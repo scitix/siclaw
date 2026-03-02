@@ -5,7 +5,7 @@ import { formatResult, formatSummary } from "./format.js";
 import { NORMAL_BUDGET, QUICK_BUDGET } from "./types.js";
 import { Text } from "@mariozechner/pi-tui";
 import { deepSearchEvents, deepSearchGate } from "./events.js";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef, LlmConfigRef } from "../../core/agent-factory.js";
 
 interface DeepSearchHypothesis {
   text: string;
@@ -17,7 +17,7 @@ interface DeepSearchParams {
   question: string;
   budget?: "normal" | "quick";
   triageContext?: string;
-  hypotheses?: DeepSearchHypothesis[];
+  hypotheses?: DeepSearchHypothesis[] | string;
 }
 
 /** Colorize status emoji keywords in already-formatted text. */
@@ -101,7 +101,7 @@ function renderDeepSearchResult(result: any, options: any, theme: any) {
   return new Text("\n" + (hint ? hint + "\n" : "") + styled.join("\n"), 0, 0);
 }
 
-export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef, llmConfigRef?: LlmConfigRef): ToolDefinition {
   return {
     name: "deep_search",
     label: "Deep Search",
@@ -124,9 +124,7 @@ Use this tool when:
 - RDMA/RoCE troubleshooting with complex failure modes
 
 Do NOT use for simple queries that can be answered with 1-2 kubectl commands.
-Do triage first before calling this tool — confirm the problem exists and gather basic context.
-
-Requires LLM config in .siclaw/config/settings.json.`,
+Do triage first before calling this tool — confirm the problem exists and gather basic context.`,
     parameters: Type.Object({
       question: Type.String({
         description:
@@ -147,46 +145,46 @@ Requires LLM config in .siclaw/config/settings.json.`,
         }),
       ),
       hypotheses: Type.Optional(
-        Type.Array(
-          Type.Object({
-            text: Type.String({ description: "Specific hypothesis description" }),
-            confidence: Type.Number({ description: "Prior belief 0-100" }),
-            suggestedTools: Type.Array(Type.String(), {
-              description: 'Validation commands, e.g. "bash: skills/core/roce-pcie-link/scripts/pcie-link.sh --node X"',
+        Type.Union([
+          Type.Array(
+            Type.Object({
+              text: Type.String({ description: "Specific hypothesis description" }),
+              confidence: Type.Number({ description: "Prior belief 0-100" }),
+              suggestedTools: Type.Array(Type.String(), {
+                description: 'Validation commands, e.g. "bash: skills/core/roce-pcie-link/scripts/pcie-link.sh --node X"',
+              }),
             }),
-          }),
-          {
-            description:
-              "Pre-confirmed hypotheses from user. When provided, Phase 2 (hypothesis generation) is skipped. " +
-              "Use skill script paths in suggestedTools for best results.",
-          },
-        ),
+          ),
+          Type.String({ description: "JSON-encoded array of hypotheses (fallback for models that serialize arrays as strings)" }),
+        ], {
+          description:
+            "Pre-confirmed hypotheses from user. When provided, Phase 2 (hypothesis generation) is skipped. " +
+            "Use skill script paths in suggestedTools for best results.",
+        }),
       ),
     }),
     renderResult: renderDeepSearchResult,
     async execute(_toolCallId, rawParams) {
+      // Gate removed — let the model decide when to proceed with deep_search.
+      // The hypothesis review UI is informational; no hard block required.
       if (deepSearchGate.blocked) {
-        return {
-          content: [{ type: "text" as const, text:
-            "ERROR: User has not confirmed the hypotheses yet. " +
-            "Wait for the user to click 'Confirm & Run' before calling deep_search. " +
-            "Do NOT call deep_search until user confirms." }],
-          details: { error: true, gated: true },
-        };
+        deepSearchGate.blocked = false;
       }
 
       const params = rawParams as DeepSearchParams;
       const budget = params.budget === "quick" ? QUICK_BUDGET : NORMAL_BUDGET;
 
       // Defensive: LLM sometimes passes hypotheses as JSON string instead of array
-      let hypotheses = params.hypotheses;
-      if (typeof hypotheses === "string") {
+      let hypotheses: DeepSearchHypothesis[] | undefined;
+      if (typeof params.hypotheses === "string") {
         try {
-          const parsed = JSON.parse(hypotheses);
+          const parsed = JSON.parse(params.hypotheses);
           hypotheses = Array.isArray(parsed) ? parsed : parsed?.hypotheses;
         } catch {
           hypotheses = undefined;
         }
+      } else if (Array.isArray(params.hypotheses)) {
+        hypotheses = params.hypotheses;
       }
 
       try {
@@ -195,6 +193,10 @@ Requires LLM config in .siclaw/config/settings.json.`,
           triageContext: params.triageContext,
           hypotheses,
           kubeconfigRef,
+          // Pass current main model's LLM config to sub-agents
+          apiKey: llmConfigRef?.apiKey,
+          baseUrl: llmConfigRef?.baseUrl,
+          model: llmConfigRef?.model,
           onProgress: (event) => deepSearchEvents.emit("progress", event),
         });
         const report = formatResult(result);
