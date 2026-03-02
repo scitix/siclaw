@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.fullname" . }}-cron
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "cron") | nindent 4 }}
+spec:
+  replicas: {{ .Values.cron.replicas }}
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "cron") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "cron") | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: cron
+          image: {{ include "siclaw.image" (dict "component" "cron" "ctx" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: api
+              containerPort: 3100
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: SICLAW_CRON_API_PORT
+              value: "3100"
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: SICLAW_GATEWAY_URL
+              value: "http://{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local"
+            {{- range $key, $value := .Values.cron.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.cron.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /cron/health
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /cron/health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10

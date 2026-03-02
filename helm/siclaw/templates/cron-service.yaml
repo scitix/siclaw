@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siclaw.fullname" . }}-cron
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "cron") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: api
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "cron") | nindent 4 }}

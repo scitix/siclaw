@@ -1,0 +1,6 @@
+apiVersion: v2
+name: siclaw
+description: A Helm chart for deploying Siclaw — AI-powered coding assistant platform
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

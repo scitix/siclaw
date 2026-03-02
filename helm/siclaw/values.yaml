@@ -1,0 +1,59 @@
+# -- Global
+nameOverride: ""
+fullnameOverride: ""
+namespace: siclaw
+
+# -- Container images
+image:
+  registry: ""          # e.g. "scitix" -> scitix/siclaw-gateway:latest; empty -> siclaw-gateway:latest
+  pullPolicy: Always
+  tag: "latest"
+
+# -- Gateway
+gateway:
+  replicas: 1
+  service:
+    type: NodePort
+    port: 80
+    nodePort: 31000
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  env: {}               # extra env vars
+
+# -- AgentBox (spawned at runtime by gateway)
+agentbox:
+  image:
+    # Override registry/tag if agentbox image differs from gateway
+    registry: ""        # defaults to image.registry
+    tag: ""             # defaults to image.tag
+
+# -- Cron
+cron:
+  replicas: 2
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  env: {}
+
+# -- Database (MySQL — SQLite is not supported in K8s mode)
+database:
+  # Provide URL directly or reference an existing secret
+  url: ""
+  existingSecret:
+    name: ""
+    key: "database-url"
+
+# -- Persistence
+persistence:
+  skills:
+    storageClass: ""    # empty = cluster default
+    size: 10Gi
