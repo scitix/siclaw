@@ -1,0 +1,12 @@
+{
+  "labels": {
+    "deep-investigation":  ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "find-node":           ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "image-pull-debug":    ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "node-logs":           ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "node-ping-gateway":   ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "node-show-gateway":   ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "pod-ping-gateway":    ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "pod-show-gateway":    ["kubernetes", "network",  "diagnostic", "sre", "developer"]
+  }
+}

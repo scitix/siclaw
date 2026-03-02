@@ -1,0 +1,26 @@
+{
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "LLM_API_KEY",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "gpt-4o",
+          "name": "GPT-4o",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "compat": {
+            "supportsDeveloperRole": true,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+__pycache__/
+CLAUDE.md
+.siclaw/
+.claude/
+siclaw-inner/

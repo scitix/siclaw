@@ -1,0 +1,99 @@
+# Test-only MySQL deployment
+# NOT for production — use a managed MySQL instance instead.
+#
+# Deploy: kubectl apply -f k8s/test/mysql.yaml -n siclaw
+# Connect: mysql -h siclaw-mysql -u root -p siclaw
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: siclaw-mysql-data
+  namespace: siclaw
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nfs-siclaw
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-mysql
+  namespace: siclaw
+  labels:
+    app: siclaw-mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siclaw-mysql
+  template:
+    metadata:
+      labels:
+        app: siclaw-mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8
+          ports:
+            - containerPort: 3306
+              name: mysql
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: siclaw-secrets
+                  key: mysql-root-password
+            - name: MYSQL_DATABASE
+              value: "siclaw"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          livenessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - localhost
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - localhost
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: siclaw-mysql-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-mysql
+  namespace: siclaw
+spec:
+  type: ClusterIP
+  selector:
+    app: siclaw-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      protocol: TCP

@@ -1,0 +1,112 @@
+# Cron Service Deployment
+# Independent cron scheduler with multi-instance HA support.
+# Default 2 replicas — each pod registers itself, sends heartbeats,
+# and claims jobs via DB-based coordination.
+#
+# Prerequisites:
+# 1. Same secrets as gateway (database-url, etc.)
+# 2. Replace ${REGISTRY} with your private registry address
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-cron
+  namespace: siclaw
+  labels:
+    app: siclaw-cron
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: siclaw-cron
+  template:
+    metadata:
+      labels:
+        app: siclaw-cron
+    spec:
+      serviceAccountName: default
+      containers:
+      - name: cron
+        image: siclaw-cron:latest
+        imagePullPolicy: Always
+        ports:
+        - name: api
+          containerPort: 3100
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: SICLAW_CRON_API_PORT
+          value: "3100"
+        # Pod name as instance ID — unique per replica
+        - name: HOSTNAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SICLAW_GATEWAY_URL
+          value: "http://siclaw-gateway.siclaw.svc.cluster.local"
+        - name: SICLAW_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: database-url
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /cron/health
+            port: 3100
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /cron/health
+            port: 3100
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      terminationGracePeriodSeconds: 30
+
+---
+# Headless Service for stable pod DNS (pod-name.siclaw-cron-headless.siclaw.svc)
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-cron-headless
+  namespace: siclaw
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: siclaw-cron
+  ports:
+  - name: api
+    port: 3100
+    targetPort: 3100
+    protocol: TCP
+
+---
+# Regular Service for gateway → cron notifications (load-balanced)
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-cron
+  namespace: siclaw
+spec:
+  type: ClusterIP
+  selector:
+    app: siclaw-cron
+  ports:
+  - name: api
+    port: 80
+    targetPort: 3100
+    protocol: TCP
+

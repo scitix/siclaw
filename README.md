@@ -1,93 +1,234 @@
-# siclaw
+# Siclaw
 
+AI-powered SRE platform that turns natural language into Kubernetes diagnostics.
 
+Siclaw gives every engineer an on-call copilot — describe a problem in plain language, and the agent runs kubectl, reads logs, traces network paths, and delivers a root-cause analysis. It works from a terminal, a web UI, or directly inside Feishu / DingTalk / Discord.
 
-## Getting started
+## Core Capabilities
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### Autonomous Kubernetes Diagnostics
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+The agent has 20+ built-in tools (restricted bash, kubectl, node/pod exec, network namespace introspection) and follows a **safe-by-default** principle — read-only by default, explicit confirmation before any mutation.
 
-## Add your files
+### Deep Investigation
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+For complex incidents, activate **Deep Investigation** mode. The engine runs a structured 4-phase workflow:
+
+1. **Triage** — Confirm symptoms with quick commands
+2. **Hypotheses** — Rank possible root causes (user picks which to explore)
+3. **Deep Search** — Spawn parallel sub-agents to validate each hypothesis with budget control
+4. **Conclusion** — Synthesize findings into actionable recommendations
+
+### Skill System
+
+Skills are reusable diagnostic playbooks (a SKILL.md spec + shell scripts) that the agent discovers and executes at runtime.
+
+| Tier | Location | Description |
+|------|----------|-------------|
+| Core | `skills/core/` | Built-in (node logs, network gateway, image pull debug, etc.) |
+| Team | `skills/team/` | Shared across all users, admin-managed |
+| Personal | `skills/user/` | Per-user, created via the `create_skill` tool |
+
+Skills are hot-reloadable — update on disk or via the web editor, and active sessions pick up changes instantly.
+
+### Multi-User Gateway
+
+A central HTTP + WebSocket server that manages isolated **AgentBox** pods (one per user per workspace) on Kubernetes.
+
+- **Web UI** — React frontend with chat, skill editor, cron scheduler, credential vault
+- **IM Channels** — Feishu, DingTalk, Discord (route messages through AgentBox pods)
+- **SSO** — OIDC/Dex integration, or local username/password
+- **Cron** — Schedule recurring agent tasks with multi-instance HA coordination
+- **Triggers** — Webhook endpoints for Prometheus / PagerDuty / custom alerts
+- **Workspaces** — Per-project isolation of skills, tools, environments, and credentials
+
+### Pluggable LLM Backend
+
+Siclaw supports two agent runtimes and any OpenAI-compatible LLM provider:
+
+| Brain | Package | Best for |
+|-------|---------|----------|
+| `pi-agent` | `@mariozechner/pi-coding-agent` | OpenAI-compatible providers (Qwen, DeepSeek, Kimi, etc.) |
+| `claude-sdk` | `@anthropic-ai/claude-agent-sdk` | Anthropic Claude with native tool use |
+
+Configure providers from the **Settings** page in the web UI — switch models per session.
+
+### MCP Tool Servers
+
+Extend the agent with external [Model Context Protocol](https://modelcontextprotocol.io) servers. Supports stdio, SSE, and streamable-http transports. Configure in `.siclaw/config/settings.json` (see `settings.example.json`).
+
+### Persistent Memory
+
+The agent maintains a per-user memory store (markdown files + vector embeddings) that survives across sessions. Past investigations, environment quirks, and team conventions are automatically recalled.
+
+## Architecture
 
 ```
-cd existing_repo
-git remote add origin http://gitlab.scitix-inner.ai/k8s/siclaw.git
-git branch -M main
-git push -uf origin main
+  Web UI / IM Channel / Webhook
+              │
+              ▼
+  ┌───────────────────────┐
+  │       Gateway          │  Control plane: auth, routing, DB, cron
+  │    (HTTP + WebSocket)  │
+  └──────────┬────────────┘
+             │ K8s API
+             ▼
+  ┌───────────────────────┐
+  │      AgentBox Pod      │  Execution plane: one per user per workspace
+  │  ┌─────────────────┐  │
+  │  │  Agent Runtime   │  │  pi-agent or claude-sdk
+  │  │  ┌───────────┐  │  │
+  │  │  │  Tools     │  │  │  kubectl, bash, node_exec, deep_search, ...
+  │  │  │  Skills    │  │  │  core/ + team/ + personal/
+  │  │  │  MCP       │  │  │  external tool servers
+  │  │  │  Memory    │  │  │  vector search + markdown
+  │  │  └───────────┘  │  │
+  │  └─────────────────┘  │
+  └───────────────────────┘
+              │
+              ▼
+      Target K8s Clusters
+     (user-provided kubeconfig)
 ```
 
-## Integrate with your tools
+## Quick Start
 
-- [ ] [Set up project integrations](http://gitlab.scitix-inner.ai/k8s/siclaw/-/settings/integrations)
+### CLI Mode (Local Development)
 
-## Collaborate with your team
+```bash
+npm ci
+npm run build
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+# Interactive TUI
+node siclaw-tui.mjs
 
-## Test and Deploy
+# Single-shot
+node siclaw-tui.mjs --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+```
 
-Use the built-in continuous integration in GitLab.
+Requires `.siclaw/config/settings.json` with at least one LLM provider and a valid kubeconfig:
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+```bash
+mkdir -p .siclaw/config
+cp settings.example.json .siclaw/config/settings.json
+# Edit .siclaw/config/settings.json with your LLM provider details
+```
 
-***
+### Gateway Mode (Multi-User)
 
-# Editing this README
+```bash
+# Set required env vars
+export SICLAW_DATABASE_URL="mysql://user:pass@host:3306/siclaw"
+export SICLAW_JWT_SECRET="your-secret"
+export SICLAW_LLM_API_KEY="your-api-key"
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# Start gateway
+node siclaw-gateway.mjs          # local spawner
+node siclaw-gateway.mjs --k8s    # K8s pod spawner
 
-## Suggestions for a good README
+# Open http://localhost:3000
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### Docker (Production)
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+# Build all images
+make build-docker
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+# Deploy to K8s
+make deploy
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Three images: `siclaw-gateway`, `siclaw-agentbox`, `siclaw-cron`.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Configuration
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### Files
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+| File | Purpose |
+|------|---------|
+| `settings.example.json` | Example config — copy to `.siclaw/config/settings.json` |
+| `skills/core/` | Built-in diagnostic skills |
+| `k8s/` | Kubernetes deployment manifests |
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+### Environment Variables
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+**Gateway:**
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+| Variable | Description |
+|----------|-------------|
+| `SICLAW_DATABASE_URL` | MySQL connection string |
+| `SICLAW_JWT_SECRET` | JWT signing secret |
+| `SICLAW_LLM_API_KEY` | API key for LLM provider |
+| `SICLAW_AGENTBOX_IMAGE` | AgentBox container image |
+| `SICLAW_K8S_NAMESPACE` | Kubernetes namespace (default: `default`) |
+| `SICLAW_SSO_ISSUER` | OIDC issuer URL (enables SSO) |
+| `SICLAW_S3_ENDPOINT` | S3-compatible endpoint for skill/session backup |
+| `SICLAW_CRON_SERVICE_URL` | Cron worker service URL |
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+**AgentBox:**
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+| Variable | Description |
+|----------|-------------|
+| `SICLAW_LLM_API_KEY` | API key (injected from K8s secret) |
+| `SICLAW_GATEWAY_URL` | Internal gateway URL |
+| `SICLAW_DEBUG_IMAGE` | Debug pod image (default: `busybox:latest`) |
+| `SICLAW_EMBEDDING_BASE_URL` | Embedding API for memory indexing |
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+SSO, S3, and system URLs can also be configured from the **Settings > System** page in the web UI (admin only, stored in DB).
+
+## Project Structure
+
+```
+src/
+├── cli-main.ts              # TUI entry point
+├── gateway-main.ts          # Gateway entry point
+├── agentbox-main.ts         # AgentBox entry point
+├── cron-main.ts             # Cron worker entry point
+├── core/
+│   ├── agent-factory.ts     # Session factory (tools + brain + skills)
+│   ├── prompt.ts            # SRE system prompt
+│   ├── brains/              # pi-agent & claude-sdk adapters
+│   ├── llm-proxy.ts         # Anthropic → OpenAI translation proxy
+│   └── mcp-client.ts        # MCP server management
+├── tools/
+│   ├── restricted-bash.ts   # Sandboxed shell
+│   ├── kubectl.ts           # Read-only kubectl wrapper
+│   ├── deep-search/         # Parallel sub-agent investigation
+│   ├── node-exec.ts         # K8s node command execution
+│   └── ...                  # 20+ tool definitions
+├── memory/                  # Vector + keyword search indexer
+├── gateway/
+│   ├── server.ts            # HTTP + WebSocket server
+│   ├── rpc-methods.ts       # All RPC handlers
+│   ├── auth/                # JWT, SSO, user store
+│   ├── agentbox/            # K8s pod spawner + local spawner
+│   ├── channels/            # IM platform integrations
+│   ├── db/                  # Drizzle ORM schema + repositories
+│   └── web/                 # React frontend (Vite + Tailwind)
+├── lib/
+│   ├── s3-storage.ts        # S3/OSS for skill versions
+│   └── s3-backup.ts         # Session JSONL backup
+skills/
+├── core/                    # Built-in skills (8)
+├── team/                    # Team-shared skills
+└── extension/               # Optional extension skills
+k8s/                         # Kubernetes manifests
+```
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Runtime | Node.js 22+ (ESM-only) |
+| Language | TypeScript 5.8 |
+| Agent | pi-coding-agent / claude-agent-sdk |
+| Database | MySQL + Drizzle ORM |
+| Frontend | React + Vite + Tailwind CSS |
+| K8s Client | @kubernetes/client-node |
+| MCP | @modelcontextprotocol/sdk |
+| Realtime | WebSocket (ws) |
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Apache License 2.0 — see [LICENSE](LICENSE) for details.

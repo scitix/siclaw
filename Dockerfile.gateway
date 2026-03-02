@@ -1,0 +1,75 @@
+# Gateway Docker Image — multi-stage build
+# Stage 1: build (tsc + vite)
+# Stage 2: production runtime
+
+# ── Build stage ──────────────────────────────────────────────────
+FROM node:22-slim AS builder
+
+WORKDIR /app
+
+# Install all dependencies (including devDependencies for tsc/vite)
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+# Backend build (tsc)
+RUN npx tsc
+
+# Frontend build (vite)
+WORKDIR /app/src/gateway/web
+RUN npm install && npm run build
+
+# ── Production stage ─────────────────────────────────────────────
+FROM node:22-slim
+
+# Install system dependencies (git needed for skill versioning)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files and install production deps only
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy compiled JavaScript from builder
+COPY --from=builder /app/dist/ ./dist/
+
+# Copy web frontend from builder
+COPY --from=builder /app/src/gateway/web/dist/ ./dist/gateway/web/dist/
+
+# Copy core skills (baked-in, always available)
+COPY skills/core/ ./skills/core/
+
+# Extension skills directory (populated by overlay builds)
+RUN mkdir -p ./skills/extension
+
+# Create data directory
+RUN mkdir -p .siclaw
+
+# Environment variables
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOST=0.0.0.0
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/api/health || exit 1
+
+# Expose port
+EXPOSE 3000
+
+# Run as non-root user for security
+RUN useradd -m -s /bin/bash gateway
+RUN chown -R gateway:gateway /app
+USER gateway
+
+# Start gateway with K8s spawner
+CMD ["node", "dist/gateway-main.js", "--k8s"]

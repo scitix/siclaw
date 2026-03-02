@@ -1,0 +1,583 @@
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { Markdown } from '@/components/Markdown';
+import { InputArea } from './InputArea';
+import { SkillCard, type SkillRefStatus } from './SkillCard';
+import { ScheduleCard, type ScheduleCardStatus } from './ScheduleCard';
+import { InvestigationCard } from './InvestigationCard';
+import { HypothesesCard } from './HypothesesCard';
+import { DpChecklistCard, type DpChecklistItem } from './DpChecklistCard';
+import type { PilotMessage, ContextUsage, InvestigationProgress } from '@/hooks/usePilot';
+import type { WsStatus } from '@/hooks/useWebSocket';
+import type { Skill } from '@/pages/Skills/skillsData';
+
+type RpcSendFn = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>;
+
+export interface PilotAreaProps {
+    messages: PilotMessage[];
+    isLoading: boolean;
+    isLoadingHistory?: boolean;
+    wsStatus: WsStatus;
+    isConnected: boolean;
+    hasMore?: boolean;
+    isLoadingMore?: boolean;
+    sendMessage: (text: string) => void;
+    abortResponse?: () => void;
+    loadMoreHistory?: () => void;
+    sendRpc?: RpcSendFn;
+    contextUsage?: ContextUsage | null;
+    isCompacting?: boolean;
+    skills?: Skill[];
+    editingSkill?: { id: string; name: string } | null;
+    onEditSkill?: (id: string, name: string) => void;
+    onClearEditSkill?: () => void;
+    onSkillSaved?: () => void;
+    onOpenSkillPanel?: (msg: PilotMessage) => void;
+    onOpenSchedulePanel?: (msg: PilotMessage) => void;
+    panelMessage?: PilotMessage | null;
+    updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
+    pendingMessages?: string[];
+    onRemovePending?: (index: number) => void;
+    investigationProgress?: InvestigationProgress | null;
+    dpActive?: boolean;
+    onSetDpActive?: (active: boolean) => void;
+    dpFocus?: string | null;
+    dpChecklist?: DpChecklistItem[] | null;
+    onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void;
+    onExitDp?: () => void;
+}
+
+/** Compute superseded status for skill messages */
+function computeSkillStatuses(messages: PilotMessage[]): Map<string, SkillRefStatus> {
+    const statuses = new Map<string, SkillRefStatus>();
+
+    // Group skill messages by skill identifier (skillId or skill name)
+    const skillGroups = new Map<string, string[]>(); // skillKey -> [messageId, ...]
+
+    for (const msg of messages) {
+        if (msg.role !== 'tool') continue;
+        if (msg.toolName !== 'create_skill' && msg.toolName !== 'update_skill') continue;
+
+        let parsed: { skill?: { name: string }; skillId?: string } | null = null;
+        try { parsed = JSON.parse(msg.content); } catch { continue; }
+        if (!parsed?.skill) continue;
+
+        const key = parsed.skillId || parsed.skill.name;
+        if (!skillGroups.has(key)) skillGroups.set(key, []);
+        skillGroups.get(key)!.push(msg.id);
+
+        // Determine status from metadata
+        const meta = msg.metadata as Record<string, unknown> | undefined;
+        if (meta?.skillCard === 'saved') {
+            statuses.set(msg.id, 'saved');
+        } else if (meta?.skillCard === 'dismissed') {
+            statuses.set(msg.id, 'dismissed');
+        } else {
+            statuses.set(msg.id, 'pending');
+        }
+    }
+
+    // Mark superseded: in each group, only the latest unsaved/undismissed message is active
+    for (const [, msgIds] of skillGroups) {
+        // Find the latest pending message
+        let latestPendingIdx = -1;
+        for (let i = msgIds.length - 1; i >= 0; i--) {
+            if (statuses.get(msgIds[i]) === 'pending') {
+                latestPendingIdx = i;
+                break;
+            }
+        }
+        // Mark all other pending messages as superseded
+        for (let i = 0; i < msgIds.length; i++) {
+            if (statuses.get(msgIds[i]) === 'pending' && i !== latestPendingIdx) {
+                statuses.set(msgIds[i], 'superseded');
+            }
+        }
+    }
+
+    return statuses;
+}
+
+/** Compute superseded status for schedule messages */
+function computeScheduleStatuses(messages: PilotMessage[]): Map<string, ScheduleCardStatus> {
+    const statuses = new Map<string, ScheduleCardStatus>();
+    const scheduleGroups = new Map<string, string[]>(); // scheduleName -> [messageId, ...]
+
+    for (const msg of messages) {
+        if (msg.role !== 'tool') continue;
+        if (msg.toolName !== 'manage_schedule') continue;
+
+        let parsed: { action?: string; schedule?: { name: string }; id?: string } | null = null;
+        try { parsed = JSON.parse(msg.content); } catch { continue; }
+        if (!parsed) continue;
+
+        const key = parsed.schedule?.name || parsed.id || msg.id;
+        if (!scheduleGroups.has(key)) scheduleGroups.set(key, []);
+        scheduleGroups.get(key)!.push(msg.id);
+
+        const meta = msg.metadata as Record<string, unknown> | undefined;
+        if (meta?.scheduleCard === 'saved') {
+            statuses.set(msg.id, 'saved');
+        } else if (meta?.scheduleCard === 'dismissed') {
+            statuses.set(msg.id, 'dismissed');
+        } else {
+            statuses.set(msg.id, 'pending');
+        }
+    }
+
+    // Mark superseded: in each group, only the latest pending message is active
+    for (const [, msgIds] of scheduleGroups) {
+        let latestPendingIdx = -1;
+        for (let i = msgIds.length - 1; i >= 0; i--) {
+            if (statuses.get(msgIds[i]) === 'pending') {
+                latestPendingIdx = i;
+                break;
+            }
+        }
+        for (let i = 0; i < msgIds.length; i++) {
+            if (statuses.get(msgIds[i]) === 'pending' && i !== latestPendingIdx) {
+                statuses.set(msgIds[i], 'superseded');
+            }
+        }
+    }
+
+    return statuses;
+}
+
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp }: PilotAreaProps) {
+    const scrollRef = useRef<HTMLDivElement>(null);
+    const scrollContainerRef = useRef<HTMLDivElement>(null);
+    const prevScrollHeightRef = useRef(0);
+    const prevMsgCountRef = useRef(0);
+    // Track whether user has manually scrolled away from bottom
+    const userScrolledAwayRef = useRef(false);
+
+    const scrollToBottom = useCallback((smooth = true) => {
+        requestAnimationFrame(() => {
+            scrollRef.current?.scrollIntoView(smooth ? { behavior: 'smooth' } : undefined);
+        });
+    }, []);
+
+    // Compute skill/schedule statuses for superseded preprocessing
+    const skillStatuses = useMemo(() => computeSkillStatuses(messages), [messages]);
+    const scheduleStatuses = useMemo(() => computeScheduleStatuses(messages), [messages]);
+
+    // Find the latest propose_hypotheses message (older ones will be rendered as superseded)
+    const latestHypothesesId = useMemo(() => {
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].toolName === 'propose_hypotheses' && !messages[i].isStreaming) {
+                return messages[i].id;
+            }
+        }
+        return null;
+    }, [messages]);
+
+    // Handles three cases:
+    // 1. Initial load / session switch (0 → N): force scroll to bottom
+    // 2. Prepend (load more): restore scroll position so view doesn't jump
+    // 3. Append (new message/streaming): auto-scroll unless user scrolled away
+    useEffect(() => {
+        const container = scrollContainerRef.current;
+        if (!container) return;
+
+        if (prevScrollHeightRef.current) {
+            // Prepend case: older messages were inserted at top
+            const diff = container.scrollHeight - prevScrollHeightRef.current;
+            if (diff > 0) container.scrollTop += diff;
+            prevScrollHeightRef.current = 0;
+        } else if (prevMsgCountRef.current === 0 && messages.length > 0) {
+            // Initial load / session switch: scroll to bottom after DOM renders
+            userScrolledAwayRef.current = false;
+            scrollToBottom(false);
+        } else if (messages.length > prevMsgCountRef.current) {
+            // New message added — check if it's a user message (force scroll)
+            const latest = messages[messages.length - 1];
+            if (latest?.role === 'user') {
+                // User just sent a message — always scroll to bottom
+                userScrolledAwayRef.current = false;
+                scrollToBottom(false);
+            } else if (!userScrolledAwayRef.current) {
+                // Bot message / streaming — scroll if user hasn't scrolled away
+                scrollToBottom(true);
+            }
+        } else if (!userScrolledAwayRef.current) {
+            // Same count but content changed (streaming update)
+            scrollToBottom(true);
+        }
+        prevMsgCountRef.current = messages.length;
+    }, [messages, scrollToBottom]);
+
+    // Detect if user manually scrolls away from bottom
+    const handleScroll = useCallback(() => {
+        const container = scrollContainerRef.current;
+        if (!container) return;
+
+        const { scrollTop, scrollHeight, clientHeight } = container;
+        const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
+        // User is "at bottom" if within 300px (generous threshold for input area height)
+        userScrolledAwayRef.current = distanceFromBottom > 300;
+
+        // Load more when near top
+        if (!hasMore || isLoadingMore || !loadMoreHistory) return;
+        if (container.scrollTop < 80) {
+            prevScrollHeightRef.current = container.scrollHeight;
+            loadMoreHistory();
+        }
+    }, [hasMore, isLoadingMore, loadMoreHistory]);
+
+    return (
+        <div className="flex-1 flex flex-col h-full bg-white">
+            {/* Connection status indicator */}
+            <div className="absolute top-4 right-16 z-30">
+                <div className={cn(
+                    "flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium transition-colors",
+                    isConnected
+                        ? "bg-green-50 text-green-600"
+                        : wsStatus === 'connecting'
+                            ? "bg-yellow-50 text-yellow-600"
+                            : "bg-red-50 text-red-600"
+                )}>
+                    {isConnected ? (
+                        <Wifi className="w-3 h-3" />
+                    ) : wsStatus === 'connecting' ? (
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                        <WifiOff className="w-3 h-3" />
+                    )}
+                    <span>{isConnected ? 'Connected' : wsStatus === 'connecting' ? 'Connecting...' : 'Disconnected'}</span>
+                </div>
+            </div>
+
+
+            <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 lg:px-8 py-8" onScroll={handleScroll}>
+                <div className="max-w-5xl mx-auto space-y-8">
+                    {isLoadingHistory ? (
+                        <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                            <Loader2 className="w-8 h-8 animate-spin text-gray-300 mb-4" />
+                            <p className="text-sm">Loading messages...</p>
+                        </div>
+                    ) : messages.length === 0 ? (
+                        <div className="flex flex-col items-center justify-center py-20 text-gray-400">
+                            <Cpu className="w-12 h-12 mb-4 text-gray-300" />
+                            <p className="text-lg font-medium">Start a conversation</p>
+                            <p className="text-sm mt-1">Ask me anything about your infrastructure</p>
+                        </div>
+                    ) : (
+                        <>
+                            {isLoadingMore && (
+                                <div className="flex justify-center py-2">
+                                    <Loader2 className="w-4 h-4 animate-spin text-gray-400" />
+                                </div>
+                            )}
+
+                            {!hasMore && messages.length > 0 && (
+                                <div className="flex justify-center">
+                                    <span className="text-xs font-semibold text-gray-400 bg-gray-100 px-3 py-1 rounded-full">Start of conversation</span>
+                                </div>
+                            )}
+
+                            {messages.filter(m => !m.hidden).map((msg) => (
+                                <MessageItem
+                                    key={msg.id}
+                                    message={msg}
+                                    sendRpc={sendRpc}
+                                    skills={skills}
+                                    editingSkill={editingSkill}
+                                    onEditSkill={onEditSkill}
+                                    onSkillSaved={onSkillSaved}
+                                    skillStatus={skillStatuses.get(msg.id)}
+                                    scheduleStatus={scheduleStatuses.get(msg.id)}
+                                    onOpenSkillPanel={onOpenSkillPanel}
+                                    onOpenSchedulePanel={onOpenSchedulePanel}
+                                    updateMessageMeta={updateMessageMeta}
+                                    isInPanel={panelMessage?.id === msg.id}
+                                    investigationProgress={investigationProgress}
+                                    sendMessage={sendMessage}
+                                    abortResponse={abortResponse}
+                                    dpFocus={dpFocus}
+                                    onHypothesesConfirmed={onHypothesesConfirmed}
+                                    hypothesesSuperseded={latestHypothesesId != null && msg.toolName === 'propose_hypotheses' && msg.id !== latestHypothesesId}
+                                />
+                            ))}
+
+                            {/* DP Checklist Card — persistent progress during Deep Investigation */}
+                            {dpChecklist && dpChecklist.length > 0 && (
+                                <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
+                            )}
+
+                            {isLoading && (
+                                <div className="flex gap-4">
+                                    <div className="w-8 h-8 rounded-full bg-white border border-gray-200 flex items-center justify-center text-primary-600 shadow-sm">
+                                        <Cpu className="w-5 h-5" />
+                                    </div>
+                                    <div className="flex items-center gap-2 text-gray-400">
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        <span className="text-sm">Thinking...</span>
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    )}
+                    <div ref={scrollRef} />
+                </div>
+            </div>
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} skills={skills} onEditSkill={onEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} />
+        </div>
+    );
+}
+
+// Parse [User Script: name (lang)] references from user messages
+interface ScriptRef { name: string; lang: string; }
+
+function parseScriptRefs(content: string): { scripts: ScriptRef[]; text: string } {
+    const scripts: ScriptRef[] = [];
+    const regex = /\[User Script: ([^\s]+) \((\w+)\)\]\n*/g;
+    const text = content.replace(regex, (_, name, lang) => {
+        scripts.push({ name, lang });
+        return '';
+    }).trim();
+    return { scripts, text };
+}
+
+/** Parse [Skill: name] or legacy [Editing Skill: name]...--- block from user messages */
+function parseSkillRef(content: string): { skillName: string | null; text: string } {
+    // New compact format: [Skill: name]
+    const compactMatch = content.match(/\[Skill: ([^\]]+)\]\n*/);
+    if (compactMatch) {
+        return { skillName: compactMatch[1], text: content.replace(compactMatch[0], '').trim() };
+    }
+    // Legacy verbose format: [Editing Skill: name]\n...---\n
+    const legacyMatch = content.match(/\[Editing Skill: ([^\]]+)\]\n(?:.*\n)*?---\n*/);
+    if (legacyMatch) {
+        return { skillName: legacyMatch[1], text: content.replace(legacyMatch[0], '').trim() };
+    }
+    return { skillName: null, text: content };
+}
+
+/** Parse [Deep Investigation] marker from user messages */
+function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean; text: string } {
+    const match = content.match(/\[Deep Investigation\]\n*/);
+    if (match) {
+        return { isDeepInvestigation: true, text: content.replace(match[0], '').trim() };
+    }
+    return { isDeepInvestigation: false, text: content };
+}
+
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, onHypothesesConfirmed, hypothesesSuperseded }: {
+    message: PilotMessage;
+    sendRpc?: RpcSendFn;
+    skills?: Skill[];
+    editingSkill?: { id: string; name: string } | null;
+    onEditSkill?: (id: string, name: string) => void;
+    onSkillSaved?: () => void;
+    skillStatus?: SkillRefStatus;
+    scheduleStatus?: ScheduleCardStatus;
+    onOpenSkillPanel?: (msg: PilotMessage) => void;
+    onOpenSchedulePanel?: (msg: PilotMessage) => void;
+    updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
+    isInPanel?: boolean;
+    investigationProgress?: InvestigationProgress | null;
+    sendMessage?: (text: string) => void;
+    abortResponse?: () => void;
+    dpFocus?: string | null;
+    onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void;
+    hypothesesSuperseded?: boolean;
+}) {
+    const isUser = message.role === 'user';
+    const isTool = message.role === 'tool';
+
+    if (isTool) {
+        if ((message.toolName === 'create_skill' || message.toolName === 'update_skill') && !message.isStreaming) {
+            return (
+                <SkillCard
+                    message={message}
+                    status={skillStatus ?? 'pending'}
+                    onOpenPanel={onOpenSkillPanel}
+                />
+            );
+        }
+        if (message.toolName === 'manage_schedule' && !message.isStreaming) {
+            return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} />;
+        }
+        if (message.toolName === 'deep_search') {
+            // In DP mode, DpChecklistCard handles the running display — hide duplicate InvestigationCard
+            if (message.isStreaming && dpFocus) {
+                return null;
+            }
+            return <InvestigationCard message={message} progress={message.isStreaming ? investigationProgress : undefined} />;
+        }
+        if (message.toolName === 'propose_hypotheses' && !message.isStreaming) {
+            return <HypothesesCard message={message} sendMessage={sendMessage} abortResponse={abortResponse} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} />;
+        }
+        return <ToolItem message={message} skills={skills} onEditSkill={onEditSkill} />;
+    }
+
+    // Parse references from user messages
+    const { isDeepInvestigation, text: afterDeepInv } = isUser
+        ? parseDeepInvestigation(message.content)
+        : { isDeepInvestigation: false, text: message.content };
+    const { scripts, text: afterScripts } = isUser
+        ? parseScriptRefs(afterDeepInv)
+        : { scripts: [] as ScriptRef[], text: afterDeepInv };
+    const { skillName, text: textContent } = isUser
+        ? parseSkillRef(afterScripts)
+        : { skillName: null, text: afterScripts };
+
+    return (
+        <div className={cn(
+            "flex gap-4 group",
+            isUser ? "flex-row-reverse" : "flex-row"
+        )}>
+            {/* Avatar */}
+            <div className={cn(
+                "w-8 h-8 rounded-full flex items-center justify-center shrink-0 shadow-sm border",
+                isUser
+                    ? "bg-primary-600 border-primary-600 text-white"
+                    : "bg-white border-gray-200 text-primary-600"
+            )}>
+                {isUser
+                    ? <User className="w-4 h-4" />
+                    : <Cpu className="w-5 h-5" />
+                }
+            </div>
+
+            <div className={cn(
+                "flex flex-col min-w-0",
+                isUser ? "items-end" : "items-start"
+            )}>
+                <div className="flex items-baseline gap-2 mb-1">
+                    <span className="text-sm font-semibold text-gray-900">
+                        {isUser ? 'You' : 'Siclaw'}
+                    </span>
+                    <span className="text-xs text-gray-400">{message.timestamp}</span>
+                    {message.isStreaming && !isUser && (
+                        <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+                    )}
+                </div>
+
+                {/* Reference chips (user messages only) */}
+                {(isDeepInvestigation || skillName || scripts.length > 0) && (
+                    <div className="flex flex-wrap gap-1.5 mb-1.5">
+                        {isDeepInvestigation && (
+                            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50 border border-blue-200 text-xs font-medium text-blue-700">
+                                <SearchCode className="w-3.5 h-3.5 text-blue-500" />
+                                <span>Deep Investigation</span>
+                                {dpFocus && (
+                                    <span className="ml-1 px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 text-[10px] font-semibold uppercase">
+                                        {dpFocus}
+                                    </span>
+                                )}
+                            </div>
+                        )}
+                        {skillName && (
+                            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-50 border border-indigo-200 text-xs font-medium text-indigo-700">
+                                <BookOpen className="w-3.5 h-3.5 text-indigo-500" />
+                                <span>{skillName}</span>
+                            </div>
+                        )}
+                        {scripts.map((s, i) => (
+                            <div
+                                key={i}
+                                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-primary-50 border border-primary-200 text-xs font-medium text-primary-800"
+                            >
+                                {s.lang === 'python'
+                                    ? <FileCode className="w-3.5 h-3.5 text-blue-600" />
+                                    : <Terminal className="w-3.5 h-3.5 text-green-600" />
+                                }
+                                <span>{s.name}</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+
+                {textContent && (
+                    <div className={cn(
+                        "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm max-w-3xl min-w-0 overflow-hidden",
+                        isUser
+                            ? "bg-primary-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-white/15 [&_code]:text-white [&_a]:text-blue-200"
+                            : "bg-white border border-gray-200 text-gray-800 rounded-tl-sm"
+                    )}>
+                        <Markdown>{textContent}</Markdown>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function ToolItem({ message, skills, onEditSkill }: { message: PilotMessage; skills?: Skill[]; onEditSkill?: (id: string, name: string) => void }) {
+    const [expanded, setExpanded] = useState(false);
+    // Auto-expand while streaming
+    const isOpen = message.isStreaming || expanded;
+
+    // Check if this is a run_skill call with an editable (personal) skill
+    const editableSkill = (() => {
+        if (message.toolName !== 'run_skill' || !skills || !onEditSkill) return null;
+        const skillName = message.toolInput;
+        if (!skillName) return null;
+        return skills.find(s =>
+            s.scope === 'personal' && (s.name === skillName || (s as any).dirName === skillName)
+        ) ?? null;
+    })();
+
+    return (
+        <div className="pl-12 min-w-0">
+            <div className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+                <button
+                    type="button"
+                    className="flex items-center gap-2 w-full px-4 py-2 bg-gray-50 border-b border-gray-200 hover:bg-gray-100 transition-colors cursor-pointer text-left min-w-0"
+                    onClick={() => setExpanded(!expanded)}
+                >
+                    <ChevronRight className={cn(
+                        "w-3.5 h-3.5 text-gray-400 transition-transform shrink-0",
+                        isOpen && "rotate-90"
+                    )} />
+                    <Terminal className="w-4 h-4 text-gray-500 shrink-0" />
+                    <span className="font-mono text-xs font-semibold text-gray-700 shrink-0">{message.toolName}</span>
+                    {message.toolInput && (
+                        <span className="font-mono text-xs text-gray-500 truncate min-w-0">{message.toolInput}</span>
+                    )}
+                    {message.toolStatus === 'running' && (
+                        <Loader2 className="w-3 h-3 animate-spin text-blue-400 ml-auto shrink-0" />
+                    )}
+                    {message.toolStatus === 'success' && (
+                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500 ml-auto shrink-0" />
+                    )}
+                    {message.toolStatus === 'error' && (
+                        <XCircle className="w-3.5 h-3.5 text-red-500 ml-auto shrink-0" />
+                    )}
+                    {message.toolStatus === 'aborted' && (
+                        <Ban className="w-3.5 h-3.5 text-amber-500 ml-auto shrink-0" />
+                    )}
+                    {editableSkill && !message.isStreaming && (
+                        <span
+                            className="ml-auto shrink-0 p-1 rounded hover:bg-indigo-100 text-gray-400 hover:text-indigo-600 transition-colors"
+                            title="Edit this skill"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onEditSkill!(String(editableSkill.id), editableSkill.name);
+                            }}
+                        >
+                            <Pencil className="w-3.5 h-3.5" />
+                        </span>
+                    )}
+                </button>
+                {isOpen && (
+                    <div className="overflow-x-auto bg-slate-50 max-h-80 overflow-y-auto">
+                        {message.toolInput && (
+                            <div className="px-4 pt-3 pb-2 border-b border-slate-200">
+                                <pre className="text-xs font-mono leading-relaxed text-slate-800 whitespace-pre-wrap break-all">{message.toolInput}</pre>
+                            </div>
+                        )}
+                        <div className="p-4">
+                            <pre className="text-xs font-mono leading-relaxed text-slate-600 whitespace-pre-wrap">
+                                {message.content || (message.toolStatus === 'aborted' ? 'Aborted.' : 'Running...')}
+                            </pre>
+                        </div>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}

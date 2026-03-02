@@ -1,0 +1,66 @@
+# AgentBox Docker Image — multi-stage build
+# Stage 1: build (tsc)
+# Stage 2: production runtime
+
+# ── Build stage ──────────────────────────────────────────────────
+FROM node:22-slim AS builder
+
+WORKDIR /app
+
+# Install all dependencies (including devDependencies for tsc)
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+# Backend build (tsc)
+RUN npx tsc
+
+# ── Production stage ─────────────────────────────────────────────
+FROM node:22-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    python3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl \
+    && mv kubectl /usr/local/bin/
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files and install production deps only
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Copy compiled JavaScript from builder
+COPY --from=builder /app/dist/ ./dist/
+
+# Copy skills directories
+COPY skills/core/ ./skills/core/
+RUN mkdir -p ./skills/extension ./skills/team ./skills/user
+
+# Environment variables
+ENV NODE_ENV=production
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Expose port
+EXPOSE 3000
+
+# Run as non-root user for security
+RUN useradd -m -s /bin/bash agentbox
+USER agentbox
+
+# Start agentbox
+CMD ["node", "dist/agentbox-main.js"]

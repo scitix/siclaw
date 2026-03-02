@@ -1,0 +1,209 @@
+# Gateway Deployment
+# Stateless API Gateway that manages AgentBox pods
+#
+# Prerequisites:
+# 1. Create namespace: kubectl create namespace siclaw
+# 2. Create secrets: kubectl create secret generic siclaw-secrets \
+#      --from-literal=jwt-secret=your-jwt-secret \
+#      --from-literal=llm-api-key=your-llm-api-key \
+#      -n siclaw
+# 3. Replace ${REGISTRY} with your private registry address
+# 4. Users stored in DB (no users.json needed)
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+  labels:
+    app: siclaw-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siclaw-gateway
+  template:
+    metadata:
+      labels:
+        app: siclaw-gateway
+    spec:
+      serviceAccountName: siclaw-gateway
+      initContainers:
+      - name: init-skills-dir
+        image: mysql:8
+        command:
+        - sh
+        - -c
+        - |
+          mkdir -p /mnt/skills/core /mnt/skills/team /mnt/skills/user
+          chmod -R 777 /mnt/skills
+          if [ ! -d /mnt/skills/.git ]; then
+            cd /mnt/skills && git init && git config user.email siclaw@system && git config user.name Siclaw && git commit --allow-empty -m "init skills repo"
+          fi
+        volumeMounts:
+        - name: skills-pv
+          mountPath: /mnt/skills
+      containers:
+      - name: gateway
+        image: siclaw-gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: SICLAW_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SICLAW_AGENTBOX_IMAGE
+          value: "siclaw-agentbox:latest"
+        - name: SICLAW_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: jwt-secret
+        - name: SICLAW_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: database-url
+        - name: SICLAW_CRON_SERVICE_URL
+          value: "http://siclaw-cron.siclaw.svc.cluster.local"
+        - name: SICLAW_LLM_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: llm-api-key
+        - name: SICLAW_SSO_ISSUER
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-sso
+              key: sso-issuer
+        - name: SICLAW_SSO_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-sso
+              key: sso-client-id
+        - name: SICLAW_SSO_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-sso
+              key: sso-client-secret
+        - name: SICLAW_SSO_REDIRECT_URI
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-sso
+              key: sso-redirect-uri
+        - name: SICLAW_SKILLS_DIR
+          value: "/mnt/skills"
+        - name: SICLAW_S3_ENDPOINT
+          value: ""
+        - name: SICLAW_S3_BUCKET
+          value: ""
+        - name: SICLAW_S3_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: s3-access-key
+        - name: SICLAW_S3_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: s3-secret-key
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        volumeMounts:
+        - name: skills-pv
+          mountPath: /mnt/skills
+          readOnly: false
+      volumes:
+      - name: skills-pv
+        persistentVolumeClaim:
+          claimName: siclaw-skills
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+spec:
+  type: NodePort
+  selector:
+    app: siclaw-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    nodePort: 31000
+    protocol: TCP
+
+---
+# ServiceAccount for Gateway to manage AgentBox pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+
+---
+# Role for managing AgentBox pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "create"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: siclaw-gateway
+subjects:
+- kind: ServiceAccount
+  name: siclaw-gateway
+  namespace: siclaw
+

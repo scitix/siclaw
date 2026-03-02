@@ -1,0 +1,71 @@
+{
+  "name": "siclaw",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "siclaw-tui": "./siclaw-tui.mjs",
+    "siclaw-gateway": "./siclaw-gateway.mjs",
+    "siclaw-agentbox": "./siclaw-agentbox.mjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.58",
+    "@anthropic-ai/sdk": "^0.71.2",
+    "@kubernetes/client-node": "^1.4.0",
+    "@mariozechner/pi-coding-agent": "^0.55.1",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@sinclair/typebox": "^0.34.0",
+    "@types/js-yaml": "^4.0.9",
+    "clsx": "^2.1.1",
+    "diff": "^8.0.3",
+    "drizzle-orm": "^0.45.1",
+    "framer-motion": "^12.31.0",
+    "js-yaml": "^4.1.1",
+    "lucide-react": "^0.563.0",
+    "markdown-it": "^14.1.0",
+    "mysql2": "^3.16.3",
+    "react-router-dom": "^7.13.0",
+    "sql.js": "^1.12.0",
+    "tailwind-merge": "^3.4.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-s3": "^3.984.0",
+    "@larksuiteoapi/node-sdk": "^1.56.1",
+    "dingtalk-stream-sdk-nodejs": "^2.0.4",
+    "discord.js": "^14.16.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^22.19.8",
+    "@types/react-router-dom": "^5.3.3",
+    "@types/sql.js": "^1.4.9",
+    "@types/ws": "^8.5.0",
+    "autoprefixer": "^10.4.24",
+    "drizzle-kit": "^0.31.8",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.18",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:web": "cd src/gateway/web && npm install && npm run build",
+    "dev": "tsx src/cli-main.ts",
+    "dev:gateway": "npm run build:web && tsx src/gateway-main.ts",
+    "dev:agentbox": "tsx src/agentbox-main.ts",
+    "start": "node siclaw-tui.mjs",
+    "start:gateway": "node siclaw-gateway.mjs",
+    "start:agentbox": "node dist/agentbox-main.js",
+    "test": "vitest run",
+    "docker:build:gateway": "docker build -f Dockerfile.gateway -t siclaw-gateway:latest .",
+    "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw-agentbox:latest .",
+    "docker:push:gateway": "docker push siclaw-gateway:latest",
+    "docker:push:agentbox": "docker push siclaw-agentbox:latest"
+  }
+}
