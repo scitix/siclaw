@@ -1,7 +1,6 @@
 <div align="center">
 
-<!-- Logo placeholder — replace with actual logo -->
-<img src="docs/assets/logo-placeholder.png" alt="Siclaw Logo" width="200" height="200" onerror="this.style.display='none'" />
+<img src="docs/assets/logo.png" alt="Siclaw Logo" width="400" />
 
 # Siclaw
 
