@@ -16,7 +16,7 @@
 #   make status          — Show K8s deployment status
 #   make help            — Show all targets
 
-REGISTRY ?= ghcr.io/your-org/siclaw
+REGISTRY ?= registry-cn-shanghai.siflow.cn/k8s/siclaw
 NAMESPACE ?= siclaw
 TAG       ?= latest
 
