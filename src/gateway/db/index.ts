@@ -125,12 +125,26 @@ function acquireSqliteLock(
   } catch (err: any) {
     if (err.code !== "EEXIST") throw err;
     // Lock file exists — check if the holder is still alive
-    let holderPid: number;
+    let holderPid: number | undefined;
     try {
       holderPid = parseInt(readFileSync(lockPath, "utf8"), 10);
-      process.kill(holderPid, 0); // signal 0 = existence check
     } catch {
-      // Holder process is dead — reclaim stale lock
+      // Can't read lock file — reclaim it
+      writeFileSync(lockPath, String(process.pid));
+      return;
+    }
+    try {
+      process.kill(holderPid, 0); // signal 0 = existence check
+    } catch (killErr: any) {
+      // ESRCH = process does not exist → safe to reclaim
+      // EPERM = process exists but we lack permission → do NOT reclaim
+      if (killErr?.code === "EPERM") {
+        throw new Error(
+          `SQLite database locked by process ${holderPid} (still running, no permission to probe). ` +
+          `If the process is dead, remove: ${lockPath}`,
+        );
+      }
+      // Process is dead — reclaim stale lock
       writeFileSync(lockPath, String(process.pid));
       return;
     }

@@ -133,16 +133,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   };
 
   // Initialize database (defaults to SQLite if SICLAW_DATABASE_URL is not set)
-  let db: Database | null = null;
-  try {
-    db = await createDb();
-    await initSchema(db);
-    console.log("[gateway] Database initialized");
-  } catch (err) {
-    console.error("[gateway] Database init failed:", err);
-    console.warn("[gateway] Continuing without database");
-    db = null;
-  }
+  const db = await createDb();
+  await initSchema(db);
+  console.log("[gateway] Database initialized");
 
   // Config repo for webhook route
   const configRepo = db ? new ConfigRepository(db) : null;

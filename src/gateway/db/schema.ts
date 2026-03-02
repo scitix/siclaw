@@ -10,7 +10,7 @@
 
 import type * as MysqlSchema from "./schema-mysql.js";
 
-const _envUrl = process.env.SICLAW_DATABASE_URL || "";
+const _envUrl = process.env.SICLAW_DATABASE_URL || "sqlite:.siclaw/data.sqlite";
 
 export const schemaDialect: "mysql" | "sqlite" =
   _envUrl.startsWith("sqlite:") || _envUrl.startsWith("file:") ? "sqlite" : "mysql";
