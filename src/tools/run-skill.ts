@@ -124,6 +124,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
             ...process.env,
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+            KUBECONFIG: "/dev/null",
           },
         };
         const child = exec(command, execOpts as any);
