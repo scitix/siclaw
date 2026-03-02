@@ -107,6 +107,8 @@ export function ModelsPage() {
         try {
             await sendRpc('config.setDefaultModel', { provider: defaultProvider, modelId: defaultModelId });
             setSavedDefault({ provider: defaultProvider, modelId: defaultModelId });
+            // Notify Pilot to refresh model selection
+            try { new BroadcastChannel('siclaw-model-config').postMessage('default-changed'); } catch { /* ignore */ }
         } catch (err) {
             console.error('Failed to save default model:', err);
         } finally {
