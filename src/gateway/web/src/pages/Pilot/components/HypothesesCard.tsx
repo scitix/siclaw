@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Search, CheckCircle2, Send, X, MessageSquare, ChevronRight, Play } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Markdown } from '@/components/Markdown';
 import type { PilotMessage } from '@/hooks/usePilot';
 
 // --- Types ---
@@ -366,8 +367,8 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                         })}
                     </div>
                 ) : (
-                    <div className="mb-3">
-                        <p className="text-sm text-gray-600 whitespace-pre-wrap">{message.toolInput}</p>
+                    <div className="mb-3 text-sm text-gray-600">
+                        <Markdown>{hypothesesSource}</Markdown>
                     </div>
                 )}
 
