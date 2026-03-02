@@ -23,6 +23,26 @@ export interface PromptOptions {
   brainType?: string;
   /** Workspace ID (for logging/context) */
   workspaceId?: string;
+  /** Workspace-specific credentials directory (absolute path, from gateway sync) */
+  credentialsDir?: string;
+  /** Full provider config for dynamic registration (from gateway DB) */
+  modelConfig?: {
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    api: string;
+    authHeader: boolean;
+    models: Array<{
+      id: string;
+      name: string;
+      reasoning: boolean;
+      input: string[];
+      cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+      contextWindow: number;
+      maxTokens: number;
+      compat?: Record<string, unknown>;
+    }>;
+  };
 }
 
 export interface PromptResponse {

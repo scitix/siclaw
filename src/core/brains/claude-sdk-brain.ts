@@ -281,6 +281,10 @@ export class ClaudeSdkBrain implements BrainSession {
     };
   }
 
+  registerProvider(_name: string, _config: Record<string, unknown>): void {
+    // Claude SDK brain uses model ID directly, no registry needed
+  }
+
   // ---------- Private helpers ----------
 
   /**

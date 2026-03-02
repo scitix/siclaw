@@ -113,7 +113,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; modelConfig?: Record<string, unknown>; credentialsDir?: string };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -121,6 +121,33 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType);
+
+    // Update credentials directory from gateway (workspace-specific path)
+    if (body.credentialsDir) {
+      managed.kubeconfigRef.credentialsDir = body.credentialsDir;
+      console.log(`[agentbox-http] Updated credentialsDir for session ${managed.id}: ${body.credentialsDir}`);
+    }
+
+    // Dynamically register provider config from gateway DB (before findModel)
+    if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
+      try {
+        managed.brain.registerProvider(body.modelProvider, body.modelConfig);
+        console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
+        // Update LLM config ref so deep_search sub-agents follow the main model
+        const mc = body.modelConfig as Record<string, unknown>;
+        if (mc.baseUrl && mc.apiKey) {
+          managed.llmConfigRef.apiKey = mc.apiKey as string;
+          managed.llmConfigRef.baseUrl = mc.baseUrl as string;
+          // Use the specific modelId from the prompt if available
+          if (body.modelId) {
+            managed.llmConfigRef.model = body.modelId as string;
+          }
+          console.log(`[agentbox-http] Updated llmConfigRef: baseUrl=${(mc.baseUrl as string).slice(0, 40)}... model=${managed.llmConfigRef.model}`);
+        }
+      } catch (err) {
+        console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
+      }
+    }
 
     // Set model if specified in prompt request (ensures model is applied before first prompt)
     if (body.modelProvider && body.modelId) {

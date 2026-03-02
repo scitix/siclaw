@@ -92,4 +92,8 @@ export class PiAgentBrain implements BrainSession {
       reasoning: model.reasoning,
     };
   }
+
+  registerProvider(name: string, config: Record<string, unknown>): void {
+    this.session.modelRegistry.registerProvider(name, config as any);
+  }
 }
