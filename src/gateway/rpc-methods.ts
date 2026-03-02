@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { AgentBoxManager } from "./agentbox/manager.js";
-import { AgentBoxClient } from "./agentbox/client.js";
+import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
@@ -512,6 +512,19 @@ export function createRpcMethods(
         console.warn("[rpc] credential sync before chat failed:", err instanceof Error ? err.message : err));
     }
 
+    // Resolve full provider config from DB (so agentbox can register it dynamically)
+    let modelConfig: PromptOptions["modelConfig"];
+    if (modelProvider && modelConfigRepo) {
+      try {
+        const providerConfig = await modelConfigRepo.getProviderWithModels(modelProvider);
+        if (providerConfig) {
+          modelConfig = providerConfig;
+        }
+      } catch (err) {
+        console.warn(`[rpc] Failed to resolve provider config for "${modelProvider}":`, err instanceof Error ? err.message : err);
+      }
+    }
+
     // Get or create AgentBox (per workspace)
     const handle = await agentBoxManager.getOrCreate(userId, effectiveWorkspaceId, {
       workspaceId: effectiveWorkspaceId,
@@ -519,8 +532,13 @@ export function createRpcMethods(
     });
     const client = new AgentBoxClient(handle.endpoint);
 
+    // Compute workspace-specific credentials directory (for local/process spawners)
+    const credentialsDir = workspace
+      ? path.resolve(skillsDir, "user", userId, `.ws-${workspace.id}`, ".credentials")
+      : undefined;
+
     // Send prompt
-    const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType });
+    const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentialsDir });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
 
     // Cancel previous SSE subscription

@@ -155,6 +155,7 @@ Examples:
       const env = {
         ...process.env,
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+        KUBECONFIG: "/dev/null",
       };
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";

@@ -75,4 +75,7 @@ export interface BrainSession {
 
   /** Find a model by provider + id. Returns undefined if not found. */
   findModel(provider: string, modelId: string): BrainModelInfo | undefined;
+
+  /** Register a provider dynamically (from gateway DB config). */
+  registerProvider?(name: string, config: Record<string, unknown>): void;
 }

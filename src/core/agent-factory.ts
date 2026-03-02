@@ -54,6 +54,13 @@ export interface KubeconfigRef {
   credentialsDir?: string; // path to credentials directory (e.g. /home/agentbox/.credentials)
 }
 
+/** Mutable ref to LLM config for deep_search sub-agents (updated by gateway prompt handler) */
+export interface LlmConfigRef {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+}
+
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
@@ -71,6 +78,8 @@ export interface SiclawSessionResult {
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
   kubeconfigRef: KubeconfigRef;
+  /** Mutable ref to LLM config for deep_search sub-agents */
+  llmConfigRef: LlmConfigRef;
   /** Mutable skill dirs array — update contents + call session.reload() to switch */
   skillsDirs: string[];
   mode: SessionMode;
@@ -219,6 +228,7 @@ export async function createSiclawSession(
   const modelRegistry = new ModelRegistry(authStorage, modelsJson);
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
+  const llmConfigRef: LlmConfigRef = {};
 
   const mode = opts?.mode ?? "web";
   const tools = [readTool, editTool, writeTool, grepTool, findTool, lsTool];
@@ -233,7 +243,7 @@ export async function createSiclawSession(
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef),
     createManageScheduleTool(kubeconfigRef),
-    createDeepSearchTool(kubeconfigRef),
+    createDeepSearchTool(kubeconfigRef, llmConfigRef),
     createCredentialListTool(kubeconfigRef),
   ];
 
@@ -383,6 +393,7 @@ export async function createSiclawSession(
       session: null as any,  // No pi-agent session for SDK brain
       customTools: sdkTools,
       kubeconfigRef,
+      llmConfigRef,
       skillsDirs,
       mode,
       mcpManager,
@@ -424,5 +435,5 @@ export async function createSiclawSession(
   });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer };
 }

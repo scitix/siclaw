@@ -118,6 +118,7 @@ Examples:
       const childEnv = {
         ...process.env,
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+        KUBECONFIG: "/dev/null",
       };
       const podCheckErr = await checkPodRunning(pod, namespace, childEnv);
       if (podCheckErr) {

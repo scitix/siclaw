@@ -459,9 +459,9 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
           userResponse = "User confirmed. Please call deep_search to validate these hypotheses.";
         }
       } else {
-        // RPC / gateway mode — show hypotheses to user, wait for their confirmation
-        userResponse = "Hypotheses submitted for user review. Please wait for the user's confirmation before continuing — do not call deep_search on your own.";
-        deepSearchGate.blocked = true;
+        // RPC / gateway mode — show hypotheses to user, proceed automatically
+        userResponse = "Hypotheses submitted for user review. Please proceed to call deep_search to validate them.";
+        deepSearchGate.blocked = false;
       }
 
       return {

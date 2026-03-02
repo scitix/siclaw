@@ -317,6 +317,75 @@ export class ModelConfigRepository {
     };
   }
 
+  // ─── Full Provider Config (for AgentBox) ───────
+
+  async getProviderWithModels(providerName: string): Promise<{
+    name: string;
+    baseUrl: string;
+    apiKey: string;
+    api: string;
+    authHeader: boolean;
+    models: Array<{
+      id: string;
+      name: string;
+      reasoning: boolean;
+      input: string[];
+      cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+      contextWindow: number;
+      maxTokens: number;
+      compat: Record<string, unknown>;
+    }>;
+  } | null> {
+    const provRows = await this.db
+      .select({
+        id: modelProviders.id,
+        name: modelProviders.name,
+        baseUrl: modelProviders.baseUrl,
+        apiKey: modelProviders.apiKey,
+        api: modelProviders.api,
+        authHeader: modelProviders.authHeader,
+      })
+      .from(modelProviders)
+      .where(eq(modelProviders.name, providerName))
+      .limit(1);
+
+    if (provRows.length === 0) return null;
+    const prov = provRows[0];
+
+    const modelRows = await this.db
+      .select({
+        modelId: modelEntries.modelId,
+        name: modelEntries.name,
+        reasoning: modelEntries.reasoning,
+        inputJson: modelEntries.inputJson,
+        costJson: modelEntries.costJson,
+        contextWindow: modelEntries.contextWindow,
+        maxTokens: modelEntries.maxTokens,
+        compatJson: modelEntries.compatJson,
+      })
+      .from(modelEntries)
+      .where(eq(modelEntries.providerId, prov.id))
+      .orderBy(modelEntries.sortOrder);
+
+    return {
+      name: prov.name,
+      baseUrl: prov.baseUrl ?? "",
+      apiKey: prov.apiKey ?? "",
+      api: prov.api,
+      authHeader: prov.authHeader,
+      models: modelRows.map((m) => ({
+        id: m.modelId,
+        name: m.name,
+        reasoning: m.reasoning,
+        input: m.inputJson ?? ["text"],
+        cost: m.costJson ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: m.contextWindow,
+        maxTokens: m.maxTokens,
+        compat: (m.compatJson ?? {}) as Record<string, unknown>,
+      })),
+    };
+  }
+
   // ─── Embedding Config ──────────────────────────
 
   async getEmbeddingConfig(): Promise<{ provider: string; model: string; dimensions: number } | null> {

@@ -628,16 +628,15 @@ export function usePilot() {
             const result = await sendRpc<{ models: ModelInfo[]; default: { provider: string; modelId: string } | null }>('model.list');
             const list = result.models ?? [];
             setModels(list);
-            // Resolve default model from config
+            // Always sync to DB default model (so changes on Models page take effect immediately)
             if (list.length > 0) {
-                setSelectedModel(prev => {
-                    if (prev) return prev;
-                    if (result.default) {
-                        const match = list.find(m => m.provider === result.default!.provider && m.id === result.default!.modelId);
-                        if (match) return match;
-                    }
-                    return list[0];
-                });
+                if (result.default) {
+                    const match = list.find(m => m.provider === result.default!.provider && m.id === result.default!.modelId);
+                    if (match) setSelectedModel(match);
+                    else setSelectedModel(prev => prev ?? list[0]);
+                } else {
+                    setSelectedModel(prev => prev ?? list[0]);
+                }
             }
         } catch (err) {
             console.error('Failed to load models:', err);
@@ -1070,6 +1069,13 @@ export function usePilot() {
             }
         }
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Listen for model config changes from Models page (cross-tab/cross-component)
+    useEffect(() => {
+        const ch = new BroadcastChannel('siclaw-model-config');
+        ch.onmessage = () => { loadModelsRef.current(); };
+        return () => ch.close();
+    }, []);
 
     return {
         messages,

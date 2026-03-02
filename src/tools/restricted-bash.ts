@@ -427,6 +427,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             ...process.env,
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+            // Always block local ~/.kube/config — only UI-configured credentials are allowed
+            KUBECONFIG: "/dev/null",
           },
         };
         const child = exec(command, execOpts as any);
