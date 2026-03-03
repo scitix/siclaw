@@ -104,7 +104,7 @@ export type ProgressEvent =
  * - Skills auto-loaded but included via systemPrompt (not loader scanning)
  * - read + restricted bash + node_exec tools only
  */
-async function createSubAgentSession(systemPrompt: string, kubeconfigRef?: KubeconfigRef): Promise<AgentSession> {
+async function createSubAgentSession(systemPrompt: string, options?: SubAgentOptions): Promise<AgentSession> {
   const fullPrompt = systemPrompt + "\n\n" + getSkillsPrompt();
 
   const loader = new DefaultResourceLoader({
@@ -116,13 +116,37 @@ async function createSubAgentSession(systemPrompt: string, kubeconfigRef?: Kubec
   });
   await loader.reload();
 
+  const registry = getSharedModelRegistry();
+
+  // Register dynamic provider from main session's llmConfigRef (gateway mode).
+  // ModelRegistry is a singleton and registerProvider is idempotent (same name overwrites).
+  let dynamicModel: ReturnType<ModelRegistry["find"]>;
+  if (options?.baseUrl && options?.apiKey && options?.model) {
+    const providerName = "dp-dynamic";
+    registry.registerProvider(providerName, {
+      baseUrl: options.baseUrl,
+      apiKey: options.apiKey,
+      models: [{
+        id: options.model,
+        name: options.model,
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 131072,
+        maxTokens: 8192,
+      }],
+    });
+    dynamicModel = registry.find(providerName, options.model);
+  }
+
   const { session } = await createAgentSession({
+    model: dynamicModel ?? undefined,
     tools: [readTool],
-    customTools: [createRestrictedBashTool(kubeconfigRef), createNodeExecTool(kubeconfigRef)],
+    customTools: [createRestrictedBashTool(options?.kubeconfigRef), createNodeExecTool(options?.kubeconfigRef)],
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(),
     authStorage: getSharedAuth(),
-    modelRegistry: getSharedModelRegistry(),
+    modelRegistry: registry,
   });
 
   return session;
@@ -262,7 +286,7 @@ export async function runSubAgent(
   onProgress?: ProgressCallback,
   forceOutputPrompt?: string,
 ): Promise<SubAgentResult> {
-  const session = await createSubAgentSession(systemPrompt, options?.kubeconfigRef);
+  const session = await createSubAgentSession(systemPrompt, options);
   const evidence: Evidence[] = [];
   let callsUsed = 0;
   let budgetExhausted = false;
