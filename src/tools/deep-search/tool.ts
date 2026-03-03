@@ -165,10 +165,13 @@ Do triage first before calling this tool — confirm the problem exists and gath
     }),
     renderResult: renderDeepSearchResult,
     async execute(_toolCallId, rawParams) {
-      // Gate removed — let the model decide when to proceed with deep_search.
-      // The hypothesis review UI is informational; no hard block required.
+      // Hard gate: refuse to execute if hypotheses have not been confirmed by the user.
+      // This prevents the model from skipping hypothesis review (e.g. after user Modify feedback).
       if (deepSearchGate.blocked) {
-        deepSearchGate.blocked = false;
+        return {
+          content: [{ type: "text", text: "Cannot run deep_search: hypotheses have not been confirmed by the user. Call propose_hypotheses first and wait for user confirmation." }],
+          details: {},
+        };
       }
 
       const params = rawParams as DeepSearchParams;
