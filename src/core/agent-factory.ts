@@ -227,7 +227,9 @@ This is a new user (no PROFILE.md found). In your first interaction:
 1. Introduce yourself warmly as Siclaw, a personal SRE assistant that learns and remembers.
 2. Briefly mention your key capabilities: skill-based diagnostics, deep investigation, persistent memory, scheduled automation.
 3. Through natural conversation, learn about the user: their name, role, what infrastructure they manage.
-4. When you have enough context (at minimum: name + role), save a profile to \`${memoryDir}/PROFILE.md\` using the write tool:
+
+**CRITICAL — You MUST write PROFILE.md:**
+After the user's FIRST reply that contains ANY identifying info (name, role, team, or what they work on), you MUST immediately use the write tool to create \`${memoryDir}/PROFILE.md\`. Do NOT wait for multiple exchanges. Do NOT skip this step. Fill in what you know and leave unknowns as "TBD".
 
 \`\`\`markdown
 # User Profile
@@ -237,7 +239,7 @@ This is a new user (no PROFILE.md found). In your first interaction:
 - **Preferences**: ...
 \`\`\`
 
-Keep it to 2-3 exchanges max. If the user wants to skip and work directly, respect that — learn organically over time.`);
+This file controls whether the onboarding flow is shown. If you do not write it, the user will be stuck in the onboarding loop forever.`);
   }
 
   const memoryFile = path.join(memoryDir, "MEMORY.md");

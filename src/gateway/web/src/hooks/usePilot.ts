@@ -961,7 +961,8 @@ export function usePilot() {
         setSessionBrainType(null); // unlock brain selector for new session
         clearDpTimers();
         resetDpState();
-    }, [models, defaultModelRef]);
+        loadSystemStatus();
+    }, [models, defaultModelRef, loadSystemStatus]);
 
     const deleteSession = useCallback(async (sessionKey: string) => {
         if (!isConnected) return;
