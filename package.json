@@ -36,8 +36,11 @@
   "optionalDependencies": {
     "@aws-sdk/client-s3": "^3.984.0",
     "@larksuiteoapi/node-sdk": "^1.56.1",
+    "@slack/bolt": "^4.6.0",
+    "@slack/web-api": "^7.14.1",
     "dingtalk-stream-sdk-nodejs": "^2.0.4",
-    "discord.js": "^14.16.0"
+    "discord.js": "^14.16.0",
+    "grammy": "^1.41.1"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",

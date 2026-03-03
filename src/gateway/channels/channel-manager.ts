@@ -12,6 +12,8 @@ import type { UserStore } from "../auth/user-store.js";
 import type { BindCodeStore } from "../auth/bind-code-store.js";
 import { createLarkChannel } from "./lark.js";
 import { createDiscordChannel } from "./discord.js";
+import { createSlackChannel } from "./slack.js";
+import { createTelegramChannel } from "./telegram.js";
 
 export interface ChannelDeps {
   userStore: UserStore;
@@ -27,6 +29,8 @@ type ChannelFactory = (
 const FACTORIES: Record<string, ChannelFactory> = {
   lark: createLarkChannel,
   discord: createDiscordChannel,
+  slack: createSlackChannel,
+  telegram: createTelegramChannel,
 };
 
 export class ChannelManager {
