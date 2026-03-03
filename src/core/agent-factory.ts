@@ -136,18 +136,23 @@ function buildAppendSystemPrompt(
   const parts: string[] = [];
 
   const skillSearchDirs: string[] = [];
+  const platformDirs = new Set<string>();
   const activeDir = path.join(skillsBase, "user", getUserSkillDirName());
   if (fs.existsSync(activeDir)) {
     skillSearchDirs.push(activeDir);
     const sysDir = path.join(skillsBase, "user", getPlatformSkillDirName());
     if (fs.existsSync(sysDir)) {
       skillSearchDirs.push(sysDir);
+      platformDirs.add(sysDir);
     }
   } else {
     const SKILL_SCOPES = ["core", "team", "extension", "user", "platform"];
     for (const scope of SKILL_SCOPES) {
       const scopeDir = path.join(skillsBase, scope);
-      if (fs.existsSync(scopeDir)) skillSearchDirs.push(scopeDir);
+      if (fs.existsSync(scopeDir)) {
+        skillSearchDirs.push(scopeDir);
+        if (scope === "platform") platformDirs.add(scopeDir);
+      }
     }
   }
 
@@ -156,6 +161,7 @@ function buildAppendSystemPrompt(
   const seenSkills = new Set<string>();
 
   for (const searchDir of skillSearchDirs) {
+    const isPlatformDir = platformDirs.has(searchDir);
     try {
       const entries = fs.readdirSync(searchDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -163,6 +169,9 @@ function buildAppendSystemPrompt(
         if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
         if (seenSkills.has(entry.name)) continue;
         seenSkills.add(entry.name);
+        // Platform skills are internal (create-skill, update-skill, manage-skill) —
+        // they're loaded by pi-agent but should not appear in the user-facing skill listing.
+        if (isPlatformDir) continue;
         const skillName = entry.name;
         const sDir = path.join(searchDir, skillName, "scripts");
         let scripts: string[] = [];

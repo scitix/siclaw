@@ -6,7 +6,9 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
-import { loadConfig } from "./core/config.js";
+import { loadConfig, getDefaultLlm } from "./core/config.js";
+import { needsSetup, runInteractiveSetup } from "./cli-setup.js";
+import type { BrainType } from "./core/brain-session.js";
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -14,6 +16,21 @@ const promptIndex = args.indexOf("--prompt");
 const initialMessage = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
 const isPrintMode = args.includes("--print") || !!initialMessage;
 const continueSession = args.includes("--continue");
+const forceSetup = args.includes("--setup");
+const brainIndex = args.indexOf("--brain");
+const brainArg = brainIndex >= 0 ? args[brainIndex + 1] : undefined;
+const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk" : undefined;
+
+// P0: Interactive setup — runs before anything else
+if (forceSetup || needsSetup()) {
+  await runInteractiveSetup();
+  // Re-check after setup — user may have aborted
+  if (needsSetup()) {
+    console.log("No provider configured. Run again or edit .siclaw/config/settings.json manually.");
+    process.exit(1);
+  }
+}
+
 const debugMode = args.includes("--debug") || loadConfig().debug;
 
 // Session
@@ -22,8 +39,34 @@ const sessionManager = continueSession
   : SessionManager.create(process.cwd());
 
 // Create session via shared factory
-const { brain, session, modelFallbackMessage, customTools } =
-  await createSiclawSession({ sessionManager });
+const { brain, session, modelFallbackMessage, customTools, skillsDirs } =
+  await createSiclawSession({ sessionManager, mode: "cli", brainType });
+
+// P1-1: Startup status summary
+{
+  const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "package.json"), "utf-8"));
+  const llm = getDefaultLlm();
+  const providerEntries = Object.entries(loadConfig().providers);
+  const providerName = providerEntries.length > 0 ? providerEntries[0][0] : "none";
+  const modelName = llm ? (llm.model.name || llm.model.id) : "none";
+  // Count skills across all skill dirs
+  let skillCount = 0;
+  for (const dir of skillsDirs) {
+    try {
+      skillCount += fs.readdirSync(dir, { withFileTypes: true })
+        .filter((e) => (e.isDirectory() || e.isSymbolicLink()) && !e.name.startsWith("_")).length;
+    } catch { /* skip */ }
+  }
+  const memoryActive = fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
+  const parts = [
+    `Siclaw v${pkg.version}`,
+    `Model: ${modelName} (${providerName})`,
+    `Skills: ${skillCount}`,
+    memoryActive ? "Memory: active" : "Memory: off",
+  ];
+  if (brainType) parts.push(`Brain: ${brainType}`);
+  console.log(parts.join(" | "));
+}
 
 // Debug: subscribe to all session events and write to log file
 if (debugMode) {

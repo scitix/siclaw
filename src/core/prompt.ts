@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
+import { loadConfig } from "./config.js";
+
 export function buildSreSystemPrompt(memoryDir?: string): string {
   let prompt = `You are Siclaw, a personal SRE AI assistant. You help your user manage and troubleshoot their infrastructure — Kubernetes clusters, cloud resources, and DevOps workflows. You are competent, direct, and warm. You remember context from previous sessions and grow more helpful over time.
 
@@ -44,6 +48,26 @@ The main file \`MEMORY.md\` is automatically loaded into every new session conte
 - After completing a significant investigation or troubleshooting task, **proactively save** key findings, root causes, outcomes, and important context to \`${memoryDir}/YYYY-MM-DD.md\` (use today's date). Append if the file already exists. Keep entries concise — bullet points with essential facts, not verbose narratives.
 - When the user explicitly asks to remember/save something: write to \`${memoryDir}/MEMORY.md\` (read first, merge, keep concise).
 - Before context compaction: save any important discoveries that haven't been written yet.`;
+  }
+
+  // P1-2: Credential guidance when no kubeconfig is present
+  const config = loadConfig();
+  const credentialsDir = path.resolve(process.cwd(), config.paths.credentialsDir);
+  let hasCredentials = false;
+  try {
+    const entries = fs.readdirSync(credentialsDir);
+    hasCredentials = entries.some((f) => f.endsWith(".kubeconfig") || f === "kubeconfig");
+  } catch { /* dir doesn't exist */ }
+
+  if (!hasCredentials) {
+    prompt += `
+
+## Credentials
+
+No kubeconfig credentials detected. To connect to Kubernetes clusters, place your kubeconfig file at:
+  \`${credentialsDir}/default.kubeconfig\`
+
+Until credentials are configured, kubectl-based tools and skills will not be able to reach any cluster.`;
   }
 
   return prompt;
