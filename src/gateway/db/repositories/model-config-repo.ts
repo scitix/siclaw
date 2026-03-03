@@ -3,12 +3,31 @@
  */
 
 import crypto from "node:crypto";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, notInArray } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { modelProviders, modelEntries, embeddingConfig } from "../schema.js";
 
 export class ModelConfigRepository {
   constructor(private db: Database) {}
+
+  /**
+   * Remove orphan model entries whose provider_id no longer exists.
+   * Called once at startup to keep the DB clean.
+   */
+  async cleanOrphanModels() {
+    const providerIds = this.db
+      .select({ id: modelProviders.id })
+      .from(modelProviders);
+
+    const result = await this.db
+      .delete(modelEntries)
+      .where(notInArray(modelEntries.providerId, providerIds));
+
+    const deleted = (result as any)?.rowsAffected ?? (result as any)?.changes ?? 0;
+    if (deleted > 0) {
+      console.log(`[model-config] Cleaned ${deleted} orphan model entries`);
+    }
+  }
 
   // ─── Providers ─────────────────────────────────
 

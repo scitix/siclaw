@@ -138,9 +138,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   // Config repo for webhook route
   const configRepo = db ? new ConfigRepository(db) : null;
 
-  // Inject LLM/Embedding provider config from DB into new AgentBox pods
+  // Clean orphan model entries on startup, then set up env resolver
   if (db) {
     const modelConfigRepo = new ModelConfigRepository(db);
+    await modelConfigRepo.cleanOrphanModels();
     agentBoxManager.setEnvResolver(async () => {
       const env: Record<string, string> = {};
 
