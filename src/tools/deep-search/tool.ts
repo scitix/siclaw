@@ -197,6 +197,7 @@ Do triage first before calling this tool — confirm the problem exists and gath
           apiKey: llmConfigRef?.apiKey,
           baseUrl: llmConfigRef?.baseUrl,
           model: llmConfigRef?.model,
+          api: llmConfigRef?.api,
           onProgress: (event) => deepSearchEvents.emit("progress", event),
         });
         const report = formatResult(result);

@@ -59,6 +59,7 @@ export interface LlmConfigRef {
   apiKey?: string;
   baseUrl?: string;
   model?: string;
+  api?: string;
 }
 
 export interface CreateSiclawSessionOpts {

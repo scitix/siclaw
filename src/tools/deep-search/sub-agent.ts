@@ -81,6 +81,7 @@ export interface SubAgentOptions {
   model?: string;
   apiKey?: string;
   baseUrl?: string;
+  api?: string;
   kubeconfigRef?: KubeconfigRef;
 }
 
@@ -126,6 +127,7 @@ async function createSubAgentSession(systemPrompt: string, options?: SubAgentOpt
     registry.registerProvider(providerName, {
       baseUrl: options.baseUrl,
       apiKey: options.apiKey,
+      api: options.api ?? "openai-completions",
       models: [{
         id: options.model,
         name: options.model,

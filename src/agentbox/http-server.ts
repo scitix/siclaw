@@ -152,6 +152,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         if (mc.baseUrl && mc.apiKey) {
           managed.llmConfigRef.apiKey = mc.apiKey as string;
           managed.llmConfigRef.baseUrl = mc.baseUrl as string;
+          if (mc.api) {
+            managed.llmConfigRef.api = mc.api as string;
+          }
           // Use the specific modelId from the prompt if available
           if (body.modelId) {
             managed.llmConfigRef.model = body.modelId as string;
