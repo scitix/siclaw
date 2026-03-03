@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 
 export function initMemoryDb(dbPath: string): DatabaseSync {
-  const db = new DatabaseSync(dbPath);
+  // allowExtension enables loading native extensions like sqlite-vec
+  const db = new DatabaseSync(dbPath, { allowExtension: true } as Record<string, unknown>);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
 
@@ -27,6 +28,14 @@ export function initMemoryDb(dbPath: string): DatabaseSync {
       UNIQUE(file_path, heading, content)
     );
 
+    CREATE TABLE IF NOT EXISTS embedding_cache (
+      content_hash TEXT NOT NULL,
+      model        TEXT NOT NULL,
+      embedding    BLOB NOT NULL,
+      updated_at   INTEGER NOT NULL,
+      PRIMARY KEY (content_hash, model)
+    );
+
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
       content, heading,
       content='chunks',
@@ -48,10 +57,16 @@ export function initMemoryDb(dbPath: string): DatabaseSync {
     END;
   `);
 
-  // Migration: add model column to existing chunks tables that lack it
+  // Migrations
   const cols = db.prepare("PRAGMA table_info(chunks)").all() as Array<{ name: string }>;
   if (!cols.some((c) => c.name === "model")) {
     db.exec("ALTER TABLE chunks ADD COLUMN model TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "start_line")) {
+    db.exec("ALTER TABLE chunks ADD COLUMN start_line INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!cols.some((c) => c.name === "end_line")) {
+    db.exec("ALTER TABLE chunks ADD COLUMN end_line INTEGER NOT NULL DEFAULT 0");
   }
 
   return db;

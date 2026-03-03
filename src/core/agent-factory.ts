@@ -70,6 +70,12 @@ export interface CreateSiclawSessionOpts {
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for workspace customization */
   systemPromptAppend?: string;
+  /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
+  memoryIndexer?: MemoryIndexer;
+  /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
+  mcpManager?: McpClientManager;
+  /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
+  mcpTools?: ToolDefinition[];
 }
 
 export interface SiclawSessionResult {
@@ -253,13 +259,17 @@ export async function createSiclawSession(
   }
   // -- MCP external tools --
   const cwd = process.cwd();
-  let mcpManager: McpClientManager | undefined;
-  console.log(`[agent-factory] Loading MCP config (cwd=${cwd})...`);
-  const mcpConfig = loadMcpServersConfig(cwd);
-  if (mcpConfig) {
-    const serverNames = Object.keys(mcpConfig.mcpServers);
-    console.log(`[agent-factory] MCP config loaded: ${serverNames.length} servers [${serverNames.join(", ")}]`);
-    mcpManager = new McpClientManager(mcpConfig);
+  let mcpManager: McpClientManager | undefined = opts?.mcpManager;
+  const mcpServers = config.mcpServers;
+  if (mcpManager) {
+    // Shared MCP manager provided — reuse its tools
+    const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
+    if (sharedTools.length > 0) {
+      customTools.push(...sharedTools);
+      console.log(`[agent-factory] Reusing ${sharedTools.length} shared MCP tools`);
+    }
+  } else if (mcpServers && Object.keys(mcpServers).length > 0) {
+    mcpManager = new McpClientManager({ mcpServers } as any);
     try {
       await mcpManager.initialize();
       const mcpTools = mcpManager.getTools();
@@ -410,19 +420,28 @@ export async function createSiclawSession(
   // -- Pi-agent brain path (default) --
 
   // Initialize memory indexer for pi-agent (hybrid search over memory/*.md)
-  let memoryIndexer: MemoryIndexer | undefined;
+  let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
   try {
     if (!fs.existsSync(memoryDir)) {
       fs.mkdirSync(memoryDir, { recursive: true });
     }
-    // Get embedding config from settings.json
-    const embeddingOpts = resolveEmbeddingConfig();
-    memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
-    memoryIndexerRef.current = memoryIndexer;
-    await memoryIndexer.sync();
-    customTools.push(createMemorySearchTool(memoryIndexer));
-    customTools.push(createMemoryGetTool(memoryDir));
-    console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
+    if (memoryIndexer) {
+      // Shared indexer provided — reuse it, don't startWatching (caller manages lifecycle)
+      memoryIndexerRef.current = memoryIndexer;
+      customTools.push(createMemorySearchTool(memoryIndexer));
+      customTools.push(createMemoryGetTool(memoryDir));
+      console.log(`[agent-factory] Reusing shared memory indexer for ${memoryDir}`);
+    } else {
+      // Create per-session indexer (CLI mode)
+      const embeddingOpts = resolveEmbeddingConfig();
+      memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+      memoryIndexerRef.current = memoryIndexer;
+      await memoryIndexer.sync();
+      memoryIndexer.startWatching();
+      customTools.push(createMemorySearchTool(memoryIndexer));
+      customTools.push(createMemoryGetTool(memoryDir));
+      console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
+    }
   } catch (err) {
     console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
   }

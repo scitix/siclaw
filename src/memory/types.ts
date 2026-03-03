@@ -2,6 +2,8 @@ export interface MemoryChunk {
   file: string;       // relative path within memory dir
   heading: string;    // markdown heading context (breadcrumb)
   content: string;    // chunk text
+  startLine: number;  // 1-indexed start line in source file
+  endLine: number;    // 1-indexed end line (inclusive)
   score?: number;     // search relevance score
 }
 

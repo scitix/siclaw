@@ -4,19 +4,24 @@
  * Manages multiple sessions within a single AgentBox (a user may have multiple conversations).
  * Reuses createSiclawSession() to create Agents.
  * Supports session persistence via User PV.
+ *
+ * Shared components (memory indexer, MCP) are held at the AgentBox level and reused
+ * across sessions. Sessions are released after each prompt completes (request-level
+ * lifecycle) and restored from JSONL on the next prompt.
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession, type KubeconfigRef, type LlmConfigRef, type SessionMode } from "../core/agent-factory.js";
 import type { BrainSession, BrainType } from "../core/brain-session.js";
-import type { McpClientManager } from "../core/mcp-client.js";
-import type { MemoryIndexer } from "../memory/index.js";
+import { McpClientManager } from "../core/mcp-client.js";
+import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
+import { saveSessionMemory } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { S3Storage } from "../lib/s3-storage.js";
-import { loadConfig } from "../core/config.js";
+import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 
 export interface ManagedSession {
   id: string;
@@ -50,18 +55,32 @@ export interface ManagedSession {
   mode: SessionMode;
   /** Brain type used by this session */
   brainType: BrainType;
-  /** MCP client manager — shutdown on session close */
+  /** MCP client manager — now shared at AgentBox level, NOT per-session */
   mcpManager?: McpClientManager;
-  /** Memory indexer for this session (if available) */
+  /** Memory indexer — now shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
+  _lastSavedMessageCount: number;
+  /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
+  _releaseTimer: ReturnType<typeof setTimeout> | null;
 }
+
+/** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
+const SESSION_RELEASE_TTL_MS = 30_000;
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private defaultSessionId = "default";
   private s3: S3Storage | null;
+
+  // ── Shared components (AgentBox-level, outlive individual sessions) ──
+  private _sharedMemoryIndexer: MemoryIndexer | null = null;
+  private _sharedMcpManager: McpClientManager | null = null;
+  private _sharedMcpTools: ToolDefinition[] = [];
+  /** Whether shared components have been initialized */
+  private _sharedInitialized = false;
 
   constructor() {
     this.s3 = S3Storage.fromEnv();
@@ -92,9 +111,63 @@ export class AgentBoxSessionManager {
   }
 
   /**
+   * Get the memory directory path.
+   */
+  private getMemoryDir(): string {
+    const config = loadConfig();
+    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
+    return path.join(userDataDir, "memory");
+  }
+
+  /**
+   * Lazily initialize shared components (memory indexer, MCP manager).
+   * Called on first getOrCreate(). Idempotent.
+   */
+  private async ensureSharedComponents(): Promise<void> {
+    if (this._sharedInitialized) return;
+    this._sharedInitialized = true;
+
+    const config = loadConfig();
+    const memoryDir = this.getMemoryDir();
+
+    // ── Memory indexer ──
+    try {
+      if (!fs.existsSync(memoryDir)) {
+        fs.mkdirSync(memoryDir, { recursive: true });
+      }
+      const embeddingOpts = getEmbeddingConfig() ?? undefined;
+      this._sharedMemoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+      await this._sharedMemoryIndexer.sync();
+      this._sharedMemoryIndexer.startWatching();
+      console.log(`[agentbox-session] Shared memory indexer initialized for ${memoryDir}`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Shared memory indexer init failed:`, err);
+      this._sharedMemoryIndexer = null;
+    }
+
+    // ── MCP client manager ──
+    const mcpServers = config.mcpServers;
+    if (mcpServers && Object.keys(mcpServers).length > 0) {
+      try {
+        this._sharedMcpManager = new McpClientManager({ mcpServers } as any);
+        await this._sharedMcpManager.initialize();
+        this._sharedMcpTools = this._sharedMcpManager.getTools();
+        console.log(`[agentbox-session] Shared MCP manager initialized (${this._sharedMcpTools.length} tools)`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared MCP init failed:`, err);
+        this._sharedMcpManager = null;
+        this._sharedMcpTools = [];
+      }
+    }
+  }
+
+  /**
    * Get or create a session.
    * Each gateway sessionId maps to its own pi-coding-agent session directory,
    * so pod restarts correctly restore the matching conversation context.
+   *
+   * After Phase 2, sessions are released after each prompt completes.
+   * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
   async getOrCreate(sessionId?: string, mode?: SessionMode, brainType?: BrainType): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
@@ -102,16 +175,23 @@ export class AgentBoxSessionManager {
     let managed = this.sessions.get(id);
     if (managed) {
       managed.lastActiveAt = new Date();
+      // Cancel pending release — session is being reused
+      if (managed._releaseTimer) {
+        clearTimeout(managed._releaseTimer);
+        managed._releaseTimer = null;
+        console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
+      }
       return managed;
     }
+
+    // Ensure shared components are ready
+    await this.ensureSharedComponents();
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
 
     // Ensure memory directory exists
-    const config = loadConfig();
-    const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
-    const memoryDir = path.join(userDataDir, "memory");
+    const memoryDir = this.getMemoryDir();
     if (!fs.existsSync(memoryDir)) {
       fs.mkdirSync(memoryDir, { recursive: true });
     }
@@ -122,6 +202,7 @@ export class AgentBoxSessionManager {
     const isNewSession = !restored;
     const frameworkSessionManager = restored ?? SessionManager.create(sessionDir);
 
+    const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: path.resolve(process.cwd(), config.paths.credentialsDir),
     };
@@ -132,11 +213,15 @@ export class AgentBoxSessionManager {
       kubeconfigRef,
       mode: effectiveMode,
       brainType: effectiveBrainType,
+      // Pass shared components so createSiclawSession reuses them
+      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      mcpManager: this._sharedMcpManager ?? undefined,
+      mcpTools: this._sharedMcpTools.length > 0 ? this._sharedMcpTools : undefined,
     });
 
     // New session: re-sync memory index to pick up files from previous sessions
-    if (isNewSession && result.memoryIndexer) {
-      result.memoryIndexer.sync().catch((err) => {
+    if (isNewSession && this._sharedMemoryIndexer) {
+      this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on new session failed:`, err);
       });
     }
@@ -160,9 +245,12 @@ export class AgentBoxSessionManager {
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
       brainType: effectiveBrainType,
+      // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
       dpState: result.dpState,
+      _lastSavedMessageCount: 0,
+      _releaseTimer: null,
     };
 
     // Track agent lifecycle state + debug logging (works with both brain types)
@@ -257,25 +345,129 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Close the specified session.
+   * Schedule a delayed release for a session.
+   * The release happens after SESSION_RELEASE_TTL_MS of idle time.
+   * If a new prompt arrives before the TTL expires, getOrCreate() cancels the timer.
+   */
+  scheduleRelease(sessionId: string): void {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+
+    // Clear any existing timer
+    if (managed._releaseTimer) {
+      clearTimeout(managed._releaseTimer);
+    }
+
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${SESSION_RELEASE_TTL_MS / 1000}s`);
+    managed._releaseTimer = setTimeout(() => {
+      managed._releaseTimer = null;
+      this.release(sessionId).catch((err) => {
+        console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
+      });
+    }, SESSION_RELEASE_TTL_MS);
+  }
+
+  /**
+   * Release a session after prompt completion.
+   *
+   * Performs memory auto-save (if new messages since last save), syncs the
+   * shared memory index, then removes the session from the in-memory map.
+   * Shared components (memory indexer, MCP) are NOT destroyed.
+   *
+   * The session can be transparently restored from JSONL on the next getOrCreate().
+   */
+  async release(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+
+    console.log(`[agentbox-session] Releasing session: ${sessionId}`);
+
+    // 1. Auto-save session memory (dedup: only if new messages since last save)
+    try {
+      const sessionDir = this.getSessionDir(sessionId);
+      const memoryDir = this.getMemoryDir();
+      const currentMessageCount = this.countJsonlMessages(sessionDir);
+
+      if (currentMessageCount > managed._lastSavedMessageCount) {
+        const saved = await saveSessionMemory({ sessionDir, memoryDir });
+        if (saved) {
+          managed._lastSavedMessageCount = currentMessageCount;
+          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved}`);
+        }
+      } else {
+        console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
+      }
+    } catch (err) {
+      console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
+    }
+
+    // 2. Sync shared memory index to pick up the new summary file
+    if (this._sharedMemoryIndexer) {
+      await this._sharedMemoryIndexer.sync().catch((err) => {
+        console.warn(`[agentbox-session] Memory sync on release failed:`, err);
+      });
+    }
+
+    // 3. Remove session from map (shared components remain alive).
+    // Guard: only delete if the map still holds the same instance — a new
+    // getOrCreate() may have replaced it while release() was running async.
+    if (this.sessions.get(sessionId) === managed) {
+      this.sessions.delete(sessionId);
+      console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
+    } else {
+      console.log(`[agentbox-session] Session ${sessionId} was replaced during release, skipping delete`);
+    }
+  }
+
+  /**
+   * Count message entries in the latest JSONL file for dedup tracking.
+   */
+  private countJsonlMessages(sessionDir: string): number {
+    try {
+      const files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
+      if (files.length === 0) return 0;
+
+      // Find the most recent file
+      files.sort((a, b) => {
+        const aTime = fs.statSync(path.join(sessionDir, a)).mtimeMs;
+        const bTime = fs.statSync(path.join(sessionDir, b)).mtimeMs;
+        return bTime - aTime;
+      });
+
+      const content = fs.readFileSync(path.join(sessionDir, files[0]), "utf-8");
+      let count = 0;
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line);
+          if (entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant")) {
+            count++;
+          }
+        } catch { /* skip malformed */ }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Close the specified session (explicit user action, e.g. /new or /reset).
+   * Unlike release(), this is for permanent closure — but shared components
+   * are still NOT destroyed (they belong to the AgentBox).
    */
   async close(sessionId: string): Promise<void> {
     const managed = this.sessions.get(sessionId);
     if (managed) {
       console.log(`[agentbox-session] Closing session: ${sessionId}`);
-      // Shutdown MCP connections if any
-      if (managed.mcpManager) {
-        try {
-          await managed.mcpManager.shutdown();
-        } catch (err) {
-          console.warn(`[agentbox-session] MCP shutdown error for ${sessionId}:`, err);
-        }
+      if (managed._releaseTimer) {
+        clearTimeout(managed._releaseTimer);
+        managed._releaseTimer = null;
       }
-      // Sync memory index before closing to persist any writes from this session
-      if (managed.memoryIndexer) {
+      // Sync shared memory index (don't close it — it's shared)
+      if (this._sharedMemoryIndexer) {
         try {
-          await managed.memoryIndexer.sync();
-          managed.memoryIndexer.close();
+          await this._sharedMemoryIndexer.sync();
         } catch (err) {
           console.warn(`[agentbox-session] Memory sync on close failed:`, err);
         }
@@ -285,12 +477,44 @@ export class AgentBoxSessionManager {
   }
 
   /**
-   * Close all sessions.
+   * Close all sessions and destroy shared components.
+   * Called on AgentBox shutdown.
    */
   async closeAll(): Promise<void> {
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
-    for (const sessionId of this.sessions.keys()) {
-      await this.close(sessionId);
+    // Cancel all pending release timers, then clear
+    for (const managed of this.sessions.values()) {
+      if (managed._releaseTimer) {
+        clearTimeout(managed._releaseTimer);
+        managed._releaseTimer = null;
+      }
     }
+    this.sessions.clear();
+
+    // Shutdown shared MCP connections
+    if (this._sharedMcpManager) {
+      try {
+        await this._sharedMcpManager.shutdown();
+        console.log(`[agentbox-session] Shared MCP manager shut down`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared MCP shutdown error:`, err);
+      }
+      this._sharedMcpManager = null;
+      this._sharedMcpTools = [];
+    }
+
+    // Close shared memory indexer
+    if (this._sharedMemoryIndexer) {
+      try {
+        await this._sharedMemoryIndexer.sync();
+        this._sharedMemoryIndexer.close();
+        console.log(`[agentbox-session] Shared memory indexer closed`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Shared memory indexer close error:`, err);
+      }
+      this._sharedMemoryIndexer = null;
+    }
+
+    this._sharedInitialized = false;
   }
 }

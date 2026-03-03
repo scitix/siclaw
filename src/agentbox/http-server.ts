@@ -253,6 +253,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         cb();
       }
       managed._promptDoneCallbacks.clear();
+
+      // Schedule delayed release — gives frontend time to query context/model
+      // after SSE closes. If a new prompt arrives before the TTL, the timer is
+      // cancelled in getOrCreate() and the session stays alive.
+      sessionManager.scheduleRelease(managed.id);
     };
     const onPromptFinish = () => {
       // If the agent is still active, auto-compaction is in progress, or an

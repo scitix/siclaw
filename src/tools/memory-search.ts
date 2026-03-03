@@ -76,6 +76,9 @@ Returns matching memory chunks with file path, heading context, content snippet,
         const formatted = result.chunks.map((c, i) => ({
           rank: i + 1,
           file: c.file,
+          citation: c.startLine > 0
+            ? (c.startLine === c.endLine ? `${c.file}#L${c.startLine}` : `${c.file}#L${c.startLine}-L${c.endLine}`)
+            : c.file,
           heading: c.heading,
           score: Math.round((c.score ?? 0) * 1000) / 1000,
           content: truncateUtf16Safe(c.content, 500),
