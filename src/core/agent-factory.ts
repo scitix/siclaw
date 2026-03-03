@@ -240,8 +240,8 @@ function buildAppendSystemPrompt(
       const langMatch = profileContent.match(/\*\*Language\*\*:\s*(.+)/i);
       if (langMatch) {
         const lang = langMatch[1].trim();
-        if (lang && lang.toLowerCase() !== "tbd") {
-          parts.push(`\n## Language Override\n\nThis user's preferred language is **${lang}**. You MUST respond in ${lang} by default, even if the conversation has no prior messages. Only switch language if the user explicitly writes in a different language.`);
+        if (lang && lang.toLowerCase() !== "tbd" && lang.toLowerCase() !== "english") {
+          parts.push(`\n## Language Preference\n\nThis user's preferred language is **${lang}**. Start conversations in ${lang} by default. If the user switches to a different language, follow their lead naturally.`);
         }
       }
     }
@@ -263,7 +263,7 @@ After the user's FIRST reply that contains ANY identifying info (name, role, tea
 - **Role**: ...
 - **Infrastructure**: ...
 - **Preferences**: ...
-- **Language**: ... (the language the user communicates in)
+- **Language**: ... (the language the user communicates in, default to "English" if unclear)
 \`\`\`
 
 This file controls whether the onboarding flow is shown. If you do not write it, the user will be stuck in the onboarding loop forever.`);
