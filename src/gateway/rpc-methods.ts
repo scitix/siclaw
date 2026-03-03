@@ -59,8 +59,7 @@ export function createRpcMethods(
   activePromptUsers?: Set<string>,
 ): {
   methods: Map<string, RpcHandler>;
-  syncCredentialsForUser: (userId: string) => Promise<void>;
-  syncWorkspaceCredentials: (userId: string, workspaceId: string, isDefault: boolean) => Promise<void>;
+  buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
 } {
   const methods = new Map<string, RpcHandler>();
 
@@ -509,11 +508,13 @@ export function createRpcMethods(
       if (wsTools.length > 0) allowedTools = wsTools;
     }
 
-    // Sync credentials to PVC before AgentBox starts (ensures mount has data)
-    if (workspace) {
-      await syncWorkspaceCredentials(userId, workspace.id, workspace.isDefault).catch((err) =>
-        console.warn("[rpc] credential sync before chat failed:", err instanceof Error ? err.message : err));
-    }
+    // Build credential payload to send in prompt body (agentbox materializes locally)
+    const credentials = workspace
+      ? await buildCredentialPayload(userId, workspace.id, workspace.isDefault).catch((err) => {
+          console.warn("[rpc] credential payload build failed:", err instanceof Error ? err.message : err);
+          return undefined;
+        })
+      : undefined;
 
     // Resolve full provider config from DB (so agentbox can register it dynamically)
     let modelConfig: PromptOptions["modelConfig"];
@@ -535,13 +536,8 @@ export function createRpcMethods(
     });
     const client = new AgentBoxClient(handle.endpoint);
 
-    // Compute workspace-specific credentials directory (for local/process spawners)
-    const credentialsDir = workspace
-      ? path.resolve(skillsDir, "user", userId, `.ws-${workspace.id}`, ".credentials")
-      : undefined;
-
     // Send prompt
-    const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentialsDir });
+    const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentials });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
 
     // Cancel previous SSE subscription
@@ -3075,10 +3071,6 @@ export function createRpcMethods(
 
     const id = await credRepo.create({ userId, name, type, description, configJson });
 
-    // Sync credentials to PVC for all user workspaces
-    syncCredentialsForUser(userId).catch((err) =>
-      console.warn("[rpc] credential sync after create failed:", err.message));
-
     return { id, name, type };
   });
 
@@ -3103,10 +3095,6 @@ export function createRpcMethods(
 
     await credRepo.update(userId, id, updates);
 
-    // Sync credentials to PVC for all user workspaces
-    syncCredentialsForUser(userId).catch((err) =>
-      console.warn("[rpc] credential sync after update failed:", err.message));
-
     return { status: "updated" };
   });
 
@@ -3121,10 +3109,6 @@ export function createRpcMethods(
     if (!existing) throw new Error("Credential not found");
 
     await credRepo.delete(userId, id);
-
-    // Sync credentials to PVC for all user workspaces
-    syncCredentialsForUser(userId).catch((err) =>
-      console.warn("[rpc] credential sync after delete failed:", err.message));
 
     return { status: "deleted" };
   });
@@ -3295,7 +3279,6 @@ export function createRpcMethods(
     }
 
     await workspaceRepo.setCredentials(workspaceId, credentialIds);
-    await syncWorkspaceCredentials(userId, workspaceId, ws.isDefault);
 
     return { status: "updated" };
   });
@@ -3331,31 +3314,37 @@ export function createRpcMethods(
     metadata?: Record<string, unknown>;
   }
 
+  /** Credential file entry (name + content, materialized on agentbox side) */
+  interface CredentialFile { name: string; content: string; mode?: number }
+
+  /** Credential payload sent in prompt body */
+  interface CredentialPayload { manifest: CredentialManifestEntry[]; files: CredentialFile[] }
+
   /**
-   * Sync credentials for a workspace to the PVC.
-   * Default workspace: provisions ALL user credentials.
-   * Custom workspace: provisions only linked credentials.
-   * Writes files to /mnt/skills/user/{userId}/.ws-{wsId}/.credentials/
+   * Build credential payload for a workspace.
+   * Default workspace: returns ALL user credentials.
+   * Custom workspace: returns only linked credentials.
+   * Returns data only — does NOT write to disk. Agentbox materializes files locally.
    */
-  async function syncWorkspaceCredentials(
+  async function buildCredentialPayload(
     userId: string,
     workspaceId: string,
     isDefault: boolean,
-  ): Promise<void> {
+  ): Promise<CredentialPayload> {
     // Ensure user agent-data directory exists (used as subPath mount for user data)
     const agentDataDir = path.join(skillsDir, "user", userId, "agent-data");
     if (!fs.existsSync(agentDataDir)) {
       fs.mkdirSync(agentDataDir, { recursive: true });
     }
 
-    if (!credRepo) return;
+    if (!credRepo) return { manifest: [], files: [] };
 
     // Determine which credentials to provision
     let creds: Awaited<ReturnType<CredentialRepository["listForUser"]>>;
     if (isDefault) {
       creds = await credRepo.listForUser(userId);
     } else {
-      if (!workspaceRepo) return;
+      if (!workspaceRepo) return { manifest: [], files: [] };
       const linkedIds = await workspaceRepo.getCredentials(workspaceId);
       if (linkedIds.length === 0) {
         creds = [];
@@ -3364,35 +3353,16 @@ export function createRpcMethods(
       }
     }
 
-    const credsDir = path.join(skillsDir, "user", userId, `.ws-${workspaceId}`, ".credentials");
-
-    // Clean up legacy environment kubeconfig directories (security: prevent agent from finding them)
-    const legacyKubeDir = path.join(skillsDir, "user", userId, ".kube");
-    if (fs.existsSync(legacyKubeDir)) {
-      fs.rmSync(legacyKubeDir, { recursive: true });
-      console.log(`[rpc] Cleaned legacy .kube dir for user ${userId}`);
-    }
-    const legacyWsEnvsDir = path.join(skillsDir, "user", userId, `.ws-${workspaceId}`, "envs");
-    if (fs.existsSync(legacyWsEnvsDir)) {
-      fs.rmSync(legacyWsEnvsDir, { recursive: true });
-      console.log(`[rpc] Cleaned legacy envs dir for workspace ${workspaceId}`);
-    }
-
-    // Clear contents but preserve the directory inode.
-    // IMPORTANT: K8s subPath bind mounts capture the directory inode.
-    // If we rmSync + mkdirSync, the directory gets a new inode and
-    // already-running pods' bind mounts become stale (ENOENT / stale NFS handle).
-    fs.mkdirSync(credsDir, { recursive: true });
-    for (const entry of fs.readdirSync(credsDir)) {
-      fs.rmSync(path.join(credsDir, entry), { recursive: true });
-    }
+    // IdentityFile path used inside agentbox (resolves to .siclaw/credentials/)
+    const credsDirInBox = path.resolve(process.cwd(), ".siclaw/credentials");
 
     const manifest: CredentialManifestEntry[] = [];
+    const files: CredentialFile[] = [];
 
     for (const cred of creds) {
       const config = (cred.configJson ?? {}) as Record<string, unknown>;
       const safeName = cred.name.replace(/[^a-zA-Z0-9_-]/g, "_");
-      const files: string[] = [];
+      const fileNames: string[] = [];
 
       let metadata: Record<string, unknown> | undefined;
 
@@ -3401,9 +3371,8 @@ export function createRpcMethods(
           const content = config.content as string;
           if (content) {
             const filename = `${safeName}.kubeconfig`;
-            fs.writeFileSync(path.join(credsDir, filename), content, "utf-8");
-            files.push(filename);
-            // Extract cluster/context metadata from kubeconfig YAML
+            files.push({ name: filename, content });
+            fileNames.push(filename);
             try {
               const kc = yaml.load(content) as Record<string, unknown>;
               const clusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
@@ -3427,23 +3396,21 @@ export function createRpcMethods(
           break;
         }
         case "ssh_key": {
-          // Write private key with 0600 permissions
           const privateKey = config.privateKey as string;
           if (privateKey) {
             const keyFile = `${safeName}.key`;
-            fs.writeFileSync(path.join(credsDir, keyFile), privateKey, { mode: 0o600 });
-            files.push(keyFile);
+            files.push({ name: keyFile, content: privateKey, mode: 0o600 });
+            fileNames.push(keyFile);
           }
-          // Write ssh_config
           const sshConfigLines = [`Host ${safeName}`];
           if (config.host) sshConfigLines.push(`  HostName ${config.host}`);
           if (config.port) sshConfigLines.push(`  Port ${config.port}`);
           if (config.username) sshConfigLines.push(`  User ${config.username}`);
-          if (privateKey) sshConfigLines.push(`  IdentityFile /home/agentbox/.credentials/${safeName}.key`);
+          if (privateKey) sshConfigLines.push(`  IdentityFile ${credsDirInBox}/${safeName}.key`);
           sshConfigLines.push("  StrictHostKeyChecking no");
           const sshConfigFile = `${safeName}.ssh_config`;
-          fs.writeFileSync(path.join(credsDir, sshConfigFile), sshConfigLines.join("\n") + "\n", "utf-8");
-          files.push(sshConfigFile);
+          files.push({ name: sshConfigFile, content: sshConfigLines.join("\n") + "\n" });
+          fileNames.push(sshConfigFile);
           metadata = {
             host: config.host,
             ...(config.port ? { port: config.port } : {}),
@@ -3452,19 +3419,18 @@ export function createRpcMethods(
           break;
         }
         case "ssh_password": {
-          // Write ssh_config + password file
           const sshConfigLines = [`Host ${safeName}`];
           if (config.host) sshConfigLines.push(`  HostName ${config.host}`);
           if (config.port) sshConfigLines.push(`  Port ${config.port}`);
           if (config.username) sshConfigLines.push(`  User ${config.username}`);
           sshConfigLines.push("  StrictHostKeyChecking no");
           const sshFile = `${safeName}.ssh_config`;
-          fs.writeFileSync(path.join(credsDir, sshFile), sshConfigLines.join("\n") + "\n", "utf-8");
-          files.push(sshFile);
+          files.push({ name: sshFile, content: sshConfigLines.join("\n") + "\n" });
+          fileNames.push(sshFile);
           if (config.password) {
             const pwFile = `${safeName}.password`;
-            fs.writeFileSync(path.join(credsDir, pwFile), String(config.password), { mode: 0o600 });
-            files.push(pwFile);
+            files.push({ name: pwFile, content: String(config.password), mode: 0o600 });
+            fileNames.push(pwFile);
           }
           metadata = {
             host: config.host,
@@ -3479,8 +3445,8 @@ export function createRpcMethods(
           if (config.url) tokenData.url = config.url;
           if (config.token) tokenData.token = config.token;
           if (config.headers) tokenData.headers = config.headers;
-          fs.writeFileSync(path.join(credsDir, tokenFile), JSON.stringify(tokenData, null, 2), { mode: 0o600 });
-          files.push(tokenFile);
+          files.push({ name: tokenFile, content: JSON.stringify(tokenData, null, 2), mode: 0o600 });
+          fileNames.push(tokenFile);
           metadata = { ...(config.url ? { url: config.url } : {}) };
           break;
         }
@@ -3490,8 +3456,8 @@ export function createRpcMethods(
           if (config.url) authData.url = config.url;
           if (config.username) authData.username = config.username;
           if (config.password) authData.password = config.password;
-          fs.writeFileSync(path.join(credsDir, authFile), JSON.stringify(authData, null, 2), { mode: 0o600 });
-          files.push(authFile);
+          files.push({ name: authFile, content: JSON.stringify(authData, null, 2), mode: 0o600 });
+          fileNames.push(authFile);
           metadata = {
             ...(config.url ? { url: config.url } : {}),
             ...(config.username ? { username: config.username } : {}),
@@ -3506,44 +3472,18 @@ export function createRpcMethods(
         name: cred.name,
         type: cred.type,
         description: cred.description,
-        files,
+        files: fileNames,
         ...(metadata ? { metadata } : {}),
       });
     }
 
-    // Write manifest
-    fs.writeFileSync(
-      path.join(credsDir, "manifest.json"),
-      JSON.stringify(manifest, null, 2),
-      "utf-8",
-    );
+    return { manifest, files };
   }
 
-  /**
-   * Sync credentials for all workspaces that reference a given credential (or for all user workspaces).
-   * Called after credential CRUD operations.
-   */
-  async function syncCredentialsForUser(userId: string): Promise<void> {
-    if (!workspaceRepo) return;
-
-    // Clean up global legacy kubeconfig directory (one-time, from old environment system)
-    const globalLegacyDir = path.join(skillsDir, "_default_kubeconfigs");
-    if (fs.existsSync(globalLegacyDir)) {
-      fs.rmSync(globalLegacyDir, { recursive: true });
-      console.log("[rpc] Cleaned legacy _default_kubeconfigs dir");
-    }
-
-    const allWs = await workspaceRepo.list(userId);
-    for (const ws of allWs) {
-      await syncWorkspaceCredentials(userId, ws.id, ws.isDefault);
-    }
-  }
-
-  /** Clean workspace dir contents but preserve .credentials/ subdirectory */
-  function cleanWsDirPreserveCredentials(wsDir: string): void {
+  /** Clean workspace dir contents */
+  function cleanWsDir(wsDir: string): void {
     if (fs.existsSync(wsDir)) {
       for (const entry of fs.readdirSync(wsDir)) {
-        if (entry === ".credentials") continue;
         fs.rmSync(path.join(wsDir, entry), { recursive: true });
       }
     } else {
@@ -3567,7 +3507,7 @@ export function createRpcMethods(
       await syncActiveSkills(userId);
 
       // Clean workspace dir but preserve .credentials/
-      cleanWsDirPreserveCredentials(wsDir);
+      cleanWsDir(wsDir);
 
       const prodDir = path.join(skillsDir, "user", userId, ".skills-prod");
       if (fs.existsSync(prodDir)) {
@@ -3586,7 +3526,7 @@ export function createRpcMethods(
     }
 
     // Custom workspace: only symlink allowed skills
-    cleanWsDirPreserveCredentials(wsDir);
+    cleanWsDir(wsDir);
 
     const allowedSet = new Set(allowedSkills);
 
@@ -3652,7 +3592,7 @@ export function createRpcMethods(
     return { ok: true };
   });
 
-  return { methods, syncCredentialsForUser, syncWorkspaceCredentials };
+  return { methods, buildCredentialPayload };
 }
 
 /** One-time migration: upload published skill snapshots to S3 */

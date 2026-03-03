@@ -46,7 +46,7 @@ COPY --from=builder /app/dist/ ./dist/
 
 # Copy skills directories
 COPY skills/core/ ./skills/core/
-RUN mkdir -p ./skills/extension ./skills/team ./skills/user
+RUN mkdir -p ./.siclaw/skills/extension ./.siclaw/skills/team ./.siclaw/skills/user ./.siclaw/credentials
 
 # Copy MCP servers config if present (optional — NFS is the primary source)
 COPY config/mcp-servers.jso[n] ./config/
@@ -63,6 +63,7 @@ EXPOSE 3000
 
 # Run as non-root user for security
 RUN useradd -m -s /bin/bash agentbox
+RUN chown -R agentbox:agentbox ./.siclaw/
 USER agentbox
 
 # Start agentbox

@@ -4,6 +4,8 @@
  * Provides HTTP API for Gateway to call, with SSE streaming support.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/agent-factory.js";
@@ -113,7 +115,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; modelConfig?: Record<string, unknown>; credentialsDir?: string };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -122,10 +124,22 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType);
 
-    // Update credentials directory from gateway (workspace-specific path)
-    if (body.credentialsDir) {
-      managed.kubeconfigRef.credentialsDir = body.credentialsDir;
-      console.log(`[agentbox-http] Updated credentialsDir for session ${managed.id}: ${body.credentialsDir}`);
+    // Materialize credential files from payload (sent by gateway in prompt body)
+    if (body.credentials?.files?.length) {
+      const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
+      fs.mkdirSync(credDir, { recursive: true });
+      // Clear existing files
+      for (const entry of fs.readdirSync(credDir)) {
+        fs.rmSync(path.join(credDir, entry), { recursive: true });
+      }
+      // Write credential files
+      for (const file of body.credentials.files) {
+        fs.writeFileSync(path.join(credDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
+      }
+      // Write manifest
+      fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(body.credentials.manifest, null, 2));
+      managed.kubeconfigRef.credentialsDir = credDir;
+      console.log(`[agentbox-http] Materialized ${body.credentials.files.length} credential files to ${credDir}`);
     }
 
     // Dynamically register provider config from gateway DB (before findModel)

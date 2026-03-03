@@ -82,10 +82,8 @@ export interface GatewayServer {
   onWebhook?: (trigger: any, payload: unknown) => void;
   /** Callback for cron job completion notifications — set by gateway-main.ts */
   onCronNotify?: (data: { userId: string; jobName: string; result: string; resultText: string; error?: string }) => void;
-  /** Sync credentials for a user across all their workspaces */
-  syncCredentialsForUser: (userId: string) => Promise<void>;
-  /** Sync credentials for a specific workspace */
-  syncWorkspaceCredentials: (userId: string, workspaceId: string, isDefault: boolean) => Promise<void>;
+  /** Build credential payload for a specific workspace (sent in prompt body) */
+  buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
   close(): Promise<void>;
 }
 
@@ -166,7 +164,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   }
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, syncCredentialsForUser, syncWorkspaceCredentials } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers);
+  const { methods: rpcMethods, buildCredentialPayload } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers);
 
   // System config repo (used by JWT, SSO, S3, etc.)
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
@@ -1100,8 +1098,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     bindCodeStore,
     db,
     rpcMethods,
-    syncCredentialsForUser,
-    syncWorkspaceCredentials,
+    buildCredentialPayload,
     async close() {
       bindCodeStore.dispose();
       await agentBoxManager.cleanup();

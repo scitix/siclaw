@@ -23,8 +23,11 @@ export interface PromptOptions {
   brainType?: string;
   /** Workspace ID (for logging/context) */
   workspaceId?: string;
-  /** Workspace-specific credentials directory (absolute path, from gateway sync) */
-  credentialsDir?: string;
+  /** Credential payload — agentbox materializes files locally from this data */
+  credentials?: {
+    manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>;
+    files: Array<{ name: string; content: string; mode?: number }>;
+  };
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {
     name: string;

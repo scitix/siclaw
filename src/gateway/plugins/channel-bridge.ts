@@ -81,7 +81,7 @@ export function createChannelBridge(
   broadcast: BroadcastFn,
   userStore?: UserStore,
   configRepo?: ConfigRepository,
-  syncWorkspaceCredentials?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<void>,
+  buildCredentialPayload?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>,
 ): ChannelBridge {
   // channelId → outbound sender
   const outbounds = new Map<string, ChannelPlugin>();
@@ -128,9 +128,13 @@ export function createChannelBridge(
         return;
       }
 
-      // Sync credentials to PVC before AgentBox starts
-      await syncWorkspaceCredentials?.(boundUser.id, "default", true).catch((err) =>
-        console.warn("[channel-bridge] credential sync failed:", err instanceof Error ? err.message : err));
+      // Build credential payload to send in prompt body
+      const credentials = buildCredentialPayload
+        ? await buildCredentialPayload(boundUser.id, "default", true).catch((err) => {
+            console.warn("[channel-bridge] credential payload build failed:", err instanceof Error ? err.message : err);
+            return undefined;
+          })
+        : undefined;
 
       // Channel and web share the same AgentBox — mode-driven skill loading
       // handles tool/skill differences per session.
@@ -154,6 +158,7 @@ export function createChannelBridge(
         sessionId: chatId,
         text: promptText,
         mode: "channel",
+        credentials,
       });
       console.log(
         `[channel-bridge] Prompt sent to AgentBox ${handle.boxId} session=${result.sessionId}`,

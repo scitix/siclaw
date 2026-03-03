@@ -65,7 +65,7 @@ await channelStore.init();
 const configRepo = gateway.db ? new ConfigRepository(gateway.db) : undefined;
 
 // Create channel bridge (routes through AgentBox pods, not in-process sessions)
-const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.syncWorkspaceCredentials);
+const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.buildCredentialPayload);
 
 // Auto-remember chatId from inbound messages for notifications
 channelBridge.onInbound = (channelId, chatId) => {
