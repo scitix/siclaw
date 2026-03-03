@@ -442,15 +442,17 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    */
   addRoute("POST", "/api/sessions/:sessionId/confirm-hypotheses", async (_req, res, params) => {
     const { sessionId } = params;
-    const managed = sessionManager.get(sessionId);
 
-    if (!managed) {
-      sendJson(res, 404, { error: "Session not found" });
-      return;
-    }
-
+    // Always clear the gate first — it's a process-level singleton, not per-session.
+    // The session may have been released by TTL, but the gate still needs clearing.
     console.log(`[agentbox-http] Confirming hypotheses for session ${sessionId}, clearing gate`);
     deepSearchGate.blocked = false;
+
+    const managed = sessionManager.get(sessionId);
+    if (!managed) {
+      sendJson(res, 200, { ok: true, gateCleared: true, sessionFound: false });
+      return;
+    }
 
     // Also update SDK brain dpState checklist (pi-agent does this in extension input handler)
     if (managed.dpState?.enabled && managed.dpState.checklist) {

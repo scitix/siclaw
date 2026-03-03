@@ -271,7 +271,7 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
 
     const handleConfirm = () => {
         if (sendMessage) {
-            sendMessage('User has confirmed the hypotheses. Please call deep_search to validate them.');
+            sendMessage('The user has confirmed hypotheses. Please call deep_search to validate them.');
             setConfirmed(true);
             emitConfirmed();
         }
