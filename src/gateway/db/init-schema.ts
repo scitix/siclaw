@@ -315,6 +315,24 @@ const DDL_STATEMENTS = [
     UNIQUE KEY uk_provider_model (provider_id, model_id)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    transport VARCHAR(30) NOT NULL,
+    url VARCHAR(500),
+    command VARCHAR(500),
+    args_json JSON,
+    env_json JSON,
+    headers_json JSON,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    description TEXT,
+    source VARCHAR(20) NOT NULL DEFAULT 'db',
+    created_by VARCHAR(32),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  )`,
+
 ];
 
 // Indexes — handled separately since MySQL lacks CREATE INDEX IF NOT EXISTS

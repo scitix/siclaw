@@ -25,6 +25,8 @@ import { CredentialRepository } from "./db/repositories/credential-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels.js";
+import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
+import { loadMcpServersConfig } from "../core/mcp-client.js";
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
 import { ScriptEvaluator } from "./skills/script-evaluator.js";
 import { S3Storage } from "../lib/s3-storage.js";
@@ -76,6 +78,7 @@ export function createRpcMethods(
   const credRepo = db ? new CredentialRepository(db) : null;
   const workspaceRepo = db ? new WorkspaceRepository(db) : null;
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
+  const mcpRepo = db ? new McpServerRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
   /** Resolve workspaceId for a session from DB, falling back to "default" */
@@ -893,10 +896,195 @@ export function createRpcMethods(
   // MCP Server Methods
   // ─────────────────────────────────────────────────
 
+  /**
+   * Merge local config + MySQL → write to NFS for AgentBox consumption.
+   * 1. Load local config/mcp-servers.json as base
+   * 2. Load DB entries and overlay (same name → DB wins; disabled in DB → removed)
+   * 3. Write merged result to SICLAW_MCP_DIR/mcp-servers.json
+   */
+  async function syncMcpConfig(): Promise<void> {
+    const merged: Record<string, any> = {};
+
+    // 1. Local config as base layer
+    const localConfig = loadMcpServersConfig(undefined, { localOnly: true });
+    if (localConfig?.mcpServers) {
+      for (const [name, cfg] of Object.entries(localConfig.mcpServers)) {
+        merged[name] = cfg;
+      }
+      console.log(`[mcp-sync] Local file: ${Object.keys(localConfig.mcpServers).length} servers [${Object.keys(localConfig.mcpServers).join(", ")}]`);
+    }
+
+    // 2. DB overlay (same name overwrites local; disabled removes)
+    if (mcpRepo) {
+      const rows = await mcpRepo.list();
+      const enabled = rows.filter(r => r.enabled);
+      const disabled = rows.filter(r => !r.enabled);
+      console.log(`[mcp-sync] DB source: ${rows.length} total, ${enabled.length} enabled, ${disabled.length} disabled`);
+      for (const row of rows) {
+        if (!row.enabled) {
+          delete merged[row.name];
+          console.log(`[mcp-sync]   remove (disabled): ${row.name}`);
+          continue;
+        }
+        const cfg: Record<string, any> = {};
+        if (row.transport) cfg.transport = row.transport;
+        if (row.url) cfg.url = row.url;
+        if (row.command) cfg.command = row.command;
+        if (row.argsJson) cfg.args = row.argsJson;
+        if (row.envJson) cfg.env = row.envJson;
+        if (row.headersJson) cfg.headers = row.headersJson;
+        const overwritten = row.name in merged ? " (overwrites local)" : "";
+        merged[row.name] = cfg;
+        console.log(`[mcp-sync]   add: ${row.name} (${row.transport}, source=${row.source})${overwritten}`);
+      }
+    }
+
+    // Write merged config to MCP dir (NFS in K8s, local fallback in dev)
+    let mcpDir = process.env.SICLAW_MCP_DIR;
+    if (!mcpDir) {
+      mcpDir = path.resolve(process.cwd(), ".siclaw", "mcp");
+      process.env.SICLAW_MCP_DIR = mcpDir;
+      console.log(`[mcp-sync] SICLAW_MCP_DIR not set, using fallback: ${mcpDir}`);
+    }
+    fs.mkdirSync(mcpDir, { recursive: true });
+    const outPath = path.resolve(mcpDir, "mcp-servers.json");
+    fs.writeFileSync(outPath, JSON.stringify({ mcpServers: merged }, null, 2), "utf-8");
+    console.log(`[mcp-sync] Wrote ${Object.keys(merged).length} servers to ${outPath}: [${Object.keys(merged).join(", ")}]`);
+  }
+
+  // Run initial sync on startup
+  syncMcpConfig().catch((err) => {
+    console.warn("[rpc] Initial syncMcpConfig failed:", err.message);
+  });
+
   methods.set("mcp.list", async (_params, context: RpcContext) => {
     requireAuth(context);
-    // TODO: read from DB when MCP WebUI is implemented
-    return { servers: [] };
+    if (mcpRepo) {
+      const rows = await mcpRepo.list();
+      return {
+        servers: rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          transport: r.transport,
+          url: r.url,
+          command: r.command,
+          argsJson: r.argsJson,
+          envJson: r.envJson,
+          headersJson: r.headersJson,
+          enabled: r.enabled,
+          description: r.description,
+          source: r.source,
+          createdAt: r.createdAt?.toISOString(),
+          updatedAt: r.updatedAt?.toISOString(),
+        })),
+      };
+    }
+
+    // Fallback: read local file (CLI / no-DB mode)
+    const mcpConfigPath = path.resolve(process.cwd(), "config", "mcp-servers.json");
+    try {
+      const raw = fs.readFileSync(mcpConfigPath, "utf-8");
+      const config = JSON.parse(raw) as {
+        mcpServers: Record<string, { url?: string; command?: string; transport?: string }>;
+      };
+      const servers: Array<Record<string, unknown>> = [];
+      for (const [name, serverConfig] of Object.entries(config.mcpServers ?? {})) {
+        servers.push({
+          id: name,
+          name,
+          url: serverConfig.url,
+          transport: serverConfig.transport ?? (serverConfig.url ? "streamable-http" : "stdio"),
+          enabled: true,
+          source: "file",
+        });
+      }
+      return { servers };
+    } catch {
+      return { servers: [] };
+    }
+  });
+
+  methods.set("mcp.create", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!mcpRepo) throw new Error("Database not available");
+
+    const name = params.name as string;
+    const transport = params.transport as string;
+    if (!name) throw new Error("Missing required param: name");
+    if (!transport) throw new Error("Missing required param: transport");
+
+    console.log(`[mcp-rpc] mcp.create: name=${name}, transport=${transport}, by=${context.auth?.username}`);
+    const id = await mcpRepo.create({
+      name,
+      transport,
+      url: params.url as string | undefined,
+      command: params.command as string | undefined,
+      argsJson: params.argsJson as string[] | undefined,
+      envJson: params.envJson as Record<string, string> | undefined,
+      headersJson: params.headersJson as Record<string, string> | undefined,
+      enabled: params.enabled !== false,
+      description: params.description as string | undefined,
+      createdBy: context.auth?.userId,
+    });
+    console.log(`[mcp-rpc] mcp.create: id=${id}, syncing config...`);
+
+    await syncMcpConfig();
+    return { id, name };
+  });
+
+  methods.set("mcp.update", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!mcpRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    console.log(`[mcp-rpc] mcp.update: id=${id}, by=${context.auth?.username}`);
+    await mcpRepo.update(id, {
+      name: params.name as string | undefined,
+      transport: params.transport as string | undefined,
+      url: params.url as string | undefined,
+      command: params.command as string | undefined,
+      argsJson: params.argsJson as string[] | undefined,
+      envJson: params.envJson as Record<string, string> | undefined,
+      headersJson: params.headersJson as Record<string, string> | undefined,
+      enabled: params.enabled as boolean | undefined,
+      description: params.description as string | undefined,
+    });
+
+    await syncMcpConfig();
+    return { ok: true };
+  });
+
+  methods.set("mcp.delete", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!mcpRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    const existing = await mcpRepo.getById(id);
+    console.log(`[mcp-rpc] mcp.delete: id=${id}, name=${existing?.name ?? "unknown"}, by=${context.auth?.username}`);
+    await mcpRepo.delete(id);
+    await syncMcpConfig();
+    return { ok: true };
+  });
+
+  methods.set("mcp.toggle", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!mcpRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    const server = await mcpRepo.getById(id);
+    if (!server) throw new Error("MCP server not found");
+
+    const newEnabled = !server.enabled;
+    console.log(`[mcp-rpc] mcp.toggle: ${server.name} ${server.enabled} → ${newEnabled}, by=${context.auth?.username}`);
+    await mcpRepo.update(id, { enabled: newEnabled });
+    await syncMcpConfig();
+    return { id, enabled: newEnabled };
   });
 
   methods.set("chat.steer", async (params, context: RpcContext) => {

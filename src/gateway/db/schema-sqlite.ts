@@ -358,6 +358,25 @@ export interface ReviewFinding {
   snippet?: string;
 }
 
+// ─── MCP Servers ────────────────────────────────
+
+export const mcpServers = sqliteTable("mcp_servers", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  transport: text("transport").notNull(),
+  url: text("url"),
+  command: text("command"),
+  argsJson: text("args_json", { mode: "json" }).$type<string[]>(),
+  envJson: text("env_json", { mode: "json" }).$type<Record<string, string>>(),
+  headersJson: text("headers_json", { mode: "json" }).$type<Record<string, string>>(),
+  enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  description: text("description"),
+  source: text("source").notNull().default("db"),
+  createdBy: text("created_by").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
 // ─── System Config ────────────────────────────────
 
 export const systemConfig = sqliteTable("system_config", {

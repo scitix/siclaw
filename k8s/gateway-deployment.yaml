@@ -50,6 +50,8 @@ spec:
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
           value: "/mnt/skills"
+        - name: SICLAW_MCP_DIR
+          value: "/mnt/mcp"
         - name: SICLAW_CRON_SERVICE_URL
           value: "http://siclaw-cron.siclaw.svc.cluster.local"
         - name: SICLAW_DATABASE_URL
@@ -79,6 +81,10 @@ spec:
         volumeMounts:
         - name: skills-pv
           mountPath: /mnt/skills
+          readOnly: false
+        - name: skills-pv
+          mountPath: /mnt/mcp
+          subPath: mcp
           readOnly: false
       volumes:
       - name: skills-pv

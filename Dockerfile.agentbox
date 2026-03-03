@@ -48,6 +48,9 @@ COPY --from=builder /app/dist/ ./dist/
 COPY skills/core/ ./skills/core/
 RUN mkdir -p ./skills/extension ./skills/team ./skills/user
 
+# Copy MCP servers config if present (optional — NFS is the primary source)
+COPY config/mcp-servers.jso[n] ./config/
+
 # Environment variables
 ENV NODE_ENV=production
 

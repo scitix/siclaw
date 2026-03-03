@@ -45,7 +45,7 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
 import type { BrainSession, BrainType } from "./brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "./llm-proxy.js";
-import { McpClientManager } from "./mcp-client.js";
+import { McpClientManager, loadMcpServersConfig } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath } from "./config.js";
 
 export type SessionMode = "web" | "channel" | "cli";
@@ -254,20 +254,26 @@ export async function createSiclawSession(
   // -- MCP external tools --
   const cwd = process.cwd();
   let mcpManager: McpClientManager | undefined;
-  const mcpServers = config.mcpServers;
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    mcpManager = new McpClientManager({ mcpServers } as any);
+  console.log(`[agent-factory] Loading MCP config (cwd=${cwd})...`);
+  const mcpConfig = loadMcpServersConfig(cwd);
+  if (mcpConfig) {
+    const serverNames = Object.keys(mcpConfig.mcpServers);
+    console.log(`[agent-factory] MCP config loaded: ${serverNames.length} servers [${serverNames.join(", ")}]`);
+    mcpManager = new McpClientManager(mcpConfig);
     try {
       await mcpManager.initialize();
       const mcpTools = mcpManager.getTools();
+      console.log(`[agent-factory] MCP initialization complete: ${mcpTools.length} tools discovered`);
       if (mcpTools.length > 0) {
         customTools.push(...mcpTools);
-        console.log(`[agent-factory] Added ${mcpTools.length} MCP tools`);
+        console.log(`[agent-factory] Added ${mcpTools.length} MCP tools: ${mcpTools.map(t => t.name).join(", ")}`);
       }
     } catch (err) {
       console.warn(`[agent-factory] MCP initialization failed:`, err);
       mcpManager = undefined;
     }
+  } else {
+    console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
   }
 
   // Filter custom tools by workspace allow-list
@@ -384,7 +390,7 @@ export async function createSiclawSession(
       cwd,
       customTools: sdkTools,
       proxyUrl,
-      externalMcpServers: mcpServers && Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
+      externalMcpServers: mcpConfig?.mcpServers && Object.keys(mcpConfig.mcpServers).length > 0 ? mcpConfig.mcpServers : undefined,
       dpState,
     });
 

@@ -18,6 +18,7 @@ import { ModelsPage } from './pages/Models';
 import { BrainsPage } from './pages/Brains';
 import { CredentialsPage } from './pages/Credentials';
 import { WorkspacesPage } from './pages/Workspaces';
+import { McpServersPage } from './pages/McpServers';
 
 function ComingSoonPage({ title }: { title: string }) {
     return (
@@ -67,7 +68,7 @@ const router = createBrowserRouter([
                     { path: 'credentials', element: <CredentialsPage /> },
                     { path: 'sessions', element: <ComingSoonPage title="Sessions" /> },
                     { path: 'workspace', element: <WorkspacesPage /> },
-                    { path: 'mcp', element: <ComingSoonPage title="MCP Servers" /> },
+                    { path: 'mcp', element: <McpServersPage /> },
                     { path: 'brains', element: <BrainsPage /> },
                     { path: 'models', element: <ModelsPage /> },
                 ],

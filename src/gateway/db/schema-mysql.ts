@@ -371,6 +371,25 @@ export interface ReviewFinding {
   snippet?: string;
 }
 
+// ─── MCP Servers ────────────────────────────────
+
+export const mcpServers = mysqlTable("mcp_servers", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  name: varchar("name", { length: 255 }).notNull().unique(),
+  transport: varchar("transport", { length: 30 }).notNull(),
+  url: varchar("url", { length: 500 }),
+  command: varchar("command", { length: 500 }),
+  argsJson: json("args_json").$type<string[]>(),
+  envJson: json("env_json").$type<Record<string, string>>(),
+  headersJson: json("headers_json").$type<Record<string, string>>(),
+  enabled: boolean("enabled").notNull().default(true),
+  description: text("description"),
+  source: varchar("source", { length: 20 }).notNull().default("db"),
+  createdBy: varchar("created_by", { length: 32 }).references(() => users.id),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
 // ─── System Config ────────────────────────────────
 
 export const systemConfig = mysqlTable("system_config", {

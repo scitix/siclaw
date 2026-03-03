@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "tools-server-external": {
+      "url": "http://<NODE_IP>:30800/mcp"
+    }
+  }
+}

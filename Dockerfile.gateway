@@ -51,6 +51,9 @@ COPY skills/core/ ./skills/core/
 # Extension skills directory (populated by overlay builds)
 RUN mkdir -p ./skills/extension
 
+# Copy MCP servers config if present (optional — DB is primary source)
+COPY config/mcp-servers.jso[n] ./config/
+
 # Create data directory
 RUN mkdir -p .siclaw
 

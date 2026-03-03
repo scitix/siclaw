@@ -47,6 +47,7 @@ export const {
   credentials,
   userPermissions,
   systemConfig,
+  mcpServers,
   skillReviews,
 } = _mod;
 

@@ -7,9 +7,10 @@
  * Config loaded from .siclaw/config/settings.json mcpServers field.
  */
 
+import fs from "fs";
+import path from "path";
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { loadConfig } from "./config.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,11 +112,71 @@ export function jsonSchemaToTypebox(schema: any): TSchema {
 // Config loading
 // ---------------------------------------------------------------------------
 
-export function loadMcpServersConfig(): McpServersConfig | null {
-  const config = loadConfig();
-  const mcpServers = config.mcpServers;
-  if (!mcpServers || Object.keys(mcpServers).length === 0) return null;
-  return { mcpServers } as McpServersConfig;
+/**
+ * Try loading an MCP servers config from a single path.
+ */
+function tryLoadConfig(configPath: string): McpServersConfig | null {
+  if (!fs.existsSync(configPath)) {
+    console.log(`[mcp-client] Config not found: ${configPath}`);
+    return null;
+  }
+
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const json = JSON.parse(raw) as McpServersConfig;
+    if (!json.mcpServers || typeof json.mcpServers !== "object") {
+      console.warn(`[mcp-client] Invalid config (no mcpServers object): ${configPath}`);
+      return null;
+    }
+
+    // Resolve env var references in headers (e.g. "${API_TOKEN}" → process.env.API_TOKEN)
+    for (const [, config] of Object.entries(json.mcpServers)) {
+      if ("headers" in config && config.headers) {
+        for (const [key, value] of Object.entries(config.headers)) {
+          const match = value.match(/^\$\{(\w+)\}$/);
+          if (match) {
+            config.headers[key] = process.env[match[1]] ?? "";
+          }
+        }
+      }
+    }
+
+    const serverNames = Object.keys(json.mcpServers);
+    console.log(`[mcp-client] Loaded config from ${configPath}: ${serverNames.length} servers [${serverNames.join(", ")}]`);
+    return json;
+  } catch (err) {
+    console.warn(`[mcp-client] Failed to load config from ${configPath}: ${err}`);
+    return null;
+  }
+}
+
+/**
+ * Load MCP servers config with NFS-first priority:
+ * 1. NFS path (SICLAW_MCP_DIR/mcp-servers.json) — unless localOnly
+ * 2. Local config file (config/mcp-servers.json)
+ */
+export function loadMcpServersConfig(
+  cwd?: string,
+  opts?: { localOnly?: boolean },
+): McpServersConfig | null {
+  const mcpDir = process.env.SICLAW_MCP_DIR;
+  console.log(`[mcp-client] loadMcpServersConfig: SICLAW_MCP_DIR=${mcpDir || "(unset)"}, localOnly=${opts?.localOnly ?? false}`);
+
+  // 1. NFS (unless localOnly=true)
+  if (!opts?.localOnly) {
+    if (mcpDir) {
+      const nfsPath = path.resolve(mcpDir, "mcp-servers.json");
+      const config = tryLoadConfig(nfsPath);
+      if (config) {
+        console.log(`[mcp-client] Using NFS config: ${nfsPath}`);
+        return config;
+      }
+    }
+  }
+  // 2. Local file (Docker image / CLI mode)
+  const localPath = path.resolve(cwd ?? process.cwd(), "config", "mcp-servers.json");
+  console.log(`[mcp-client] Falling back to local config: ${localPath}`);
+  return tryLoadConfig(localPath);
 }
 
 // ---------------------------------------------------------------------------

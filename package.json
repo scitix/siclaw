@@ -14,7 +14,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.1.58",
     "@anthropic-ai/sdk": "^0.71.2",
     "@kubernetes/client-node": "^1.4.0",
-    "@mariozechner/pi-coding-agent": "^0.55.1",
+    "@mariozechner/pi-coding-agent": "^0.55.3",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.34.0",
     "@types/js-yaml": "^4.0.9",
