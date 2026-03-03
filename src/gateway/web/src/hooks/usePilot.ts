@@ -284,6 +284,7 @@ export function usePilot() {
     const [skills, setSkills] = useState<Skill[]>([]);
     const [editingSkill, setEditingSkill] = useState<{ id: string; name: string } | null>(null);
     const [models, setModels] = useState<ModelInfo[]>([]);
+    const [defaultModelRef, setDefaultModelRef] = useState<{ provider: string; modelId: string } | null>(null);
     const [selectedModel, setSelectedModel] = useState<ModelInfo | null>(null);
     const [selectedBrain, setSelectedBrain] = useState<BrainType>(() => {
         return (localStorage.getItem(SELECTED_BRAIN_STORAGE) as BrainType) || "pi-agent";
@@ -628,6 +629,7 @@ export function usePilot() {
             const result = await sendRpc<{ models: ModelInfo[]; default: { provider: string; modelId: string } | null }>('model.list');
             const list = result.models ?? [];
             setModels(list);
+            setDefaultModelRef(result.default ?? null);
             // Always sync to DB default model (so changes on Models page take effect immediately)
             if (list.length > 0) {
                 if (result.default) {
@@ -935,11 +937,15 @@ export function usePilot() {
         setMessages([]);
         setContextUsage(null);
         setIsCompacting(false);
-        setSelectedModel(models.length > 0 ? models[0] : null);
+        // Use the DB default model, fall back to first in list
+        const defaultModel = defaultModelRef
+            ? models.find(m => m.provider === defaultModelRef.provider && m.id === defaultModelRef.modelId)
+            : null;
+        setSelectedModel(defaultModel ?? models[0] ?? null);
         setSessionBrainType(null); // unlock brain selector for new session
         clearDpTimers();
         resetDpState();
-    }, [models]);
+    }, [models, defaultModelRef]);
 
     const deleteSession = useCallback(async (sessionKey: string) => {
         if (!isConnected) return;

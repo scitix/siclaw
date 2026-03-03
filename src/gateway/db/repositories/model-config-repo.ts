@@ -160,20 +160,20 @@ export class ModelConfigRepository {
     }
     const providerId = provRows[0].id;
 
-    // Check for duplicates
+    // Check for duplicates (case-insensitive to prevent kimi-k2.5 vs Kimi-K2.5)
     const existing = await this.db
       .select({ id: modelEntries.id })
       .from(modelEntries)
       .where(
         and(
           eq(modelEntries.providerId, providerId),
-          eq(modelEntries.modelId, model.id),
+          sql`lower(${modelEntries.modelId}) = lower(${model.id})`,
         ),
       )
       .limit(1);
 
     if (existing.length > 0) {
-      throw new Error(`Model "${model.id}" already exists in provider "${providerName}"`);
+      throw new Error(`Model "${model.id}" already exists in provider "${providerName}" (case-insensitive match)`);
     }
 
     const newEntry = {
