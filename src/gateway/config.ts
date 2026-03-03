@@ -5,6 +5,7 @@ export interface ChannelConfig {
 
 export interface GatewayConfig {
   port: number;
+  internalPort?: number; // HTTPS port for internal mTLS API (default: 3002)
   host: string;
   plugins: {
     paths: string[];

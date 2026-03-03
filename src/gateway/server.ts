@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,6 +19,8 @@ import { PermissionRepository } from "./db/repositories/permission-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
+import { CertificateManager } from "./security/cert-manager.js";
+import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -72,6 +75,8 @@ function serveStatic(res: http.ServerResponse, urlPath: string): void {
 
 export interface GatewayServer {
   httpServer: http.Server;
+  httpsServer: https.Server | null; // HTTPS server for internal mTLS API
+  certManager: CertificateManager;
   broadcast: import("./ws-protocol.js").BroadcastFn;
   userStore: UserStore;
   bindCodeStore: BindCodeStore;
@@ -317,7 +322,21 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   };
 
-  // HTTP server
+  // Initialize Certificate Manager for mTLS
+  const certDir = path.resolve(process.cwd(), ".siclaw", "certs");
+  const certManager = new CertificateManager(certDir);
+
+  // Generate Gateway server certificate for internal API
+  const gatewayHostname = process.env.SICLAW_GATEWAY_HOSTNAME || "siclaw-gateway.siclaw.svc.cluster.local";
+  const serverCert = certManager.issueServerCertificate(gatewayHostname);
+
+  // Create mTLS middleware for internal API
+  const mtlsMiddleware = createMtlsMiddleware({
+    certManager,
+    protectedPaths: ["/api/internal/"],
+  });
+
+  // HTTP server (Public API)
   const httpServer = http.createServer((req, res) => {
     const url = req.url ?? "/";
     const method = req.method ?? "GET";
@@ -481,35 +500,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
-    // Internal cron list endpoint: GET /api/internal/cron-list?userId=xxx
-    if (url.startsWith("/api/internal/cron-list") && method === "GET") {
-      if (!db) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Database not available" }));
-        return;
-      }
-      (async () => {
-        try {
-          const fullUrl = new URL(req.url!, `http://${req.headers.host}`);
-          const userId = fullUrl.searchParams.get("userId");
-          if (!userId) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "userId required" }));
-            return;
-          }
-          const envId = fullUrl.searchParams.get("envId");
-          const configRepo = new ConfigRepository(db);
-          const jobs = await configRepo.listCronJobs(userId, envId ?? undefined);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ jobs }));
-        } catch (err) {
-          console.error("[gateway] cron-list error:", err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      })();
-      return;
-    }
+    // NOTE: /api/internal/cron-list has been moved to HTTPS server (port 3002)
+    // with mTLS authentication for AgentBox access only.
 
     // ─── Internal cron coordination API (used by cron service) ────────
     // These thin wrappers let cron-main talk to the DB through gateway,
@@ -759,28 +751,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
-    // Internal settings endpoint: GET /api/internal/settings
-    // Returns provider/model/embedding config for AgentBox pods to bootstrap settings.json
-    if (url === "/api/internal/settings" && method === "GET") {
-      if (!db) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Database not available" }));
-        return;
-      }
-      (async () => {
-        try {
-          const modelConfigRepo = new ModelConfigRepository(db);
-          const settings = await modelConfigRepo.exportSettingsConfig();
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(settings));
-        } catch (err) {
-          console.error("[gateway] settings export error:", err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      })();
-      return;
-    }
+    // NOTE: /api/internal/settings and /api/internal/cron-list have been moved to
+    // HTTPS server (port 3002) with mTLS authentication. These endpoints are no longer
+    // available on the HTTP server to enforce zero-trust security for AgentBox communication.
 
     // Internal embedding config endpoint: GET /api/internal/embedding-config
     if (url === "/api/internal/embedding-config" && method === "GET") {
@@ -1071,8 +1044,122 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     console.log(`[gateway] WebSocket: ws://${config.host}:${config.port}/ws`);
   });
 
+  // HTTPS server for internal mTLS API (AgentBox connections)
+  const internalPort = config.internalPort || 3002;
+  let httpsServer: https.Server | null = null;
+
+  try {
+    httpsServer = https.createServer(
+      {
+        cert: serverCert.cert,
+        key: serverCert.key,
+        ca: certManager.getCACertificate(),
+        requestCert: true,         // Request client certificate
+        rejectUnauthorized: true,  // Reject connections without valid certificate
+      },
+      (req, res) => {
+        const url = req.url ?? "/";
+        const method = req.method ?? "GET";
+
+        console.log(`[gateway] HTTPS ${method} ${url}`);
+
+        // Apply mTLS middleware (validates certificate and attaches identity)
+        mtlsMiddleware(req, res, () => {
+          // All /api/internal/* endpoints from HTTP server should be duplicated here
+          // For now, handle the key endpoints we've implemented
+
+          // Internal settings endpoint: GET /api/internal/settings
+          if (url === "/api/internal/settings" && method === "GET") {
+            if (!db) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Database not available" }));
+              return;
+            }
+            (async () => {
+              try {
+                const modelConfigRepo = new ModelConfigRepository(db);
+                const settings = await modelConfigRepo.exportSettingsConfig();
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(settings));
+              } catch (err) {
+                console.error("[gateway] settings export error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            })();
+            return;
+          }
+
+          // Internal cron jobs list endpoint: GET /api/internal/cron-list?userId=xxx
+          if (url.startsWith("/api/internal/cron-list") && method === "GET") {
+            if (!db) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Database not available" }));
+              return;
+            }
+            (async () => {
+              try {
+                // Verify mTLS certificate identity (set by middleware)
+                const identity = (req as any).certIdentity;
+                if (!identity) {
+                  res.writeHead(401, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Client certificate required" }));
+                  return;
+                }
+
+                // Parse userId from query params
+                const urlObj = new URL(url, `https://${req.headers.host}`);
+                const requestedUserId = urlObj.searchParams.get("userId");
+                if (!requestedUserId) {
+                  res.writeHead(400, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Missing userId parameter" }));
+                  return;
+                }
+
+                // Authorization: certificate userId must match requested userId
+                if (identity.userId !== requestedUserId) {
+                  console.warn(`[gateway] cron-list authorization failed: cert userId=${identity.userId} requested=${requestedUserId}`);
+                  res.writeHead(403, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Forbidden: userId mismatch" }));
+                  return;
+                }
+
+                // Query cron jobs using ConfigRepository
+                const configRepo = new ConfigRepository(db);
+                const jobs = await configRepo.listCronJobs(requestedUserId);
+
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ jobs }));
+                console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${requestedUserId}`);
+              } catch (err) {
+                console.error("[gateway] cron-list error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            })();
+            return;
+          }
+
+          // Default: 404 for unknown internal API paths
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not found" }));
+        });
+      }
+    );
+
+    httpsServer.listen(internalPort, config.host, () => {
+      console.log(`[gateway] Internal API (mTLS) listening on https://${config.host}:${internalPort}`);
+      console.log(`[gateway] Certificate CN: ${gatewayHostname}`);
+    });
+  } catch (err) {
+    console.error("[gateway] Failed to start HTTPS server for internal API:", err);
+    console.warn("[gateway] Internal API will not be available");
+  }
+
   const gatewayServer: GatewayServer = {
     httpServer,
+    httpsServer,
+    certManager,
     broadcast,
     userStore,
     bindCodeStore,
@@ -1088,6 +1175,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       clients.clear();
       wss.close();
       httpServer.close();
+      if (httpsServer) {
+        httpsServer.close();
+      }
       await closeDb();
     },
   };

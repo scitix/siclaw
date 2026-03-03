@@ -10,6 +10,7 @@ import path from "node:path";
 import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
+import { GatewayClient } from "./agentbox/gateway-client.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -25,21 +26,20 @@ const config = loadConfig();
 const PORT = config.server.port;
 
 async function main() {
-  // If gatewayUrl is configured, fetch the latest settings.json from Gateway
+  // If gatewayUrl is configured, fetch the latest settings.json from Gateway (with mTLS)
   if (config.server.gatewayUrl) {
     try {
-      const resp = await fetch(`${config.server.gatewayUrl}/api/internal/settings`, {
-        signal: AbortSignal.timeout(5000),
+      const gatewayClient = new GatewayClient({
+        gatewayUrl: config.server.gatewayUrl,
       });
-      if (resp.ok) {
-        const remoteConfig = await resp.json();
-        const configPath = getConfigPath();
-        const dir = path.dirname(configPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
-        reloadConfig();
-        console.log(`[agentbox] Fetched settings from Gateway: ${config.server.gatewayUrl}`);
-      }
+
+      const remoteConfig = await gatewayClient.fetchSettings();
+      const configPath = getConfigPath();
+      const dir = path.dirname(configPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
+      reloadConfig();
+      console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
     } catch (err) {
       console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
     }
