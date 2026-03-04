@@ -7,9 +7,11 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import https from "node:https";
 import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
+import { GatewayClient } from "./agentbox/gateway-client.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -25,20 +27,39 @@ const config = loadConfig();
 const PORT = config.server.port;
 
 async function main() {
-  // If gatewayUrl is configured, fetch the latest settings.json from Gateway
+  // If gatewayUrl is configured, fetch the latest settings.json from Gateway (with mTLS)
   if (config.server.gatewayUrl) {
     try {
-      const resp = await fetch(`${config.server.gatewayUrl}/api/internal/settings`, {
-        signal: AbortSignal.timeout(5000),
+      const gatewayClient = new GatewayClient({
+        gatewayUrl: config.server.gatewayUrl,
       });
-      if (resp.ok) {
-        const remoteConfig = await resp.json();
-        const configPath = getConfigPath();
-        const dir = path.dirname(configPath);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
-        reloadConfig();
-        console.log(`[agentbox] Fetched settings from Gateway: ${config.server.gatewayUrl}`);
+
+      const remoteConfig = await gatewayClient.fetchSettings();
+      const configPath = getConfigPath();
+      const dir = path.dirname(configPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
+      reloadConfig();
+      console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
+
+      // Fetch and materialize skill bundle (team + personal only; builtin baked in image)
+      try {
+        const bundle = await gatewayClient.fetchSkillBundle();
+        const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
+        const { materializeBundle } = await import("./agentbox/http-server.js");
+        await materializeBundle(bundle, skillsDir);
+
+        // Write disabled builtins list for agent-factory to exclude
+        if (bundle.disabledBuiltins?.length) {
+          fs.writeFileSync(
+            path.join(skillsDir, ".disabled-builtins.json"),
+            JSON.stringify(bundle.disabledBuiltins),
+          );
+        }
+
+        console.log(`[agentbox] Skill bundle materialized: ${bundle.skills.length} skills (${bundle.disabledBuiltins?.length || 0} builtins disabled), version=${bundle.version}`);
+      } catch (bundleErr: any) {
+        console.warn(`[agentbox] Failed to fetch skill bundle: ${bundleErr.message}`);
       }
     } catch (err) {
       console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
@@ -50,7 +71,7 @@ async function main() {
   console.log(`[agentbox] cwd: ${process.cwd()}`);
   console.log(`[agentbox] userDataDir=${userDataDir}`);
   console.log(`[agentbox] skillsDir=${skillsDir}`);
-  for (const tier of ["core", "team", "extension", "user", "platform"]) {
+  for (const tier of ["core"]) {
     const dir = path.join(skillsDir, tier);
     if (fs.existsSync(dir)) {
       const entries = fs.readdirSync(dir).filter(e => !e.startsWith("."));
@@ -66,9 +87,10 @@ async function main() {
   // Start HTTP server
   const server = createHttpServer(sessionManager);
 
+  const protocol = server instanceof https.Server ? "https" : "http";
   server.listen(PORT, () => {
-    console.log(`[agentbox] HTTP server listening on port ${PORT}`);
-    console.log(`[agentbox] Health check: http://localhost:${PORT}/health`);
+    console.log(`[agentbox] ${protocol.toUpperCase()} server listening on port ${PORT}`);
+    console.log(`[agentbox] Health check: ${protocol}://localhost:${PORT}/health`);
   });
 
   // Graceful shutdown

@@ -80,7 +80,7 @@ export const skills = mysqlTable("skills", {
   description: text("description"),
   type: varchar("type", { length: 50 }),
   version: int("version").notNull().default(1),
-  scope: mysqlEnum("scope", ["core", "team", "personal"])
+  scope: mysqlEnum("scope", ["builtin", "team", "personal"])
     .notNull()
     .default("personal"),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
@@ -90,7 +90,7 @@ export const skills = mysqlTable("skills", {
     "pending",
     "approved",
   ]).default("none"),
-  reviewStatus: mysqlEnum("review_status", ["draft", "published", "pending"])
+  reviewStatus: mysqlEnum("review_status", ["draft", "pending", "approved"])
     .notNull()
     .default("draft"),
   dirName: varchar("dir_name", { length: 255 }).notNull(),
@@ -104,6 +104,21 @@ export const skills = mysqlTable("skills", {
   forkedFromId: varchar("forked_from_id", { length: 64 }),
 });
 
+// ─── Skill Contents ─────────────────────────────────
+
+export const skillContents = mysqlTable("skill_contents", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  skillId: varchar("skill_id", { length: 64 }).notNull()
+    .references(() => skills.id, { onDelete: "cascade" }),
+  tag: mysqlEnum("tag", ["working", "staging", "published"]).notNull().default("working"),
+  specs: text("specs"),
+  scriptsJson: json("scripts_json").$type<Array<{ name: string; content: string }>>(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+}, (table) => ({
+  ukSkillTag: uniqueIndex("uk_skill_tag").on(table.skillId, table.tag),
+}));
+
 // ─── Skill Versions ─────────────────────────────────
 
 export const skillVersions = mysqlTable("skill_versions", {
@@ -111,7 +126,9 @@ export const skillVersions = mysqlTable("skill_versions", {
   skillId: varchar("skill_id", { length: 64 }).notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
   version: int("version").notNull(),
-  s3Key: varchar("s3_key", { length: 500 }).notNull(),
+  s3Key: varchar("s3_key", { length: 500 }),
+  specs: text("specs"),
+  scriptsJson: json("scripts_json").$type<Array<{ name: string; content: string }>>(),
   files: json("files").$type<{ specs?: string; scripts?: string[] }>(),
   commitMessage: varchar("commit_message", { length: 500 }),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),

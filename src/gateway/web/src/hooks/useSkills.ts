@@ -13,7 +13,7 @@ export interface UseSkillsResult {
     loadSkills: (scope?: string, search?: string) => Promise<void>;
     loadMore: () => Promise<void>;
     toggleEnabled: (skill: Skill) => Promise<void>;
-    publishSkill: (skill: Skill) => Promise<void>;
+    publishSkill: (skill: Skill, contributeToTeam?: boolean) => Promise<void>;
     requestPublish: (skill: Skill) => Promise<void>;
     approveSkill: (skill: Skill) => Promise<void>;
     rejectSkill: (skill: Skill, reason?: string) => Promise<void>;
@@ -91,9 +91,9 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
         }
     }, [sendRpc]);
 
-    const publishSkill = useCallback(async (skill: Skill) => {
+    const publishSkill = useCallback(async (skill: Skill, contributeToTeam?: boolean) => {
         try {
-            await sendRpc('skill.publish', { id: String(skill.id) });
+            await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam });
             await loadSkills();
         } catch (err) {
             console.error('[useSkills] publishSkill failed:', err);
@@ -111,7 +111,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
 
     const approveSkill = useCallback(async (skill: Skill) => {
         try {
-            await sendRpc('skill.approve', { id: String(skill.id) });
+            await sendRpc('skill.review', { id: String(skill.id), decision: 'approve' });
             await loadSkills();
         } catch (err) {
             console.error('[useSkills] approveSkill failed:', err);
@@ -120,7 +120,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
 
     const rejectSkill = useCallback(async (skill: Skill, reason?: string) => {
         try {
-            await sendRpc('skill.reject', { id: String(skill.id), reason });
+            await sendRpc('skill.review', { id: String(skill.id), decision: 'reject', reason });
             await loadSkills();
         } catch (err) {
             console.error('[useSkills] rejectSkill failed:', err);

@@ -174,11 +174,24 @@ const DDL_STATEMENTS = [
     UNIQUE (user_id, permission)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS skill_contents (
+    id TEXT PRIMARY KEY,
+    skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL DEFAULT 'working' CHECK(tag IN ('working', 'staging', 'published')),
+    specs TEXT,
+    scripts_json TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    UNIQUE (skill_id, tag)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS skill_versions (
     id TEXT PRIMARY KEY,
     skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
     version INTEGER NOT NULL,
-    s3_key TEXT NOT NULL,
+    s3_key TEXT,
+    specs TEXT,
+    scripts_json TEXT,
     files TEXT,
     commit_message TEXT,
     author_id TEXT REFERENCES users(id),
@@ -303,6 +316,7 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_user_env_configs_user ON user_env_configs(user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_user_env_configs_env ON user_env_configs(env_id)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_versions_skill ON skill_versions(skill_id, version)`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_contents_skill ON skill_contents(skill_id)`,
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
 ];
 

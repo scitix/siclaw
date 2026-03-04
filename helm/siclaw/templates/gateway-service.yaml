@@ -15,5 +15,9 @@ spec:
       {{- if and (eq .Values.gateway.service.type "NodePort") .Values.gateway.service.nodePort }}
       nodePort: {{ .Values.gateway.service.nodePort }}
       {{- end }}
+    - port: {{ .Values.gateway.service.internalPort | default 3002 }}
+      targetPort: https-internal
+      protocol: TCP
+      name: https-internal
   selector:
     {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}

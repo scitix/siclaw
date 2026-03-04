@@ -5,12 +5,23 @@
  *   { "labels": { "skill-dir-name": ["label1", "label2", ...] } }
  *
  * Gateway scans all tiers, merges into a single in-memory Map keyed by "scope:dirName".
+ * Core and extension labels are unified under the "builtin" key prefix.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 
-const TIERS = ["core", "team", "extension", "platform"];
+const TIERS = ["builtin", "team", "platform"];
+
+/**
+ * Mapping from tier name to the filesystem directories to scan.
+ * "builtin" merges both core/ and extension/ meta.json files.
+ */
+const TIER_DIRS: Record<string, string[]> = {
+  builtin: ["core", "extension"],
+  team: ["team"],
+  platform: ["platform"],
+};
 
 function loadLabelsFromDisk(): Record<string, string[]> {
   // Scan both the built-in skills dir and SICLAW_SKILLS_DIR (if set and different)
@@ -25,20 +36,24 @@ function loadLabelsFromDisk(): Record<string, string[]> {
 
   for (const skillsDir of dirs) {
   for (const tier of TIERS) {
-    const metaPath = path.join(skillsDir, tier, "meta.json");
-    if (!fs.existsSync(metaPath)) continue;
+    const dirs = TIER_DIRS[tier] ?? [tier];
+    for (const dir of dirs) {
+      const metaPath = path.join(skillsDir, dir, "meta.json");
+      if (!fs.existsSync(metaPath)) continue;
 
-    try {
-      const raw = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as {
-        labels?: Record<string, string[]>;
-      };
-      if (raw.labels) {
-        for (const [dirName, skillLabels] of Object.entries(raw.labels)) {
-          labels[`${tier}:${dirName}`] = skillLabels;
+      try {
+        const raw = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as {
+          labels?: Record<string, string[]>;
+        };
+        if (raw.labels) {
+          for (const [dirName, skillLabels] of Object.entries(raw.labels)) {
+            // All core/extension labels keyed as "builtin:{dirName}"
+            labels[`${tier}:${dirName}`] = skillLabels;
+          }
         }
+      } catch (err) {
+        console.warn(`[skill-labels] Failed to load ${metaPath}:`, err instanceof Error ? err.message : err);
       }
-    } catch (err) {
-      console.warn(`[skill-labels] Failed to load ${metaPath}:`, err instanceof Error ? err.message : err);
     }
   }
   }

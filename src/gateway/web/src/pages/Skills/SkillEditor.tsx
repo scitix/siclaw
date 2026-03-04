@@ -1,4 +1,4 @@
-import { X, Terminal, Plus, Trash2, Code2, Loader2, FileUp, FileCode, ArrowLeft, Save, LayoutTemplate, ChevronDown, Copy, Lock, Users, Eye, ShieldAlert, Puzzle, History, RotateCcw } from 'lucide-react';
+import { X, Terminal, Plus, Trash2, Code2, Loader2, FileUp, FileCode, ArrowLeft, Save, LayoutTemplate, ChevronDown, Copy, Lock, Users, Eye, ShieldAlert, History, RotateCcw } from 'lucide-react';
 import { Tooltip } from '../../components/Tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
@@ -466,16 +466,13 @@ export function SkillEditor() {
                         {formData.scope && formData.scope !== 'personal' && (
                             <span className={cn(
                                 "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium",
-                                formData.scope === 'core' ? "bg-gray-100 text-gray-700"
-                                    : formData.scope === 'extension' ? "bg-teal-50 text-teal-700"
+                                formData.scope === 'builtin' ? "bg-gray-100 text-gray-700"
                                     : "bg-blue-50 text-blue-700"
                             )}>
-                                {formData.scope === 'core' ? <Lock className="w-2.5 h-2.5" />
-                                    : formData.scope === 'extension' ? <Puzzle className="w-2.5 h-2.5" />
+                                {formData.scope === 'builtin' ? <Lock className="w-2.5 h-2.5" />
                                     : <Users className="w-2.5 h-2.5" />}
-                                {formData.scope === 'core' ? 'System Core'
-                                    : formData.scope === 'extension' ? 'System Extension'
-                                    : 'Team Shared'}
+                                {formData.scope === 'builtin' ? 'System Skills'
+                                    : 'Team Skills'}
                                 <span className="text-gray-400 ml-0.5">· Read-only</span>
                             </span>
                         )}

@@ -294,6 +294,28 @@ export function isSkillScript(cmd: string): boolean {
   }
 }
 
+/**
+ * Commands blocked in local bash — these can read local files or expose secrets,
+ * bypassing the path-restricted Read/Grep/Glob tools.
+ * Use dedicated tools instead: Read (cat), Glob (find/ls), Grep (grep on files).
+ *
+ * NOTE: ALLOWED_COMMANDS is shared with node-exec/pod-exec (remote contexts)
+ * where these commands are legitimate. Only restricted-bash (local) blocks them.
+ */
+const LOCAL_BLOCKED_COMMANDS = new Set([
+  // file reading — use Read tool (path-restricted to cwd)
+  "cat", "ls", "find", "stat", "file",
+  "readlink", "realpath", "basename", "dirname",
+  "diff", "md5sum", "sha256sum",
+  "strings", "lsof", "lsns",
+  // compressed file reading
+  "zcat", "zgrep", "bzcat", "xzcat",
+  // environment variable exposure — may contain API keys, DB passwords
+  "env", "printenv",
+  // not useful in restricted context
+  "pwd",
+]);
+
 interface RestrictedBashParams {
   command: string;
   timeout_seconds?: number;
@@ -316,6 +338,7 @@ This is the primary tool for all kubectl interactions. It runs through a shell, 
 
 Allowed commands: kubectl, grep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column, and other text processing tools.
 kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth, exec.
+Local file access commands (cat, ls, find, stat, env, etc.) are blocked — use the dedicated read/grep/glob tools instead.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
 Examples:
@@ -365,6 +388,11 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       for (const cmd of commands) {
         const binary = getCommandBinary(cmd);
         if (!binary) continue;
+        // Block local file-access commands (use Read/Grep/Glob tools instead)
+        if (LOCAL_BLOCKED_COMMANDS.has(binary)) {
+          violations.push(binary);
+          continue;
+        }
         if (ALLOWED_COMMANDS.has(binary) || binary === "kubectl") continue;
         // Allow skill scripts (skills/...) — both "bash script.sh" and direct invocation
         if (isSkillScript(cmd)) {

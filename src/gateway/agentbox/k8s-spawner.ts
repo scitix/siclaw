@@ -7,6 +7,7 @@
 import * as k8s from "@kubernetes/client-node";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
+import { CertificateManager } from "../security/cert-manager.js";
 
 export interface K8sSpawnerConfig {
   /** K8s namespace */
@@ -32,6 +33,7 @@ export class K8sSpawner implements BoxSpawner {
   private kc: k8s.KubeConfig;
   private coreApi: k8s.CoreV1Api;
   private config: Required<K8sSpawnerConfig>;
+  private certManager: CertificateManager | null = null;
 
   constructor(config?: K8sSpawnerConfig) {
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -41,6 +43,11 @@ export class K8sSpawner implements BoxSpawner {
     this.kc.loadFromDefault();
 
     this.coreApi = this.kc.makeApiClient(k8s.CoreV1Api);
+  }
+
+  /** Inject CertificateManager after DB initialization */
+  setCertManager(cm: CertificateManager): void {
+    this.certManager = cm;
   }
 
   /** Update the AgentBox image at runtime (takes effect on next spawn) */
@@ -95,6 +102,53 @@ export class K8sSpawner implements BoxSpawner {
 
 
 
+    // Issue client certificate for mTLS authentication (env encoded in cert)
+    if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
+    const podEnv = boxConfig.podEnv ?? "prod";
+    const certBundle = this.certManager.issueAgentBoxCertificate(userId, workspaceId, podName, podEnv);
+    const certSecretName = `${podName}-cert`;
+
+    // Create certificate Secret
+    try {
+      await this.coreApi.createNamespacedSecret({
+        namespace,
+        body: {
+          apiVersion: "v1",
+          kind: "Secret",
+          metadata: { name: certSecretName },
+          type: "kubernetes.io/tls",
+          data: {
+            "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
+            "tls.key": Buffer.from(certBundle.key).toString("base64"),
+            "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
+          },
+        },
+      });
+      console.log(`[k8s-spawner] Created certificate Secret ${certSecretName}`);
+    } catch (err: any) {
+      if (err.code === 409 || err.statusCode === 409) {
+        // Secret exists with stale cert — replace it
+        await this.coreApi.deleteNamespacedSecret({ name: certSecretName, namespace });
+        await this.coreApi.createNamespacedSecret({
+          namespace,
+          body: {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: { name: certSecretName },
+            type: "kubernetes.io/tls",
+            data: {
+              "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
+              "tls.key": Buffer.from(certBundle.key).toString("base64"),
+              "ca.crt": Buffer.from(certBundle.ca).toString("base64"),
+            },
+          },
+        });
+        console.log(`[k8s-spawner] Replaced certificate Secret ${certSecretName}`);
+      } else {
+        throw err;
+      }
+    }
+
     // Environment variables
     const env: k8s.V1EnvVar[] = [
       { name: "USER_ID", value: boxConfig.userId },
@@ -105,6 +159,7 @@ export class K8sSpawner implements BoxSpawner {
       { name: "SICLAW_USER_DATA_DIR", value: ".siclaw/user-data" },
       { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-gateway.${namespace}.svc.cluster.local:3002` },
       { name: "SICLAW_CREDENTIALS_DIR", value: "/home/agentbox/.credentials" },
+      { name: "SICLAW_CERT_PATH", value: "/etc/siclaw/certs" },
     ];
 
     // Pass workspace allowed tools
@@ -136,8 +191,16 @@ export class K8sSpawner implements BoxSpawner {
         restartPolicy: "Never",
         volumes: [
           {
-            name: "skills-pv",
-            persistentVolumeClaim: { claimName: "siclaw-skills" },
+            name: "skills-local",
+            emptyDir: {},
+          },
+          {
+            name: "user-data",
+            emptyDir: {},
+          },
+          {
+            name: "client-cert",
+            secret: { secretName: certSecretName },
           },
         ],
         containers: [
@@ -149,53 +212,17 @@ export class K8sSpawner implements BoxSpawner {
             env,
             volumeMounts: [
               {
-                name: "skills-pv",
-                mountPath: "/app/.siclaw/skills/core",
-                subPath: "core",
-                readOnly: true,
+                name: "skills-local",
+                mountPath: "/app/.siclaw/skills",
               },
               {
-                name: "skills-pv",
-                mountPath: "/app/.siclaw/skills/team",
-                subPath: "team",
-                readOnly: true,
-              },
-              {
-                name: "skills-pv",
-                mountPath: "/app/.siclaw/skills/user",
-                subPath: `user/${userId}/.ws-${workspaceId}`,
-                readOnly: true,
-              },
-              {
-                name: "skills-pv",
+                name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
                 subPath: `user/${userId}/agent-data`,
               },
               {
-                name: "skills-pv",
-                mountPath: "/app/.siclaw/mcp",
-                subPath: "mcp",
-                readOnly: true,
-              },
-              {
-                name: "skills-pv",
-                mountPath: "/home/agentbox/.credentials",
-                subPath: `user/${userId}/.ws-${workspaceId}/.credentials`,
-                readOnly: true,
-              },
-              // NOTE: These sub-path mounts coexist with the optional Secret-based
-              // kubeconfig mount at /home/agentbox/.kube — K8s allows more-specific
-              // mounts to overlay subdirectories without conflicts.
-              {
-                name: "skills-pv",
-                mountPath: "/home/agentbox/.kube/envs",
-                subPath: `user/${userId}/.kube/envs`,
-                readOnly: true,
-              },
-              {
-                name: "skills-pv",
-                mountPath: "/home/agentbox/.kube/defaults",
-                subPath: "_default_kubeconfigs",
+                name: "client-cert",
+                mountPath: "/etc/siclaw/certs",
                 readOnly: true,
               },
             ],
@@ -210,12 +237,12 @@ export class K8sSpawner implements BoxSpawner {
               },
             },
             readinessProbe: {
-              httpGet: { path: "/health", port: 3000 as any },
+              httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
               initialDelaySeconds: 2,
               periodSeconds: 2,
             },
             livenessProbe: {
-              httpGet: { path: "/health", port: 3000 as any },
+              httpGet: { path: "/health", port: 3000 as any, scheme: "HTTPS" },
               initialDelaySeconds: 10,
               periodSeconds: 10,
             },
@@ -334,7 +361,7 @@ export class K8sSpawner implements BoxSpawner {
         "True";
 
       if (phase === "Running" && ready && podIP) {
-        return `http://${podIP}:3000`;
+        return `https://${podIP}:3000`;
       }
 
       if (phase === "Failed" || phase === "Unknown") {
@@ -416,7 +443,7 @@ export class K8sSpawner implements BoxSpawner {
         boxId,
         userId,
         status,
-        endpoint: podIP ? `http://${podIP}:3000` : "",
+        endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
           ? new Date(pod.metadata.creationTimestamp)
           : new Date(),
@@ -450,7 +477,7 @@ export class K8sSpawner implements BoxSpawner {
         boxId: pod.metadata?.name || "",
         userId,
         status,
-        endpoint: podIP ? `http://${podIP}:3000` : "",
+        endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
           ? new Date(pod.metadata.creationTimestamp)
           : new Date(),

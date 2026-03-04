@@ -24,6 +24,9 @@ spec:
             - name: http
               containerPort: 3000
               protocol: TCP
+            - name: https-internal
+              containerPort: 3002
+              protocol: TCP
           env:
             - name: NODE_ENV
               value: "production"
@@ -41,6 +44,8 @@ spec:
               value: ".siclaw/skills"
             - name: SICLAW_CRON_SERVICE_URL
               value: "http://{{ include "siclaw.fullname" . }}-cron.{{ .Values.namespace }}.svc.cluster.local"
+            - name: SICLAW_GATEWAY_HOSTNAME
+              value: "{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local"
             {{- if .Values.database.existingSecret.name }}
             - name: SICLAW_DATABASE_URL
               valueFrom:
@@ -77,5 +82,4 @@ spec:
             periodSeconds: 10
       volumes:
         - name: skills
-          persistentVolumeClaim:
-            claimName: {{ include "siclaw.fullname" . }}-skills
+          emptyDir: {}

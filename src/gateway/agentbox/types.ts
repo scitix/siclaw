@@ -21,6 +21,8 @@ export interface AgentBoxConfig {
     cpu?: string;
     memory?: string;
   };
+  /** Pod environment type — determines which skills are available via bundle API */
+  podEnv?: "prod" | "dev";
 }
 
 /** AgentBox information */
