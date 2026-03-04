@@ -244,18 +244,27 @@ function buildAppendSystemPrompt(
           parts.push(`\n## Language Preference\n\nThis user's preferred language is **${lang}**. Start conversations in ${lang} by default. If the user switches to a different language, follow their lead naturally.`);
         }
       }
+
+      // Detect TBD fields and prompt model to fill them during conversation
+      const tbdFields: string[] = [];
+      const fieldRegex = /\*\*(\w+)\*\*:\s*TBD/gi;
+      let tbdMatch;
+      while ((tbdMatch = fieldRegex.exec(profileContent)) !== null) {
+        tbdFields.push(tbdMatch[1]);
+      }
+      if (tbdFields.length > 0) {
+        parts.push(`\n## Profile Update Needed\n\nThe user's profile has incomplete fields: **${tbdFields.join(", ")}**.\nWhen the user mentions relevant info during conversation (e.g. their role, name, what infrastructure they manage), update \`${memoryDir}/PROFILE.md\` immediately using the write tool. Replace the "TBD" value with what you learned. Do not ask the user explicitly — just pick it up naturally from context.`);
+      }
     }
   } else {
     // First-session: instruct agent to introduce itself and collect user context
     parts.push(`\n## First Session — Getting to Know the User
 
-This is a new user (no PROFILE.md found). In your first interaction:
-1. Introduce yourself warmly as Siclaw, a personal SRE assistant that learns and remembers.
-2. Briefly mention your key capabilities: skill-based diagnostics, deep investigation, persistent memory, scheduled automation.
-3. Through natural conversation, learn about the user: their name, role, what infrastructure they manage.
+No PROFILE.md found. This is a new user.
 
-**CRITICAL — You MUST write PROFILE.md:**
-After the user's FIRST reply that contains ANY identifying info (name, role, team, or what they work on), you MUST immediately use the write tool to create \`${memoryDir}/PROFILE.md\`. Do NOT wait for multiple exchanges. Do NOT skip this step. Fill in what you know and leave unknowns as "TBD".
+1. Greet warmly as Siclaw, briefly mention key capabilities (diagnostics, investigation, memory, automation).
+2. Through natural conversation, learn: name, role, infrastructure.
+3. After user's FIRST reply with any identifying info, IMMEDIATELY write \`${memoryDir}/PROFILE.md\`:
 
 \`\`\`markdown
 # User Profile
@@ -263,10 +272,10 @@ After the user's FIRST reply that contains ANY identifying info (name, role, tea
 - **Role**: ...
 - **Infrastructure**: ...
 - **Preferences**: ...
-- **Language**: ... (the language the user communicates in, default to "English" if unclear)
+- **Language**: ... (user's communication language)
 \`\`\`
 
-This file controls whether the onboarding flow is shown. If you do not write it, the user will be stuck in the onboarding loop forever.`);
+Writing this file exits the onboarding flow. Fill what you know, use "TBD" for unknowns. Do NOT delay.`);
   }
 
   const memoryFile = path.join(memoryDir, "MEMORY.md");

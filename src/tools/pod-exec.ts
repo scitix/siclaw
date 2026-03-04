@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
+import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { validateCommand } from "./node-exec.js";
 import { parseArgs } from "./command-sets.js";
 
@@ -103,6 +104,8 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams) {
       const params = rawParams as PodExecParams;
+      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
+      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const childEnv = {
         ...process.env,
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
@@ -130,7 +133,7 @@ Examples:
       }
 
       // Check pod exists and is Running
-      const podCheckErr = await checkPodRunning(pod, namespace, childEnv);
+      const podCheckErr = await checkPodRunning(pod, namespace, childEnv, kubeconfigPath ?? undefined);
       if (podCheckErr) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: podCheckErr }, null, 2) }],
@@ -142,7 +145,7 @@ Examples:
       const cmdArgs = parseArgs(params.command);
 
       // Build kubectl exec args
-      const kubectlArgs = ["exec", pod, "-n", namespace];
+      const kubectlArgs = [...kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }

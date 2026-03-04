@@ -257,6 +257,15 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     }
 
+    // Universal fallback: clear gate regardless of brain type / dpState.
+    // Pi-agent's extension input handler should also clear it, but if the
+    // extension state wasn't restored (TTL release/restore race), this ensures
+    // the gate is cleared before the agent processes the confirmation message.
+    if (deepSearchGate.blocked && promptText.includes("user has confirmed hypotheses")) {
+      deepSearchGate.blocked = false;
+      console.log(`[agentbox-http] Gate cleared by universal fallback for session ${managed.id}`);
+    }
+
     // Execute prompt asynchronously; notify SSE to close on completion
     console.log(`[agentbox-http] Starting prompt for session ${managed.id}`);
     const actuallyFinish = () => {
