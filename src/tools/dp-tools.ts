@@ -13,7 +13,6 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { deepSearchGate } from "./deep-search/events.js";
 
 // --- Shared types ---
 
@@ -124,7 +123,6 @@ export function createManageChecklistTool(dpState: DpState): ToolDefinition {
       const conclusionItem = dpState.checklist.items.find((i) => i.id === "conclusion");
       if (conclusionItem?.status === "done") {
         dpState.checklist = null;
-        deepSearchGate.blocked = false;
       }
 
       return {
@@ -137,17 +135,19 @@ export function createManageChecklistTool(dpState: DpState): ToolDefinition {
 
 /**
  * Create the propose_hypotheses tool.
- * In SDK/gateway mode: returns "waiting for confirmation" + blocks the gate.
+ * Non-blocking: presents hypotheses to the user and immediately tells
+ * the model to proceed. The frontend renders them for user review;
+ * if the user wants changes they can send a follow-up message.
  */
 export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
   return {
     name: "propose_hypotheses",
     label: "Propose Hypotheses",
     description:
-      "Present hypotheses to the user for confirmation during deep investigation. " +
+      "Present hypotheses to the user during deep investigation. " +
       "Call this after triage to propose 3-5 ranked hypotheses. " +
-      "The tool will show the hypotheses to the user and wait for their confirmation or edits. " +
-      "Only available in deep investigation mode.",
+      "This is non-blocking — after presenting, proceed to call deep_search immediately. " +
+      "The user can interrupt with edits if needed.",
     parameters: Type.Object({
       hypotheses: Type.String({
         description:
@@ -162,13 +162,9 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
 
-      // Gateway/SDK mode — block gate, wait for user confirmation
-      deepSearchGate.blocked = true;
-      const userResponse = "Hypotheses submitted for user review.\n\nSTOP. Do NOT call any more tools. Do NOT call deep_search. Do NOT fall back to manual investigation.\nWait for the user to confirm — their confirmation message will appear as a new user message.\nYour next output should ONLY be a brief text message telling the user you are waiting for their confirmation.";
-
       return {
-        content: [{ type: "text" as const, text: userResponse }],
-        details: { hypotheses: hypothesesText, autoConfirmed: false },
+        content: [{ type: "text" as const, text: "Hypotheses presented to user. Proceed to call deep_search with these hypotheses." }],
+        details: { hypotheses: hypothesesText },
       };
     },
   };
@@ -205,7 +201,6 @@ export function createEndInvestigationTool(dpState: DpState): ToolDefinition {
         }
       }
       dpState.checklist = null;
-      deepSearchGate.blocked = false;
       return {
         content: [{ type: "text" as const, text: `Investigation ended: ${reason}` }],
         details: {},

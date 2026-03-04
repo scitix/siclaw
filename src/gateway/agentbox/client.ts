@@ -167,15 +167,6 @@ export class AgentBoxClient {
   }
 
   /**
-   * Confirm hypotheses — directly clears the deep_search gate
-   */
-  async confirmHypotheses(sessionId: string): Promise<void> {
-    await this.fetch(`/api/sessions/${sessionId}/confirm-hypotheses`, {
-      method: "POST",
-    });
-  }
-
-  /**
    * Abort the current prompt execution
    */
   async abortSession(sessionId: string): Promise<void> {

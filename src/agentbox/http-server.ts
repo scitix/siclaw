@@ -11,7 +11,7 @@ import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
-import { deepSearchEvents, deepSearchGate, HYPOTHESES_CONFIRMED_SENTINEL } from "../tools/deep-search/events.js";
+import { deepSearchEvents } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 
@@ -235,33 +235,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           }
         }
         dpState.checklist = null;
-        deepSearchGate.blocked = false;
         promptText = `The user has exited deep investigation mode. ${userText}`;
         console.log(`[agentbox-http] DP exited for SDK brain, session ${managed.id}`);
-      } else if (deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
-        deepSearchGate.blocked = false;
-        if (dpState.checklist) {
-          const hypItem = dpState.checklist.items.find((i) => i.id === "hypotheses");
-          if (hypItem && hypItem.status !== "done") {
-            hypItem.status = "done";
-            if (!hypItem.summary) hypItem.summary = "Confirmed";
-          }
-          const dsItem = dpState.checklist.items.find((i) => i.id === "deep_search");
-          if (dsItem && dsItem.status !== "done") {
-            dsItem.status = "in_progress";
-          }
-        }
-        console.log(`[agentbox-http] DP hypotheses confirmed for SDK brain, session ${managed.id}`);
       }
-    }
-
-    // Universal fallback: clear gate regardless of brain type / dpState.
-    // Pi-agent's extension input handler should also clear it, but if the
-    // extension state wasn't restored (TTL release/restore race), this ensures
-    // the gate is cleared before the agent processes the confirmation message.
-    if (deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
-      deepSearchGate.blocked = false;
-      console.log(`[agentbox-http] Gate cleared by universal fallback for session ${managed.id}`);
     }
 
     // Execute prompt asynchronously; notify SSE to close on completion
@@ -441,40 +417,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       managed._promptDoneCallbacks.delete(cleanup);
       unsubAll();
     });
-  });
-
-  /**
-   * POST /api/sessions/:sessionId/confirm-hypotheses - directly clear the deep_search gate
-   * Bypasses the steer/input pipeline to ensure the gate is reliably cleared.
-   */
-  addRoute("POST", "/api/sessions/:sessionId/confirm-hypotheses", async (_req, res, params) => {
-    const { sessionId } = params;
-
-    // Always clear the gate first — it's a process-level singleton, not per-session.
-    // The session may have been released by TTL, but the gate still needs clearing.
-    console.log(`[agentbox-http] Confirming hypotheses for session ${sessionId}, clearing gate`);
-    deepSearchGate.blocked = false;
-
-    const managed = sessionManager.get(sessionId);
-    if (!managed) {
-      sendJson(res, 200, { ok: true, gateCleared: true, sessionFound: false });
-      return;
-    }
-
-    // Also update SDK brain dpState checklist (pi-agent does this in extension input handler)
-    if (managed.dpState?.checklist) {
-      const hypItem = managed.dpState.checklist.items.find((i) => i.id === "hypotheses");
-      if (hypItem && hypItem.status !== "done") {
-        hypItem.status = "done";
-        if (!hypItem.summary) hypItem.summary = "Confirmed";
-      }
-      const dsItem = managed.dpState.checklist.items.find((i) => i.id === "deep_search");
-      if (dsItem && dsItem.status !== "done") {
-        dsItem.status = "in_progress";
-      }
-    }
-
-    sendJson(res, 200, { ok: true, gateCleared: true });
   });
 
   /**
