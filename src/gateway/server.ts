@@ -20,6 +20,7 @@ import { PermissionRepository } from "./db/repositories/permission-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
+import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 
@@ -108,10 +109,7 @@ export interface StartGatewayOptions {
 export async function startGateway(opts: StartGatewayOptions): Promise<GatewayServer> {
   const { config, agentBoxManager, extraRpcMethods, extraHttpHandlers } = opts;
 
-  // Track users with active internal API calls (cron, triggers) to prevent WS teardown from killing their pods
-  const activeInternalUsers = new Set<string>();
-
-  // Track users with active SSE prompt streams (web UI) to prevent WS teardown from killing mid-execution pods
+  // Track users with active SSE prompt streams (web UI)
   const activePromptUsers = new Set<string>();
 
   const clients = new Set<WebSocket>();
@@ -170,6 +168,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     });
   }
 
+  // Workspace repo (used by internal API to resolve default workspace)
+  const internalWorkspaceRepo = db ? new WorkspaceRepository(db) : null;
+
   // System config repo (used by JWT, SSO, cert-manager, etc.)
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
 
@@ -187,7 +188,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   };
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions);
 
   // Apply DB-stored agentbox image override (takes effect on next pod spawn)
   if (sysConfigRepo) {
@@ -722,30 +723,27 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
           console.log(`[gateway] agent-prompt from=${caller} user=${userId} session=${data.sessionId}`);
 
-          // Protect from WS teardown while internal call is active
-          activeInternalUsers.add(userId);
-          try {
-            // 1. Get or create user's AgentBox (default workspace for internal API calls)
-            const handle = await agentBoxManager.getOrCreate(userId, "default");
-            const client = new AgentBoxClient(handle.endpoint);
+          // 1. Get or create user's AgentBox (resolve real workspace ID from DB)
+          const wsId = internalWorkspaceRepo
+            ? (await internalWorkspaceRepo.getOrCreateDefault(userId)).id
+            : "default";
+          const handle = await agentBoxManager.getOrCreate(userId, wsId);
+          const client = new AgentBoxClient(handle.endpoint);
 
-            // 2. Send prompt
-            const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
+          // 2. Send prompt
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
 
-            // 3. Wait for completion with timeout
-            const resultText = await Promise.race([
-              waitForAgentCompletion(client, promptResult.sessionId),
-              rejectAfterTimeout(timeoutMs, data.sessionId),
-            ]);
+          // 3. Wait for completion with timeout
+          const resultText = await Promise.race([
+            waitForAgentCompletion(client, promptResult.sessionId),
+            rejectAfterTimeout(timeoutMs, data.sessionId),
+          ]);
 
-            const durationMs = Date.now() - startTime;
-            console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
+          const durationMs = Date.now() - startTime;
+          console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
 
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", resultText, durationMs }));
-          } finally {
-            activeInternalUsers.delete(userId);
-          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success", resultText, durationMs }));
         } catch (err) {
           const durationMs = Date.now() - startTime;
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -903,9 +901,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     }
   });
 
-  // Grace period timers for delayed agentbox teardown
-  const teardownTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
   // -- WebSocket keep-alive: ping every 30s, terminate unresponsive clients --
   const PING_INTERVAL = 30_000;
   const aliveClients = new WeakSet<WebSocket>();
@@ -941,23 +936,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
         userConnections.set(auth.userId, conns);
       }
       conns.add(ws);
-
-      // Cancel pending teardown if user reconnected within grace period
-      const pendingTeardown = teardownTimers.get(auth.userId);
-      if (pendingTeardown) {
-        clearTimeout(pendingTeardown);
-        teardownTimers.delete(auth.userId);
-        console.log(`[gateway] Cancelled AgentBox teardown for ${auth.username} (reconnected)`);
-      }
-
-      // Create AgentBox on first connection for this user
-      if (conns.size === 1) {
-        agentBoxManager.getOrCreate(auth.userId).then((handle) => {
-          console.log(`[gateway] AgentBox ready for ${auth.username}: ${handle.boxId}`);
-        }).catch((err) => {
-          console.error(`[gateway] AgentBox create failed for ${auth.username}:`, err.message);
-        });
-      }
     }
 
     ws.on("message", async (data) => {
@@ -969,11 +947,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
         return;
       }
       console.log(`[gateway] RPC: ${frame.method} id=${frame.id} user=${authWs.auth?.username || "anonymous"}`);
-
-      // Keep agentbox alive while user is active
-      if (authWs.auth?.userId) {
-        agentBoxManager.touch(authWs.auth.userId);
-      }
 
       // Build RPC context with auth info and event sender
       const context: RpcContext = {
@@ -989,6 +962,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             console.warn(`[gateway] WS not open, dropping event: ${event} for userId=${authWs.auth?.userId ?? "unknown"}`);
           }
         },
+        ws,
       };
 
       await dispatchRpc(rpcMethods, frame, ws, context);
@@ -997,28 +971,16 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     ws.on("close", () => {
       clients.delete(ws);
 
-      // Remove from per-user tracking and stop AgentBox when last connection closes
+      // Abort SSE streams associated with this WS connection
+      cleanupForWs(ws);
+
+      // Remove from per-user tracking
       if (auth?.userId) {
         const conns = userConnections.get(auth.userId);
         if (conns) {
           conns.delete(ws);
           if (conns.size === 0) {
             userConnections.delete(auth.userId);
-            // Grace period: wait 30s before stopping (in case user refreshes the page)
-            console.log(`[gateway] Last WS for ${auth.username} closed, will stop AgentBox in 30s`);
-            const timer = setTimeout(() => {
-              teardownTimers.delete(auth.userId);
-              // Skip teardown if the agent is still running (internal API or web prompt)
-              if (activeInternalUsers.has(auth.userId) || activePromptUsers.has(auth.userId)) {
-                console.log(`[gateway] Skipping AgentBox teardown for ${auth.username} (active prompt/internal API)`);
-                return;
-              }
-              console.log(`[gateway] Stopping all AgentBoxes for ${auth.username} (no reconnect)`);
-              agentBoxManager.stopAll(auth.userId).catch((err) => {
-                console.error(`[gateway] AgentBox stopAll failed for ${auth.username}:`, err.message);
-              });
-            }, 30_000);
-            teardownTimers.set(auth.userId, timer);
           }
         }
       }
@@ -1031,13 +993,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       clients.delete(ws);
     });
   });
-
-  // Keep AgentBox alive for all users with active WebSocket connections
-  setInterval(() => {
-    for (const userId of userConnections.keys()) {
-      agentBoxManager.touch(userId);
-    }
-  }, 60_000);
 
   // Short keep-alive so idle HTTP connections free up quickly.
   // Browsers limit per-host connections (Chrome: 6). Page assets can fill all

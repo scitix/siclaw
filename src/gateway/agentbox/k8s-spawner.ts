@@ -187,6 +187,8 @@ export class K8sSpawner implements BoxSpawner {
         },
       },
       spec: {
+        hostname: podName,
+        subdomain: "agentbox-hs",
         automountServiceAccountToken: false,
         restartPolicy: "Never",
         volumes: [

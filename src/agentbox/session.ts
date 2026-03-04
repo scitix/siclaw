@@ -74,6 +74,9 @@ export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private defaultSessionId = "default";
 
+  /** Callback fired after a session is released — used by http-server to check idle status */
+  onSessionRelease?: () => void;
+
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
   /** Whether shared components have been initialized */
@@ -322,6 +325,14 @@ export class AgentBoxSessionManager {
   }
 
   /**
+   * Get the number of active (in-memory) sessions.
+   * Used by http-server idle self-destruct to decide when to start the shutdown timer.
+   */
+  activeCount(): number {
+    return this.sessions.size;
+  }
+
+  /**
    * Schedule a delayed release for a session.
    * The release happens after SESSION_RELEASE_TTL_MS of idle time.
    * If a new prompt arrives before the TTL expires, getOrCreate() cancels the timer.
@@ -400,6 +411,8 @@ export class AgentBoxSessionManager {
     if (this.sessions.get(sessionId) === managed) {
       this.sessions.delete(sessionId);
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
+      // Notify http-server to check idle status
+      this.onSessionRelease?.();
     } else {
       console.log(`[agentbox-session] Session ${sessionId} was replaced during release, skipping delete`);
     }

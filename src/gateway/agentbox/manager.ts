@@ -3,26 +3,26 @@
  *
  * Manages the lifecycle of AgentBoxes and provides a high-level API:
  * - Get or create an AgentBox by userId
- * - Automatic health checks and reclamation
- * - Multiple Spawner support
+ * - K8s: stateless, queries K8s API each time (no in-memory cache)
+ * - Local dev: in-memory cache for fast lookups
  */
 
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 
 export interface AgentBoxManagerConfig {
-  /** Idle timeout (ms); box is automatically reclaimed after this period */
-  idleTimeoutMs?: number;
-  /** Health check interval (ms) */
+  /** Health check interval (ms) — local dev only */
   healthCheckIntervalMs?: number;
   /** Maximum number of retries */
   maxRetries?: number;
+  /** K8s namespace */
+  namespace?: string;
 }
 
 const DEFAULT_CONFIG: Required<AgentBoxManagerConfig> = {
-  idleTimeoutMs: 30 * 60 * 1000, // 30 minutes
   healthCheckIntervalMs: 60 * 1000, // 1 minute
   maxRetries: 3,
+  namespace: "default",
 };
 
 interface ManagedBox {
@@ -37,20 +37,27 @@ export class AgentBoxManager {
   private spawner: BoxSpawner;
   private config: Required<AgentBoxManagerConfig>;
 
-  /** "userId:workspaceId" → ManagedBox */
+  /**
+   * In-memory cache — used ONLY for local dev spawners (process, local).
+   * K8s spawner queries the K8s API each time and bypasses this cache.
+   */
   private boxes = new Map<string, ManagedBox>();
 
-  /** Health check timer */
+  /** Health check timer (local dev only) */
   private healthCheckTimer?: ReturnType<typeof setInterval>;
 
   /** Optional async resolver that provides extra env vars for new AgentBoxes */
   private envResolver?: EnvResolver;
 
+  /** Whether the spawner is K8s-based (stateless, no in-memory cache) */
+  private readonly isK8s: boolean;
+
   constructor(spawner: BoxSpawner, config?: AgentBoxManagerConfig) {
     this.spawner = spawner;
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.isK8s = spawner.name === "k8s";
 
-    console.log(`[agentbox-manager] Initialized with spawner: ${spawner.name}`);
+    console.log(`[agentbox-manager] Initialized with spawner: ${spawner.name}${this.isK8s ? " (stateless, K8s API discovery)" : " (in-memory cache)"}`);
   }
 
   /**
@@ -76,10 +83,10 @@ export class AgentBoxManager {
   }
 
   /**
-   * Start health check
+   * Start health check (local dev only — removes stale entries from in-memory cache)
    */
   startHealthCheck(): void {
-    if (this.healthCheckTimer) return;
+    if (this.isK8s || this.healthCheckTimer) return;
 
     this.healthCheckTimer = setInterval(async () => {
       await this.runHealthCheck();
@@ -107,25 +114,21 @@ export class AgentBoxManager {
   }
 
   /**
-   * Run health check
+   * Build deterministic pod name (must match K8sSpawner.podName)
+   */
+  private podName(userId: string, workspaceId: string): string {
+    const sanitizedUser = userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+    const wsSuffix = workspaceId
+      ? workspaceId.replace(/[^a-z0-9]/g, "").slice(0, 8)
+      : "default";
+    return `agentbox-${sanitizedUser}-${wsSuffix}`;
+  }
+
+  /**
+   * Run health check (local dev only — cleans stale entries)
    */
   private async runHealthCheck(): Promise<void> {
-    const now = Date.now();
-
     for (const [key, managed] of this.boxes.entries()) {
-      const idleTime = now - managed.lastActiveAt.getTime();
-
-      // Check if idle timeout has been exceeded
-      if (idleTime > this.config.idleTimeoutMs) {
-        console.log(
-          `[agentbox-manager] Box ${key} idle for ${idleTime}ms, stopping...`,
-        );
-        await this.spawner.stop(managed.handle.boxId);
-        this.boxes.delete(key);
-        continue;
-      }
-
-      // Check whether the Pod still exists
       const info = await this.spawner.get(managed.handle.boxId);
       if (!info || info.status === "stopped" || info.status === "error") {
         console.log(`[agentbox-manager] Box ${key} is gone, removing from cache`);
@@ -138,28 +141,78 @@ export class AgentBoxManager {
    * Get or create an AgentBox
    */
   async getOrCreate(userId: string, workspaceId = "default", config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    if (this.isK8s) {
+      return this.getOrCreateK8s(userId, workspaceId, config);
+    }
+    return this.getOrCreateLocal(userId, workspaceId, config);
+  }
+
+  /**
+   * K8s path: stateless — queries K8s API each time, uses Pod IP endpoint.
+   * Any Gateway pod can call this (K8s API is cluster-wide).
+   */
+  private async getOrCreateK8s(userId: string, workspaceId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    const name = this.podName(userId, workspaceId);
+
+    // 1. Check if pod already exists and is running
+    const info = await this.spawner.get(name);
+    if (info && info.status === "running" && info.endpoint) {
+      return { boxId: name, userId, endpoint: info.endpoint };
+    }
+
+    // 2. Pod doesn't exist or not running → create
+    console.log(`[agentbox-manager] Creating new AgentBox for user: ${userId} workspace: ${workspaceId}`);
+
+    const resolvedEnv = await this.resolveEnv(config?.env);
+    const handle = await this.spawner.spawn({
+      userId,
+      workspaceId,
+      ...config,
+      env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
+    });
+
+    // 3. Return handle with Pod IP endpoint (from spawner.spawn → waitForPodReady)
+    return handle;
+  }
+
+  /**
+   * Local dev path: in-memory cache
+   */
+  private async getOrCreateLocal(userId: string, workspaceId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
     const key = this.boxKey(userId, workspaceId);
 
     // Check cache
     const existing = this.boxes.get(key);
     if (existing) {
-      // Update last active time
       existing.lastActiveAt = new Date();
-
-      // Verify the Box still exists
       const info = await this.spawner.get(existing.handle.boxId);
       if (info && info.status === "running") {
         return existing.handle;
       }
-
-      // Box is stale, remove from cache
       this.boxes.delete(key);
     }
 
-    // Create a new AgentBox
     console.log(`[agentbox-manager] Creating new AgentBox for user: ${userId} workspace: ${workspaceId}`);
 
-    // Resolve extra env vars from DB (e.g. LLM/Embedding provider config)
+    const resolvedEnv = await this.resolveEnv(config?.env);
+    const handle = await this.spawner.spawn({
+      userId,
+      workspaceId,
+      ...config,
+      env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
+    });
+
+    this.boxes.set(key, {
+      handle,
+      lastActiveAt: new Date(),
+      createdAt: new Date(),
+    });
+
+    return handle;
+  }
+
+  /** Resolve merged env vars */
+  private async resolveEnv(configEnv?: Record<string, string>): Promise<Record<string, string>> {
     let resolvedEnv: Record<string, string> | undefined;
     if (this.envResolver) {
       try {
@@ -168,31 +221,22 @@ export class AgentBoxManager {
         console.warn("[agentbox-manager] envResolver failed, continuing without extra env:", err);
       }
     }
-
-    const mergedEnv = { ...config?.env, ...resolvedEnv };
-
-    const handle = await this.spawner.spawn({
-      userId,
-      workspaceId,
-      ...config,
-      env: Object.keys(mergedEnv).length > 0 ? mergedEnv : undefined,
-    });
-
-    const managed: ManagedBox = {
-      handle,
-      lastActiveAt: new Date(),
-      createdAt: new Date(),
-    };
-
-    this.boxes.set(key, managed);
-
-    return handle;
+    return { ...configEnv, ...resolvedEnv };
   }
 
   /**
-   * Get an AgentBox (without auto-creating)
+   * Get an AgentBox (without auto-creating).
+   *
+   * NOTE: This is synchronous, so for K8s it cannot query the API.
+   * Returns undefined for K8s — callers should use getOrCreate() or
+   * the async getAsync() instead.
    */
   get(userId: string, workspaceId = "default"): AgentBoxHandle | undefined {
+    if (this.isK8s) {
+      // Cannot query K8s API synchronously — return undefined.
+      // Callers that need K8s handles should use getOrCreate() or getAsync().
+      return undefined;
+    }
     const key = this.boxKey(userId, workspaceId);
     const managed = this.boxes.get(key);
     if (managed) {
@@ -203,15 +247,35 @@ export class AgentBoxManager {
   }
 
   /**
+   * Get an AgentBox asynchronously (without auto-creating).
+   * For K8s: queries the K8s API to find the running pod.
+   */
+  async getAsync(userId: string, workspaceId = "default"): Promise<AgentBoxHandle | undefined> {
+    if (this.isK8s) {
+      const name = this.podName(userId, workspaceId);
+      const info = await this.spawner.get(name);
+      if (info && info.status === "running" && info.endpoint) {
+        return { boxId: name, userId, endpoint: info.endpoint };
+      }
+      return undefined;
+    }
+    return this.get(userId, workspaceId);
+  }
+
+  /**
    * Stop the AgentBox for a given user and workspace
    */
   async stop(userId: string, workspaceId = "default"): Promise<void> {
+    if (this.isK8s) {
+      const name = this.podName(userId, workspaceId);
+      console.log(`[agentbox-manager] Stopping AgentBox ${name}`);
+      await this.spawner.stop(name);
+      return;
+    }
     const key = this.boxKey(userId, workspaceId);
     const managed = this.boxes.get(key);
     if (!managed) return;
-
     console.log(`[agentbox-manager] Stopping AgentBox for ${key}`);
-
     await this.spawner.stop(managed.handle.boxId);
     this.boxes.delete(key);
   }
@@ -220,6 +284,16 @@ export class AgentBoxManager {
    * Stop ALL AgentBoxes for a given user (across all workspaces)
    */
   async stopAll(userId: string): Promise<void> {
+    if (this.isK8s) {
+      const allBoxes = await this.spawner.list();
+      for (const box of allBoxes) {
+        if (box.userId === userId) {
+          console.log(`[agentbox-manager] Stopping AgentBox ${box.boxId}`);
+          await this.spawner.stop(box.boxId);
+        }
+      }
+      return;
+    }
     const toRemove: string[] = [];
     for (const [key, managed] of this.boxes) {
       if (key.startsWith(userId + ":")) {
@@ -235,6 +309,11 @@ export class AgentBoxManager {
 
   /** Get all active user IDs with running AgentBoxes (deduplicated) */
   activeUserIds(): string[] {
+    if (this.isK8s) {
+      // Cannot determine from in-memory state — return empty.
+      // Callers (e.g. notifyAllSkillReload) should use spawner.list() instead.
+      return [];
+    }
     const userIds = new Set<string>();
     for (const key of this.boxes.keys()) {
       const userId = key.split(":")[0];
@@ -245,6 +324,11 @@ export class AgentBoxManager {
 
   /** Get all AgentBox handles for a given user (across all workspaces) */
   getForUser(userId: string): AgentBoxHandle[] {
+    if (this.isK8s) {
+      // Cannot query K8s API synchronously — return empty.
+      // Skill reload notifications will be picked up on next prompt.
+      return [];
+    }
     const handles: AgentBoxHandle[] = [];
     for (const [key, managed] of this.boxes) {
       if (key.startsWith(userId + ":")) {
@@ -262,9 +346,10 @@ export class AgentBoxManager {
   }
 
   /**
-   * Update last active time
+   * Update last active time (no-op for K8s — AgentBox self-governs)
    */
   touch(userId: string, workspaceId = "default"): void {
+    if (this.isK8s) return;
     const key = this.boxKey(userId, workspaceId);
     const managed = this.boxes.get(key);
     if (managed) {

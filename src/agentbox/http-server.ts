@@ -105,6 +105,39 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     ensureProxy().catch(err => console.warn("[agentbox] LLM proxy pre-start failed:", err));
   }
 
+  // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
+  const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  let activeSseCount = 0;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function resetIdleTimer(): void {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function checkIdle(): void {
+    if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+      if (idleTimer) return; // already scheduled
+      idleTimer = setTimeout(() => {
+        // Re-check before exiting (new connection may have arrived)
+        if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
+          console.log("[agentbox] No connections for 5 min, shutting down");
+          process.exit(0);
+        }
+        idleTimer = null;
+      }, IDLE_TIMEOUT_MS);
+      console.log(`[agentbox] Idle detected, will shut down in ${IDLE_TIMEOUT_MS / 1000}s if no activity`);
+    }
+  }
+
+  // Start initial idle check (pod may never receive any connections)
+  checkIdle();
+
+  // Wire session release → idle check (session released after TTL)
+  sessionManager.onSessionRelease = () => checkIdle();
+
   const routes: Route[] = [];
 
   // Route registration helper
@@ -352,6 +385,10 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     console.log(`[agentbox-http] Starting SSE stream for session ${sessionId}`);
 
+    // Track active SSE connections for idle self-destruct
+    activeSseCount++;
+    resetIdleTimer();
+
     // Set SSE response headers
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -432,12 +469,23 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       deepSearchEvents.off("progress", deepProgressSSEHandler);
     };
 
+    // Decrement SSE counter and check idle (called once per SSE lifecycle)
+    let sseCountDecremented = false;
+    const decrementSse = () => {
+      if (!sseCountDecremented) {
+        sseCountDecremented = true;
+        activeSseCount--;
+        checkIdle();
+      }
+    };
+
     // Close SSE when prompt completes
     const cleanup = () => {
       console.log(`[agentbox-http] SSE closing for session ${sessionId} (prompt done, ${sseEventCount} events sent)`);
       clearInterval(heartbeat);
       unsubAll();
       closeSSE();
+      decrementSse();
     };
     managed._promptDoneCallbacks.add(cleanup);
 
@@ -448,6 +496,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       clearInterval(heartbeat);
       managed._promptDoneCallbacks.delete(cleanup);
       unsubAll();
+      decrementSse();
     });
 
     // Handle response errors
@@ -457,6 +506,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       clearInterval(heartbeat);
       managed._promptDoneCallbacks.delete(cleanup);
       unsubAll();
+      decrementSse();
     });
   });
 

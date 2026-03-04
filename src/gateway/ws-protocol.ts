@@ -71,6 +71,8 @@ export interface RpcContext {
   auth?: { userId: string; username: string };
   /** Send an event to the requesting WebSocket client only */
   sendEvent: SendEventFn;
+  /** Reference to the originating WebSocket connection */
+  ws?: WebSocket;
 }
 
 export type RpcHandler = (

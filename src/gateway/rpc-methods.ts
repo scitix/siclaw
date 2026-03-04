@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions, type AgentBoxTlsOptions } from "./agentbox/client.js";
+import type { WebSocket } from "ws";
 import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
@@ -64,6 +65,8 @@ export function createRpcMethods(
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
   getSkillBundle: (userId: string, env: "prod" | "dev") => Promise<SkillBundle>;
+  /** Abort all SSE streams associated with a specific WebSocket connection */
+  cleanupForWs: (ws: WebSocket) => void;
 } {
   const methods = new Map<string, RpcHandler>();
 
@@ -96,10 +99,13 @@ export function createRpcMethods(
   async function findAgentBoxForSession(userId: string, sessionId?: string): Promise<import("./agentbox/types.js").AgentBoxHandle | undefined> {
     if (sessionId) {
       const wsId = await resolveSessionWorkspace(sessionId);
-      const handle = agentBoxManager.get(userId, wsId);
+      const handle = await agentBoxManager.getAsync(userId, wsId);
       if (handle) return handle;
     }
-    // Fallback: try any active box for this user
+    // Fallback: try any active box for this user (async for K8s)
+    const handle = await agentBoxManager.getAsync(userId);
+    if (handle) return handle;
+    // Final fallback: sync path for local dev
     const handles = agentBoxManager.getForUser(userId);
     return handles[0];
   }
@@ -274,11 +280,12 @@ export function createRpcMethods(
     }
   }
 
-  // Active SSE subscriptions (userId → stream info)
+  // Active SSE subscriptions (userId:sessionId → stream info)
   const activeStreams = new Map<string, {
     abort: () => void;
     endpoint: string;
     sessionId: string;
+    ws?: WebSocket;
   }>();
 
   // Cached deep_search progress snapshots for reconnecting clients
@@ -320,7 +327,7 @@ export function createRpcMethods(
     if (chatRepo) {
       if (sessionId) {
         const existing = await chatRepo.getSession(sessionId);
-        if (!existing) sessionId = null;
+        if (!existing || existing.userId !== userId) sessionId = null;
       }
       if (!sessionId) {
         const created = await chatRepo.createSession(userId, "New Chat", effectiveWorkspaceId);
@@ -403,21 +410,23 @@ export function createRpcMethods(
       sensitiveStrings.length > 0 ? sensitiveStrings : undefined,
     );
 
-    // Cancel previous SSE subscription
-    const existingStream = activeStreams.get(userId);
+    // Cancel previous SSE subscription for this session
+    const streamKey = `${userId}:${result.sessionId}`;
+    const existingStream = activeStreams.get(streamKey);
     if (existingStream) {
       existingStream.abort();
     }
 
-    // Clear stale DP progress snapshot for this user (new prompt = fresh state)
-    dpProgressSnapshots.delete(userId);
+    // Clear stale DP progress snapshot for this session (new prompt = fresh state)
+    dpProgressSnapshots.delete(streamKey);
 
     // Subscribe to SSE events and forward to WebSocket
     const abortController = new AbortController();
-    activeStreams.set(userId, {
+    activeStreams.set(streamKey, {
       abort: () => abortController.abort(),
       endpoint: handle.endpoint,
       sessionId: result.sessionId,
+      ws: context.ws,
     });
 
     // Async SSE processing
@@ -435,10 +444,6 @@ export function createRpcMethods(
           const eventData = event as Record<string, unknown>;
           const eventType = eventData.type as string;
           sseEventCount++;
-
-          // Keep agentbox alive during long-running prompts —
-          // without this, the idle timeout (5min) kills the pod mid-execution
-          agentBoxManager.touch(userId, effectiveWorkspaceId);
 
           // Only log key lifecycle events to avoid flooding
           if (eventType === "agent_start" || eventType === "agent_end" || eventType === "message_end" || eventType === "message_start" || eventType.includes("error")) {
@@ -507,10 +512,10 @@ export function createRpcMethods(
           if (eventType === "tool_progress" && eventData.toolName === "deep_search") {
             const progress = eventData.progress as Record<string, unknown> | undefined;
             if (progress) {
-              let snap = dpProgressSnapshots.get(userId);
+              let snap = dpProgressSnapshots.get(streamKey);
               if (!snap) {
                 snap = { sessionId: result.sessionId, events: [], updatedAt: Date.now() };
-                dpProgressSnapshots.set(userId, snap);
+                dpProgressSnapshots.set(streamKey, snap);
               }
               snap.events.push(progress);
               snap.updatedAt = Date.now();
@@ -555,7 +560,7 @@ export function createRpcMethods(
       } finally {
         const sseDurationMs = Date.now() - sseStartTime;
         console.log(`[rpc] SSE stream ended for userId=${userId} sessionId=${result.sessionId} (${sseEventCount} events, ${sseDurationMs}ms)`);
-        activeStreams.delete(userId);
+        activeStreams.delete(streamKey);
         activePromptUsers?.delete(userId);
         // Signal frontend that agent prompt is truly done
         const donePayload = {
@@ -969,9 +974,11 @@ export function createRpcMethods(
   methods.set("chat.steer", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const text = params.text as string;
+    const sessionId = params.sessionId as string | undefined;
     if (!text) throw new Error("Missing required param: text");
 
-    const stream = activeStreams.get(userId);
+    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
     const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
@@ -979,10 +986,12 @@ export function createRpcMethods(
     return { status: "steered" };
   });
 
-  methods.set("chat.clearQueue", async (_params, context: RpcContext) => {
+  methods.set("chat.clearQueue", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
+    const sessionId = params.sessionId as string | undefined;
 
-    const stream = activeStreams.get(userId);
+    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
     const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
@@ -990,11 +999,13 @@ export function createRpcMethods(
     return cleared;
   });
 
-  methods.set("chat.abort", async (_params, context: RpcContext) => {
+  methods.set("chat.abort", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
+    const sessionId = params.sessionId as string | undefined;
 
-    const stream = activeStreams.get(userId);
-    if (stream) {
+    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
+    if (stream && streamKey) {
       // Abort the AgentBox session FIRST (stops the agent prompt, waits for idle)
       try {
         const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
@@ -1005,17 +1016,34 @@ export function createRpcMethods(
 
       // THEN abort the gateway SSE loop — this triggers prompt_done to the frontend
       stream.abort();
-      activeStreams.delete(userId);
+      activeStreams.delete(streamKey);
     }
 
     return { status: "aborted" };
   });
 
-  methods.set("chat.dpProgress", async (_params, context: RpcContext) => {
+  methods.set("chat.confirmHypotheses", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    const snap = dpProgressSnapshots.get(userId);
+    const sessionId = params.sessionId as string | undefined;
+
+    // Hypotheses confirmation is handled via steer messages from the frontend.
+    // This RPC is a gate-clear signal — acknowledge it so the frontend knows it was received.
+    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
+    if (stream) {
+      const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
+      await client.steerSession(stream.sessionId, "[hypotheses confirmed]");
+    }
+    return { status: "confirmed" };
+  });
+
+  methods.set("chat.dpProgress", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const sessionId = params.sessionId as string | undefined;
+    const snapKey = sessionId ? `${userId}:${sessionId}` : userId;
+    const snap = dpProgressSnapshots.get(snapKey);
     if (!snap || Date.now() - snap.updatedAt > 600_000) {
-      dpProgressSnapshots.delete(userId);
+      dpProgressSnapshots.delete(snapKey);
       return { events: null };
     }
     return { sessionId: snap.sessionId, events: snap.events };
@@ -1089,7 +1117,7 @@ export function createRpcMethods(
     }
 
     // Fallback: get from AgentBox
-    const handle = agentBoxManager.get(userId, workspaceId ?? "default");
+    const handle = await agentBoxManager.getAsync(userId, workspaceId ?? "default");
     if (!handle) return { sessions: [] };
 
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
@@ -1128,7 +1156,7 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const workspaceId = (params?.workspaceId as string) ?? "default";
 
-    const handle = agentBoxManager.get(userId, workspaceId);
+    const handle = await agentBoxManager.getAsync(userId, workspaceId);
     if (!handle) return { boxStatus: "not_created" };
 
     try {
@@ -3336,7 +3364,18 @@ export function createRpcMethods(
     return buildSkillBundle(userId, env, skillWriter, skillRepo, skillContentRepo, disabled);
   }
 
-  return { methods, buildCredentialPayload, getSkillBundle };
+  /** Abort all SSE streams associated with a specific WebSocket connection */
+  function cleanupForWs(ws: WebSocket): void {
+    for (const [key, stream] of activeStreams.entries()) {
+      if (stream.ws === ws) {
+        console.log(`[rpc] Cleaning up SSE stream ${key} (WS closed)`);
+        stream.abort();
+        activeStreams.delete(key);
+      }
+    }
+  }
+
+  return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };
 }
 
 
