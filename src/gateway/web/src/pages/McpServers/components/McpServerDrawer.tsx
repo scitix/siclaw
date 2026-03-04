@@ -1,4 +1,4 @@
-import { X, Save, Trash2 } from 'lucide-react';
+import { X, Save, Trash2, Plus } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { McpServer, McpTransport } from '../mcpServerData';
 import { MCP_TRANSPORT_OPTIONS } from '../mcpServerData';
@@ -49,8 +49,6 @@ function recordToKv(rec?: Record<string, string> | null): KVPair[] {
 function KVEditor({ label, pairs, onChange }: { label: string; pairs: KVPair[]; onChange: (p: KVPair[]) => void }) {
     const updatePair = (idx: number, field: 'key' | 'value', val: string) => {
         const next = pairs.map((p, i) => i === idx ? { ...p, [field]: val } : p);
-        // Auto-add empty row if last row has content
-        if (idx === next.length - 1 && val.trim()) next.push({ key: '', value: '' });
         onChange(next);
     };
     const removePair = (idx: number) => {
@@ -58,9 +56,22 @@ function KVEditor({ label, pairs, onChange }: { label: string; pairs: KVPair[]; 
         if (next.length === 0) next.push({ key: '', value: '' });
         onChange(next);
     };
+    const addPair = () => {
+        onChange([...pairs, { key: '', value: '' }]);
+    };
     return (
         <div className="space-y-1.5">
-            <label className="text-sm font-medium text-gray-700">{label}</label>
+            <div className="flex items-center justify-between">
+                <label className="text-sm font-medium text-gray-700">{label}</label>
+                <button
+                    type="button"
+                    onClick={addPair}
+                    className="flex items-center gap-1 px-2 py-0.5 text-xs font-medium text-primary-600 hover:text-primary-700 hover:bg-primary-50 rounded-md transition-colors"
+                >
+                    <Plus className="w-3.5 h-3.5" />
+                    Add
+                </button>
+            </div>
             <div className="space-y-2">
                 {pairs.map((pair, idx) => (
                     <div key={idx} className="flex items-center gap-2">
@@ -78,7 +89,7 @@ function KVEditor({ label, pairs, onChange }: { label: string; pairs: KVPair[]; 
                             placeholder="Value"
                             className="flex-1 px-2.5 py-1.5 bg-white border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                         />
-                        {pairs.length > 1 && pair.key.trim() && (
+                        {pairs.length > 1 && (
                             <button
                                 type="button"
                                 onClick={() => removePair(idx)}
