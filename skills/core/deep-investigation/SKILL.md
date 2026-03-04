@@ -7,9 +7,10 @@ description: >-
 
 # Deep Investigation
 
-A structured 4-phase workflow for deep-diving into complex issues that require
-hypothesis-driven validation. This mode provides dedicated tools — you MUST use
-them instead of ad-hoc investigation.
+A structured workflow for deep-diving into complex issues using hypothesis-driven
+validation. When the user explicitly activates Deep Investigation mode (toggle, /dp,
+Ctrl+I), follow this recommended structure. Outside of DP mode, use these tools
+adaptively based on the situation.
 
 ## When to Use
 
@@ -23,7 +24,11 @@ them instead of ad-hoc investigation.
 - Simple questions answerable with 1-2 kubectl commands
 - When the issue is already clear from initial triage
 
-## Workflow (4 phases)
+## Recommended Workflow (4 phases)
+
+The following phases are a recommended structure. You may skip or merge phases
+when the situation calls for it — e.g., skip straight to deep_search if the user
+gives a clear direction, or end after triage if the answer is already apparent.
 
 ### Phase 1: Quick Triage
 
@@ -39,17 +44,17 @@ Formulate 3-5 ranked hypotheses based on triage findings.
 
 1. Call `manage_checklist` to mark `hypotheses` as `in_progress`.
 2. Call `propose_hypotheses` tool with your formatted hypothesis list.
-3. The tool returns a "waiting for user confirmation" message — **STOP here**.
-   Do NOT call any more tools. Do NOT attempt to validate hypotheses yourself.
-   Simply tell the user you are waiting for their confirmation.
+3. In DP mode, this is a good point to pause for user input — the user may want
+   to adjust hypotheses before committing to an expensive deep_search.
+   If the user is actively engaged, wait for their confirmation.
+   If the user gave a clear directive, you may proceed directly.
 
 ### Phase 3: Deep Search Validation
 
-After the user confirms (you will see a message saying "User has confirmed the hypotheses"):
+Validate hypotheses using parallel sub-agents.
 
 1. Call `manage_checklist` to mark `deep_search` as `in_progress`.
-2. Call `deep_search` tool with triageContext and the confirmed hypotheses.
-   - If the gate blocks you (ERROR: user has not confirmed), STOP and wait.
+2. Call `deep_search` tool with triageContext and the hypotheses.
 3. When deep_search completes, call `manage_checklist` to mark `deep_search` as `done`.
 
 ### Phase 4: Present Findings
@@ -65,20 +70,18 @@ Synthesize the deep_search results into a conclusion.
 | Tool | Purpose |
 |------|---------|
 | `manage_checklist` | Update checklist progress (items: triage, hypotheses, deep_search, conclusion) |
-| `propose_hypotheses` | Submit hypotheses for user review — renders a UI card |
-| `deep_search` | Launch parallel sub-agent validation of confirmed hypotheses |
+| `propose_hypotheses` | Present hypotheses to the user — a communication tool for aligning investigation direction |
+| `deep_search` | Launch parallel sub-agent validation of hypotheses |
 | `end_investigation` | End early — auto-skips remaining phases |
 
-## Common Mistakes
+## Guidelines
 
-1. **Text hypotheses**: Never output hypotheses as plain text. Always use `propose_hypotheses` tool — it renders a proper UI card for user interaction.
-2. **Skip confirmation**: Never call `deep_search` before the user confirms hypotheses. The tool will return an error if you try.
-3. **Manual validation**: Never validate hypotheses yourself with kubectl/bash. That's what `deep_search` does with parallel sub-agents and budget control.
-4. **task_plan during DP**: Never call `task_plan` or `update_plan` during deep investigation. Use the DP-specific tools (`manage_checklist`, etc.) instead. `task_plan` is blocked during DP mode.
-5. **Continue after propose**: After `propose_hypotheses` returns, STOP. Wait for user confirmation before doing anything else.
+1. **Use propose_hypotheses for communication**: Always use the tool (not plain text) to present hypotheses — it renders a proper UI card. Think of it as a way to align with the user on investigation direction, not as a mandatory gate.
+2. **Be cost-aware with deep_search**: It launches parallel sub-agents consuming 30-60 tool calls. When the investigation direction is uncertain, use propose_hypotheses to get alignment first.
+3. **Avoid redundant validation**: Let deep_search handle hypothesis validation with its parallel sub-agents. Running the same checks manually is inefficient.
+4. **Use DP-specific tools during DP mode**: Prefer `manage_checklist` over `task_plan` during deep investigation to keep the checklist UI consistent.
 
 ## Early Exit
 
-- If triage alone is sufficient to answer the question, present your findings and **ask the user** before ending.
+- If triage alone is sufficient to answer the question, present your findings and ask the user before ending.
 - Call `end_investigation` to cleanly exit — it marks all remaining items as skipped.
-- Never silently skip phases without user consent.

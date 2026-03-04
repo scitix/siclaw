@@ -6,6 +6,13 @@ import { NORMAL_BUDGET, QUICK_BUDGET } from "./types.js";
 import { Text } from "@mariozechner/pi-tui";
 import { deepSearchEvents } from "./events.js";
 import type { KubeconfigRef, LlmConfigRef } from "../../core/agent-factory.js";
+import type { MemoryIndexer } from "../../memory/indexer.js";
+
+/** Mutable ref to the shared memory indexer (set after session creation). */
+export interface MemoryRef {
+  indexer?: MemoryIndexer;
+  dir?: string;
+}
 
 interface DeepSearchHypothesis {
   text: string;
@@ -101,7 +108,7 @@ function renderDeepSearchResult(result: any, options: any, theme: any) {
   return new Text("\n" + (hint ? hint + "\n" : "") + styled.join("\n"), 0, 0);
 }
 
-export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef, llmConfigRef?: LlmConfigRef): ToolDefinition {
+export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef, llmConfigRef?: LlmConfigRef, memoryRef?: MemoryRef): ToolDefinition {
   return {
     name: "deep_search",
     label: "Deep Search",
@@ -193,6 +200,9 @@ Do triage first before calling this tool — confirm the problem exists and gath
           model: llmConfigRef?.model,
           api: llmConfigRef?.api,
           onProgress: (event) => deepSearchEvents.emit("progress", event),
+          // Pass memory refs for investigation history retrieval and persistence
+          memoryIndexer: memoryRef?.indexer,
+          memoryDir: memoryRef?.dir,
         });
         const report = formatResult(result);
         const reportPath = await writeReport(report);

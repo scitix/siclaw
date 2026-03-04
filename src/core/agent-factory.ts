@@ -10,12 +10,13 @@ import {
   createReadTool,
   createEditTool,
   createWriteTool,
-  grepTool,
-  findTool,
-  lsTool,
+  createGrepTool,
+  createFindTool,
+  createLsTool,
   type AgentSession,
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
+import { globSync } from "glob";
 import { createRestrictedBashTool } from "../tools/restricted-bash.js";
 import { createNodeExecTool } from "../tools/node-exec.js";
 import { createNodeScriptTool } from "../tools/node-script.js";
@@ -27,7 +28,7 @@ import { createCreateSkillTool } from "../tools/create-skill.js";
 import { createRunSkillTool } from "../tools/run-skill.js";
 import { createUpdateSkillTool } from "../tools/update-skill.js";
 import { createManageScheduleTool } from "../tools/manage-schedule.js";
-import { createDeepSearchTool } from "../tools/deep-search/tool.js";
+import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
 import {
   type DpState,
   createManageChecklistTool,
@@ -327,6 +328,9 @@ export async function createSiclawSession(
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const llmConfigRef: LlmConfigRef = {};
   const mode = opts?.mode ?? "web";
+  // Mutable ref — populated after memoryIndexer is created (below), so deep_search
+  // can retrieve past investigations and persist new ones.
+  const memoryRef: MemoryRef = {};
 
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
@@ -338,7 +342,7 @@ export async function createSiclawSession(
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef),
     createManageScheduleTool(kubeconfigRef),
-    createDeepSearchTool(kubeconfigRef, llmConfigRef),
+    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createCredentialListTool(kubeconfigRef),
   ];
 
@@ -394,30 +398,15 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
 
   // -- Path-restricted file I/O tools --
-  // write/edit: only userDataDir (agent's runtime sandbox: memory, sessions)
-  // read: entire cwd tree (skills, memory, credentials)
-  const readAllowedDirs = [cwd];
+  // Whitelist: only skills directories + user-data (no credentials, no config)
+  const builtinSkillsRoot = path.resolve(cwd, "skills");
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir];
   const writeAllowedDirs = [userDataDir];
 
-  // Block reading sensitive credential/config files (but allow skills/ and user-data/)
-  const READ_BLOCKED_PATTERNS = [
-    /\.siclaw\/config\/settings\.json$/,
-    /\.siclaw\/credentials\//,
-  ];
-
-  const tools = [
+  const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
-        readFile: async (p) => {
-          assertPathAllowed(p, readAllowedDirs, "read");
-          const resolved = path.resolve(p);
-          for (const pattern of READ_BLOCKED_PATTERNS) {
-            if (pattern.test(resolved)) {
-              throw new Error("Access denied: credential/config files cannot be read");
-            }
-          }
-          return fsReadFile(p);
-        },
+        readFile: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsReadFile(p); },
         access: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
@@ -434,10 +423,31 @@ export async function createSiclawSession(
         mkdir: async (d) => { assertPathAllowed(d, writeAllowedDirs, "write"); await fsMkdir(d, { recursive: true }); },
       },
     }),
-    grepTool,
-    findTool,
-    lsTool,
+    createGrepTool(cwd, {
+      operations: {
+        isDirectory: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.statSync(p).isDirectory(); },
+        readFile: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.readFileSync(p, "utf-8"); },
+      },
+    }),
+    createFindTool(cwd, {
+      operations: {
+        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "find"); return fs.existsSync(p); },
+        glob: (pattern, searchCwd, options) => {
+          assertPathAllowed(searchCwd, readAllowedDirs, "find");
+          return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore }).slice(0, options.limit);
+        },
+      },
+    }),
+    createLsTool(cwd, {
+      operations: {
+        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.existsSync(p); },
+        stat: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.statSync(p); },
+        readdir: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.readdirSync(p); },
+      },
+    }),
   ];
+  // Push into customTools so they override framework defaults via extension mechanism
+  customTools.push(...restrictedFileTools);
 
   // Skills: single directory model (bundle API populates skillsBase directly)
   // CLI fallback: search scope subdirectories
@@ -515,9 +525,8 @@ export async function createSiclawSession(
   if (opts?.brainType === "claude-sdk") {
     console.log(`[agent-factory] Creating Claude SDK brain`);
 
-    // Add framework file I/O tools — pi-agent gets these as built-ins,
-    // SDK brain needs them as custom MCP tools for reading SKILL.md, MEMORY.md, etc.
-    const sdkTools = [...customTools, ...tools];
+    // Restricted file tools are already in customTools (pushed above)
+    const sdkTools = [...customTools];
 
     // DP tools for SDK brain — mutable state shared with http-server via dpState ref
     const dpState: DpState = { checklist: null };
@@ -533,10 +542,29 @@ export async function createSiclawSession(
     const appendParts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
 
-    // Inject deep investigation workflow so the model always knows about DP tools
+    // Inject deep investigation judgment framework
     const dpWorkflow = getDpWorkflow();
     if (dpWorkflow) {
-      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Deep Investigation Capability\n\nYou have access to a structured deep investigation workflow. Use it for complex issues requiring hypothesis-driven validation.\n\n${dpWorkflow}`;
+      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Investigation Capability
+
+You have access to deep investigation tools. Use judgment about when and how:
+
+**When to investigate autonomously:**
+- Problem has a clear direction → call deep_search directly with your triage context
+- User gives specific instruction (e.g. "validate H1 and H3") → execute immediately
+
+**When to consult the user first:**
+- Multiple plausible root causes and investigation will be expensive
+- User is actively engaged in the discussion (asking questions, giving feedback)
+- You're unsure about the investigation direction
+
+**Cost awareness:**
+deep_search launches parallel sub-agents consuming 30-60 tool calls.
+Like any expensive operation, confirm direction with the user when the path isn't clear.
+Use propose_hypotheses to present your thinking and get user alignment.
+
+**When user explicitly activates Deep Investigation mode (magnifying glass / /dp / Ctrl+I):**
+Follow the structured workflow described in the deep-investigation skill guide.`;
     }
 
     // Append workspace custom prompt
@@ -603,6 +631,9 @@ export async function createSiclawSession(
       customTools.push(createMemoryGetTool(memoryDir));
       console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
     }
+    // Populate mutable ref so deep_search can access memory for investigation history
+    memoryRef.indexer = memoryIndexer;
+    memoryRef.dir = memoryDir;
   } catch (err) {
     console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
   }
@@ -611,7 +642,7 @@ export async function createSiclawSession(
     opts?.sessionManager ?? SessionManager.create(process.cwd());
 
   const { session, modelFallbackMessage } = await createAgentSession({
-    tools,
+    tools: restrictedFileTools,
     customTools,
     resourceLoader: loader,
     sessionManager,

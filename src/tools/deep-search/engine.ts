@@ -11,6 +11,7 @@ import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
+import type { MemoryIndexer } from "../../memory/indexer.js";
 import type {
   DeepSearchBudget,
   HypothesisNode,
@@ -117,6 +118,61 @@ async function writeDebugTrace(
 }
 
 /**
+ * Write a concise investigation summary to the memory directory so it gets
+ * indexed and can be retrieved during future hypothesis generation.
+ * Format is designed for chunking: clear headings, concise content, structured verdicts.
+ */
+async function writeInvestigationToMemory(
+  memoryDir: string,
+  question: string,
+  hypotheses: HypothesisNode[],
+  conclusion: string,
+  durationMs: number,
+): Promise<void> {
+  const investigationsDir = join(memoryDir, "investigations");
+  await mkdir(investigationsDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const date = new Date().toISOString().slice(0, 10);
+  const filepath = join(investigationsDir, `${date}-${timestamp.slice(11)}.md`);
+
+  const validated = hypotheses.filter(h => h.status === "validated");
+  const invalidated = hypotheses.filter(h => h.status === "invalidated");
+
+  const lines: string[] = [
+    `# Investigation: ${question}`,
+    ``,
+    `**Date**: ${date}`,
+    `**Duration**: ${(durationMs / 1000).toFixed(0)}s`,
+    `**Hypotheses**: ${hypotheses.length} total, ${validated.length} validated, ${invalidated.length} invalidated`,
+    ``,
+    `## Root Cause`,
+    ``,
+    conclusion.length > 1500 ? conclusion.slice(0, 1500) + "\n...(truncated)" : conclusion,
+    ``,
+    `## Hypothesis Verdicts`,
+    ``,
+  ];
+
+  for (const h of hypotheses) {
+    if (h.status === "skipped") continue;
+    const keyEvidence = h.evidence.slice(0, 2)
+      .map(e => `  - \`${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}\``)
+      .join("\n");
+    lines.push(
+      `### ${h.id}: ${h.text}`,
+      `**Verdict**: ${h.status.toUpperCase()} (${h.confidence}%)`,
+      h.reasoning ? `**Reasoning**: ${h.reasoning.slice(0, 300)}` : "",
+      keyEvidence ? `**Key evidence**:\n${keyEvidence}` : "",
+      ``,
+    );
+  }
+
+  await writeFile(filepath, lines.filter(l => l !== undefined).join("\n"), "utf-8");
+  console.log(`[deep-search] Investigation summary written to memory: ${filepath}`);
+}
+
+/**
  * Extract JSON from LLM output using multi-layer fallback:
  * 1. Direct JSON.parse
  * 2. Fenced code block (```json ... ```)
@@ -193,8 +249,9 @@ async function generateHypotheses(
   maxHypotheses: number,
   options?: SubAgentOptions,
   onProgress?: ProgressCallback,
+  relatedInvestigations?: string,
 ): Promise<RawHypothesis[]> {
-  const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses);
+  const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses, relatedInvestigations);
   const fallback: RawHypothesis[] = [{ text: "Failed to parse hypotheses JSON", confidence: 0, suggestedTools: [] }];
 
   const MAX_RETRIES = 1;
@@ -313,6 +370,10 @@ export interface InvestigateOptions extends SubAgentOptions {
   triageContext?: string;
   /** Pre-confirmed hypotheses from PL agent. Skips Phase 2 when provided. */
   hypotheses?: TriageHypothesis[];
+  /** Memory indexer for retrieving related past investigations during hypothesis generation. */
+  memoryIndexer?: MemoryIndexer;
+  /** Memory directory path for persisting investigation summaries. */
+  memoryDir?: string;
 }
 
 /**
@@ -356,6 +417,23 @@ export async function investigate(
   }
 
   // --- Phase 2: Hypothesis Generation (skip if hypotheses provided) ---
+  // Retrieve related past investigations from memory (best-effort, non-blocking)
+  let relatedInvestigations: string | undefined;
+  if (options?.memoryIndexer && !(options?.hypotheses && options.hypotheses.length > 0)) {
+    try {
+      const searchResult = await options.memoryIndexer.search(question, 3, 0.4);
+      const investigationChunks = searchResult.chunks.filter(c => c.file.startsWith("investigations/"));
+      if (investigationChunks.length > 0) {
+        relatedInvestigations = investigationChunks
+          .map((c, i) => `[Past Investigation ${i + 1}] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`)
+          .join("\n\n---\n\n");
+        onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Found ${investigationChunks.length} related past investigation(s)` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Memory search for related investigations failed:`, err);
+    }
+  }
+
   let hypotheses: HypothesisNode[];
   if (options?.hypotheses && options.hypotheses.length > 0) {
     onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Using ${options.hypotheses.length} pre-confirmed hypotheses (skipped)` });
@@ -377,6 +455,7 @@ export async function investigate(
       budget.maxHypotheses,
       options,
       onProgress,
+      relatedInvestigations,
     );
     hypotheses = rawHypotheses.map((h, i) => ({
       id: `H${i + 1}`,
@@ -536,6 +615,15 @@ export async function investigate(
     debugTracePath = await writeDebugTrace(question, hypotheses, globalCallsUsed, totalDurationMs);
   } catch {
     // Trace writing is non-critical
+  }
+
+  // Persist investigation summary to memory for future hypothesis retrieval (best-effort)
+  if (options?.memoryDir) {
+    try {
+      await writeInvestigationToMemory(options.memoryDir, question, hypotheses, conclusion, totalDurationMs);
+    } catch (err) {
+      console.warn(`[deep-search] Failed to write investigation to memory:`, err);
+    }
   }
 
   return {

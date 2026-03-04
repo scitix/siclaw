@@ -141,11 +141,10 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
     name: "propose_hypotheses",
     label: "Propose Hypotheses",
     description:
-      "Present hypotheses to the user during deep investigation (non-blocking). " +
-      "Call this after triage to propose 3-5 ranked hypotheses. " +
-      "The tool will show the hypotheses to the user and immediately return — " +
-      "proceed to call deep_search right away without waiting for confirmation. " +
-      "Only available in deep investigation mode.",
+      "Present hypotheses to the user as a structured UI card. " +
+      "Use this to communicate your investigation thinking and align direction before committing to deep_search. " +
+      "Works both inside and outside Deep Investigation mode. " +
+      "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.",
     parameters: Type.Object({
       hypotheses: Type.String({
         description:
@@ -154,15 +153,20 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
       }),
     }),
     async execute(_toolCallId, params) {
+      const isDpMode = dpState.checklist !== null;
       if (!dpState.checklist) {
-        dpState.checklist = createChecklist("");
+        // Outside DP mode — don't create a checklist, just present hypotheses
       }
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
 
+      const responseText = isDpMode
+        ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."
+        : "Hypotheses presented to user. Decide whether to proceed based on user engagement.";
+
       return {
-        content: [{ type: "text" as const, text: "Hypotheses recorded. Proceed to call deep_search to validate them." }],
-        details: { hypotheses: hypothesesText, autoConfirmed: true },
+        content: [{ type: "text" as const, text: responseText }],
+        details: { hypotheses: hypothesesText },
       };
     },
   };

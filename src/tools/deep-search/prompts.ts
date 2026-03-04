@@ -76,7 +76,17 @@ export function hypothesisGenerationPrompt(
   question: string,
   contextSummary: string,
   maxHypotheses: number,
+  relatedInvestigations?: string,
 ): string {
+  const historySection = relatedInvestigations
+    ? `\n<prior_investigations>
+The following are summaries from previous investigations on similar issues.
+Use them to generate better hypotheses — prioritize root causes that were validated before,
+and avoid re-proposing hypotheses that were conclusively invalidated in similar contexts.
+${relatedInvestigations}
+</prior_investigations>\n`
+    : "";
+
   return `You are a senior SRE investigator. Based on the question and context below, generate ${maxHypotheses} ranked hypotheses.
 
 <question>${question}</question>
@@ -84,7 +94,7 @@ export function hypothesisGenerationPrompt(
 <context>
 ${contextSummary}
 </context>
-
+${historySection}
 ${getFormattedSkillsPrompt()}
 
 ${rdmaTroubleshootingPriority()}
@@ -101,7 +111,7 @@ RULES:
   Only fall back to raw kubectl/node_exec when no skill covers the check.
 - Cover diverse failure modes — do not cluster hypotheses around a single root cause.
 - Be specific: "Pod OOMKilled due to 256Mi limit" > "Pod has memory issues".
-- For RDMA/RoCE: follow the troubleshooting priority order above.`;
+- For RDMA/RoCE: follow the troubleshooting priority order above.${relatedInvestigations ? "\n- If prior investigations revealed validated root causes for similar issues, include them with HIGHER initial confidence." : ""}`;
 }
 
 /**
