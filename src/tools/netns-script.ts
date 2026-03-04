@@ -9,6 +9,7 @@ import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkNodeReady } from "./k8s-checks.js";
 import { loadConfig } from "../core/config.js";
 import { sanitizeEnv } from "./sanitize-env.js";
+import { parseArgs, shellEscape } from "./command-sets.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
@@ -308,7 +309,9 @@ Examples:
       // Step 3: Build debug pod with double nsenter
       const b64 = Buffer.from(resolved.content).toString("base64");
       const ext = resolved.interpreter === "python3" ? ".py" : ".sh";
-      const scriptArgs = args ? ` ${args}` : "";
+      // Security: shell-escape each argument to prevent injection via args parameter
+      const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
+      const scriptArgs = escapedArgs ? ` ${escapedArgs}` : "";
 
       // The inner script that runs inside nsenter on the host.
       // Uses unshare --mount + sysfs remount so that /sys reflects the pod's

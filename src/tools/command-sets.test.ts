@@ -502,6 +502,65 @@ describe("validateCommandRestrictions", () => {
       expect(err).not.toBeNull();
       expect(err).toContain("@file");
     });
+
+    // HTTP method whitelist tests
+    it("blocks curl -X DELETE (standalone short flag)", () => {
+      const err = validateCommandRestrictions("curl -X DELETE https://api.example.com/resource/123");
+      expect(err).not.toBeNull();
+      expect(err).toContain("DELETE");
+    });
+
+    it("blocks curl --request DELETE (standalone long flag)", () => {
+      const err = validateCommandRestrictions("curl --request DELETE https://api.example.com/resource/123");
+      expect(err).not.toBeNull();
+      expect(err).toContain("DELETE");
+    });
+
+    it("blocks curl -X PUT", () => {
+      const err = validateCommandRestrictions("curl -X PUT -d '{\"a\":1}' https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("PUT");
+    });
+
+    it("blocks curl -X PATCH", () => {
+      const err = validateCommandRestrictions("curl -X PATCH -d '{\"a\":1}' https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("PATCH");
+    });
+
+    it("blocks curl --request=DELETE (inline value)", () => {
+      const err = validateCommandRestrictions("curl --request=DELETE https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("DELETE");
+    });
+
+    it("blocks curl -sX DELETE (combined short flags)", () => {
+      const err = validateCommandRestrictions("curl -sX DELETE https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("DELETE");
+    });
+
+    it("blocks curl -X=DELETE (short flag with =)", () => {
+      const err = validateCommandRestrictions("curl -X=DELETE https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("DELETE");
+    });
+
+    it("allows curl -X GET", () => {
+      expect(validateCommandRestrictions("curl -X GET https://api.example.com/resource")).toBeNull();
+    });
+
+    it("allows curl -X POST", () => {
+      expect(validateCommandRestrictions("curl -X POST -d '{\"a\":1}' https://api.example.com/resource")).toBeNull();
+    });
+
+    it("allows curl -X HEAD", () => {
+      expect(validateCommandRestrictions("curl -X HEAD https://api.example.com/resource")).toBeNull();
+    });
+
+    it("allows curl -X OPTIONS", () => {
+      expect(validateCommandRestrictions("curl -X OPTIONS https://api.example.com/resource")).toBeNull();
+    });
   });
 
   describe("rdma restrictions", () => {
@@ -948,17 +1007,13 @@ describe("validateCommandRestrictions", () => {
 
   // ─── Existing validators (still working) ────────────────────
 
-  describe("awk restrictions (awk removed from whitelist but validators still exist)", () => {
-    it("blocks awk system()", () => {
-      const err = validateCommandRestrictions("awk '{system(\"id\")}'");
-      expect(err).not.toBeNull();
-      expect(err).toContain("system()");
+  describe("awk restrictions (awk removed from whitelist entirely)", () => {
+    it("awk is not in ALLOWED_COMMANDS", () => {
+      expect(ALLOWED_COMMANDS.has("awk")).toBe(false);
     });
 
-    it("blocks gawk system()", () => {
-      const err = validateCommandRestrictions("gawk '{system(\"id\")}'");
-      expect(err).not.toBeNull();
-      expect(err).toContain("system()");
+    it("gawk is not in ALLOWED_COMMANDS", () => {
+      expect(ALLOWED_COMMANDS.has("gawk")).toBe(false);
     });
   });
 
