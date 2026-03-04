@@ -103,7 +103,7 @@ export class K8sSpawner implements BoxSpawner {
       { name: "SICLAW_SKILLS_DIR", value: ".siclaw/skills" },
       { name: "SICLAW_MCP_DIR", value: ".siclaw/mcp" },
       { name: "SICLAW_USER_DATA_DIR", value: ".siclaw/user-data" },
-      { name: "SICLAW_GATEWAY_URL", value: "http://siclaw-gateway.siclaw.svc.cluster.local" },
+      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-gateway.${namespace}.svc.cluster.local:3002` },
       { name: "SICLAW_CREDENTIALS_DIR", value: "/home/agentbox/.credentials" },
     ];
 
@@ -183,6 +183,9 @@ export class K8sSpawner implements BoxSpawner {
                 subPath: `user/${userId}/.ws-${workspaceId}/.credentials`,
                 readOnly: true,
               },
+              // NOTE: These sub-path mounts coexist with the optional Secret-based
+              // kubeconfig mount at /home/agentbox/.kube — K8s allows more-specific
+              // mounts to overlay subdirectories without conflicts.
               {
                 name: "skills-pv",
                 mountPath: "/home/agentbox/.kube/envs",
