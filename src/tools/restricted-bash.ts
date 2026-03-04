@@ -15,6 +15,7 @@ import {
   getCommandBinary,
   validateCommandRestrictions,
 } from "./command-sets.js";
+import { resolveKubeconfigPath, resolveKubeconfigByName } from "./kubeconfig-resolver.js";
 
 const execAsync = promisify(exec);
 
@@ -412,6 +413,26 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         }
       }
 
+      // Block reading sensitive credential/config files via any file-reading command
+      const SENSITIVE_PATH_RE = [
+        /\.siclaw\/config\/settings\.json/,
+        /\.siclaw\/credentials\//,
+      ];
+      const FILE_READING_CMDS = ["cat", "head", "tail", "less", "more", "grep", "awk", "gawk"];
+      for (const cmd of commands) {
+        const binary = getCommandBinary(cmd);
+        if (binary && FILE_READING_CMDS.includes(binary)) {
+          if (SENSITIVE_PATH_RE.some((re) => re.test(cmd))) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                error: "Reading credential or config files is not allowed.",
+              }, null, 2) }],
+              details: { blocked: true },
+            };
+          }
+        }
+      }
+
       // Skill scripts (debug pods, perftest, etc.) need longer timeouts
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
@@ -427,11 +448,24 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             ...process.env,
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            // Always block local ~/.kube/config — only UI-configured credentials are allowed
-            KUBECONFIG: "/dev/null",
+            // Auto-resolve KUBECONFIG from credentials; fall back to /dev/null to block ~/.kube/config
+            KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
           },
         };
-        const child = exec(command, execOpts as any);
+
+        // Resolve --kubeconfig=<name> (no path separators) to actual file path
+        let finalCommand = command;
+        if (kubeconfigRef?.credentialsDir) {
+          finalCommand = command.replace(
+            /--kubeconfig=([^\s/"']+)/g,
+            (_match, name) => {
+              const resolved = resolveKubeconfigByName(kubeconfigRef.credentialsDir!, name);
+              return resolved ? `--kubeconfig=${resolved}` : _match;
+            },
+          );
+        }
+
+        const child = exec(finalCommand, execOpts as any);
 
         // Kill the entire process group (shell + all child processes like kubectl exec)
         // detached: true makes the shell a process group leader, so -pid kills the whole group

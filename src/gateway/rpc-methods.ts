@@ -34,6 +34,7 @@ import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js"
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
 import { notifyCronService as notifyCronServiceImpl } from "./cron/notify.js";
+import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -540,6 +541,16 @@ export function createRpcMethods(
     const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentials });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
 
+    // Build redaction config from credential payload + model secrets (sanitize outbound WS stream)
+    const sensitiveStrings: string[] = [];
+    if (modelConfig?.apiKey) sensitiveStrings.push(modelConfig.apiKey);
+    if (modelConfig?.baseUrl) sensitiveStrings.push(modelConfig.baseUrl);
+    const redactionConfig: RedactionConfig = buildRedactionConfig(
+      credentials?.manifest,
+      credentials?.manifest?.length ? path.resolve(process.cwd(), ".siclaw/credentials") : undefined,
+      sensitiveStrings.length > 0 ? sensitiveStrings : undefined,
+    );
+
     // Cancel previous SSE subscription
     const existingStream = activeStreams.get(userId);
     if (existingStream) {
@@ -614,6 +625,27 @@ export function createRpcMethods(
             ...eventData,
             ...(dbMessageId ? { dbMessageId } : {}),
           };
+
+          // Redact sensitive credential info from outbound WS stream (DB stores raw data)
+          if (redactionConfig.patterns.length > 0) {
+            const ep = eventPayload as Record<string, unknown>;
+            if (eventType === "message_update") {
+              const ame = ep.assistantMessageEvent as { type?: string; delta?: string } | undefined;
+              if (ame?.type === "text_delta" && ame.delta) {
+                ame.delta = redactText(ame.delta, redactionConfig);
+              }
+            } else if (eventType === "tool_execution_end") {
+              const toolResult = ep.result as { content?: Array<{ type: string; text?: string }> } | undefined;
+              if (toolResult?.content) {
+                for (const block of toolResult.content) {
+                  if (block.type === "text" && block.text) {
+                    block.text = redactText(block.text, redactionConfig);
+                  }
+                }
+              }
+            }
+          }
+
           if (sendToUser) {
             sendToUser(userId, "agent_event", eventPayload);
           } else {

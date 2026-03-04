@@ -10,6 +10,7 @@ import {
   listSkillScripts,
   listAllSkillsWithScripts,
 } from "./script-resolver.js";
+import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 
 interface RunSkillParams {
   skill: string;
@@ -124,7 +125,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
             ...process.env,
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            KUBECONFIG: "/dev/null",
+            KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
           },
         };
         const child = exec(command, execOpts as any);

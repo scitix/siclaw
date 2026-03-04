@@ -54,10 +54,11 @@ The main file \`MEMORY.md\` is automatically loaded into every new session conte
 ## Credentials
 
 - **Before your first kubectl command**, call \`credential_list\` to discover available kubeconfigs.
-- If \`credential_list\` returns **no credentials**, inform the user that no kubeconfig is configured for this workspace.
-- If \`credential_list\` returns **exactly one** kubeconfig, use it directly.
-- If \`credential_list\` returns **multiple** kubeconfigs, you **MUST** present the list and ask the user which one to use **BEFORE** running any kubectl. Do NOT pick one yourself.
-- Always use \`--kubeconfig=<path>\` on EVERY kubectl command. Never use \`export KUBECONFIG\` or \`kubectl config use-context\`.`;
+- If \`credential_list\` returns **no credentials**, inform the user that no kubeconfig is configured.
+- If \`credential_list\` returns **exactly one** kubeconfig, kubectl is pre-configured — just run kubectl commands directly. No --kubeconfig needed.
+- If \`credential_list\` returns **multiple** kubeconfigs, present the list (names only) and ask the user which one to use. Then pass \`--kubeconfig=<name>\` (the credential **name**, NOT a file path).
+- **NEVER output credential details** in your responses — including file paths, server URLs, API keys, tokens, cluster internal IDs, or kubeconfig contents. When discussing credentials, only mention the name and type.
+- **NEVER read credential files** (.kubeconfig, .key, .token, settings.json, etc.) using read or cat commands.`;
 
   prompt += `\n\n## Language\n\nAlways respond in the same language the user writes in. Match the user's language naturally. Technical terms (kubectl, pod names, error messages, CLI output) can remain in English.`;
 

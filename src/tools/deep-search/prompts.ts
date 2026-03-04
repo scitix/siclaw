@@ -23,14 +23,12 @@ function environmentContext(kubeconfigPath?: string): string {
 ## Environment
 
 ### Kubeconfig
-kubeconfig file: \`${kubeconfigPath}\`
-MUST add \`--kubeconfig=${kubeconfigPath}\` to EVERY kubectl command.
-Do NOT use \`export KUBECONFIG=...\` — blocked by sandbox.
+A kubeconfig is pre-configured. Just run kubectl commands directly — do NOT pass --kubeconfig.
+Use \`node_exec\` for host-level diagnostics (it handles kubeconfig internally).
 
 ### Sandbox Restrictions
 - \`export\`, \`env\` (with args), \`cp\`, \`mv\`, \`rm\` are blocked
 - \`kubectl run/apply/delete\` blocked (read-only mode in bash)
-- Use \`node_exec\` for host-level diagnostics (it handles kubeconfig internally)
 `;
 }
 
