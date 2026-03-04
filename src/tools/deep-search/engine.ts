@@ -492,20 +492,21 @@ export async function investigate(
 
         activeCount++;
 
-        runOneHypothesis(hypothesis, perBudget, isRetry).then(() => {
-          activeCount--;
-
-          // Early exit: validated with high confidence → stop launching new tasks
-          if (hypothesis.status === "validated" && hypothesis.confidence >= EARLY_EXIT_CONFIDENCE) {
-            rootCauseFound = true;
-          }
-
-          // Fill the freed slot
-          tryStartNext();
-
-          // Pool complete when nothing active and nothing to start
-          if (activeCount === 0) resolvePool();
-        });
+        runOneHypothesis(hypothesis, perBudget, isRetry)
+          .then(() => {
+            // Early exit: validated with high confidence → stop launching new tasks
+            if (hypothesis.status === "validated" && hypothesis.confidence >= EARLY_EXIT_CONFIDENCE) {
+              rootCauseFound = true;
+            }
+          })
+          .catch((err) => {
+            console.error(`[deep-search] Unexpected error for hypothesis "${hypothesis.id}":`, err);
+          })
+          .finally(() => {
+            activeCount--;
+            tryStartNext();
+            if (activeCount === 0) resolvePool();
+          });
       }
 
       // Edge case: nothing was started and nothing is active

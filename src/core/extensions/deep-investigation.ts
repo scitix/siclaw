@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { deepSearchEvents, deepSearchGate, type ProgressEvent } from "../../tools/deep-search/events.js";
+import { deepSearchEvents, deepSearchGate, HYPOTHESES_CONFIRMED_SENTINEL, type ProgressEvent } from "../../tools/deep-search/events.js";
 import {
   type ChecklistItemStatus,
   type DpChecklist,
@@ -525,7 +525,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
 
   api.on("input", async (event) => {
     if (!dpModeEnabled || !deepSearchGate.blocked) return { action: "continue" as const };
-    if (event.text.includes("user has confirmed hypotheses")) {
+    if (event.text.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
       deepSearchGate.blocked = false;
       // Auto-mark hypotheses as done (user confirmed them)
       if (checklist) {
