@@ -36,7 +36,6 @@ export interface DpChecklist {
  * For SDK brain, this lives on ManagedSession so http-server can inspect it.
  */
 export interface DpState {
-  enabled: boolean;
   checklist: DpChecklist | null;
 }
 
@@ -103,11 +102,8 @@ export function createManageChecklistTool(dpState: DpState): ToolDefinition {
       })),
     }),
     async execute(_toolCallId, params) {
-      if (!dpState.enabled || !dpState.checklist) {
-        return {
-          content: [{ type: "text" as const, text: "Not in deep investigation mode. Use /dp to start." }],
-          details: {},
-        };
+      if (!dpState.checklist) {
+        dpState.checklist = createChecklist("");
       }
 
       const { updates } = params as { updates: Array<{ id: string; status?: string; summary?: string }> };
@@ -124,10 +120,10 @@ export function createManageChecklistTool(dpState: DpState): ToolDefinition {
         results.push(`update ${upd.id}: ${upd.status ?? "ok"}`);
       }
 
-      // Auto-exit DP mode when conclusion is marked done
+      // Auto-cleanup when conclusion is marked done
       const conclusionItem = dpState.checklist.items.find((i) => i.id === "conclusion");
       if (conclusionItem?.status === "done") {
-        dpState.enabled = false;
+        dpState.checklist = null;
         deepSearchGate.blocked = false;
       }
 
@@ -160,11 +156,8 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
       }),
     }),
     async execute(_toolCallId, params) {
-      if (!dpState.enabled || !dpState.checklist) {
-        return {
-          content: [{ type: "text" as const, text: "Not in deep investigation mode. Use /dp to start." }],
-          details: {},
-        };
+      if (!dpState.checklist) {
+        dpState.checklist = createChecklist("");
       }
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
@@ -201,8 +194,8 @@ export function createEndInvestigationTool(dpState: DpState): ToolDefinition {
       }),
     }),
     async execute(_toolCallId, params) {
-      if (!dpState.enabled || !dpState.checklist) {
-        return { content: [{ type: "text" as const, text: "Not in investigation mode." }], details: {} };
+      if (!dpState.checklist) {
+        return { content: [{ type: "text" as const, text: "No investigation in progress." }], details: {} };
       }
       const { reason } = params as { reason: string };
       for (const item of dpState.checklist.items) {
@@ -211,7 +204,7 @@ export function createEndInvestigationTool(dpState: DpState): ToolDefinition {
           item.summary = reason;
         }
       }
-      dpState.enabled = false;
+      dpState.checklist = null;
       deepSearchGate.blocked = false;
       return {
         content: [{ type: "text" as const, text: `Investigation ended: ${reason}` }],

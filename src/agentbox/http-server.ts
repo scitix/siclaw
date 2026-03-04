@@ -220,14 +220,13 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (promptText.startsWith(DP_MARKER)) {
         const question = promptText.slice(DP_MARKER.length).trim();
         if (question) {
-          dpState.enabled = true;
           dpState.checklist = createChecklist(question);
           promptText = buildActivationMessage(question);
           console.log(`[agentbox-http] DP activated for SDK brain, session ${managed.id}`);
         }
       } else if (promptText.startsWith(EXIT_MARKER)) {
         const userText = promptText.slice(EXIT_MARKER.length).trim();
-        if (dpState.enabled && dpState.checklist) {
+        if (dpState.checklist) {
           for (const item of dpState.checklist.items) {
             if (item.status === "pending" || item.status === "in_progress") {
               item.status = "skipped";
@@ -235,12 +234,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
             }
           }
         }
-        dpState.enabled = false;
         dpState.checklist = null;
         deepSearchGate.blocked = false;
         promptText = `The user has exited deep investigation mode. ${userText}`;
         console.log(`[agentbox-http] DP exited for SDK brain, session ${managed.id}`);
-      } else if (dpState.enabled && deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
+      } else if (deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
         deepSearchGate.blocked = false;
         if (dpState.checklist) {
           const hypItem = dpState.checklist.items.find((i) => i.id === "hypotheses");
@@ -464,7 +462,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // Also update SDK brain dpState checklist (pi-agent does this in extension input handler)
-    if (managed.dpState?.enabled && managed.dpState.checklist) {
+    if (managed.dpState?.checklist) {
       const hypItem = managed.dpState.checklist.items.find((i) => i.id === "hypotheses");
       if (hypItem && hypItem.status !== "done") {
         hypItem.status = "done";

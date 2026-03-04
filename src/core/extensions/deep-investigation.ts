@@ -151,7 +151,6 @@ function formatHypothesesWidget(text: string, theme: any): string[] {
 
 export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- Mode state ---
-  let dpModeEnabled = false;
   let checklist: DpChecklist | null = null;
 
   // --- Progress rendering state ---
@@ -167,7 +166,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- Status bar ---
 
   function updateStatus(ctx: ExtensionContext): void {
-    if (!dpModeEnabled || !checklist) {
+    if (!checklist) {
       ctx.ui.setStatus("dp-mode", undefined);
       return;
     }
@@ -186,7 +185,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
 
   function persistState(): void {
     api.appendEntry("dp-mode", {
-      enabled: dpModeEnabled,
+      enabled: checklist !== null,
       checklist,
     });
   }
@@ -194,8 +193,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- Toggle ---
 
   function enableDpMode(ctx: ExtensionContext): void {
-    if (dpModeEnabled) return;
-    dpModeEnabled = true;
+    if (checklist) return;
     checklist = createChecklist("");
     updateStatus(ctx);
     persistState();
@@ -203,8 +201,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   }
 
   function disableDpMode(ctx: ExtensionContext): void {
-    if (!dpModeEnabled) return;
-    dpModeEnabled = false;
+    if (!checklist) return;
     deepSearchGate.blocked = false;
     checklist = null;
     updateStatus(ctx);
@@ -213,7 +210,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   }
 
   function toggleDpMode(ctx: ExtensionContext): void {
-    if (dpModeEnabled) {
+    if (checklist) {
       disableDpMode(ctx);
     } else {
       enableDpMode(ctx);
@@ -282,7 +279,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
         toggleDpMode(ctx);
         return;
       }
-      if (!dpModeEnabled) {
+      if (!checklist) {
         enableDpMode(ctx);
       }
       checklist!.question = prompt;
@@ -299,11 +296,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     },
     ctx: ExtensionContext,
   ): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
-    if (!dpModeEnabled || !checklist) {
-      return {
-        content: [{ type: "text" as const, text: "Not in deep investigation mode. Use /dp to start." }],
-        details: {},
-      };
+    if (!checklist) {
+      checklist = createChecklist("");
     }
 
     const results: string[] = [];
@@ -377,8 +371,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!dpModeEnabled || !checklist) {
-        return { content: [{ type: "text" as const, text: "Not in investigation mode." }], details: {} };
+      if (!checklist) {
+        return { content: [{ type: "text" as const, text: "No investigation in progress." }], details: {} };
       }
       const { reason } = params as { reason: string };
       for (const item of checklist.items) {
@@ -415,11 +409,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!dpModeEnabled || !checklist) {
-        return {
-          content: [{ type: "text" as const, text: "Not in deep investigation mode. Use /dp to start." }],
-          details: {},
-        };
+      if (!checklist) {
+        checklist = createChecklist("");
       }
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
@@ -482,7 +473,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     if (!question) return { action: "continue" as const };
 
     // Enable DP mode if not already active
-    if (!dpModeEnabled) {
+    if (!checklist) {
       enableDpMode(ctx);
     }
     checklist!.question = question;
@@ -504,7 +495,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     const userText = event.text.slice(marker.length).trim();
 
     // Immediately clean up backend DP state
-    if (dpModeEnabled && checklist) {
+    if (checklist) {
       for (const item of checklist.items) {
         if (item.status === "pending" || item.status === "in_progress") {
           item.status = "skipped";
@@ -524,7 +515,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- input: clear gate when user confirms hypotheses (gateway mode) ---
 
   api.on("input", async (event) => {
-    if (!dpModeEnabled || !deepSearchGate.blocked) return { action: "continue" as const };
+    if (!deepSearchGate.blocked) return { action: "continue" as const };
     if (event.text.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
       deepSearchGate.blocked = false;
       // Auto-mark hypotheses as done (user confirmed them)
@@ -548,12 +539,10 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
 
   api.on("session_start", async (_event, ctx) => {
     // Reset state — each session starts clean (prevents bleed from previous session)
-    dpModeEnabled = false;
     checklist = null;
 
     // From CLI flag
     if (api.getFlag("dp") === true) {
-      dpModeEnabled = true;
       checklist = createChecklist("");
     }
 
@@ -564,7 +553,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       .pop() as { data?: { enabled: boolean; checklist?: DpChecklist; phase?: string; question?: string } } | undefined;
 
     if (entry?.data) {
-      dpModeEnabled = entry.data.enabled ?? dpModeEnabled;
       if (entry.data.checklist) {
         // New format
         checklist = entry.data.checklist;
