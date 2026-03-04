@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
@@ -7,6 +7,7 @@ import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
+import { parseArgs } from "./command-sets.js";
 import {
   resolveSkillScript,
   listSkillScripts,
@@ -110,47 +111,59 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       }
 
       const args = params.args?.trim() || "";
-      const command = args
-        ? `${resolved.interpreter} ${resolved.path} ${args}`
-        : `${resolved.interpreter} ${resolved.path}`;
+      // Security: parse args into array and pass via spawn() — never interpolate
+      // into a shell command string (prevents shell injection via args parameter)
+      const cmdArgs = args ? parseArgs(args) : [];
 
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
 
       try {
-        const execOpts = {
-          timeout,
-          maxBuffer: 1024 * 1024 * 10,
-          shell: "/bin/bash",
+        const child = spawn(resolved.interpreter, [resolved.path, ...cmdArgs], {
           detached: true, // make child a process group leader for clean group kill
+          stdio: ["ignore", "pipe", "pipe"],
           env: {
             ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
             KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
           },
-        };
-        const child = exec(command, execOpts as any);
+        });
 
         const onAbort = () => {
-          // Kill the entire process group (shell + all child processes like kubectl exec)
-          // so cleanup doesn't block the abort. SIGKILL is untrappable.
+          // Kill the entire process group so cleanup doesn't block the abort.
           try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
         };
         signal?.addEventListener("abort", onAbort, { once: true });
 
-        const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+        }, timeout);
+
+        const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB — matches old exec() maxBuffer
+      const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
           let stdout = "";
           let stderr = "";
-          child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-          child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+          let totalSize = 0;
+          child.stdout.on("data", (chunk: Buffer) => {
+            totalSize += chunk.length;
+            if (totalSize <= MAX_OUTPUT) stdout += chunk.toString();
+          });
+          child.stderr.on("data", (chunk: Buffer) => {
+            totalSize += chunk.length;
+            if (totalSize <= MAX_OUTPUT) stderr += chunk.toString();
+          });
           child.on("close", (code) => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
             if (code === 0) resolve({ stdout, stderr });
             else reject(Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }));
           });
-          child.on("error", reject);
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
+            reject(err);
+          });
         });
-
-        signal?.removeEventListener("abort", onAbort);
 
         const output = stdout.trim() +
           (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");

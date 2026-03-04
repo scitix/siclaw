@@ -8,8 +8,6 @@ import {
   isSkillScript,
   validateShellOperators,
   validateFindInPipeline,
-  validateAwkInPipeline,
-  validateSedInPipeline,
   validateIpInPipeline,
   ALLOWED_BINARIES,
 } from "./restricted-bash.js";
@@ -498,27 +496,8 @@ describe("validateFindInPipeline", () => {
   });
 });
 
-describe("validateAwkInPipeline", () => {
-  it("validates awk system() calls when present", () => {
-    // Note: awk is no longer in ALLOWED_COMMANDS (removed for security),
-    // but validateAwkInPipeline still works as a validator function.
-    const result = validateAwkInPipeline(["awk '{system(\"rm -rf /\")}'"]);
-    expect(result).not.toBeNull();
-    expect(result).toContain("system()");
-  });
-
-  it("ignores non-awk commands", () => {
-    expect(validateAwkInPipeline(["grep system"])).toBeNull();
-    expect(validateAwkInPipeline(["kubectl get pods"])).toBeNull();
-  });
-});
-
-describe("validateSedInPipeline (deprecated — sed removed from whitelist)", () => {
-  it("returns null for any input (sed now blocked at whitelist level)", () => {
-    expect(validateSedInPipeline(["sed 's/foo/bar/g'"])).toBeNull();
-    expect(validateSedInPipeline(["grep -i pattern"])).toBeNull();
-  });
-});
+// validateAwkInPipeline and validateSedInPipeline are deprecated no-ops
+// (awk/sed removed from ALLOWED_COMMANDS). No tests needed.
 
 describe("validateIpInPipeline", () => {
   it("allows read-only ip commands", () => {

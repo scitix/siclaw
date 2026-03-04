@@ -11,6 +11,7 @@ import { sanitizeEnv } from "./sanitize-env.js";
 import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
+import { parseArgs, shellEscape } from "./command-sets.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
@@ -172,14 +173,16 @@ Examples:
       const image = params.image || DEFAULT_IMAGE;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
+      // Security: shell-escape each argument to prevent injection via args parameter
+      const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
 
       // Base64 encode script content
       const b64 = Buffer.from(resolved.content).toString("base64");
 
       // Build the command that runs inside nsenter
       const ext = resolved.interpreter === "python3" ? ".py" : ".sh";
-      const innerCmd = args
-        ? `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${args}`
+      const innerCmd = escapedArgs
+        ? `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${escapedArgs}`
         : `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext}`;
 
       const podId = randomBytes(4).toString("hex");

@@ -6,6 +6,15 @@
 // ── Utility functions ────────────────────────────────────────────
 
 /**
+ * Shell-escape a single argument by wrapping in single quotes.
+ * Handles embedded single quotes via the standard '\'' idiom.
+ * Safe for embedding in sh -c "..." strings passed to remote execution.
+ */
+export function shellEscape(arg: string): string {
+  return "'" + arg.replace(/'/g, "'\\''") + "'";
+}
+
+/**
  * Parse a command string into an array of arguments, respecting quotes.
  * Moved from kubectl.ts to be shared.
  */
@@ -72,12 +81,13 @@ function extractFlag(arg: string): string {
  * Commands allowed across all three tools (restricted-bash, node-exec, kubectl-exec).
  * restricted-bash additionally allows `kubectl` and skill scripts.
  *
- * NOTE: sed is intentionally excluded — its scripting language has built-in
- * write (w/W) and execute (e) capabilities that are too complex to validate.
- * Use grep + cut/tr/head/tail for text processing instead.
+ * NOTE: sed and awk/gawk are intentionally excluded — they are Turing-complete
+ * scripting languages with built-in capabilities for command execution (system(),
+ * pipe-to-command), file writes, and shell escapes that cannot be reliably
+ * whitelisted. Use grep + cut/tr/head/tail/jq for text processing instead.
  */
 export const ALLOWED_COMMANDS = new Set([
-  // text processing (sed intentionally excluded)
+  // text processing (sed, awk intentionally excluded — Turing-complete, unsafe)
   "grep", "egrep", "fgrep",
   "sort", "uniq", "wc", "head", "tail", "cut", "tr",
   "jq", "yq", "column",
@@ -210,9 +220,7 @@ export function validateCommandRestrictions(cmd: string): string | null {
     // existing whitelist validators (unchanged)
     case "ip":
       return validateIp(cmd);
-    case "awk":
-    case "gawk":
-      return validateAwk(cmd);
+    // awk/gawk removed from ALLOWED_COMMANDS — no validator needed
     case "systemctl":
       return validateSystemctl(args);
     case "crictl":
@@ -264,18 +272,33 @@ function validateSort(args: string[]): string | null {
   return null;
 }
 
-const FIND_ALLOWED_ACTIONS = new Set(["-print", "-print0", "-ls", "-prune", "-quit"]);
-const FIND_DANGEROUS_ACTIONS = new Set([
-  "-exec", "-execdir", "-ok", "-okdir", "-delete",
-  "-fprint", "-fprint0", "-fprintf", "-fls",
+// Whitelist of safe find actions — only these are allowed.
+// Any unknown or new action is blocked by default.
+const FIND_SAFE_ACTIONS = new Set(["-print", "-print0", "-ls", "-prune", "-quit"]);
+// Whitelist of safe find tests/options (flags that start with -)
+const FIND_SAFE_TESTS = new Set([
+  "-name", "-iname", "-path", "-ipath", "-regex", "-iregex",
+  "-type", "-size", "-mtime", "-atime", "-ctime", "-mmin", "-amin", "-cmin",
+  "-newer", "-newermt", "-newerat", "-newerct",
+  "-perm", "-user", "-group", "-uid", "-gid", "-nouser", "-nogroup",
+  "-empty", "-readable", "-writable", "-executable",
+  "-maxdepth", "-mindepth", "-mount", "-xdev",
+  "-not", "-and", "-or", "-a", "-o",
+  "-true", "-false", "-depth", "-daystart",
+  "-samefile", "-inum", "-links", "-lname", "-ilname",
+  "-wholename", "-iwholename",
+  "-fstype", "-xtype",
 ]);
 
 function validateFind(args: string[]): string | null {
   for (const arg of args.slice(1)) {
-    if (FIND_DANGEROUS_ACTIONS.has(arg)) {
+    if (!arg.startsWith("-")) continue; // path arguments are ok
+    if (arg === "-") continue; // stdin marker
+    // Check if it's a known safe action or test
+    if (!FIND_SAFE_ACTIONS.has(arg) && !FIND_SAFE_TESTS.has(arg)) {
       return JSON.stringify({
-        error: `find "${arg}" is not allowed. Only read-only find operations (listing/filtering) are permitted.`,
-        allowed_actions: [...FIND_ALLOWED_ACTIONS],
+        error: `find "${arg}" is not allowed. Only read-only find operations are permitted.`,
+        allowed_actions: [...FIND_SAFE_ACTIONS],
       }, null, 2);
     }
   }
@@ -445,43 +468,73 @@ function validateIfconfig(args: string[]): string | null {
   return null;
 }
 
+// Whitelist of safe conntrack operations — only these are allowed.
 const CONNTRACK_SAFE_OPS = new Set([
   "-L", "--dump", "-G", "--get", "-C", "--count", "-S", "--stats", "-E", "--event",
 ]);
-const CONNTRACK_DANGEROUS_OPS = new Set([
-  "-D", "--delete", "-F", "--flush", "-U", "--update", "-I", "--create",
+// Whitelist of safe conntrack filter/display flags
+const CONNTRACK_SAFE_FLAGS = new Set([
+  "-p", "--proto", "-s", "--src", "-d", "--dst", "--sport", "--dport",
+  "-m", "--mark", "-f", "--family", "-z", "--zero",
+  "-o", "--output", "-e", "--event-mask", "-b", "--buffer-size",
+  "-n", "--src-nat", "-g", "--dst-nat",
+  "--orig-src", "--orig-dst", "--reply-src", "--reply-dst",
+  "--orig-port-src", "--orig-port-dst", "--reply-port-src", "--reply-port-dst",
+  "--state", "--status", "--timeout",
 ]);
+const CONNTRACK_SAFE_PREFIXES = [
+  "-p=", "--proto=", "-s=", "--src=", "-d=", "--dst=", "--sport=", "--dport=",
+  "-m=", "--mark=", "-f=", "--family=", "-o=", "--output=", "-e=", "--event-mask=",
+  "-b=", "--buffer-size=", "--state=", "--status=", "--timeout=",
+];
 
 function validateConntrack(args: string[]): string | null {
+  // Must have at least one safe operation flag
+  let hasOp = false;
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (CONNTRACK_DANGEROUS_OPS.has(arg)) {
+    if (!arg.startsWith("-")) continue; // positional values are ok
+    if (CONNTRACK_SAFE_OPS.has(arg)) {
+      hasOp = true;
+      continue;
+    }
+    const flag = extractFlag(arg);
+    if (!CONNTRACK_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CONNTRACK_SAFE_PREFIXES)) {
       return JSON.stringify({
-        error: `conntrack "${arg}" is not allowed. Only read-only operations (-L, -G, -C, -S, -E) are permitted.`,
+        error: `conntrack "${arg}" is not allowed. Only read-only operations are permitted.`,
+        allowed_ops: [...CONNTRACK_SAFE_OPS],
       }, null, 2);
     }
   }
+  // Bare "conntrack" without operation defaults to -L — safe
   return null;
 }
 
 const CURL_SAFE_FLAGS = new Set([
   "-s", "--silent", "-S", "--show-error", "-k", "--insecure", "-v", "--verbose",
-  "-H", "--header", "-X", "--request", "-m", "--max-time", "--connect-timeout",
+  "-H", "--header", "-m", "--max-time", "--connect-timeout",
   "-L", "--location", "-I", "--head", "-w", "--write-out",
   "-d", "--data", "--data-raw", "--data-urlencode", "--compressed",
   "-A", "--user-agent", "-b", "--cookie", "-e", "--referer",
   "-u", "--user", "--cacert", "--cert", "-x", "--proxy",
   "--retry", "--retry-delay", "--retry-max-time",
   "-f", "--fail", "-4", "-6", "-N", "--no-buffer",
+  // NOTE: -X/--request are NOT here — they are value-consuming flags
+  // handled separately with method validation below.
 ]);
 const CURL_SAFE_PREFIXES = [
-  "-H=", "--header=", "-X=", "--request=", "-m=", "--max-time=", "--connect-timeout=",
+  "-H=", "--header=", "-m=", "--max-time=", "--connect-timeout=",
   "-w=", "--write-out=", "-d=", "--data=", "--data-raw=", "--data-urlencode=",
   "-A=", "--user-agent=", "-b=", "--cookie=", "-e=", "--referer=",
   "-u=", "--user=", "--cacert=", "--cert=", "-x=", "--proxy=",
   "--retry=", "--retry-delay=", "--retry-max-time=",
+  // NOTE: -X=/--request= are NOT here — handled separately below.
 ];
 const CURL_DATA_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-urlencode"]);
+const CURL_REQUEST_FLAGS = new Set(["-X", "--request"]);
+// Whitelist of safe HTTP methods — only these are allowed with -X/--request.
+// Any new or unknown method is blocked by default.
+const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST"]);
 
 // Single-char curl flags that are safe (for combined flag parsing like -sS)
 const CURL_SAFE_SHORT_CHARS = new Set([
@@ -489,41 +542,92 @@ const CURL_SAFE_SHORT_CHARS = new Set([
   "4", "6",
 ]);
 
+// Helper: validate and consume a -X/--request method value.
+// Returns error string if blocked, null if safe.
+function checkCurlMethod(method: string | undefined): string | null {
+  if (method && !CURL_SAFE_METHODS.has(method.toUpperCase())) {
+    return JSON.stringify({
+      error: `curl -X ${method.toUpperCase()} is not allowed. Only safe HTTP methods (${[...CURL_SAFE_METHODS].join(", ")}) are permitted.`,
+    }, null, 2);
+  }
+  return null;
+}
+
+// Helper: validate a -d/--data value for @file upload.
+function checkCurlDataValue(flag: string, value: string | undefined): string | null {
+  if (value && value.startsWith("@")) {
+    return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
+  }
+  return null;
+}
+
 function validateCurl(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (!arg.startsWith("-")) continue; // URL (positional) allowed
 
-    // Handle long flags (--xxx)
+    // ── Long flags (--xxx) ──────────────────────────────────
     if (arg.startsWith("--")) {
       const flag = extractFlag(arg);
+      const hasValue = arg.includes("=");
+      const inlineValue = hasValue ? arg.slice(flag.length + 1) : undefined;
+
+      // -X/--request: value-consuming, must check method
+      if (CURL_REQUEST_FLAGS.has(flag)) {
+        const method = hasValue ? inlineValue : args[i + 1];
+        const err = checkCurlMethod(method);
+        if (err) return err;
+        if (!hasValue) i++; // consume next arg as value
+        continue;
+      }
+
+      // -d/--data*: value-consuming, must check @file
+      if (CURL_DATA_FLAGS.has(flag)) {
+        const value = hasValue ? inlineValue : args[i + 1];
+        const err = checkCurlDataValue(flag, value);
+        if (err) return err;
+        if (!hasValue) i++; // consume next arg as value
+        continue;
+      }
+
+      // All other long flags: must be in whitelist
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
         }, null, 2);
       }
-      // Check data flags for @file upload
-      if (CURL_DATA_FLAGS.has(flag)) {
-        if (flag === arg) {
-          const nextArg = args[i + 1];
-          if (nextArg && nextArg.startsWith("@")) {
-            return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
-          }
-          i++;
-        } else {
-          const value = arg.slice(flag.length + 1);
-          if (value.startsWith("@")) {
-            return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
-          }
-        }
+      // Value-consuming safe flags: -H, -m, -w, -A, -b, -e, -u, --cacert, --cert, -x, --retry*
+      if (!hasValue && CURL_SAFE_FLAGS.has(flag) && (
+        ["-H", "--header", "-m", "--max-time", "--connect-timeout",
+         "-w", "--write-out", "-A", "--user-agent", "-b", "--cookie",
+         "-e", "--referer", "-u", "--user", "--cacert", "--cert",
+         "-x", "--proxy", "--retry", "--retry-delay", "--retry-max-time",
+        ].includes(flag)
+      )) {
+        i++; // consume next arg as value
       }
       continue;
     }
 
-    // Handle short flags: could be combined like -sS, -sSk
-    // Single short flag with = is like -m=10
+    // ── Short flags with = (e.g. -m=10, -X=GET) ────────────
     if (arg.includes("=")) {
       const flag = extractFlag(arg);
+      const inlineValue = arg.slice(flag.length + 1);
+
+      // -X=METHOD
+      if (flag === "-X") {
+        const err = checkCurlMethod(inlineValue);
+        if (err) return err;
+        continue;
+      }
+
+      // -d=@file
+      if (flag === "-d") {
+        const err = checkCurlDataValue("-d", inlineValue);
+        if (err) return err;
+        continue;
+      }
+
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
@@ -532,7 +636,7 @@ function validateCurl(args: string[]): string | null {
       continue;
     }
 
-    // Check each character in combined short flags (e.g. -sS, -sSk, -vk)
+    // ── Combined short flags (e.g. -sS, -sSX, -vk) ─────────
     const chars = arg.slice(1); // remove leading -
     for (const ch of chars) {
       if (!CURL_SAFE_SHORT_CHARS.has(ch)) {
@@ -542,17 +646,18 @@ function validateCurl(args: string[]): string | null {
       }
     }
 
-    // If last char is a flag that takes a value (-d, -H, -X, etc.), skip next arg
+    // If last char is a value-consuming flag, validate + consume next arg
     const lastChar = chars[chars.length - 1];
     if (lastChar && "HXmwdAbeuxr".includes(lastChar)) {
-      // Check data flag @file restriction
-      if (lastChar === "d") {
-        const nextArg = args[i + 1];
-        if (nextArg && nextArg.startsWith("@")) {
-          return `curl -d with @file is not allowed. File uploads are blocked.`;
-        }
+      if (lastChar === "X") {
+        const err = checkCurlMethod(args[i + 1]);
+        if (err) return err;
       }
-      i++; // skip value
+      if (lastChar === "d") {
+        const err = checkCurlDataValue("-d", args[i + 1]);
+        if (err) return err;
+      }
+      i++; // consume next arg as value
     }
   }
   return null;
@@ -575,17 +680,19 @@ function validateRdma(args: string[]): string | null {
   return null;
 }
 
-const IBPORTSTATE_DANGEROUS_ACTIONS = new Set([
-  "enable", "disable", "reset", "speed", "width", "espeed",
-]);
+// Whitelist of safe ibportstate actions — only query is allowed.
+const IBPORTSTATE_SAFE_ACTIONS = new Set(["query"]);
 
 function validateIbportstate(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (arg.startsWith("-")) continue;
-    if (IBPORTSTATE_DANGEROUS_ACTIONS.has(arg)) {
+    if (arg.startsWith("-")) continue; // flags are ok (port number, lid, etc.)
+    // Positional args that are numbers are port/lid values — ok
+    if (/^\d+$/.test(arg)) continue;
+    if (!IBPORTSTATE_SAFE_ACTIONS.has(arg)) {
       return JSON.stringify({
         error: `ibportstate "${arg}" is not allowed. Only query operations are permitted.`,
+        allowed: [...IBPORTSTATE_SAFE_ACTIONS],
       }, null, 2);
     }
   }
@@ -682,6 +789,7 @@ function validateDate(args: string[]): string | null {
   return null;
 }
 
+// Whitelist of safe dmesg flags — only these are allowed.
 const DMESG_SAFE_FLAGS = new Set([
   "-T", "--ctime", "-H", "--human", "-l", "--level", "-f", "--facility",
   "-k", "--kernel", "-x", "--decode", "-L", "--color", "--time-format",
@@ -692,22 +800,12 @@ const DMESG_SAFE_PREFIXES = [
   "-l=", "--level=", "-f=", "--facility=", "--time-format=",
   "--since=", "--until=", "-L=", "--color=",
 ];
-const DMESG_DANGEROUS_FLAGS = new Set([
-  "-C", "--clear", "-c", "--read-clear",
-  "-D", "--console-off", "-E", "--console-on",
-  "-n", "--console-level",
-]);
 
 function validateDmesg(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (!arg.startsWith("-")) continue;
     const flag = extractFlag(arg);
-    if (DMESG_DANGEROUS_FLAGS.has(flag)) {
-      return JSON.stringify({
-        error: `dmesg "${arg}" is not allowed. Only read-only dmesg queries are permitted.`,
-      }, null, 2);
-    }
     if (!DMESG_SAFE_FLAGS.has(flag) && !startsWithAny(arg, DMESG_SAFE_PREFIXES)) {
       return JSON.stringify({
         error: `dmesg "${arg}" is not allowed. Only read-only dmesg queries are permitted.`,
@@ -749,6 +847,7 @@ function validateHostnamectl(args: string[]): string | null {
   return null;
 }
 
+// Whitelist of safe journalctl flags — only these are allowed.
 const JOURNALCTL_SAFE_FLAGS = new Set([
   "-u", "--unit", "-n", "--lines", "--since", "--until",
   "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
@@ -766,13 +865,6 @@ const JOURNALCTL_SAFE_PREFIXES = [
   "-t=", "--identifier=", "-g=", "--grep=", "-D=", "--directory=",
   "--file=", "--case-sensitive=",
 ];
-const JOURNALCTL_DANGEROUS_FLAGS = new Set([
-  "-f", "--follow",
-  "--vacuum-size", "--vacuum-time", "--vacuum-files",
-  "--rotate", "--flush", "--sync",
-  "--relinquish-var", "--smart-relinquish-var",
-  "--setup-keys", "--verify",
-]);
 
 function validateJournalctl(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
@@ -782,16 +874,12 @@ function validateJournalctl(args: string[]): string | null {
     if (!arg.startsWith("-")) continue; // positional args allowed
 
     const flag = extractFlag(arg);
-    if (JOURNALCTL_DANGEROUS_FLAGS.has(flag) || startsWithAny(arg, ["--vacuum-"])) {
+    if (!JOURNALCTL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, JOURNALCTL_SAFE_PREFIXES)) {
+      // Special message for follow mode (common mistake, helpful hint)
       const msg = flag === "-f" || flag === "--follow"
         ? `journalctl follow mode (${arg}) is not allowed — it blocks the agent. Use -n or --since instead.`
         : `journalctl "${arg}" is not allowed. Only read-only journalctl queries are permitted.`;
       return JSON.stringify({ error: msg }, null, 2);
-    }
-    if (!JOURNALCTL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, JOURNALCTL_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `journalctl "${arg}" is not allowed. Only read-only journalctl queries are permitted.`,
-      }, null, 2);
     }
   }
   return null;
@@ -838,11 +926,6 @@ function validateSysctl(args: string[]): string | null {
     const arg = args[i];
     if (arg.startsWith("-")) {
       const flag = extractFlag(arg);
-      if (flag === "-w" || flag === "--write" || flag === "-p" || flag === "--load" || flag === "--system") {
-        return JSON.stringify({
-          error: `sysctl "${arg}" is not allowed. Only read-only sysctl queries are permitted.`,
-        }, null, 2);
-      }
       if (!SYSCTL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, SYSCTL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `sysctl "${arg}" is not allowed. Only read-only sysctl queries are permitted.`,
@@ -947,14 +1030,8 @@ function validateIp(cmd: string): string | null {
   return null;
 }
 
-function validateAwk(cmd: string): string | null {
-  if (/\bsystem\s*\(/.test(cmd)) {
-    return JSON.stringify({
-      error: "awk system() calls are not allowed. Use awk for text processing only.",
-    }, null, 2);
-  }
-  return null;
-}
+// validateAwk removed — awk/gawk excluded from ALLOWED_COMMANDS entirely
+// (Turing-complete language with command execution, file writes, etc.)
 
 function validateMount(args: string[]): string | null {
   const nonFlagArgs = args.slice(1).filter((a) => !a.startsWith("-"));
