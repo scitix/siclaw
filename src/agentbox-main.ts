@@ -12,6 +12,7 @@ import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
+import { syncMcpFromGateway } from "./agentbox/mcp-sync.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -44,33 +45,20 @@ async function main() {
 
       // Fetch MCP config from Gateway and merge with local seed
       try {
-        const remoteMcp = await gatewayClient.fetchMcpServers();
-
-        // Local config/mcp-servers.json as base
-        const { loadMcpServersConfig } = await import("./core/mcp-client.js");
-        const localMcp = loadMcpServersConfig(undefined, { localOnly: true });
-        const merged: Record<string, any> = {};
-        if (localMcp?.mcpServers) {
-          Object.assign(merged, localMcp.mcpServers);
-        }
-        // Gateway overlay (same name overwrites local)
-        if (remoteMcp?.mcpServers) {
-          Object.assign(merged, remoteMcp.mcpServers);
-        }
-
-        // Write merged result to SICLAW_MCP_DIR/mcp-servers.json
-        let mcpDir = process.env.SICLAW_MCP_DIR;
-        if (!mcpDir) {
-          mcpDir = path.resolve(process.cwd(), ".siclaw", "mcp");
-          process.env.SICLAW_MCP_DIR = mcpDir;
-        }
-        if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
-        const mcpOutPath = path.resolve(mcpDir, "mcp-servers.json");
-        fs.writeFileSync(mcpOutPath, JSON.stringify({ mcpServers: merged }, null, 2), "utf-8");
+        const count = await syncMcpFromGateway(gatewayClient);
         reloadConfig();
-        console.log(`[agentbox] Fetched MCP config from Gateway: ${Object.keys(merged).length} servers [${Object.keys(merged).join(", ")}]`);
+        console.log(`[agentbox] Fetched MCP config from Gateway: ${count} servers`);
       } catch (mcpErr: any) {
-        console.warn(`[agentbox] Failed to fetch MCP config from Gateway: ${mcpErr.message}`);
+        console.warn(`[agentbox] Failed to fetch MCP config, retrying in 5s: ${mcpErr.message}`);
+        setTimeout(async () => {
+          try {
+            const count = await syncMcpFromGateway(gatewayClient);
+            reloadConfig();
+            console.log(`[agentbox] MCP config retry succeeded: ${count} servers`);
+          } catch (retryErr: any) {
+            console.warn(`[agentbox] MCP config retry failed: ${retryErr.message}`);
+          }
+        }, 5000);
       }
 
       // Fetch and materialize skill bundle (team + personal only; builtin baked in image)
