@@ -13,9 +13,17 @@ import path from "node:path";
 const TIERS = ["core", "team", "extension", "platform"];
 
 function loadLabelsFromDisk(): Record<string, string[]> {
-  const skillsDir = process.env.SICLAW_SKILLS_DIR || path.join(process.cwd(), "skills");
+  // Scan both the built-in skills dir and SICLAW_SKILLS_DIR (if set and different)
+  const builtinDir = path.join(process.cwd(), "skills");
+  const overrideDir = process.env.SICLAW_SKILLS_DIR;
+  const dirs = [builtinDir];
+  if (overrideDir && path.resolve(overrideDir) !== path.resolve(builtinDir)) {
+    dirs.push(overrideDir);
+  }
+
   const labels: Record<string, string[]> = {};
 
+  for (const skillsDir of dirs) {
   for (const tier of TIERS) {
     const metaPath = path.join(skillsDir, tier, "meta.json");
     if (!fs.existsSync(metaPath)) continue;
@@ -32,6 +40,7 @@ function loadLabelsFromDisk(): Record<string, string[]> {
     } catch (err) {
       console.warn(`[skill-labels] Failed to load ${metaPath}:`, err instanceof Error ? err.message : err);
     }
+  }
   }
 
   return labels;
