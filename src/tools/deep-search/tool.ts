@@ -168,8 +168,9 @@ Do triage first before calling this tool — confirm the problem exists and gath
       // Hard gate: refuse to execute if hypotheses have not been confirmed by the user.
       // This prevents the model from skipping hypothesis review (e.g. after user Modify feedback).
       if (deepSearchGate.blocked) {
+        console.warn(`[deep_search] Gate blocked — refusing execution. This usually means the model called deep_search before user confirmed hypotheses.`);
         return {
-          content: [{ type: "text", text: "Cannot run deep_search: hypotheses have not been confirmed by the user. Call propose_hypotheses first and wait for user confirmation." }],
+          content: [{ type: "text", text: "BLOCKED: User has not yet confirmed hypotheses. STOP making tool calls and wait for the user's confirmation message.\nDo NOT fall back to manual kubectl investigation. The user will confirm shortly — just wait." }],
           details: {},
         };
       }

@@ -1,0 +1,16 @@
+node_modules/
+k8s/test*
+dist/
+*.tsbuildinfo
+.env
+.env.local
+__pycache__/
+.srebot/
+docs/
+TS_CODE_INDEX.md
+CLAUDE.md
+.siclaw/
+.claude/
+siclaw-inner/
+skills/user/
+user-data/

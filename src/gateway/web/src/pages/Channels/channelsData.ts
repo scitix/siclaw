@@ -54,28 +54,31 @@ export interface Channel {
 /** Static channel metadata (icon, name, description) */
 export const CHANNEL_META: Omit<Channel, 'status' | 'config' | 'enabled' | 'error'>[] = [
     {
-        id: 'slack',
-        name: 'Slack',
-        description: 'Slack workspace bot with rich message formatting and threads.',
-        icon: Hash,
-    },
-    {
-        id: 'discord',
-        name: 'Discord',
-        description: 'Discord server bot with slash commands and channel messaging.',
-        icon: Terminal,
+        id: 'lark',
+        name: 'Lark',
+        description: 'Enterprise bot for Lark with interactive cards and approval flows.',
+        icon: MessageCircle,
     },
     {
         id: 'telegram',
         name: 'Telegram',
         description: 'Bot integration for Telegram groups and direct messages.',
         icon: MessageSquare,
+        comingSoon: true,
     },
     {
-        id: 'lark',
-        name: 'Lark',
-        description: 'Enterprise bot for Lark with interactive cards and approval flows.',
-        icon: MessageCircle,
+        id: 'slack',
+        name: 'Slack',
+        description: 'Slack workspace bot with rich message formatting and threads.',
+        icon: Hash,
+        comingSoon: true,
+    },
+    {
+        id: 'discord',
+        name: 'Discord',
+        description: 'Discord server bot with slash commands and channel messaging.',
+        icon: Terminal,
+        comingSoon: true,
     },
     {
         id: 'whatsapp',
