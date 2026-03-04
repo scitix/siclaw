@@ -85,6 +85,8 @@ async function main() {
     if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
     fs.writeFileSync(path.join(mcpDir, "mcp-servers.json"), JSON.stringify({ mcpServers: merged }, null, 2) + "\n");
     if (!process.env.SICLAW_MCP_DIR) process.env.SICLAW_MCP_DIR = mcpDir;
+    // Clear config cache so loadConfig() picks up the new MCP servers
+    reloadConfig();
     console.log(`[agentbox] Merged MCP config: ${Object.keys(merged).length} servers [${Object.keys(merged).join(", ")}]`);
   }
 
