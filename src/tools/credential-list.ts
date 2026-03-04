@@ -70,9 +70,9 @@ export function createCredentialListTool(kubeconfigRef: KubeconfigRef): ToolDefi
     },
     renderResult: renderTextResult,
     description: `List available credentials in the current workspace.
-Returns credential names, types, descriptions, file paths, and metadata (e.g. cluster URLs, SSH hosts).
-For kubeconfig credentials, a connectivity probe is included (reachable / unreachable).
-Use this to discover which credentials are available before running kubectl, ssh, or API commands.
+Returns credential names, types, descriptions, and connectivity status.
+For kubeconfig credentials, a connectivity probe is included.
+Use this to discover which credentials are available before running kubectl commands.
 
 Optional filters:
 - type: Filter by credential type (kubeconfig, ssh_key, ssh_password, api_token, api_basic_auth)
@@ -112,14 +112,14 @@ Optional filters:
           credentials = credentials.filter((c) => c.name.toLowerCase().includes(needle));
         }
 
-        // Enrich with full paths
-        const result: CredentialEntry[] = credentials.map((c) => ({
+        // Internal enrichment: resolve full paths for probing (NOT returned to model)
+        const enriched: CredentialEntry[] = credentials.map((c) => ({
           ...c,
           files: c.files.map((f) => `${credentialsDir}/${f}`),
         }));
 
         // Probe kubeconfig connectivity in parallel
-        const kubeconfigs = result.filter((c) => c.type === "kubeconfig");
+        const kubeconfigs = enriched.filter((c) => c.type === "kubeconfig");
         if (kubeconfigs.length > 0) {
           const probes = await Promise.all(
             kubeconfigs.map(async (c) => {
@@ -128,7 +128,7 @@ Optional filters:
             }),
           );
           for (const { name, probe } of probes) {
-            const cred = result.find((c) => c.name === name);
+            const cred = enriched.find((c) => c.name === name);
             if (cred) {
               cred.reachable = probe.reachable;
               if (probe.version) cred.server_version = probe.version;
@@ -136,6 +136,16 @@ Optional filters:
             }
           }
         }
+
+        // Map to safe return structure — strip files[], metadata, and other sensitive fields
+        const safeResult = enriched.map((c) => ({
+          name: c.name,
+          type: c.type,
+          description: c.description ?? null,
+          ...(c.reachable !== undefined ? { reachable: c.reachable } : {}),
+          ...(c.server_version ? { server_version: c.server_version } : {}),
+          ...(c.probe_error ? { probe_error: c.probe_error } : {}),
+        }));
 
         // Build selection hint for the agent
         const reachableKubeconfigs = kubeconfigs.filter((c) => c.reachable);
@@ -147,7 +157,7 @@ Optional filters:
         }
 
         return {
-          content: [{ type: "text", text: JSON.stringify({ credentials: result }, null, 2) + hint }],
+          content: [{ type: "text", text: JSON.stringify({ credentials: safeResult }, null, 2) + hint }],
           details: {},
         };
       } catch (err) {

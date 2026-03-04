@@ -399,10 +399,25 @@ export async function createSiclawSession(
   const readAllowedDirs = [cwd];
   const writeAllowedDirs = [userDataDir];
 
+  // Block reading sensitive credential/config files (but allow skills/ and user-data/)
+  const READ_BLOCKED_PATTERNS = [
+    /\.siclaw\/config\/settings\.json$/,
+    /\.siclaw\/credentials\//,
+  ];
+
   const tools = [
     createReadTool(cwd, {
       operations: {
-        readFile: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsReadFile(p); },
+        readFile: async (p) => {
+          assertPathAllowed(p, readAllowedDirs, "read");
+          const resolved = path.resolve(p);
+          for (const pattern of READ_BLOCKED_PATTERNS) {
+            if (pattern.test(resolved)) {
+              throw new Error("Access denied: credential/config files cannot be read");
+            }
+          }
+          return fsReadFile(p);
+        },
         access: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsAccess(p, fs.constants.R_OK); },
       },
     }),

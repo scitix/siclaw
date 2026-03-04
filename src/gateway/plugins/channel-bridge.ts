@@ -5,6 +5,7 @@ import type { ChannelPlugin, StreamingCard } from "./api.js";
 import type { UserStore } from "../auth/user-store.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
 import { notifyCronService } from "../cron/notify.js";
+import { buildRedactionConfig, redactText, type RedactionConfig } from "../output-redactor.js";
 
 export type OutboundSender = (sessionKey: string, text: string) => Promise<void>;
 
@@ -135,6 +136,12 @@ export function createChannelBridge(
             return undefined;
           })
         : undefined;
+
+      // Build redaction config for outbound channel messages
+      const redactionConfig: RedactionConfig = buildRedactionConfig(
+        credentials?.manifest,
+        credentials?.manifest?.length ? ".siclaw/credentials" : undefined,
+      );
 
       // Channel and web share the same AgentBox — mode-driven skill loading
       // handles tool/skill differences per session.
@@ -361,10 +368,13 @@ export function createChannelBridge(
               const toolResult = evt.result as
                 | { content?: Array<{ type: string; text?: string }> }
                 | undefined;
-              let output = toolResult?.content
-                ?.filter((c) => c.type === "text")
-                .map((c) => c.text ?? "")
-                .join("") ?? "";
+              let output = redactText(
+                toolResult?.content
+                  ?.filter((c) => c.type === "text")
+                  .map((c) => c.text ?? "")
+                  .join("") ?? "",
+                redactionConfig,
+              );
 
               // Auto-execute manage_schedule results (except list)
               // Only attempt parse when output looks like JSON (starts with '{')
@@ -421,7 +431,7 @@ export function createChannelBridge(
                 | { type: string; delta?: string }
                 | undefined;
               if (ame?.type === "text_delta" && ame.delta) {
-                assistantText += ame.delta;
+                assistantText += redactText(ame.delta, redactionConfig);
                 if (supportsStreaming && card) {
                   scheduleUpdate(getDisplayContent());
                 }
