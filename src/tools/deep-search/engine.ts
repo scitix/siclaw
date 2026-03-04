@@ -10,6 +10,7 @@ import {
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type {
   DeepSearchBudget,
   HypothesisNode,
@@ -330,6 +331,7 @@ export async function investigate(
 ): Promise<InvestigationResult> {
   const budget = options?.budget ?? NORMAL_BUDGET;
   const onProgress = options?.onProgress;
+  const kubeconfigPath = resolveKubeconfigPath(options?.kubeconfigRef?.credentialsDir) ?? undefined;
   const startTime = Date.now();
   let globalCallsUsed = 0;
 
@@ -340,7 +342,7 @@ export async function investigate(
     contextSummary = options.triageContext;
   } else {
     onProgress?.({ type: "phase", phase: "Phase 1/4", detail: "Gathering context..." });
-    const contextPrompt = contextGatheringPrompt(question, budget.maxContextCalls);
+    const contextPrompt = contextGatheringPrompt(question, budget.maxContextCalls, kubeconfigPath);
     const contextResult = await runSubAgent(
       contextPrompt,
       question,
@@ -401,162 +403,118 @@ export async function investigate(
   onProgress?.({ type: "phase", phase: "Phase 3/4", detail: `Validating ${hypotheses.length} hypotheses (budget: ${validationBudget} calls)...` });
 
   let rootCauseFound = false;
-  let priorFindings: string | undefined;
   let timedOut = false;
 
-  for (let batchStart = 0; batchStart < hypotheses.length; batchStart += budget.maxParallel) {
-    // Early exit: skip remaining batches if a hypothesis was validated with high confidence
-    if (rootCauseFound) break;
+  // Build a summary of completed hypotheses for sub-agent context
+  function buildPriorFindings(): string | undefined {
+    const completed = hypotheses.filter(h => h.status !== "pending" && h.status !== "skipped");
+    if (completed.length === 0) return undefined;
+    return completed.map(h => {
+      const reasoning = h.reasoning.length > 100
+        ? h.reasoning.slice(0, 100) + "..."
+        : (h.reasoning || "(no details)");
+      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}`;
+    }).join("\n");
+  }
 
-    // Global timeout check: break out of Phase 3 if exceeded
-    const elapsed = Date.now() - startTime;
-    if (elapsed > budget.maxDurationMs) {
-      timedOut = true;
-      onProgress?.({ type: "phase", phase: "Phase 3/4", detail: `Global timeout (${(budget.maxDurationMs / 1000).toFixed(0)}s) exceeded, skipping remaining hypotheses...` });
-      break;
-    }
+  // Validate a single hypothesis via sub-agent, handling verdict parsing and error retry
+  async function runOneHypothesis(
+    hypothesis: HypothesisNode,
+    perBudget: number,
+    isRetry: boolean,
+  ): Promise<void> {
+    const taggedProgress: ProgressCallback | undefined = onProgress
+      ? (event: ProgressEvent) => onProgress({ ...event, hypothesisId: hypothesis.id } as ProgressEvent)
+      : undefined;
 
-    const remainingBudget = budget.maxTotalCalls - globalCallsUsed;
-    if (remainingBudget <= 0) break;
-
-    const batch = hypotheses.slice(batchStart, batchStart + budget.maxParallel);
-    const perHypothesisBudget = Math.min(
-      budget.maxCallsPerHypothesis,
-      Math.floor(remainingBudget / batch.length),
-    );
-
-    if (perHypothesisBudget <= 0) break;
-
-    const validationPromises = batch.map(async (hypothesis) => {
-      const prompt = hypothesisValidationPrompt(
-        hypothesis.text,
-        hypothesis.suggestedTools,
-        contextSummary,
-        perHypothesisBudget,
-        priorFindings,
-      );
-
-      // Wrap onProgress to tag every sub-agent event with its hypothesisId
-      const taggedProgress: ProgressCallback | undefined = onProgress
-        ? (event: ProgressEvent) => onProgress({ ...event, hypothesisId: hypothesis.id } as ProgressEvent)
-        : undefined;
-
+    try {
       const result = await runSubAgent(
-        prompt,
-        `Validate hypothesis: ${hypothesis.text}`,
-        perHypothesisBudget,
-        options,
-        taggedProgress,
-        forceVerdictPrompt(),
+        hypothesisValidationPrompt(
+          hypothesis.text, hypothesis.suggestedTools, contextSummary,
+          perBudget, buildPriorFindings(), kubeconfigPath,
+        ),
+        `Validate hypothesis${isRetry ? " (retry)" : ""}: ${hypothesis.text}`,
+        perBudget, options, taggedProgress, forceVerdictPrompt(),
       );
 
       const verdict = parseVerdict(result.textOutput);
-
       hypothesis.status = verdict.status;
       hypothesis.confidence = verdict.confidence;
       hypothesis.reasoning = verdict.reasoning;
       hypothesis.evidence = result.evidence;
       hypothesis.toolCallsUsed = result.callsUsed;
       hypothesis.trace = result.trace;
+      globalCallsUsed += result.callsUsed;
 
-      onProgress?.({
-        type: "hypothesis",
-        id: hypothesis.id,
-        status: hypothesis.status,
-        confidence: hypothesis.confidence,
-      });
-
-      return result.callsUsed;
-    });
-
-    const settledResults = await Promise.allSettled(validationPromises);
-
-    // Process results: fulfilled → count calls, rejected → collect for retry
-    const failedInBatch: HypothesisNode[] = [];
-    for (let i = 0; i < settledResults.length; i++) {
-      const result = settledResults[i];
-      if (result.status === "fulfilled") {
-        globalCallsUsed += result.value;
-      } else {
-        // Sub-agent crashed — mark as inconclusive initially, collect for retry
-        const failedH = batch[i];
-        failedH.status = "inconclusive";
-        failedH.confidence = 0;
-        failedH.reasoning = `Sub-agent error: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`;
-        onProgress?.({ type: "hypothesis", id: failedH.id, status: "inconclusive", confidence: 0 });
-        failedInBatch.push(failedH);
+      onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence });
+    } catch (err) {
+      if (!isRetry) {
+        // First failure → queue for retry
+        hypothesis.status = "inconclusive";
+        hypothesis.confidence = 0;
+        hypothesis.reasoning = `Sub-agent error: ${err instanceof Error ? err.message : String(err)}`;
+        onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "inconclusive", confidence: 0 });
+        retryQueue.push(hypothesis);
       }
-    }
-
-    // Single retry for transient failures (sequential to avoid burst)
-    for (const hypothesis of failedInBatch) {
-      if (rootCauseFound) break;
-      const retryBudget = Math.min(
-        budget.maxCallsPerHypothesis,
-        budget.maxTotalCalls - globalCallsUsed,
-      );
-      if (retryBudget <= 0) break;
-
-      const retryPrompt = hypothesisValidationPrompt(
-        hypothesis.text,
-        hypothesis.suggestedTools,
-        contextSummary,
-        retryBudget,
-        priorFindings,
-      );
-      const taggedProgress: ProgressCallback | undefined = onProgress
-        ? (event: ProgressEvent) => onProgress({ ...event, hypothesisId: hypothesis.id } as ProgressEvent)
-        : undefined;
-
-      try {
-        const result = await runSubAgent(
-          retryPrompt,
-          `Validate hypothesis (retry): ${hypothesis.text}`,
-          retryBudget,
-          options,
-          taggedProgress,
-          forceVerdictPrompt(),
-        );
-
-        const verdict = parseVerdict(result.textOutput);
-        hypothesis.status = verdict.status;
-        hypothesis.confidence = verdict.confidence;
-        hypothesis.reasoning = verdict.reasoning;
-        hypothesis.evidence = result.evidence;
-        hypothesis.toolCallsUsed = result.callsUsed;
-        hypothesis.trace = result.trace;
-        globalCallsUsed += result.callsUsed;
-
-        onProgress?.({
-          type: "hypothesis",
-          id: hypothesis.id,
-          status: hypothesis.status,
-          confidence: hypothesis.confidence,
-        });
-      } catch {
-        // Both attempts failed — leave as inconclusive (already marked above)
-      }
-    }
-
-    // Check if any hypothesis in this batch was validated with high confidence
-    if (batch.some((h) => h.status === "validated" && h.confidence >= EARLY_EXIT_CONFIDENCE)) {
-      rootCauseFound = true;
-    }
-
-    // Collect findings from completed hypotheses for the next batch
-    const completed = hypotheses.filter((h) => h.status !== "pending" && h.status !== "skipped");
-    if (completed.length > 0) {
-      priorFindings = completed
-        .map((h) => {
-          const status = h.status.toUpperCase();
-          const reasoning = h.reasoning.length > 100
-            ? h.reasoning.slice(0, 100) + "..."
-            : (h.reasoning || "(no details)");
-          return `- ${h.id} (${h.text}): ${status} (${h.confidence}%) — ${reasoning}`;
-        })
-        .join("\n");
+      // Second failure → leave as inconclusive (already marked)
     }
   }
+
+  // Concurrency pool: keep maxParallel slots busy, fill freed slots immediately
+  const queue = [...hypotheses];
+  let activeCount = 0;
+  const retryQueue: HypothesisNode[] = [];
+
+  await new Promise<void>((resolvePool) => {
+    function tryStartNext() {
+      while (activeCount < budget.maxParallel && !rootCauseFound) {
+        // Timeout check
+        if (Date.now() - startTime > budget.maxDurationMs) {
+          timedOut = true;
+          onProgress?.({ type: "phase", phase: "Phase 3/4", detail: `Global timeout (${(budget.maxDurationMs / 1000).toFixed(0)}s) exceeded, skipping remaining hypotheses...` });
+          break;
+        }
+
+        // Budget check
+        const remaining = budget.maxTotalCalls - globalCallsUsed;
+        if (remaining <= 0) break;
+
+        // Pick from retry queue first, then main queue
+        const hypothesis = retryQueue.shift() ?? queue.shift();
+        if (!hypothesis) break;
+
+        const isRetry = hypothesis.status === "inconclusive";
+        const perBudget = Math.min(
+          budget.maxCallsPerHypothesis,
+          Math.floor(remaining / Math.max(1, activeCount + queue.length + retryQueue.length)),
+        );
+        if (perBudget <= 0) break;
+
+        activeCount++;
+
+        runOneHypothesis(hypothesis, perBudget, isRetry)
+          .then(() => {
+            // Early exit: validated with high confidence → stop launching new tasks
+            if (hypothesis.status === "validated" && hypothesis.confidence >= EARLY_EXIT_CONFIDENCE) {
+              rootCauseFound = true;
+            }
+          })
+          .catch((err) => {
+            console.error(`[deep-search] Unexpected error for hypothesis "${hypothesis.id}":`, err);
+          })
+          .finally(() => {
+            activeCount--;
+            tryStartNext();
+            if (activeCount === 0) resolvePool();
+          });
+      }
+
+      // Edge case: nothing was started and nothing is active
+      if (activeCount === 0) resolvePool();
+    }
+
+    tryStartNext();
+  });
 
   // Mark remaining pending hypotheses as skipped
   for (const h of hypotheses) {

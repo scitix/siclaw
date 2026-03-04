@@ -16,11 +16,13 @@ const KUBECTL_TIMEOUT = 10_000; // 10s — pre-check should be fast
 export async function checkNodeReady(
   node: string,
   env?: NodeJS.ProcessEnv,
+  kubeconfigPath?: string,
 ): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       "kubectl",
       [
+        ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
         "get",
         "node",
         node,
@@ -58,6 +60,7 @@ export async function waitForPodDone(
   timeoutMs: number,
   env?: NodeJS.ProcessEnv,
   signal?: AbortSignal,
+  kubeconfigPath?: string,
 ): Promise<string> {
   const pollInterval = 2_000;
   const deadline = Date.now() + timeoutMs;
@@ -68,7 +71,10 @@ export async function waitForPodDone(
     try {
       const { stdout } = await execFileAsync(
         "kubectl",
-        ["get", "pod", podName, "-o", "jsonpath={.status.phase}"],
+        [
+          ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
+          "get", "pod", podName, "-o", "jsonpath={.status.phase}",
+        ],
         { timeout: KUBECTL_TIMEOUT, env },
       );
       const phase = stdout.trim();
@@ -98,11 +104,13 @@ export async function checkPodRunning(
   pod: string,
   namespace: string,
   env?: NodeJS.ProcessEnv,
+  kubeconfigPath?: string,
 ): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       "kubectl",
       [
+        ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
         "get",
         "pod",
         pod,

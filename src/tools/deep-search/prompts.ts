@@ -13,14 +13,36 @@ import {
 import { getFormattedSkillsPrompt } from "./sub-agent.js";
 
 /**
+ * Generate environment context section for sub-agent prompts.
+ * Tells the sub-agent about kubeconfig path and sandbox restrictions.
+ */
+function environmentContext(kubeconfigPath?: string): string {
+  if (!kubeconfigPath) return "";
+
+  return `
+## Environment
+
+### Kubeconfig
+kubeconfig file: \`${kubeconfigPath}\`
+MUST add \`--kubeconfig=${kubeconfigPath}\` to EVERY kubectl command.
+Do NOT use \`export KUBECONFIG=...\` — blocked by sandbox.
+
+### Sandbox Restrictions
+- \`export\`, \`env\` (with args), \`cp\`, \`mv\`, \`rm\` are blocked
+- \`kubectl run/apply/delete\` blocked (read-only mode in bash)
+- Use \`node_exec\` for host-level diagnostics (it handles kubeconfig internally)
+`;
+}
+
+/**
  * Phase 1: Context gathering system prompt (used as pi-agent session prompt).
  * Skills are auto-loaded by pi-agent — only tool semantics needed here.
  */
-export function contextGatheringPrompt(question: string, maxCalls: number): string {
+export function contextGatheringPrompt(question: string, maxCalls: number, kubeconfigPath?: string): string {
   return `You are a Kubernetes SRE assistant. Gather the MINIMUM necessary context about the environment related to this question:
 
 <question>${question}</question>
-
+${environmentContext(kubeconfigPath)}
 ${toolSemantics()}
 
 RULES:
@@ -94,6 +116,7 @@ export function hypothesisValidationPrompt(
   contextSummary: string,
   maxCalls: number,
   priorFindings?: string,
+  kubeconfigPath?: string,
 ): string {
   const toolList = suggestedTools.length > 0
     ? `\nSuggested commands to start with:\n${suggestedTools.map((t) => `- ${t}`).join("\n")}`
@@ -114,6 +137,7 @@ ${priorFindings}
 ${contextSummary}
 </context>
 ${priorSection}${toolList}
+${environmentContext(kubeconfigPath)}
 
 ${toolSemantics()}
 

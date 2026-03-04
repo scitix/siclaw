@@ -11,7 +11,7 @@ import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
-import { deepSearchEvents, deepSearchGate } from "../tools/deep-search/events.js";
+import { deepSearchEvents, deepSearchGate, HYPOTHESES_CONFIRMED_SENTINEL } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 
@@ -240,7 +240,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         deepSearchGate.blocked = false;
         promptText = `The user has exited deep investigation mode. ${userText}`;
         console.log(`[agentbox-http] DP exited for SDK brain, session ${managed.id}`);
-      } else if (dpState.enabled && deepSearchGate.blocked && promptText.includes("user has confirmed hypotheses")) {
+      } else if (dpState.enabled && deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
         deepSearchGate.blocked = false;
         if (dpState.checklist) {
           const hypItem = dpState.checklist.items.find((i) => i.id === "hypotheses");
@@ -255,6 +255,15 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         }
         console.log(`[agentbox-http] DP hypotheses confirmed for SDK brain, session ${managed.id}`);
       }
+    }
+
+    // Universal fallback: clear gate regardless of brain type / dpState.
+    // Pi-agent's extension input handler should also clear it, but if the
+    // extension state wasn't restored (TTL release/restore race), this ensures
+    // the gate is cleared before the agent processes the confirmation message.
+    if (deepSearchGate.blocked && promptText.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
+      deepSearchGate.blocked = false;
+      console.log(`[agentbox-http] Gate cleared by universal fallback for session ${managed.id}`);
     }
 
     // Execute prompt asynchronously; notify SSE to close on completion

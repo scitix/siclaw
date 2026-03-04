@@ -6,6 +6,7 @@ import type { KubeconfigRef } from "../core/agent-factory.js";
 import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
+import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 
 interface PodScriptParams {
   pod: string;
@@ -115,12 +116,14 @@ Examples:
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
 
       // Pre-check: pod exists and is Running
+      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
+      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const childEnv = {
         ...process.env,
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };
-      const podCheckErr = await checkPodRunning(pod, namespace, childEnv);
+      const podCheckErr = await checkPodRunning(pod, namespace, childEnv, kubeconfigPath ?? undefined);
       if (podCheckErr) {
         return {
           content: [{ type: "text", text: `Error: ${podCheckErr}` }],
@@ -129,7 +132,7 @@ Examples:
       }
 
       // Build kubectl exec args
-      const kubectlArgs = ["exec", "-i", pod, "-n", namespace];
+      const kubectlArgs = [...kubeconfigArgs, "exec", "-i", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }

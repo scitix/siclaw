@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
 import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
+import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { loadConfig } from "../core/config.js";
 import {
   ALLOWED_COMMANDS,
@@ -226,6 +227,8 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
+      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
+      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const childEnv = {
         ...process.env,
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
@@ -251,7 +254,7 @@ Examples:
       }
 
       // Check node exists and is Ready (after all local validation passes)
-      const nodeCheckErr = await checkNodeReady(params.node, childEnv);
+      const nodeCheckErr = await checkNodeReady(params.node, childEnv, kubeconfigPath ?? undefined);
       if (nodeCheckErr) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: nodeCheckErr }, null, 2) }],
@@ -271,7 +274,7 @@ Examples:
 
       const cleanup = () => {
         spawnAsync("kubectl", [
-          "delete", "pod", podName, "--force", "--grace-period=0",
+          ...kubeconfigArgs, "delete", "pod", podName, "--force", "--grace-period=0",
         ], 10_000, childEnv).catch(() => {});
       };
 
@@ -298,6 +301,7 @@ Examples:
       try {
         // Phase 1: Create pod
         await spawnAsync("kubectl", [
+          ...kubeconfigArgs,
           "run", podName,
           "--restart=Never",
           `--image=${image}`,
@@ -306,7 +310,7 @@ Examples:
 
         // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
         try {
-          await waitForPodDone(podName, timeout, childEnv, signal);
+          await waitForPodDone(podName, timeout, childEnv, signal, kubeconfigPath ?? undefined);
         } catch {
           // Timed out — still fetch logs before cleanup
         }
@@ -324,7 +328,7 @@ Examples:
         let stderr = "";
         try {
           const logsResult = await spawnAsync("kubectl", [
-            "logs", podName,
+            ...kubeconfigArgs, "logs", podName,
           ], 10_000, childEnv);
           stdout = logsResult.stdout;
           stderr = logsResult.stderr;
@@ -337,7 +341,7 @@ Examples:
         let exitCode: number | null = null;
         try {
           const statusResult = await spawnAsync("kubectl", [
-            "get", "pod", podName,
+            ...kubeconfigArgs, "get", "pod", podName,
             "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
           ], 5_000, childEnv);
           const code = parseInt(statusResult.stdout.trim(), 10);

@@ -171,7 +171,7 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
 
       // Gateway/SDK mode — block gate, wait for user confirmation
       deepSearchGate.blocked = true;
-      const userResponse = "Hypotheses submitted for user review. Please wait for the user's confirmation before continuing — do not call deep_search on your own.";
+      const userResponse = "Hypotheses submitted for user review.\n\nSTOP. Do NOT call any more tools. Do NOT call deep_search. Do NOT fall back to manual investigation.\nWait for the user to confirm — their confirmation message will appear as a new user message.\nYour next output should ONLY be a brief text message telling the user you are waiting for their confirmation.";
 
       return {
         content: [{ type: "text" as const, text: userResponse }],
