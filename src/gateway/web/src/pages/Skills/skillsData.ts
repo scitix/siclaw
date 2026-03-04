@@ -39,11 +39,11 @@ export type Skill = {
     specs?: string;
     scripts?: Script[];
     labels?: string[];
-    scope: 'core' | 'team' | 'personal' | 'extension';
+    scope: 'builtin' | 'team' | 'personal';
     author?: string;
     authorId?: string;
     contributionStatus?: 'none' | 'pending' | 'approved';
-    reviewStatus?: 'draft' | 'published' | 'pending';
+    reviewStatus?: 'draft' | 'approved' | 'pending';
     upvotes?: number;
     downvotes?: number;
     userVote?: 1 | -1 | null;
@@ -178,14 +178,15 @@ export async function rpcReviewDecision(
     reason?: string,
     stagingVersion?: number,
 ): Promise<{ status: string }> {
-    return sendRpc('skill.reviewDecision', { id, decision, reason, stagingVersion });
+    return sendRpc('skill.review', { id, decision, reason, stagingVersion });
 }
 
 export async function rpcRequestPublish(
     sendRpc: RpcSendFn,
     id: string,
+    contributeToTeam?: boolean,
 ): Promise<{ status: string }> {
-    return sendRpc('skill.requestPublish', { id });
+    return sendRpc('skill.submit', { id, contributeToTeam });
 }
 
 export async function rpcWithdrawSkill(

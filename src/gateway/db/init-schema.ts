@@ -65,11 +65,11 @@ const DDL_STATEMENTS = [
     version INT NOT NULL DEFAULT 1,
     published_version INT NULL,
     staging_version INT NOT NULL DEFAULT 0,
-    scope ENUM('core', 'team', 'personal') NOT NULL DEFAULT 'personal',
+    scope ENUM('builtin', 'team', 'personal') NOT NULL DEFAULT 'personal',
     author_id VARCHAR(32),
     status VARCHAR(50) DEFAULT 'installed',
     contribution_status ENUM('none', 'pending', 'approved') DEFAULT 'none',
-    review_status ENUM('draft', 'published', 'pending') NOT NULL DEFAULT 'draft',
+    review_status ENUM('draft', 'pending', 'approved') NOT NULL DEFAULT 'draft',
     dir_name VARCHAR(255) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -189,11 +189,25 @@ const DDL_STATEMENTS = [
     UNIQUE KEY uk_user_permission (user_id, permission)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS skill_contents (
+    id VARCHAR(64) PRIMARY KEY,
+    skill_id VARCHAR(64) NOT NULL,
+    tag ENUM('working', 'staging', 'published') NOT NULL DEFAULT 'working',
+    specs MEDIUMTEXT,
+    scripts_json JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_skill_tag (skill_id, tag)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS skill_versions (
     id VARCHAR(64) PRIMARY KEY,
     skill_id VARCHAR(64) NOT NULL,
     version INT NOT NULL,
-    s3_key VARCHAR(500) NOT NULL,
+    s3_key VARCHAR(500) NULL,
+    specs MEDIUMTEXT,
+    scripts_json JSON,
     files JSON,
     commit_message VARCHAR(500),
     author_id VARCHAR(32),
@@ -349,6 +363,7 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE user_env_configs ADD INDEX idx_user_env_configs_user (user_id)`,
   `ALTER TABLE user_env_configs ADD INDEX idx_user_env_configs_env (env_id)`,
   `ALTER TABLE skill_versions ADD INDEX idx_skill_versions_skill (skill_id, version)`,
+  `ALTER TABLE skill_contents ADD INDEX idx_skill_contents_skill (skill_id)`,
   `ALTER TABLE credentials ADD INDEX idx_credentials_user (user_id, type)`,
 ];
 
@@ -359,6 +374,30 @@ export async function initSchema(db: Database): Promise<void> {
 
   for (const ddl of DDL_STATEMENTS) {
     await db.execute(sql.raw(ddl));
+  }
+
+  // Schema migrations — run after DDL to handle existing databases
+  const MIGRATIONS = [
+    // skill_versions: s3_key NOT NULL → NULL, add specs + scripts_json columns
+    `ALTER TABLE skill_versions MODIFY COLUMN s3_key VARCHAR(500) NULL`,
+    `ALTER TABLE skill_versions ADD COLUMN specs MEDIUMTEXT AFTER s3_key`,
+    `ALTER TABLE skill_versions ADD COLUMN scripts_json JSON AFTER specs`,
+    // skills: fix enum values from old schema
+    `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal') NOT NULL DEFAULT 'personal'`,
+    `ALTER TABLE skills MODIFY COLUMN review_status ENUM('draft','pending','approved') NOT NULL DEFAULT 'draft'`,
+  ];
+  for (const stmt of MIGRATIONS) {
+    try {
+      await db.execute(sql.raw(stmt));
+    } catch (err: any) {
+      const code = err?.cause?.code || err?.code || "";
+      // Ignore "column already exists" or "unknown column" errors
+      if (code === "ER_DUP_FIELDNAME" || code === "ER_BAD_FIELD_ERROR") continue;
+      // Ignore if column type already matches
+      if (String(err).includes("ER_DUP_FIELDNAME")) continue;
+      // Log but don't fail
+      console.warn("[db] Migration warning:", String(err).slice(0, 200));
+    }
   }
 
   // Create indexes (ignore ER_DUP_KEYNAME if already exist)

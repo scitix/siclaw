@@ -10,8 +10,9 @@ import { skillVersions } from "../schema.js";
 export interface CreateSkillVersionInput {
   skillId: string;
   version: number;
-  s3Key: string;
   files?: { specs?: string; scripts?: string[] } | null;
+  specs?: string;
+  scriptsJson?: Array<{ name: string; content: string }>;
   commitMessage?: string;
   authorId?: string;
 }
@@ -27,8 +28,10 @@ export class SkillVersionRepository {
       id,
       skillId: input.skillId,
       version: input.version,
-      s3Key: input.s3Key,
+      s3Key: null,
       files: input.files ?? null,
+      specs: input.specs ?? null,
+      scriptsJson: input.scriptsJson ?? null,
       commitMessage: input.commitMessage ?? null,
       authorId: input.authorId ?? null,
     });

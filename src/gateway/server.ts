@@ -9,6 +9,7 @@ import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient } from "./agentbox/client.js";
 import { createBroadcaster, buildEvent, parseFrame, dispatchRpc, MAX_BUFFERED_BYTES, type RpcHandler, type RpcContext } from "./ws-protocol.js";
 import { createRpcMethods } from "./rpc-methods.js";
+import type { SkillBundle } from "./skills/skill-bundle.js";
 import { UserStore, createLoginHandler, createAuthMiddleware, BindCodeStore, signJwt, type AuthContext } from "./auth/index.js";
 import { loadOAuth2Config, generateState, consumeState, buildAuthorizeUrl, exchangeCode, fetchUserInfo } from "./auth/oauth2.js";
 import { createDb, closeDb, type Database } from "./db/index.js";
@@ -169,11 +170,24 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     });
   }
 
-  // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers);
-
-  // System config repo (used by JWT, SSO, S3, etc.)
+  // System config repo (used by JWT, SSO, cert-manager, etc.)
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
+
+  // Initialize Certificate Manager for mTLS (CA persisted in DB)
+  const certManager = await CertificateManager.create(sysConfigRepo);
+  agentBoxManager.setCertManager(certManager);
+  const gatewayHostname = process.env.SICLAW_GATEWAY_HOSTNAME || "siclaw-gateway.siclaw.svc.cluster.local";
+  const serverCert = certManager.issueServerCertificate(gatewayHostname);
+
+  // Gateway cert as mTLS client credentials for AgentBox calls
+  const agentBoxTlsOptions = {
+    cert: serverCert.cert,
+    key: serverCert.key,
+    ca: certManager.getCACertificate(),
+  };
+
+  // Create RPC methods using AgentBoxManager
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions);
 
   // Apply DB-stored agentbox image override (takes effect on next pod spawn)
   if (sysConfigRepo) {
@@ -322,15 +336,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   };
 
-  // Initialize Certificate Manager for mTLS
-  const certDir = path.resolve(process.cwd(), ".siclaw", "certs");
-  const certManager = new CertificateManager(certDir);
-
-  // Generate Gateway server certificate for internal API
-  const gatewayHostname = process.env.SICLAW_GATEWAY_HOSTNAME || "siclaw-gateway.siclaw.svc.cluster.local";
-  const serverCert = certManager.issueServerCertificate(gatewayHostname);
-
-  // Create mTLS middleware for internal API
+  // Create mTLS middleware for internal API (certManager + serverCert initialized earlier)
   const mtlsMiddleware = createMtlsMiddleware({
     certManager,
     protectedPaths: ["/api/internal/"],
@@ -1133,6 +1139,31 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${requestedUserId}`);
               } catch (err) {
                 console.error("[gateway] cron-list error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            })();
+            return;
+          }
+
+          // Skill Bundle endpoint: GET /api/internal/skills/bundle
+          // AgentBox pulls its skill bundle via mTLS — identity comes from certificate
+          if (url === "/api/internal/skills/bundle" && method === "GET") {
+            (async () => {
+              try {
+                const identity = (req as any).certIdentity;
+                if (!identity) {
+                  res.writeHead(401, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "Client certificate required" }));
+                  return;
+                }
+
+                const bundle = await getSkillBundle(identity.userId, identity.env);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(bundle));
+                console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} skills=${bundle.skills.length}`);
+              } catch (err) {
+                console.error("[gateway] skills/bundle error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ error: "Internal server error" }));
               }

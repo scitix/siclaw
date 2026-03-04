@@ -77,11 +77,11 @@ export const skills = sqliteTable("skills", {
   description: text("description"),
   type: text("type"),
   version: integer("version").notNull().default(1),
-  scope: text("scope").notNull().default("personal"), // "core" | "team" | "personal"
+  scope: text("scope").notNull().default("personal"), // "builtin" | "team" | "personal"
   authorId: text("author_id").references(() => users.id),
   status: text("status").default("installed"),
   contributionStatus: text("contribution_status").default("none"), // "none" | "pending" | "approved"
-  reviewStatus: text("review_status").notNull().default("draft"), // "draft" | "published" | "pending"
+  reviewStatus: text("review_status").notNull().default("draft"), // "draft" | "pending" | "approved"
   dirName: text("dir_name").notNull(),
   publishedVersion: integer("published_version"),
   stagingVersion: integer("staging_version").notNull().default(0),
@@ -93,6 +93,21 @@ export const skills = sqliteTable("skills", {
   forkedFromId: text("forked_from_id"),
 });
 
+// ─── Skill Contents ─────────────────────────────────
+
+export const skillContents = sqliteTable("skill_contents", {
+  id: text("id").primaryKey(),
+  skillId: text("skill_id").notNull()
+    .references(() => skills.id, { onDelete: "cascade" }),
+  tag: text("tag").notNull().default("working"), // "working" | "staging" | "published"
+  specs: text("specs"),
+  scriptsJson: text("scripts_json", { mode: "json" }).$type<Array<{ name: string; content: string }>>(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+}, (table) => ({
+  ukSkillTag: uniqueIndex("uk_skill_tag").on(table.skillId, table.tag),
+}));
+
 // ─── Skill Versions ─────────────────────────────────
 
 export const skillVersions = sqliteTable("skill_versions", {
@@ -100,7 +115,9 @@ export const skillVersions = sqliteTable("skill_versions", {
   skillId: text("skill_id").notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
   version: integer("version").notNull(),
-  s3Key: text("s3_key").notNull(),
+  s3Key: text("s3_key"),
+  specs: text("specs"),
+  scriptsJson: text("scripts_json", { mode: "json" }).$type<Array<{ name: string; content: string }>>(),
   files: text("files", { mode: "json" }).$type<{ specs?: string; scripts?: string[] }>(),
   commitMessage: text("commit_message"),
   authorId: text("author_id").references(() => users.id),

@@ -26,6 +26,7 @@ export const {
   sessions,
   messages,
   skills,
+  skillContents,
   skillVersions,
   channels,
   cronJobs,

@@ -3,20 +3,26 @@
  *
  * Architecture:
  * - Gateway acts as CA (Certificate Authority)
+ * - CA cert + key persisted in DB (system_config table) to survive pod restarts
  * - Each AgentBox receives a unique client certificate
  * - Certificate contains identity info (userId, workspaceId)
  * - Gateway validates certificates and extracts identity for authorization
  */
 
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import forge from "node-forge";
+import type { SystemConfigRepository } from "../db/repositories/system-config-repo.js";
+
+/** CA validity: 10 years */
+const CA_VALIDITY_DAYS = 3650;
+/** Renew CA when less than 30 days remaining */
+const CA_RENEW_THRESHOLD_DAYS = 30;
 
 export interface CertificateIdentity {
   userId: string;
   workspaceId: string;
   boxId: string;
+  env: "prod" | "dev";
   issuedAt: Date;
   expiresAt: Date;
 }
@@ -35,56 +41,87 @@ export interface CertificateBundle {
 export class CertificateManager {
   private caCert: string;
   private caKey: string;
-  private certDir: string;
 
-  constructor(certDir: string = path.join(process.cwd(), ".siclaw", "certs")) {
-    this.certDir = certDir;
+  private constructor(caCert: string, caKey: string) {
+    this.caCert = caCert;
+    this.caKey = caKey;
+  }
 
-    // Ensure cert directory exists
-    if (!fs.existsSync(certDir)) {
-      fs.mkdirSync(certDir, { recursive: true });
+  /**
+   * Create a CertificateManager instance.
+   *
+   * - With DB: loads CA from system_config, generates + persists if absent or expiring soon
+   * - Without DB (local dev): generates ephemeral CA in memory
+   */
+  static async create(configRepo: SystemConfigRepository | null): Promise<CertificateManager> {
+    if (configRepo) {
+      return CertificateManager.createWithDb(configRepo);
+    }
+    // No DB — ephemeral CA for local development
+    console.log("[cert-manager] No database available, generating ephemeral CA");
+    const ca = CertificateManager.generateCA();
+    return new CertificateManager(ca.cert, ca.key);
+  }
+
+  private static async createWithDb(configRepo: SystemConfigRepository): Promise<CertificateManager> {
+    const existingCert = await configRepo.get("ca.cert");
+    const existingKey = await configRepo.get("ca.key");
+
+    if (existingCert && existingKey) {
+      // Check if CA is expiring soon
+      const needsRenew = CertificateManager.isCAExpiringSoon(existingCert);
+      if (!needsRenew) {
+        console.log("[cert-manager] Loaded CA certificate from database");
+        return new CertificateManager(existingCert, existingKey);
+      }
+      console.log("[cert-manager] CA certificate expiring soon, regenerating");
     }
 
-    const caPath = path.join(certDir, "ca.crt");
-    const keyPath = path.join(certDir, "ca.key");
+    // Generate new CA and persist to DB
+    const ca = CertificateManager.generateCA();
+    await configRepo.set("ca.cert", ca.cert);
+    await configRepo.set("ca.key", ca.key);
+    console.log("[cert-manager] Generated new CA certificate and saved to database");
 
-    // Load or generate CA certificate
-    if (fs.existsSync(caPath) && fs.existsSync(keyPath)) {
-      this.caCert = fs.readFileSync(caPath, "utf-8");
-      this.caKey = fs.readFileSync(keyPath, "utf-8");
-      console.log("[cert-manager] Loaded existing CA certificate");
-    } else {
-      const ca = this.generateCA();
-      this.caCert = ca.cert;
-      this.caKey = ca.key;
-      fs.writeFileSync(caPath, this.caCert);
-      fs.writeFileSync(keyPath, this.caKey, { mode: 0o600 }); // Private key should be readable only by owner
-      console.log("[cert-manager] Generated new CA certificate");
+    return new CertificateManager(ca.cert, ca.key);
+  }
+
+  /**
+   * Check if CA cert expires within CA_RENEW_THRESHOLD_DAYS
+   */
+  private static isCAExpiringSoon(certPem: string): boolean {
+    try {
+      const cert = forge.pki.certificateFromPem(certPem);
+      const now = new Date();
+      const threshold = new Date(now.getTime() + CA_RENEW_THRESHOLD_DAYS * 24 * 60 * 60 * 1000);
+      return cert.validity.notAfter < threshold;
+    } catch {
+      // Can't parse — treat as expired
+      return true;
     }
   }
 
   /**
    * Generate CA (Certificate Authority) certificate
    */
-  private generateCA(): { cert: string; key: string } {
+  private static generateCA(): { cert: string; key: string } {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 4096,
       publicKeyEncoding: { type: "spki", format: "pem" },
       privateKeyEncoding: { type: "pkcs8", format: "pem" },
     });
 
-    // Create self-signed CA certificate
-    const cert = this.createCertificate({
+    const cert = CertificateManager.createCertificateStatic({
       subject: {
         CN: "Siclaw Gateway CA",
         O: "Siclaw",
         OU: "Security",
       },
-      issuer: null, // Self-signed
+      issuer: null,
       publicKey,
       signingKey: privateKey,
       isCA: true,
-      validityDays: 3650, // 10 years
+      validityDays: CA_VALIDITY_DAYS,
     });
 
     return { cert, key: privateKey };
@@ -102,7 +139,7 @@ export class CertificateManager {
 
     const cert = this.createCertificate({
       subject: {
-        CN: hostname, // Common Name = Gateway hostname
+        CN: hostname,
         O: "Siclaw",
         OU: "Gateway",
       },
@@ -114,8 +151,8 @@ export class CertificateManager {
       publicKey,
       signingKey: this.caKey,
       isCA: false,
-      validityDays: 90, // 90 days for server cert
-      extendedKeyUsage: ["serverAuth"], // Server authentication only
+      validityDays: 90,
+      extendedKeyUsage: ["serverAuth", "clientAuth"],
     });
 
     console.log(`[cert-manager] Issued server certificate for ${hostname}`);
@@ -126,7 +163,7 @@ export class CertificateManager {
   /**
    * Issue a client certificate for an AgentBox instance
    */
-  issueAgentBoxCertificate(userId: string, workspaceId: string, boxId: string): CertificateBundle {
+  issueAgentBoxCertificate(userId: string, workspaceId: string, boxId: string, env: "prod" | "dev" = "prod"): CertificateBundle {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
       publicKeyEncoding: { type: "spki", format: "pem" },
@@ -138,10 +175,11 @@ export class CertificateManager {
 
     const cert = this.createCertificate({
       subject: {
-        CN: userId, // Common Name = userId
-        OU: workspaceId, // Organizational Unit = workspaceId
+        CN: userId,
+        OU: workspaceId,
         O: "Siclaw",
-        serialNumber: boxId, // Serial Number = boxId
+        serialNumber: boxId,
+        L: env,
       },
       issuer: {
         CN: "Siclaw Gateway CA",
@@ -152,10 +190,10 @@ export class CertificateManager {
       signingKey: this.caKey,
       isCA: false,
       validityDays: 30,
-      extendedKeyUsage: ["clientAuth"], // Client authentication only
+      extendedKeyUsage: ["clientAuth", "serverAuth"],
     });
 
-    console.log(`[cert-manager] Issued certificate for userId=${userId} workspaceId=${workspaceId} boxId=${boxId}`);
+    console.log(`[cert-manager] Issued certificate for userId=${userId} workspaceId=${workspaceId} boxId=${boxId} env=${env}`);
 
     return {
       cert,
@@ -165,6 +203,7 @@ export class CertificateManager {
         userId,
         workspaceId,
         boxId,
+        env,
         issuedAt,
         expiresAt,
       },
@@ -176,11 +215,9 @@ export class CertificateManager {
    */
   verifyCertificate(clientCert: string): CertificateIdentity | null {
     try {
-      // Parse client certificate
       const cert = forge.pki.certificateFromPem(clientCert);
       const caCert = forge.pki.certificateFromPem(this.caCert);
 
-      // Verify certificate is signed by our CA
       try {
         const isValid = caCert.verify(cert);
         if (!isValid) {
@@ -192,18 +229,18 @@ export class CertificateManager {
         return null;
       }
 
-      // Check expiration
       const now = new Date();
       if (now < cert.validity.notBefore || now > cert.validity.notAfter) {
         console.warn("[cert-manager] Certificate expired or not yet valid");
         return null;
       }
 
-      // Extract identity from subject fields
       const subject = cert.subject.attributes;
       const userId = subject.find((attr: any) => attr.name === "commonName")?.value as string | undefined;
       const workspaceId = subject.find((attr: any) => attr.name === "organizationalUnitName")?.value as string | undefined;
       const boxId = subject.find((attr: any) => attr.name === "serialNumber")?.value as string | undefined;
+      const envRaw = subject.find((attr: any) => attr.name === "localityName")?.value as string | undefined;
+      const env = (envRaw === "dev" ? "dev" : "prod") as "prod" | "dev";
 
       if (!userId || !workspaceId || !boxId) {
         console.warn("[cert-manager] Certificate missing required identity fields");
@@ -214,6 +251,7 @@ export class CertificateManager {
         userId,
         workspaceId,
         boxId,
+        env,
         issuedAt: cert.validity.notBefore,
         expiresAt: cert.validity.notAfter,
       };
@@ -231,46 +269,37 @@ export class CertificateManager {
   }
 
   /**
+   * Instance method — delegates to static
+   */
+  private createCertificate(opts: CertOpts): string {
+    return CertificateManager.createCertificateStatic(opts);
+  }
+
+  /**
    * Create X.509 certificate using node-forge
    */
-  private createCertificate(opts: {
-    subject: Record<string, string>;
-    issuer: Record<string, string> | null;
-    publicKey: string;
-    signingKey: string;
-    isCA: boolean;
-    validityDays: number;
-    extendedKeyUsage?: string[];
-  }): string {
-    // Convert PEM keys to forge format
+  private static createCertificateStatic(opts: CertOpts): string {
     const publicKeyForge = forge.pki.publicKeyFromPem(opts.publicKey);
     const privateKeyForge = forge.pki.privateKeyFromPem(opts.signingKey);
 
-    // Create certificate
     const cert = forge.pki.createCertificate();
-
-    // Public key
     cert.publicKey = publicKeyForge;
-
-    // Serial number (random)
     cert.serialNumber = forge.util.bytesToHex(forge.random.getBytesSync(16));
 
-    // Validity period
     const notBefore = new Date();
     const notAfter = new Date();
     notAfter.setDate(notBefore.getDate() + opts.validityDays);
     cert.validity.notBefore = notBefore;
     cert.validity.notAfter = notAfter;
 
-    // Subject
     const subjectAttrs = [];
     if (opts.subject.CN) subjectAttrs.push({ name: "commonName", value: opts.subject.CN });
     if (opts.subject.O) subjectAttrs.push({ name: "organizationName", value: opts.subject.O });
     if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU });
     if (opts.subject.serialNumber) subjectAttrs.push({ name: "serialNumber", value: opts.subject.serialNumber });
+    if (opts.subject.L) subjectAttrs.push({ name: "localityName", value: opts.subject.L });
     cert.setSubject(subjectAttrs);
 
-    // Issuer (self-signed if null)
     const issuerData = opts.issuer || opts.subject;
     const issuerAttrs = [];
     if (issuerData.CN) issuerAttrs.push({ name: "commonName", value: issuerData.CN });
@@ -278,34 +307,32 @@ export class CertificateManager {
     if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU });
     cert.setIssuer(issuerAttrs);
 
-    // Extensions
     const extensions: any[] = [
-      {
-        name: "basicConstraints",
-        cA: opts.isCA,
-      },
-      {
-        name: "keyUsage",
-        keyCertSign: opts.isCA,
-        digitalSignature: true,
-        keyEncipherment: true,
-      },
+      { name: "basicConstraints", cA: opts.isCA },
+      { name: "keyUsage", keyCertSign: opts.isCA, digitalSignature: true, keyEncipherment: true },
     ];
 
     if (opts.extendedKeyUsage) {
       extensions.push({
-        name: "extendedKeyUsage",
+        name: "extKeyUsage",
         clientAuth: opts.extendedKeyUsage.includes("clientAuth"),
         serverAuth: opts.extendedKeyUsage.includes("serverAuth"),
       });
     }
 
     cert.setExtensions(extensions);
-
-    // Sign certificate
     cert.sign(privateKeyForge, forge.md.sha256.create());
 
-    // Convert to PEM
     return forge.pki.certificateToPem(cert);
   }
+}
+
+interface CertOpts {
+  subject: Record<string, string>;
+  issuer: Record<string, string> | null;
+  publicKey: string;
+  signingKey: string;
+  isCA: boolean;
+  validityDays: number;
+  extendedKeyUsage?: string[];
 }

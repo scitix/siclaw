@@ -68,8 +68,6 @@ spec:
           volumeMounts:
             - name: skills
               mountPath: /app/.siclaw/skills
-            - name: certs
-              mountPath: /.siclaw/certs
           livenessProbe:
             httpGet:
               path: /api/health
@@ -84,8 +82,4 @@ spec:
             periodSeconds: 10
       volumes:
         - name: skills
-          persistentVolumeClaim:
-            claimName: {{ include "siclaw.fullname" . }}-skills
-        - name: certs
-          persistentVolumeClaim:
-            claimName: {{ include "siclaw.fullname" . }}-gateway-certs
+          emptyDir: {}

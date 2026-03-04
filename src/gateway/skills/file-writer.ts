@@ -1,15 +1,14 @@
 /**
- * Skill File Writer — writes skill files to Skills PV
+ * Skill File Writer
  *
  * Directory layout:
- *   .siclaw/skills/user/{userId}/{skillName}/SKILL.md
- *   .siclaw/skills/team/{skillName}/SKILL.md
- *   .siclaw/skills/core/{skillName}/SKILL.md
+ *   skills/core/{skillName}/SKILL.md           — builtin (baked in Docker image)
+ *   .siclaw/skills/team/{skillName}/SKILL.md   — team (from DB)
+ *   .siclaw/skills/user/{userId}/{skillName}/   — personal (from DB)
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import type { S3Storage } from "../../lib/s3-storage.js";
 
 export interface SkillFiles {
   specs?: string;
@@ -23,7 +22,7 @@ export interface ScannedSkill {
   dirName: string;
   name: string;
   description: string;
-  scope: "core" | "team" | "personal" | "extension";
+  scope: "builtin" | "team" | "personal";
   scripts: string[];
 }
 
@@ -32,7 +31,7 @@ export class SkillFileWriter {
 
   /** Initialize Skills PV (ensure dirs exist) */
   async init(): Promise<void> {
-    for (const sub of ["core", "team", "user", "extension", "platform"]) {
+    for (const sub of ["core", "team", "user", "platform"]) {
       const dir = path.join(this.skillsDir, sub);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -43,25 +42,23 @@ export class SkillFileWriter {
 
   /** Resolve skill directory path */
   resolveDir(
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
     dirName: string,
     userId?: string,
   ): string {
     switch (scope) {
-      case "core":
+      case "builtin":
         return path.join(this.skillsDir, "core", dirName);
       case "team":
         return path.join(this.skillsDir, "team", dirName);
       case "personal":
         return path.join(this.skillsDir, "user", userId || "unknown", dirName);
-      case "extension":
-        return path.join(this.skillsDir, "extension", dirName);
     }
   }
 
   /** Write skill files to disk */
   async writeSkill(
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
     dirName: string,
     files: SkillFiles,
     opts: { userId?: string },
@@ -110,16 +107,16 @@ export class SkillFileWriter {
 
   /** Read skill files from disk */
   readSkill(
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
     dirName: string,
     userId?: string,
   ): SkillFiles | null {
     let skillDir = this.resolveDir(scope, dirName, userId);
 
-    // Fallback to Docker-baked cwd/skills/{scope} for core/extension skills
-    if (!fs.existsSync(skillDir) && (scope === "core" || scope === "extension")) {
-      const bakedDir = path.join(process.cwd(), "skills", scope, dirName);
-      if (fs.existsSync(bakedDir)) skillDir = bakedDir;
+    // Fallback to Docker-baked cwd/skills/core for builtin skills
+    if (!fs.existsSync(skillDir) && scope === "builtin") {
+      const bakedCore = path.join(process.cwd(), "skills", "core", dirName);
+      if (fs.existsSync(bakedCore)) skillDir = bakedCore;
     }
 
     if (!fs.existsSync(skillDir)) return null;
@@ -184,7 +181,7 @@ export class SkillFileWriter {
   /** Scan a single directory for skills */
   private scanDir(
     dir: string,
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
   ): ScannedSkill[] {
     if (!fs.existsSync(dir)) return [];
 
@@ -221,36 +218,28 @@ export class SkillFileWriter {
   }
 
   /** Scan all skills under a scope directory */
-  scanScope(scope: "core" | "team" | "extension", userId?: string): ScannedSkill[] {
-    const scopeDir =
-      scope === "core"
-        ? path.join(this.skillsDir, "core")
-        : scope === "team"
-          ? path.join(this.skillsDir, "team")
-          : scope === "extension"
-            ? path.join(this.skillsDir, "extension")
-            : path.join(this.skillsDir, "user", userId || "unknown");
+  scanScope(scope: "builtin" | "team"): ScannedSkill[] {
+    if (scope === "builtin") {
+      const results: ScannedSkill[] = [];
+      const seen = new Set<string>();
 
-    const results = this.scanDir(scopeDir, scope);
-
-    // For core/extension skills: also scan Docker-baked cwd/skills/{scope} (dedup by dirName)
-    if (scope === "core" || scope === "extension") {
-      const bakedDir = path.join(process.cwd(), "skills", scope);
-      if (bakedDir !== scopeDir) {
-        const baked = this.scanDir(bakedDir, scope);
-        const seen = new Set(results.map((s) => s.dirName));
-        for (const s of baked) {
-          if (!seen.has(s.dirName)) results.push(s);
-        }
+      // Scan Docker-baked cwd/skills/core
+      const bakedCore = path.join(process.cwd(), "skills", "core");
+      for (const s of this.scanDir(bakedCore, "builtin")) {
+        if (!seen.has(s.dirName)) { seen.add(s.dirName); results.push(s); }
       }
+
+      return results;
     }
 
-    return results;
+    // team scope
+    const scopeDir = path.join(this.skillsDir, "team");
+    return this.scanDir(scopeDir, "team");
   }
 
   /** Delete skill files from disk (including .published/ if present) */
   async deleteSkill(
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
     dirName: string,
     opts: { userId?: string },
   ): Promise<void> {
@@ -383,7 +372,7 @@ export class SkillFileWriter {
 
   /** Rename a skill directory on disk (and its .published/ dir if present) */
   async renameDir(
-    scope: "core" | "team" | "personal" | "extension",
+    scope: "builtin" | "team" | "personal",
     oldDirName: string,
     newDirName: string,
     opts: { userId?: string },
@@ -433,17 +422,4 @@ export class SkillFileWriter {
     return { teamDir: destDir };
   }
 
-  /** Materialize skill files from S3 to a local directory */
-  async materializeFromS3(
-    s3: S3Storage,
-    s3Key: string,
-    targetDir: string,
-  ): Promise<void> {
-    // Clear target if exists
-    if (fs.existsSync(targetDir)) {
-      fs.rmSync(targetDir, { recursive: true, force: true });
-    }
-    fs.mkdirSync(targetDir, { recursive: true });
-    await s3.downloadDir(s3Key, targetDir);
-  }
 }

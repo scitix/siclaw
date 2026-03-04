@@ -145,8 +145,8 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                                                         );
                                                         const groups: { label: string; scope: Skill['scope'] }[] = [
                                                             { label: 'Personal', scope: 'personal' },
-                                                            { label: 'Team', scope: 'team' },
-                                                            { label: 'Core', scope: 'core' },
+                                                            { label: 'Team Skills', scope: 'team' },
+                                                            { label: 'System Skills', scope: 'builtin' },
                                                         ];
                                                         const hasResults = filtered.length > 0;
 

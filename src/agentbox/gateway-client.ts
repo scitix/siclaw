@@ -24,6 +24,19 @@ export interface CronJob {
   lastResult?: string | null;
 }
 
+export interface SkillBundleEntry {
+  dirName: string;
+  scope: "builtin" | "team" | "personal";
+  specs: string;
+  scripts: Array<{ name: string; content: string }>;
+}
+
+export interface SkillBundle {
+  version: string;
+  skills: SkillBundleEntry[];
+  disabledBuiltins?: string[];
+}
+
 export class GatewayClient {
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
@@ -65,6 +78,14 @@ export class GatewayClient {
   async listCronJobs(userId: string): Promise<CronJob[]> {
     const data = await this.request(`/api/internal/cron-list?userId=${encodeURIComponent(userId)}`, "GET");
     return data.jobs || [];
+  }
+
+  /**
+   * Fetch the skill bundle from Gateway via mTLS.
+   * Identity (userId, env) is derived from the client certificate — no params needed.
+   */
+  async fetchSkillBundle(): Promise<SkillBundle> {
+    return this.request("/api/internal/skills/bundle", "GET");
   }
 
   /**

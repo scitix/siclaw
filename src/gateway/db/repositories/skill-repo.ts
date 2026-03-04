@@ -12,7 +12,7 @@ export interface CreateSkillInput {
   name: string;
   description?: string;
   type?: string;
-  scope: "core" | "team" | "personal";
+  scope: "builtin" | "team" | "personal";
   authorId?: string;
   dirName: string;
   forkedFromId?: string;
@@ -25,10 +25,9 @@ export interface UpdateSkillInput {
   type?: string;
   status?: string;
   contributionStatus?: "none" | "pending" | "approved";
-  reviewStatus?: "draft" | "published" | "pending";
-  scope?: "core" | "team" | "personal";
+  reviewStatus?: "draft" | "pending" | "approved";
+  scope?: "builtin" | "team" | "personal";
   dirName?: string;
-  s3Key?: string;
   publishedVersion?: number | null;
   stagingVersion?: number;
   teamSourceSkillId?: string | null;
@@ -55,14 +54,13 @@ export class SkillRepository {
   async listForUser(userId: string, opts?: {
     limit?: number;
     offset?: number;
-    scope?: "core" | "team" | "personal";
+    scope?: "builtin" | "team" | "personal";
     search?: string;
   }) {
     const limit = opts?.limit ?? 30;
     const offset = opts?.offset ?? 0;
 
     let conditions = or(
-      eq(skills.scope, "core"),
       eq(skills.scope, "team"),
       and(eq(skills.scope, "personal"), eq(skills.authorId, userId)),
     );
@@ -143,7 +141,6 @@ export class SkillRepository {
       setFields.reviewStatus = updates.reviewStatus;
     if (updates.scope !== undefined) setFields.scope = updates.scope;
     if (updates.dirName !== undefined) setFields.dirName = updates.dirName;
-    if (updates.s3Key !== undefined) setFields.s3Key = updates.s3Key;
     if (updates.publishedVersion !== undefined) setFields.publishedVersion = updates.publishedVersion;
     if (updates.stagingVersion !== undefined) setFields.stagingVersion = updates.stagingVersion;
     if (updates.teamSourceSkillId !== undefined) setFields.teamSourceSkillId = updates.teamSourceSkillId;

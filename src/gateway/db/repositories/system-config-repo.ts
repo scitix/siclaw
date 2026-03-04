@@ -1,8 +1,8 @@
 /**
  * System Config Repository — key/value config stored in DB.
  *
- * Used for SSO, S3, system URLs, etc.
- * Keys follow dotted notation: "sso.issuer", "s3.endpoint", etc.
+ * Used for SSO, system URLs, CA certs, etc.
+ * Keys follow dotted notation: "sso.issuer", "system.baseUrl", etc.
  */
 
 import { eq, like } from "drizzle-orm";
@@ -14,8 +14,8 @@ import { isUniqueViolation } from "../dialect-helpers.js";
 const SENSITIVE_KEYS = new Set([
   "jwt.secret",
   "sso.clientSecret",
-  "s3.accessKey",
-  "s3.secretKey",
+  "ca.cert",
+  "ca.key",
 ]);
 
 export class SystemConfigRepository {

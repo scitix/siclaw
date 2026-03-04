@@ -51,9 +51,3 @@ database:
   existingSecret:
     name: ""
     key: "database-url"
-
-# -- Persistence
-persistence:
-  skills:
-    storageClass: ""    # empty = cluster default
-    size: 10Gi
