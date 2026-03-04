@@ -10,7 +10,6 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[English](README.md) | [中文](README.zh-CN.md)
 
 </div>
 
