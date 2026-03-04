@@ -33,6 +33,7 @@ import {
   createManageChecklistTool,
   createProposeHypothesesTool,
   createEndInvestigationTool,
+  getDpWorkflow,
 } from "../tools/dp-tools.js";
 import { createMemorySearchTool } from "../tools/memory-search.js";
 import { createMemoryGetTool } from "../tools/memory-get.js";
@@ -486,7 +487,7 @@ export async function createSiclawSession(
     const sdkTools = [...customTools, ...tools];
 
     // DP tools for SDK brain — mutable state shared with http-server via dpState ref
-    const dpState: DpState = { enabled: false, checklist: null };
+    const dpState: DpState = { checklist: null };
     sdkTools.push(
       createManageChecklistTool(dpState),
       createProposeHypothesesTool(dpState),
@@ -498,6 +499,12 @@ export async function createSiclawSession(
     // Build the same append content that pi-agent gets via appendSystemPromptOverride
     const appendParts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
+
+    // Inject deep investigation workflow so the model always knows about DP tools
+    const dpWorkflow = getDpWorkflow();
+    if (dpWorkflow) {
+      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Deep Investigation Capability\n\nYou have access to a structured deep investigation workflow. Use it for complex issues requiring hypothesis-driven validation.\n\n${dpWorkflow}`;
+    }
 
     // Append workspace custom prompt
     if (opts?.systemPromptAppend) {

@@ -13,13 +13,15 @@ them instead of ad-hoc investigation.
 
 ## When to Use
 
-- User activates via `/dp <question>`, Ctrl+I, or the [Deep Investigation] toggle in the web UI.
-- The system will tell you when DP mode is active.
+- Complex issues requiring hypothesis-driven investigation with multiple potential root causes
+- Issues involving RDMA/RoCE, network, or hardware that need systematic validation
+- When the user explicitly requests deep investigation (toggle, /dp, Ctrl+I)
+- When initial triage reveals multiple possible root causes
 
 ## When NOT to Use
 
-- Simple questions answerable with 1-2 kubectl commands.
-- User hasn't activated DP mode — never self-activate.
+- Simple questions answerable with 1-2 kubectl commands
+- When the issue is already clear from initial triage
 
 ## Workflow (4 phases)
 
