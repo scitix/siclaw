@@ -42,6 +42,37 @@ async function main() {
       reloadConfig();
       console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
 
+      // Fetch MCP config from Gateway and merge with local seed
+      try {
+        const remoteMcp = await gatewayClient.fetchMcpServers();
+
+        // Local config/mcp-servers.json as base
+        const { loadMcpServersConfig } = await import("./core/mcp-client.js");
+        const localMcp = loadMcpServersConfig(undefined, { localOnly: true });
+        const merged: Record<string, any> = {};
+        if (localMcp?.mcpServers) {
+          Object.assign(merged, localMcp.mcpServers);
+        }
+        // Gateway overlay (same name overwrites local)
+        if (remoteMcp?.mcpServers) {
+          Object.assign(merged, remoteMcp.mcpServers);
+        }
+
+        // Write merged result to SICLAW_MCP_DIR/mcp-servers.json
+        let mcpDir = process.env.SICLAW_MCP_DIR;
+        if (!mcpDir) {
+          mcpDir = path.resolve(process.cwd(), ".siclaw", "mcp");
+          process.env.SICLAW_MCP_DIR = mcpDir;
+        }
+        if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
+        const mcpOutPath = path.resolve(mcpDir, "mcp-servers.json");
+        fs.writeFileSync(mcpOutPath, JSON.stringify({ mcpServers: merged }, null, 2), "utf-8");
+        reloadConfig();
+        console.log(`[agentbox] Fetched MCP config from Gateway: ${Object.keys(merged).length} servers [${Object.keys(merged).join(", ")}]`);
+      } catch (mcpErr: any) {
+        console.warn(`[agentbox] Failed to fetch MCP config from Gateway: ${mcpErr.message}`);
+      }
+
       // Fetch and materialize skill bundle (team + personal only; builtin baked in image)
       try {
         const bundle = await gatewayClient.fetchSkillBundle();

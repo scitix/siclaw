@@ -27,7 +27,7 @@ import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
-import { loadMcpServersConfig } from "../core/mcp-client.js";
+
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
 import { SkillContentRepository, type SkillContentTag } from "./db/repositories/skill-content-repo.js";
 import { ScriptEvaluator } from "./skills/script-evaluator.js";
@@ -780,66 +780,20 @@ export function createRpcMethods(
   // MCP Server Methods
   // ─────────────────────────────────────────────────
 
-  /**
-   * Merge local config + MySQL → write to NFS for AgentBox consumption.
-   * 1. Load local config/mcp-servers.json as base
-   * 2. Load DB entries and overlay (same name → DB wins; disabled in DB → removed)
-   * 3. Write merged result to SICLAW_MCP_DIR/mcp-servers.json
-   */
-  async function syncMcpConfig(): Promise<void> {
-    const merged: Record<string, any> = {};
-
-    // 1. Local config as base layer
-    const localConfig = loadMcpServersConfig(undefined, { localOnly: true });
-    if (localConfig?.mcpServers) {
-      for (const [name, cfg] of Object.entries(localConfig.mcpServers)) {
-        merged[name] = cfg;
-      }
-      console.log(`[mcp-sync] Local file: ${Object.keys(localConfig.mcpServers).length} servers [${Object.keys(localConfig.mcpServers).join(", ")}]`);
-    }
-
-    // 2. DB overlay (same name overwrites local; disabled removes)
-    if (mcpRepo) {
-      const rows = await mcpRepo.list();
-      const enabled = rows.filter(r => r.enabled);
-      const disabled = rows.filter(r => !r.enabled);
-      console.log(`[mcp-sync] DB source: ${rows.length} total, ${enabled.length} enabled, ${disabled.length} disabled`);
-      for (const row of rows) {
-        if (!row.enabled) {
-          delete merged[row.name];
-          console.log(`[mcp-sync]   remove (disabled): ${row.name}`);
-          continue;
-        }
-        const cfg: Record<string, any> = {};
-        if (row.transport) cfg.transport = row.transport;
-        if (row.url) cfg.url = row.url;
-        if (row.command) cfg.command = row.command;
-        if (row.argsJson) cfg.args = row.argsJson;
-        if (row.envJson) cfg.env = row.envJson;
-        if (row.headersJson) cfg.headers = row.headersJson;
-        const overwritten = row.name in merged ? " (overwrites local)" : "";
-        merged[row.name] = cfg;
-        console.log(`[mcp-sync]   add: ${row.name} (${row.transport}, source=${row.source})${overwritten}`);
+  /** Notify all active AgentBoxes to reload MCP config from Gateway (fire-and-forget) */
+  function notifyMcpChange(): void {
+    for (const userId of agentBoxManager.activeUserIds()) {
+      const handles = agentBoxManager.getForUser(userId);
+      for (const handle of handles) {
+        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+        client.reloadMcp().then((r) => {
+          console.log(`[mcp-notify] Reloaded MCP for ${userId} box=${handle.boxId}: ${r.servers} servers`);
+        }).catch((err) => {
+          console.warn(`[mcp-notify] Failed to notify ${userId} box=${handle.boxId}: ${err.message}`);
+        });
       }
     }
-
-    // Write merged config to MCP dir (NFS in K8s, local fallback in dev)
-    let mcpDir = process.env.SICLAW_MCP_DIR;
-    if (!mcpDir) {
-      mcpDir = path.resolve(process.cwd(), ".siclaw", "mcp");
-      process.env.SICLAW_MCP_DIR = mcpDir;
-      console.log(`[mcp-sync] SICLAW_MCP_DIR not set, using fallback: ${mcpDir}`);
-    }
-    fs.mkdirSync(mcpDir, { recursive: true });
-    const outPath = path.resolve(mcpDir, "mcp-servers.json");
-    fs.writeFileSync(outPath, JSON.stringify({ mcpServers: merged }, null, 2), "utf-8");
-    console.log(`[mcp-sync] Wrote ${Object.keys(merged).length} servers to ${outPath}: [${Object.keys(merged).join(", ")}]`);
   }
-
-  // Run initial sync on startup
-  syncMcpConfig().catch((err) => {
-    console.warn("[rpc] Initial syncMcpConfig failed:", err.message);
-  });
 
   methods.set("mcp.list", async (_params, context: RpcContext) => {
     requireAuth(context);
@@ -912,7 +866,7 @@ export function createRpcMethods(
     });
     console.log(`[mcp-rpc] mcp.create: id=${id}, syncing config...`);
 
-    await syncMcpConfig();
+    notifyMcpChange();
     return { id, name };
   });
 
@@ -936,7 +890,7 @@ export function createRpcMethods(
       description: params.description as string | undefined,
     });
 
-    await syncMcpConfig();
+    notifyMcpChange();
     return { ok: true };
   });
 
@@ -950,7 +904,7 @@ export function createRpcMethods(
     const existing = await mcpRepo.getById(id);
     console.log(`[mcp-rpc] mcp.delete: id=${id}, name=${existing?.name ?? "unknown"}, by=${context.auth?.username}`);
     await mcpRepo.delete(id);
-    await syncMcpConfig();
+    notifyMcpChange();
     return { ok: true };
   });
 
@@ -967,7 +921,7 @@ export function createRpcMethods(
     const newEnabled = !server.enabled;
     console.log(`[mcp-rpc] mcp.toggle: ${server.name} ${server.enabled} → ${newEnabled}, by=${context.auth?.username}`);
     await mcpRepo.update(id, { enabled: newEnabled });
-    await syncMcpConfig();
+    notifyMcpChange();
     return { id, enabled: newEnabled };
   });
 

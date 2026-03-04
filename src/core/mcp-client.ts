@@ -151,8 +151,8 @@ function tryLoadConfig(configPath: string): McpServersConfig | null {
 }
 
 /**
- * Load MCP servers config with NFS-first priority:
- * 1. NFS path (SICLAW_MCP_DIR/mcp-servers.json) — unless localOnly
+ * Load MCP servers config:
+ * 1. Gateway-fetched config (SICLAW_MCP_DIR/mcp-servers.json) — unless localOnly
  * 2. Local config file (config/mcp-servers.json)
  */
 export function loadMcpServersConfig(
@@ -162,15 +162,13 @@ export function loadMcpServersConfig(
   const mcpDir = process.env.SICLAW_MCP_DIR;
   console.log(`[mcp-client] loadMcpServersConfig: SICLAW_MCP_DIR=${mcpDir || "(unset)"}, localOnly=${opts?.localOnly ?? false}`);
 
-  // 1. NFS (unless localOnly=true)
-  if (!opts?.localOnly) {
-    if (mcpDir) {
-      const nfsPath = path.resolve(mcpDir, "mcp-servers.json");
-      const config = tryLoadConfig(nfsPath);
-      if (config) {
-        console.log(`[mcp-client] Using NFS config: ${nfsPath}`);
-        return config;
-      }
+  // 1. Gateway-fetched config (unless localOnly=true)
+  if (!opts?.localOnly && mcpDir) {
+    const mcpPath = path.resolve(mcpDir, "mcp-servers.json");
+    const config = tryLoadConfig(mcpPath);
+    if (config) {
+      console.log(`[mcp-client] Using config: ${mcpPath}`);
+      return config;
     }
   }
   // 2. Local file (Docker image / CLI mode)
