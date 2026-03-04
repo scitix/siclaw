@@ -980,32 +980,6 @@ export function createRpcMethods(
     return { status: "aborted" };
   });
 
-  methods.set("chat.confirmHypotheses", async (_params, context: RpcContext) => {
-    const userId = requireAuth(context);
-
-    // Try activeStream first; fallback to agentBoxManager (covers race where
-    // chat.confirmHypotheses arrives before SSE subscription is established)
-    const stream = activeStreams.get(userId);
-    let endpoint: string;
-    let sessionId: string;
-    if (stream) {
-      endpoint = stream.endpoint;
-      sessionId = stream.sessionId;
-    } else {
-      const handle = await findAgentBoxForSession(userId);
-      if (!handle) throw new Error("No active agent session");
-      endpoint = handle.endpoint;
-      const abClient = new AgentBoxClient(endpoint, 30000, agentBoxTlsOptions);
-      const sessions = await abClient.listSessions();
-      if (!sessions.sessions?.length) throw new Error("No active session");
-      sessionId = sessions.sessions[0].id;
-    }
-
-    const client = new AgentBoxClient(endpoint, 30000, agentBoxTlsOptions);
-    await client.confirmHypotheses(sessionId);
-    return { status: "confirmed" };
-  });
-
   methods.set("chat.dpProgress", async (_params, context: RpcContext) => {
     const userId = requireAuth(context);
     const snap = dpProgressSnapshots.get(userId);
