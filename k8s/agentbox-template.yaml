@@ -1,0 +1,115 @@
+# AgentBox Pod Template
+# This template is used by K8sSpawner to create per-user AgentBox pods
+#
+# Variables to substitute:
+#   ${USER_ID}  - User identifier
+#   ${IMAGE}    - Container image (e.g., siclaw-agentbox:latest)
+#   ${NAMESPACE} - Kubernetes namespace
+#
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agentbox-${USER_ID}
+  namespace: ${NAMESPACE}
+  labels:
+    app: agentbox
+    user: ${USER_ID}
+    managed-by: siclaw-gateway
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
+
+  containers:
+  - name: agentbox
+    image: ${IMAGE}
+    imagePullPolicy: Always
+
+    ports:
+    - name: http
+      containerPort: 3000
+      protocol: TCP
+
+    env:
+    - name: USER_ID
+      value: "${USER_ID}"
+    - name: NODE_ENV
+      value: "production"
+    - name: SICLAW_AGENTBOX_PORT
+      value: "3000"
+    # LLM/S3 config is injected dynamically by gateway via envResolver
+
+    # Resource limits
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+
+    # Health probes
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 3000
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: 3000
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+    # Volume mounts
+    volumeMounts:
+    - name: kubeconfig
+      mountPath: /home/agentbox/.kube
+      readOnly: true
+    - name: tmp
+      mountPath: /tmp
+    - name: workspace
+      mountPath: /workspace
+
+  volumes:
+  # User-specific kubeconfig (optional)
+  - name: kubeconfig
+    secret:
+      secretName: user-${USER_ID}-kubeconfig
+      optional: true
+  # Temp directory
+  - name: tmp
+    emptyDir:
+      sizeLimit: 500Mi
+  # Workspace for user files
+  - name: workspace
+    emptyDir:
+      sizeLimit: 1Gi
+
+---
+# Service for accessing the AgentBox pod
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentbox-${USER_ID}
+  namespace: ${NAMESPACE}
+  labels:
+    app: agentbox
+    user: ${USER_ID}
+spec:
+  type: ClusterIP
+  selector:
+    app: agentbox
+    user: ${USER_ID}
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+    protocol: TCP
+

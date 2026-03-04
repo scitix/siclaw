@@ -1,0 +1,20 @@
+# Data PV — gateway SQLite database + JWT secret + local state
+# Only needed in SQLite mode (default). Not required when using MySQL.
+#
+# Deploy: kubectl apply -f k8s/siclaw-data-pvc.yaml -n siclaw
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: siclaw-data
+  namespace: siclaw
+  labels:
+    app: siclaw
+    component: data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nfs
+  resources:
+    requests:
+      storage: 1Gi

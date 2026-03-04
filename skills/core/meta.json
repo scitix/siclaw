@@ -1,0 +1,23 @@
+{
+  "labels": {
+    "cluster-events":           ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "deep-investigation":       ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "deployment-rollout-debug": ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "dns-debug":                ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "find-node":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "hpa-debug":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "image-pull-debug":         ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "ingress-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "job-debug":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "node-health-check":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "node-logs":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "node-ping-gateway":        ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "node-show-gateway":        ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "pod-crash-debug":          ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "pod-pending-debug":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "pod-ping-gateway":         ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "pod-show-gateway":         ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "pvc-debug":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "service-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"]
+  }
+}
