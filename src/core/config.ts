@@ -8,6 +8,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { loadMcpServersConfig } from "./mcp-client.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -240,6 +241,14 @@ export function loadConfig(): SiclawConfig {
   }
   if (process.env.SICLAW_GATEWAY_URL) {
     cached.server.gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+  }
+
+  // Merge MCP servers from SICLAW_MCP_DIR (NFS) or local config
+  if (Object.keys(cached.mcpServers).length === 0) {
+    const mcpConfig = loadMcpServersConfig();
+    if (mcpConfig?.mcpServers) {
+      cached.mcpServers = mcpConfig.mcpServers;
+    }
   }
 
   return cached;
