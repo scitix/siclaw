@@ -32,7 +32,7 @@ console.log(`[gateway] Using spawner: ${spawner.name}`);
 
 // Create AgentBox Manager
 const agentBoxManager = new AgentBoxManager(spawner, {
-  idleTimeoutMs: 5 * 60 * 1000, // 5-minute idle timeout
+  namespace: process.env.SICLAW_K8S_NAMESPACE || "default",
 });
 agentBoxManager.startHealthCheck();
 
