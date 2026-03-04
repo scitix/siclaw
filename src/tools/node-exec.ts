@@ -7,6 +7,7 @@ import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
 import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 import { loadConfig } from "../core/config.js";
 import {
   ALLOWED_COMMANDS,
@@ -230,7 +231,7 @@ Examples:
       const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
       const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const childEnv = {
-        ...process.env,
+        ...sanitizeEnv(process.env as Record<string, string>),
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };

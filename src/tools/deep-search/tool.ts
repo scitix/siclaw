@@ -4,7 +4,7 @@ import { investigate, writeReport } from "./engine.js";
 import { formatResult, formatSummary } from "./format.js";
 import { NORMAL_BUDGET, QUICK_BUDGET } from "./types.js";
 import { Text } from "@mariozechner/pi-tui";
-import { deepSearchEvents, deepSearchGate } from "./events.js";
+import { deepSearchEvents } from "./events.js";
 import type { KubeconfigRef, LlmConfigRef } from "../../core/agent-factory.js";
 
 interface DeepSearchHypothesis {
@@ -165,16 +165,6 @@ Do triage first before calling this tool — confirm the problem exists and gath
     }),
     renderResult: renderDeepSearchResult,
     async execute(_toolCallId, rawParams) {
-      // Hard gate: refuse to execute if hypotheses have not been confirmed by the user.
-      // This prevents the model from skipping hypothesis review (e.g. after user Modify feedback).
-      if (deepSearchGate.blocked) {
-        console.warn(`[deep_search] Gate blocked — refusing execution. This usually means the model called deep_search before user confirmed hypotheses.`);
-        return {
-          content: [{ type: "text", text: "BLOCKED: User has not yet confirmed hypotheses. STOP making tool calls and wait for the user's confirmation message.\nDo NOT fall back to manual kubectl investigation. The user will confirm shortly — just wait." }],
-          details: {},
-        };
-      }
-
       const params = rawParams as DeepSearchParams;
       const budget = params.budget === "quick" ? QUICK_BUDGET : NORMAL_BUDGET;
 

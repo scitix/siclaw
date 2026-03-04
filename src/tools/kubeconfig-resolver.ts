@@ -35,3 +35,22 @@ export function resolveKubeconfigPath(credentialsDir?: string): string | null {
     return null;
   }
 }
+
+/**
+ * Resolve a kubeconfig path by credential name.
+ * Used to translate `--kubeconfig=<name>` into an actual file path.
+ * Returns null if no match found.
+ */
+export function resolveKubeconfigByName(credentialsDir: string, name: string): string | null {
+  const manifestPath = join(credentialsDir, "manifest.json");
+  if (!existsSync(manifestPath)) return null;
+  try {
+    const entries = JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
+    const match = entries.find((e) => e.type === "kubeconfig" && e.name === name);
+    if (!match) return null;
+    const kubeconfigFile = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
+    return kubeconfigFile ? join(credentialsDir, kubeconfigFile) : null;
+  } catch {
+    return null;
+  }
+}

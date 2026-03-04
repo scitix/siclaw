@@ -7,6 +7,7 @@ import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 interface PodScriptParams {
   pod: string;
@@ -119,7 +120,7 @@ Examples:
       const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
       const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const childEnv = {
-        ...process.env,
+        ...sanitizeEnv(process.env as Record<string, string>),
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };

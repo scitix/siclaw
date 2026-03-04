@@ -15,6 +15,8 @@ import {
   getCommandBinary,
   validateCommandRestrictions,
 } from "./command-sets.js";
+import { resolveKubeconfigPath, resolveKubeconfigByName } from "./kubeconfig-resolver.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 const execAsync = promisify(exec);
 
@@ -203,6 +205,18 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     if (subcommand === "exec") {
       const execCheck = validateExecCommand(args);
       if (execCheck) return execCheck;
+    }
+
+    // Block "kubectl config view --raw" — leaks full kubeconfig with certs/tokens
+    if (subcommand === "config") {
+      const configSub = args.filter((a) => !a.startsWith("-"));
+      const hasView = configSub.includes("view");
+      const hasRaw = args.includes("--raw");
+      if (hasView && hasRaw) {
+        return JSON.stringify({
+          error: "kubectl config view --raw is not allowed — it exposes credentials.",
+        }, null, 2);
+      }
     }
   }
   return null;
@@ -440,6 +454,28 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         }
       }
 
+      // Block reading sensitive credential/config files via any file-reading command.
+      // Also catches $KUBECONFIG / ${KUBECONFIG} shell variable expansion.
+      const SENSITIVE_PATH_RE = [
+        /\.siclaw\/config\/settings\.json/,
+        /\.siclaw\/credentials\//,
+        /\$\{?KUBECONFIG\}?/,
+      ];
+      const FILE_READING_CMDS = ["cat", "head", "tail", "less", "more", "grep", "awk", "gawk"];
+      for (const cmd of commands) {
+        const binary = getCommandBinary(cmd);
+        if (binary && FILE_READING_CMDS.includes(binary)) {
+          if (SENSITIVE_PATH_RE.some((re) => re.test(cmd))) {
+            return {
+              content: [{ type: "text", text: JSON.stringify({
+                error: "Reading credential or config files is not allowed.",
+              }, null, 2) }],
+              details: { blocked: true },
+            };
+          }
+        }
+      }
+
       // Skill scripts (debug pods, perftest, etc.) need longer timeouts
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
@@ -452,14 +488,27 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           shell: "/bin/bash",
           detached: true, // make child a process group leader for clean group kill
           env: {
-            ...process.env,
+            ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            // Always block local ~/.kube/config — only UI-configured credentials are allowed
-            KUBECONFIG: "/dev/null",
+            // Auto-resolve KUBECONFIG from credentials; fall back to /dev/null to block ~/.kube/config
+            KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
           },
         };
-        const child = exec(command, execOpts as any);
+
+        // Resolve --kubeconfig=<name> (no path separators) to actual file path
+        let finalCommand = command;
+        if (kubeconfigRef?.credentialsDir) {
+          finalCommand = command.replace(
+            /--kubeconfig=([^\s/"']+)/g,
+            (_match, name) => {
+              const resolved = resolveKubeconfigByName(kubeconfigRef.credentialsDir!, name);
+              return resolved ? `--kubeconfig=${resolved}` : _match;
+            },
+          );
+        }
+
+        const child = exec(finalCommand, execOpts as any);
 
         // Kill the entire process group (shell + all child processes like kubectl exec)
         // detached: true makes the shell a process group leader, so -pid kills the whole group

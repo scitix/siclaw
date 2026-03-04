@@ -948,10 +948,7 @@ export function usePilot() {
                 maxCalls: 10,
             })),
         });
-        // Try to clear gate via dedicated RPC. This may fail if the agent session
-        // has already ended (normal — the steer message's input handler clears it instead).
-        sendRpc('chat.confirmHypotheses').catch(() => {});
-    }, [sendRpc]);
+    }, []);
 
     const createSession = useCallback(() => {
         // Don't create a DB session yet — just reset UI to "new chat" state.

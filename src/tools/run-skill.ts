@@ -5,6 +5,8 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
+import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 import {
   resolveSkillScript,
   listSkillScripts,
@@ -121,10 +123,10 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           shell: "/bin/bash",
           detached: true, // make child a process group leader for clean group kill
           env: {
-            ...process.env,
+            ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            KUBECONFIG: "/dev/null",
+            KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
           },
         };
         const child = exec(command, execOpts as any);

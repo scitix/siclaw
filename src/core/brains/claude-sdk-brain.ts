@@ -142,9 +142,6 @@ export class ClaudeSdkBrain implements BrainSession {
             (i) => i.status === "pending" || i.status === "in_progress",
           );
           if (pending.length === 0) break;
-          // Don't nudge if waiting for user hypothesis confirmation (gate blocked)
-          const { deepSearchGate } = await import("../../tools/deep-search/events.js");
-          if (deepSearchGate.blocked) break;
           nudges++;
           const nextPhase = pending[0].label;
           console.log(`[claude-sdk-brain] DP auto-continue (${nudges}/${MAX_DP_NUDGES}): ${nextPhase}`);

@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { deepSearchEvents, deepSearchGate, HYPOTHESES_CONFIRMED_SENTINEL, type ProgressEvent } from "../../tools/deep-search/events.js";
+import { deepSearchEvents, type ProgressEvent } from "../../tools/deep-search/events.js";
 import {
   type ChecklistItemStatus,
   type DpChecklist,
@@ -202,7 +202,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
 
   function disableDpMode(ctx: ExtensionContext): void {
     if (!checklist) return;
-    deepSearchGate.blocked = false;
     checklist = null;
     updateStatus(ctx);
     persistState();
@@ -397,9 +396,10 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     name: "propose_hypotheses",
     label: "Propose Hypotheses",
     description:
-      "Present hypotheses to the user for confirmation during deep investigation. " +
+      "Present hypotheses to the user during deep investigation (non-blocking). " +
       "Call this after triage to propose 3-5 ranked hypotheses. " +
-      "The tool will show the hypotheses to the user and wait for their confirmation or edits. " +
+      "The tool will show the hypotheses to the user and immediately return — " +
+      "proceed to call deep_search right away without waiting for confirmation. " +
       "Only available in deep investigation mode.",
     parameters: Type.Object({
       hypotheses: Type.String({
@@ -414,7 +414,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       }
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
-      let userResponse: string;
 
       const hasTUI = ctx.hasUI && isThemeUsable(ctx);
 
@@ -423,41 +422,14 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
         const widgetLines = formatHypothesesWidget(hypothesesText, ctx.ui.theme);
         ctx.ui.setWidget("dp-hypotheses", widgetLines);
 
-        // Simple confirmation select (hypotheses already visible in widget)
-        const choice = await ctx.ui.select("\uD83D\uDD0D Deep Investigation \u2014 Hypothesis Confirmation", [
-          "\u2714 Continue Validation",
-          "\u270F Supplement/Edit then Continue",
-          "\u2718 Exit Investigation",
-        ]);
-
-        // Clear widget after selection
-        ctx.ui.setWidget("dp-hypotheses", undefined);
-
-        if (choice?.startsWith("\u2714")) {
-          userResponse = "User confirmed. Please call deep_search to validate these hypotheses.";
-        } else if (choice?.startsWith("\u270F")) {
-          const feedback = await ctx.ui.editor("Supplement hypotheses or provide edits:", "");
-          if (feedback?.trim()) {
-            userResponse = `User feedback: ${feedback.trim()}\n\nPlease incorporate the edits and then call deep_search.`;
-          } else {
-            userResponse = "User confirmed. Please call deep_search to validate these hypotheses.";
-          }
-        } else if (choice?.startsWith("\u2718")) {
-          disableDpMode(ctx);
-          userResponse = "User chose to exit the investigation.";
-        } else {
-          // Escape pressed — default to confirm
-          userResponse = "User confirmed. Please call deep_search to validate these hypotheses.";
-        }
-      } else {
-        // RPC / gateway mode — block until user confirms via input handler
-        userResponse = "Hypotheses submitted for user review. Please wait for the user's confirmation before continuing — do not call deep_search on your own.";
-        deepSearchGate.blocked = true;
+        // Auto-dismiss widget after a short delay (non-blocking)
+        setTimeout(() => ctx.ui.setWidget("dp-hypotheses", undefined), 5000);
       }
 
+      // Non-blocking: immediately return and let the model proceed to deep_search
       return {
-        content: [{ type: "text" as const, text: userResponse }],
-        details: { hypotheses: hypothesesText, autoConfirmed: hasTUI },
+        content: [{ type: "text" as const, text: "Hypotheses recorded. Proceed to call deep_search to validate them." }],
+        details: { hypotheses: hypothesesText, autoConfirmed: true },
       };
     },
   });
@@ -510,29 +482,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       action: "transform" as const,
       text: `The user has exited deep investigation mode. ${userText}`,
     };
-  });
-
-  // --- input: clear gate when user confirms hypotheses (gateway mode) ---
-
-  api.on("input", async (event) => {
-    if (!deepSearchGate.blocked) return { action: "continue" as const };
-    if (event.text.includes(HYPOTHESES_CONFIRMED_SENTINEL)) {
-      deepSearchGate.blocked = false;
-      // Auto-mark hypotheses as done (user confirmed them)
-      if (checklist) {
-        const hypItem = checklist.items.find((i) => i.id === "hypotheses");
-        if (hypItem && hypItem.status !== "done") {
-          hypItem.status = "done";
-          if (!hypItem.summary) hypItem.summary = "Confirmed";
-        }
-        const dsItem = checklist.items.find((i) => i.id === "deep_search");
-        if (dsItem && dsItem.status !== "done") {
-          dsItem.status = "in_progress";
-        }
-        persistState();
-      }
-    }
-    return { action: "continue" as const };
   });
 
   // --- session_start: restore persisted state ---
