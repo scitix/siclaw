@@ -2,9 +2,10 @@
 # This template is used by K8sSpawner to create per-user AgentBox pods
 #
 # Variables to substitute:
-#   ${USER_ID}  - User identifier
-#   ${IMAGE}    - Container image (e.g., siclaw-agentbox:latest)
-#   ${NAMESPACE} - Kubernetes namespace
+#   ${USER_ID}      - User identifier
+#   ${IMAGE}        - Container image (e.g., siclaw-agentbox:latest)
+#   ${NAMESPACE}    - Kubernetes namespace
+#   ${WORKSPACE_ID} - Workspace identifier (e.g., "default")
 #
 apiVersion: v1
 kind: Pod
@@ -37,6 +38,18 @@ spec:
       value: "production"
     - name: SICLAW_AGENTBOX_PORT
       value: "3000"
+    - name: PI_CODING_AGENT_DIR
+      value: ".siclaw/user-data/agent"
+    - name: SICLAW_SKILLS_DIR
+      value: ".siclaw/skills"
+    - name: SICLAW_MCP_DIR
+      value: ".siclaw/mcp"
+    - name: SICLAW_USER_DATA_DIR
+      value: ".siclaw/user-data"
+    - name: SICLAW_GATEWAY_URL
+      value: "https://siclaw-gateway.${NAMESPACE}.svc.cluster.local:3002"
+    - name: SICLAW_CREDENTIALS_DIR
+      value: "/home/agentbox/.credentials"
     # LLM/S3 config is injected dynamically by gateway via envResolver
 
     # Resource limits
@@ -76,6 +89,38 @@ spec:
       mountPath: /tmp
     - name: workspace
       mountPath: /workspace
+    # Skills & MCP mounts (from shared PVC)
+    - name: skills-pv
+      mountPath: /app/.siclaw/skills/core
+      subPath: core
+      readOnly: true
+    - name: skills-pv
+      mountPath: /app/.siclaw/skills/team
+      subPath: team
+      readOnly: true
+    - name: skills-pv
+      mountPath: /app/.siclaw/skills/user
+      subPath: user/${USER_ID}/.ws-${WORKSPACE_ID}
+      readOnly: true
+    - name: skills-pv
+      mountPath: /app/.siclaw/user-data
+      subPath: user/${USER_ID}/agent-data
+    - name: skills-pv
+      mountPath: /app/.siclaw/mcp
+      subPath: mcp
+      readOnly: true
+    - name: skills-pv
+      mountPath: /home/agentbox/.credentials
+      subPath: user/${USER_ID}/.ws-${WORKSPACE_ID}/.credentials
+      readOnly: true
+    - name: skills-pv
+      mountPath: /home/agentbox/.kube/envs
+      subPath: user/${USER_ID}/.kube/envs
+      readOnly: true
+    - name: skills-pv
+      mountPath: /home/agentbox/.kube/defaults
+      subPath: _default_kubeconfigs
+      readOnly: true
 
   volumes:
   # User-specific kubeconfig (optional)
@@ -91,6 +136,10 @@ spec:
   - name: workspace
     emptyDir:
       sizeLimit: 1Gi
+  # Shared skills PVC
+  - name: skills-pv
+    persistentVolumeClaim:
+      claimName: siclaw-skills
 
 ---
 # Service for accessing the AgentBox pod
