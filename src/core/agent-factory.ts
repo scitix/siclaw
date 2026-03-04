@@ -28,7 +28,7 @@ import { createCreateSkillTool } from "../tools/create-skill.js";
 import { createRunSkillTool } from "../tools/run-skill.js";
 import { createUpdateSkillTool } from "../tools/update-skill.js";
 import { createManageScheduleTool } from "../tools/manage-schedule.js";
-import { createDeepSearchTool } from "../tools/deep-search/tool.js";
+import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
 import {
   type DpState,
   createManageChecklistTool,
@@ -328,6 +328,9 @@ export async function createSiclawSession(
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const llmConfigRef: LlmConfigRef = {};
   const mode = opts?.mode ?? "web";
+  // Mutable ref — populated after memoryIndexer is created (below), so deep_search
+  // can retrieve past investigations and persist new ones.
+  const memoryRef: MemoryRef = {};
 
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
@@ -339,7 +342,7 @@ export async function createSiclawSession(
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef),
     createManageScheduleTool(kubeconfigRef),
-    createDeepSearchTool(kubeconfigRef, llmConfigRef),
+    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createCredentialListTool(kubeconfigRef),
   ];
 
@@ -628,6 +631,9 @@ Follow the structured workflow described in the deep-investigation skill guide.`
       customTools.push(createMemoryGetTool(memoryDir));
       console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
     }
+    // Populate mutable ref so deep_search can access memory for investigation history
+    memoryRef.indexer = memoryIndexer;
+    memoryRef.dir = memoryDir;
   } catch (err) {
     console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
   }
