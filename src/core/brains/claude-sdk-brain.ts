@@ -137,7 +137,7 @@ export class ClaudeSdkBrain implements BrainSession {
       if (this.config.dpState) {
         let nudges = 0;
         const MAX_DP_NUDGES = 3;
-        while (nudges < MAX_DP_NUDGES && this.config.dpState.enabled && this.config.dpState.checklist) {
+        while (nudges < MAX_DP_NUDGES && this.config.dpState.checklist) {
           const pending = this.config.dpState.checklist.items.filter(
             (i) => i.status === "pending" || i.status === "in_progress",
           );

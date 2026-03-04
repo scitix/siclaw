@@ -275,7 +275,10 @@ export function usePilot() {
     const [investigationProgress, setInvestigationProgress] = useState<InvestigationProgress | null>(null);
     const [dpFocus, setDpFocus] = useState<string | null>(null);
     const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null);
-    const [dpActive, setDpActive] = useState(false);
+    const DP_ACTIVE_STORAGE = 'siclaw_dp_active';
+    const [dpActive, setDpActive] = useState(() => {
+        return localStorage.getItem(DP_ACTIVE_STORAGE) === 'true';
+    });
     const [sessions, setSessions] = useState<Session[]>([]);
     const [currentSessionKey, setCurrentSessionKey] = useState<string | null>(() => {
         return localStorage.getItem(SESSION_KEY_STORAGE);
@@ -329,11 +332,10 @@ export function usePilot() {
         dpTimersRef.current.clear();
     };
 
-    /** Reset all DP-related state (checklist, focus, toggle, progress) */
+    /** Reset all DP-related state (checklist, focus, progress) — toggle is user preference, not reset */
     const resetDpState = () => {
         setDpChecklist(null);
         setDpFocus(null);
-        setDpActive(false);
         setInvestigationProgress(null);
     };
 
@@ -345,6 +347,11 @@ export function usePilot() {
             localStorage.removeItem(SESSION_KEY_STORAGE);
         }
     }, [currentSessionKey]);
+
+    // Persist dpActive to localStorage
+    useEffect(() => {
+        localStorage.setItem(DP_ACTIVE_STORAGE, String(dpActive));
+    }, [dpActive]);
 
     // Persist selectedBrain to localStorage
     useEffect(() => {
