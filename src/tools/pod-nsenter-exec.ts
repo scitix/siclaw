@@ -10,6 +10,7 @@ import { validateCommand } from "./node-exec.js";
 import { parseArgs } from "./command-sets.js";
 import { validatePodName } from "./pod-exec.js";
 import { loadConfig } from "../core/config.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
@@ -145,7 +146,7 @@ Examples:
     async execute(_toolCallId, rawParams) {
       const params = rawParams as PodNsenterExecParams;
       const env = {
-        ...process.env,
+        ...sanitizeEnv(process.env as Record<string, string>),
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };

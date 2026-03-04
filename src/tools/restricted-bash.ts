@@ -16,6 +16,7 @@ import {
   validateCommandRestrictions,
 } from "./command-sets.js";
 import { resolveKubeconfigPath, resolveKubeconfigByName } from "./kubeconfig-resolver.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 const execAsync = promisify(exec);
 
@@ -445,7 +446,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           shell: "/bin/bash",
           detached: true, // make child a process group leader for clean group kill
           env: {
-            ...process.env,
+            ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
             // Auto-resolve KUBECONFIG from credentials; fall back to /dev/null to block ~/.kube/config

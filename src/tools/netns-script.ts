@@ -8,6 +8,7 @@ import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkNodeReady } from "./k8s-checks.js";
 import { loadConfig } from "../core/config.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
@@ -153,7 +154,7 @@ Examples:
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NetnsScriptParams;
       const env = {
-        ...process.env,
+        ...sanitizeEnv(process.env as Record<string, string>),
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };

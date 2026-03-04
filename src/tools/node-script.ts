@@ -10,6 +10,7 @@ import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
+import { sanitizeEnv } from "./sanitize-env.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
@@ -133,7 +134,7 @@ Examples:
       const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
       const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
       const env = {
-        ...process.env,
+        ...sanitizeEnv(process.env as Record<string, string>),
         ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
         KUBECONFIG: "/dev/null",
       };
