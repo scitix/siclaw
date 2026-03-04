@@ -533,10 +533,29 @@ export async function createSiclawSession(
     const appendParts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
 
-    // Inject deep investigation workflow so the model always knows about DP tools
+    // Inject deep investigation judgment framework
     const dpWorkflow = getDpWorkflow();
     if (dpWorkflow) {
-      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Deep Investigation Capability\n\nYou have access to a structured deep investigation workflow. Use it for complex issues requiring hypothesis-driven validation.\n\n${dpWorkflow}`;
+      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Investigation Capability
+
+You have access to deep investigation tools. Use judgment about when and how:
+
+**When to investigate autonomously:**
+- Problem has a clear direction → call deep_search directly with your triage context
+- User gives specific instruction (e.g. "validate H1 and H3") → execute immediately
+
+**When to consult the user first:**
+- Multiple plausible root causes and investigation will be expensive
+- User is actively engaged in the discussion (asking questions, giving feedback)
+- You're unsure about the investigation direction
+
+**Cost awareness:**
+deep_search launches parallel sub-agents consuming 30-60 tool calls.
+Like any expensive operation, confirm direction with the user when the path isn't clear.
+Use propose_hypotheses to present your thinking and get user alignment.
+
+**When user explicitly activates Deep Investigation mode (magnifying glass / /dp / Ctrl+I):**
+Follow the structured workflow described in the deep-investigation skill guide.`;
     }
 
     // Append workspace custom prompt
