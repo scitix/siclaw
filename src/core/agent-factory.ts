@@ -10,12 +10,13 @@ import {
   createReadTool,
   createEditTool,
   createWriteTool,
-  grepTool,
-  findTool,
-  lsTool,
+  createGrepTool,
+  createFindTool,
+  createLsTool,
   type AgentSession,
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
+import { globSync } from "glob";
 import { createRestrictedBashTool } from "../tools/restricted-bash.js";
 import { createNodeExecTool } from "../tools/node-exec.js";
 import { createNodeScriptTool } from "../tools/node-script.js";
@@ -394,30 +395,15 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
 
   // -- Path-restricted file I/O tools --
-  // write/edit: only userDataDir (agent's runtime sandbox: memory, sessions)
-  // read: entire cwd tree (skills, memory, credentials)
-  const readAllowedDirs = [cwd];
+  // Whitelist: only skills directories + user-data (no credentials, no config)
+  const builtinSkillsRoot = path.resolve(cwd, "skills");
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir];
   const writeAllowedDirs = [userDataDir];
 
-  // Block reading sensitive credential/config files (but allow skills/ and user-data/)
-  const READ_BLOCKED_PATTERNS = [
-    /\.siclaw\/config\/settings\.json$/,
-    /\.siclaw\/credentials\//,
-  ];
-
-  const tools = [
+  const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
-        readFile: async (p) => {
-          assertPathAllowed(p, readAllowedDirs, "read");
-          const resolved = path.resolve(p);
-          for (const pattern of READ_BLOCKED_PATTERNS) {
-            if (pattern.test(resolved)) {
-              throw new Error("Access denied: credential/config files cannot be read");
-            }
-          }
-          return fsReadFile(p);
-        },
+        readFile: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsReadFile(p); },
         access: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
@@ -434,10 +420,31 @@ export async function createSiclawSession(
         mkdir: async (d) => { assertPathAllowed(d, writeAllowedDirs, "write"); await fsMkdir(d, { recursive: true }); },
       },
     }),
-    grepTool,
-    findTool,
-    lsTool,
+    createGrepTool(cwd, {
+      operations: {
+        isDirectory: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.statSync(p).isDirectory(); },
+        readFile: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.readFileSync(p, "utf-8"); },
+      },
+    }),
+    createFindTool(cwd, {
+      operations: {
+        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "find"); return fs.existsSync(p); },
+        glob: (pattern, searchCwd, options) => {
+          assertPathAllowed(searchCwd, readAllowedDirs, "find");
+          return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore }).slice(0, options.limit);
+        },
+      },
+    }),
+    createLsTool(cwd, {
+      operations: {
+        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.existsSync(p); },
+        stat: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.statSync(p); },
+        readdir: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.readdirSync(p); },
+      },
+    }),
   ];
+  // Push into customTools so they override framework defaults via extension mechanism
+  customTools.push(...restrictedFileTools);
 
   // Skills: single directory model (bundle API populates skillsBase directly)
   // CLI fallback: search scope subdirectories
@@ -515,9 +522,8 @@ export async function createSiclawSession(
   if (opts?.brainType === "claude-sdk") {
     console.log(`[agent-factory] Creating Claude SDK brain`);
 
-    // Add framework file I/O tools — pi-agent gets these as built-ins,
-    // SDK brain needs them as custom MCP tools for reading SKILL.md, MEMORY.md, etc.
-    const sdkTools = [...customTools, ...tools];
+    // Restricted file tools are already in customTools (pushed above)
+    const sdkTools = [...customTools];
 
     // DP tools for SDK brain — mutable state shared with http-server via dpState ref
     const dpState: DpState = { checklist: null };
@@ -630,7 +636,7 @@ Follow the structured workflow described in the deep-investigation skill guide.`
     opts?.sessionManager ?? SessionManager.create(process.cwd());
 
   const { session, modelFallbackMessage } = await createAgentSession({
-    tools,
+    tools: restrictedFileTools,
     customTools,
     resourceLoader: loader,
     sessionManager,
