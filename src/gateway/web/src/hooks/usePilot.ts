@@ -281,7 +281,7 @@ export function usePilot() {
     });
     const [sessions, setSessions] = useState<Session[]>([]);
     const [currentSessionKey, setCurrentSessionKey] = useState<string | null>(() => {
-        return localStorage.getItem(SESSION_KEY_STORAGE);
+        return sessionStorage.getItem(SESSION_KEY_STORAGE);
     });
     const [isLoading, setIsLoading] = useState(false);
     const [pendingMessages, setPendingMessages] = useState<string[]>([]);
@@ -314,6 +314,9 @@ export function usePilot() {
     // Stale-loading watchdog: reset UI if no agent events for too long while loading
     const lastAgentEventRef = useRef<number>(0);
     const staleTimerRef = useRef<ReturnType<typeof setInterval>>();
+    // Ref to track current sessionKey for WS event filtering (avoids stale closures)
+    const currentSessionKeyRef = useRef(currentSessionKey);
+    useEffect(() => { currentSessionKeyRef.current = currentSessionKey; }, [currentSessionKey]);
     // DP-related timeout refs (for cleanup on abort/session switch)
     const dpTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
@@ -339,12 +342,12 @@ export function usePilot() {
         setInvestigationProgress(null);
     };
 
-    // Persist currentSessionKey to localStorage
+    // Persist currentSessionKey to sessionStorage (per-tab isolation)
     useEffect(() => {
         if (currentSessionKey) {
-            localStorage.setItem(SESSION_KEY_STORAGE, currentSessionKey);
+            sessionStorage.setItem(SESSION_KEY_STORAGE, currentSessionKey);
         } else {
-            localStorage.removeItem(SESSION_KEY_STORAGE);
+            sessionStorage.removeItem(SESSION_KEY_STORAGE);
         }
     }, [currentSessionKey]);
 
@@ -365,8 +368,13 @@ export function usePilot() {
     const handleWsMessage = useCallback((msg: WsMessage) => {
         // Event frames: { type: "event", event: "agent_event", payload: { type: "message_update", ... } }
         if (msg.type === 'event' && msg.payload) {
-            lastAgentEventRef.current = Date.now();
             const payload = msg.payload as Record<string, unknown>;
+
+            // Filter events by sessionId — ignore events from other tabs' sessions
+            const eventSessionId = payload.sessionId as string | undefined;
+            if (eventSessionId && eventSessionId !== currentSessionKeyRef.current) return;
+
+            lastAgentEventRef.current = Date.now();
             const eventType = payload.type as string;
 
             switch (eventType) {
@@ -789,7 +797,7 @@ export function usePilot() {
         // During agent execution: steer instead of sending a new prompt
         if (isLoading) {
             try {
-                await sendRpc('chat.steer', { text });
+                await sendRpc('chat.steer', { text, sessionId: currentSessionKeyRef.current });
                 setPendingMessages(prev => [...prev, text]);
             } catch (err) {
                 console.error('Failed to steer:', err);
@@ -852,7 +860,7 @@ export function usePilot() {
                 : m
         ));
         try {
-            await sendRpc('chat.abort');
+            await sendRpc('chat.abort', { sessionId: currentSessionKeyRef.current });
         } catch (err) {
             console.error('Failed to abort:', err);
         }
@@ -865,7 +873,7 @@ export function usePilot() {
         setPendingMessages([]);
         if (!isConnected) return;
         try {
-            await sendRpc('chat.clearQueue');
+            await sendRpc('chat.clearQueue', { sessionId: currentSessionKeyRef.current });
         } catch (err) {
             console.error('Failed to clear queue:', err);
         }
@@ -880,11 +888,11 @@ export function usePilot() {
         // Clear server queue and re-steer remaining messages
         if (!isConnected) return;
         try {
-            await sendRpc('chat.clearQueue');
+            await sendRpc('chat.clearQueue', { sessionId: currentSessionKeyRef.current });
             // Re-steer remaining messages (get fresh state after splice)
             setPendingMessages(prev => {
                 for (const msg of prev) {
-                    sendRpc('chat.steer', { text: msg }).catch(() => {});
+                    sendRpc('chat.steer', { text: msg, sessionId: currentSessionKeyRef.current }).catch(() => {});
                 }
                 return prev;
             });
@@ -948,7 +956,10 @@ export function usePilot() {
                 maxCalls: 10,
             })),
         });
-    }, []);
+        // Try to clear gate via dedicated RPC. This may fail if the agent session
+        // has already ended (normal — the steer message's input handler clears it instead).
+        sendRpc('chat.confirmHypotheses', { sessionId: currentSessionKeyRef.current }).catch(() => {});
+    }, [sendRpc]);
 
     const createSession = useCallback(() => {
         // Don't create a DB session yet — just reset UI to "new chat" state.
@@ -1055,7 +1066,7 @@ export function usePilot() {
     const restoreDpProgress = useCallback(async () => {
         if (!isConnected) return;
         try {
-            const snap = await sendRpc<{ sessionId?: string; events: Array<Record<string, unknown>> | null }>('chat.dpProgress');
+            const snap = await sendRpc<{ sessionId?: string; events: Array<Record<string, unknown>> | null }>('chat.dpProgress', { sessionId: currentSessionKeyRef.current });
             if (!snap.events || snap.events.length === 0) return;
             // Replay events through the same reducer used for live progress
             let state: InvestigationProgress = { hypotheses: [] };
