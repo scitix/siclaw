@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "siclaw.fullname" . }}-test-connection"
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "test") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  restartPolicy: Never
+  containers:
+    - name: wget
+      image: busybox
+      command: ["wget"]
+      args: ["--spider", "--timeout=5", "http://{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.gateway.service.port }}/api/health"]
