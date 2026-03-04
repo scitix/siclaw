@@ -8,6 +8,7 @@ import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
+import { parseArgs, shellEscape } from "./command-sets.js";
 
 interface PodScriptParams {
   pod: string;
@@ -114,6 +115,8 @@ Examples:
       }
 
       const args = params.args?.trim() || "";
+      // Security: shell-escape each argument to prevent injection via args parameter
+      const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
 
       // Pre-check: pod exists and is Running
@@ -140,8 +143,8 @@ Examples:
 
       // Use the appropriate interpreter
       const ext = resolved.interpreter === "python3" ? ".py" : ".sh";
-      const execCmd = args
-        ? `cat > /tmp/_s${ext} && chmod +x /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${args}; r=$?; rm -f /tmp/_s${ext}; exit $r`
+      const execCmd = escapedArgs
+        ? `cat > /tmp/_s${ext} && chmod +x /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${escapedArgs}; r=$?; rm -f /tmp/_s${ext}; exit $r`
         : `cat > /tmp/_s${ext} && chmod +x /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext}; r=$?; rm -f /tmp/_s${ext}; exit $r`;
       kubectlArgs.push("--", "sh", "-c", execCmd);
 

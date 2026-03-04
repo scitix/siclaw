@@ -103,6 +103,15 @@ export function validateShellOperators(command: string): string | null {
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
 
+    // Block newline/carriage-return characters — bash interprets them as command
+    // separators, but extractCommands() does not split on them, so they can be
+    // used to smuggle commands past whitelist validation.
+    if (ch === "\n" || ch === "\r") {
+      return JSON.stringify({
+        error: "Newline characters are not allowed in commands.",
+      }, null, 2);
+    }
+
     // Block backtick command substitution everywhere (including inside quotes)
     if (ch === "`") {
       return JSON.stringify({
@@ -236,13 +245,8 @@ export function validateFindInPipeline(commands: string[]): string | null {
   return null;
 }
 
-export function validateAwkInPipeline(commands: string[]): string | null {
-  for (const cmd of commands) {
-    const binary = getCommandBinary(cmd);
-    if (binary !== "awk" && binary !== "gawk") continue;
-    const err = validateCommandRestrictions(cmd);
-    if (err) return err;
-  }
+/** @deprecated awk/gawk have been removed from the allowed commands list. */
+export function validateAwkInPipeline(_commands: string[]): string | null {
   return null;
 }
 
