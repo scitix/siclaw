@@ -1,0 +1,74 @@
+{
+  "_comment": "Copy this file to .siclaw/config/settings.json and fill in your API key. Or run: npx tsx src/cli-main.ts --setup",
+  "providers": {
+    "default": {
+      "_comment": "Option 1: OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-YOUR-OPENAI-KEY",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "gpt-4o",
+          "name": "GPT-4o",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 128000,
+          "maxTokens": 16384,
+          "compat": {
+            "supportsDeveloperRole": true,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    },
+    "_anthropic_example": {
+      "_comment": "Option 2: Anthropic — rename this key to 'default' to use",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-YOUR-ANTHROPIC-KEY",
+      "api": "anthropic",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "claude-sonnet-4-20250514",
+          "name": "Claude Sonnet 4",
+          "reasoning": true,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 200000,
+          "maxTokens": 16000,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    },
+    "_compatible_example": {
+      "_comment": "Option 3: OpenAI-compatible API (Qwen, DeepSeek, Ollama, vLLM, etc.) — rename to 'default' to use",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "sk-YOUR-KEY",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "qwen-plus",
+          "name": "Qwen Plus",
+          "reasoning": false,
+          "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "compat": {
+            "supportsDeveloperRole": true,
+            "supportsUsageInStreaming": true,
+            "maxTokensField": "max_tokens"
+          }
+        }
+      ]
+    }
+  }
+}

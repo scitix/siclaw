@@ -1,0 +1,154 @@
+# Gateway Deployment
+# Stateless API Gateway that manages AgentBox pods
+#
+# Prerequisites:
+# 1. Create namespace: kubectl create namespace siclaw
+# 2. Apply PVC: kubectl apply -f k8s/siclaw-skills-pvc.yaml
+# 3. Create secret with MySQL connection URL:
+#    kubectl create secret generic siclaw-secrets \
+#      --from-literal=database-url='mysql://user:pass@host:3306/siclaw' \
+#      -n siclaw
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+  labels:
+    app: siclaw-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siclaw-gateway
+  template:
+    metadata:
+      labels:
+        app: siclaw-gateway
+    spec:
+      serviceAccountName: siclaw-gateway
+      containers:
+      - name: gateway
+        image: siclaw-gateway:latest  # Replace with your registry image
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: HOST
+          value: "0.0.0.0"
+        - name: SICLAW_K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SICLAW_AGENTBOX_IMAGE
+          value: "siclaw-agentbox:latest"
+        - name: SICLAW_SKILLS_DIR
+          value: "/mnt/skills"
+        - name: SICLAW_MCP_DIR
+          value: "/mnt/mcp"
+        - name: SICLAW_CRON_SERVICE_URL
+          value: "http://siclaw-cron.siclaw.svc.cluster.local"
+        - name: SICLAW_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-secrets
+              key: database-url
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 2
+          periodSeconds: 2
+        volumeMounts:
+        - name: skills-pv
+          mountPath: /mnt/skills
+          readOnly: false
+        - name: skills-pv
+          mountPath: /mnt/mcp
+          subPath: mcp
+          readOnly: false
+      volumes:
+      - name: skills-pv
+        persistentVolumeClaim:
+          claimName: siclaw-skills
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+spec:
+  type: NodePort
+  selector:
+    app: siclaw-gateway
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    nodePort: 31000
+    protocol: TCP
+
+---
+# ServiceAccount for Gateway to manage AgentBox pods
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+
+---
+# Role for managing AgentBox pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "create"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: siclaw-gateway
+  namespace: siclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: siclaw-gateway
+subjects:
+- kind: ServiceAccount
+  name: siclaw-gateway
+  namespace: siclaw
