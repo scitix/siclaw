@@ -1,4 +1,4 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, Copy, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, Puzzle, RotateCcw, SendHorizontal, Upload, Tag } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, Copy, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -27,9 +27,9 @@ export function SkillsPage() {
     const isAdmin = currentUser?.username === 'admin';
     const { isReviewer } = usePermissions(sendRpc, isConnected);
 
-    const tabFromUrl = searchParams.get('tab') as 'all' | 'core' | 'team' | 'personal' | 'extension' | 'approvals' | null;
+    const tabFromUrl = searchParams.get('tab') as 'all' | 'builtin' | 'team' | 'personal' | 'approvals' | null;
     const savedTab = sessionStorage.getItem('skills_tab') as typeof tabFromUrl;
-    const [activeTab, setActiveTab] = useState<'all' | 'core' | 'team' | 'personal' | 'extension' | 'approvals'>(tabFromUrl || savedTab || 'all');
+    const [activeTab, setActiveTab] = useState<'all' | 'builtin' | 'team' | 'personal' | 'approvals'>(tabFromUrl || savedTab || 'all');
     const [searchInput, setSearchInput] = useState('');
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
@@ -227,7 +227,7 @@ export function SkillsPage() {
             description: `Contribute "${skill.name}" to the team? An admin will review before it becomes a shared team skill.`,
             variant: 'primary',
             confirmText: 'Contribute',
-            onConfirm: () => { publishSkill(skill); }
+            onConfirm: () => { publishSkill(skill, true); }
         });
     };
 
@@ -349,9 +349,8 @@ export function SkillsPage() {
                 <div className="flex gap-2">
                     {[
                         { id: 'all', label: 'All Skills', icon: LayoutGrid },
-                        { id: 'core', label: 'System Core', icon: Shield },
-                        { id: 'extension', label: 'System Extensions', icon: Puzzle },
-                        { id: 'team', label: 'Team Shared', icon: Users },
+                        { id: 'builtin', label: 'System Skills', icon: Shield },
+                        { id: 'team', label: 'Team Skills', icon: Users },
                         { id: 'personal', label: 'My Skills', icon: User },
                     ].map((tab) => (
                         <button
@@ -403,14 +402,16 @@ export function SkillsPage() {
                             className="pl-9 pr-3 py-1.5 bg-gray-50 border-none rounded-md text-sm text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-1 focus:ring-gray-200 w-48 transition-all"
                         />
                     </div>
-                    <Tooltip content="Import Skill">
-                        <button
-                            onClick={handleCreateNew}
-                            className="p-2 rounded-lg text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-all"
-                        >
-                            <Plus className="w-5 h-5" />
-                        </button>
-                    </Tooltip>
+                    {(activeTab === 'personal') && (
+                        <Tooltip content="Create Skill">
+                            <button
+                                onClick={handleCreateNew}
+                                className="p-2 rounded-lg text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-all"
+                            >
+                                <Plus className="w-5 h-5" />
+                            </button>
+                        </Tooltip>
+                    )}
                 </div>
             </header>
 
@@ -538,7 +539,16 @@ export function SkillsPage() {
                         )}
                     </div>
                 ) : (
-                    <div className="max-w-6xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    <div className="max-w-6xl mx-auto">
+                        {displaySkills.length === 0 && !isLoading && activeTab !== 'personal' ? (
+                            <div className="flex flex-col items-center justify-center py-20 text-gray-400 text-sm">
+                                <Users className="w-8 h-8 mb-3 opacity-20" />
+                                {activeTab === 'team'
+                                    ? 'No team skills yet. Team skills are promoted from personal skills through the approval process.'
+                                    : 'No skills found.'}
+                            </div>
+                        ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                         {displaySkills.map((skill) => (
                             <div
                                 key={skill.id}
@@ -589,22 +599,16 @@ export function SkillsPage() {
                                                 Pending Publish
                                             </span>
                                         )}
-                                        {skill.reviewStatus === 'published' && (skill.scope === 'personal' || skill.scope === 'team') && (
+                                        {skill.reviewStatus === 'approved' && (skill.scope === 'personal' || skill.scope === 'team') && (
                                             <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-green-50 text-green-600 text-[10px] font-bold border border-green-200 whitespace-nowrap">
                                                 <Check className="w-2.5 h-2.5" />
-                                                Published
+                                                Approved
                                             </span>
                                         )}
-                                        {skill.scope === 'core' && (
+                                        {skill.scope === 'builtin' && (
                                             <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[10px] font-bold border border-gray-200 whitespace-nowrap">
                                                 <Lock className="w-2.5 h-2.5" />
-                                                Built-in
-                                            </span>
-                                        )}
-                                        {skill.scope === 'extension' && (
-                                            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-teal-50 text-teal-600 text-[10px] font-bold border border-teal-200 whitespace-nowrap">
-                                                <Puzzle className="w-2.5 h-2.5" />
-                                                Installed
+                                                System
                                             </span>
                                         )}
                                     </div>
@@ -676,14 +680,12 @@ export function SkillsPage() {
                                     <div className="flex items-center gap-2 text-xs font-medium text-gray-400">
                                         <span className={cn(
                                             "px-2 py-0.5 rounded flex items-center gap-1",
-                                            skill.scope === 'core' ? "bg-gray-100 text-gray-700" :
+                                            skill.scope === 'builtin' ? "bg-gray-100 text-gray-700" :
                                                 skill.scope === 'team' ? "bg-blue-50 text-blue-700" :
-                                                    skill.scope === 'extension' ? "bg-teal-50 text-teal-700" :
-                                                        "bg-purple-50 text-purple-700"
+                                                    "bg-purple-50 text-purple-700"
                                         )}>
-                                            {skill.scope === 'core' && <Lock className="w-3 h-3" />}
-                                            {skill.scope === 'extension' && <Puzzle className="w-3 h-3" />}
-                                            {skill.scope === 'core' ? 'System Core' : skill.scope === 'team' ? 'Team Shared' : skill.scope === 'extension' ? 'System Extension' : 'Personal'}
+                                            {skill.scope === 'builtin' && <Lock className="w-3 h-3" />}
+                                            {skill.scope === 'builtin' ? 'System' : skill.scope === 'team' ? 'Team' : 'Personal'}
                                         </span>
                                         {(skill.scope === 'team' || skill.scope === 'personal') && (
                                             <span className="px-1.5 py-0.5 rounded bg-gray-50 text-gray-500 text-[10px] font-medium border border-gray-100">
@@ -715,7 +717,7 @@ export function SkillsPage() {
                                             </Tooltip>
                                         )}
 
-                                        {skill.scope === 'personal' && skill.reviewStatus === 'published' && skill.contributionStatus !== 'pending' && (
+                                        {skill.scope === 'personal' && skill.reviewStatus === 'approved' && skill.contributionStatus !== 'pending' && (
                                             <Tooltip content="Contribute to Team">
                                                 <button
                                                     onClick={(e) => handleContribute(e, skill)}
@@ -794,16 +796,20 @@ export function SkillsPage() {
                             </div>
                         ))}
 
-                        {/* Add New Placeholder */}
-                        <button
-                            onClick={handleCreateNew}
-                            className="border-2 border-dashed border-gray-200 rounded-xl p-6 flex flex-col items-center justify-center text-gray-400 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50/50 transition-all gap-3 min-h-[200px]"
-                        >
-                            <div className="p-3 rounded-full bg-gray-50 group-hover:bg-white">
-                                <Plus className="w-6 h-6" />
-                            </div>
-                            <span className="font-semibold text-sm">Create Custom Skill</span>
-                        </button>
+                        {/* Add New Placeholder — only for personal tab */}
+                        {(activeTab === 'personal') && (
+                            <button
+                                onClick={handleCreateNew}
+                                className="border-2 border-dashed border-gray-200 rounded-xl p-6 flex flex-col items-center justify-center text-gray-400 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50/50 transition-all gap-3 min-h-[200px]"
+                            >
+                                <div className="p-3 rounded-full bg-gray-50 group-hover:bg-white">
+                                    <Plus className="w-6 h-6" />
+                                </div>
+                                <span className="font-semibold text-sm">Create Custom Skill</span>
+                            </button>
+                        )}
+                        </div>
+                        )}
                     </div>
                 )}
                 {isLoadingMore && (
@@ -973,9 +979,8 @@ function ScriptReviewApprovalCard({
 
     // Scope display config
     const scopeConfig = {
-        core: { label: 'System Core', cls: 'bg-gray-100 text-gray-700', icon: Lock },
-        team: { label: 'Team Shared', cls: 'bg-blue-50 text-blue-700 border-blue-100', icon: Users },
-        extension: { label: 'System Extension', cls: 'bg-teal-50 text-teal-700 border-teal-100', icon: Puzzle },
+        builtin: { label: 'System Skills', cls: 'bg-gray-100 text-gray-700', icon: Lock },
+        team: { label: 'Team Skills', cls: 'bg-blue-50 text-blue-700 border-blue-100', icon: Users },
         personal: { label: 'Personal', cls: 'bg-purple-50 text-purple-700 border-purple-100', icon: User },
     }[skill.scope] || { label: skill.scope, cls: 'bg-gray-100 text-gray-600', icon: User };
 

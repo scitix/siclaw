@@ -7,29 +7,20 @@ function skillsBase(): string {
   return path.resolve(process.cwd(), config.paths.skillsDir);
 }
 
-/** Skill scope directories to search (in priority order) */
+/** Skill scope directories to search (in priority order, CLI fallback) */
 const SKILL_SCOPES = ["core", "team", "extension", "user"];
-
-/** Resolve the active skills directory name based on isTestEnv */
-function activeDir(isTestEnv?: boolean): string {
-  return isTestEnv ? ".skills-dev" : ".skills-prod";
-}
 
 /**
  * Build the list of directories to search for a specific skill's scripts.
- * Prefers .skills-prod/ or .skills-dev/ (gateway mode); falls back to scope dirs (CLI mode).
+ * Single directory model: each pod has one /skills/ dir populated by bundle API.
+ * CLI fallback: search all scope directories.
  */
-function getSkillScriptDirs(skill: string, isTestEnv?: boolean): string[] {
+function getSkillScriptDirs(skill: string): string[] {
   const base = skillsBase();
-  const activeParent = path.join(base, "user", activeDir(isTestEnv));
 
-  // Gateway mode: .skills-prod/ or .skills-dev/ exists → only search there.
-  // If the skill isn't symlinked into the active directory (e.g. unpublished
-  // in production), return empty — do NOT fall back to raw scope dirs.
-  if (fs.existsSync(activeParent)) {
-    const activePath = path.join(activeParent, skill, "scripts");
-    return fs.existsSync(activePath) ? [activePath] : [];
-  }
+  // Search directly in skillsBase for bundle-materialized skills
+  const directPath = path.join(base, skill, "scripts");
+  if (fs.existsSync(directPath)) return [directPath];
 
   // CLI fallback: search all scope directories
   const dirs: string[] = [];
@@ -42,12 +33,19 @@ function getSkillScriptDirs(skill: string, isTestEnv?: boolean): string[] {
 
 /**
  * Build the list of base directories for enumerating all skills.
- * Prefers .skills-prod/ or .skills-dev/ (gateway mode); falls back to scope dirs (CLI mode).
+ * Single directory model: skillsBase is the root.
+ * CLI fallback: search all scope directories.
  */
-function getSkillBaseDirs(isTestEnv?: boolean): string[] {
+function getSkillBaseDirs(): string[] {
   const base = skillsBase();
-  const activePath = path.join(base, "user", activeDir(isTestEnv));
-  if (fs.existsSync(activePath)) return [activePath];
+
+  // Check if bundle-materialized skills exist directly in skillsBase
+  // (no scope subdirs like core/team/extension)
+  const hasDirectSkills = fs.existsSync(base) && fs.readdirSync(base).some(
+    (entry) => !entry.startsWith(".") && !SKILL_SCOPES.includes(entry) &&
+      fs.statSync(path.join(base, entry)).isDirectory(),
+  );
+  if (hasDirectSkills) return [base];
 
   // CLI fallback: search all scope directories
   return SKILL_SCOPES
@@ -63,14 +61,13 @@ export interface ResolvedScript {
 
 /**
  * Resolve a skill script.
- * In gateway mode searches .skills-prod/ or .skills-dev/; in CLI mode searches all scope dirs.
+ * Searches the single skills directory (bundle model) or scope dirs (CLI fallback).
  */
 export function resolveSkillScript(
   skill: string,
   script: string,
-  isTestEnv?: boolean,
 ): ResolvedScript | null {
-  for (const dir of getSkillScriptDirs(skill, isTestEnv)) {
+  for (const dir of getSkillScriptDirs(skill)) {
     const scriptPath = path.join(dir, script);
     if (fs.existsSync(scriptPath)) {
       return {
@@ -86,9 +83,9 @@ export function resolveSkillScript(
 /**
  * List available scripts for a given skill.
  */
-export function listSkillScripts(skill: string, isTestEnv?: boolean): string[] {
+export function listSkillScripts(skill: string): string[] {
   const scripts = new Set<string>();
-  for (const dir of getSkillScriptDirs(skill, isTestEnv)) {
+  for (const dir of getSkillScriptDirs(skill)) {
     try {
       for (const f of fs.readdirSync(dir)) {
         if (f.endsWith(".sh") || f.endsWith(".py")) scripts.add(f);
@@ -103,14 +100,14 @@ export function listSkillScripts(skill: string, isTestEnv?: boolean): string[] {
 /**
  * List all skills that have scripts.
  */
-export function listAllSkillsWithScripts(isTestEnv?: boolean): Array<{
+export function listAllSkillsWithScripts(): Array<{
   skill: string;
   scripts: string[];
 }> {
   const result: Array<{ skill: string; scripts: string[] }> = [];
   const seen = new Set<string>();
 
-  for (const base of getSkillBaseDirs(isTestEnv)) {
+  for (const base of getSkillBaseDirs()) {
     try {
       for (const d of fs.readdirSync(base, { withFileTypes: true })) {
         if (d.name.startsWith("_")) continue; // skip _lib etc.
@@ -144,7 +141,6 @@ export function listAllSkillsWithScripts(isTestEnv?: boolean): Array<{
 export function resolveScript(params: {
   skill?: string;
   script: string;
-  isTestEnv?: boolean;
 }): ResolvedScript | { error: string } {
   const script = params.script?.trim();
   if (!script) {
@@ -170,15 +166,15 @@ export function resolveScript(params: {
     };
   }
 
-  const resolved = resolveSkillScript(skill, script, params.isTestEnv);
+  const resolved = resolveSkillScript(skill, script);
   if (!resolved) {
-    const available = listSkillScripts(skill, params.isTestEnv);
+    const available = listSkillScripts(skill);
     if (available.length > 0) {
       return {
         error: `Script "${script}" not found in skill "${skill}". Available: ${available.join(", ")}`,
       };
     }
-    const allSkills = listAllSkillsWithScripts(params.isTestEnv);
+    const allSkills = listAllSkillsWithScripts();
     let hint = `Skill "${skill}" has no scripts directory.`;
     if (allSkills.length > 0) {
       hint += `\nSkills with scripts: ${allSkills.map((s) => `${s.skill} (${s.scripts.join(", ")})`).join("; ")}`;

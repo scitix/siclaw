@@ -68,6 +68,13 @@ export class AgentBoxManager {
     }
   }
 
+  /** Inject CertificateManager into spawner (for mTLS, K8s spawner only) */
+  setCertManager(cm: unknown): void {
+    if ('setCertManager' in this.spawner) {
+      (this.spawner as any).setCertManager(cm);
+    }
+  }
+
   /**
    * Start health check
    */

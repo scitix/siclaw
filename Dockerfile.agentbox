@@ -44,9 +44,10 @@ RUN npm ci --omit=dev
 # Copy compiled JavaScript from builder
 COPY --from=builder /app/dist/ ./dist/
 
-# Copy skills directories
+# Builtin skills baked into image (always available, no Gateway dependency)
 COPY skills/core/ ./skills/core/
-RUN mkdir -p ./.siclaw/skills/extension ./.siclaw/skills/team ./.siclaw/skills/user ./.siclaw/credentials
+# Dynamic skills (team + personal) delivered via Gateway bundle API at startup
+RUN mkdir -p ./.siclaw/skills ./.siclaw/credentials
 
 # Copy MCP servers config if present (optional — NFS is the primary source)
 COPY config/mcp-servers.jso[n] ./config/
@@ -56,7 +57,7 @@ ENV NODE_ENV=production
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -fk https://localhost:3000/health || curl -f http://localhost:3000/health || exit 1
 
 # Expose port
 EXPOSE 3000

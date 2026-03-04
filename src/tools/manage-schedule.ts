@@ -2,6 +2,7 @@ import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { loadConfig } from "../core/config.js";
+import { GatewayClient } from "../agentbox/gateway-client.js";
 
 interface ManageScheduleParams {
   action: "create" | "update" | "delete" | "pause" | "resume" | "rename" | "list";
@@ -98,13 +99,9 @@ Common cron patterns:
         const gatewayUrl = cfg.server.gatewayUrl || "http://siclaw-gateway";
         const userId = cfg.userId;
         try {
-          const listUrl = `${gatewayUrl}/api/internal/cron-list?userId=${encodeURIComponent(userId)}`;
-          const resp = await fetch(
-            listUrl,
-            { signal: AbortSignal.timeout(5_000) },
-          );
-          const data = (await resp.json()) as { jobs?: Array<{ id: string; name: string; schedule: string; status: string; description?: string | null; lastRunAt?: string | null; lastResult?: string | null }> };
-          const jobs = data.jobs ?? [];
+          // Use GatewayClient with mTLS authentication
+          const gatewayClient = new GatewayClient({ gatewayUrl });
+          const jobs = await gatewayClient.listCronJobs(userId);
           if (jobs.length === 0) {
             return {
               content: [{ type: "text" as const, text: "No scheduled tasks currently." }],

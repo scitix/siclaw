@@ -144,7 +144,7 @@ function buildAppendSystemPrompt(
     // Platform skills (create-skill, update-skill, manage-skill) are excluded —
     // they are internal agent guides, not user-facing skills.
   } else {
-    const SKILL_SCOPES = ["core", "team", "extension", "user"];
+    const SKILL_SCOPES = ["core", "team", "user"];
     for (const scope of SKILL_SCOPES) {
       const scopeDir = path.join(skillsBase, scope);
       if (fs.existsSync(scopeDir)) {
@@ -424,27 +424,45 @@ export async function createSiclawSession(
     lsTool,
   ];
 
-  // Skills: prefer .skills-prod/.skills-dev + .platform-web/.platform-channel (gateway mode),
-  // fall back to scope dirs (CLI mode)
-  const getUserSkillDirName = () => ".skills-prod";
+  // Skills: single directory model (bundle API populates skillsBase directly)
+  // CLI fallback: search scope subdirectories
+  const getUserSkillDirName = () => ".";
   const getPlatformSkillDirName = () => mode === "channel" ? ".platform-channel" : ".platform-web";
 
-  const userSkillDir = path.join(skillsBase, "user", getUserSkillDirName());
-  const platformSkillDir = path.join(skillsBase, "user", getPlatformSkillDirName());
+  // Skill directories (two fixed sources):
+  // 1. Builtin: baked into Docker image at /app/skills/core/
+  // 2. Dynamic: team + personal written by bundle API to skillsBase (.siclaw/skills/)
+  const builtinPath = path.resolve(cwd, "skills", "core");
 
-  let skillsDirs: string[];
-  if (fs.existsSync(userSkillDir)) {
-    skillsDirs = [userSkillDir];
-    // Platform skills (create-skill, update-skill, manage-skill) are internal agent guides —
-    // they should NOT be listed as user-facing skills. The agent can still read them from disk
-    // when needed (via the system prompt instructions for skill management).
-  } else {
-    // CLI fallback — exclude "platform" scope from skill loading
-    const SKILL_SCOPES = ["core", "team", "extension", "user"];
-    skillsDirs = SKILL_SCOPES
-      .map((scope) => path.join(skillsBase, scope))
-      .filter((dir) => fs.existsSync(dir));
+  // Read disabled builtins list (written by agentbox-main after bundle fetch)
+  let disabledBuiltins: Set<string> | undefined;
+  const disabledFile = path.join(skillsBase, ".disabled-builtins.json");
+  try {
+    if (fs.existsSync(disabledFile)) {
+      const list: string[] = JSON.parse(fs.readFileSync(disabledFile, "utf-8"));
+      if (list.length > 0) {
+        disabledBuiltins = new Set(list);
+        console.log(`[agent-factory] Disabled builtins: ${list.join(", ")}`);
+      }
+    }
+  } catch { /* ignore malformed file */ }
+
+  // If there are disabled builtins, enumerate individual skill dirs excluding disabled ones;
+  // otherwise pass the whole builtin directory
+  let builtinPaths: string[] = [];
+  if (fs.existsSync(builtinPath)) {
+    if (disabledBuiltins) {
+      for (const entry of fs.readdirSync(builtinPath, { withFileTypes: true })) {
+        if (entry.isDirectory() && !disabledBuiltins.has(entry.name)) {
+          builtinPaths.push(path.join(builtinPath, entry.name));
+        }
+      }
+    } else {
+      builtinPaths = [builtinPath];
+    }
   }
+
+  const skillsDirs = [...builtinPaths, skillsBase];
 
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};

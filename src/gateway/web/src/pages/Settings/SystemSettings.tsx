@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Save, Loader2, ShieldCheck, HardDrive, Globe, KeyRound } from 'lucide-react';
+import { Save, Loader2, ShieldCheck, Globe, KeyRound } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
 
@@ -38,17 +38,6 @@ const SECTIONS: SectionConfig[] = [
             { key: 'clientId', label: 'Client ID', type: 'text' },
             { key: 'clientSecret', label: 'Client Secret', type: 'password' },
             { key: 'redirectUri', label: 'Redirect URI', type: 'text', placeholder: 'https://your-domain/auth/callback' },
-        ],
-    },
-    {
-        key: 's3',
-        title: 'S3 Backup Configuration',
-        icon: HardDrive,
-        fields: [
-            { key: 'endpoint', label: 'Endpoint', type: 'text', placeholder: 'https://s3.amazonaws.com' },
-            { key: 'bucket', label: 'Bucket', type: 'text' },
-            { key: 'accessKey', label: 'Access Key', type: 'text' },
-            { key: 'secretKey', label: 'Secret Key', type: 'password' },
         ],
     },
     {

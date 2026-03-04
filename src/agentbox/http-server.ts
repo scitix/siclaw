@@ -7,6 +7,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
+import https from "node:https";
+import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
@@ -14,6 +16,7 @@ import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents, deepSearchGate, HYPOTHESES_CONFIRMED_SENTINEL } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
+import { GatewayClient } from "./gateway-client.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -56,9 +59,47 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
 
 
 /**
- * Create HTTP server
+ * Write a skill bundle to local disk.
+ * Clears existing skills and writes each skill's SKILL.md + scripts/.
  */
-export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server {
+export async function materializeBundle(
+  bundle: { skills: Array<{ dirName: string; specs: string; scripts: Array<{ name: string; content: string }> }> },
+  skillsDir: string,
+): Promise<void> {
+  // Clear existing skill dirs (but not hidden files like .gitkeep)
+  if (fs.existsSync(skillsDir)) {
+    for (const entry of fs.readdirSync(skillsDir)) {
+      if (entry.startsWith(".")) continue;
+      fs.rmSync(path.join(skillsDir, entry), { recursive: true });
+    }
+  } else {
+    fs.mkdirSync(skillsDir, { recursive: true });
+  }
+
+  for (const skill of bundle.skills) {
+    const skillDir = path.join(skillsDir, skill.dirName);
+    fs.mkdirSync(skillDir, { recursive: true });
+
+    // Write SKILL.md
+    if (skill.specs) {
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
+    }
+
+    // Write scripts
+    if (skill.scripts.length > 0) {
+      const scriptsDir = path.join(skillDir, "scripts");
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      for (const script of skill.scripts) {
+        fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
+      }
+    }
+  }
+}
+
+/**
+ * Create HTTP or HTTPS server (auto-detects certificates)
+ */
+export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server | https.Server {
   // Pre-start LLM proxy (fire-and-forget, ready before first prompt)
   if (hasOpenAIProvider()) {
     ensureProxy().catch(err => console.warn("[agentbox] LLM proxy pre-start failed:", err));
@@ -549,11 +590,37 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   /**
    * POST /api/reload-skills - hot-reload skills
    *
-   * Calls reload() on all active sessions, rescans the skills directory, and rebuilds the system prompt.
+   * Fetches skill bundle from Gateway via mTLS, writes to local disk, then
+   * calls reload() on all active sessions to rescan and rebuild system prompts.
    */
   addRoute("POST", "/api/reload-skills", async (_req, res) => {
     const sessions = sessionManager.list();
     console.log(`[agentbox-http] Reloading skills for ${sessions.length} active sessions`);
+
+    // Fetch fresh bundle from Gateway (mTLS — identity from certificate)
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (gatewayUrl) {
+      try {
+        const client = new GatewayClient({ gatewayUrl });
+        const bundle = await client.fetchSkillBundle();
+        const config = loadConfig();
+        const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
+        await materializeBundle(bundle, skillsDir);
+
+        // Write disabled builtins list for agent-factory to exclude
+        const disabledFile = path.join(skillsDir, ".disabled-builtins.json");
+        if (bundle.disabledBuiltins?.length) {
+          fs.writeFileSync(disabledFile, JSON.stringify(bundle.disabledBuiltins));
+        } else if (fs.existsSync(disabledFile)) {
+          fs.unlinkSync(disabledFile);
+        }
+
+        console.log(`[agentbox-http] Bundle materialized: ${bundle.skills.length} skills (${bundle.disabledBuiltins?.length || 0} builtins disabled), version=${bundle.version}`);
+      } catch (err: any) {
+        console.warn(`[agentbox-http] Failed to fetch skill bundle from Gateway: ${err.message}`);
+      }
+    }
+
     const errors: string[] = [];
     for (const managed of sessions) {
       try {
@@ -674,7 +741,8 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
   // ==================== Server ====================
 
-  const server = http.createServer(async (req, res) => {
+  /** Main request handler shared by HTTP and HTTPS servers */
+  const requestHandler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const method = req.method || "GET";
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
     const pathname = url.pathname;
@@ -688,6 +756,21 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       });
       res.end();
       return;
+    }
+
+    // mTLS Gateway identity check (HTTPS only, skip /health for K8s probes)
+    if (useTls && pathname !== "/health") {
+      const tlsSocket = req.socket as TLSSocket;
+      const peerCert = tlsSocket.getPeerCertificate?.();
+      if (!peerCert || !peerCert.subject) {
+        sendJson(res, 403, { error: "Client certificate required" });
+        return;
+      }
+      if (peerCert.subject.OU !== "Gateway") {
+        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway)`);
+        sendJson(res, 403, { error: "Forbidden: only Gateway can access this API" });
+        return;
+      }
     }
 
     // Match route
@@ -716,7 +799,31 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     // 404
     sendJson(res, 404, { error: "Not found" });
-  });
+  };
 
+  // Detect TLS certificates
+  const certPath = process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
+  const certFile = path.join(certPath, "tls.crt");
+  const keyFile = path.join(certPath, "tls.key");
+  const caFile = path.join(certPath, "ca.crt");
+  const useTls = fs.existsSync(certFile) && fs.existsSync(keyFile) && fs.existsSync(caFile);
+
+  if (useTls) {
+    console.log(`[agentbox-http] TLS certificates found at ${certPath}, starting HTTPS server`);
+    const server = https.createServer(
+      {
+        cert: fs.readFileSync(certFile),
+        key: fs.readFileSync(keyFile),
+        ca: fs.readFileSync(caFile),
+        requestCert: true,
+        rejectUnauthorized: false, // Allow K8s probes without client cert; app-layer checks OU for non-health routes
+      },
+      requestHandler,
+    );
+    return server;
+  }
+
+  console.log("[agentbox-http] No TLS certificates found, starting HTTP server (dev mode)");
+  const server = http.createServer(requestHandler);
   return server;
 }

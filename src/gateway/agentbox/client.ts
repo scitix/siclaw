@@ -2,7 +2,16 @@
  * AgentBox HTTP Client
  *
  * Client used by the Gateway to call the AgentBox HTTP API.
+ * Supports mTLS when TLS options are provided.
  */
+
+import https from "node:https";
+
+export interface AgentBoxTlsOptions {
+  cert: string;
+  key: string;
+  ca: string;
+}
 
 export interface PromptOptions {
   sessionId?: string;
@@ -11,8 +20,6 @@ export interface PromptOptions {
   kubeconfigPath?: string | null;
   /** Environment ID for schedule filtering — string = use this env, null = no env */
   envId?: string | null;
-  /** Whether this is a test environment (use .skills-dev skills) */
-  isTestEnv?: boolean;
   /** Session mode — "web" | "channel" */
   mode?: string;
   /** Model provider to use for this prompt */
@@ -90,10 +97,21 @@ export interface ContextUsageResponse {
 export class AgentBoxClient {
   private endpoint: string;
   private timeoutMs: number;
+  private httpsAgent: https.Agent | null = null;
 
-  constructor(endpoint: string, timeoutMs = 30000) {
+  constructor(endpoint: string, timeoutMs = 30000, tlsOptions?: AgentBoxTlsOptions) {
     this.endpoint = endpoint.replace(/\/$/, ""); // Remove trailing slash
     this.timeoutMs = timeoutMs;
+
+    if (tlsOptions) {
+      this.httpsAgent = new https.Agent({
+        cert: tlsOptions.cert,
+        key: tlsOptions.key,
+        ca: tlsOptions.ca,
+        checkServerIdentity: () => undefined, // Skip hostname verification (cert CN=userId, not hostname)
+        rejectUnauthorized: true,
+      });
+    }
   }
 
   /**
@@ -230,6 +248,12 @@ export class AgentBoxClient {
   async *streamEvents(sessionId: string): AsyncIterable<unknown> {
     const url = `${this.endpoint}/api/stream/${sessionId}`;
 
+    // Use https.request for HTTPS with mTLS
+    if (this.httpsAgent && this.endpoint.startsWith("https://")) {
+      yield* this.streamEventsHttps(sessionId);
+      return;
+    }
+
     const resp = await fetch(url, {
       headers: { Accept: "text/event-stream" },
     });
@@ -281,11 +305,73 @@ export class AgentBoxClient {
   }
 
   /**
-   * Base fetch wrapper
+   * SSE stream over HTTPS with mTLS
+   */
+  private async *streamEventsHttps(sessionId: string): AsyncIterable<unknown> {
+    const urlObj = new URL(`/api/stream/${sessionId}`, this.endpoint);
+
+    const res = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port,
+          path: urlObj.pathname,
+          method: "GET",
+          headers: { Accept: "text/event-stream" },
+          agent: this.httpsAgent!,
+        },
+        resolve,
+      );
+      req.on("error", reject);
+      req.end();
+    });
+
+    if (res.statusCode !== 200) {
+      throw new Error(`Stream request failed: ${res.statusCode}`);
+    }
+
+    console.log(`[agentbox-client] SSE open (HTTPS) sessionId=${sessionId}`);
+    let buffer = "";
+    let eventCount = 0;
+
+    try {
+      for await (const chunk of res) {
+        buffer += chunk.toString();
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6);
+            try {
+              eventCount++;
+              yield JSON.parse(data);
+            } catch {
+              console.warn(`[agentbox-client] SSE parse error sessionId=${sessionId}: ${data.slice(0, 100)}`);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[agentbox-client] SSE stream error sessionId=${sessionId}:`, err instanceof Error ? err.message : err);
+      throw err;
+    } finally {
+      console.log(`[agentbox-client] SSE closed (HTTPS) sessionId=${sessionId} (${eventCount} events)`);
+    }
+  }
+
+  /**
+   * Base fetch wrapper (supports both HTTP and HTTPS with mTLS)
    */
   private async fetch(path: string, init?: RequestInit): Promise<Response> {
     const url = `${this.endpoint}${path}`;
     const method = init?.method ?? "GET";
+
+    // Use https.request for HTTPS with mTLS
+    if (this.httpsAgent && this.endpoint.startsWith("https://")) {
+      return this.httpsRequest(path, init);
+    }
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -311,5 +397,50 @@ export class AgentBoxClient {
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  /**
+   * HTTPS request with mTLS (returns a Response-compatible object)
+   */
+  private httpsRequest(path: string, init?: RequestInit): Promise<Response> {
+    const method = init?.method ?? "GET";
+    const urlObj = new URL(path, this.endpoint);
+
+    return new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: urlObj.hostname,
+          port: urlObj.port,
+          path: urlObj.pathname + urlObj.search,
+          method,
+          headers: init?.headers as Record<string, string>,
+          agent: this.httpsAgent!,
+        },
+        (res) => {
+          let body = "";
+          res.on("data", (chunk) => (body += chunk));
+          res.on("end", () => {
+            const status = res.statusCode ?? 500;
+            if (status >= 200 && status < 300) {
+              resolve(new Response(body, { status, statusText: res.statusMessage }));
+            } else {
+              console.error(`[agentbox-client] HTTPS error: ${method} ${path} → ${status} ${body.slice(0, 200)}`);
+              reject(new Error(`AgentBox request failed: ${status} ${body}`));
+            }
+          });
+        },
+      );
+
+      req.on("error", reject);
+      req.setTimeout(this.timeoutMs, () => {
+        req.destroy();
+        reject(new Error(`AgentBox HTTPS request timeout: ${method} ${path} (${this.timeoutMs}ms)`));
+      });
+
+      if (init?.body) {
+        req.write(init.body);
+      }
+      req.end();
+    });
   }
 }

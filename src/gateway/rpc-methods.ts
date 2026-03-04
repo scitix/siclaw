@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { AgentBoxManager } from "./agentbox/manager.js";
-import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
+import { AgentBoxClient, type PromptOptions, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
@@ -28,12 +28,13 @@ import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { loadMcpServersConfig } from "../core/mcp-client.js";
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
+import { SkillContentRepository, type SkillContentTag } from "./db/repositories/skill-content-repo.js";
 import { ScriptEvaluator } from "./skills/script-evaluator.js";
-import { S3Storage } from "../lib/s3-storage.js";
 import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js";
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
 import { notifyCronService as notifyCronServiceImpl } from "./cron/notify.js";
+import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -57,9 +58,11 @@ export function createRpcMethods(
   db: Database | null,
   sendToUser?: SendToUserFn,
   activePromptUsers?: Set<string>,
+  agentBoxTlsOptions?: AgentBoxTlsOptions,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
+  getSkillBundle: (userId: string, env: "prod" | "dev") => Promise<SkillBundle>;
 } {
   const methods = new Map<string, RpcHandler>();
 
@@ -78,6 +81,7 @@ export function createRpcMethods(
   const workspaceRepo = db ? new WorkspaceRepository(db) : null;
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
   const mcpRepo = db ? new McpServerRepository(db) : null;
+  const skillContentRepo = db ? new SkillContentRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
   /** Resolve workspaceId for a session from DB, falling back to "default" */
@@ -122,7 +126,7 @@ export function createRpcMethods(
     const handles = agentBoxManager.getForUser(userId);
     if (handles.length === 0) return; // No active AgentBox, next session will pick up changes
     for (const handle of handles) {
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
       client.reloadSkills().then((r) => {
         console.log(`[rpc] Skill reload notified for ${userId} box=${handle.boxId}: reloaded=${r.reloaded}`);
       }).catch((err) => {
@@ -137,18 +141,10 @@ export function createRpcMethods(
       notifySkillReload(userId);
     }
   }
-  // Initialize skills dir, then sync all users' skill dirs
-  // so newly deployed core/extension skills are immediately available
+  // Initialize skills dir
   skillWriter.init()
-    .then(() => syncAllActiveSkills())
     .then(async () => {
-      console.log("[rpc] Skills initialized and synced");
-      // One-time migration: upload existing NFS skills to S3
-      if (s3 && skillRepo && skillVersionRepo) {
-        migrateExistingSkillsToS3(skillRepo, skillVersionRepo, s3, skillWriter)
-          .then(() => console.log("[rpc] S3 migration complete"))
-          .catch((err) => console.warn("[rpc] S3 migration error:", err.message));
-      }
+      console.log("[rpc] Skills initialized");
     })
     .catch((err) => {
       console.error("[rpc] Failed to initialize skills:", err);
@@ -160,6 +156,21 @@ export function createRpcMethods(
   const builtinExtDir = path.join(process.cwd(), "skills", "extension");
   const extSkillsDir = fs.existsSync(builtinExtDir) ? builtinExtDir : path.join(skillsDir, "extension");
 
+  /** Resolve the filesystem dir for a builtin skill dirName (core first, then extension) */
+  function resolveBuiltinSkillDir(dirName: string): string {
+    // Check core dirs first, then extension
+    const pvCore = path.join(skillsDir, "core", dirName);
+    if (fs.existsSync(pvCore)) return pvCore;
+    const bakedCore = path.join(coreSkillsDir, dirName);
+    if (fs.existsSync(bakedCore)) return bakedCore;
+    const pvExt = path.join(skillsDir, "extension", dirName);
+    if (fs.existsSync(pvExt)) return pvExt;
+    const bakedExt = path.join(extSkillsDir, dirName);
+    if (fs.existsSync(bakedExt)) return bakedExt;
+    // Default to core dir
+    return path.join(coreSkillsDir, dirName);
+  }
+
   /** Read skill name from SKILL.md frontmatter, fallback to dirName */
   function readSkillName(skillDir: string): string | null {
     const specPath = path.join(skillDir, "SKILL.md");
@@ -167,159 +178,6 @@ export function createRpcMethods(
     const specs = fs.readFileSync(specPath, "utf-8");
     const { name } = skillWriter.parseFrontmatter(specs);
     return name || null;
-  }
-
-  /** Link shared skills (team, extension, core) into a target directory */
-  function linkSharedSkills(targetDir: string, disabled: Set<string>): void {
-    // Team skills
-    for (const s of skillWriter.scanScope("team")) {
-      if (!disabled.has(s.name)) {
-        const dest = path.join(targetDir, s.dirName);
-        if (!fs.existsSync(dest)) {
-          fs.symlinkSync(path.join(skillsDir, "team", s.dirName), dest);
-        }
-      }
-    }
-    // Extension skills
-    for (const s of skillWriter.scanScope("extension")) {
-      if (!disabled.has(s.name)) {
-        const dest = path.join(targetDir, s.dirName);
-        if (!fs.existsSync(dest)) {
-          fs.symlinkSync(path.join(extSkillsDir, s.dirName), dest);
-        }
-      }
-    }
-    // Core skills
-    for (const s of skillWriter.scanScope("core")) {
-      if (!disabled.has(s.name)) {
-        const dest = path.join(targetDir, s.dirName);
-        if (!fs.existsSync(dest)) {
-          fs.symlinkSync(path.join(coreSkillsDir, s.dirName), dest);
-        }
-      }
-    }
-  }
-
-  /** Rebuild a user's .skills-prod/ symlink directory based on disabled list */
-  async function syncActiveSkills(userId: string): Promise<void> {
-    // Clean up legacy directory names
-    for (const legacy of [".active", ".active-dev"]) {
-      const legacyDir = path.join(skillsDir, "user", userId, legacy);
-      if (fs.existsSync(legacyDir)) fs.rmSync(legacyDir, { recursive: true });
-    }
-
-    const disabled = new Set(
-      skillRepo ? await skillRepo.listDisabledSkills(userId) : [],
-    );
-    const activeDir = path.join(skillsDir, "user", userId, ".skills-prod");
-
-    // Clear and rebuild
-    if (fs.existsSync(activeDir)) fs.rmSync(activeDir, { recursive: true });
-    fs.mkdirSync(activeDir, { recursive: true });
-
-    // Build map of personal skill dirName → reviewStatus for production gating
-    const reviewStatusMap = new Map<string, string>();
-    if (skillRepo) {
-      const userSkills = await skillRepo.listForUser(userId, { scope: "personal" });
-      for (const s of userSkills.skills) {
-        reviewStatusMap.set(s.dirName, (s as any).reviewStatus ?? "draft");
-      }
-    }
-
-    // Priority: user > team > core — first linked wins, duplicates skipped
-
-    // 1. Personal skills (highest priority) — production: only published skills
-    const userDir = path.join(skillsDir, "user", userId);
-    if (fs.existsSync(userDir)) {
-      for (const entry of fs.readdirSync(userDir)) {
-        if (entry.startsWith(".")) continue; // skip .skills-prod, .published, etc.
-        const entryPath = path.join(userDir, entry);
-        const stat = fs.statSync(entryPath);
-        if (!stat.isDirectory()) continue;
-        const name = readSkillName(entryPath) || entry;
-        if (disabled.has(name)) continue;
-
-        const rs = reviewStatusMap.get(entry) ?? "draft";
-        // .published/ exists → symlink to published snapshot
-        const publishedPath = skillWriter.resolvePublishedDir(userId, entry);
-        if (fs.existsSync(publishedPath)) {
-          fs.symlinkSync(path.join("..", ".published", entry), path.join(activeDir, entry));
-        } else if (rs === "published") {
-          // Migration compat: published but no .published/ dir yet → use working copy
-          fs.symlinkSync(path.join("..", entry), path.join(activeDir, entry));
-        }
-        // draft or pending without .published/ → skip (not visible in prod)
-      }
-    }
-
-    // 2-4. Shared skills (team, extension, core)
-    linkSharedSkills(activeDir, disabled);
-
-    // ── Build .skills-dev/ for test environments ──
-    // All personal skills → symlink to working copy (latest version)
-    const activeDevDir = path.join(skillsDir, "user", userId, ".skills-dev");
-    if (fs.existsSync(activeDevDir)) fs.rmSync(activeDevDir, { recursive: true });
-    fs.mkdirSync(activeDevDir, { recursive: true });
-
-    // 1. Personal skills — include ALL, always working copy
-    if (fs.existsSync(userDir)) {
-      for (const entry of fs.readdirSync(userDir)) {
-        if (entry.startsWith(".")) continue;
-        const entryPath = path.join(userDir, entry);
-        const stat = fs.statSync(entryPath);
-        if (!stat.isDirectory()) continue;
-        const name = readSkillName(entryPath) || entry;
-        if (!disabled.has(name)) {
-          fs.symlinkSync(path.join("..", entry), path.join(activeDevDir, entry));
-        }
-      }
-    }
-
-    // 2-4. Shared skills
-    linkSharedSkills(activeDevDir, disabled);
-
-    // ── Build .platform-web/ — platform skills for web mode ──
-    const platformWebDir = path.join(skillsDir, "user", userId, ".platform-web");
-    if (fs.existsSync(platformWebDir)) fs.rmSync(platformWebDir, { recursive: true });
-    fs.mkdirSync(platformWebDir, { recursive: true });
-
-    const builtinPlatformDir = path.join(process.cwd(), "skills", "platform");
-    const platformSkillsDir = fs.existsSync(builtinPlatformDir)
-      ? builtinPlatformDir
-      : path.join(skillsDir, "platform");
-
-    for (const name of ["create-skill", "update-skill"]) {
-      const src = path.join(platformSkillsDir, name);
-      if (fs.existsSync(src)) {
-        fs.symlinkSync(src, path.join(platformWebDir, name));
-      }
-    }
-
-    // ── Build .platform-channel/ — platform skills for channel mode ──
-    const platformChannelDir = path.join(skillsDir, "user", userId, ".platform-channel");
-    if (fs.existsSync(platformChannelDir)) fs.rmSync(platformChannelDir, { recursive: true });
-    fs.mkdirSync(platformChannelDir, { recursive: true });
-
-    for (const name of ["manage-skill"]) {
-      const src = path.join(platformSkillsDir, name);
-      if (fs.existsSync(src)) {
-        fs.symlinkSync(src, path.join(platformChannelDir, name));
-      }
-    }
-  }
-
-  /** Sync .skills-prod/, .skills-dev/, .platform-web/, .platform-channel/ for all existing users */
-  async function syncAllActiveSkills(): Promise<void> {
-    const userDir = path.join(skillsDir, "user");
-    if (!fs.existsSync(userDir)) return;
-    for (const uid of fs.readdirSync(userDir)) {
-      if (uid.startsWith(".")) continue;
-      const stat = fs.statSync(path.join(userDir, uid));
-      if (!stat.isDirectory()) continue;
-      await syncActiveSkills(uid).catch((err) =>
-        console.warn(`[rpc] syncActiveSkills failed for ${uid}:`, (err as Error).message),
-      );
-    }
   }
 
   /** Trigger AI script review (fire-and-forget) */
@@ -413,12 +271,6 @@ export function createRpcMethods(
         createdAt: new Date().toISOString(),
       });
     }
-  }
-
-  // S3 storage (primary storage for skill versions)
-  const s3 = S3Storage.fromEnv();
-  if (s3) {
-    console.log("[rpc] S3 storage enabled");
   }
 
   // Active SSE subscriptions (userId → stream info)
@@ -534,7 +386,7 @@ export function createRpcMethods(
       workspaceId: effectiveWorkspaceId,
       allowedTools,
     });
-    const client = new AgentBoxClient(handle.endpoint);
+    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
     // Send prompt
     const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentials });
@@ -704,7 +556,7 @@ export function createRpcMethods(
     if (!handle || !sessionId) return null;
 
     try {
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
       return await client.getContextUsage(sessionId);
     } catch {
       return null;
@@ -743,7 +595,7 @@ export function createRpcMethods(
     if (!handle || !sessionId) return { model: null };
 
     try {
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
       return await client.getModel(sessionId);
     } catch {
       return { model: null };
@@ -762,7 +614,7 @@ export function createRpcMethods(
     const handle = await findAgentBoxForSession(userId, sessionId);
     if (!handle) throw new Error("No active agent session");
 
-    const client = new AgentBoxClient(handle.endpoint);
+    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
     return await client.setModel(sessionId, provider, modelId);
   });
 
@@ -1091,7 +943,7 @@ export function createRpcMethods(
     const stream = activeStreams.get(userId);
     if (!stream) throw new Error("No active agent session");
 
-    const client = new AgentBoxClient(stream.endpoint);
+    const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
     await client.steerSession(stream.sessionId, text);
     return { status: "steered" };
   });
@@ -1102,7 +954,7 @@ export function createRpcMethods(
     const stream = activeStreams.get(userId);
     if (!stream) throw new Error("No active agent session");
 
-    const client = new AgentBoxClient(stream.endpoint);
+    const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(stream.sessionId);
     return cleared;
   });
@@ -1114,7 +966,7 @@ export function createRpcMethods(
     if (stream) {
       // Abort the AgentBox session FIRST (stops the agent prompt, waits for idle)
       try {
-        const client = new AgentBoxClient(stream.endpoint);
+        const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
         await client.abortSession(stream.sessionId);
       } catch (err) {
         console.warn(`[rpc] Failed to abort AgentBox session:`, err instanceof Error ? err.message : err);
@@ -1143,13 +995,13 @@ export function createRpcMethods(
       const handle = await findAgentBoxForSession(userId);
       if (!handle) throw new Error("No active agent session");
       endpoint = handle.endpoint;
-      const abClient = new AgentBoxClient(endpoint);
+      const abClient = new AgentBoxClient(endpoint, 30000, agentBoxTlsOptions);
       const sessions = await abClient.listSessions();
       if (!sessions.sessions?.length) throw new Error("No active session");
       sessionId = sessions.sessions[0].id;
     }
 
-    const client = new AgentBoxClient(endpoint);
+    const client = new AgentBoxClient(endpoint, 30000, agentBoxTlsOptions);
     await client.confirmHypotheses(sessionId);
     return { status: "confirmed" };
   });
@@ -1235,7 +1087,7 @@ export function createRpcMethods(
     const handle = agentBoxManager.get(userId, workspaceId ?? "default");
     if (!handle) return { sessions: [] };
 
-    const client = new AgentBoxClient(handle.endpoint);
+    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
     return client.listSessions();
   });
 
@@ -1275,7 +1127,7 @@ export function createRpcMethods(
     if (!handle) return { boxStatus: "not_created" };
 
     try {
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
       const health = await client.health();
       return {
         boxId: handle.boxId,
@@ -1328,12 +1180,6 @@ export function createRpcMethods(
       skillRepo ? await skillRepo.listDisabledSkills(userId) : [],
     );
 
-    // Auto-initialize .skills-prod/ on first access
-    const activeDir = path.join(skillsDir, "user", userId, ".skills-prod");
-    if (!fs.existsSync(activeDir)) {
-      await syncActiveSkills(userId);
-    }
-
     const isAdmin = context.auth?.username === "admin";
 
     // Helper: filter role labels for non-admin users
@@ -1344,72 +1190,41 @@ export function createRpcMethods(
       return filtered.length > 0 ? filtered : undefined;
     };
 
-    // Core skills from filesystem (only on first page without scope filter or with scope=core)
-    let coreSkills: any[] = [];
-    if (offset === 0 && (!scope || scope === "core")) {
-      const scanned = skillWriter.scanScope("core");
-      const skillKeys = scanned.map(s => `core:${s.dirName}`);
+    // Builtin skills from filesystem (merged core + extension, only on first page)
+    let builtinSkills: any[] = [];
+    if (offset === 0 && (!scope || scope === "builtin")) {
+      const scanned = skillWriter.scanScope("builtin");
+      const skillKeys = scanned.map(s => `builtin:${s.dirName}`);
       const labelsMap = batchGetLabels(skillKeys);
 
-      const allCore = scanned.map((s) => ({
-        id: `core:${s.dirName}`,
+      const allBuiltin = scanned.map((s) => ({
+        id: `builtin:${s.dirName}`,
         name: s.name,
         description: s.description,
-        labels: filterLabels(labelsMap.get(`core:${s.dirName}`) ?? []),
-        type: "Core",
+        labels: filterLabels(labelsMap.get(`builtin:${s.dirName}`) ?? []),
+        type: "BuiltIn",
         version: 1,
-        scope: "core",
+        scope: "builtin",
         status: "installed",
         dirName: s.dirName,
         contributionStatus: "none",
-        reviewStatus: "published",
+        reviewStatus: "approved",
         enabled: !disabled.has(s.name),
       }));
-      // Apply search filter to core skills too
+      // Apply search filter
       if (search) {
         const q = search.toLowerCase();
-        coreSkills = allCore.filter(s =>
+        builtinSkills = allBuiltin.filter(s =>
           s.name.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q)
         );
       } else {
-        coreSkills = allCore;
+        builtinSkills = allBuiltin;
       }
     }
 
-    // Extension skills from filesystem
-    let extensionSkills: any[] = [];
-    if (offset === 0 && (!scope || scope === "extension")) {
-      const scanned = skillWriter.scanScope("extension");
-      const skillKeys = scanned.map(s => `extension:${s.dirName}`);
-      const labelsMap = batchGetLabels(skillKeys);
-
-      const allExt = scanned.map((s) => ({
-        id: `extension:${s.dirName}`,
-        name: s.name,
-        description: s.description,
-        labels: filterLabels(labelsMap.get(`extension:${s.dirName}`) ?? []),
-        type: "Extension",
-        version: 1,
-        scope: "extension",
-        status: "installed",
-        dirName: s.dirName,
-        contributionStatus: "none",
-        reviewStatus: "published",
-        enabled: !disabled.has(s.name),
-      }));
-      if (search) {
-        const q = search.toLowerCase();
-        extensionSkills = allExt.filter(s =>
-          s.name.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q)
-        );
-      } else {
-        extensionSkills = allExt;
-      }
-    }
-
-    // DB skills (when scope is not "core" or "extension")
+    // DB skills (when scope is not "builtin")
     let dbResult = { skills: [] as any[], hasMore: false };
-    if (scope !== "core" && scope !== "extension") {
+    if (scope !== "builtin") {
       const repoOpts: any = { limit, offset };
       if (scope) repoOpts.scope = scope;
       if (search) repoOpts.search = search;
@@ -1448,7 +1263,7 @@ export function createRpcMethods(
     }
 
     return {
-      skills: [...coreSkills, ...extensionSkills, ...dbResult.skills],
+      skills: [...builtinSkills, ...dbResult.skills],
       hasMore: dbResult.hasMore,
     };
   });
@@ -1468,7 +1283,6 @@ export function createRpcMethods(
       await skillRepo.disableSkill(userId, name);
     }
 
-    await syncActiveSkills(userId);
     notifySkillReload(userId);
 
     return { name, enabled };
@@ -1479,10 +1293,10 @@ export function createRpcMethods(
     const skillId = params.id as string;
     if (!skillId) throw new Error("Missing required param: id");
 
-    // Handle core skill IDs (core:xxx)
-    if (skillId.startsWith("core:")) {
-      const dirName = skillId.slice(5);
-      const files = skillWriter.readSkill("core", dirName);
+    // Handle builtin skill IDs (builtin:xxx)
+    if (skillId.startsWith("builtin:")) {
+      const dirName = skillId.slice(8);
+      const files = skillWriter.readSkill("builtin", dirName);
       if (!files) throw new Error("Skill not found");
       const { name, description } = skillWriter.parseFrontmatter(
         files.specs || "",
@@ -1492,37 +1306,37 @@ export function createRpcMethods(
         name: name || dirName,
         description,
         labels: getLabelsForSkill(skillId),
-        type: "Core",
+        type: "BuiltIn",
         version: 1,
-        scope: "core",
+        scope: "builtin",
         status: "installed",
         dirName,
         contributionStatus: "none",
-        reviewStatus: "published",
+        reviewStatus: "approved",
         files,
       };
     }
 
-    // Handle extension skill IDs (extension:xxx)
-    if (skillId.startsWith("extension:")) {
-      const dirName = skillId.slice(10);
-      const files = skillWriter.readSkill("extension", dirName);
+    // Backward compat: handle legacy core:/extension: prefixes
+    if (skillId.startsWith("core:") || skillId.startsWith("extension:")) {
+      const dirName = skillId.includes(":") ? skillId.split(":")[1] : skillId;
+      const files = skillWriter.readSkill("builtin", dirName);
       if (!files) throw new Error("Skill not found");
       const { name, description } = skillWriter.parseFrontmatter(
         files.specs || "",
       );
       return {
-        id: skillId,
+        id: `builtin:${dirName}`,
         name: name || dirName,
         description,
-        labels: getLabelsForSkill(skillId),
-        type: "Extension",
+        labels: getLabelsForSkill(`builtin:${dirName}`),
+        type: "BuiltIn",
         version: 1,
-        scope: "extension",
+        scope: "builtin",
         status: "installed",
         dirName,
         contributionStatus: "none",
-        reviewStatus: "published",
+        reviewStatus: "approved",
         files,
       };
     }
@@ -1532,12 +1346,14 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Read files from Skills PV
-    const files = skillWriter.readSkill(
-      meta.scope as "core" | "team" | "personal",
-      meta.dirName,
-      meta.authorId ?? undefined,
-    );
+    // Read files: DB for team/personal, filesystem for builtin
+    let files: SkillFiles | null = null;
+    if (meta.scope === "builtin") {
+      files = skillWriter.readSkill("builtin", meta.dirName);
+    } else if (skillContentRepo) {
+      const tag = meta.scope === "team" ? "published" : "working";
+      files = await skillContentRepo.read(meta.id, tag as SkillContentTag);
+    }
 
     // Include latest review if available
     let latestReview = null;
@@ -1547,8 +1363,8 @@ export function createRpcMethods(
 
     // Include published files if available
     let publishedFiles = null;
-    if (meta.authorId && meta.scope === "personal") {
-      publishedFiles = skillWriter.readPublished(meta.authorId, meta.dirName);
+    if (meta.scope === "personal" && skillContentRepo) {
+      publishedFiles = await skillContentRepo.read(meta.id, "published");
     }
 
     return {
@@ -1603,10 +1419,10 @@ export function createRpcMethods(
     if (!skillRepo) throw new Error("Database not available");
 
     // Personal skills cannot be copied/forked
-    if (forkedFromId && !forkedFromId.startsWith("core:") && !forkedFromId.startsWith("extension:")) {
+    if (forkedFromId && !forkedFromId.startsWith("builtin:") && !forkedFromId.startsWith("core:") && !forkedFromId.startsWith("extension:")) {
       const source = await skillRepo.getById(forkedFromId);
       if (source && source.scope === "personal") {
-        throw new Error("Cannot copy personal skills. Only core and team skills can be forked.");
+        throw new Error("Cannot copy personal skills. Only builtin and team skills can be forked.");
       }
     }
 
@@ -1624,12 +1440,12 @@ export function createRpcMethods(
 
     // Strict cross-scope duplicate check — only forks are allowed to shadow
     if (!forkedFromId) {
-      const coreMatch = skillWriter.scanScope("core").find(s => s.dirName === dirName || s.name === name);
+      const builtinMatch = skillWriter.scanScope("builtin").find(s => s.dirName === dirName || s.name === name);
       const teamRows = await skillRepo.list({ scope: "team" });
       const teamMatch = teamRows.find((s: any) => s.dirName === dirName || s.name === name);
-      if (coreMatch || teamMatch) {
+      if (builtinMatch || teamMatch) {
         throw new Error(
-          `A ${coreMatch ? "core" : "team"} skill named "${name}" already exists. ` +
+          `A ${builtinMatch ? "builtin" : "team"} skill named "${name}" already exists. ` +
           `Use the fork/copy function to create a personal copy.`,
         );
       }
@@ -1645,7 +1461,7 @@ export function createRpcMethods(
     // Resolve version inheritance for forks
     let inheritVersion: number | undefined;
     if (forkedFromId) {
-      if (forkedFromId.startsWith("core:") || forkedFromId.startsWith("extension:")) {
+      if (forkedFromId.startsWith("builtin:") || forkedFromId.startsWith("core:") || forkedFromId.startsWith("extension:")) {
         inheritVersion = 1;
       } else if (skillRepo) {
         const source = await skillRepo.getById(forkedFromId);
@@ -1653,7 +1469,7 @@ export function createRpcMethods(
       }
     }
 
-    // Save metadata to DB first (need id for S3 key)
+    // Save metadata to DB
     const id = await skillRepo.create({
       name,
       description,
@@ -1665,16 +1481,12 @@ export function createRpcMethods(
       version: inheritVersion,
     });
 
-    // Write files to Skills PV
-    const { skillDir } = await skillWriter.writeSkill(
-      "personal",
-      dirName,
-      { specs, scripts },
-      { userId },
-    );
+    // Save content to DB
+    if (skillContentRepo) {
+      await skillContentRepo.save(id, "working", { specs, scripts });
+    }
 
-    // Always draft on create — visible in test env immediately (S3 only after publish)
-    await syncActiveSkills(userId);
+    // Always draft on create — visible in dev env immediately
     notifySkillReload(userId);
     return {
       id, dirName, reviewStatus: "draft" as const,
@@ -1711,15 +1523,14 @@ export function createRpcMethods(
       | Array<{ name: string; content?: string }>
       | undefined;
 
-    // Resolve scripts: if content is missing, try uploads dir then existing skill files
+    // Resolve scripts: if content is missing, try DB then uploads dir then existing skill files
     let scripts: Array<{ name: string; content: string }> | undefined;
     if (rawScripts && rawScripts.length > 0) {
       const uploadsDir = path.join(skillsDir, "user", userId, "uploads");
-      const existingFiles = skillWriter.readSkill(
-        meta.scope as "core" | "team" | "personal",
-        meta.dirName,
-        meta.authorId ?? undefined,
-      );
+      let existingFiles: SkillFiles | null = null;
+      if (skillContentRepo) {
+        existingFiles = await skillContentRepo.read(skillId, "working");
+      }
       const existingScriptsMap = new Map(
         (existingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
       );
@@ -1737,13 +1548,16 @@ export function createRpcMethods(
       });
     }
 
-    // Always write directly to working copy
-    await skillWriter.writeSkill(
-      meta.scope as "core" | "team" | "personal",
-      meta.dirName,
-      { specs, scripts },
-      { userId: meta.authorId ?? undefined },
-    );
+    // Save content to DB
+    if (skillContentRepo) {
+      // Merge: only update fields that were provided
+      const existing = await skillContentRepo.read(skillId, "working");
+      const mergedFiles: SkillFiles = {
+        specs: specs ?? existing?.specs,
+        scripts: scripts ?? existing?.scripts,
+      };
+      await skillContentRepo.save(skillId, "working", mergedFiles);
+    }
 
     // Update DB metadata (name and dirName are immutable after creation)
     const updates: Record<string, unknown> = {};
@@ -1756,8 +1570,7 @@ export function createRpcMethods(
     await skillRepo.update(skillId, updates);
     await skillRepo.bumpVersion(skillId);
 
-    // Sync personal skills and reload
-    await syncActiveSkills(meta.authorId ?? userId);
+    // Notify reload
     notifySkillReload(meta.authorId ?? userId);
     return { status: "updated" };
   });
@@ -1773,8 +1586,8 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Core skills cannot be deleted (extension skills are filesystem-only, not in DB)
-    if (meta.scope === "core") throw new Error("Core skills cannot be deleted");
+    // Builtin skills cannot be deleted (filesystem-only, not in DB)
+    if (meta.scope === "builtin") throw new Error("Builtin skills cannot be deleted");
     // Team skills require admin
     if (meta.scope === "team") requireAdmin(context);
     // Personal skills require ownership
@@ -1788,29 +1601,13 @@ export function createRpcMethods(
     // Clean up version records
     if (skillVersionRepo) await skillVersionRepo.deleteForSkill(skillId);
 
-    // Clean up S3
-    if (s3) {
-      s3.deleteDir(`skills/${skillId}/`).catch((err: any) =>
-        console.warn("[rpc] S3 cleanup failed:", err.message),
-      );
-    }
-
-    // Delete files
-    await skillWriter.deleteSkill(
-      meta.scope as "core" | "team" | "personal",
-      meta.dirName,
-      { userId: meta.authorId ?? undefined },
-    );
-
-    // Delete from DB
+    // Delete from DB (CASCADE deletes skill_contents)
     await skillRepo.deleteById(skillId);
 
-    // Sync skills and reload
+    // Notify reload
     if (meta.scope === "team") {
-      await syncAllActiveSkills();
       notifyAllSkillReload();
     } else {
-      await syncActiveSkills(meta.authorId ?? userId);
       notifySkillReload(meta.authorId ?? userId);
     }
     return { status: "deleted" };
@@ -1902,20 +1699,28 @@ export function createRpcMethods(
 
     if (teamDiff) {
       // Team contribution review: team version vs user's published version
-      const teamFiles = skillWriter.readSkill("team", meta.dirName);
-      const publishedFiles = meta.authorId
-        ? skillWriter.readPublished(meta.authorId, meta.dirName) : null;
+      let teamFiles: SkillFiles | null = null;
+      if (skillContentRepo) {
+        const allTeam = await skillRepo.list({ scope: "team" });
+        const teamSkill = allTeam.find((s: any) => s.dirName === meta.dirName);
+        if (teamSkill) teamFiles = await skillContentRepo.read(teamSkill.id, "published");
+      }
+
+      let publishedFiles: SkillFiles | null = null;
+      if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
+
       return { diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed") };
     } else {
-      // Publish review: published vs staging (not working copy)
-      const publishedFiles = meta.authorId
-        ? skillWriter.readPublished(meta.authorId, meta.dirName) : null;
-      const stagingFiles = meta.authorId
-        ? skillWriter.readStaging(meta.authorId, meta.dirName) : null;
-      // Backward compat: if no staging dir, fall back to working copy
-      const compareFiles = stagingFiles
-        || skillWriter.readSkill(meta.scope as "core" | "team" | "personal",
-          meta.dirName, meta.authorId ?? undefined);
+      // Publish review: published vs staging
+      let publishedFiles: SkillFiles | null = null;
+      if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
+
+      let stagingFiles: SkillFiles | null = null;
+      if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
+
+      // If no staging, fall back to working copy
+      let compareFiles = stagingFiles;
+      if (!compareFiles && skillContentRepo) compareFiles = await skillContentRepo.read(skillId, "working");
       return { diff: buildFullDiff(publishedFiles, compareFiles, "published", "staging") };
     }
   });
@@ -1938,7 +1743,7 @@ export function createRpcMethods(
     } else if (meta.scope === "team") {
       requireAdmin(context);
     } else {
-      throw new Error("Cannot rollback core/extension skills");
+      throw new Error("Cannot rollback builtin skills");
     }
 
     if (targetVersion === undefined) {
@@ -1948,21 +1753,26 @@ export function createRpcMethods(
     const targetVer = await skillVersionRepo.getByVersion(skillId, targetVersion);
     if (!targetVer) throw new Error("Target version not found");
 
-    const skillDir = skillWriter.resolveDir(
-      meta.scope as "core" | "team" | "personal",
-      meta.dirName,
-      meta.authorId ?? undefined,
-    );
+    // Resolve version content from DB
+    let rollbackFiles: SkillFiles | null = null;
 
-    // Download from S3 to NFS (overwrite working copy)
-    if (s3) {
-      await skillWriter.materializeFromS3(s3, targetVer.s3Key, skillDir);
+    // 1. Try inline content from skill_versions (specs + scriptsJson)
+    if (targetVer.specs || targetVer.scriptsJson) {
+      const scripts = Array.isArray(targetVer.scriptsJson)
+        ? (targetVer.scriptsJson as Array<{ name: string; content: string }>)
+        : [];
+      rollbackFiles = {
+        specs: (targetVer.specs as string) ?? "",
+        scripts,
+      };
     }
 
-    // Also overwrite .published/ directory (rollback == new published state)
-    if (meta.authorId && s3) {
-      const publishedDir = skillWriter.resolvePublishedDir(meta.authorId, meta.dirName);
-      await skillWriter.materializeFromS3(s3, targetVer.s3Key, publishedDir);
+    if (!rollbackFiles) throw new Error("Cannot restore version content: no inline data in skill_versions");
+
+    // Persist rolled-back content to DB (working + published)
+    if (skillContentRepo) {
+      await skillContentRepo.save(skillId, "working", rollbackFiles);
+      await skillContentRepo.save(skillId, "published", rollbackFiles);
     }
 
     // Create new version (rollback creates a new version with old content)
@@ -1970,15 +1780,11 @@ export function createRpcMethods(
     const updatedMeta = await skillRepo.getById(skillId);
     const newVersion = updatedMeta?.version ?? (meta.version + 1);
 
-    const newS3Key = `skills/${skillId}/v${newVersion}/`;
-    if (s3) {
-      await s3.uploadDir(newS3Key, skillDir);
-    }
-
     await skillVersionRepo.create({
       skillId,
       version: newVersion,
-      s3Key: newS3Key,
+      specs: rollbackFiles.specs,
+      scriptsJson: rollbackFiles.scripts,
       commitMessage: `rollback to v${targetVer.version}`,
       authorId: userId,
     });
@@ -1986,22 +1792,27 @@ export function createRpcMethods(
     // Update publishedVersion to new version
     await skillRepo.update(skillId, { publishedVersion: newVersion });
 
-    // Sync + reload
+    // Notify reload
     const scope = meta.scope as string;
     if (scope === "team") {
-      await syncAllActiveSkills();
       notifyAllSkillReload();
     } else {
-      await syncActiveSkills(meta.authorId ?? userId);
       notifySkillReload(meta.authorId ?? userId);
     }
 
     return { version: newVersion };
   });
 
-  methods.set("skill.publish", async (params, context: RpcContext) => {
+  /**
+   * skill.submit — unified submit for publish review (replaces skill.requestPublish + skill.publish)
+   *
+   * Flow: draft → pending (triggers AI review + reviewer notification)
+   * If contributeToTeam is true, also sets contributionStatus = "pending"
+   */
+  methods.set("skill.submit", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillId = params.id as string;
+    const contributeToTeam = params.contributeToTeam as boolean | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillRepo) throw new Error("Database not available");
@@ -2009,190 +1820,242 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    if (meta.scope !== "personal") throw new Error("Only personal skills can be promoted to team");
-    if (meta.authorId !== userId) throw new Error("Cannot publish another user's skill");
-
-    // Only published skills can be promoted to team
-    if ((meta as any).reviewStatus !== "published") {
-      throw new Error("Cannot promote: skill must be published first");
-    }
-
-    await skillRepo.update(skillId, { contributionStatus: "pending" });
-
-    // Notify reviewers about the contribution request
-    notifyReviewers(skillId, meta.name, context.auth?.username ?? "unknown", "contribution").catch(console.error);
-
-    return { status: "pending" };
-  });
-
-  methods.set("skill.requestPublish", async (params, context: RpcContext) => {
-    const userId = requireAuth(context);
-    const skillId = params.id as string;
-
-    if (!skillId) throw new Error("Missing required param: id");
-    if (!skillRepo) throw new Error("Database not available");
-
-    const meta = await skillRepo.getById(skillId);
-    if (!meta) throw new Error("Skill not found");
-
-    if (meta.scope !== "personal") throw new Error("Only personal skills can be published");
-    if (meta.authorId !== userId) throw new Error("Cannot publish another user's skill");
+    if (meta.scope !== "personal") throw new Error("Only personal skills can be submitted");
+    if (meta.authorId !== userId) throw new Error("Cannot submit another user's skill");
 
     const isPending = (meta as any).reviewStatus === "pending";
 
-    // 1. Snapshot working copy → NFS .staging/
-    await skillWriter.snapshotStaging(meta.authorId ?? userId, meta.dirName);
-
-    // 2. Upload staging to S3
-    if (s3) {
-      const stagingDir = skillWriter.resolveStagingDir(meta.authorId ?? userId, meta.dirName);
-      await s3.deleteDir(`skills/${skillId}/staging/`);
-      await s3.uploadDir(`skills/${skillId}/staging/`, stagingDir);
+    // 1. Snapshot working copy → staging (DB)
+    if (skillContentRepo) {
+      await skillContentRepo.copy(skillId, "working", "staging");
     }
 
-    // 3. Bump stagingVersion
+    // 2. Bump stagingVersion
     await skillRepo.bumpStagingVersion(skillId);
 
-    // 4. Set reviewStatus (only on first submit)
+    // 4. Set reviewStatus + contributionStatus
+    const updates: Record<string, unknown> = {};
     if (!isPending) {
-      await skillRepo.update(skillId, { reviewStatus: "pending" });
+      updates.reviewStatus = "pending";
+    }
+    if (contributeToTeam) {
+      updates.contributionStatus = "pending";
+    }
+    if (Object.keys(updates).length > 0) {
+      await skillRepo.update(skillId, updates);
     }
 
     // 5. AI script review using staged files
-    const stagedFiles = skillWriter.readStaging(meta.authorId ?? userId, meta.dirName);
+    let stagedFiles: SkillFiles | null = null;
+    if (skillContentRepo) {
+      stagedFiles = await skillContentRepo.read(skillId, "staging");
+    }
     if (stagedFiles?.scripts?.length) {
       triggerScriptReview(skillId, meta.name, stagedFiles.scripts, stagedFiles.specs).catch(console.error);
     }
 
     // 6. Notify reviewers (only on first submit to avoid flooding)
     if (!isPending) {
-      notifyReviewers(skillId, meta.name, context.auth?.username ?? "unknown").catch(console.error);
+      const kind = contributeToTeam ? "contribution" : "publish";
+      notifyReviewers(skillId, meta.name, context.auth?.username ?? "unknown", kind).catch(console.error);
     }
 
     return { status: "pending" };
   });
 
-  methods.set("skill.approve", async (params, context: RpcContext) => {
-    await requirePermission(context, "skill_reviewer");
-    const username = context.auth!.username;
+  /**
+   * skill.review — unified review decision (replaces skill.reviewDecision + skill.approve + skill.reject)
+   *
+   * approve: staging → published, version bump, reviewStatus = "approved"
+   *          if contributeToTeam was pending: auto-promote to team skill
+   * reject:  clean staging, reviewStatus = "draft", contributionStatus = "none"
+   */
+  methods.set("skill.review", async (params, context: RpcContext) => {
+    const reviewerId = await requirePermission(context, "skill_reviewer");
     const skillId = params.id as string;
+    const decision = params.decision as "approve" | "reject";
+    const reason = params.reason as string | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
+    if (!decision || !["approve", "reject"].includes(decision)) {
+      throw new Error("Missing or invalid param: decision");
+    }
     if (!skillRepo) throw new Error("Database not available");
 
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Only published personal skills can be promoted
-    if (meta.scope !== "personal") throw new Error("Can only promote personal skills to team");
-    if ((meta as any).reviewStatus !== "published") {
-      throw new Error("Cannot promote a skill with unreviewed scripts to team");
+    // Race protection: ensure skill is still pending review
+    const currentReviewStatus = (meta as any).reviewStatus as string;
+    if (currentReviewStatus !== "pending") {
+      throw new Error("This skill is not pending review");
     }
 
-    // Trigger LLM review for team promotion (non-blocking)
-    const reviewFiles = meta.authorId
-      ? (skillWriter.readPublished(meta.authorId, meta.dirName)
-        || skillWriter.readSkill("personal", meta.dirName, meta.authorId))
-      : null;
-    if (reviewFiles?.scripts?.length) {
-      triggerScriptReview(skillId, meta.name, reviewFiles.scripts, reviewFiles.specs).catch(console.error);
+    // Record reviewer decision
+    if (skillReviewRepo) {
+      await skillReviewRepo.create({
+        skillId,
+        version: meta.version,
+        reviewerType: "admin",
+        reviewerId,
+        riskLevel: "low",
+        summary: reason || (decision === "approve" ? "Approved by reviewer" : "Rejected by reviewer"),
+        findings: [],
+        decision,
+      });
     }
 
-    const publishedVer = (meta as any).publishedVersion ?? meta.version;
-
-    // Copy from .published/ to team directory (prefer published snapshot over working copy)
-    if (meta.authorId) {
-      const publishedDir = skillWriter.resolvePublishedDir(meta.authorId, meta.dirName);
-      if (fs.existsSync(publishedDir)) {
-        const teamDir = skillWriter.resolveDir("team", meta.dirName);
-        if (fs.existsSync(teamDir)) {
-          fs.rmSync(teamDir, { recursive: true, force: true });
-        }
-        fs.cpSync(publishedDir, teamDir, { recursive: true });
-      } else {
-        await skillWriter.copyToTeam(meta.authorId, meta.dirName);
+    if (decision === "approve") {
+      // Optimistic concurrency check
+      const clientStagingVersion = params.stagingVersion as number | undefined;
+      const currentStagingVersion = (meta as any).stagingVersion as number;
+      if (clientStagingVersion !== undefined && clientStagingVersion !== currentStagingVersion) {
+        throw new Error("STAGING_VERSION_CONFLICT: Content has changed since you reviewed it. Please reload and review again.");
       }
-    }
 
-    // Find existing team skill with same dirName
-    const allTeam = await skillRepo.list({ scope: "team" });
-    const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
+      // 1. Promote staging → published (DB)
+      if (skillContentRepo) {
+        try {
+          await skillContentRepo.copy(skillId, "staging", "published");
+        } catch {
+          // Fallback: copy from working if staging not in DB
+          await skillContentRepo.copy(skillId, "working", "published");
+        }
+      }
 
-    if (existingTeam) {
-      // UPDATE existing team record — bump team's own version
-      await skillRepo.update(existingTeam.id, {
-        description: meta.description ?? undefined,
-        type: meta.type ?? undefined,
-        teamSourceSkillId: skillId,
-        teamPinnedVersion: publishedVer,
+      // 2. Bump version
+      await skillRepo.bumpVersion(skillId);
+      const updatedMeta = await skillRepo.getById(skillId);
+      const newVersion = updatedMeta?.version ?? (meta.version + 1);
+
+      // 3. Clean up staging (DB)
+      if (skillContentRepo) {
+        await skillContentRepo.delete(skillId, "staging");
+      }
+
+      // 5. Create version record (with content stored inline)
+      if (skillVersionRepo) {
+        const publishedContent = skillContentRepo
+          ? await skillContentRepo.read(skillId, "published")
+          : null;
+        await skillVersionRepo.create({
+          skillId,
+          version: newVersion,
+          commitMessage: `approved v${newVersion}`,
+          authorId: reviewerId,
+          specs: publishedContent?.specs,
+          scriptsJson: publishedContent?.scripts,
+        });
+      }
+
+      // 6. DB update — reviewStatus = "approved"
+      await skillRepo.update(skillId, {
+        reviewStatus: "approved",
+        publishedVersion: newVersion,
+        stagingVersion: 0,
       });
-      await skillRepo.bumpVersion(existingTeam.id);
+
+      // 7. If contributionStatus === "pending", auto-promote to team
+      const contributionStatus = (meta as any).contributionStatus as string;
+      if (contributionStatus === "pending" && meta.authorId) {
+        const publishedVer = newVersion;
+
+        // Copy published content → team skill (DB primary)
+        const allTeam = await skillRepo.list({ scope: "team" });
+        const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
+
+        let teamSkillId: string;
+        if (existingTeam) {
+          teamSkillId = existingTeam.id;
+          await skillRepo.update(existingTeam.id, {
+            description: meta.description ?? undefined,
+            type: meta.type ?? undefined,
+            teamSourceSkillId: skillId,
+            teamPinnedVersion: publishedVer,
+            reviewStatus: "approved",
+            publishedVersion: publishedVer,
+          });
+          await skillRepo.bumpVersion(existingTeam.id);
+        } else {
+          teamSkillId = await skillRepo.create({
+            name: meta.name,
+            description: meta.description ?? undefined,
+            type: meta.type ?? undefined,
+            scope: "team",
+            authorId: meta.authorId ?? undefined,
+            dirName: meta.dirName,
+          });
+          await skillRepo.update(teamSkillId, {
+            teamSourceSkillId: skillId,
+            teamPinnedVersion: publishedVer,
+            reviewStatus: "approved",
+            publishedVersion: publishedVer,
+          });
+        }
+
+        // Copy published content to team skill in DB
+        if (skillContentRepo) {
+          await skillContentRepo.copyToSkill(skillId, teamSkillId, "published", "published");
+        }
+
+        // Mark contribution as approved
+        await skillRepo.update(skillId, { contributionStatus: "approved" });
+
+        // Notify all users (team skill changed)
+        notifyAllSkillReload();
+      } else {
+        // Notify author's AgentBox
+        if (meta.authorId) {
+          notifySkillReload(meta.authorId);
+        }
+      }
     } else {
-      // CREATE new team record
-      const teamId = await skillRepo.create({
-        name: meta.name,
-        description: meta.description ?? undefined,
-        type: meta.type ?? undefined,
-        scope: "team",
-        authorId: meta.authorId ?? undefined,
-        dirName: meta.dirName,
+      // Reject: clean up staging (DB)
+      if (skillContentRepo) {
+        await skillContentRepo.delete(skillId, "staging");
+      }
+
+      // Revert status: draft + contributionStatus = "none"
+      await skillRepo.update(skillId, {
+        reviewStatus: "draft",
+        contributionStatus: "none",
+        stagingVersion: 0,
       });
-      await skillRepo.update(teamId, {
-        teamSourceSkillId: skillId,
-        teamPinnedVersion: publishedVer,
-      });
-    }
-
-    // Update personal skill: mark contribution as approved (scope stays "personal")
-    await skillRepo.update(skillId, {
-      contributionStatus: "approved",
-    });
-
-    // Dismiss reviewer notifications for this skill
-    if (notifRepo) {
-      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
-    }
-
-    // Sync all users' skills and reload
-    await syncAllActiveSkills();
-    notifyAllSkillReload();
-    return { status: "approved" };
-  });
-
-  methods.set("skill.reject", async (params, context: RpcContext) => {
-    await requirePermission(context, "skill_reviewer");
-    const skillId = params.id as string;
-    const reason = (params.reason as string) || undefined;
-
-    if (!skillId) throw new Error("Missing required param: id");
-    if (!skillRepo) throw new Error("Database not available");
-
-    const meta = await skillRepo.getById(skillId);
-    if (!meta) throw new Error("Skill not found");
-
-    await skillRepo.update(skillId, { contributionStatus: "none" });
-
-    // Dismiss reviewer notifications for this skill
-    if (notifRepo) {
-      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
     }
 
     // Notify skill author
     if (notifRepo && meta.authorId) {
+      const isApproved = decision === "approve";
+
+      let title: string;
+      let message: string | undefined;
+
+      if (isApproved) {
+        title = `Your skill "${meta.name}" has been approved and is now active in production`;
+        message = reason || undefined;
+      } else {
+        title = `Your skill "${meta.name}" was rejected`;
+        const parts: string[] = [
+          "You can edit and resubmit.",
+        ];
+        if (reason) parts.push(`\nReason: ${reason}`);
+        message = parts.join("");
+      }
+
       const notifId = await notifRepo.create({
         userId: meta.authorId,
-        type: "contribution_rejected",
-        title: `Your skill "${meta.name}" was not promoted to team`,
-        message: reason,
+        type: isApproved ? "skill_approved" : "skill_rejected",
+        title,
+        message,
         relatedId: skillId,
       });
 
       if (sendToUser) {
         sendToUser(meta.authorId, "notification", {
           id: notifId,
-          type: "contribution_rejected",
-          title: `Your skill "${meta.name}" was not promoted to team`,
-          message: reason ?? null,
+          type: isApproved ? "skill_approved" : "skill_rejected",
+          title,
+          message: message ?? null,
           relatedId: skillId,
           isRead: false,
           createdAt: new Date().toISOString(),
@@ -2200,7 +2063,13 @@ export function createRpcMethods(
       }
     }
 
-    return { status: "rejected" };
+    // Dismiss all reviewer notifications for this skill
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
+
+    return { status: decision === "approve" ? "approved" : "rejected" };
   });
 
   // ─────────────────────────────────────────────────
@@ -2589,10 +2458,7 @@ export function createRpcMethods(
     const sourceSkillId = (meta as any).teamSourceSkillId;
     const sourceSkill = sourceSkillId ? await skillRepo.getById(sourceSkillId) : null;
 
-    // Delete team directory
-    await skillWriter.deleteSkill("team", meta.dirName, {});
-
-    // Delete team DB record (not mutate — the personal record is separate)
+    // Delete team DB record (CASCADE deletes skill_contents)
     await skillRepo.deleteById(skillId);
 
     // Reset contribution status on the personal source skill (if still exists)
@@ -2632,175 +2498,44 @@ export function createRpcMethods(
       }
     }
 
-    // Sync all users' skills (team skill removed) + reload
-    await syncAllActiveSkills();
+    // Notify all users (team skill removed)
     notifyAllSkillReload();
     return { status: "reverted" };
   });
 
   // ─────────────────────────────────────────────────
-  // Skill Script Review Methods
+  // Skill Script Review Methods (legacy — replaced by skill.review above)
   // ─────────────────────────────────────────────────
 
+  // Backward compat: alias skill.reviewDecision → skill.review
   methods.set("skill.reviewDecision", async (params, context: RpcContext) => {
-    const reviewerId = await requirePermission(context, "skill_reviewer");
-    const skillId = params.id as string;
-    const decision = params.decision as "approve" | "reject";
-    const reason = params.reason as string | undefined;
-
-    if (!skillId) throw new Error("Missing required param: id");
-    if (!decision || !["approve", "reject"].includes(decision)) {
-      throw new Error("Missing or invalid param: decision");
-    }
-    if (!skillRepo) throw new Error("Database not available");
-
-    const meta = await skillRepo.getById(skillId);
-    if (!meta) throw new Error("Skill not found");
-
-    // Race protection: ensure skill is still pending review
-    const currentReviewStatus = (meta as any).reviewStatus as string;
-    if (currentReviewStatus !== "pending") {
-      throw new Error("This skill is not pending review");
-    }
-
-    // Record reviewer decision
-    if (skillReviewRepo) {
-      await skillReviewRepo.create({
-        skillId,
-        version: meta.version,
-        reviewerType: "admin",
-        reviewerId,
-        riskLevel: "low",
-        summary: reason || (decision === "approve" ? "Approved by reviewer" : "Rejected by reviewer"),
-        findings: [],
-        decision,
-      });
-    }
-
-    if (decision === "approve") {
-      // Optimistic concurrency check
-      const clientStagingVersion = params.stagingVersion as number | undefined;
-      const currentStagingVersion = (meta as any).stagingVersion as number;
-      if (clientStagingVersion !== undefined && clientStagingVersion !== currentStagingVersion) {
-        throw new Error("STAGING_VERSION_CONFLICT: Content has changed since you reviewed it. Please reload and review again.");
-      }
-
-      // 1. Promote .staging/ → .published/
-      if (meta.authorId) {
-        const stagingDir = skillWriter.resolveStagingDir(meta.authorId, meta.dirName);
-        if (fs.existsSync(stagingDir)) {
-          const publishedDir = skillWriter.resolvePublishedDir(meta.authorId, meta.dirName);
-          if (fs.existsSync(publishedDir)) fs.rmSync(publishedDir, { recursive: true, force: true });
-          fs.cpSync(stagingDir, publishedDir, { recursive: true });
-        } else {
-          // Backward compat: no staging dir → snapshot from working copy
-          await skillWriter.snapshotPublish(meta.authorId, meta.dirName);
-        }
-      }
-
-      // 2. Bump version to avoid unique constraint conflict with existing records
-      await skillRepo.bumpVersion(skillId);
-      const updatedMeta = await skillRepo.getById(skillId);
-      const newVersion = updatedMeta?.version ?? (meta.version + 1);
-
-      // 3. Upload to S3 as versioned snapshot
-      const s3Key = `skills/${skillId}/v${newVersion}/`;
-      if (s3 && meta.authorId) {
-        const publishedDir = skillWriter.resolvePublishedDir(meta.authorId, meta.dirName);
-        await s3.uploadDir(s3Key, publishedDir);
-      }
-
-      // 4. Clean up staging
-      if (meta.authorId) await skillWriter.deleteStaging(meta.authorId, meta.dirName);
-      if (s3) await s3.deleteDir(`skills/${skillId}/staging/`);
-
-      // 5. Create version record
-      if (skillVersionRepo) {
-        await skillVersionRepo.create({
-          skillId,
-          version: newVersion,
-          s3Key,
-          commitMessage: `published v${newVersion}`,
-          authorId: reviewerId,
-        });
-      }
-
-      // 6. DB update
-      await skillRepo.update(skillId, {
-        reviewStatus: "published",
-        publishedVersion: newVersion,
-        stagingVersion: 0,
-      });
-
-      if (meta.authorId) {
-        await syncActiveSkills(meta.authorId);
-        notifySkillReload(meta.authorId);
-      }
-    } else {
-      // Reject: clean up staging
-      if (meta.authorId) await skillWriter.deleteStaging(meta.authorId, meta.dirName);
-      if (s3) await s3.deleteDir(`skills/${skillId}/staging/`);
-
-      // Revert status: keep .published/ if it exists (old prod version stays), else draft
-      const updates: Record<string, unknown> = { stagingVersion: 0 };
-      if (meta.authorId) {
-        const publishedDir = skillWriter.resolvePublishedDir(meta.authorId, meta.dirName);
-        updates.reviewStatus = fs.existsSync(publishedDir) ? "published" : "draft";
-      } else {
-        updates.reviewStatus = "draft";
-      }
-      await skillRepo.update(skillId, updates);
-    }
-
-    // Notify skill author
-    if (notifRepo && meta.authorId) {
-      const isApproved = decision === "approve";
-
-      let title: string;
-      let message: string | undefined;
-
-      if (isApproved) {
-        title = `Your skill "${meta.name}" has been published and is now active in production`;
-        message = reason || undefined;
-      } else {
-        title = `Your skill "${meta.name}" publish request was rejected`;
-        const parts: string[] = [
-          "You can edit and resubmit for publishing.",
-        ];
-        if (reason) parts.push(`\nReason: ${reason}`);
-        message = parts.join("");
-      }
-
-      const notifId = await notifRepo.create({
-        userId: meta.authorId,
-        type: isApproved ? "skill_approved" : "skill_rejected",
-        title,
-        message,
-        relatedId: skillId,
-      });
-
-      if (sendToUser) {
-        sendToUser(meta.authorId, "notification", {
-          id: notifId,
-          type: isApproved ? "skill_approved" : "skill_rejected",
-          title,
-          message: message ?? null,
-          relatedId: skillId,
-          isRead: false,
-          createdAt: new Date().toISOString(),
-        });
-      }
-    }
-
-    // Dismiss all reviewer notifications for this skill (first-come-first-served)
-    if (notifRepo) {
-      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
-      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
-    }
-
-    return { status: decision === "approve" ? "approved" : "rejected" };
+    const handler = methods.get("skill.review")!;
+    return handler(params, context);
   });
 
+  // Backward compat: alias skill.requestPublish → skill.submit
+  methods.set("skill.requestPublish", async (params, context: RpcContext) => {
+    const handler = methods.get("skill.submit")!;
+    return handler(params, context);
+  });
+
+  // Legacy no-ops for removed methods
+  methods.set("skill.publish", async (_params, context: RpcContext) => {
+    requireAuth(context);
+    throw new Error("skill.publish is deprecated. Use skill.submit({ contributeToTeam: true }) instead.");
+  });
+  methods.set("skill.approve", async (_params, context: RpcContext) => {
+    requireAuth(context);
+    throw new Error("skill.approve is deprecated. Use skill.review({ decision: 'approve' }) instead.");
+  });
+  methods.set("skill.reject", async (_params, context: RpcContext) => {
+    requireAuth(context);
+    throw new Error("skill.reject is deprecated. Use skill.review({ decision: 'reject' }) instead.");
+  });
+
+  // --- Old skill.reviewDecision removed, replaced by aliases above ---
+  // The following block is intentionally left as a comment for reference.
+  /* eslint-disable @typescript-eslint/no-unused-vars */
   methods.set("skill.getReview", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillId = params.id as string;
@@ -2822,7 +2557,6 @@ export function createRpcMethods(
 
   methods.set("skill.withdraw", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    const username = context.auth!.username;
     const skillId = params.id as string;
 
     if (!skillId) throw new Error("Missing required param: id");
@@ -2841,16 +2575,18 @@ export function createRpcMethods(
       throw new Error("Nothing to withdraw: skill is not pending");
     }
 
-    // Clean up staging
-    if (meta.authorId) await skillWriter.deleteStaging(meta.authorId, meta.dirName);
-    if (s3) await s3.deleteDir(`skills/${skillId}/staging/`);
+    // Clean up staging (DB)
+    if (skillContentRepo) {
+      await skillContentRepo.delete(skillId, "staging");
+    }
 
-    // Withdraw publish request: revert to published if .published/ exists, else draft
-    const publishedDir = skillWriter.resolvePublishedDir(userId, meta.dirName);
-    const newStatus = fs.existsSync(publishedDir) ? "published" : "draft";
-    await skillRepo.update(skillId, { reviewStatus: newStatus, stagingVersion: 0 });
+    // Withdraw: revert to draft, clear contribution status
+    await skillRepo.update(skillId, {
+      reviewStatus: "draft",
+      contributionStatus: "none",
+      stagingVersion: 0,
+    });
 
-    await syncActiveSkills(userId);
     notifySkillReload(userId);
     return { status: "withdrawn", wasNew: false };
   });
@@ -3501,49 +3237,8 @@ export function createRpcMethods(
   ): Promise<void> {
     const wsDir = path.join(skillsDir, "user", userId, `.ws-${workspaceId}`);
 
-    // For default workspace: mirror existing .skills-prod + .platform-web behavior
-    if (isDefault) {
-      // Ensure the user's active skills are synced first
-      await syncActiveSkills(userId);
-
-      // Clean workspace dir but preserve .credentials/
-      cleanWsDir(wsDir);
-
-      const prodDir = path.join(skillsDir, "user", userId, ".skills-prod");
-      if (fs.existsSync(prodDir)) {
-        // Copy symlinks from .skills-prod into workspace dir
-        for (const entry of fs.readdirSync(prodDir)) {
-          const src = path.join(prodDir, entry);
-          const dest = path.join(wsDir, entry);
-          const target = fs.readlinkSync(src);
-          // Adjust relative target from .ws-{id}/ context
-          const absTarget = path.resolve(prodDir, target);
-          fs.symlinkSync(absTarget, dest);
-        }
-      }
-
-      return;
-    }
-
-    // Custom workspace: only symlink allowed skills
+    // Skills are now delivered via mTLS bundle API — workspace dir only holds credentials
     cleanWsDir(wsDir);
-
-    const allowedSet = new Set(allowedSkills);
-
-    // Scan all available skills and symlink only allowed ones
-    const prodDir = path.join(skillsDir, "user", userId, ".skills-prod");
-    if (fs.existsSync(prodDir) && allowedSkills.length > 0) {
-      for (const entry of fs.readdirSync(prodDir)) {
-        // Check if skill name matches allow-list
-        const skillDir = path.join(prodDir, entry);
-        const name = readSkillName(path.resolve(prodDir, fs.readlinkSync(skillDir))) || entry;
-        if (allowedSet.has(name) || allowedSet.has(entry)) {
-          const absTarget = path.resolve(prodDir, fs.readlinkSync(skillDir));
-          fs.symlinkSync(absTarget, path.join(wsDir, entry));
-        }
-      }
-    }
-
   }
 
   // ─────────────────────────────────────────────────
@@ -3604,7 +3299,6 @@ export function createRpcMethods(
 
     const ALLOWED_SECTIONS: Record<string, string[]> = {
       sso: ["sso.enabled", "sso.issuer", "sso.clientId", "sso.clientSecret", "sso.redirectUri"],
-      s3: ["s3.endpoint", "s3.bucket", "s3.accessKey", "s3.secretKey"],
       system: ["system.baseUrl", "system.platformUrl", "system.agentboxImage"],
     };
 
@@ -3630,30 +3324,14 @@ export function createRpcMethods(
     return { ok: true };
   });
 
-  return { methods, buildCredentialPayload };
-}
-
-/** One-time migration: upload published skill snapshots to S3 */
-async function migrateExistingSkillsToS3(
-  skillRepo: SkillRepository,
-  _skillVersionRepo: SkillVersionRepository,
-  s3: S3Storage,
-  skillWriter: SkillFileWriter,
-): Promise<void> {
-  const allSkills = await skillRepo.list();
-  for (const skill of allSkills) {
-    const pubVer = (skill as any).publishedVersion;
-    if (!pubVer || !skill.authorId) continue;
-
-    const s3Key = `skills/${skill.id}/v${pubVer}/`;
-    const existing = await s3.listKeys(s3Key);
-    if (existing.length > 0) continue; // already migrated
-
-    const publishedDir = skillWriter.resolvePublishedDir(skill.authorId, skill.dirName);
-    if (fs.existsSync(publishedDir)) {
-      await s3.uploadDir(s3Key, publishedDir);
-      console.log(`[rpc] Migrated published skill ${skill.name} to S3`);
-    }
+  /** Build a skill bundle for a given user and environment (used by mTLS bundle API) */
+  async function getSkillBundle(userId: string, env: "prod" | "dev"): Promise<SkillBundle> {
+    if (!skillRepo || !skillContentRepo) throw new Error("Database not available");
+    const disabled = new Set(await skillRepo.listDisabledSkills(userId));
+    return buildSkillBundle(userId, env, skillWriter, skillRepo, skillContentRepo, disabled);
   }
+
+  return { methods, buildCredentialPayload, getSkillBundle };
 }
+
 

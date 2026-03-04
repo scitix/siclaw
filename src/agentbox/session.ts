@@ -21,7 +21,6 @@ import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionMemory } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
-import { S3Storage } from "../lib/s3-storage.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 
 export interface ManagedSession {
@@ -74,16 +73,11 @@ const SESSION_RELEASE_TTL_MS = 30_000;
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private defaultSessionId = "default";
-  private s3: S3Storage | null;
 
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
-
-  constructor() {
-    this.s3 = S3Storage.fromEnv();
-  }
 
   /**
    * Get base session storage directory.
