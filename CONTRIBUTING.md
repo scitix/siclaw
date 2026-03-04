@@ -53,6 +53,38 @@ Key directories:
 - `src/memory/` — Vector + keyword search indexer
 - `skills/` — Diagnostic playbooks (SKILL.md + scripts)
 
+## Commit Convention
+
+This project follows [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <subject>
+
+<body>
+```
+
+**Types:** `feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `perf`, `ci`
+
+**Scope** (optional): the module affected — e.g. `deep-search`, `gateway`, `agentbox`, `tui`, `tools`, `memory`, `skills`
+
+**Rules:**
+- Subject line: imperative mood, lowercase, no period, ≤72 characters
+- Body: explain **why**, not what (the diff shows what). Wrap at 72 characters
+- Reference issues with `Closes #123` or `Fixes #123` in the body
+
+**Examples:**
+
+```
+feat(deep-search): add adaptive budget for quick investigations
+
+fix(gateway): prevent session leak on WebSocket disconnect
+
+refactor(tools): remove blocking gate from DP workflow
+
+The gate mechanism caused state desync between checklist and execution
+when WebSocket connections dropped mid-investigation.
+```
+
 ## Pull Request Guidelines
 
 1. **Fork and branch** — Create a feature branch from `main`
@@ -60,6 +92,39 @@ Key directories:
 3. **Test** — Run `npm test` before submitting
 4. **TypeScript** — The project uses strict TypeScript with ESM modules
 5. **No default exports** — Use named exports throughout
+
+### PR Description Format
+
+Keep it concise — let the code speak. Focus on **why** (the problem) and **what** (the solution), not restating the diff.
+
+```markdown
+## Summary
+
+1-3 sentences: what problem does this solve and how.
+
+### Problem (if not obvious)
+
+Brief description of the issue, with symptoms or user-facing impact.
+
+### Solution
+
+What changed and why this approach was chosen over alternatives.
+
+## Test Plan
+
+- [x] Automated tests that cover the change
+- [ ] Manual verification steps
+```
+
+**Do:**
+- Lead with the problem, not the implementation
+- Call out breaking changes or migration steps explicitly
+- Link related issues (`Closes #123`)
+
+**Don't:**
+- Restate every file change — reviewers can read the diff
+- Add filler sections with no content
+- Write paragraphs when bullets suffice
 
 ## Code Style
 
