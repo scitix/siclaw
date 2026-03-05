@@ -23,6 +23,7 @@ import { SystemConfigRepository } from "./db/repositories/system-config-repo.js"
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { loadMcpServersConfig } from "../core/mcp-client.js";
+import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 
@@ -1133,35 +1134,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             (async () => {
               try {
-                const merged: Record<string, any> = {};
-
-                // 1. Local config/mcp-servers.json as base
                 const localConfig = loadMcpServersConfig(undefined, { localOnly: true });
-                if (localConfig?.mcpServers) {
-                  for (const [name, cfg] of Object.entries(localConfig.mcpServers)) {
-                    merged[name] = cfg;
-                  }
-                }
-
-                // 2. DB overlay (same name overwrites local; disabled removes)
-                if (db) {
-                  const mcpRepo = new McpServerRepository(db);
-                  const rows = await mcpRepo.list();
-                  for (const row of rows) {
-                    if (!row.enabled) {
-                      delete merged[row.name];
-                      continue;
-                    }
-                    const cfg: Record<string, any> = {};
-                    if (row.transport) cfg.transport = row.transport;
-                    if (row.url) cfg.url = row.url;
-                    if (row.command) cfg.command = row.command;
-                    if (row.argsJson) cfg.args = row.argsJson;
-                    if (row.envJson) cfg.env = row.envJson;
-                    if (row.headersJson) cfg.headers = row.headersJson;
-                    merged[row.name] = cfg;
-                  }
-                }
+                const mcpRepo = db ? new McpServerRepository(db) : null;
+                const merged = await buildMergedMcpConfig(localConfig, mcpRepo);
 
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ mcpServers: merged }));

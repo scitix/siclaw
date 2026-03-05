@@ -43,22 +43,24 @@ async function main() {
       reloadConfig();
       console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
 
-      // Fetch MCP config from Gateway and merge with local seed
-      try {
-        const count = await syncMcpFromGateway(gatewayClient);
-        reloadConfig();
-        console.log(`[agentbox] Fetched MCP config from Gateway: ${count} servers`);
-      } catch (mcpErr: any) {
-        console.warn(`[agentbox] Failed to fetch MCP config, retrying in 5s: ${mcpErr.message}`);
-        setTimeout(async () => {
+      // Fetch MCP config from Gateway and merge with local seed (exponential backoff)
+      {
+        const maxRetries = 3;
+        let mcpSynced = false;
+        for (let attempt = 0; attempt < maxRetries && !mcpSynced; attempt++) {
           try {
             const count = await syncMcpFromGateway(gatewayClient);
             reloadConfig();
-            console.log(`[agentbox] MCP config retry succeeded: ${count} servers`);
-          } catch (retryErr: any) {
-            console.warn(`[agentbox] MCP config retry failed: ${retryErr.message}`);
+            console.log(`[agentbox] Fetched MCP config from Gateway: ${count} servers`);
+            mcpSynced = true;
+          } catch (mcpErr: any) {
+            const delay = 1000 * 2 ** attempt; // 1s, 2s, 4s
+            console.warn(`[agentbox] Failed to fetch MCP config (attempt ${attempt + 1}/${maxRetries}): ${mcpErr.message}`);
+            if (attempt < maxRetries - 1) {
+              await new Promise((r) => setTimeout(r, delay));
+            }
           }
-        }, 5000);
+        }
       }
 
       // Fetch and materialize skill bundle (team + personal only; builtin baked in image)

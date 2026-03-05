@@ -27,7 +27,6 @@ import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
-
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
 import { SkillContentRepository, type SkillContentTag } from "./db/repositories/skill-content-repo.js";
 import { ScriptEvaluator } from "./skills/script-evaluator.js";
@@ -780,19 +779,33 @@ export function createRpcMethods(
   // MCP Server Methods
   // ─────────────────────────────────────────────────
 
-  /** Notify all active AgentBoxes to reload MCP config from Gateway (fire-and-forget) */
-  function notifyMcpChange(): void {
+  /** Notify all active AgentBoxes to reload MCP config from Gateway */
+  async function notifyMcpChange(): Promise<void> {
+    const promises: Array<Promise<{ userId: string; boxId: string; result: PromiseSettledResult<any> }>> = [];
     for (const userId of agentBoxManager.activeUserIds()) {
       const handles = agentBoxManager.getForUser(userId);
       for (const handle of handles) {
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-        client.reloadMcp().then((r) => {
-          console.log(`[mcp-notify] Reloaded MCP for ${userId} box=${handle.boxId}: ${r.servers} servers`);
-        }).catch((err) => {
-          console.warn(`[mcp-notify] Failed to notify ${userId} box=${handle.boxId}: ${err.message}`);
-        });
+        promises.push(
+          client.reloadMcp()
+            .then((r) => ({ userId, boxId: handle.boxId, result: { status: "fulfilled" as const, value: r } }))
+            .catch((err) => ({ userId, boxId: handle.boxId, result: { status: "rejected" as const, reason: err } })),
+        );
       }
     }
+    const results = await Promise.all(promises);
+    let success = 0;
+    let failed = 0;
+    for (const { userId, boxId, result } of results) {
+      if (result.status === "fulfilled") {
+        success++;
+        console.log(`[mcp-notify] Reloaded MCP for ${userId} box=${boxId}: ${result.value.servers} servers`);
+      } else {
+        failed++;
+        console.warn(`[mcp-notify] Failed to notify ${userId} box=${boxId}: ${result.reason.message}`);
+      }
+    }
+    console.log(`[mcp-notify] Notification complete: ${success} succeeded, ${failed} failed`);
   }
 
   methods.set("mcp.list", async (_params, context: RpcContext) => {
@@ -866,7 +879,7 @@ export function createRpcMethods(
     });
     console.log(`[mcp-rpc] mcp.create: id=${id}, syncing config...`);
 
-    notifyMcpChange();
+    await notifyMcpChange();
     return { id, name };
   });
 
@@ -890,7 +903,7 @@ export function createRpcMethods(
       description: params.description as string | undefined,
     });
 
-    notifyMcpChange();
+    await notifyMcpChange();
     return { ok: true };
   });
 
@@ -904,7 +917,7 @@ export function createRpcMethods(
     const existing = await mcpRepo.getById(id);
     console.log(`[mcp-rpc] mcp.delete: id=${id}, name=${existing?.name ?? "unknown"}, by=${context.auth?.username}`);
     await mcpRepo.delete(id);
-    notifyMcpChange();
+    await notifyMcpChange();
     return { ok: true };
   });
 
@@ -921,7 +934,7 @@ export function createRpcMethods(
     const newEnabled = !server.enabled;
     console.log(`[mcp-rpc] mcp.toggle: ${server.name} ${server.enabled} → ${newEnabled}, by=${context.auth?.username}`);
     await mcpRepo.update(id, { enabled: newEnabled });
-    notifyMcpChange();
+    await notifyMcpChange();
     return { id, enabled: newEnabled };
   });
 
