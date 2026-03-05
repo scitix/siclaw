@@ -92,21 +92,13 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
     }, [sendRpc]);
 
     const publishSkill = useCallback(async (skill: Skill, contributeToTeam?: boolean) => {
-        try {
-            await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam });
-            await loadSkills();
-        } catch (err) {
-            console.error('[useSkills] publishSkill failed:', err);
-        }
+        await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam });
+        await loadSkills();
     }, [sendRpc, loadSkills]);
 
     const requestPublish = useCallback(async (skill: Skill) => {
-        try {
-            await rpcRequestPublish(sendRpc, String(skill.id));
-            await loadSkills();
-        } catch (err) {
-            console.error('[useSkills] requestPublish failed:', err);
-        }
+        await rpcRequestPublish(sendRpc, String(skill.id));
+        await loadSkills();
     }, [sendRpc, loadSkills]);
 
     const approveSkill = useCallback(async (skill: Skill) => {

@@ -102,6 +102,7 @@ export const skills = mysqlTable("skills", {
   teamSourceSkillId: varchar("team_source_skill_id", { length: 64 }),
   teamPinnedVersion: int("team_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
+  labelsJson: json("labels_json").$type<string[]>(),
 });
 
 // ─── Skill Contents ─────────────────────────────────
