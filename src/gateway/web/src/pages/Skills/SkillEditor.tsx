@@ -10,7 +10,7 @@ import 'prismjs/components/prism-bash';
 import 'prismjs/themes/prism-dark.css';
 import { useParams, useNavigate, useSearchParams, useBlocker } from 'react-router-dom';
 import type { Skill, Script } from './skillsData';
-import { rpcGetSkillById, rpcSaveSkill, rpcDeleteSkill, rpcCopySkillToPersonal, rpcGetSkillHistory, rpcRollbackSkill } from './skillsData';
+import { rpcGetSkillById, rpcSaveSkill, rpcDeleteSkill, rpcCopySkillToPersonal, rpcGetSkillHistory, rpcRollbackSkill, rpcUpdateSkillLabels } from './skillsData';
 import { getCurrentUser } from '../../auth';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -286,7 +286,8 @@ export function SkillEditor() {
     }, [isDirty]);
 
     // --- React Router leave protection ---
-    const blocker = useBlocker(isDirty);
+    const isSaveNavigatingRef = useRef(false);
+    const blocker = useBlocker(() => isDirty && !isSaveNavigatingRef.current);
 
     // --- Draft restore handlers ---
     const handleDiscardDraft = useCallback(() => {
@@ -308,6 +309,7 @@ export function SkillEditor() {
             await rpcSaveSkill(sendRpc, formData, isNew);
             if (id) clearDraft(id);
             setServerData(formData); // Mark current state as "saved" so isDirty becomes false
+            isSaveNavigatingRef.current = true;
             navigate('/skills');
         } catch (err) {
             console.error('[SkillEditor] Save failed:', err);
@@ -326,7 +328,7 @@ export function SkillEditor() {
         try {
             await rpcDeleteSkill(sendRpc, String(formData.id));
             if (id) clearDraft(id);
-            setServerData(formData); // Prevent blocker from firing during navigate
+            isSaveNavigatingRef.current = true;
             navigate('/skills');
         } catch (err) {
             console.error('[SkillEditor] Delete failed:', err);
@@ -569,6 +571,13 @@ export function SkillEditor() {
                     <span className="text-sm text-amber-800 font-medium">This skill is pending publish review. Test environment has the latest version.</span>
                 </div>
             )}
+            {formData.reviewStatus === 'approved' && formData.scope === 'personal' && formData.publishedVersion != null
+                && Number(String(formData.version).replace(/^v/, '')) > formData.publishedVersion && (
+                <div className="px-6 py-2.5 bg-blue-50 border-b border-blue-200 flex items-center gap-2 shrink-0">
+                    <FileCode className="w-4 h-4 text-blue-500" />
+                    <span className="text-sm text-blue-800 font-medium">Modified since published v{formData.publishedVersion}. Submit for review to publish changes to production.</span>
+                </div>
+            )}
             {formData.reviewStatus === 'draft' && formData.scope === 'personal' && (
                 <div className="px-6 py-2.5 bg-gray-50 border-b border-gray-200 flex items-center gap-2 shrink-0">
                     <ShieldAlert className="w-4 h-4 text-gray-400" />
@@ -661,22 +670,54 @@ export function SkillEditor() {
                             </div>
                         </div>
 
-                        {/* Labels (read-only) */}
-                        {formData.labels && formData.labels.length > 0 ? (
-                            <div>
-                                <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 block">Labels</label>
-                                <div className="flex flex-wrap gap-1">
-                                    {formData.labels.map(label => (
-                                        <span
-                                            key={label}
-                                            className="px-1.5 py-0.5 rounded text-[10px] font-medium border bg-gray-50 text-gray-600 border-gray-200"
-                                        >
-                                            {label}
-                                        </span>
-                                    ))}
-                                </div>
+                        {/* Labels */}
+                        <div>
+                            <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 block">Labels</label>
+                            <div className="flex flex-wrap gap-1.5 items-center">
+                                {(formData.labels ?? []).map(lbl => (
+                                    <span
+                                        key={lbl}
+                                        className={cn(
+                                            "px-1.5 py-0.5 rounded text-[10px] font-medium border bg-gray-50 text-gray-600 border-gray-200 inline-flex items-center gap-1",
+                                            !isReadOnly && "pr-0.5"
+                                        )}
+                                    >
+                                        {lbl}
+                                        {!isReadOnly && (
+                                            <button
+                                                onClick={() => {
+                                                    const next = (formData.labels ?? []).filter(l => l !== lbl);
+                                                    setFormData({ ...formData, labels: next });
+                                                    if (!isNew) rpcUpdateSkillLabels(sendRpc, String(formData.id), next).catch(() => {});
+                                                }}
+                                                className="ml-0.5 p-0.5 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600 transition-colors"
+                                            >
+                                                <X className="w-2.5 h-2.5" />
+                                            </button>
+                                        )}
+                                    </span>
+                                ))}
+                                {!isReadOnly && (
+                                    <input
+                                        type="text"
+                                        placeholder="+ Add label"
+                                        className="text-[11px] px-1.5 py-0.5 border border-transparent rounded bg-transparent text-gray-500 outline-none w-20 focus:border-gray-200 focus:bg-white placeholder:text-gray-300"
+                                        onKeyDown={(e) => {
+                                            if (e.key === 'Enter' || e.key === ',') {
+                                                e.preventDefault();
+                                                const val = (e.target as HTMLInputElement).value.trim();
+                                                if (val && !(formData.labels ?? []).includes(val)) {
+                                                    const next = [...(formData.labels ?? []), val];
+                                                    setFormData({ ...formData, labels: next });
+                                                    if (!isNew) rpcUpdateSkillLabels(sendRpc, String(formData.id), next).catch(() => {});
+                                                }
+                                                (e.target as HTMLInputElement).value = '';
+                                            }
+                                        }}
+                                    />
+                                )}
                             </div>
-                        ) : null}
+                        </div>
 
                         <div className="flex-1 flex flex-col min-h-[400px]">
                             <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 flex justify-between group px-1">
