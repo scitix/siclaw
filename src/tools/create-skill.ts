@@ -8,6 +8,7 @@ interface CreateSkillParams {
   type?: string;
   specs: string;
   scripts?: Array<{ name: string; content?: string }>;
+  labels?: string[];
 }
 
 export function createCreateSkillTool(): ToolDefinition {
@@ -125,6 +126,9 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
           { description: "Optional helper scripts for the skill. For user-uploaded scripts, just provide the name — the server will copy it from uploads automatically." }
         )
       ),
+      labels: Type.Optional(
+        Type.Array(Type.String(), { description: "Labels/tags for the skill (e.g. ['gpu', 'network', 'monitoring'])" })
+      ),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as CreateSkillParams;
@@ -160,6 +164,7 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
       }
 
       const hasScripts = params.scripts && params.scripts.length > 0;
+      const labels = params.labels?.map(l => l.trim()).filter(Boolean);
       const result = {
         skill: {
           name: params.name.trim(),
@@ -170,6 +175,7 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
             name: s.name,
             content: s.content,
           })) || [],
+          labels: labels && labels.length > 0 ? labels : undefined,
         },
         summary: `Created skill definition '${params.name.trim()}'. Please review and click Save.`
           + (hasScripts ? ' This skill has scripts and will require admin approval after saving. Do NOT attempt to test or run it until approved.' : ''),

@@ -1731,6 +1731,12 @@ export function createRpcMethods(
     if (params.description !== undefined)
       updates.description = params.description;
     if (params.type) updates.type = params.type;
+    if (params.labels !== undefined) {
+      const cleaned = Array.isArray(params.labels)
+        ? (params.labels as string[]).map(l => l.trim()).filter(Boolean)
+        : null;
+      updates.labels = cleaned && cleaned.length > 0 ? cleaned : null;
+    }
 
     // Staging model: user can freely edit working copy while pending — staging is unaffected
 
