@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { skillExistsInBundle } from "./script-resolver.js";
 
 interface UpdateSkillParams {
   id?: string;
@@ -8,6 +9,7 @@ interface UpdateSkillParams {
   type?: string;
   specs: string;
   scripts?: Array<{ name: string; content?: string }>;
+  labels?: string[];
 }
 
 export function createUpdateSkillTool(): ToolDefinition {
@@ -117,6 +119,9 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
           },
         ),
       ),
+      labels: Type.Optional(
+        Type.Array(Type.String(), { description: "Labels/tags for the skill (e.g. ['gpu', 'network', 'monitoring'])" })
+      ),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as UpdateSkillParams;
@@ -146,7 +151,25 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
         };
       }
 
+      const skillName = params.name.trim();
+
+      // Reject if the target skill doesn't exist in the bundle (personal/team)
+      if (!skillExistsInBundle(skillName)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: `Skill '${skillName}' not found. Cannot update a skill that doesn't exist. Use 'create_skill' to create a new skill, or check the skill name.`,
+              }),
+            },
+          ],
+          details: { error: true },
+        };
+      }
+
       const hasScripts = params.scripts && params.scripts.length > 0;
+      const labels = params.labels?.map(l => l.trim()).filter(Boolean);
       const result = {
         skillId: params.id?.trim() || "",
         skill: {
@@ -159,6 +182,7 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
               name: s.name,
               content: s.content,
             })) || [],
+          labels: labels && labels.length > 0 ? labels : undefined,
         },
         summary: `Updated skill definition '${params.name.trim()}'. Please review and click Update.`
           + (hasScripts ? ' Script changes will be staged for admin review. The old version remains active until approved. Do NOT attempt to test the new version until approved.' : ''),

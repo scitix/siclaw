@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -19,13 +19,13 @@ export const Tooltip: React.FC<TooltipProps> = ({
     const triggerRef = useRef<HTMLDivElement>(null);
     const [coords, setCoords] = useState({ top: 0, left: 0 });
 
-    useEffect(() => {
-        if (isVisible && triggerRef.current) {
+    const handleMouseEnter = useCallback(() => {
+        if (triggerRef.current) {
             const rect = triggerRef.current.getBoundingClientRect();
             let top = 0;
             let left = 0;
 
-            const offset = 8; // gap between element and tooltip
+            const offset = 8;
 
             switch (position) {
                 case 'top':
@@ -48,14 +48,15 @@ export const Tooltip: React.FC<TooltipProps> = ({
 
             setCoords({ top, left });
         }
-    }, [isVisible, position]);
+        setIsVisible(true);
+    }, [position]);
 
     return (
         <>
             <div
                 ref={triggerRef}
                 className="relative flex items-center"
-                onMouseEnter={() => setIsVisible(true)}
+                onMouseEnter={handleMouseEnter}
                 onMouseLeave={() => setIsVisible(false)}
             >
                 {children}

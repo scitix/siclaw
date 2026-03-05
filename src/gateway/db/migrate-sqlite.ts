@@ -61,18 +61,19 @@ const DDL_STATEMENTS = [
     version INTEGER NOT NULL DEFAULT 1,
     published_version INTEGER,
     staging_version INTEGER NOT NULL DEFAULT 0,
-    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('core', 'team', 'personal')),
+    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal')),
     author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
     status TEXT DEFAULT 'installed',
     contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
-    review_status TEXT NOT NULL DEFAULT 'draft' CHECK(review_status IN ('draft', 'published', 'pending')),
+    review_status TEXT NOT NULL DEFAULT 'draft' CHECK(review_status IN ('draft', 'approved', 'pending')),
     dir_name TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     s3_key TEXT,
     team_source_skill_id TEXT,
     team_pinned_version INTEGER,
-    forked_from_id TEXT
+    forked_from_id TEXT,
+    labels_json TEXT
   )`,
 
   `CREATE TABLE IF NOT EXISTS channels (
