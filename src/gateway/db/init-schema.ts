@@ -77,6 +77,7 @@ const DDL_STATEMENTS = [
     team_source_skill_id VARCHAR(64) NULL,
     team_pinned_version INT NULL,
     forked_from_id VARCHAR(64) NULL,
+    labels_json JSON NULL,
     FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL
   )`,
 
@@ -385,6 +386,7 @@ export async function initSchema(db: Database): Promise<void> {
     // skills: fix enum values from old schema
     `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal') NOT NULL DEFAULT 'personal'`,
     `ALTER TABLE skills MODIFY COLUMN review_status ENUM('draft','pending','approved') NOT NULL DEFAULT 'draft'`,
+    `ALTER TABLE skills ADD COLUMN labels_json JSON NULL`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

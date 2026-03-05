@@ -1255,11 +1255,19 @@ export function createRpcMethods(
         }
       }
 
-      // Attach enabled field to DB skills
-      dbResult.skills = dbResult.skills.map((s: any) => ({
-        ...s,
-        enabled: !disabled.has(s.name),
-      }));
+      // Attach enabled field and labels to DB skills
+      dbResult.skills = dbResult.skills.map((s: any) => {
+        // Merge DB labels with filesystem labels (e.g. team meta.json)
+        const fsLabels = getLabelsForSkill(`${s.scope}:${s.dirName}`);
+        const dbLabels: string[] = s.labelsJson ?? [];
+        const merged = [...new Set([...dbLabels, ...fsLabels])];
+        const { labelsJson: _, ...rest } = s;
+        return {
+          ...rest,
+          labels: filterLabels(merged.length > 0 ? merged : undefined),
+          enabled: !disabled.has(s.name),
+        };
+      });
     }
 
     return {
@@ -1286,6 +1294,32 @@ export function createRpcMethods(
     notifySkillReload(userId);
 
     return { name, enabled };
+  });
+
+  methods.set("skill.updateLabels", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const skillId = params.id as string;
+    const labels = params.labels as string[];
+
+    if (!skillId) throw new Error("Missing required param: id");
+    if (!Array.isArray(labels)) throw new Error("Missing required param: labels (array)");
+    if (!skillRepo) throw new Error("Database not available");
+
+    const meta = await skillRepo.getById(skillId);
+    if (!meta) throw new Error("Skill not found");
+
+    // Permission: personal = owner, team = admin
+    if (meta.scope === "builtin") throw new Error("Cannot edit builtin skill labels");
+    if (meta.scope === "team") requireAdmin(context);
+    if (meta.scope === "personal" && meta.authorId !== userId) {
+      throw new Error("Forbidden: you can only edit your own skill labels");
+    }
+
+    // Sanitize: trim, dedupe, remove empty
+    const cleaned = [...new Set(labels.map(l => l.trim()).filter(Boolean))];
+    await skillRepo.update(skillId, { labels: cleaned.length > 0 ? cleaned : null });
+
+    return { id: skillId, labels: cleaned };
   });
 
   methods.set("skill.get", async (params, context: RpcContext) => {
@@ -1367,8 +1401,15 @@ export function createRpcMethods(
       publishedFiles = await skillContentRepo.read(meta.id, "published");
     }
 
+    // Merge DB labels with filesystem labels
+    const fsLabels = getLabelsForSkill(`${meta.scope}:${meta.dirName}`);
+    const dbLabels: string[] = (meta as any).labelsJson ?? [];
+    const mergedLabels = [...new Set([...dbLabels, ...fsLabels])];
+    const { labelsJson: _lj, ...metaRest } = meta as any;
+
     return {
-      ...meta,
+      ...metaRest,
+      labels: mergedLabels.length > 0 ? mergedLabels : undefined,
       files,
       latestReview,
       publishedFiles,
@@ -1470,6 +1511,8 @@ export function createRpcMethods(
     }
 
     // Save metadata to DB
+    const rawLabels = params.labels as string[] | undefined;
+    const labels = rawLabels?.map(l => l.trim()).filter(Boolean);
     const id = await skillRepo.create({
       name,
       description,
@@ -1479,6 +1522,7 @@ export function createRpcMethods(
       dirName,
       forkedFromId: forkedFromId ?? undefined,
       version: inheritVersion,
+      labels: labels && labels.length > 0 ? labels : undefined,
     });
 
     // Save content to DB
@@ -2080,6 +2124,7 @@ export function createRpcMethods(
 
       // 7. If contributionStatus === "pending", auto-promote to team
       const contributionStatus = (meta as any).contributionStatus as string;
+      console.log(`[skill.review] contributionStatus="${contributionStatus}" authorId="${meta.authorId}" — promote=${contributionStatus === "pending" && !!meta.authorId}`);
       if (contributionStatus === "pending" && meta.authorId) {
         const publishedVer = newVersion;
 
@@ -2090,6 +2135,7 @@ export function createRpcMethods(
         let teamSkillId: string;
         if (existingTeam) {
           teamSkillId = existingTeam.id;
+          console.log(`[skill.review] Updating existing team skill ${teamSkillId} (dirName=${meta.dirName})`);
           await skillRepo.update(existingTeam.id, {
             description: meta.description ?? undefined,
             type: meta.type ?? undefined,
@@ -2100,6 +2146,7 @@ export function createRpcMethods(
           });
           await skillRepo.bumpVersion(existingTeam.id);
         } else {
+          console.log(`[skill.review] Creating new team skill for dirName=${meta.dirName}`);
           teamSkillId = await skillRepo.create({
             name: meta.name,
             description: meta.description ?? undefined,
@@ -2119,12 +2166,14 @@ export function createRpcMethods(
         // Copy published content to team skill in DB
         if (skillContentRepo) {
           await skillContentRepo.copyToSkill(skillId, teamSkillId, "published", "published");
+          console.log(`[skill.review] Copied published content from ${skillId} → team skill ${teamSkillId}`);
         }
 
         // Mark contribution as approved
         await skillRepo.update(skillId, { contributionStatus: "approved" });
 
         // Notify all users (team skill changed)
+        console.log(`[skill.review] Contribution promoted to team successfully. Team skill id=${teamSkillId}`);
         notifyAllSkillReload();
       } else {
         // Notify author's AgentBox

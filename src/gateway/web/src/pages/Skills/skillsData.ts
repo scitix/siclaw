@@ -138,6 +138,7 @@ export async function rpcSaveSkill(
             type: skill.type,
             specs: skill.specs,
             scripts,
+            labels: skill.labels,
         });
     } else {
         await sendRpc('skill.update', {
@@ -236,6 +237,10 @@ export interface LabelInfo {
 export async function rpcListLabels(sendRpc: RpcSendFn): Promise<LabelInfo[]> {
     const result = await sendRpc<{ labels: LabelInfo[] }>('label.list');
     return result.labels ?? [];
+}
+
+export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, labels: string[]): Promise<{ id: string; labels: string[] }> {
+    return sendRpc('skill.updateLabels', { id, labels });
 }
 
 /** Fork a builtin/team skill to personal scope (server-side content copy) */
