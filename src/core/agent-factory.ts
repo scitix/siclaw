@@ -28,6 +28,7 @@ import { createPodNsenterExecTool } from "../tools/pod-nsenter-exec.js";
 import { createCreateSkillTool } from "../tools/create-skill.js";
 import { createRunSkillTool } from "../tools/run-skill.js";
 import { createUpdateSkillTool } from "../tools/update-skill.js";
+import { createForkSkillTool } from "../tools/fork-skill.js";
 import { createManageScheduleTool } from "../tools/manage-schedule.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
 import {
@@ -146,7 +147,7 @@ function buildAppendSystemPrompt(
     // Platform skills (create-skill, update-skill, manage-skill) are excluded —
     // they are internal agent guides, not user-facing skills.
   } else {
-    const SKILL_SCOPES = ["core", "team", "user"];
+    const SKILL_SCOPES = ["user", "team", "core"];
     for (const scope of SKILL_SCOPES) {
       const scopeDir = path.join(skillsBase, scope);
       if (fs.existsSync(scopeDir)) {
@@ -350,6 +351,7 @@ export async function createSiclawSession(
   if (mode === "web" || mode === "cli") {
     customTools.push(createCreateSkillTool());
     customTools.push(createUpdateSkillTool());
+    customTools.push(createForkSkillTool());
   }
   // -- MCP external tools --
   const cwd = process.cwd();
@@ -489,7 +491,8 @@ export async function createSiclawSession(
     }
   }
 
-  const skillsDirs = [...builtinPaths, skillsBase];
+  // Priority: team/personal (skillsBase) > builtin — higher-specificity scopes first
+  const skillsDirs = [skillsBase, ...builtinPaths];
 
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};

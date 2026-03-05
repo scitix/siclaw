@@ -1,4 +1,4 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, Copy, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, Copy, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -235,10 +235,10 @@ export function SkillsPage() {
         e.stopPropagation();
         setDialogState({
             isOpen: true,
-            title: 'Copy to Personal',
-            description: `This will create a personal copy of "${skill.name}" that you can edit and customize.`,
+            title: 'Fork to Personal',
+            description: `This will fork "${skill.name}" into your personal skills. You can edit and customize the fork, and optionally contribute changes back to the team.`,
             variant: 'primary',
-            confirmText: 'Copy Skill',
+            confirmText: 'Fork Skill',
             onConfirm: () => { copyToPersonal(skill); }
         });
     };
@@ -728,48 +728,27 @@ export function SkillsPage() {
                                             </Tooltip>
                                         )}
 
-                                        {skill.scope === 'personal' && (
-                                            <Tooltip content="Delete Skill">
-                                                <button
-                                                    onClick={(e) => handleDelete(e, skill)}
-                                                    className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                                >
-                                                    <Trash2 className="w-4 h-4" />
-                                                </button>
-                                            </Tooltip>
-                                        )}
-
                                         {skill.scope !== 'personal' && (
-                                            <Tooltip content="Copy to Personal">
+                                            <Tooltip content="Fork to Personal">
                                                 <button
                                                     onClick={(e) => handleCopy(e, skill)}
                                                     className="p-1.5 text-gray-400 hover:text-purple-600 hover:bg-purple-50 rounded-lg transition-colors"
                                                 >
-                                                    <Copy className="w-4 h-4" />
+                                                    <GitFork className="w-4 h-4" />
                                                 </button>
                                             </Tooltip>
                                         )}
 
                                         {/* Admin actions for team skills */}
                                         {isAdmin && skill.scope === 'team' && (
-                                            <>
-                                                <Tooltip content="Revert to Personal">
-                                                    <button
-                                                        onClick={(e) => handleRevert(e, skill)}
-                                                        className="p-1.5 text-gray-400 hover:text-orange-600 hover:bg-orange-50 rounded-lg transition-colors"
-                                                    >
-                                                        <Undo2 className="w-4 h-4" />
-                                                    </button>
-                                                </Tooltip>
-                                                <Tooltip content="Delete Skill">
-                                                    <button
-                                                        onClick={(e) => handleDelete(e, skill)}
-                                                        className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                                    >
-                                                        <Trash2 className="w-4 h-4" />
-                                                    </button>
-                                                </Tooltip>
-                                            </>
+                                            <Tooltip content="Revert to Personal">
+                                                <button
+                                                    onClick={(e) => handleRevert(e, skill)}
+                                                    className="p-1.5 text-gray-400 hover:text-orange-600 hover:bg-orange-50 rounded-lg transition-colors"
+                                                >
+                                                    <Undo2 className="w-4 h-4" />
+                                                </button>
+                                            </Tooltip>
                                         )}
 
                                         {(skill.scope === 'personal' || (isAdmin && skill.scope === 'team')) && (
@@ -791,6 +770,17 @@ export function SkillsPage() {
                                                 {skill.scope === 'personal' ? <Settings className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                                             </button>
                                         </Tooltip>
+
+                                        {(skill.scope === 'personal' || (isAdmin && skill.scope === 'team')) && (
+                                            <Tooltip content="Delete Skill">
+                                                <button
+                                                    onClick={(e) => handleDelete(e, skill)}
+                                                    className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                                >
+                                                    <Trash2 className="w-4 h-4" />
+                                                </button>
+                                            </Tooltip>
+                                        )}
                                     </div>
                                 </div>
                             </div>

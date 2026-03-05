@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { skillExistsInBundle, skillExistsAsBuiltin } from "./script-resolver.js";
 
 interface CreateSkillParams {
   name: string;
@@ -138,6 +139,22 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
       if (!params.specs?.trim()) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: "Skill specs (SKILL.md content) is required." }) }],
+          details: { error: true },
+        };
+      }
+
+      const skillName = params.name.trim();
+
+      // Reject if a skill with the same name already exists
+      if (skillExistsInBundle(skillName)) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `A skill named '${skillName}' already exists (personal or team). Use 'update_skill' to modify it, or 'fork_skill' to fork a builtin/team skill.` }) }],
+          details: { error: true },
+        };
+      }
+      if (skillExistsAsBuiltin(skillName)) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `A builtin skill named '${skillName}' already exists. Use 'fork_skill' to fork it into a personal copy with modifications.` }) }],
           details: { error: true },
         };
       }

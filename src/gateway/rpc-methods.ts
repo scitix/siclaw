@@ -1494,6 +1494,129 @@ export function createRpcMethods(
     };
   });
 
+  // ─── skill.fork ─────────────────────────────────────
+  // Server-side fork: reads source content, creates personal copy.
+  // Accepts optional overrides for specs/scripts (used by Pilot auto-fork).
+  methods.set("skill.fork", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+
+    const sourceId = params.sourceId as string;
+    if (!sourceId) throw new Error("Missing required param: sourceId");
+
+    if (!skillRepo) throw new Error("Database not available");
+
+    // ── 1. Resolve source skill metadata + content ──
+    let sourceName: string;
+    let sourceDescription: string | undefined;
+    let sourceType: string | undefined;
+    let sourceFiles: SkillFiles | null = null;
+    let sourceDirName: string;
+    let sourceScope: string;
+
+    if (sourceId.startsWith("builtin:") || sourceId.startsWith("core:") || sourceId.startsWith("extension:")) {
+      // Builtin skill — read from filesystem
+      sourceDirName = sourceId.includes(":") ? sourceId.split(":")[1] : sourceId;
+      sourceFiles = skillWriter.readSkill("builtin", sourceDirName);
+      if (!sourceFiles) throw new Error(`Source skill not found: ${sourceId}`);
+      const parsed = skillWriter.parseFrontmatter(sourceFiles.specs || "");
+      sourceName = parsed.name || sourceDirName;
+      sourceDescription = parsed.description || undefined;
+      sourceType = "Custom";
+      sourceScope = "builtin";
+    } else {
+      // DB skill (team or personal)
+      const sourceMeta = await skillRepo.getById(sourceId);
+      if (!sourceMeta) throw new Error(`Source skill not found: ${sourceId}`);
+      if (sourceMeta.scope === "personal") {
+        throw new Error("Cannot fork personal skills. Only builtin and team skills can be forked.");
+      }
+      sourceName = sourceMeta.name;
+      sourceDescription = sourceMeta.description ?? undefined;
+      sourceType = sourceMeta.type ?? undefined;
+      sourceDirName = sourceMeta.dirName;
+      sourceScope = sourceMeta.scope;
+
+      if (skillContentRepo) {
+        const tag = sourceMeta.scope === "team" ? "published" : "working";
+        sourceFiles = await skillContentRepo.read(sourceMeta.id, tag as SkillContentTag);
+      }
+    }
+
+    // ── 2. Apply optional overrides ──
+    const effectiveName = (params.name as string)?.trim() || sourceName;
+    const effectiveDescription = (params.description as string) ?? sourceDescription;
+    const effectiveType = (params.type as string) ?? sourceType;
+    const effectiveSpecs = (params.specs as string) ?? sourceFiles?.specs;
+    const rawScripts = params.scripts as Array<{ name: string; content?: string }> | undefined;
+    const effectiveScripts = rawScripts
+      ? rawScripts.map(s => ({
+          name: s.name,
+          content: s.content ?? sourceFiles?.scripts?.find(ss => ss.name === s.name)?.content ?? "",
+        }))
+      : sourceFiles?.scripts;
+
+    // ── 3. Generate dirName and check for duplicates ──
+    const dirName = effectiveName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+
+    const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
+    const duplicate = existingResult.skills.find(
+      (s: any) => s.dirName === dirName && s.scope === "personal" && s.authorId === userId,
+    );
+    if (duplicate) {
+      throw new Error(
+        `A personal skill named "${effectiveName}" already exists (id: ${duplicate.id}). ` +
+        `Delete it first if you want to re-fork.`,
+      );
+    }
+
+    // Clean up residual directory
+    const residualDir = skillWriter.resolveDir("personal", dirName, userId);
+    if (fs.existsSync(residualDir)) {
+      fs.rmSync(residualDir, { recursive: true, force: true });
+    }
+
+    // ── 4. Resolve version from source ──
+    let inheritVersion = 1;
+    if (sourceScope !== "builtin" && skillRepo) {
+      const source = await skillRepo.getById(sourceId);
+      if (source) inheritVersion = source.version;
+    }
+
+    // ── 5. Create personal skill ──
+    const id = await skillRepo.create({
+      name: effectiveName,
+      description: effectiveDescription,
+      type: effectiveType,
+      scope: "personal",
+      authorId: userId,
+      dirName,
+      forkedFromId: sourceId,
+      version: inheritVersion,
+    });
+
+    // ── 6. Save content ──
+    if (skillContentRepo) {
+      await skillContentRepo.save(id, "working", {
+        specs: effectiveSpecs,
+        scripts: effectiveScripts,
+      });
+    }
+
+    const hasScripts = effectiveScripts && effectiveScripts.length > 0;
+    notifySkillReload(userId);
+    return {
+      id,
+      dirName,
+      name: effectiveName,
+      forkedFromId: sourceId,
+      reviewStatus: "draft" as const,
+      hasScripts,
+    };
+  });
+
   methods.set("skill.update", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const username = context.auth!.username;

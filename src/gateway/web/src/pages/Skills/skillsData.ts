@@ -238,19 +238,16 @@ export async function rpcListLabels(sendRpc: RpcSendFn): Promise<LabelInfo[]> {
     return result.labels ?? [];
 }
 
-/** Fetch a core/team skill's full data and create a personal copy */
-export async function rpcCopySkillToPersonal(sendRpc: RpcSendFn, id: string): Promise<{ id: string }> {
-    const skill = await rpcGetSkillById(sendRpc, id);
-    if (!skill) throw new Error('Skill not found');
+/** Fork a builtin/team skill to personal scope (server-side content copy) */
+export async function rpcForkSkill(
+    sendRpc: RpcSendFn,
+    sourceId: string,
+    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }> },
+): Promise<{ id: string; dirName: string; name: string; forkedFromId: string }> {
+    return sendRpc('skill.fork', { sourceId, ...overrides });
+}
 
-    const scripts = skill.scripts?.map(s => ({ name: s.name, content: s.content }));
-    const result = await sendRpc<{ id: string }>('skill.create', {
-        name: skill.name,
-        description: skill.description,
-        type: skill.type,
-        specs: skill.specs,
-        scripts,
-        forkedFromId: String(id),
-    });
-    return result;
+/** @deprecated Use rpcForkSkill instead */
+export async function rpcCopySkillToPersonal(sendRpc: RpcSendFn, id: string): Promise<{ id: string }> {
+    return rpcForkSkill(sendRpc, String(id));
 }

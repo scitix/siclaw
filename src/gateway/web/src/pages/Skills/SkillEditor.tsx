@@ -1,4 +1,4 @@
-import { X, Terminal, Plus, Trash2, Code2, Loader2, FileUp, FileCode, ArrowLeft, Save, LayoutTemplate, ChevronDown, Copy, Lock, Users, Eye, ShieldAlert, History, RotateCcw } from 'lucide-react';
+import { X, Terminal, Plus, Trash2, Code2, Loader2, FileUp, FileCode, ArrowLeft, Save, LayoutTemplate, ChevronDown, GitFork, Lock, Users, Eye, ShieldAlert, History, RotateCcw } from 'lucide-react';
 import { Tooltip } from '../../components/Tooltip';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
@@ -515,19 +515,11 @@ export function SkillEditor() {
                                 disabled={isCopying}
                                 className="p-2 text-purple-600 hover:bg-purple-50 rounded-lg transition-colors disabled:opacity-50"
                             >
-                                {isCopying ? <Loader2 className="w-5 h-5 animate-spin" /> : <Copy className="w-5 h-5" />}
+                                {isCopying ? <Loader2 className="w-5 h-5 animate-spin" /> : <GitFork className="w-5 h-5" />}
                             </button>
                         </Tooltip>
                     ) : (
                         <>
-                            <Tooltip content="Delete Skill">
-                                <button
-                                    onClick={handleDeleteClick}
-                                    className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                                >
-                                    <Trash2 className="w-5 h-5" />
-                                </button>
-                            </Tooltip>
                             <Tooltip content={isSaving ? "Saving..." : "Save Changes"}>
                                 <button
                                     onClick={handleSave}
@@ -535,6 +527,14 @@ export function SkillEditor() {
                                     className="p-2 text-primary-600 hover:bg-primary-50 rounded-lg transition-colors disabled:opacity-50"
                                 >
                                     {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : <Save className="w-5 h-5" />}
+                                </button>
+                            </Tooltip>
+                            <Tooltip content="Delete Skill">
+                                <button
+                                    onClick={handleDeleteClick}
+                                    className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                                >
+                                    <Trash2 className="w-5 h-5" />
                                 </button>
                             </Tooltip>
                         </>

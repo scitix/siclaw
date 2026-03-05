@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { X, BookOpen, Tag, ChevronRight, Terminal, FileCode, Save, Loader2, Check, AlertCircle, AlertTriangle, Copy, Info } from 'lucide-react';
+import { X, BookOpen, Tag, ChevronRight, Terminal, FileCode, Save, Loader2, Check, AlertCircle, AlertTriangle, Copy, Info, GitFork } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { diffLines, type Change } from 'diff';
 import type { PilotMessage } from '@/hooks/usePilot';
@@ -50,7 +50,7 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
     const [specsExpanded, setSpecsExpanded] = useState(true);
 
     // Parse skill data from tool result
-    let parsed: { skill: SkillData; skillId?: string; summary: string } | null = null;
+    let parsed: { skill: SkillData; skillId?: string; sourceSkillName?: string; fork?: boolean; summary: string } | null = null;
     try {
         parsed = JSON.parse(message.content);
     } catch {
@@ -59,6 +59,7 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
 
     const skill = parsed?.skill;
     const isUpdate = message.toolName === 'update_skill';
+    const isFork = message.toolName === 'fork_skill' || !!parsed?.fork;
 
     // Find existing skill by name from skills list (primary lookup strategy)
     // Prefer personal scope: when both team and personal "dice-roll" exist,
@@ -72,11 +73,18 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
                 skills.find(s => s.name === parsed.skillId)
               : undefined)
         : undefined;
+
+    // For fork_skill: find the source skill (builtin/team) to fork from
+    const forkSourceSkill = isFork
+        ? skills.find(s => s.name === (parsed?.sourceSkillName ?? skill?.name) && s.scope !== 'personal') ??
+          skills.find(s => s.name === (parsed?.sourceSkillName ?? skill?.name))
+        : undefined;
+
     // Resolve update target: prefer name-matched skill, fall back to toolSkillId
     const updateTargetId = matchedSkill ? String(matchedSkill.id) : parsed?.skillId || undefined;
 
-    // Duplicate detection (create mode only)
-    const existingSkill = !isUpdate ? matchedSkill : undefined;
+    // Duplicate detection (create mode only, not for fork)
+    const existingSkill = !isUpdate && !isFork ? matchedSkill : undefined;
     const hasDuplicate = !!existingSkill;
 
     // Sync save state when metadata changes (e.g. from another source)
@@ -87,29 +95,33 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
         }
     }, [metaState]);
 
-    // Fetch old skill content for diff (update mode — uses name-matched ID)
+    // Fetch old skill content for diff (update mode or fork mode)
     useEffect(() => {
-        if (!isUpdate || !updateTargetId || !sendRpc) return;
+        const fetchId = isUpdate ? updateTargetId
+            : isFork ? (forkSourceSkill ? String(forkSourceSkill.id) : undefined)
+            : undefined;
+        if (!fetchId || !sendRpc) return;
         setLoadingOld(true);
-        sendRpc<{ files?: SkillFiles }>('skill.get', { id: updateTargetId })
+        sendRpc<{ files?: SkillFiles }>('skill.get', { id: fetchId })
             .then(result => {
                 setOldFiles(result.files ?? null);
             })
             .catch(() => setOldFiles(null))
             .finally(() => setLoadingOld(false));
-    }, [isUpdate, updateTargetId, sendRpc]);
+    }, [isUpdate, isFork, updateTargetId, forkSourceSkill, sendRpc]);
 
-    // Compute diffs
+    // Compute diffs (update mode shows changes; fork mode shows changes vs source)
+    const showDiff = isUpdate || (isFork && !!oldFiles);
     const specsDiff = useMemo(() => {
-        if (!isUpdate || !skill?.specs || !oldFiles?.specs) return null;
+        if (!showDiff || !skill?.specs || !oldFiles?.specs) return null;
         const changes = diffLines(oldFiles.specs ?? '', skill.specs ?? '');
         // Check if all changes are equal (no actual diff)
         if (changes.every(c => !c.added && !c.removed)) return null;
         return changes;
-    }, [isUpdate, skill?.specs, oldFiles?.specs]);
+    }, [showDiff, skill?.specs, oldFiles?.specs]);
 
     const scriptDiffs = useMemo(() => {
-        if (!isUpdate || !skill?.scripts) return null;
+        if (!showDiff || !skill?.scripts) return null;
         const oldScriptsMap = new Map(
             (oldFiles?.scripts ?? []).map(s => [s.name, s.content])
         );
@@ -155,16 +167,32 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
 
             let rs: string | undefined;
 
-            if (mode === 'update') {
+            if (isFork && mode !== 'create-new-name') {
+                // Fork mode: call skill.fork with source skill ID
+                const sourceId = forkSourceSkill ? String(forkSourceSkill.id) : undefined;
+                if (!sourceId) {
+                    throw new Error(`Source skill "${parsed?.sourceSkillName ?? skill.name}" not found`);
+                }
+                const res = await sendRpc<{ reviewStatus?: string }>('skill.fork', {
+                    sourceId,
+                    name: skill.name,
+                    description: skill.description,
+                    type: skill.type,
+                    specs: skill.specs,
+                    scripts,
+                });
+                rs = res.reviewStatus;
+                setSavedName('Forked to Personal');
+            } else if (mode === 'update') {
                 // Non-personal skills are read-only — fork to personal
                 if (matchedSkill && matchedSkill.scope !== 'personal') {
-                    const res = await sendRpc<{ reviewStatus?: string }>('skill.create', {
+                    const res = await sendRpc<{ reviewStatus?: string }>('skill.fork', {
+                        sourceId: String(matchedSkill.id),
                         name: skill.name,
                         description: skill.description,
                         type: skill.type,
                         specs: skill.specs,
                         scripts,
-                        forkedFromId: String(matchedSkill.id),
                     });
                     rs = res.reviewStatus;
                     setSavedName('Saved to Personal');
@@ -193,13 +221,13 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
                     rs = res.reviewStatus;
                     setSavedName('Updated');
                 } else {
-                    const res = await sendRpc<{ reviewStatus?: string }>('skill.create', {
+                    const res = await sendRpc<{ reviewStatus?: string }>('skill.fork', {
+                        sourceId: String(existingSkill.id),
                         name: skill.name,
                         description: skill.description,
                         type: skill.type,
                         specs: skill.specs,
                         scripts,
-                        forkedFromId: String(existingSkill.id),
                     });
                     rs = res.reviewStatus;
                     setSavedName('Saved to Personal');
@@ -413,6 +441,18 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
 
                 <div className="flex items-center gap-2">
                     {saveState === 'idle' && !isAlreadyUpToDate && (() => {
+                        if (isFork && forkSourceSkill) {
+                            const alreadyHasPersonal = skills.some(s => s.name === skill.name && s.scope === 'personal');
+                            return (
+                                <button
+                                    onClick={() => handleSave(alreadyHasPersonal ? 'create-new-name' : 'create')}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-purple-600 text-white hover:bg-purple-700 transition-colors shadow-sm"
+                                >
+                                    <GitFork className="w-3.5 h-3.5" />
+                                    Fork to Personal
+                                </button>
+                            );
+                        }
                         if (isUpdate && updateTargetId) {
                             const isNonPersonal = matchedSkill && matchedSkill.scope !== 'personal';
                             return (

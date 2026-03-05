@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { skillExistsInBundle } from "./script-resolver.js";
 
 interface UpdateSkillParams {
   id?: string;
@@ -139,6 +140,23 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
               type: "text",
               text: JSON.stringify({
                 error: "Skill specs (SKILL.md content) is required.",
+              }),
+            },
+          ],
+          details: { error: true },
+        };
+      }
+
+      const skillName = params.name.trim();
+
+      // Reject if the target skill doesn't exist in the bundle (personal/team)
+      if (!skillExistsInBundle(skillName)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: `Skill '${skillName}' not found. Cannot update a skill that doesn't exist. Use 'create_skill' to create a new skill, or check the skill name.`,
               }),
             },
           ],

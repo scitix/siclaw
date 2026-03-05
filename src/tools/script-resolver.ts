@@ -7,50 +7,101 @@ function skillsBase(): string {
   return path.resolve(process.cwd(), config.paths.skillsDir);
 }
 
-/** Skill scope directories to search (in priority order, CLI fallback) */
-const SKILL_SCOPES = ["core", "team", "extension", "user"];
+/** Builtin skills directory (baked into Docker image at skills/core/) */
+function builtinCoreDir(): string {
+  return path.resolve(process.cwd(), "skills", "core");
+}
+
+/** Load disabled builtins list (written by agentbox startup from bundle API) */
+function loadDisabledBuiltins(): Set<string> {
+  try {
+    const filePath = path.join(skillsBase(), ".disabled-builtins.json");
+    if (fs.existsSync(filePath)) {
+      return new Set(JSON.parse(fs.readFileSync(filePath, "utf-8")) as string[]);
+    }
+  } catch { /* ignore malformed file */ }
+  return new Set();
+}
+
+/**
+ * Skill scope directories to search (in priority order, CLI fallback).
+ * Higher-specificity scopes first: personal > team > builtin.
+ */
+const SKILL_SCOPES = ["user", "extension", "team", "core"];
 
 /**
  * Build the list of directories to search for a specific skill's scripts.
- * Single directory model: each pod has one /skills/ dir populated by bundle API.
- * CLI fallback: search all scope directories.
+ *
+ * Priority: personal/team (bundle) > builtin (Docker image).
+ * 1. Bundle-materialized (skillsBase/<skill>/) — contains personal or team
+ * 2. CLI fallback: scope subdirectories (user > team > core)
+ * 3. Builtin fallback (skills/core/) — unless disabled
  */
 function getSkillScriptDirs(skill: string): string[] {
   const base = skillsBase();
 
-  // Search directly in skillsBase for bundle-materialized skills
+  // 1. Bundle-materialized skills (personal/team override builtins)
   const directPath = path.join(base, skill, "scripts");
   if (fs.existsSync(directPath)) return [directPath];
 
-  // CLI fallback: search all scope directories
+  // 2. CLI fallback: search all scope directories (user > team > core)
   const dirs: string[] = [];
   for (const scope of SKILL_SCOPES) {
     const dir = path.join(base, scope, skill, "scripts");
     if (fs.existsSync(dir)) dirs.push(dir);
   }
-  return dirs;
+  if (dirs.length > 0) return dirs;
+
+  // 3. Builtin fallback (skills/core/) — for skills not in the bundle
+  const disabled = loadDisabledBuiltins();
+  if (!disabled.has(skill)) {
+    const builtinPath = path.join(builtinCoreDir(), skill, "scripts");
+    if (fs.existsSync(builtinPath)) return [builtinPath];
+  }
+
+  return [];
 }
 
 /**
  * Build the list of base directories for enumerating all skills.
- * Single directory model: skillsBase is the root.
- * CLI fallback: search all scope directories.
+ *
+ * Priority: personal/team (bundle) > builtin (Docker image).
+ * Uses seenSkills dedup in callers so first-wins = highest priority.
  */
 function getSkillBaseDirs(): string[] {
   const base = skillsBase();
 
-  // Check if bundle-materialized skills exist directly in skillsBase
-  // (no scope subdirs like core/team/extension)
+  // 1. Bundle-materialized skills (personal/team first)
   const hasDirectSkills = fs.existsSync(base) && fs.readdirSync(base).some(
     (entry) => !entry.startsWith(".") && !SKILL_SCOPES.includes(entry) &&
       fs.statSync(path.join(base, entry)).isDirectory(),
   );
-  if (hasDirectSkills) return [base];
+  if (hasDirectSkills) {
+    const dirs = [base];
+    // Builtin as fallback for skills not in the bundle
+    const coreDir = builtinCoreDir();
+    if (fs.existsSync(coreDir)) dirs.push(coreDir);
+    return dirs;
+  }
 
-  // CLI fallback: search all scope directories
+  // 2. CLI fallback: search all scope directories (user > team > core)
   return SKILL_SCOPES
     .map((scope) => path.join(base, scope))
     .filter((dir) => fs.existsSync(dir));
+}
+
+/** Check if a skill exists in the materialized bundle (personal/team) */
+export function skillExistsInBundle(skillName: string): boolean {
+  const dir = path.join(skillsBase(), skillName);
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+}
+
+/** Check if a skill exists as a non-disabled builtin (skills/core/) */
+export function skillExistsAsBuiltin(skillName: string): boolean {
+  const disabled = loadDisabledBuiltins();
+  if (disabled.has(skillName)) return false;
+  const dir = path.join(builtinCoreDir(), skillName);
+  return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
 }
 
 export interface ResolvedScript {
@@ -106,13 +157,18 @@ export function listAllSkillsWithScripts(): Array<{
 }> {
   const result: Array<{ skill: string; scripts: string[] }> = [];
   const seen = new Set<string>();
+  const disabled = loadDisabledBuiltins();
+  const coreDir = builtinCoreDir();
 
   for (const base of getSkillBaseDirs()) {
+    const isBuiltinDir = base === coreDir;
     try {
       for (const d of fs.readdirSync(base, { withFileTypes: true })) {
         if (d.name.startsWith("_")) continue; // skip _lib etc.
         if ((!d.isDirectory() && !d.isSymbolicLink()) || seen.has(d.name))
           continue;
+        // Skip disabled builtins so they don't shadow bundle overrides
+        if (isBuiltinDir && disabled.has(d.name)) continue;
         const scriptsDir = path.join(base, d.name, "scripts");
         try {
           const scripts = fs
