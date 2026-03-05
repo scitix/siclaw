@@ -1,4 +1,4 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, Copy, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -183,7 +183,9 @@ export function SkillsPage() {
 
     // Sync activeTab from URL when searchParams change (e.g., navigation from notifications)
     useEffect(() => {
-        const tab = (searchParams.get('tab') || 'all') as typeof activeTab;
+        const urlTab = searchParams.get('tab');
+        if (!urlTab) return; // No explicit tab in URL — keep current/sessionStorage tab
+        const tab = urlTab as typeof activeTab;
         if (tab !== activeTab) {
             setActiveTab(tab);
             sessionStorage.setItem('skills_tab', tab);
@@ -599,12 +601,21 @@ export function SkillsPage() {
                                                 Pending Publish
                                             </span>
                                         )}
-                                        {skill.reviewStatus === 'approved' && (skill.scope === 'personal' || skill.scope === 'team') && (
-                                            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-green-50 text-green-600 text-[10px] font-bold border border-green-200 whitespace-nowrap">
-                                                <Check className="w-2.5 h-2.5" />
-                                                Approved
-                                            </span>
-                                        )}
+                                        {skill.reviewStatus === 'approved' && (skill.scope === 'personal' || skill.scope === 'team') && (() => {
+                                            const ver = Number(String(skill.version).replace(/^v/, ''));
+                                            const hasUnpublished = skill.publishedVersion != null && ver > skill.publishedVersion;
+                                            return hasUnpublished ? (
+                                                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 text-[10px] font-bold border border-blue-200 whitespace-nowrap">
+                                                    <FileCode className="w-2.5 h-2.5" />
+                                                    Modified
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-green-50 text-green-600 text-[10px] font-bold border border-green-200 whitespace-nowrap">
+                                                    <Check className="w-2.5 h-2.5" />
+                                                    Approved
+                                                </span>
+                                            );
+                                        })()}
                                         {skill.scope === 'builtin' && (
                                             <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[10px] font-bold border border-gray-200 whitespace-nowrap">
                                                 <Lock className="w-2.5 h-2.5" />
@@ -634,12 +645,13 @@ export function SkillsPage() {
                                                     </span>
                                                 ))}
                                                 {overflow > 0 && (
-                                                    <span
-                                                        onClick={(e) => { e.stopPropagation(); navigate(`/skills/${skill.id}`); }}
-                                                        className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 text-gray-500 border border-gray-200 cursor-pointer hover:bg-gray-200 transition-colors"
-                                                    >
-                                                        +{overflow}
-                                                    </span>
+                                                    <Tooltip content={skill.labels.slice(MAX_CARD_LABELS).join(', ')} position="bottom">
+                                                        <span
+                                                            className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 text-gray-500 border border-gray-200"
+                                                        >
+                                                            +{overflow}
+                                                        </span>
+                                                    </Tooltip>
                                                 )}
                                             </div>
                                         );
@@ -941,7 +953,7 @@ function ScriptReviewApprovalCard({
                 title: 'Approve Skill',
                 description: `Are you sure you want to approve "${skill.name}"? It will become active in production.`,
                 variant: 'primary',
-                confirmText: isContributionReview && !isScriptReview ? 'Approve & Publish' : 'Approve',
+                confirmText: isContributionReview ? 'Approve & Publish to Team' : 'Approve',
                 onConfirm: () => executeDecision('approve'),
             });
         } else {
@@ -1242,7 +1254,7 @@ function ScriptReviewApprovalCard({
                                             className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-green-700 bg-green-50 border border-green-200 hover:bg-green-100 rounded-lg transition-all disabled:opacity-50"
                                         >
                                             <Check className="w-4 h-4" />
-                                            {isContributionReview && !isScriptReview ? 'Approve & Publish' : 'Approve'}
+                                            {isContributionReview ? 'Approve & Publish to Team' : 'Approve'}
                                         </button>
                                     </div>
                                 </div>
