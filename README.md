@@ -6,6 +6,7 @@
 
 **AI-powered SRE copilot — from plain language to root-cause analysis**
 
+[![CI](https://github.com/scitix/siclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/scitix/siclaw/actions/workflows/ci.yml)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -60,6 +61,13 @@ Siclaw gives every engineer an on-call copilot. Describe a problem in plain lang
       Target K8s Clusters
      (user-provided kubeconfig)
 ```
+
+## Prerequisites
+
+- **Node.js >= 22.12.0** — [Download](https://nodejs.org/)
+- **npm** — Comes with Node.js
+- **kubectl** — Required for K8s diagnostics ([Install guide](https://kubernetes.io/docs/tasks/tools/))
+- A valid **kubeconfig** pointing to your target cluster
 
 ## Quick Start
 
@@ -313,9 +321,18 @@ k8s/                         # Kubernetes manifests
 | MCP | @modelcontextprotocol/sdk |
 | Realtime | WebSocket (ws) |
 
+## Community
+
+- [GitHub Issues](https://github.com/scitix/siclaw/issues) — Bug reports and feature requests
+- [GitHub Discussions](https://github.com/scitix/siclaw/discussions) — Questions, ideas, and general discussion
+
+<!-- TODO: Add Discord invite link once server is created -->
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture overview, and pull request guidelines.
+
+Looking for a place to start? Check out issues labeled [`good first issue`](https://github.com/scitix/siclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
 
 ## License
 
