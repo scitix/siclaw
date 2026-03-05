@@ -26,6 +26,7 @@ import { loadMcpServersConfig } from "../core/mcp-client.js";
 import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
+import { createResourceNotifier } from "./resource-notifier.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -190,8 +191,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     ca: certManager.getCACertificate(),
   };
 
+  // Create resource notifier for unified AgentBox reload notifications
+  const resourceNotifier = createResourceNotifier(agentBoxManager, agentBoxTlsOptions);
+
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier);
 
   // Apply DB-stored agentbox image override (takes effect on next pod spawn)
   if (sysConfigRepo) {
