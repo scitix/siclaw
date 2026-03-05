@@ -10,7 +10,7 @@
  */
 
 import { AgentBoxClient, type AgentBoxTlsOptions } from "./agentbox/client.js";
-import type { AgentBoxHandle } from "./agentbox/types.js";
+import type { AgentBoxHandle, AgentBoxInfo } from "./agentbox/types.js";
 import type {
   ResourceDescriptor,
   ResourceNotifier,
@@ -19,11 +19,12 @@ import type {
 
 /**
  * Minimal subset of AgentBoxManager that the notifier needs.
- * Avoids importing the full manager (and its heavy transitive deps).
+ * Uses list() for K8s compatibility (activeUserIds/getForUser return [] in K8s mode).
  */
 export interface AgentBoxManagerLike {
   activeUserIds(): string[];
   getForUser(userId: string): AgentBoxHandle[];
+  list(): Promise<AgentBoxInfo[]>;
 }
 
 /**
@@ -94,15 +95,31 @@ export function createResourceNotifier(
 
   return {
     async notifyAll(descriptor: ResourceDescriptor): Promise<NotifyResult> {
-      const handles: AgentBoxHandle[] = [];
-      for (const userId of manager.activeUserIds()) {
-        handles.push(...manager.getForUser(userId));
+      // Try in-memory cache first (local dev), fall back to async list (K8s)
+      let handles: AgentBoxHandle[] = [];
+      const userIds = manager.activeUserIds();
+      if (userIds.length > 0) {
+        for (const userId of userIds) {
+          handles.push(...manager.getForUser(userId));
+        }
+      } else {
+        // K8s mode: activeUserIds() returns [], query pods via spawner
+        const boxes = await manager.list();
+        handles = boxes.map((b) => ({ boxId: b.boxId, userId: b.userId, endpoint: b.endpoint }));
       }
       return notifyHandles(descriptor, handles);
     },
 
     async notifyUser(descriptor: ResourceDescriptor, userId: string): Promise<NotifyResult> {
-      const handles = manager.getForUser(userId);
+      // Try in-memory cache first (local dev), fall back to async list (K8s)
+      let handles = manager.getForUser(userId);
+      if (handles.length === 0) {
+        // K8s mode: getForUser() returns [], query pods via spawner
+        const boxes = await manager.list();
+        handles = boxes
+          .filter((b) => b.userId === userId)
+          .map((b) => ({ boxId: b.boxId, userId: b.userId, endpoint: b.endpoint }));
+      }
       if (handles.length === 0) {
         return { resourceType: descriptor.type, success: 0, failed: 0 };
       }
