@@ -15,9 +15,10 @@ import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
-import { loadConfig, reloadConfig } from "../core/config.js";
+import { loadConfig } from "../core/config.js";
 import { GatewayClient } from "./gateway-client.js";
-import { syncMcpFromGateway } from "./mcp-sync.js";
+import { getResourceHandler } from "./resource-handlers.js";
+import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -58,44 +59,6 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
-
-/**
- * Write a skill bundle to local disk.
- * Clears existing skills and writes each skill's SKILL.md + scripts/.
- */
-export async function materializeBundle(
-  bundle: { skills: Array<{ dirName: string; specs: string; scripts: Array<{ name: string; content: string }> }> },
-  skillsDir: string,
-): Promise<void> {
-  // Clear existing skill dirs (but not hidden files like .gitkeep)
-  if (fs.existsSync(skillsDir)) {
-    for (const entry of fs.readdirSync(skillsDir)) {
-      if (entry.startsWith(".")) continue;
-      fs.rmSync(path.join(skillsDir, entry), { recursive: true });
-    }
-  } else {
-    fs.mkdirSync(skillsDir, { recursive: true });
-  }
-
-  for (const skill of bundle.skills) {
-    const skillDir = path.join(skillsDir, skill.dirName);
-    fs.mkdirSync(skillDir, { recursive: true });
-
-    // Write SKILL.md
-    if (skill.specs) {
-      fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
-    }
-
-    // Write scripts
-    if (skill.scripts.length > 0) {
-      const scriptsDir = path.join(skillDir, "scripts");
-      fs.mkdirSync(scriptsDir, { recursive: true });
-      for (const script of skill.scripts) {
-        fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
-      }
-    }
-  }
-}
 
 /**
  * Create HTTP or HTTPS server (auto-detects certificates)
@@ -581,87 +544,60 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
-   * POST /api/reload-skills - hot-reload skills
+   * POST /api/reload-{mcp,skills} — unified resource reload endpoints
    *
-   * Fetches skill bundle from Gateway via mTLS, writes to local disk, then
-   * calls reload() on all active sessions to rescan and rebuild system prompts.
+   * Each endpoint delegates to the matching AgentBoxResourceHandler:
+   * fetch → materialize → postReload.
+   * URL paths are preserved for backward compatibility.
    */
-  addRoute("POST", "/api/reload-skills", async (_req, res) => {
-    const sessions = sessionManager.list();
-    console.log(`[agentbox-http] Reloading skills for ${sessions.length} active sessions`);
-
-    // Fetch fresh bundle from Gateway (mTLS — identity from certificate)
-    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
-    if (gatewayUrl) {
-      try {
-        const client = new GatewayClient({ gatewayUrl });
-        const bundle = await client.fetchSkillBundle();
-        const config = loadConfig();
-        const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
-        await materializeBundle(bundle, skillsDir);
-
-        // Write disabled builtins list for agent-factory to exclude
-        const disabledFile = path.join(skillsDir, ".disabled-builtins.json");
-        if (bundle.disabledBuiltins?.length) {
-          fs.writeFileSync(disabledFile, JSON.stringify(bundle.disabledBuiltins));
-        } else if (fs.existsSync(disabledFile)) {
-          fs.unlinkSync(disabledFile);
-        }
-
-        console.log(`[agentbox-http] Bundle materialized: ${bundle.skills.length} skills (${bundle.disabledBuiltins?.length || 0} builtins disabled), version=${bundle.version}`);
-      } catch (err: any) {
-        console.warn(`[agentbox-http] Failed to fetch skill bundle from Gateway: ${err.message}`);
-      }
-    }
-
-    const errors: string[] = [];
-    for (const managed of sessions) {
-      try {
-        await managed.brain.reload();
-        console.log(`[agentbox-http] Skills reloaded for session ${managed.id}`);
-      } catch (err: any) {
-        console.error(`[agentbox-http] Failed to reload skills for session ${managed.id}:`, err);
-        errors.push(`${managed.id}: ${err.message}`);
-      }
-    }
-    sendJson(res, 200, { ok: true, reloaded: sessions.length - errors.length, errors });
-  });
-
-  /**
-   * POST /api/reload-mcp - hot-reload MCP configuration
-   *
-   * Fetches merged MCP config from Gateway via mTLS, writes to local disk.
-   * New sessions will pick up the updated config.
-   */
-  let _mcpGatewayClient: GatewayClient | null = null;
-  function getMcpGatewayClient(): GatewayClient | null {
+  let _reloadGatewayClient: GatewayClient | null = null;
+  function getReloadGatewayClient(): GatewayClient | null {
     const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
     if (!gatewayUrl) return null;
-    if (!_mcpGatewayClient) _mcpGatewayClient = new GatewayClient({ gatewayUrl });
-    return _mcpGatewayClient;
+    if (!_reloadGatewayClient) _reloadGatewayClient = new GatewayClient({ gatewayUrl });
+    return _reloadGatewayClient;
   }
 
-  addRoute("POST", "/api/reload-mcp", async (_req, res) => {
-    console.log("[agentbox-http] Reloading MCP configuration");
+  for (const descriptor of Object.values(RESOURCE_DESCRIPTORS)) {
+    addRoute("POST", descriptor.reloadPath, async (_req, res) => {
+      const resourceType = descriptor.type;
+      console.log(`[agentbox-http] Reloading ${resourceType} configuration`);
 
-    const client = getMcpGatewayClient();
-    if (!client) {
-      console.warn("[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping MCP reload");
-      sendJson(res, 200, { ok: true, servers: 0 });
-      return;
-    }
+      const client = getReloadGatewayClient();
+      if (!client) {
+        console.warn(`[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping ${resourceType} reload`);
+        sendJson(res, 200, { ok: true, servers: 0 });
+        return;
+      }
 
-    try {
-      const count = await syncMcpFromGateway(client);
-      reloadConfig();
+      const handler = getResourceHandler(resourceType);
+      if (!handler) {
+        sendJson(res, 500, { error: `No handler for resource type "${resourceType}"` });
+        return;
+      }
 
-      console.log(`[agentbox-http] MCP config reloaded: ${count} servers`);
-      sendJson(res, 200, { ok: true, servers: count });
-    } catch (err: any) {
-      console.error(`[agentbox-http] Failed to reload MCP config: ${err.message}`);
-      sendJson(res, 500, { error: `MCP reload failed: ${err.message}` });
-    }
-  });
+      try {
+        const payload = await handler.fetch(client);
+        const count = await handler.materialize(payload);
+
+        // Build session list for postReload (skills needs brain.reload())
+        const sessions = sessionManager.list().map((s) => ({
+          id: s.id,
+          brain: s.brain,
+        }));
+
+        if (handler.postReload) {
+          await handler.postReload({ sessions });
+        }
+
+        console.log(`[agentbox-http] ${resourceType} reloaded: ${count} items`);
+        sendJson(res, 200, { ok: true, servers: count });
+      } catch (err: any) {
+        console.error(`[agentbox-http] Failed to reload ${resourceType}: ${err.message}`);
+        sendJson(res, 500, { error: `${resourceType} reload failed: ${err.message}` });
+      }
+    });
+  }
 
   /**
    * GET /api/models - list available models (read from settings.json)

@@ -24,19 +24,6 @@ export interface CronJob {
   lastResult?: string | null;
 }
 
-export interface SkillBundleEntry {
-  dirName: string;
-  scope: "builtin" | "team" | "personal";
-  specs: string;
-  scripts: Array<{ name: string; content: string }>;
-}
-
-export interface SkillBundle {
-  version: string;
-  skills: SkillBundleEntry[];
-  disabledBuiltins?: string[];
-}
-
 export class GatewayClient {
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
@@ -81,24 +68,9 @@ export class GatewayClient {
   }
 
   /**
-   * Fetch the skill bundle from Gateway via mTLS.
-   * Identity (userId, env) is derived from the client certificate — no params needed.
-   */
-  async fetchSkillBundle(): Promise<SkillBundle> {
-    return this.request("/api/internal/skills/bundle", "GET");
-  }
-
-  /**
-   * Fetch merged MCP servers config from Gateway
-   */
-  async fetchMcpServers(): Promise<{ mcpServers: Record<string, any> }> {
-    return this.request("/api/internal/mcp-servers", "GET");
-  }
-
-  /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
+  public request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
