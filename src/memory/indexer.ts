@@ -7,7 +7,7 @@ import { initMemoryDb } from "./schema.js";
 import { chunkMarkdown } from "./chunker.js";
 import { vectorToBlob, blobToVector } from "./embeddings.js";
 import { tokenizeForFts } from "./stop-words.js";
-import type { EmbeddingProvider, MemoryChunk, MemorySearchResult } from "./types.js";
+import type { EmbeddingProvider, InvestigationRecord, MemoryChunk, MemorySearchResult } from "./types.js";
 import { applyTemporalDecay, type TemporalDecayConfig } from "./temporal-decay.js";
 import { mmrRerank, type MMRConfig } from "./mmr.js";
 
@@ -422,6 +422,81 @@ export class MemoryIndexer {
     }
   }
 
+  /** Insert a structured investigation record into the investigations table. */
+  insertInvestigation(record: InvestigationRecord): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO investigations
+         (id, question, root_cause_category, affected_entities, environment_tags,
+          causal_chain, confidence, conclusion, duration_ms, total_tool_calls,
+          hypotheses_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.id,
+        record.question,
+        record.rootCauseCategory,
+        JSON.stringify(record.affectedEntities),
+        JSON.stringify(record.environmentTags),
+        JSON.stringify(record.causalChain),
+        record.confidence,
+        record.conclusion,
+        record.durationMs,
+        record.totalToolCalls,
+        JSON.stringify(record.hypotheses),
+        record.createdAt,
+      );
+  }
+
+  /** Search past investigations by structured fields. */
+  searchInvestigations(
+    _question: string,
+    opts?: { rootCauseCategory?: string; environmentTag?: string; topK?: number },
+  ): InvestigationRecord[] {
+    const topK = opts?.topK ?? 5;
+    const conditions: string[] = [];
+    const params: (string | number)[] = [];
+
+    if (opts?.rootCauseCategory) {
+      conditions.push("root_cause_category = ?");
+      params.push(opts.rootCauseCategory);
+    }
+    if (opts?.environmentTag) {
+      conditions.push("environment_tags LIKE ?");
+      params.push(`%${opts.environmentTag}%`);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const sql = `SELECT * FROM investigations ${where} ORDER BY created_at DESC LIMIT ?`;
+    params.push(topK);
+
+    try {
+      const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        id: r.id as string,
+        question: r.question as string,
+        rootCauseCategory: (r.root_cause_category as string) ?? "unknown",
+        affectedEntities: safeJsonArray(r.affected_entities as string) as string[],
+        environmentTags: safeJsonArray(r.environment_tags as string) as string[],
+        causalChain: safeJsonArray(r.causal_chain as string) as string[],
+        confidence: (r.confidence as number) ?? 0,
+        conclusion: (r.conclusion as string) ?? "",
+        durationMs: (r.duration_ms as number) ?? 0,
+        totalToolCalls: (r.total_tool_calls as number) ?? 0,
+        hypotheses: safeJsonArray(r.hypotheses_json as string) as Array<{
+          id: string;
+          text: string;
+          status: string;
+          confidence: number;
+        }>,
+        createdAt: (r.created_at as number) ?? 0,
+      }));
+    } catch (err) {
+      console.warn(`[memory-indexer] searchInvestigations failed:`, err);
+      return [];
+    }
+  }
+
   close(): void {
     this._closed = true;
     this.stopWatching();
@@ -566,6 +641,16 @@ export class MemoryIndexer {
     } catch {
       return [];
     }
+  }
+}
+
+function safeJsonArray(raw: string | null | undefined): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 

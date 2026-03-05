@@ -10,8 +10,10 @@ import {
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
+import crypto from "node:crypto";
 import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
+import type { InvestigationRecord } from "../../memory/types.js";
 import type {
   DeepSearchBudget,
   HypothesisNode,
@@ -30,6 +32,17 @@ interface RawHypothesis {
   text: string;
   confidence: number;
   suggestedTools: string[];
+}
+
+interface ConclusionResult {
+  text: string;
+  structured?: {
+    root_cause_category: string;
+    affected_entities: string[];
+    environment_tags: string[];
+    causal_chain: string[];
+    confidence: number;
+  };
 }
 
 /**
@@ -295,13 +308,56 @@ async function generateHypotheses(
 }
 
 /**
+ * Parse structured extraction block from LLM conclusion output.
+ * Returns { text, structured? } — structured is undefined if parsing fails (graceful degradation).
+ */
+function parseConclusionOutput(raw: string): ConclusionResult {
+  const startMarker = "STRUCTURED_EXTRACTION_START";
+  const endMarker = "STRUCTURED_EXTRACTION_END";
+
+  const startIdx = raw.indexOf(startMarker);
+  const endIdx = raw.indexOf(endMarker);
+
+  if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
+    return { text: raw.trim() };
+  }
+
+  const text = raw.slice(0, startIdx).trim();
+  const jsonBlock = raw.slice(startIdx + startMarker.length, endIdx).trim();
+
+  const jsonStr = extractJSON(jsonBlock);
+  if (!jsonStr) {
+    console.warn(`[deep-search] Failed to extract JSON from structured block, degrading to text-only conclusion`);
+    return { text };
+  }
+
+  try {
+    const parsed = JSON.parse(jsonStr);
+    return {
+      text,
+      structured: {
+        root_cause_category: parsed.root_cause_category ?? "unknown",
+        affected_entities: Array.isArray(parsed.affected_entities) ? parsed.affected_entities : [],
+        environment_tags: Array.isArray(parsed.environment_tags) ? parsed.environment_tags : [],
+        causal_chain: Array.isArray(parsed.causal_chain) ? parsed.causal_chain : [],
+        confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+      },
+    };
+  } catch {
+    console.warn(`[deep-search] Failed to parse structured extraction JSON, degrading to text-only conclusion`);
+    return { text };
+  }
+}
+
+/**
  * Phase 4: Generate final conclusion using a single LLM call (no tools).
+ * Returns both human-readable text and optional structured extraction.
  */
 async function generateConclusion(
   question: string,
   hypotheses: HypothesisNode[],
   options?: SubAgentOptions,
-): Promise<string> {
+): Promise<ConclusionResult> {
   const hypothesesSummary = hypotheses
     .map((h) => {
       const evidenceText = h.evidence
@@ -314,10 +370,11 @@ async function generateConclusion(
   const prompt = conclusionPrompt(question, hypothesesSummary);
   // No onProgress here — Phase 4 conclusion text should NOT leak into spinner
   try {
-    return await llmComplete(undefined, prompt, options);
+    const raw = await llmComplete(undefined, prompt, options);
+    return parseConclusionOutput(raw);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return `Conclusion generation failed: ${msg}`;
+    return { text: `Conclusion generation failed: ${msg}` };
   }
 }
 
@@ -416,21 +473,48 @@ export async function investigate(
     contextSummary = parseContextSummary(contextResult.textOutput);
   }
 
-  // --- Phase 2: Hypothesis Generation (skip if hypotheses provided) ---
-  // Retrieve related past investigations from memory (best-effort, non-blocking)
+  // --- Prior Investigation Retrieval (structured + semantic, for Phase 2) ---
   let relatedInvestigations: string | undefined;
   if (options?.memoryIndexer && !(options?.hypotheses && options.hypotheses.length > 0)) {
+    const parts: string[] = [];
+
+    // 1. Structured query: precise match on categories/entities
+    try {
+      const structuredResults = options.memoryIndexer.searchInvestigations(question, { topK: 3 });
+      if (structuredResults.length > 0) {
+        const seenQuestions = new Set<string>();
+        for (const inv of structuredResults) {
+          seenQuestions.add(inv.question);
+          const tags = [
+            `root_cause: ${inv.rootCauseCategory}`,
+            `confidence: ${inv.confidence}%`,
+            inv.environmentTags.length > 0 ? `env: ${inv.environmentTags.join(", ")}` : "",
+          ].filter(Boolean).join(", ");
+          const chain = inv.causalChain.length > 0 ? `\nCausal chain: ${inv.causalChain.join(" → ")}` : "";
+          parts.push(`[Structured] [${tags}] ${inv.question}${chain}\nConclusion: ${inv.conclusion.slice(0, 300)}`);
+        }
+        onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Found ${structuredResults.length} structured prior investigation(s)` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Structured investigation retrieval failed:`, err);
+    }
+
+    // 2. Semantic search: existing chunk-based search (catches cases not covered by structured fields)
     try {
       const searchResult = await options.memoryIndexer.search(question, 3, 0.4);
       const investigationChunks = searchResult.chunks.filter(c => c.file.startsWith("investigations/"));
       if (investigationChunks.length > 0) {
-        relatedInvestigations = investigationChunks
-          .map((c, i) => `[Past Investigation ${i + 1}] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`)
-          .join("\n\n---\n\n");
-        onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Found ${investigationChunks.length} related past investigation(s)` });
+        for (const c of investigationChunks) {
+          parts.push(`[Semantic] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`);
+        }
+        onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Found ${investigationChunks.length} semantic match(es) from past investigations` });
       }
     } catch (err) {
-      console.warn(`[deep-search] Memory search for related investigations failed:`, err);
+      console.warn(`[deep-search] Semantic investigation search failed:`, err);
+    }
+
+    if (parts.length > 0) {
+      relatedInvestigations = parts.join("\n\n---\n\n");
     }
   }
 
@@ -605,9 +689,38 @@ export async function investigate(
 
   // --- Phase 4: Conclusion ---
   onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Generating conclusion..." });
-  const conclusion = await generateConclusion(question, hypotheses, options);
+  const conclusionResult = await generateConclusion(question, hypotheses, options);
 
   const totalDurationMs = Date.now() - startTime;
+
+  // Write structured investigation record to SQLite (best-effort)
+  if (conclusionResult.structured && options?.memoryIndexer) {
+    try {
+      const record: InvestigationRecord = {
+        id: crypto.randomUUID(),
+        question,
+        rootCauseCategory: conclusionResult.structured.root_cause_category,
+        affectedEntities: conclusionResult.structured.affected_entities,
+        environmentTags: conclusionResult.structured.environment_tags,
+        causalChain: conclusionResult.structured.causal_chain,
+        confidence: conclusionResult.structured.confidence,
+        conclusion: conclusionResult.text,
+        durationMs: totalDurationMs,
+        totalToolCalls: globalCallsUsed,
+        hypotheses: hypotheses.map((h) => ({
+          id: h.id,
+          text: h.text,
+          status: h.status,
+          confidence: h.confidence,
+        })),
+        createdAt: Date.now(),
+      };
+      options.memoryIndexer.insertInvestigation(record);
+      console.log(`[deep-search] Structured investigation record saved: ${record.rootCauseCategory} (${record.confidence}%)`);
+    } catch (err) {
+      console.warn(`[deep-search] Failed to save structured investigation record:`, err);
+    }
+  }
 
   // Write debug trace file (best-effort, don't fail investigation on trace errors)
   let debugTracePath: string | undefined;
@@ -620,7 +733,7 @@ export async function investigate(
   // Persist investigation summary to memory for future hypothesis retrieval (best-effort)
   if (options?.memoryDir) {
     try {
-      await writeInvestigationToMemory(options.memoryDir, question, hypotheses, conclusion, totalDurationMs);
+      await writeInvestigationToMemory(options.memoryDir, question, hypotheses, conclusionResult.text, totalDurationMs);
     } catch (err) {
       console.warn(`[deep-search] Failed to write investigation to memory:`, err);
     }
@@ -630,7 +743,7 @@ export async function investigate(
     question,
     contextSummary,
     hypotheses,
-    conclusion,
+    conclusion: conclusionResult.text,
     totalToolCalls: globalCallsUsed,
     totalDurationMs,
     timedOut,

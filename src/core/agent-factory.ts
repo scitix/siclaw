@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
@@ -398,9 +399,10 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
 
   // -- Path-restricted file I/O tools --
-  // Whitelist: only skills directories + user-data (no credentials, no config)
+  // Whitelist: only skills directories + user-data + reports (no credentials, no config)
   const builtinSkillsRoot = path.resolve(cwd, "skills");
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir];
+  const reportsDir = path.join(homedir(), ".siclaw", "reports");
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [

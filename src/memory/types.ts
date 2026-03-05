@@ -20,3 +20,19 @@ export interface EmbeddingProvider {
   /** Max input tokens per text. Texts exceeding this are truncated before embedding. */
   maxInputTokens?: number;
 }
+
+/** Structured record extracted from a deep investigation conclusion. */
+export interface InvestigationRecord {
+  id: string;
+  question: string;
+  rootCauseCategory: string;
+  affectedEntities: string[];
+  environmentTags: string[];
+  causalChain: string[];
+  confidence: number;
+  conclusion: string;
+  durationMs: number;
+  totalToolCalls: number;
+  hypotheses: Array<{ id: string; text: string; status: string; confidence: number }>;
+  createdAt: number;
+}
