@@ -58,6 +58,29 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+const SAFE_ENTRY_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+function assertSafeEntryName(name: string, label: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (trimmed === "." || trimmed === ".." || !SAFE_ENTRY_NAME_RE.test(trimmed)) {
+    throw new Error(`${label} contains invalid characters`);
+  }
+  return trimmed;
+}
+
+function resolveSafeChildPath(baseDir: string, name: string, label: string): string {
+  const safeName = assertSafeEntryName(name, label);
+  const base = path.resolve(baseDir);
+  const resolved = path.resolve(base, safeName);
+  if (path.dirname(resolved) !== base) {
+    throw new Error(`${label} path escapes base directory`);
+  }
+  return resolved;
+}
+
 
 /**
  * Write a skill bundle to local disk.
@@ -78,7 +101,7 @@ export async function materializeBundle(
   }
 
   for (const skill of bundle.skills) {
-    const skillDir = path.join(skillsDir, skill.dirName);
+    const skillDir = resolveSafeChildPath(skillsDir, skill.dirName, "Skill directory name");
     fs.mkdirSync(skillDir, { recursive: true });
 
     // Write SKILL.md
@@ -91,7 +114,8 @@ export async function materializeBundle(
       const scriptsDir = path.join(skillDir, "scripts");
       fs.mkdirSync(scriptsDir, { recursive: true });
       for (const script of skill.scripts) {
-        fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
+        const scriptPath = resolveSafeChildPath(scriptsDir, script.name, "Script file name");
+        fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
       }
     }
   }
@@ -209,7 +233,8 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
       // Write credential files
       for (const file of body.credentials.files) {
-        fs.writeFileSync(path.join(credDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
+        const filePath = resolveSafeChildPath(credDir, file.name, "Credential file name");
+        fs.writeFileSync(filePath, file.content, file.mode ? { mode: file.mode } : undefined);
       }
       // Write manifest
       fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(body.credentials.manifest, null, 2));

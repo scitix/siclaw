@@ -39,6 +39,8 @@ import { buildRedactionConfig, redactText, type RedactionConfig } from "./output
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
+const SAFE_FILE_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
 function requireAuth(context: RpcContext): string {
   const userId = context.auth?.userId;
   if (!userId) throw new Error("Unauthorized: login required");
@@ -50,6 +52,44 @@ function requireAdmin(context: RpcContext): string {
   if (context.auth?.username !== "admin")
     throw new Error("Forbidden: admin access required");
   return userId;
+}
+
+function assertSafeFileName(name: string, label: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error(`${label} must not be empty`);
+  }
+  if (trimmed === "." || trimmed === ".." || !SAFE_FILE_NAME_RE.test(trimmed)) {
+    throw new Error(`${label} contains invalid characters`);
+  }
+  return trimmed;
+}
+
+function resolvePathUnderDir(baseDir: string, fileName: string, label: string): string {
+  const safeName = assertSafeFileName(fileName, label);
+  const base = path.resolve(baseDir);
+  const resolved = path.resolve(base, safeName);
+  if (path.dirname(resolved) !== base) {
+    throw new Error(`${label} path escapes base directory`);
+  }
+  return resolved;
+}
+
+function redactEventPayloadValue(value: unknown, redactionConfig: RedactionConfig): unknown {
+  if (typeof value === "string") {
+    return redactText(value, redactionConfig);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactEventPayloadValue(item, redactionConfig));
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = redactEventPayloadValue(v, redactionConfig);
+    }
+    return out;
+  }
+  return value;
 }
 
 
@@ -481,30 +521,14 @@ export function createRpcMethods(
             ...eventData,
             ...(dbMessageId ? { dbMessageId } : {}),
           };
-          // Redact sensitive credential info from outbound WS stream
-          if (redactionConfig.patterns.length > 0) {
-            const ep = eventPayload as Record<string, unknown>;
-            if (eventType === "message_update") {
-              const ame = ep.assistantMessageEvent as { type?: string; delta?: string } | undefined;
-              if (ame?.type === "text_delta" && ame.delta) {
-                ame.delta = redactText(ame.delta, redactionConfig);
-              }
-            } else if (eventType === "tool_execution_end") {
-              const toolResult = ep.result as { content?: Array<{ type: string; text?: string }> } | undefined;
-              if (toolResult?.content) {
-                for (const block of toolResult.content) {
-                  if (block.type === "text" && block.text) {
-                    block.text = redactText(block.text, redactionConfig);
-                  }
-                }
-              }
-            }
-          }
+          const outboundPayload = redactionConfig.patterns.length > 0
+            ? redactEventPayloadValue(eventPayload, redactionConfig) as Record<string, unknown>
+            : eventPayload;
 
           if (sendToUser) {
-            sendToUser(userId, "agent_event", eventPayload);
+            sendToUser(userId, "agent_event", outboundPayload);
           } else {
-            context.sendEvent("agent_event", eventPayload);
+            context.sendEvent("agent_event", outboundPayload);
           }
 
           // Cache deep_search tool_progress events for WS reconnect recovery
@@ -1398,13 +1422,14 @@ export function createRpcMethods(
     if (rawScripts && rawScripts.length > 0) {
       const uploadsDir = path.join(skillsDir, "user", userId, "uploads");
       scripts = rawScripts.map(s => {
-        if (s.content) return { name: s.name, content: s.content };
+        const scriptName = assertSafeFileName(s.name, "Script name");
+        if (s.content) return { name: scriptName, content: s.content };
         // Look up from user uploads
-        const uploadPath = path.join(uploadsDir, s.name);
+        const uploadPath = resolvePathUnderDir(uploadsDir, scriptName, "Script name");
         if (!fs.existsSync(uploadPath)) {
-          throw new Error(`Script "${s.name}" not found in uploads directory`);
+          throw new Error(`Script "${scriptName}" not found in uploads directory`);
         }
-        return { name: s.name, content: fs.readFileSync(uploadPath, "utf-8") };
+        return { name: scriptName, content: fs.readFileSync(uploadPath, "utf-8") };
       });
     }
 
@@ -1535,16 +1560,17 @@ export function createRpcMethods(
         (existingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
       );
       scripts = rawScripts.map((s) => {
-        if (s.content) return { name: s.name, content: s.content };
+        const scriptName = assertSafeFileName(s.name, "Script name");
+        if (s.content) return { name: scriptName, content: s.content };
         // Try existing skill scripts
-        const existing = existingScriptsMap.get(s.name);
-        if (existing) return { name: s.name, content: existing };
+        const existing = existingScriptsMap.get(scriptName);
+        if (existing) return { name: scriptName, content: existing };
         // Try uploads directory
-        const uploadPath = path.join(uploadsDir, s.name);
+        const uploadPath = resolvePathUnderDir(uploadsDir, scriptName, "Script name");
         if (fs.existsSync(uploadPath)) {
-          return { name: s.name, content: fs.readFileSync(uploadPath, "utf-8") };
+          return { name: scriptName, content: fs.readFileSync(uploadPath, "utf-8") };
         }
-        throw new Error(`Script "${s.name}" content not found`);
+        throw new Error(`Script "${scriptName}" content not found`);
       });
     }
 
@@ -3344,5 +3370,3 @@ export function createRpcMethods(
 
   return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };
 }
-
-

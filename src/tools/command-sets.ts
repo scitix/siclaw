@@ -516,7 +516,7 @@ const CURL_SAFE_FLAGS = new Set([
   "-s", "--silent", "-S", "--show-error", "-k", "--insecure", "-v", "--verbose",
   "-H", "--header", "-m", "--max-time", "--connect-timeout",
   "-L", "--location", "-I", "--head", "-w", "--write-out",
-  "-d", "--data", "--data-raw", "--data-urlencode", "--compressed",
+  "--compressed",
   "-A", "--user-agent", "-b", "--cookie", "-e", "--referer",
   "-u", "--user", "--cacert", "--cert", "-x", "--proxy",
   "--retry", "--retry-delay", "--retry-max-time",
@@ -526,7 +526,7 @@ const CURL_SAFE_FLAGS = new Set([
 ]);
 const CURL_SAFE_PREFIXES = [
   "-H=", "--header=", "-m=", "--max-time=", "--connect-timeout=",
-  "-w=", "--write-out=", "-d=", "--data=", "--data-raw=", "--data-urlencode=",
+  "-w=", "--write-out=",
   "-A=", "--user-agent=", "-b=", "--cookie=", "-e=", "--referer=",
   "-u=", "--user=", "--cacert=", "--cert=", "-x=", "--proxy=",
   "--retry=", "--retry-delay=", "--retry-max-time=",
@@ -536,11 +536,11 @@ const CURL_DATA_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-urlencode
 const CURL_REQUEST_FLAGS = new Set(["-X", "--request"]);
 // Whitelist of safe HTTP methods — only these are allowed with -X/--request.
 // Any new or unknown method is blocked by default.
-const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST"]);
+const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 // Single-char curl flags that are safe (for combined flag parsing like -sS)
 const CURL_SAFE_SHORT_CHARS = new Set([
-  "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "d", "A", "b", "e", "u", "x", "f", "N",
+  "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "A", "b", "e", "u", "x", "f", "N",
   "4", "6",
 ]);
 
@@ -555,18 +555,38 @@ function checkCurlMethod(method: string | undefined): string | null {
   return null;
 }
 
-// Helper: validate a -d/--data value for @file upload.
+// Helper: request-body flags are blocked in read-only mode.
 function checkCurlDataValue(flag: string, value: string | undefined): string | null {
+  if (!value) {
+    return `curl ${flag} is not allowed in read-only mode. Request body flags are blocked.`;
+  }
   if (value && value.startsWith("@")) {
     return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
+  }
+  return `curl ${flag} is not allowed in read-only mode. Request body flags are blocked.`;
+}
+
+function validateCurlTarget(target: string): string | null {
+  const t = target.trim();
+  if (!t) return null;
+  if (/^https?:\/\//i.test(t)) return null;
+  if (/^(?:file|ftp|ftps|scp|sftp|dict|gopher|imap|ldap|ldaps|pop3|rtsp|smb|smtp|telnet|tftp):/i.test(t)) {
+    return `curl target "${t}" is not allowed. Only HTTP(S) targets are permitted.`;
+  }
+  if (t.startsWith("/") || t.startsWith("./") || t.startsWith("../") || t.startsWith("~")) {
+    return `curl target "${t}" is not allowed. Local file paths are blocked.`;
   }
   return null;
 }
 
 function validateCurl(args: string[]): string | null {
+  const targets: string[] = [];
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) continue; // URL (positional) allowed
+    if (!arg.startsWith("-")) {
+      targets.push(arg);
+      continue;
+    }
 
     // ── Long flags (--xxx) ──────────────────────────────────
     if (arg.startsWith("--")) {
@@ -650,17 +670,17 @@ function validateCurl(args: string[]): string | null {
 
     // If last char is a value-consuming flag, validate + consume next arg
     const lastChar = chars[chars.length - 1];
-    if (lastChar && "HXmwdAbeuxr".includes(lastChar)) {
+    if (lastChar && "HXmwAbeuxr".includes(lastChar)) {
       if (lastChar === "X") {
         const err = checkCurlMethod(args[i + 1]);
         if (err) return err;
       }
-      if (lastChar === "d") {
-        const err = checkCurlDataValue("-d", args[i + 1]);
-        if (err) return err;
-      }
       i++; // consume next arg as value
     }
+  }
+  for (const target of targets) {
+    const err = validateCurlTarget(target);
+    if (err) return err;
   }
   return null;
 }
@@ -1036,9 +1056,14 @@ function validateIp(cmd: string): string | null {
 // (Turing-complete language with command execution, file writes, etc.)
 
 function validateMount(args: string[]): string | null {
-  const nonFlagArgs = args.slice(1).filter((a) => !a.startsWith("-"));
-  if (nonFlagArgs.length >= 2) {
-    return "mount with device and mountpoint arguments is not allowed. Only listing mounts (mount without arguments or with -l) is permitted.";
+  if (args.length === 1) return null; // bare "mount" lists mounts
+  for (const arg of args.slice(1)) {
+    if (!arg.startsWith("-")) {
+      return "mount with positional arguments is not allowed. Only listing mounts (mount or mount -l) is permitted.";
+    }
+    if (arg !== "-l") {
+      return `mount "${arg}" is not allowed. Only listing mounts (mount or mount -l) is permitted.`;
+    }
   }
   return null;
 }
