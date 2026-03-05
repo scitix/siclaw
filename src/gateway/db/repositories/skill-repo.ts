@@ -17,6 +17,7 @@ export interface CreateSkillInput {
   dirName: string;
   forkedFromId?: string;
   version?: number;
+  labels?: string[];
 }
 
 export interface UpdateSkillInput {
@@ -33,6 +34,7 @@ export interface UpdateSkillInput {
   teamSourceSkillId?: string | null;
   teamPinnedVersion?: number | null;
   forkedFromId?: string | null;
+  labels?: string[] | null;
 }
 
 export class SkillRepository {
@@ -124,6 +126,7 @@ export class SkillRepository {
       status: "installed",
       contributionStatus: "none",
       forkedFromId: input.forkedFromId ?? null,
+      labelsJson: input.labels ?? null,
     });
     return id;
   }
@@ -146,6 +149,7 @@ export class SkillRepository {
     if (updates.teamSourceSkillId !== undefined) setFields.teamSourceSkillId = updates.teamSourceSkillId;
     if (updates.teamPinnedVersion !== undefined) setFields.teamPinnedVersion = updates.teamPinnedVersion;
     if (updates.forkedFromId !== undefined) setFields.forkedFromId = updates.forkedFromId;
+    if (updates.labels !== undefined) setFields.labelsJson = updates.labels;
 
     await this.db.update(skills).set(setFields).where(eq(skills.id, id));
   }
