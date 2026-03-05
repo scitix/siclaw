@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+src/gateway/web/node_modules/
+
+# Build output
+dist/
+src/gateway/web/dist/
+
+# Runtime data
+.siclaw/
+*.sqlite
+*.db
+
+# Environment & secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
