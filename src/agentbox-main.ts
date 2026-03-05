@@ -12,6 +12,7 @@ import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
+import { syncMcpFromGateway } from "./agentbox/mcp-sync.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -41,6 +42,26 @@ async function main() {
       fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
       reloadConfig();
       console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
+
+      // Fetch MCP config from Gateway and merge with local seed (exponential backoff)
+      {
+        const maxRetries = 3;
+        let mcpSynced = false;
+        for (let attempt = 0; attempt < maxRetries && !mcpSynced; attempt++) {
+          try {
+            const count = await syncMcpFromGateway(gatewayClient);
+            reloadConfig();
+            console.log(`[agentbox] Fetched MCP config from Gateway: ${count} servers`);
+            mcpSynced = true;
+          } catch (mcpErr: any) {
+            const delay = 1000 * 2 ** attempt; // 1s, 2s, 4s
+            console.warn(`[agentbox] Failed to fetch MCP config (attempt ${attempt + 1}/${maxRetries}): ${mcpErr.message}`);
+            if (attempt < maxRetries - 1) {
+              await new Promise((r) => setTimeout(r, delay));
+            }
+          }
+        }
+      }
 
       // Fetch and materialize skill bundle (team + personal only; builtin baked in image)
       try {

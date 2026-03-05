@@ -89,6 +89,13 @@ export class GatewayClient {
   }
 
   /**
+   * Fetch merged MCP servers config from Gateway
+   */
+  async fetchMcpServers(): Promise<{ mcpServers: Record<string, any> }> {
+    return this.request("/api/internal/mcp-servers", "GET");
+  }
+
+  /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
   private request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {

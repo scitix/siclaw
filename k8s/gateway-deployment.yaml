@@ -34,6 +34,9 @@ spec:
         - name: http
           containerPort: 3000
           protocol: TCP
+        - name: mtls
+          containerPort: 3002
+          protocol: TCP
         env:
         - name: NODE_ENV
           value: "production"
@@ -45,6 +48,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        - name: SICLAW_GATEWAY_HOSTNAME
+          value: "siclaw-gateway.siclaw.svc.cluster.local"
         - name: SICLAW_AGENTBOX_IMAGE
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
@@ -97,6 +102,10 @@ spec:
     port: 80
     targetPort: 3000
     nodePort: 31000
+    protocol: TCP
+  - name: mtls
+    port: 3002
+    targetPort: 3002
     protocol: TCP
 
 ---

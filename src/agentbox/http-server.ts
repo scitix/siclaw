@@ -15,8 +15,9 @@ import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
-import { loadConfig } from "../core/config.js";
+import { loadConfig, reloadConfig } from "../core/config.js";
 import { GatewayClient } from "./gateway-client.js";
+import { syncMcpFromGateway } from "./mcp-sync.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -624,6 +625,42 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     }
     sendJson(res, 200, { ok: true, reloaded: sessions.length - errors.length, errors });
+  });
+
+  /**
+   * POST /api/reload-mcp - hot-reload MCP configuration
+   *
+   * Fetches merged MCP config from Gateway via mTLS, writes to local disk.
+   * New sessions will pick up the updated config.
+   */
+  let _mcpGatewayClient: GatewayClient | null = null;
+  function getMcpGatewayClient(): GatewayClient | null {
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (!gatewayUrl) return null;
+    if (!_mcpGatewayClient) _mcpGatewayClient = new GatewayClient({ gatewayUrl });
+    return _mcpGatewayClient;
+  }
+
+  addRoute("POST", "/api/reload-mcp", async (_req, res) => {
+    console.log("[agentbox-http] Reloading MCP configuration");
+
+    const client = getMcpGatewayClient();
+    if (!client) {
+      console.warn("[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping MCP reload");
+      sendJson(res, 200, { ok: true, servers: 0 });
+      return;
+    }
+
+    try {
+      const count = await syncMcpFromGateway(client);
+      reloadConfig();
+
+      console.log(`[agentbox-http] MCP config reloaded: ${count} servers`);
+      sendJson(res, 200, { ok: true, servers: count });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Failed to reload MCP config: ${err.message}`);
+      sendJson(res, 500, { error: `MCP reload failed: ${err.message}` });
+    }
   });
 
   /**

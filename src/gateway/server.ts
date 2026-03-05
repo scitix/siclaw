@@ -21,6 +21,9 @@ import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
+import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
+import { loadMcpServersConfig } from "../core/mcp-client.js";
+import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 
@@ -1119,6 +1122,27 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} skills=${bundle.skills.length}`);
               } catch (err) {
                 console.error("[gateway] skills/bundle error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            })();
+            return;
+          }
+
+          // Internal MCP servers endpoint: GET /api/internal/mcp-servers
+          // Returns merged MCP config (local seed + DB overlay) for AgentBox consumption
+          if (url === "/api/internal/mcp-servers" && method === "GET") {
+            (async () => {
+              try {
+                const localConfig = loadMcpServersConfig(undefined, { localOnly: true });
+                const mcpRepo = db ? new McpServerRepository(db) : null;
+                const merged = await buildMergedMcpConfig(localConfig, mcpRepo);
+
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ mcpServers: merged }));
+                console.log(`[gateway] MCP servers served: ${Object.keys(merged).length} servers [${Object.keys(merged).join(", ")}]`);
+              } catch (err) {
+                console.error("[gateway] mcp-servers error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ error: "Internal server error" }));
               }
