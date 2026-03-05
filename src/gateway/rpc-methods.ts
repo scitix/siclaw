@@ -132,14 +132,16 @@ export function createRpcMethods(
 
   /** Notify a user's AgentBox(es) to hot-reload skills (fire-and-forget) */
   function notifySkillReload(userId: string): void {
-    resourceNotifier!.notifyUser(RESOURCE_DESCRIPTORS.skills, userId).catch((err) => {
+    if (!resourceNotifier) return;
+    resourceNotifier.notifyUser(RESOURCE_DESCRIPTORS.skills, userId).catch((err) => {
       console.warn(`[resource-notify] Skill reload failed for ${userId}:`, err.message);
     });
   }
 
   /** Notify ALL active AgentBoxes to reload (for team/core skill changes) */
   function notifyAllSkillReload(): void {
-    resourceNotifier!.notifyAll(RESOURCE_DESCRIPTORS.skills).catch((err) => {
+    if (!resourceNotifier) return;
+    resourceNotifier.notifyAll(RESOURCE_DESCRIPTORS.skills).catch((err) => {
       console.warn(`[resource-notify] All skill reload failed:`, err.message);
     });
   }
@@ -777,7 +779,8 @@ export function createRpcMethods(
 
   /** Notify all active AgentBoxes to reload MCP config from Gateway */
   async function notifyMcpChange(): Promise<void> {
-    const result = await resourceNotifier!.notifyAll(RESOURCE_DESCRIPTORS.mcp);
+    if (!resourceNotifier) return;
+    const result = await resourceNotifier.notifyAll(RESOURCE_DESCRIPTORS.mcp);
     console.log(`[resource-notify] MCP notification complete: ${result.success} succeeded, ${result.failed} failed`);
   }
 

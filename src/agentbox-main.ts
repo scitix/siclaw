@@ -44,7 +44,10 @@ async function main() {
       console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
 
       // Sync all resources (MCP, skills) from Gateway with retry
-      await syncAllResources(gatewayClient);
+      const { failed } = await syncAllResources(gatewayClient.toClientLike());
+      if (failed.length > 0) {
+        console.warn(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
+      }
     } catch (err) {
       console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
     }

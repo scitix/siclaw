@@ -12,9 +12,6 @@
 /** Every syncable resource has a well-known type key. */
 export type ResourceType = "mcp" | "skills";
 
-/** How the Gateway should fan out reload notifications. */
-export type NotifyMode = "broadcast" | "per-user";
-
 // ── Config / descriptor interfaces ────────────────────────────────────
 
 export interface RetryConfig {
@@ -34,23 +31,11 @@ export interface ResourceDescriptor {
   gatewayPath: string;
   /** AgentBox HTTP path the Gateway POSTs to trigger a reload. */
   reloadPath: string;
-  /** Supported notification modes. */
-  notifyModes: NotifyMode[];
   /** Default retry configuration for initial sync. */
   retry: RetryConfig;
 }
 
 // ── Gateway-side interfaces ───────────────────────────────────────────
-
-/**
- * Provides the raw resource payload on the Gateway side.
- * One implementation per ResourceType (e.g. MCP provider, skills provider).
- */
-export interface GatewayResourceProvider<T = unknown> {
-  type: ResourceType;
-  /** Fetch the resource for a given identity (userId / anonymous). */
-  fetch(identity?: string): Promise<T>;
-}
 
 /**
  * Result of a notify round — how many boxes succeeded / failed.
@@ -111,14 +96,12 @@ export const RESOURCE_DESCRIPTORS: Record<ResourceType, ResourceDescriptor> = {
     type: "mcp",
     gatewayPath: "/api/internal/mcp-servers",
     reloadPath: "/api/reload-mcp",
-    notifyModes: ["broadcast"],
     retry: { maxRetries: 3, baseDelayMs: 1000 },
   },
   skills: {
     type: "skills",
     gatewayPath: "/api/internal/skills/bundle",
     reloadPath: "/api/reload-skills",
-    notifyModes: ["broadcast", "per-user"],
     retry: { maxRetries: 3, baseDelayMs: 1000 },
   },
 };

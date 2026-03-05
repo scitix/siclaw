@@ -566,7 +566,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       const client = getReloadGatewayClient();
       if (!client) {
         console.warn(`[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping ${resourceType} reload`);
-        sendJson(res, 200, { ok: true, servers: 0 });
+        sendJson(res, 200, { ok: true, count: 0, type: resourceType });
         return;
       }
 
@@ -577,7 +577,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
 
       try {
-        const payload = await handler.fetch(client);
+        const payload = await handler.fetch(client.toClientLike());
         const count = await handler.materialize(payload);
 
         // Build session list for postReload (skills needs brain.reload())
@@ -591,7 +591,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         }
 
         console.log(`[agentbox-http] ${resourceType} reloaded: ${count} items`);
-        sendJson(res, 200, { ok: true, servers: count });
+        sendJson(res, 200, { ok: true, count, type: resourceType });
       } catch (err: any) {
         console.error(`[agentbox-http] Failed to reload ${resourceType}: ${err.message}`);
         sendJson(res, 500, { error: `${resourceType} reload failed: ${err.message}` });

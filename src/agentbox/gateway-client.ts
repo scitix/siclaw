@@ -68,9 +68,19 @@ export class GatewayClient {
   }
 
   /**
+   * Return a GatewayClientLike adapter for use with resource handlers.
+   * Keeps `request()` private while exposing a minimal interface.
+   */
+  toClientLike(): import("../shared/resource-sync.js").GatewayClientLike {
+    return {
+      request: (p: string, m: "GET" | "POST", b?: unknown) => this.request(p, m, b),
+    };
+  }
+
+  /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  public request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
+  private request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
