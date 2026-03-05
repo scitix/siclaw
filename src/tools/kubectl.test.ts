@@ -224,7 +224,7 @@ describe("createKubectlTool", () => {
     it("blocks sysctl -w via command restrictions", () => {
       const err = validateExecCommand(["exec", "pod", "--", "sysctl", "-w", "net.ipv4.ip_forward=1"]);
       expect(err).not.toBeNull();
-      expect(err).toContain("write");
+      expect(err).toContain("not allowed");
     });
 
     it("blocks curl -o via command restrictions", () => {

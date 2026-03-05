@@ -142,6 +142,10 @@ function tryLoadConfig(configPath: string): McpServersConfig | null {
     }
 
     const serverNames = Object.keys(json.mcpServers);
+    if (serverNames.length === 0) {
+      console.log(`[mcp-client] Config has no servers: ${configPath}`);
+      return null;
+    }
     console.log(`[mcp-client] Loaded config from ${configPath}: ${serverNames.length} servers [${serverNames.join(", ")}]`);
     return json;
   } catch (err) {

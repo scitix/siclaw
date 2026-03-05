@@ -610,7 +610,7 @@ describe("createRestrictedBashTool — blocks dangerous options in pipelines", (
     { cmd: "kubectl get pods | awk '{print $1}'", reason: "Blocked" },
     { cmd: "kubectl get pods -o yaml | sed 's/foo/bar/'", reason: "Blocked" },
     { cmd: "kubectl get nodes -o wide | ip addr add 10.0.0.1/24 dev eth0", reason: "not allowed" },
-    { cmd: "ls /var | find /tmp -name '*.log' -exec rm {} \\;", reason: "not allowed" },
+    { cmd: "ls /var | find /tmp -name '*.log' -exec rm {} \\;", reason: "disallowed command" },
   ];
 
   for (const { cmd, reason } of blockedPipelines) {
@@ -630,47 +630,49 @@ describe("createRestrictedBashTool — blocks dangerous options in pipelines", (
 describe("createRestrictedBashTool — find validation", () => {
   const tool = createRestrictedBashTool();
 
-  it("allows safe find commands", async () => {
+  // find is in LOCAL_BLOCKED_COMMANDS (local file access blocked in restricted-bash).
+  // These commands are allowed in node-exec/pod-exec (tested in command-sets.test.ts).
+  it("blocks find in restricted-bash (local file access)", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "find /tmp -name '*.log' -type f" },
       undefined,
       {} as any
     );
-    expect(result.content[0].text).not.toContain("Blocked");
-    expect(result.content[0].text).not.toContain("not allowed");
+    expect(result.content[0].text).toContain("disallowed command");
+    expect((result.details as any).blocked).toBe(true);
   });
 
-  it("allows find piped to grep", async () => {
+  it("blocks find piped to head in restricted-bash", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "find /tmp -name '*.yaml' | head -10" },
       undefined,
       {} as any
     );
-    expect(result.content[0].text).not.toContain("Blocked");
-    expect(result.content[0].text).not.toContain("not allowed");
+    expect(result.content[0].text).toContain("disallowed command");
+    expect((result.details as any).blocked).toBe(true);
   });
 
-  it("blocks find -exec", async () => {
+  it("blocks find -exec in restricted-bash", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "find . -name '*.sh' -exec chmod +x {} \\;" },
       undefined,
       {} as any
     );
-    expect(result.content[0].text).toContain("not allowed");
+    expect(result.content[0].text).toContain("disallowed command");
     expect((result.details as any).blocked).toBe(true);
   });
 
-  it("blocks find -delete", async () => {
+  it("blocks find -delete in restricted-bash", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "find /tmp -name '*.log' -delete" },
       undefined,
       {} as any
     );
-    expect(result.content[0].text).toContain("not allowed");
+    expect(result.content[0].text).toContain("disallowed command");
     expect((result.details as any).blocked).toBe(true);
   });
 });
@@ -881,14 +883,16 @@ describe("createRestrictedBashTool — sysctl/mount/env restrictions", () => {
     expect((result.details as any).blocked).toBe(true);
   });
 
-  it("blocks env command execution", async () => {
+  // env is in LOCAL_BLOCKED_COMMANDS (may expose secrets locally).
+  // The validateEnv restriction is tested in command-sets.test.ts for remote contexts.
+  it("blocks env command in restricted-bash (local secret exposure)", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "env ls" },
       undefined,
       {} as any
     );
-    expect(result.content[0].text).toContain("cannot be used to execute");
+    expect(result.content[0].text).toContain("disallowed command");
     expect((result.details as any).blocked).toBe(true);
   });
 });
@@ -1050,17 +1054,20 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
     expect((result.details as any).blocked).toBe(true);
   });
 
-  // simple commands without validators pass through
-  it("allows lsof (no validator needed)", async () => {
+  // lsof and zcat are in LOCAL_BLOCKED_COMMANDS (local file/process inspection blocked).
+  // They are allowed in node-exec/pod-exec (tested in command-sets.test.ts).
+  it("blocks lsof in restricted-bash (local file inspection)", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "lsof" },
       undefined,
       {} as any
     );
-    expect((result.details as any).blocked).toBeFalsy();
+    expect(result.content[0].text).toContain("disallowed command");
+    expect((result.details as any).blocked).toBe(true);
   });
 
+  // timedatectl is NOT in LOCAL_BLOCKED_COMMANDS, so it passes through
   it("allows timedatectl (no validator needed)", async () => {
     const result = await tool.execute(
       "test-id",
@@ -1071,13 +1078,14 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
     expect((result.details as any).blocked).toBeFalsy();
   });
 
-  it("allows zcat in pipeline", async () => {
+  it("blocks zcat in restricted-bash (local file reading)", async () => {
     const result = await tool.execute(
       "test-id",
       { command: "zcat /var/log/syslog.1.gz | head -20" },
       undefined,
       {} as any
     );
-    expect((result.details as any).blocked).toBeFalsy();
+    expect(result.content[0].text).toContain("disallowed command");
+    expect((result.details as any).blocked).toBe(true);
   });
 });
