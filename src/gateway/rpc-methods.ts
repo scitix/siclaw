@@ -2009,6 +2009,23 @@ export function createRpcMethods(
     if (meta.authorId !== userId) throw new Error("Cannot submit another user's skill");
 
     const isPending = (meta as any).reviewStatus === "pending";
+    const publishedVersion = (meta as any).publishedVersion as number | null;
+
+    // Guard: no changes since last publish — nothing to submit
+    if (publishedVersion != null && meta.version <= publishedVersion) {
+      if (contributeToTeam) {
+        // Check if already contributed
+        const contributionStatus = (meta as any).contributionStatus as string;
+        if (contributionStatus === "approved") {
+          throw new Error("This skill has already been contributed to the team. Edit the skill first before re-contributing.");
+        }
+        if (contributionStatus === "pending") {
+          throw new Error("This skill is already pending contribution review.");
+        }
+      } else {
+        throw new Error("No changes since last publish. Edit the skill first before re-submitting.");
+      }
+    }
 
     // 1. Snapshot working copy → staging (DB)
     if (skillContentRepo) {

@@ -209,6 +209,17 @@ export function SkillsPage() {
         toggleEnabled(skill);
     };
 
+    const showError = (message: string) => {
+        setDialogState({
+            isOpen: true,
+            title: 'Error',
+            description: message,
+            variant: 'warning',
+            confirmText: 'OK',
+            onConfirm: () => { },
+        });
+    };
+
     const handlePublish = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
         setDialogState({
@@ -217,7 +228,7 @@ export function SkillsPage() {
             description: `Are you sure you want to publish "${skill.name}"? It will be reviewed by an admin before becoming available in production.`,
             variant: 'primary',
             confirmText: 'Request Publish',
-            onConfirm: () => { requestPublish(skill); }
+            onConfirm: () => { requestPublish(skill).catch((err: any) => showError(err?.message || String(err))); }
         });
     };
 
@@ -229,7 +240,7 @@ export function SkillsPage() {
             description: `Contribute "${skill.name}" to the team? An admin will review before it becomes a shared team skill.`,
             variant: 'primary',
             confirmText: 'Contribute',
-            onConfirm: () => { publishSkill(skill, true); }
+            onConfirm: () => { publishSkill(skill, true).catch((err: any) => showError(err?.message || String(err))); }
         });
     };
 
