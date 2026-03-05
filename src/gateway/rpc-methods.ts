@@ -1556,6 +1556,7 @@ export function createRpcMethods(
     let sourceFiles: SkillFiles | null = null;
     let sourceDirName: string;
     let sourceScope: string;
+    let sourceLabels: string[] | null = null;
 
     if (sourceId.startsWith("builtin:") || sourceId.startsWith("core:") || sourceId.startsWith("extension:")) {
       // Builtin skill — read from filesystem
@@ -1567,6 +1568,8 @@ export function createRpcMethods(
       sourceDescription = parsed.description || undefined;
       sourceType = "Custom";
       sourceScope = "builtin";
+      const fsLabels = getLabelsForSkill(`builtin:${sourceDirName}`);
+      sourceLabels = fsLabels.length > 0 ? fsLabels : null;
     } else {
       // DB skill (team or personal)
       const sourceMeta = await skillRepo.getById(sourceId);
@@ -1579,6 +1582,10 @@ export function createRpcMethods(
       sourceType = sourceMeta.type ?? undefined;
       sourceDirName = sourceMeta.dirName;
       sourceScope = sourceMeta.scope;
+      const dbLabels: string[] = (sourceMeta as any).labelsJson ?? [];
+      const fsLabels = getLabelsForSkill(`${sourceMeta.scope}:${sourceDirName}`);
+      const merged = [...new Set([...dbLabels, ...fsLabels])];
+      sourceLabels = merged.length > 0 ? merged : null;
 
       if (skillContentRepo) {
         const tag = sourceMeta.scope === "team" ? "published" : "working";
@@ -1591,6 +1598,9 @@ export function createRpcMethods(
     const effectiveDescription = (params.description as string) ?? sourceDescription;
     const effectiveType = (params.type as string) ?? sourceType;
     const effectiveSpecs = (params.specs as string) ?? sourceFiles?.specs;
+    const effectiveLabels = params.labels !== undefined
+      ? (params.labels as string[] | null)
+      : sourceLabels;
     const rawScripts = params.scripts as Array<{ name: string; content?: string }> | undefined;
     const effectiveScripts = rawScripts
       ? rawScripts.map(s => ({
@@ -1630,6 +1640,7 @@ export function createRpcMethods(
     }
 
     // ── 5. Create personal skill ──
+    const cleanedLabels = effectiveLabels?.map(l => l.trim()).filter(Boolean);
     const id = await skillRepo.create({
       name: effectiveName,
       description: effectiveDescription,
@@ -1639,6 +1650,7 @@ export function createRpcMethods(
       dirName,
       forkedFromId: sourceId,
       version: inheritVersion,
+      labels: cleanedLabels && cleanedLabels.length > 0 ? cleanedLabels : undefined,
     });
 
     // ── 6. Save content ──

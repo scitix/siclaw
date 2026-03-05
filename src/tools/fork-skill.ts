@@ -6,6 +6,7 @@ interface ForkSkillParams {
   source: string;
   specs?: string;
   scripts?: Array<{ name: string; content?: string }>;
+  labels?: string[];
 }
 
 export function createForkSkillTool(): ToolDefinition {
@@ -57,6 +58,9 @@ Examples:
           { description: "Modified scripts. If omitted, all source scripts are copied." }
         )
       ),
+      labels: Type.Optional(
+        Type.Array(Type.String(), { description: "Labels/tags for the forked skill (e.g. ['gpu', 'network'])" })
+      ),
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as ForkSkillParams;
@@ -83,6 +87,7 @@ Examples:
 
       const hasScripts = params.scripts && params.scripts.length > 0;
       const hasModifications = !!params.specs || hasScripts;
+      const labels = params.labels?.map(l => l.trim()).filter(Boolean);
 
       const result = {
         fork: true,
@@ -96,6 +101,7 @@ Examples:
             name: s.name,
             content: s.content,
           })) || [],
+          labels: labels && labels.length > 0 ? labels : undefined,
         },
         summary: hasModifications
           ? `Forked skill '${sourceName}' with modifications. Please review and click Save to Personal.`
