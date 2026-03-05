@@ -249,5 +249,18 @@ Write a clear, actionable conclusion that:
 3. Provides specific remediation steps if applicable.
 4. Notes any inconclusive areas that need further investigation.
 
-Keep it concise (3-5 paragraphs max). Do NOT repeat all the evidence — summarize the key findings.`;
+Keep it concise (3-5 paragraphs max). Do NOT repeat all the evidence — summarize the key findings.
+
+After your conclusion text, output a structured extraction in this exact format:
+
+STRUCTURED_EXTRACTION_START
+{"root_cause_category":"<category>","affected_entities":["<entity1>"],"environment_tags":["<tag1>"],"causal_chain":["<step1>","<step2>"],"confidence":<0-100>}
+STRUCTURED_EXTRACTION_END
+
+Rules for structured extraction:
+- root_cause_category: one of: mtu_mismatch, pcie_error, driver_issue, firmware_bug, config_error, resource_exhaustion, network_partition, scheduling_failure, hardware_failure, software_bug, permission_denied, unknown
+- affected_entities: K8s resource paths like "pod/name", "node/name", "ns/name", "svc/name"
+- environment_tags: cluster/infra identifiers found during investigation
+- causal_chain: ordered list of cause-effect steps leading to the root cause
+- confidence: your overall confidence in the root cause diagnosis (0-100)`;
 }

@@ -42,6 +42,21 @@ export function initMemoryDb(dbPath: string): DatabaseSync {
       content_rowid='id'
     );
 
+    CREATE TABLE IF NOT EXISTS investigations (
+      id                  TEXT PRIMARY KEY,
+      question            TEXT NOT NULL,
+      root_cause_category TEXT,
+      affected_entities   TEXT,
+      environment_tags    TEXT,
+      causal_chain        TEXT,
+      confidence          INTEGER,
+      conclusion          TEXT,
+      duration_ms         INTEGER,
+      total_tool_calls    INTEGER,
+      hypotheses_json     TEXT,
+      created_at          INTEGER NOT NULL
+    );
+
     -- Triggers to keep FTS in sync
     CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
       INSERT INTO chunks_fts(rowid, content, heading) VALUES (new.id, new.content, new.heading);

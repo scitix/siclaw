@@ -4,7 +4,7 @@ import { createEmbeddingProvider } from "./embeddings.js";
 
 export { MemoryIndexer, type MemorySearchConfig } from "./indexer.js";
 export { createEmbeddingProvider } from "./embeddings.js";
-export type { MemoryChunk, MemorySearchResult, EmbeddingProvider } from "./types.js";
+export type { MemoryChunk, MemorySearchResult, EmbeddingProvider, InvestigationRecord } from "./types.js";
 export type { TemporalDecayConfig } from "./temporal-decay.js";
 export type { MMRConfig } from "./mmr.js";
 
