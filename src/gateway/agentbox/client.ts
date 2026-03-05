@@ -6,6 +6,7 @@
  */
 
 import https from "node:https";
+import { RESOURCE_DESCRIPTORS, type ResourceType } from "../../shared/resource-sync.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -146,20 +147,11 @@ export class AgentBoxClient {
   }
 
   /**
-   * Hot-reload skills — notify AgentBox to rescan the skills directory
+   * Generic resource reload — POST to the descriptor's reloadPath.
    */
-  async reloadSkills(): Promise<{ ok: boolean; reloaded: number; errors: string[] }> {
-    const resp = await this.fetch("/api/reload-skills", {
-      method: "POST",
-    });
-    return resp.json();
-  }
-
-  /**
-   * Hot-reload MCP configuration — notify AgentBox to refetch from Gateway
-   */
-  async reloadMcp(): Promise<{ ok: boolean; servers: number }> {
-    const resp = await this.fetch("/api/reload-mcp", {
+  async reloadResource(type: ResourceType): Promise<unknown> {
+    const descriptor = RESOURCE_DESCRIPTORS[type];
+    const resp = await this.fetch(descriptor.reloadPath, {
       method: "POST",
     });
     return resp.json();

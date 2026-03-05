@@ -36,6 +36,8 @@ import yaml from "js-yaml";
 import { notifyCronService as notifyCronServiceImpl } from "./cron/notify.js";
 import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
+import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+import type { ResourceNotifier } from "../shared/resource-sync.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -60,6 +62,7 @@ export function createRpcMethods(
   sendToUser?: SendToUserFn,
   activePromptUsers?: Set<string>,
   agentBoxTlsOptions?: AgentBoxTlsOptions,
+  resourceNotifier?: ResourceNotifier,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
@@ -129,23 +132,18 @@ export function createRpcMethods(
 
   /** Notify a user's AgentBox(es) to hot-reload skills (fire-and-forget) */
   function notifySkillReload(userId: string): void {
-    const handles = agentBoxManager.getForUser(userId);
-    if (handles.length === 0) return; // No active AgentBox, next session will pick up changes
-    for (const handle of handles) {
-      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-      client.reloadSkills().then((r) => {
-        console.log(`[rpc] Skill reload notified for ${userId} box=${handle.boxId}: reloaded=${r.reloaded}`);
-      }).catch((err) => {
-        console.warn(`[rpc] Skill reload failed for ${userId} box=${handle.boxId}:`, err.message);
-      });
-    }
+    if (!resourceNotifier) return;
+    resourceNotifier.notifyUser(RESOURCE_DESCRIPTORS.skills, userId).catch((err) => {
+      console.warn(`[resource-notify] Skill reload failed for ${userId}:`, err.message);
+    });
   }
 
   /** Notify ALL active AgentBoxes to reload (for team/core skill changes) */
   function notifyAllSkillReload(): void {
-    for (const userId of agentBoxManager.activeUserIds()) {
-      notifySkillReload(userId);
-    }
+    if (!resourceNotifier) return;
+    resourceNotifier.notifyAll(RESOURCE_DESCRIPTORS.skills).catch((err) => {
+      console.warn(`[resource-notify] All skill reload failed:`, err.message);
+    });
   }
   // Initialize skills dir
   skillWriter.init()
@@ -781,31 +779,9 @@ export function createRpcMethods(
 
   /** Notify all active AgentBoxes to reload MCP config from Gateway */
   async function notifyMcpChange(): Promise<void> {
-    const promises: Array<Promise<{ userId: string; boxId: string; result: PromiseSettledResult<any> }>> = [];
-    for (const userId of agentBoxManager.activeUserIds()) {
-      const handles = agentBoxManager.getForUser(userId);
-      for (const handle of handles) {
-        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-        promises.push(
-          client.reloadMcp()
-            .then((r) => ({ userId, boxId: handle.boxId, result: { status: "fulfilled" as const, value: r } }))
-            .catch((err) => ({ userId, boxId: handle.boxId, result: { status: "rejected" as const, reason: err } })),
-        );
-      }
-    }
-    const results = await Promise.all(promises);
-    let success = 0;
-    let failed = 0;
-    for (const { userId, boxId, result } of results) {
-      if (result.status === "fulfilled") {
-        success++;
-        console.log(`[mcp-notify] Reloaded MCP for ${userId} box=${boxId}: ${result.value.servers} servers`);
-      } else {
-        failed++;
-        console.warn(`[mcp-notify] Failed to notify ${userId} box=${boxId}: ${result.reason.message}`);
-      }
-    }
-    console.log(`[mcp-notify] Notification complete: ${success} succeeded, ${failed} failed`);
+    if (!resourceNotifier) return;
+    const result = await resourceNotifier.notifyAll(RESOURCE_DESCRIPTORS.mcp);
+    console.log(`[resource-notify] MCP notification complete: ${result.success} succeeded, ${result.failed} failed`);
   }
 
   methods.set("mcp.list", async (_params, context: RpcContext) => {
