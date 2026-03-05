@@ -3,10 +3,14 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "siclaw-tui": "./siclaw-tui.mjs",
-    "siclaw-gateway": "./siclaw-gateway.mjs",
-    "siclaw-agentbox": "./siclaw-agentbox.mjs"
+    "siclaw": "./siclaw.mjs"
   },
+  "files": [
+    "dist/",
+    "siclaw.mjs",
+    "skills/",
+    "settings.example.json"
+  ],
   "engines": {
     "node": ">=22.12.0"
   },
@@ -60,8 +64,10 @@
     "vitest": "^3.0.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run copy:web",
     "build:web": "cd src/gateway/web && npm install && npm run build",
+    "copy:web": "node -e \"const fs=require('fs');const p=require('path');const s=p.join('src','gateway','web','dist');const d=p.join('dist','gateway','web','dist');if(fs.existsSync(s)){fs.cpSync(s,d,{recursive:true});console.log('Copied web UI to '+d)}\"",
+    "prepublishOnly": "npm run build:web && npm run build",
     "dev": "tsx src/cli-main.ts",
     "dev:gateway": "npm run build:web && tsx src/gateway-main.ts",
     "dev:agentbox": "tsx src/agentbox-main.ts",
