@@ -2133,6 +2133,7 @@ export function createRpcMethods(
         const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
 
         let teamSkillId: string;
+        const srcLabels = (meta as any).labelsJson as string[] | null;
         if (existingTeam) {
           teamSkillId = existingTeam.id;
           console.log(`[skill.review] Updating existing team skill ${teamSkillId} (dirName=${meta.dirName})`);
@@ -2143,6 +2144,7 @@ export function createRpcMethods(
             teamPinnedVersion: publishedVer,
             reviewStatus: "approved",
             publishedVersion: publishedVer,
+            labels: srcLabels ?? undefined,
           });
           await skillRepo.bumpVersion(existingTeam.id);
         } else {
@@ -2154,6 +2156,7 @@ export function createRpcMethods(
             scope: "team",
             authorId: meta.authorId ?? undefined,
             dirName: meta.dirName,
+            labels: srcLabels ?? undefined,
           });
           await skillRepo.update(teamSkillId, {
             teamSourceSkillId: skillId,
