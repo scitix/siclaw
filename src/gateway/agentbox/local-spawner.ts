@@ -185,7 +185,10 @@ export class LocalSpawner implements BoxSpawner {
 
   /** Sync skills for a user */
   private async syncSkills(userId: string): Promise<void> {
-    if (!this.skillBundleProvider) return;
+    if (!this.skillBundleProvider) {
+      console.warn(`[local-spawner] Skills sync skipped: no bundle provider configured`);
+      return;
+    }
     try {
       const bundle = await this.skillBundleProvider(userId, "prod");
       const count = await skillsHandler.materialize(bundle);
@@ -203,6 +206,7 @@ export class LocalSpawner implements BoxSpawner {
    */
   async reloadResource(type: ResourceType, userId?: string): Promise<void> {
     if (type === "mcp") {
+      // MCP is a global resource (not user-scoped), so userId is intentionally ignored.
       await this.syncMcp();
       // postReload: reloadConfig so next session creation uses new MCP config
       await mcpHandler.postReload?.({});

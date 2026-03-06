@@ -353,6 +353,16 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     sdb.run(sql.raw(ddl));
   }
 
+  // Trigger: auto-update updated_at on mcp_servers UPDATE (mirrors MySQL ON UPDATE CURRENT_TIMESTAMP)
+  sdb.run(sql.raw(`
+    CREATE TRIGGER IF NOT EXISTS trg_mcp_servers_updated_at
+    AFTER UPDATE ON mcp_servers
+    FOR EACH ROW
+    BEGIN
+      UPDATE mcp_servers SET updated_at = unixepoch() WHERE id = NEW.id;
+    END
+  `));
+
   // Seed default embedding config if not present
   sdb.run(sql.raw(
     `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)

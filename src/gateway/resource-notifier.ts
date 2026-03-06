@@ -109,8 +109,9 @@ export function createResourceNotifier(
       if (localReloader) {
         try {
           await localReloader(descriptor.type);
-          console.log(`[resource-notify] ${descriptor.type} local reload OK`);
-          return { resourceType: descriptor.type, success: 1, failed: 0 };
+          const boxCount = Math.max(1, manager.activeUserIds().length);
+          console.log(`[resource-notify] ${descriptor.type} local reload OK (${boxCount} boxes)`);
+          return { resourceType: descriptor.type, success: boxCount, failed: 0 };
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[resource-notify] ${descriptor.type} local reload failed: ${msg}`);

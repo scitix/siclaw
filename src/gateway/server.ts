@@ -27,6 +27,7 @@ import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import { createResourceNotifier } from "./resource-notifier.js";
+import { LocalSpawner } from "./agentbox/local-spawner.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -195,10 +196,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
   // Wire local-mode resource sync: inject DB repo + localReloader
   // For LocalSpawner, resources are synced in-process (no HTTP + mTLS round-trip).
-  const isLocalSpawner = spawner?.name === "local";
-  const localSpawner = isLocalSpawner
-    ? spawner as import("./agentbox/local-spawner.js").LocalSpawner
-    : null;
+  const localSpawner = spawner instanceof LocalSpawner ? spawner : null;
 
   if (localSpawner && db) {
     localSpawner.setMcpRepo(new McpServerRepository(db));
