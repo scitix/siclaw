@@ -4,79 +4,113 @@ sidebarTitle: "LLM Providers"
 description: "Configure Siclaw to use Anthropic, OpenAI, Ollama, or any compatible LLM."
 ---
 
-Siclaw needs an LLM to power its investigation engine. Configure via `~/.siclaw/config/settings.json` or environment variables.
+Siclaw needs an LLM to power its investigation engine. Configure via `~/.siclaw/config/settings.json` or environment variable overrides.
 
 ## Anthropic (Recommended)
 
 ```json
 {
-  "llm": {
-    "provider": "anthropic",
-    "apiKey": "sk-ant-...",
-    "model": "claude-sonnet-4-20250514"
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic",
+      "authHeader": true,
+      "models": [{
+        "id": "claude-sonnet-4-20250514",
+        "name": "Claude Sonnet 4",
+        "contextWindow": 200000,
+        "maxTokens": 16000
+      }]
+    }
   }
 }
 ```
 
-Or via environment variable:
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-Recommended models: `claude-sonnet-4-20250514` (best balance of speed and quality) or `claude-opus-4-20250514` (highest quality for complex investigations).
+Recommended models: `claude-sonnet-4-20250514` (best balance) or `claude-opus-4-20250514` (highest quality).
 
 ## OpenAI
 
 ```json
 {
-  "llm": {
-    "provider": "openai",
-    "apiKey": "sk-...",
-    "model": "gpt-4o"
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [{
+        "id": "gpt-4o",
+        "name": "GPT-4o",
+        "contextWindow": 128000,
+        "maxTokens": 16384
+      }]
+    }
   }
 }
-```
-
-Or:
-
-```bash
-export OPENAI_API_KEY="sk-..."
-export OPENAI_MODEL="gpt-4o"
 ```
 
 ## OpenAI-Compatible Providers
 
-Any API that implements the OpenAI chat completions format works with Siclaw. This includes Ollama, vLLM, LiteLLM, Azure OpenAI, Moonshot, and many others.
+Any API that implements the OpenAI chat completions format works with Siclaw — Ollama, vLLM, LiteLLM, Azure OpenAI, Moonshot, DeepSeek, and many others.
 
 ```json
 {
-  "llm": {
-    "provider": "openai-compatible",
-    "baseUrl": "http://localhost:11434/v1",
-    "apiKey": "ollama",
-    "model": "llama3.1:70b"
+  "providers": {
+    "default": {
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "ollama",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [{
+        "id": "llama3.1:70b",
+        "name": "Llama 3.1 70B",
+        "contextWindow": 131072,
+        "maxTokens": 8192
+      }]
+    }
   }
 }
-```
-
-Or:
-
-```bash
-export OPENAI_BASE_URL="http://localhost:11434/v1"
-export OPENAI_API_KEY="ollama"
-export OPENAI_MODEL="llama3.1:70b"
 ```
 
 ### Common Providers
 
 | Provider | `baseUrl` | Notes |
 |----------|-----------|-------|
-| **Ollama** | `http://localhost:11434/v1` | Local, free. Use 70B+ models for best results. |
+| **Ollama** | `http://localhost:11434/v1` | Local, free. Use 70B+ for best results. |
 | **vLLM** | `http://localhost:8000/v1` | Self-hosted GPU inference |
-| **Azure OpenAI** | `https://{resource}.openai.azure.com/openai/deployments/{deployment}` | Set deployment as model |
 | **Moonshot (Kimi)** | `https://api.moonshot.cn/v1` | `moonshot-v1-128k` |
 | **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| **Qwen (DashScope)** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+
+<Tip>
+See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for a complete example with all fields.
+</Tip>
+
+## Environment Variable Overrides
+
+These override the default provider's settings at runtime (highest priority):
+
+```bash
+SICLAW_LLM_API_KEY=sk-...       # Override default provider's API key
+SICLAW_LLM_BASE_URL=https://... # Override default provider's base URL
+SICLAW_LLM_MODEL=gpt-4o         # Override default model ID
+```
+
+API keys also support `$VAR` / `${VAR}` references in `settings.json`:
+
+```json
+{
+  "providers": {
+    "default": {
+      "apiKey": "${MY_API_KEY}",
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
+    }
+  }
+}
+```
 
 ## Embedding Provider
 
@@ -102,34 +136,6 @@ Embedding is used for memory search — matching current symptoms against past i
 | **BGE-M3** (recommended) | `bge-m3` | 1024 | Multilingual, good for technical content |
 | **OpenAI** | `text-embedding-3-small` | 1536 | Easy setup if you already have an OpenAI key |
 | **Ollama** | `nomic-embed-text` | 768 | Local, free |
-
-## Environment Variables Reference
-
-All LLM settings can be overridden via environment variables:
-
-```bash
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-
-# OpenAI / Compatible
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.example.com/v1
-OPENAI_MODEL=gpt-4o
-
-# Database (Gateway / K8s mode)
-DB_TYPE=mysql
-DB_HOST=mysql.svc.cluster.local
-DB_PORT=3306
-DB_NAME=siclaw
-DB_USER=siclaw
-DB_PASSWORD=...
-
-# Channels
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-LARK_APP_ID=cli_...
-LARK_APP_SECRET=...
-```
 
 ## Model Recommendations
 

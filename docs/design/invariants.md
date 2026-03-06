@@ -72,7 +72,7 @@ Bundle ≠ core skills (baked into image/repo checkout)
 skills/
 ├── core/          ← Built-in, read-only, baked into image. Never overwritten by sync.
 ├── team/          ← Admin-managed via WebUI, synced from DB
-├── user/&lt;userId&gt;/ ← Personal skills, synced from DB per user
+├── user/{userId}/ ← Personal skills, synced from DB per user
 └── extension/     ← Optional overlay builds
 ```
 

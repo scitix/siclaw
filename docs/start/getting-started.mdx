@@ -6,7 +6,7 @@ description: "Install Siclaw and run your first investigation in under 5 minutes
 
 ## Prerequisites
 
-- **Node.js** ≥ 22.12.0
+- **Node.js** >= 22.12.0
 - **kubectl** configured with access to a Kubernetes cluster
 - An **LLM API key** (Anthropic, OpenAI, or any OpenAI-compatible provider)
 
@@ -38,10 +38,10 @@ npm run dev
 
 ## Configure Your LLM
 
-On first run, Siclaw will prompt you to configure an LLM provider. You can also set it via environment variables:
+On first run, Siclaw will prompt you to configure an LLM provider. You can also override via environment variables:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+export SICLAW_LLM_API_KEY="sk-ant-..."
 npx siclaw
 ```
 
@@ -49,10 +49,13 @@ Or configure manually in `~/.siclaw/config/settings.json`:
 
 ```json
 {
-  "llm": {
-    "provider": "anthropic",
-    "apiKey": "sk-ant-...",
-    "model": "claude-sonnet-4-20250514"
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic",
+      "models": [{ "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" }]
+    }
   }
 }
 ```

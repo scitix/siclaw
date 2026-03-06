@@ -21,11 +21,11 @@ skills/core/k8s-pod-diagnostics/
 skills/
 ├── core/             ← Built-in, read-only, ships with Siclaw
 ├── team/             ← Team-managed via Web UI, admin-published
-├── user/{userId}/    ← Personal skills, per-user
+├── user/&lt;userId&gt;/    ← Personal skills, per-user
 └── extension/        ← Optional overlay builds
 ```
 
-**Loading priority** (highest wins): `user/{userId}` > `team` > `core`
+**Loading priority** (highest wins): personal > `team` > `core`
 
 ## Creating a Skill
 
@@ -68,7 +68,7 @@ draft → request review → pending → AI + static analysis → approved/rejec
 
 ### Static Analysis
 
-27 danger patterns are checked automatically:
+Danger patterns are checked automatically:
 
 | Severity | Examples |
 |----------|---------|

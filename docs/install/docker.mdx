@@ -26,9 +26,9 @@ services:
     ports:
       - "3001:3001"    # Web UI + API
     environment:
-      - LLM_PROVIDER=anthropic
-      - LLM_API_KEY=sk-ant-...
-      - LLM_MODEL=claude-sonnet-4-20250514
+      - SICLAW_LLM_API_KEY=sk-ant-...
+      - SICLAW_LLM_BASE_URL=https://api.anthropic.com/v1
+      - SICLAW_LLM_MODEL=claude-sonnet-4-20250514
     volumes:
       - siclaw-data:/app/.siclaw
       - ~/.kube/config:/app/.kube/config:ro
@@ -55,9 +55,9 @@ All users share the same filesystem in Docker mode. This is a development/small-
 Connect messaging platforms by setting environment variables:
 
 ```bash
-# Slack
+# Slack (Socket Mode)
 SLACK_BOT_TOKEN=xoxb-...
-SLACK_SIGNING_SECRET=...
+SLACK_APP_TOKEN=xapp-...
 
 # Lark
 LARK_APP_ID=...

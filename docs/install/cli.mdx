@@ -39,7 +39,7 @@ Siclaw stores its configuration and data in `~/.siclaw/`:
 ~/.siclaw/
 ├── config/
 │   └── settings.json     ← LLM provider, model, API key
-├── data.sqlite            ← Session data (sql.js)
+├── data.sqlite            ← Session data (Gateway mode, sql.js)
 ├── memory/
 │   ├── .memory.db         ← Investigation memory (node:sqlite)
 │   └── *.md               ← Raw memory files
@@ -49,27 +49,30 @@ Siclaw stores its configuration and data in `~/.siclaw/`:
 
 ### LLM Configuration
 
-Edit `~/.siclaw/config/settings.json`:
+Edit `~/.siclaw/config/settings.json` (see [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for full format):
 
 ```json
 {
-  "llm": {
-    "provider": "anthropic",
-    "apiKey": "sk-ant-...",
-    "model": "claude-sonnet-4-20250514"
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic",
+      "models": [{ "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" }]
+    }
   }
 }
 ```
 
-Or use environment variables:
+Or use environment variable overrides:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-# or
-export OPENAI_API_KEY="sk-..."
-export OPENAI_BASE_URL="https://api.example.com/v1"
-export OPENAI_MODEL="gpt-4o"
+export SICLAW_LLM_API_KEY="sk-ant-..."
+export SICLAW_LLM_BASE_URL="https://api.openai.com/v1"
+export SICLAW_LLM_MODEL="gpt-4o"
 ```
+
+See [LLM Providers](/configuration/providers) for Ollama, vLLM, and other setups.
 
 ### Kubeconfig
 
@@ -81,7 +84,7 @@ KUBECONFIG=/path/to/kubeconfig siclaw
 
 ## Embedding (Optional)
 
-To enable Investigation Memory with semantic search, configure an embedding provider:
+To enable Investigation Memory with semantic search, add an embedding config:
 
 ```json
 {
