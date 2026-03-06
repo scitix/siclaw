@@ -918,7 +918,7 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
       undefined,
       {} as any
     );
-    expect(result.content[0].text).toContain("follow");
+    expect(result.content[0].text).toContain("-f");
     expect((result.details as any).blocked).toBe(true);
   });
 
