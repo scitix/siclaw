@@ -21,12 +21,13 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 ## Features
 
 - **Deep Investigation** — Hypothesis-driven 4-phase diagnostic engine (context gathering → hypothesis generation → parallel validation → root-cause conclusion), bringing Deep Research to SRE with cross-system, multi-dimensional fault analysis
+- **Investigation Memory** — Accumulates structured knowledge from every deep investigation into a local hybrid store (vector + full-text); surfaces relevant past experience during hypothesis generation so the agent gets smarter with every incident resolved
 - **Security Governance** — Strict permission layer between agent and infrastructure: read-only by default, command whitelist, write operations require per-item approval, credentials isolated by workspace — zero accidental mutations in production
 - **Team Collaboration** — Multi-workspace, multi-user management (SSO/OAuth2), isolated AgentBox sandboxes per user, designed for multi-team, multi-environment enterprise scenarios
 - **Alert-Driven Operations** — Webhook triggers connect to your existing monitoring stack (Prometheus, PagerDuty, custom), automatically launching agent investigations when alerts fire
 - **Scheduled Tasks** — Cron-based recurring jobs for routine health checks, periodic diagnostics, or any agent task — manageable via Web UI or natural language
 - **Skill System** — AI-generated diagnostic skills with automated risk-level review, supporting creation, forking, and hot-reload via Web UI or natural language — organize across core / team / personal tiers to codify your team's operational expertise into reusable, shareable runbooks
-- **Extensible** — [MCP](https://modelcontextprotocol.io) tool servers and persistent per-user memory (vector + keyword search) across sessions
+- **Extensible** — [MCP](https://modelcontextprotocol.io) tool servers for custom data source integrations
 - **Multi-Channel Access** — Terminal TUI, Web UI, or IM bots (Slack, Discord, Telegram, Lark)
 
 ## Architecture
@@ -42,8 +43,7 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 
 - **Node.js >= 22.12.0** — [Download](https://nodejs.org/)
 - **npm** — Comes with Node.js
-- **kubectl** — Required for K8s diagnostics ([Install guide](https://kubernetes.io/docs/tasks/tools/))
-- A valid **kubeconfig** pointing to your target cluster
+- **kubectl** + **kubeconfig** — Required for Kubernetes diagnostics only ([Install guide](https://kubernetes.io/docs/tasks/tools/)); not needed for TUI or Local Server mode without K8s access
 
 ## Quick Start
 
@@ -242,8 +242,9 @@ Configure a Lark bot in **Settings > Channels** of the web UI. You'll need:
 |-------|-----------|
 | Runtime | Node.js 22+ (ESM-only) |
 | Language | TypeScript 5.9 |
-| Agent | [pi-coding-agent](https://github.com/nicholasgriffintn/pi-coding-agent) / [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk) |
-| Database | MySQL or SQLite (via [sql.js](https://github.com/sql-js/sql.js)) + Drizzle ORM |
+| Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) / [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk) |
+| Database (gateway) | MySQL or SQLite (via [sql.js](https://github.com/sql-js/sql.js)) + Drizzle ORM |
+| Database (memory) | node:sqlite + FTS5 + bge-m3 embeddings |
 | Frontend | React + Vite + Tailwind CSS |
 | K8s Client | @kubernetes/client-node |
 | MCP | @modelcontextprotocol/sdk |
