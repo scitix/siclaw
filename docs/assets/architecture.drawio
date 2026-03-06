@@ -1,0 +1,186 @@
+<mxGraphModel dx="1422" dy="762" grid="0" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="0" pageScale="1" pageWidth="1200" pageHeight="910" math="0" shadow="0">
+  <root>
+    <mxCell id="0"/>
+    <mxCell id="1" parent="0"/>
+
+    <!-- Layer 1: User Interfaces -->
+    <mxCell id="L1" value="User Interfaces" style="swimlane;startSize=25;fillColor=#EFF6FF;strokeColor=#3B82F6;fontColor=#1D4ED8;fontSize=13;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="1">
+      <mxGeometry x="20" y="15" width="1160" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="L1a" value="TUI / CLI" style="rounded=1;whiteSpace=wrap;fillColor=#DBEAFE;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;" vertex="1" parent="L1">
+      <mxGeometry x="10" y="33" width="255" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L1b" value="Web UI" style="rounded=1;whiteSpace=wrap;fillColor=#DBEAFE;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;" vertex="1" parent="L1">
+      <mxGeometry x="275" y="33" width="200" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L1c" value="Slack / Discord / Telegram / Lark" style="rounded=1;whiteSpace=wrap;fillColor=#DBEAFE;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;" vertex="1" parent="L1">
+      <mxGeometry x="485" y="33" width="380" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L1d" value="Webhooks / Cron" style="rounded=1;whiteSpace=wrap;fillColor=#DBEAFE;strokeColor=#3B82F6;fontColor=#1E40AF;fontSize=11;" vertex="1" parent="L1">
+      <mxGeometry x="875" y="33" width="275" height="42" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow L1 to L2 -->
+    <mxCell id="E1" value="HTTP / WebSocket" style="edgeStyle=orthogonalEdgeStyle;rounded=0;fontSize=10;fontColor=#374151;strokeColor=#6B7280;fontStyle=0;" edge="1" source="L1" target="L2" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Layer 2: Gateway -->
+    <mxCell id="L2" value="Gateway  ·  Control Plane" style="swimlane;startSize=25;fillColor=#F5F3FF;strokeColor=#7C3AED;fontColor=#5B21B6;fontSize=13;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="1">
+      <mxGeometry x="20" y="145" width="1160" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="L2a" value="Auth (JWT / SSO / OIDC)" style="rounded=1;whiteSpace=wrap;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=11;" vertex="1" parent="L2">
+      <mxGeometry x="10" y="33" width="220" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L2b" value="Session Manager" style="rounded=1;whiteSpace=wrap;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=11;" vertex="1" parent="L2">
+      <mxGeometry x="240" y="33" width="185" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L2c" value="Skill Management" style="rounded=1;whiteSpace=wrap;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=11;" vertex="1" parent="L2">
+      <mxGeometry x="435" y="33" width="185" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L2d" value="Cron Scheduler" style="rounded=1;whiteSpace=wrap;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=11;" vertex="1" parent="L2">
+      <mxGeometry x="630" y="33" width="185" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L2e" value="DB: MySQL / SQLite" style="rounded=1;whiteSpace=wrap;fillColor=#EDE9FE;strokeColor=#7C3AED;fontColor=#4C1D95;fontSize=11;" vertex="1" parent="L2">
+      <mxGeometry x="825" y="33" width="325" height="42" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow L2 to L3 -->
+    <mxCell id="E2" value="mTLS (K8s) / HTTP (local)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;fontSize=10;fontColor=#374151;strokeColor=#6B7280;" edge="1" source="L2" target="L3" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Layer 3: AgentBox -->
+    <mxCell id="L3" value="AgentBox  ·  Execution Plane  (one per user  —  K8s Pod or in-process)" style="swimlane;startSize=25;fillColor=#F0FDFA;strokeColor=#0D9488;fontColor=#0F766E;fontSize=13;fontStyle=1;rounded=1;arcSize=2;" vertex="1" parent="1">
+      <mxGeometry x="20" y="275" width="1160" height="285" as="geometry"/>
+    </mxCell>
+
+    <!-- Agent Brain sub-box -->
+    <mxCell id="L3_brain" value="Agent Brain" style="swimlane;startSize=20;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=1;rounded=1;arcSize=5;" vertex="1" parent="L3">
+      <mxGeometry x="10" y="33" width="255" height="115" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_brain1" value="pi-agent · claude-sdk" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_brain">
+      <mxGeometry x="10" y="25" width="235" height="75" as="geometry"/>
+    </mxCell>
+
+    <!-- Tools sub-box -->
+    <mxCell id="L3_tools" value="Tools" style="swimlane;startSize=20;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=1;rounded=1;arcSize=5;" vertex="1" parent="L3">
+      <mxGeometry x="275" y="33" width="580" height="115" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_t1" value="bash&#xa;(whitelist)" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=10;" vertex="1" parent="L3_tools">
+      <mxGeometry x="8" y="25" width="100" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_t2" value="kubectl&#xa;(read-only)" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=10;" vertex="1" parent="L3_tools">
+      <mxGeometry x="116" y="25" width="100" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_t3" value="pod_exec" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=10;" vertex="1" parent="L3_tools">
+      <mxGeometry x="224" y="25" width="100" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_t4" value="memory_search" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=10;" vertex="1" parent="L3_tools">
+      <mxGeometry x="332" y="25" width="100" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_t5" value="MCP Servers" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=10;" vertex="1" parent="L3_tools">
+      <mxGeometry x="440" y="25" width="132" height="75" as="geometry"/>
+    </mxCell>
+
+    <!-- Skills sub-box -->
+    <mxCell id="L3_skills" value="Skills  (3-tier overlay)" style="swimlane;startSize=20;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=1;rounded=1;arcSize=5;" vertex="1" parent="L3">
+      <mxGeometry x="865" y="33" width="285" height="115" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_s1" value="Core" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_skills">
+      <mxGeometry x="8" y="25" width="79" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_s2" value="Team" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_skills">
+      <mxGeometry x="103" y="25" width="79" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_s3" value="Personal" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_skills">
+      <mxGeometry x="198" y="25" width="79" height="75" as="geometry"/>
+    </mxCell>
+    <mxCell id="ES1" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#0D9488;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="L3_s1" target="L3_s2" parent="L3_skills">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="ES2" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#0D9488;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="L3_s2" target="L3_s3" parent="L3_skills">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Deep Investigation Engine sub-box -->
+    <mxCell id="L3_di" value="Deep Investigation Engine" style="swimlane;startSize=20;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="L3">
+      <mxGeometry x="10" y="158" width="1140" height="112" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_p1" value="Phase 1&#xa;Triage" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_di">
+      <mxGeometry x="10" y="25" width="245" height="72" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_p2" value="Phase 2&#xa;Hypotheses" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_di">
+      <mxGeometry x="285" y="25" width="245" height="72" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_p3" value="Phase 3&#xa;Parallel Validation&#xa;(3 sub-agents)" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_di">
+      <mxGeometry x="560" y="25" width="245" height="72" as="geometry"/>
+    </mxCell>
+    <mxCell id="L3_p4" value="Phase 4&#xa;Conclusion +&#xa;Knowledge Extraction" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_di">
+      <mxGeometry x="835" y="25" width="295" height="72" as="geometry"/>
+    </mxCell>
+    <mxCell id="EP1" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#0D9488;" edge="1" source="L3_p1" target="L3_p2" parent="L3_di">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="EP2" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#0D9488;" edge="1" source="L3_p2" target="L3_p3" parent="L3_di">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+    <mxCell id="EP3" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#0D9488;" edge="1" source="L3_p3" target="L3_p4" parent="L3_di">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow L3 to L4 (center, read/write) -->
+    <mxCell id="E3" value="read / write" style="edgeStyle=orthogonalEdgeStyle;rounded=0;fontSize=10;fontColor=#374151;strokeColor=#6B7280;" edge="1" source="L3" target="L4" parent="1">
+      <mxGeometry relative="1" as="geometry"/>
+    </mxCell>
+
+    <!-- Arrow L3 to L5 (right side bypass, read-only) -->
+    <mxCell id="E4" value="read-only" style="edgeStyle=orthogonalEdgeStyle;rounded=0;fontSize=10;fontColor=#374151;strokeColor=#6B7280;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="L3" target="L5" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="1193" y="417"/>
+          <mxPoint x="1193" y="828"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- Layer 4: Knowledge System -->
+    <mxCell id="L4" value="Knowledge System" style="swimlane;startSize=25;fillColor=#FFFBEB;strokeColor=#D97706;fontColor=#92400E;fontSize=13;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="1">
+      <mxGeometry x="20" y="605" width="1160" height="135" as="geometry"/>
+    </mxCell>
+    <mxCell id="L4_im" value="Investigation Memory&#xa;SQLite + FTS5 + bge-m3&#xa;&#x2713; IM Phase 0-1 complete" style="rounded=1;whiteSpace=wrap;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=11;" vertex="1" parent="L4">
+      <mxGeometry x="10" y="33" width="560" height="87" as="geometry"/>
+    </mxCell>
+    <mxCell id="L4_kb" value="Team Knowledge Base&#xa;Qdrant vector DB&#xa;&#x26A1; KR0 - in progress" style="rounded=1;whiteSpace=wrap;fillColor=#FEF9C3;strokeColor=#CA8A04;fontColor=#713F12;fontSize=11;dashed=1;dashPattern=8 4;" vertex="1" parent="L4">
+      <mxGeometry x="590" y="33" width="560" height="87" as="geometry"/>
+    </mxCell>
+
+    <!-- Bidirectional arrow: L4_im <-> L3 (feedback loop, left-side route) -->
+    <mxCell id="E5" value="inject context /&#xa;extract knowledge" style="edgeStyle=orthogonalEdgeStyle;rounded=0;fontSize=9;fontColor=#92400E;strokeColor=#D97706;dashed=1;startArrow=open;startFill=0;endArrow=open;endFill=0;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="L4_im" target="L3" parent="1">
+      <mxGeometry relative="1" as="geometry">
+        <Array as="points">
+          <mxPoint x="5" y="681"/>
+          <mxPoint x="5" y="417"/>
+        </Array>
+      </mxGeometry>
+    </mxCell>
+
+    <!-- Layer 5: Infrastructure -->
+    <mxCell id="L5" value="Target Infrastructure" style="swimlane;startSize=25;fillColor=#F9FAFB;strokeColor=#6B7280;fontColor=#374151;fontSize=13;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="1">
+      <mxGeometry x="20" y="783" width="1160" height="90" as="geometry"/>
+    </mxCell>
+    <mxCell id="L5a" value="Kubernetes Clusters&#xa;(kubeconfig)" style="rounded=1;whiteSpace=wrap;fillColor=#E5E7EB;strokeColor=#6B7280;fontColor=#374151;fontSize=11;" vertex="1" parent="L5">
+      <mxGeometry x="10" y="33" width="270" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L5b" value="Prometheus / Grafana" style="rounded=1;whiteSpace=wrap;fillColor=#E5E7EB;strokeColor=#6B7280;fontColor=#374151;fontSize=11;" vertex="1" parent="L5">
+      <mxGeometry x="290" y="33" width="270" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L5c" value="Elasticsearch / Loki" style="rounded=1;whiteSpace=wrap;fillColor=#E5E7EB;strokeColor=#6B7280;fontColor=#374151;fontSize=11;" vertex="1" parent="L5">
+      <mxGeometry x="570" y="33" width="270" height="42" as="geometry"/>
+    </mxCell>
+    <mxCell id="L5d" value="PagerDuty / Alertmanager" style="rounded=1;whiteSpace=wrap;fillColor=#E5E7EB;strokeColor=#6B7280;fontColor=#374151;fontSize=11;" vertex="1" parent="L5">
+      <mxGeometry x="850" y="33" width="300" height="42" as="geometry"/>
+    </mxCell>
+
+  </root>
+</mxGraphModel>

@@ -31,34 +31,12 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 
 ## Architecture
 
-```
-  TUI / Web UI / IM Bots / Webhooks
-                  │
-                  ▼
-  ┌─────────────────────────────┐
-  │           Gateway            │  Control plane
-  │    (HTTP + WebSocket + mTLS) │  Auth (JWT/SSO), routing, skill mgmt
-  │                              │  DB (MySQL / SQLite), cron scheduling
-  └──────────┬──────────────────┘
-             │ mTLS
-             ▼
-  ┌─────────────────────────────┐
-  │         AgentBox             │  Execution plane (one per user)
-  │  ┌───────────────────────┐  │
-  │  │    Agent Runtime       │  │  LLM-powered diagnostic agent
-  │  │  ┌─────────────────┐  │  │
-  │  │  │  Tools           │  │  │  kubectl, bash, node_exec, deep_search
-  │  │  │  Skills          │  │  │  core / team / personal
-  │  │  │  MCP Servers     │  │  │  external tool extensions
-  │  │  │  Memory          │  │  │  vector + keyword search (SQLite)
-  │  │  └─────────────────┘  │  │
-  │  └───────────────────────┘  │
-  └─────────────────────────────┘
-                  │
-                  ▼
-        Target K8s Clusters
-       (user-provided kubeconfig)
-```
+![Siclaw System Architecture](docs/assets/architecture.svg)
+
+> Three deployment modes share one agent core: **TUI** (single-user terminal),
+> **Local Server** (Gateway + SQLite, multi-user), **Kubernetes** (isolated AgentBox pod per user).
+> The Knowledge System feeds the agent with accumulated investigation experience (IM Phase 0–1 ✓)
+> and team-wide knowledge via Qdrant (KR0 — in progress).
 
 ## Prerequisites
 
