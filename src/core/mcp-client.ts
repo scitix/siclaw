@@ -155,30 +155,30 @@ function tryLoadConfig(configPath: string): McpServersConfig | null {
 }
 
 /**
- * Load MCP servers config:
- * 1. Gateway-fetched config (SICLAW_MCP_DIR/mcp-servers.json) — unless localOnly
- * 2. Local config file (config/mcp-servers.json)
+ * Load MCP servers config from SICLAW_MCP_DIR/mcp-servers.json.
+ *
+ * This file is written by the agentbox resource-handler after fetching
+ * the merged config from the Gateway API. In CLI mode (no Gateway),
+ * mcpServers are configured directly in `.siclaw/config/settings.json`.
  */
 export function loadMcpServersConfig(
-  cwd?: string,
+  _cwd?: string,
   opts?: { localOnly?: boolean },
 ): McpServersConfig | null {
   const mcpDir = process.env.SICLAW_MCP_DIR;
   console.log(`[mcp-client] loadMcpServersConfig: SICLAW_MCP_DIR=${mcpDir || "(unset)"}, localOnly=${opts?.localOnly ?? false}`);
 
-  // 1. Gateway-fetched config (unless localOnly=true)
-  if (!opts?.localOnly && mcpDir) {
-    const mcpPath = path.resolve(mcpDir, "mcp-servers.json");
-    const config = tryLoadConfig(mcpPath);
-    if (config) {
-      console.log(`[mcp-client] Using config: ${mcpPath}`);
-      return config;
-    }
+  if (opts?.localOnly || !mcpDir) {
+    return null;
   }
-  // 2. Local file (Docker image / CLI mode)
-  const localPath = path.resolve(cwd ?? process.cwd(), "config", "mcp-servers.json");
-  console.log(`[mcp-client] Falling back to local config: ${localPath}`);
-  return tryLoadConfig(localPath);
+
+  const mcpPath = path.resolve(mcpDir, "mcp-servers.json");
+  const config = tryLoadConfig(mcpPath);
+  if (config) {
+    console.log(`[mcp-client] Using config: ${mcpPath}`);
+    return config;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

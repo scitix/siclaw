@@ -48,9 +48,6 @@ COPY --from=builder /app/src/gateway/web/dist/ ./dist/gateway/web/dist/
 # Copy core skills (baked-in, always available)
 COPY skills/core/ ./skills/core/
 
-# Copy MCP servers config if present (optional — DB is primary source)
-COPY config/mcp-servers.jso[n] ./config/
-
 # Create data directory
 RUN mkdir -p .siclaw
 

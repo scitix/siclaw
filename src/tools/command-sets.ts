@@ -140,144 +140,329 @@ export const ALLOWED_COMMANDS = new Set([
   "expr", "seq",
 ]);
 
-// ── Perftest binary names ────────────────────────────────────────
+// ── Declarative Command Rule Engine ──────────────────────────────
 
-const PERFTEST_BINARIES = new Set([
+/**
+ * Declarative command validation rule.
+ * JSON-serializable: no Set, no function, no RegExp.
+ * Can be stored in a database, served via API, or edited in an admin UI.
+ */
+export interface CommandRule {
+  command: string;
+  category?: string;
+  description?: string;
+
+  /** Flag whitelist. Present → check flags; absent → all flags allowed. */
+  allowedFlags?: string[];
+
+  /** Subcommand/action whitelist at a given positional position. */
+  allowedSubcommands?: {
+    position: number;
+    allowed: string[];
+  };
+
+  /** Positional argument policy: "allow" (default), "block", or max count. */
+  positionals?: "allow" | "block" | number;
+
+  /** At least one of these flags must be present (OR semantics). */
+  requiredFlags?: string[];
+
+  /** Delegate to a named custom validator function. */
+  customValidator?: string;
+}
+
+export const COMMAND_RULES: Record<string, CommandRule> = {
+
+  // ── Flag whitelist ──
+
+  sort: {
+    command: "sort", category: "text",
+    allowedFlags: [
+      "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
+      "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
+      "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
+      "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
+    ],
+  },
+
+  yq: {
+    command: "yq", category: "text",
+    allowedFlags: [
+      "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
+      "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
+      "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
+      "--xml-attribute-prefix", "--xml-content-name",
+      "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
+    ],
+  },
+
+  ethtool: {
+    command: "ethtool", category: "network",
+    allowedFlags: [
+      "-i", "-S", "-T", "-a", "-c", "-g", "-k", "-l", "-P", "-m", "-d", "--phy-statistics",
+    ],
+  },
+
+  arp: {
+    command: "arp", category: "network",
+    allowedFlags: ["-a", "-n", "-e", "-v", "--all", "--numeric", "--verbose"],
+  },
+
+  dmesg: {
+    command: "dmesg", category: "system",
+    allowedFlags: [
+      "-T", "--ctime", "-H", "--human", "-l", "--level", "-f", "--facility",
+      "-k", "--kernel", "-x", "--decode", "-L", "--color", "--time-format",
+      "--nopager",
+      "--since", "--until", "-S", "--syslog", "-t", "--notime", "-P",
+      // NOTE: -w/--follow/-W/--follow-new intentionally excluded — they hang indefinitely
+    ],
+  },
+
+  journalctl: {
+    command: "journalctl", category: "system",
+    allowedFlags: [
+      "-u", "--unit", "-n", "--lines", "--since", "--until",
+      "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
+      "--no-pager", "-o", "--output", "-r", "--reverse",
+      "-x", "--catalog", "--system", "--user",
+      "-t", "--identifier", "-g", "--grep", "--case-sensitive",
+      "-S", "-U", "-e", "--pager-end", "-a", "--all",
+      "-q", "--quiet", "--no-hostname", "--no-full",
+      "-m", "--merge", "-D", "--directory", "--file", "--list-boots",
+    ],
+  },
+
+  iptables: {
+    command: "iptables", category: "network",
+    allowedFlags: [
+      "-L", "--list", "-S", "--list-rules",
+      "-n", "--numeric", "-v", "--verbose",
+      "-x", "--exact", "--line-numbers", "-t", "--table",
+    ],
+  },
+
+  // ── Flag whitelist + requiredFlags ──
+
+  top: {
+    command: "top", category: "process",
+    allowedFlags: [
+      "-b", "--batch", "-n", "-d", "-p", "-H", "-c", "-o", "-O",
+      "-w", "-1", "-e", "-E", "-i", "-S", "-s", "-u", "-U",
+    ],
+    requiredFlags: ["-b", "--batch"],
+  },
+
+  // ── Flag whitelist + positional restrictions ──
+
+  hostname: {
+    command: "hostname", category: "system",
+    allowedFlags: [
+      "-f", "-d", "-s", "-i", "-I", "-A",
+      "--fqdn", "--domain", "--short", "--ip-address", "--all-ip-addresses",
+    ],
+    positionals: "block",
+  },
+
+  route: {
+    command: "route", category: "network",
+    allowedFlags: ["-n", "-e", "-v", "-F", "-C", "--numeric", "--extend", "--verbose"],
+    positionals: "block",
+  },
+
+  ifconfig: {
+    command: "ifconfig", category: "network",
+    allowedFlags: ["-a", "-s", "--all", "--short"],
+    positionals: 1,
+  },
+
+  uniq: {
+    command: "uniq", category: "text",
+    positionals: 1,
+  },
+
+  // ── Subcommand whitelist (position: 0) ──
+
+  systemctl: {
+    command: "systemctl", category: "service",
+    allowedSubcommands: {
+      position: 0,
+      allowed: [
+        "status", "show", "list-units", "list-unit-files",
+        "is-active", "is-enabled", "is-failed", "cat",
+        "list-dependencies", "list-sockets", "list-timers",
+      ],
+    },
+  },
+
+  crictl: {
+    command: "crictl", category: "container",
+    allowedSubcommands: {
+      position: 0,
+      allowed: [
+        "ps", "images", "inspect", "inspecti", "inspectp",
+        "logs", "stats", "info", "version", "pods",
+      ],
+    },
+  },
+
+  timedatectl: {
+    command: "timedatectl", category: "system",
+    allowedSubcommands: {
+      position: 0,
+      allowed: ["status", "show", "list-timezones", "timesync-status"],
+    },
+  },
+
+  hostnamectl: {
+    command: "hostnamectl", category: "system",
+    allowedSubcommands: {
+      position: 0,
+      allowed: ["status", "show"],
+    },
+  },
+
+  // ── Action whitelist (position: 1) ──
+
+  tc: {
+    command: "tc", category: "network",
+    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
+  },
+
+  bridge: {
+    command: "bridge", category: "network",
+    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
+  },
+
+  rdma: {
+    command: "rdma", category: "network",
+    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
+  },
+
+  // ── Custom validators ──
+
+  curl:         { command: "curl",         category: "network",   customValidator: "curl" },
+  conntrack:    { command: "conntrack",    category: "network",   customValidator: "conntrack" },
+  find:         { command: "find",         category: "file",      customValidator: "find" },
+  ip:           { command: "ip",           category: "network",   customValidator: "ip" },
+  "nvidia-smi": { command: "nvidia-smi",   category: "gpu",       customValidator: "nvidia-smi" },
+  date:         { command: "date",         category: "system",    customValidator: "date" },
+  ctr:          { command: "ctr",          category: "container", customValidator: "ctr" },
+  ibportstate:  { command: "ibportstate",  category: "rdma",      customValidator: "ibportstate" },
+  env:          { command: "env",          category: "system",    customValidator: "env" },
+  tee:          { command: "tee",          category: "system",    customValidator: "tee" },
+  mount:        { command: "mount",        category: "system",    customValidator: "mount" },
+  sysctl:       { command: "sysctl",       category: "system",    customValidator: "sysctl" },
+};
+
+// ip6tables shares iptables rules
+COMMAND_RULES["ip6tables"] = { ...COMMAND_RULES["iptables"], command: "ip6tables" };
+
+// Perftest: 11 binaries share one flag set
+const PERFTEST_FLAGS = [
+  "-s", "--size", "-D", "--duration", "-n", "--iters",
+  "-p", "--port", "-d", "--ib-dev", "-i", "--ib-port",
+  "-m", "--mtu", "-x", "--gid-index", "--sl",
+  "-a", "--all", "-b", "--bidirectional",
+  "-F", "--CPU-freq", "-c", "--connection",
+  "-R", "--rdma_cm", "-q", "--qp",
+  "--run_infinitely", "--report_gbits", "--report_per_port",
+  "-l", "--post_list", "--use_cuda", "--use_rocm", "--output_format",
+  "-h", "--help", "-V", "--version",
+];
+for (const bin of [
   "ib_write_bw", "ib_write_lat", "ib_read_bw", "ib_read_lat",
   "ib_send_bw", "ib_send_lat", "ib_atomic_bw", "ib_atomic_lat",
   "raw_ethernet_bw", "raw_ethernet_lat", "raw_ethernet_burst_lat",
-]);
-
-// ── Command-level validators ─────────────────────────────────────
-
-// ip subcommands that are read-only
-const IP_SAFE_ACTIONS = new Set(["show", "list", "ls", "get"]);
-
-/**
- * Apply extra security restrictions to whitelisted commands.
- * Takes a raw command string, parses it internally.
- * Returns an error message string if blocked, or null if allowed.
- */
-export function validateCommandRestrictions(cmd: string): string | null {
-  const args = parseArgs(cmd);
-  if (args.length === 0) return null;
-
-  const binary = args[0];
-  const baseName = binary.split("/").pop()?.toLowerCase() ?? "";
-
-  switch (baseName) {
-    // B1: text processing
-    case "sort":
-      return validateSort(args);
-    case "find":
-      return validateFind(args);
-    case "yq":
-      return validateYq(args);
-    case "uniq":
-      return validateUniq(args);
-
-    // B2: network diagnostics
-    case "ethtool":
-      return validateEthtool(args);
-    case "tc":
-      return validateTc(args);
-    case "bridge":
-      return validateBridge(args);
-    case "route":
-      return validateRoute(args);
-    case "arp":
-      return validateArp(args);
-    case "ifconfig":
-      return validateIfconfig(args);
-    case "conntrack":
-      return validateConntrack(args);
-    case "curl":
-      return validateCurl(args);
-    case "rdma":
-      return validateRdma(args);
-    case "ibportstate":
-      return validateIbportstate(args);
-
-    // B3: system/hardware
-    case "nvidia-smi":
-      return validateNvidiaSmi(args);
-    case "hostname":
-      return validateHostname(args);
-    case "date":
-      return validateDate(args);
-    case "dmesg":
-      return validateDmesg(args);
-    case "timedatectl":
-      return validateTimedatectl(args);
-    case "hostnamectl":
-      return validateHostnamectl(args);
-    case "journalctl":
-      return validateJournalctl(args);
-    case "sysctl":
-      return validateSysctl(args);
-
-    case "top":
-      return validateTop(args);
-
-    // existing whitelist validators (unchanged)
-    case "ip":
-      return validateIp(cmd);
-    // awk/gawk removed from ALLOWED_COMMANDS — no validator needed
-    case "systemctl":
-      return validateSystemctl(args);
-    case "crictl":
-      return validateCrictl(args);
-    case "ctr":
-      return validateCtr(args);
-    case "iptables":
-    case "ip6tables":
-      return validateIptables(args);
-    case "tee":
-      return validateTee(args);
-    case "mount":
-      return validateMount(args);
-    case "env":
-      return validateEnv(args);
-
-    default:
-      // perftest binaries
-      if (PERFTEST_BINARIES.has(baseName)) {
-        return validatePerftest(args, baseName);
-      }
-      return null;
-  }
+]) {
+  COMMAND_RULES[bin] = { command: bin, category: "perftest", allowedFlags: PERFTEST_FLAGS };
 }
 
-// ── Individual validators ────────────────────────────────────────
+// ── Generic rule engine ──────────────────────────────────────────
 
-// ─── B1: Text Processing ─────────────────────────────────────────
+function validateByRule(args: string[], rule: CommandRule): string | null {
+  const cmd = rule.command;
 
-const SORT_SAFE_FLAGS = new Set([
-  "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
-  "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
-  "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
-  "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
-]);
-const SORT_SAFE_PREFIXES = ["-k", "-t", "--key=", "--field-separator="];
-
-function validateSort(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // positional args (filenames) allowed
-    const flag = extractFlag(arg);
-    if (!SORT_SAFE_FLAGS.has(flag) && !startsWithAny(arg, SORT_SAFE_PREFIXES)) {
+  // 1. requiredFlags: at least one must be present
+  if (rule.requiredFlags?.length) {
+    if (!rule.requiredFlags.some((f) => args.includes(f))) {
       return JSON.stringify({
-        error: `sort "${arg}" is not allowed. Only read-only sort flags are permitted.`,
+        error: `${cmd} requires one of: ${rule.requiredFlags.join(", ")}`,
       }, null, 2);
     }
   }
+
+  // 2. allowedSubcommands: check the Nth positional
+  if (rule.allowedSubcommands) {
+    const { position, allowed } = rule.allowedSubcommands;
+    let posCount = 0;
+    for (const arg of args.slice(1)) {
+      if (arg.startsWith("-")) continue;
+      if (posCount === position) {
+        if (!allowed.includes(arg)) {
+          return JSON.stringify({
+            error: `${cmd} ${position === 0 ? "subcommand" : "action"} "${arg}" is not allowed.`,
+          }, null, 2);
+        }
+        return null;
+      }
+      posCount++;
+    }
+    return null; // not enough positionals → safe default
+  }
+
+  // 3. check flags + positionals
+  const positionalPolicy = rule.positionals ?? "allow";
+  let positionalCount = 0;
+
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+
+    if (!arg.startsWith("-")) {
+      positionalCount++;
+      if (positionalPolicy === "block") {
+        return JSON.stringify({
+          error: `${cmd} "${arg}" is not allowed.`,
+        }, null, 2);
+      }
+      if (typeof positionalPolicy === "number" && positionalCount > positionalPolicy) {
+        return JSON.stringify({
+          error: `${cmd} does not allow more than ${positionalPolicy} positional argument(s).`,
+        }, null, 2);
+      }
+      continue;
+    }
+
+    // flag check — skip if no allowedFlags defined
+    if (!rule.allowedFlags) continue;
+
+    const flag = extractFlag(arg);
+    if (rule.allowedFlags.includes(flag)) continue;
+
+    // short flag with attached value: -k2,3 → check "-k"
+    // Only when 3rd char is NOT a letter — prevents combined flags like -ro
+    // from bypassing the check (where -r is safe but -o is not)
+    if (!arg.startsWith("--") && arg.length > 2) {
+      const thirdChar = arg[2];
+      if (thirdChar && !/[a-zA-Z]/.test(thirdChar)) {
+        const shortFlag = arg.slice(0, 2);
+        if (rule.allowedFlags.includes(shortFlag)) continue;
+      }
+    }
+
+    return JSON.stringify({
+      error: `${cmd} "${arg}" is not allowed.`,
+    }, null, 2);
+  }
+
   return null;
 }
 
-// Whitelist of safe find actions — only these are allowed.
-// Any unknown or new action is blocked by default.
+// ── Custom validator functions ───────────────────────────────────
+
+// ─── find ────────────────────────────────────────────────────────
+
 const FIND_SAFE_ACTIONS = new Set(["-print", "-print0", "-ls", "-prune", "-quit"]);
-// Whitelist of safe find tests/options (flags that start with -)
 const FIND_SAFE_TESTS = new Set([
   "-name", "-iname", "-path", "-ipath", "-regex", "-iregex",
   "-type", "-size", "-mtime", "-atime", "-ctime", "-mmin", "-amin", "-cmin",
@@ -296,7 +481,6 @@ function validateFind(args: string[]): string | null {
   for (const arg of args.slice(1)) {
     if (!arg.startsWith("-")) continue; // path arguments are ok
     if (arg === "-") continue; // stdin marker
-    // Check if it's a known safe action or test
     if (!FIND_SAFE_ACTIONS.has(arg) && !FIND_SAFE_TESTS.has(arg)) {
       return JSON.stringify({
         error: `find "${arg}" is not allowed. Only read-only find operations are permitted.`,
@@ -307,174 +491,11 @@ function validateFind(args: string[]): string | null {
   return null;
 }
 
-const YQ_SAFE_FLAGS = new Set([
-  "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
-  "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
-  "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
-  "--xml-attribute-prefix", "--xml-content-name",
-  "-s", "--split-exp", "--unwrapScalar", "--nul-output",
-  "--header-preprocess",
-]);
-const YQ_SAFE_PREFIXES = ["-o=", "--output-format=", "-p=", "--input-format=",
-  "--xml-attribute-prefix=", "--xml-content-name="];
+// ─── conntrack ───────────────────────────────────────────────────
 
-function validateYq(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // expression or filename
-    const flag = extractFlag(arg);
-    if (!YQ_SAFE_FLAGS.has(flag) && !startsWithAny(arg, YQ_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `yq "${arg}" is not allowed. In-place editing is not permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-function validateUniq(args: string[]): string | null {
-  let positionalCount = 0;
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg.startsWith("-")) continue; // any flag is ok
-    positionalCount++;
-    if (positionalCount >= 2) {
-      return JSON.stringify({
-        error: "uniq with output file argument is not allowed. Only reading from stdin or a single input file is permitted.",
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-// ─── B2: Network Diagnostics ─────────────────────────────────────
-
-const ETHTOOL_SAFE_FLAGS = new Set([
-  "-i", "-S", "-T", "-a", "-c", "-g", "-k", "-l", "-P", "-m", "-d", "--phy-statistics",
-]);
-
-function validateEthtool(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // device name
-    if (!ETHTOOL_SAFE_FLAGS.has(arg)) {
-      return JSON.stringify({
-        error: `ethtool "${arg}" is not allowed. Only read-only ethtool queries are permitted.`,
-        allowed: [...ETHTOOL_SAFE_FLAGS],
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-const SUBCMD_SAFE_ACTIONS = new Set(["show", "list", "ls"]);
-
-function validateTc(args: string[]): string | null {
-  // tc [options] <object> <action>
-  // Find the first positional (object), then the second positional (action)
-  const positional: string[] = [];
-  for (let i = 1; i < args.length; i++) {
-    if (args[i].startsWith("-")) continue;
-    positional.push(args[i]);
-    if (positional.length >= 2) break;
-  }
-  // No args or just object → defaults to show → safe
-  if (positional.length < 2) return null;
-  const action = positional[1];
-  if (!SUBCMD_SAFE_ACTIONS.has(action)) {
-    return JSON.stringify({
-      error: `tc action "${action}" is not allowed. Only read-only actions (show, list, ls) are permitted.`,
-    }, null, 2);
-  }
-  return null;
-}
-
-function validateBridge(args: string[]): string | null {
-  const positional: string[] = [];
-  for (let i = 1; i < args.length; i++) {
-    if (args[i].startsWith("-")) continue;
-    positional.push(args[i]);
-    if (positional.length >= 2) break;
-  }
-  if (positional.length < 2) return null;
-  const action = positional[1];
-  if (!SUBCMD_SAFE_ACTIONS.has(action)) {
-    return JSON.stringify({
-      error: `bridge action "${action}" is not allowed. Only read-only actions (show, list, ls) are permitted.`,
-    }, null, 2);
-  }
-  return null;
-}
-
-const ROUTE_SAFE_FLAGS = new Set([
-  "-n", "-e", "-v", "-F", "-C", "--numeric", "--extend", "--verbose",
-]);
-
-function validateRoute(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg.startsWith("-")) {
-      if (!ROUTE_SAFE_FLAGS.has(arg)) {
-        return JSON.stringify({
-          error: `route "${arg}" is not allowed. Only read-only route queries are permitted.`,
-        }, null, 2);
-      }
-    } else {
-      // Any positional argument (add, del, etc.) is blocked
-      return JSON.stringify({
-        error: `route "${arg}" is not allowed. Only "route" (display routing table) with read-only flags is permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-const ARP_SAFE_FLAGS = new Set([
-  "-a", "-n", "-e", "-v", "--all", "--numeric", "--verbose",
-]);
-
-function validateArp(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // hostname query is ok
-    if (!ARP_SAFE_FLAGS.has(arg)) {
-      return JSON.stringify({
-        error: `arp "${arg}" is not allowed. Only read-only arp queries are permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-const IFCONFIG_SAFE_FLAGS = new Set(["-a", "-s", "--all", "--short"]);
-
-function validateIfconfig(args: string[]): string | null {
-  let positionalCount = 0;
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg.startsWith("-")) {
-      if (!IFCONFIG_SAFE_FLAGS.has(arg)) {
-        return JSON.stringify({
-          error: `ifconfig "${arg}" is not allowed. Only read-only ifconfig queries are permitted.`,
-        }, null, 2);
-      }
-    } else {
-      positionalCount++;
-      if (positionalCount >= 2) {
-        return JSON.stringify({
-          error: "ifconfig with configuration arguments is not allowed. Only viewing interface info is permitted.",
-        }, null, 2);
-      }
-    }
-  }
-  return null;
-}
-
-// Whitelist of safe conntrack operations — only these are allowed.
 const CONNTRACK_SAFE_OPS = new Set([
   "-L", "--dump", "-G", "--get", "-C", "--count", "-S", "--stats", "-E", "--event",
 ]);
-// Whitelist of safe conntrack filter/display flags
 const CONNTRACK_SAFE_FLAGS = new Set([
   "-p", "--proto", "-s", "--src", "-d", "--dst", "--sport", "--dport",
   "-m", "--mark", "-f", "--family", "-z", "--zero",
@@ -491,13 +512,10 @@ const CONNTRACK_SAFE_PREFIXES = [
 ];
 
 function validateConntrack(args: string[]): string | null {
-  // Must have at least one safe operation flag
-  let hasOp = false;
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) continue; // positional values are ok
+    if (!arg.startsWith("-")) continue;
     if (CONNTRACK_SAFE_OPS.has(arg)) {
-      hasOp = true;
       continue;
     }
     const flag = extractFlag(arg);
@@ -508,9 +526,10 @@ function validateConntrack(args: string[]): string | null {
       }, null, 2);
     }
   }
-  // Bare "conntrack" without operation defaults to -L — safe
   return null;
 }
+
+// ─── curl ────────────────────────────────────────────────────────
 
 const CURL_SAFE_FLAGS = new Set([
   "-s", "--silent", "-S", "--show-error", "-k", "--insecure", "-v", "--verbose",
@@ -521,8 +540,6 @@ const CURL_SAFE_FLAGS = new Set([
   "-u", "--user", "--cacert", "--cert", "-x", "--proxy",
   "--retry", "--retry-delay", "--retry-max-time",
   "-f", "--fail", "-4", "-6", "-N", "--no-buffer",
-  // NOTE: -X/--request are NOT here — they are value-consuming flags
-  // handled separately with method validation below.
 ]);
 const CURL_SAFE_PREFIXES = [
   "-H=", "--header=", "-m=", "--max-time=", "--connect-timeout=",
@@ -530,22 +547,15 @@ const CURL_SAFE_PREFIXES = [
   "-A=", "--user-agent=", "-b=", "--cookie=", "-e=", "--referer=",
   "-u=", "--user=", "--cacert=", "--cert=", "-x=", "--proxy=",
   "--retry=", "--retry-delay=", "--retry-max-time=",
-  // NOTE: -X=/--request= are NOT here — handled separately below.
 ];
 const CURL_DATA_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-urlencode"]);
 const CURL_REQUEST_FLAGS = new Set(["-X", "--request"]);
-// Whitelist of safe HTTP methods — only these are allowed with -X/--request.
-// Any new or unknown method is blocked by default.
 const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST"]);
-
-// Single-char curl flags that are safe (for combined flag parsing like -sS)
 const CURL_SAFE_SHORT_CHARS = new Set([
   "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "d", "A", "b", "e", "u", "x", "f", "N",
   "4", "6",
 ]);
 
-// Helper: validate and consume a -X/--request method value.
-// Returns error string if blocked, null if safe.
 function checkCurlMethod(method: string | undefined): string | null {
   if (method && !CURL_SAFE_METHODS.has(method.toUpperCase())) {
     return JSON.stringify({
@@ -555,7 +565,6 @@ function checkCurlMethod(method: string | undefined): string | null {
   return null;
 }
 
-// Helper: validate a -d/--data value for @file upload.
 function checkCurlDataValue(flag: string, value: string | undefined): string | null {
   if (value && value.startsWith("@")) {
     return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
@@ -566,7 +575,7 @@ function checkCurlDataValue(flag: string, value: string | undefined): string | n
 function validateCurl(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) continue; // URL (positional) allowed
+    if (!arg.startsWith("-")) continue;
 
     // ── Long flags (--xxx) ──────────────────────────────────
     if (arg.startsWith("--")) {
@@ -574,31 +583,27 @@ function validateCurl(args: string[]): string | null {
       const hasValue = arg.includes("=");
       const inlineValue = hasValue ? arg.slice(flag.length + 1) : undefined;
 
-      // -X/--request: value-consuming, must check method
       if (CURL_REQUEST_FLAGS.has(flag)) {
         const method = hasValue ? inlineValue : args[i + 1];
         const err = checkCurlMethod(method);
         if (err) return err;
-        if (!hasValue) i++; // consume next arg as value
+        if (!hasValue) i++;
         continue;
       }
 
-      // -d/--data*: value-consuming, must check @file
       if (CURL_DATA_FLAGS.has(flag)) {
         const value = hasValue ? inlineValue : args[i + 1];
         const err = checkCurlDataValue(flag, value);
         if (err) return err;
-        if (!hasValue) i++; // consume next arg as value
+        if (!hasValue) i++;
         continue;
       }
 
-      // All other long flags: must be in whitelist
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
         }, null, 2);
       }
-      // Value-consuming safe flags: -H, -m, -w, -A, -b, -e, -u, --cacert, --cert, -x, --retry*
       if (!hasValue && CURL_SAFE_FLAGS.has(flag) && (
         ["-H", "--header", "-m", "--max-time", "--connect-timeout",
          "-w", "--write-out", "-A", "--user-agent", "-b", "--cookie",
@@ -606,7 +611,7 @@ function validateCurl(args: string[]): string | null {
          "-x", "--proxy", "--retry", "--retry-delay", "--retry-max-time",
         ].includes(flag)
       )) {
-        i++; // consume next arg as value
+        i++;
       }
       continue;
     }
@@ -616,14 +621,12 @@ function validateCurl(args: string[]): string | null {
       const flag = extractFlag(arg);
       const inlineValue = arg.slice(flag.length + 1);
 
-      // -X=METHOD
       if (flag === "-X") {
         const err = checkCurlMethod(inlineValue);
         if (err) return err;
         continue;
       }
 
-      // -d=@file
       if (flag === "-d") {
         const err = checkCurlDataValue("-d", inlineValue);
         if (err) return err;
@@ -639,7 +642,7 @@ function validateCurl(args: string[]): string | null {
     }
 
     // ── Combined short flags (e.g. -sS, -sSX, -vk) ─────────
-    const chars = arg.slice(1); // remove leading -
+    const chars = arg.slice(1);
     for (const ch of chars) {
       if (!CURL_SAFE_SHORT_CHARS.has(ch)) {
         return JSON.stringify({
@@ -648,7 +651,6 @@ function validateCurl(args: string[]): string | null {
       }
     }
 
-    // If last char is a value-consuming flag, validate + consume next arg
     const lastChar = chars[chars.length - 1];
     if (lastChar && "HXmwdAbeuxr".includes(lastChar)) {
       if (lastChar === "X") {
@@ -659,37 +661,20 @@ function validateCurl(args: string[]): string | null {
         const err = checkCurlDataValue("-d", args[i + 1]);
         if (err) return err;
       }
-      i++; // consume next arg as value
+      i++;
     }
   }
   return null;
 }
 
-function validateRdma(args: string[]): string | null {
-  const positional: string[] = [];
-  for (let i = 1; i < args.length; i++) {
-    if (args[i].startsWith("-")) continue;
-    positional.push(args[i]);
-    if (positional.length >= 2) break;
-  }
-  if (positional.length < 2) return null;
-  const action = positional[1];
-  if (!SUBCMD_SAFE_ACTIONS.has(action)) {
-    return JSON.stringify({
-      error: `rdma action "${action}" is not allowed. Only read-only actions (show, list, ls) are permitted.`,
-    }, null, 2);
-  }
-  return null;
-}
+// ─── ibportstate ─────────────────────────────────────────────────
 
-// Whitelist of safe ibportstate actions — only query is allowed.
 const IBPORTSTATE_SAFE_ACTIONS = new Set(["query"]);
 
 function validateIbportstate(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (arg.startsWith("-")) continue; // flags are ok (port number, lid, etc.)
-    // Positional args that are numbers are port/lid values — ok
+    if (arg.startsWith("-")) continue;
     if (/^\d+$/.test(arg)) continue;
     if (!IBPORTSTATE_SAFE_ACTIONS.has(arg)) {
       return JSON.stringify({
@@ -701,7 +686,7 @@ function validateIbportstate(args: string[]): string | null {
   return null;
 }
 
-// ─── B3: System / Hardware ───────────────────────────────────────
+// ─── nvidia-smi ──────────────────────────────────────────────────
 
 const NVIDIA_SMI_SAFE_FLAGS = new Set([
   "-q", "--query", "-L", "--list-gpus", "-i",
@@ -713,14 +698,12 @@ const NVIDIA_SMI_SAFE_PREFIXES = [
 const NVIDIA_SMI_SUBCMDS = new Set(["topo", "nvlink"]);
 
 function validateNvidiaSmi(args: string[]): string | null {
-  if (args.length <= 1) return null; // bare nvidia-smi is safe
+  if (args.length <= 1) return null;
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
     if (!arg.startsWith("-")) {
-      // positional: allow topo, nvlink subcmds and their arguments
       if (NVIDIA_SMI_SUBCMDS.has(arg)) return null;
-      // After a safe flag like -i, the next positional is its value — skip it
       continue;
     }
     const flag = extractFlag(arg);
@@ -733,29 +716,7 @@ function validateNvidiaSmi(args: string[]): string | null {
   return null;
 }
 
-const HOSTNAME_SAFE_FLAGS = new Set([
-  "-f", "-d", "-s", "-i", "-I", "-A",
-  "--fqdn", "--domain", "--short", "--ip-address", "--all-ip-addresses",
-]);
-
-function validateHostname(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (arg.startsWith("-")) {
-      if (!HOSTNAME_SAFE_FLAGS.has(arg)) {
-        return JSON.stringify({
-          error: `hostname "${arg}" is not allowed. Only read-only hostname queries are permitted.`,
-        }, null, 2);
-      }
-    } else {
-      // Any positional = setting hostname
-      return JSON.stringify({
-        error: "hostname with a name argument is not allowed. Only viewing the hostname is permitted.",
-      }, null, 2);
-    }
-  }
-  return null;
-}
+// ─── date ────────────────────────────────────────────────────────
 
 const DATE_SAFE_FLAGS = new Set([
   "-d", "--date", "-u", "--utc", "--universal",
@@ -777,12 +738,10 @@ function validateDate(args: string[]): string | null {
           error: `date "${arg}" is not allowed. Only read-only date queries are permitted.`,
         }, null, 2);
       }
-      // Skip next arg if it's a value for -d, -r, etc.
       if (DATE_SAFE_FLAGS.has(arg) && (arg === "-d" || arg === "--date" || arg === "-r" || arg === "--reference")) {
-        i++; // skip value
+        i++;
       }
     } else {
-      // Non-+ positional arg → not allowed
       return JSON.stringify({
         error: `date "${arg}" is not allowed. Only format strings (+...) and read-only flags are permitted.`,
       }, null, 2);
@@ -791,130 +750,7 @@ function validateDate(args: string[]): string | null {
   return null;
 }
 
-// Whitelist of safe dmesg flags — only these are allowed.
-const DMESG_SAFE_FLAGS = new Set([
-  "-T", "--ctime", "-H", "--human", "-l", "--level", "-f", "--facility",
-  "-k", "--kernel", "-x", "--decode", "-L", "--color", "--time-format",
-  "-w", "--follow", "-W", "--follow-new", "--nopager",
-  "--since", "--until", "-S", "--syslog", "-t", "--notime", "-P",
-]);
-const DMESG_SAFE_PREFIXES = [
-  "-l=", "--level=", "-f=", "--facility=", "--time-format=",
-  "--since=", "--until=", "-L=", "--color=",
-];
-
-function validateDmesg(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue;
-    const flag = extractFlag(arg);
-    if (!DMESG_SAFE_FLAGS.has(flag) && !startsWithAny(arg, DMESG_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `dmesg "${arg}" is not allowed. Only read-only dmesg queries are permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-const TIMEDATECTL_SAFE = new Set(["status", "show", "list-timezones", "timesync-status"]);
-
-function validateTimedatectl(args: string[]): string | null {
-  for (const arg of args.slice(1)) {
-    if (arg.startsWith("-")) continue;
-    if (!TIMEDATECTL_SAFE.has(arg)) {
-      return JSON.stringify({
-        error: `timedatectl subcommand "${arg}" is not allowed. Only read-only subcommands are permitted.`,
-        allowed: [...TIMEDATECTL_SAFE].sort(),
-      }, null, 2);
-    }
-    return null; // first positional is safe
-  }
-  return null; // bare timedatectl is fine (defaults to status)
-}
-
-const HOSTNAMECTL_SAFE = new Set(["status", "show"]);
-
-function validateHostnamectl(args: string[]): string | null {
-  for (const arg of args.slice(1)) {
-    if (arg.startsWith("-")) continue;
-    if (!HOSTNAMECTL_SAFE.has(arg)) {
-      return JSON.stringify({
-        error: `hostnamectl subcommand "${arg}" is not allowed. Only read-only subcommands are permitted.`,
-        allowed: [...HOSTNAMECTL_SAFE].sort(),
-      }, null, 2);
-    }
-    return null;
-  }
-  return null;
-}
-
-// Whitelist of safe journalctl flags — only these are allowed.
-const JOURNALCTL_SAFE_FLAGS = new Set([
-  "-u", "--unit", "-n", "--lines", "--since", "--until",
-  "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
-  "--no-pager", "-o", "--output", "-r", "--reverse",
-  "-x", "--catalog", "--system", "--user",
-  "-t", "--identifier", "-g", "--grep", "--case-sensitive",
-  "-S", "-U", "-e", "--pager-end", "-a", "--all",
-  "-q", "--quiet", "--no-hostname", "--no-full",
-  "-m", "--merge", "-D", "--directory", "--file",
-  "--list-boots",
-]);
-const JOURNALCTL_SAFE_PREFIXES = [
-  "-u=", "--unit=", "-n=", "--lines=", "--since=", "--until=",
-  "-p=", "--priority=", "-b=", "--boot=", "-o=", "--output=",
-  "-t=", "--identifier=", "-g=", "--grep=", "-D=", "--directory=",
-  "--file=", "--case-sensitive=",
-];
-
-function validateJournalctl(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    // Allow KEY=VALUE field matching (e.g. _SYSTEMD_UNIT=foo.service)
-    if (!arg.startsWith("-") && arg.includes("=")) continue;
-    if (!arg.startsWith("-")) continue; // positional args allowed
-
-    const flag = extractFlag(arg);
-    if (!JOURNALCTL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, JOURNALCTL_SAFE_PREFIXES)) {
-      // Special message for follow mode (common mistake, helpful hint)
-      const msg = flag === "-f" || flag === "--follow"
-        ? `journalctl follow mode (${arg}) is not allowed — it blocks the agent. Use -n or --since instead.`
-        : `journalctl "${arg}" is not allowed. Only read-only journalctl queries are permitted.`;
-      return JSON.stringify({ error: msg }, null, 2);
-    }
-  }
-  return null;
-}
-
-const TOP_SAFE_FLAGS = new Set([
-  "-b", "--batch", "-n", "-d", "-p", "-H", "-c", "-o", "-O",
-  "-w", "-1", "-e", "-E", "-i", "-S", "-s", "-u", "-U",
-]);
-const TOP_SAFE_PREFIXES = [
-  "-n=", "-d=", "-p=", "-o=", "-O=", "-w=", "-e=", "-E=", "-u=", "-U=",
-];
-
-function validateTop(args: string[]): string | null {
-  // top MUST run in batch mode (-b) to prevent interactive kill/renice
-  const hasBatch = args.some((a) => a === "-b" || a === "--batch");
-  if (!hasBatch) {
-    return JSON.stringify({
-      error: 'top must be run in batch mode (-b). Interactive mode is not allowed.',
-    }, null, 2);
-  }
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue;
-    const flag = extractFlag(arg);
-    if (!TOP_SAFE_FLAGS.has(flag) && !startsWithAny(arg, TOP_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `top "${arg}" is not allowed. Only batch-mode read-only flags are permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
+// ─── sysctl ──────────────────────────────────────────────────────
 
 const SYSCTL_SAFE_FLAGS = new Set([
   "-a", "--all", "-n", "--values", "-e", "--ignore",
@@ -934,7 +770,6 @@ function validateSysctl(args: string[]): string | null {
         }, null, 2);
       }
     } else {
-      // Positional: block key=value (write)
       if (arg.includes("=")) {
         return JSON.stringify({
           error: `sysctl write ("${arg}") is not allowed. Only read-only sysctl queries are permitted.`,
@@ -945,73 +780,16 @@ function validateSysctl(args: string[]): string | null {
   return null;
 }
 
-const IPTABLES_SAFE_FLAGS = new Set([
-  "-L", "--list", "-S", "--list-rules",
-  "-n", "--numeric", "-v", "--verbose",
-  "-x", "--exact", "--line-numbers",
-  "-t", "--table",
-]);
-const IPTABLES_SAFE_PREFIXES = ["-t=", "--table="];
+// ─── ip ──────────────────────────────────────────────────────────
 
-function validateIptables(args: string[]): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // chain name (positional) is ok
-    const flag = extractFlag(arg);
-    if (!IPTABLES_SAFE_FLAGS.has(flag) && !startsWithAny(arg, IPTABLES_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `iptables "${arg}" is not allowed. Only list operations (-L, -S, -n, -v) are permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-// ─── B4: Perftest ────────────────────────────────────────────────
-
-const PERFTEST_SAFE_FLAGS = new Set([
-  "-s", "--size", "-D", "--duration", "-n", "--iters",
-  "-p", "--port", "-d", "--ib-dev", "-i", "--ib-port",
-  "-m", "--mtu", "-x", "--gid-index", "--sl",
-  "-a", "--all", "-b", "--bidirectional",
-  "-F", "--CPU-freq", "-c", "--connection",
-  "-R", "--rdma_cm", "-q", "--qp",
-  "--run_infinitely", "--report_gbits", "--report_per_port",
-  "-l", "--post_list", "--use_cuda", "--use_rocm", "--output_format",
-  "-h", "--help", "-V", "--version",
-]);
-const PERFTEST_SAFE_PREFIXES = [
-  "-s=", "--size=", "-D=", "--duration=", "-n=", "--iters=",
-  "-p=", "--port=", "-d=", "--ib-dev=", "-i=", "--ib-port=",
-  "-m=", "--mtu=", "-x=", "--gid-index=", "--sl=",
-  "-c=", "--connection=", "-q=", "--qp=", "-l=", "--post_list=",
-  "--output_format=",
-];
-
-function validatePerftest(args: string[], binary: string): string | null {
-  for (let i = 1; i < args.length; i++) {
-    const arg = args[i];
-    if (!arg.startsWith("-")) continue; // server hostname/IP
-    const flag = extractFlag(arg);
-    if (!PERFTEST_SAFE_FLAGS.has(flag) && !startsWithAny(arg, PERFTEST_SAFE_PREFIXES)) {
-      return JSON.stringify({
-        error: `${binary} "${arg}" is not allowed. Only standard perftest flags are permitted.`,
-      }, null, 2);
-    }
-  }
-  return null;
-}
-
-// ─── Existing validators (unchanged) ─────────────────────────────
+const IP_SAFE_ACTIONS = new Set(["show", "list", "ls", "get"]);
 
 function validateIp(cmd: string): string | null {
   const parts = cmd.trim().split(/\s+/);
-  // Skip flags starting with -
   let objectIdx = 1;
   while (objectIdx < parts.length && parts[objectIdx].startsWith("-")) {
     objectIdx++;
   }
-  // ip with just an object (e.g. "ip addr") defaults to "show" — safe
   const action = parts[objectIdx + 1];
   if (!action) return null;
 
@@ -1032,16 +810,41 @@ function validateIp(cmd: string): string | null {
   return null;
 }
 
-// validateAwk removed — awk/gawk excluded from ALLOWED_COMMANDS entirely
-// (Turing-complete language with command execution, file writes, etc.)
+// ─── mount ───────────────────────────────────────────────────────
+
+const MOUNT_SAFE_FLAGS = new Set([
+  "-l", "--list", "-t", "--types", "-v", "--verbose", "-n", "--no-mtab",
+  "-r", "--read-only",
+]);
+const MOUNT_SAFE_PREFIXES = ["-t=", "--types="];
 
 function validateMount(args: string[]): string | null {
-  const nonFlagArgs = args.slice(1).filter((a) => !a.startsWith("-"));
-  if (nonFlagArgs.length >= 2) {
-    return "mount with device and mountpoint arguments is not allowed. Only listing mounts (mount without arguments or with -l) is permitted.";
+  let nonFlagCount = 0;
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg.startsWith("-")) {
+      nonFlagCount++;
+      if (nonFlagCount >= 2) {
+        return "mount with device and mountpoint arguments is not allowed. Only listing mounts (mount without arguments or with -l) is permitted.";
+      }
+      continue;
+    }
+    const flag = extractFlag(arg);
+    if (MOUNT_SAFE_FLAGS.has(flag) || startsWithAny(arg, MOUNT_SAFE_PREFIXES)) {
+      // -t/--types consumes next arg as value
+      if (!arg.includes("=") && (flag === "-t" || flag === "--types")) {
+        i++;
+      }
+      continue;
+    }
+    return JSON.stringify({
+      error: `mount "${arg}" is not allowed. Only listing mounts is permitted.`,
+    }, null, 2);
   }
   return null;
 }
+
+// ─── env ─────────────────────────────────────────────────────────
 
 function validateEnv(args: string[]): string | null {
   const restArgs = args.slice(1);
@@ -1058,67 +861,25 @@ function validateEnv(args: string[]): string | null {
   return null;
 }
 
-const SYSTEMCTL_SAFE = new Set([
-  "status", "show", "list-units", "list-unit-files",
-  "is-active", "is-enabled", "is-failed", "cat",
-  "list-dependencies", "list-sockets", "list-timers",
-]);
-
-function validateSystemctl(args: string[]): string | null {
-  // Find the first non-flag argument after "systemctl" — that is the subcommand
-  for (const arg of args.slice(1)) {
-    if (arg.startsWith("-")) continue;
-    if (!SYSTEMCTL_SAFE.has(arg)) {
-      return JSON.stringify({
-        error: `systemctl subcommand "${arg}" is not allowed. Only read-only subcommands are permitted.`,
-        allowed: [...SYSTEMCTL_SAFE].sort(),
-      }, null, 2);
-    }
-    return null; // first positional is safe
-  }
-  return null; // no subcommand (bare "systemctl") is fine
-}
-
-const CRICTL_SAFE = new Set([
-  "ps", "images", "inspect", "inspecti", "inspectp",
-  "logs", "stats", "info", "version", "pods",
-]);
-
-function validateCrictl(args: string[]): string | null {
-  for (const arg of args.slice(1)) {
-    if (arg.startsWith("-")) continue;
-    if (!CRICTL_SAFE.has(arg)) {
-      return JSON.stringify({
-        error: `crictl subcommand "${arg}" is not allowed. Only read-only subcommands are permitted.`,
-        allowed: [...CRICTL_SAFE].sort(),
-      }, null, 2);
-    }
-    return null;
-  }
-  return null;
-}
+// ─── ctr ─────────────────────────────────────────────────────────
 
 const CTR_SAFE_ACTIONS = new Set(["ls", "list", "info", "check"]);
 
 function validateCtr(args: string[]): string | null {
-  // ctr [global-flags] <object> <action> [args...]
-  // Also allow: ctr version, ctr info
   const positional: string[] = [];
   const skipNext = new Set(["-n", "--namespace", "-a", "--address"]);
   for (let i = 1; i < args.length; i++) {
-    if (skipNext.has(args[i])) { i++; continue; } // flag with value
+    if (skipNext.has(args[i])) { i++; continue; }
     if (args[i].startsWith("-")) continue;
     positional.push(args[i]);
   }
 
   if (positional.length === 0) return null;
 
-  // "ctr version" and "ctr info" are safe standalone commands
   if (positional[0] === "version" || positional[0] === "info") return null;
 
-  // For object+action pattern, verify the action is read-only
   const action = positional[1];
-  if (!action) return null; // just object name, default action is usually "ls" — safe
+  if (!action) return null;
 
   if (!CTR_SAFE_ACTIONS.has(action)) {
     return JSON.stringify({
@@ -1129,12 +890,11 @@ function validateCtr(args: string[]): string | null {
   return null;
 }
 
+// ─── tee ─────────────────────────────────────────────────────────
+
 function validateTee(args: string[]): string | null {
-  // Allow: tee (no args, copies stdin to stdout)
-  // Allow: tee /dev/null
-  // Block: tee /any/other/path, tee -a /path
   for (const arg of args.slice(1)) {
-    if (arg.startsWith("-")) continue; // flags like -a are ok if target is /dev/null
+    if (arg.startsWith("-")) continue;
     if (arg !== "/dev/null") {
       return JSON.stringify({
         error: `tee to "${arg}" is not allowed. Only "tee" or "tee /dev/null" is permitted.`,
@@ -1142,4 +902,44 @@ function validateTee(args: string[]): string | null {
     }
   }
   return null;
+}
+
+// ── Custom validator registry ────────────────────────────────────
+
+const CUSTOM_VALIDATORS: Record<string, (args: string[], baseName: string) => string | null> = {
+  curl:         (args) => validateCurl(args),
+  conntrack:    (args) => validateConntrack(args),
+  find:         (args) => validateFind(args),
+  ip:           (args) => validateIp(args.join(" ")),
+  "nvidia-smi": (args) => validateNvidiaSmi(args),
+  date:         (args) => validateDate(args),
+  ctr:          (args) => validateCtr(args),
+  ibportstate:  (args) => validateIbportstate(args),
+  env:          (args) => validateEnv(args),
+  tee:          (args) => validateTee(args),
+  mount:        (args) => validateMount(args),
+  sysctl:       (args) => validateSysctl(args),
+};
+
+// ── Entry point ──────────────────────────────────────────────────
+
+/**
+ * Apply extra security restrictions to whitelisted commands.
+ * Takes a raw command string, parses it internally.
+ * Returns an error message string if blocked, or null if allowed.
+ */
+export function validateCommandRestrictions(cmd: string): string | null {
+  const args = parseArgs(cmd);
+  if (args.length === 0) return null;
+
+  const baseName = args[0].split("/").pop()?.toLowerCase() ?? "";
+
+  const rule = COMMAND_RULES[baseName];
+  if (!rule) return null;
+
+  if (rule.customValidator) {
+    return CUSTOM_VALIDATORS[rule.customValidator]?.(args, baseName) ?? null;
+  }
+
+  return validateByRule(args, rule);
 }

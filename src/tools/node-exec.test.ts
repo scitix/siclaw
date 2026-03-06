@@ -241,7 +241,7 @@ describe("validateCommand", () => {
     it("blocks journalctl -f in pipeline", () => {
       const result = validateCommand("journalctl -f | grep error");
       expect(result).not.toBeNull();
-      expect(result).toContain("follow");
+      expect(result).toContain("-f");
     });
 
     it("blocks pipe to non-whitelisted command", () => {
