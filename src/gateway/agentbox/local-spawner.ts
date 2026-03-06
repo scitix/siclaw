@@ -5,7 +5,9 @@
  * Each user gets an independent port.
  */
 
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
@@ -14,6 +16,7 @@ import { AgentBoxSessionManager } from "../../agentbox/session.js";
 // to avoid HTTP + mTLS round-trip that is only needed for cross-process (K8s) mode.
 import { mcpHandler, skillsHandler } from "../../agentbox/resource-handlers.js";
 import { buildMergedMcpConfig } from "../mcp-config-builder.js";
+import { loadConfig } from "../../core/config.js";
 import type { McpServerRepository } from "../db/repositories/mcp-server-repo.js";
 import type { ResourceType } from "../../shared/resource-sync.js";
 
@@ -82,6 +85,8 @@ export class LocalSpawner implements BoxSpawner {
 
     // Create session manager and HTTP server
     const sessionManager = new AgentBoxSessionManager();
+    // Set userId so sessions created in this box use per-user skill directories
+    sessionManager.userId = userId;
     const httpServer = createHttpServer(sessionManager);
 
     // Start server
@@ -183,7 +188,13 @@ export class LocalSpawner implements BoxSpawner {
     }
   }
 
-  /** Sync skills for a user */
+  /**
+   * Sync skills for a user into a per-user directory.
+   *
+   * Unlike skillsHandler.materialize() which clears the entire skillsDir,
+   * this writes to {skillsBase}/user/{userId}/ so multiple users don't
+   * overwrite each other's skills in local (shared-process) mode.
+   */
   private async syncSkills(userId: string): Promise<void> {
     if (!this.skillBundleProvider) {
       console.warn(`[local-spawner] Skills sync skipped: no bundle provider configured`);
@@ -191,9 +202,46 @@ export class LocalSpawner implements BoxSpawner {
     }
     try {
       const bundle = await this.skillBundleProvider(userId, "prod");
-      const count = await skillsHandler.materialize(bundle);
-      if (count > 0) {
-        console.log(`[local-spawner] Skills sync for ${userId}: ${count} skills materialized`);
+      const config = loadConfig();
+      const skillsBase = path.resolve(process.cwd(), config.paths.skillsDir);
+      const userSkillsDir = path.join(skillsBase, "user", userId);
+
+      // Clear only this user's directory (not other users or core/team)
+      if (fs.existsSync(userSkillsDir)) {
+        for (const entry of fs.readdirSync(userSkillsDir)) {
+          if (entry.startsWith(".")) continue;
+          fs.rmSync(path.join(userSkillsDir, entry), { recursive: true });
+        }
+      } else {
+        fs.mkdirSync(userSkillsDir, { recursive: true });
+      }
+
+      // Write skills into per-user directory
+      for (const skill of bundle.skills) {
+        const skillDir = path.join(userSkillsDir, skill.dirName);
+        fs.mkdirSync(skillDir, { recursive: true });
+        if (skill.specs) {
+          fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
+        }
+        if (skill.scripts.length > 0) {
+          const scriptsDir = path.join(skillDir, "scripts");
+          fs.mkdirSync(scriptsDir, { recursive: true });
+          for (const script of skill.scripts) {
+            fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
+          }
+        }
+      }
+
+      // Write disabled builtins list into per-user directory
+      const disabledFile = path.join(userSkillsDir, ".disabled-builtins.json");
+      if (bundle.disabledBuiltins?.length) {
+        fs.writeFileSync(disabledFile, JSON.stringify(bundle.disabledBuiltins));
+      } else if (fs.existsSync(disabledFile)) {
+        fs.unlinkSync(disabledFile);
+      }
+
+      if (bundle.skills.length > 0) {
+        console.log(`[local-spawner] Skills sync for ${userId}: ${bundle.skills.length} skills → ${userSkillsDir}`);
       }
     } catch (err: any) {
       console.warn(`[local-spawner] Skills sync failed for ${userId}: ${err.message}`);

@@ -82,6 +82,8 @@ export interface CreateSiclawSessionOpts {
   mcpManager?: McpClientManager;
   /** Pre-resolved MCP tools from shared mcpManager — avoids re-discovery */
   mcpTools?: ToolDefinition[];
+  /** User ID for per-user skill directory isolation (local spawner mode) */
+  userId?: string;
 }
 
 export interface SiclawSessionResult {
@@ -453,9 +455,9 @@ export async function createSiclawSession(
   // Push into customTools so they override framework defaults via extension mechanism
   customTools.push(...restrictedFileTools);
 
-  // Skills: single directory model (bundle API populates skillsBase directly)
-  // CLI fallback: search scope subdirectories
-  const getUserSkillDirName = () => ".";
+  // Skills: when userId is set (local mode), use per-user directory for isolation;
+  // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
+  const getUserSkillDirName = opts?.userId ? () => opts.userId! : () => ".";
   const getPlatformSkillDirName = () => mode === "channel" ? ".platform-channel" : ".platform-web";
 
   // Skill directories (two fixed sources):
@@ -463,9 +465,12 @@ export async function createSiclawSession(
   // 2. Dynamic: team + personal written by bundle API to skillsBase (.siclaw/skills/)
   const builtinPath = path.resolve(cwd, "skills", "core");
 
-  // Read disabled builtins list (written by agentbox-main after bundle fetch)
+  // Read disabled builtins list (written by agentbox-main / local-spawner after bundle fetch)
   let disabledBuiltins: Set<string> | undefined;
-  const disabledFile = path.join(skillsBase, ".disabled-builtins.json");
+  // Local mode writes .disabled-builtins.json into per-user dir; K8s mode writes to skillsBase root
+  const disabledFile = opts?.userId
+    ? path.join(skillsBase, "user", opts.userId, ".disabled-builtins.json")
+    : path.join(skillsBase, ".disabled-builtins.json");
   try {
     if (fs.existsSync(disabledFile)) {
       const list: string[] = JSON.parse(fs.readFileSync(disabledFile, "utf-8"));
@@ -491,8 +496,13 @@ export async function createSiclawSession(
     }
   }
 
-  // Priority: team/personal (skillsBase) > builtin — higher-specificity scopes first
-  const skillsDirs = [skillsBase, ...builtinPaths];
+  // Priority: team/personal > builtin — higher-specificity scopes first.
+  // Local mode: scan per-user dir only (avoids loading other users' skills).
+  // K8s mode: scan skillsBase flat (single-user pod).
+  const dynamicSkillBase = opts?.userId
+    ? path.join(skillsBase, "user", opts.userId)
+    : skillsBase;
+  const skillsDirs = [dynamicSkillBase, ...builtinPaths];
 
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};
