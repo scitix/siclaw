@@ -729,16 +729,16 @@ export function createRpcMethods(
     const baseUrl = params.baseUrl as string;
     const apiKey = params.apiKey as string;
     const api = (params.api as string) ?? "openai-completions";
-    const model = params.model as string | undefined;
     if (!baseUrl || !apiKey) throw new Error("Missing required params: baseUrl, apiKey");
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
+    const base = baseUrl.replace(/\/+$/, "");
 
     try {
       if (api === "anthropic") {
-        // Anthropic: 1-token chat completion
-        const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/v1/messages`, {
+        // Anthropic: auth-only check via counting message tokens (free, no completion)
+        const res = await fetch(`${base}/v1/messages/count_tokens`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -746,52 +746,45 @@ export function createRpcMethods(
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify({
-            model: model ?? "claude-sonnet-4-20250514",
-            max_tokens: 1,
+            model: "claude-sonnet-4-20250514",
             messages: [{ role: "user", content: "hi" }],
           }),
           signal: controller.signal,
         });
-        if (!res.ok) {
-          const body = await res.text().catch(() => "");
-          return { ok: false, message: `HTTP ${res.status}: ${body.slice(0, 200)}` };
+        if (res.ok) return { ok: true, message: "Connection successful" };
+        // 404 means endpoint not available — try a simple auth header check
+        if (res.status === 404) {
+          // Any authenticated GET that returns non-401 means key is valid
+          const fallback = await fetch(`${base}/v1/models`, {
+            headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+            signal: controller.signal,
+          });
+          if (fallback.status !== 401 && fallback.status !== 403) {
+            return { ok: true, message: "Connection successful" };
+          }
         }
-        return { ok: true, message: "Connection successful" };
+        const body = await res.text().catch(() => "");
+        return { ok: false, message: `HTTP ${res.status}: ${body.slice(0, 200)}` };
       }
 
-      // OpenAI-compatible: try GET /models first
-      const modelsUrl = `${baseUrl.replace(/\/+$/, "")}/models`;
-      const res = await fetch(modelsUrl, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: controller.signal,
-      });
-
-      if (res.ok) {
-        const data = await res.json().catch(() => ({}));
-        const modelList = Array.isArray(data?.data) ? data.data.map((m: { id?: string }) => m.id).filter(Boolean) : [];
-        return { ok: true, message: `Connection successful (${modelList.length} models available)`, models: modelList };
+      // OpenAI-compatible: try GET /models (auth-only, no completion)
+      const modelsPaths = [`${base}/models`, `${base}/v1/models`];
+      for (const url of modelsPaths) {
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+          signal: controller.signal,
+        });
+        if (res.ok) {
+          return { ok: true, message: "Connection successful" };
+        }
+        // 401/403 = bad key — definitive failure
+        if (res.status === 401 || res.status === 403) {
+          const body = await res.text().catch(() => "");
+          return { ok: false, message: `Authentication failed (HTTP ${res.status})` };
+        }
+        // 404 = endpoint not found but server responded — try next path
       }
-
-      // Fallback: 1-token chat completion
-      const chatUrl = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
-      const chatRes = await fetch(chatUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: model ?? "gpt-4o",
-          max_tokens: 1,
-          messages: [{ role: "user", content: "hi" }],
-        }),
-        signal: controller.signal,
-      });
-
-      if (!chatRes.ok) {
-        const body = await chatRes.text().catch(() => "");
-        return { ok: false, message: `HTTP ${chatRes.status}: ${body.slice(0, 200)}` };
-      }
+      // All paths returned 404: server is reachable and didn't reject the key
       return { ok: true, message: "Connection successful" };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

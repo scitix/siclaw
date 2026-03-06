@@ -8,11 +8,10 @@ interface ConnectionTestButtonProps {
     baseUrl: string;
     apiKey: string;
     api?: string;
-    model?: string;
     disabled?: boolean;
 }
 
-export function ConnectionTestButton({ baseUrl, apiKey, api, model, disabled }: ConnectionTestButtonProps) {
+export function ConnectionTestButton({ baseUrl, apiKey, api, disabled }: ConnectionTestButtonProps) {
     const { sendRpc } = useWebSocket();
     const [state, setState] = useState<TestState>('idle');
     const [message, setMessage] = useState('');
@@ -22,9 +21,9 @@ export function ConnectionTestButton({ baseUrl, apiKey, api, model, disabled }: 
         setState('testing');
         setMessage('');
         try {
-            const result = await sendRpc<{ ok: boolean; message: string; models?: string[] }>(
+            const result = await sendRpc<{ ok: boolean; message: string }>(
                 'provider.testConnection',
-                { baseUrl, apiKey, api, model },
+                { baseUrl, apiKey, api },
             );
             setState(result.ok ? 'success' : 'error');
             setMessage(result.message);

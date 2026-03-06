@@ -221,7 +221,6 @@ export function QuickSetupCard({ onComplete }: QuickSetupCardProps) {
                             baseUrl={baseUrl}
                             apiKey={apiKey}
                             api={api}
-                            model={isCustom ? customModelId : selectedModel?.id}
                         />
                         <button
                             onClick={handleSave}
