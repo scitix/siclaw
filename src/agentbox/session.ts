@@ -74,6 +74,9 @@ export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
   private defaultSessionId = "default";
 
+  /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
+  userId?: string;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -197,6 +200,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       brainType: effectiveBrainType,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      userId: this.userId,
     });
 
     // New session: re-sync memory index to pick up files from previous sessions
