@@ -16,7 +16,7 @@
 
 ---
 
-Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://github.com/nicholasgriffintn/OpenClaw) and designed to be the collaborative AI foundation for engineering teams. Unlike general-purpose coding agents, Siclaw is built for **read-only infrastructure diagnostics** — the agent observes, analyzes, and reports, but never mutates your environment directly. When remediation is needed, Siclaw integrates with your existing change management systems to execute changes through established, auditable workflows. Describe a problem in plain language and the agent runs kubectl, reads logs, traces network paths, and delivers a root-cause analysis — from a terminal, a web UI, or your team's IM workspace.
+Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://github.com/openclaw) and designed to be the collaborative AI foundation for engineering teams. Unlike general-purpose coding agents, Siclaw is built for **read-only infrastructure diagnostics** — the agent observes, analyzes, and reports, but never mutates your environment directly. When remediation is needed, Siclaw integrates with your existing change management systems to execute changes through established, auditable workflows. Describe a problem in plain language and the agent runs kubectl, reads logs, traces network paths, and delivers a root-cause analysis — from a terminal, a web UI, or your team's IM workspace.
 
 ## Features
 
