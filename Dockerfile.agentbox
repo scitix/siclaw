@@ -49,9 +49,6 @@ COPY skills/core/ ./skills/core/
 # Dynamic skills (team + personal) delivered via Gateway bundle API at startup
 RUN mkdir -p ./.siclaw/skills ./.siclaw/credentials
 
-# Copy MCP servers config if present (optional — NFS is the primary source)
-COPY config/mcp-servers.jso[n] ./config/
-
 # Environment variables
 ENV NODE_ENV=production
 
