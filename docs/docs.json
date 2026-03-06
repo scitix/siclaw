@@ -1,0 +1,121 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Siclaw",
+  "description": "AI Agent Platform for SRE — hypothesis-driven deep investigation engine that thinks like your best engineer.",
+  "theme": "mint",
+  "icons": {
+    "library": "lucide"
+  },
+  "logo": {
+    "light": "/assets/logo-light.svg",
+    "dark": "/assets/logo-dark.svg",
+    "href": "https://www.siclaw.ai"
+  },
+  "favicon": "/assets/favicon.svg",
+  "colors": {
+    "primary": "#3B82F6",
+    "dark": "#60A5FA",
+    "light": "#2563EB"
+  },
+  "fonts": {
+    "heading": {
+      "family": "DM Sans"
+    },
+    "body": {
+      "family": "Inter"
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Website",
+        "href": "https://www.siclaw.ai"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/scitix/siclaw",
+        "icon": "github"
+      }
+    ]
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Get Started",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "index",
+              "start/core-concepts"
+            ]
+          },
+          {
+            "group": "Quick Start",
+            "pages": [
+              "start/getting-started",
+              "start/first-investigation",
+              "start/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Deploy",
+        "groups": [
+          {
+            "group": "Installation",
+            "pages": [
+              "install/cli",
+              "install/docker",
+              "install/kubernetes"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/providers",
+              "configuration/mcp"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Features",
+        "groups": [
+          {
+            "group": "Core",
+            "pages": [
+              "features/deep-investigation",
+              "features/skills",
+              "features/memory"
+            ]
+          },
+          {
+            "group": "Platform",
+            "pages": [
+              "features/channels"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Roadmap",
+        "groups": [
+          {
+            "group": "Project",
+            "pages": [
+              "design/roadmap"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/scitix/siclaw",
+      "slack": "https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw"
+    }
+  }
+}

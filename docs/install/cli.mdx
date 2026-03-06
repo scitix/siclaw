@@ -1,0 +1,100 @@
+---
+title: "CLI Installation"
+sidebarTitle: "CLI"
+description: "Run Siclaw as a terminal application for personal diagnostics."
+---
+
+## Quick Install
+
+```bash
+npx siclaw
+```
+
+That's it. npx downloads and runs the latest version automatically.
+
+## Global Install
+
+If you prefer a permanent installation:
+
+```bash
+npm install -g siclaw
+siclaw
+```
+
+## From Source
+
+```bash
+git clone https://github.com/scitix/siclaw.git
+cd siclaw
+npm ci
+npm run build
+npm run dev
+```
+
+## Configuration
+
+Siclaw stores its configuration and data in `~/.siclaw/`:
+
+```
+~/.siclaw/
+├── config/
+│   └── settings.json     ← LLM provider, model, API key
+├── data.sqlite            ← Session data (Gateway mode, sql.js)
+├── memory/
+│   ├── .memory.db         ← Investigation memory (node:sqlite)
+│   └── *.md               ← Raw memory files
+└── reports/
+    └── deep-search-*.md   ← Investigation reports
+```
+
+### LLM Configuration
+
+Edit `~/.siclaw/config/settings.json` (see [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for full format):
+
+```json
+{
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic",
+      "models": [{ "id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4" }]
+    }
+  }
+}
+```
+
+Or use environment variable overrides:
+
+```bash
+export SICLAW_LLM_API_KEY="sk-ant-..."
+export SICLAW_LLM_BASE_URL="https://api.openai.com/v1"
+export SICLAW_LLM_MODEL="gpt-4o"
+```
+
+See [LLM Providers](/configuration/providers) for Ollama, vLLM, and other setups.
+
+### Kubeconfig
+
+Siclaw uses your default kubeconfig (`~/.kube/config`). To use a specific context:
+
+```bash
+KUBECONFIG=/path/to/kubeconfig siclaw
+```
+
+## Embedding (Optional)
+
+To enable Investigation Memory with semantic search, add an embedding config:
+
+```json
+{
+  "embedding": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "sk-...",
+    "model": "bge-m3",
+    "dimensions": 1024
+  }
+}
+```
+
+Without embedding, memory features are disabled but all other functionality works normally.

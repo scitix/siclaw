@@ -1,0 +1,117 @@
+---
+title: "Channels & Integrations"
+sidebarTitle: "Channels"
+description: "Access Siclaw via Terminal, Web UI, Slack, Lark, webhooks, and scheduled patrols."
+---
+
+## Supported Channels
+
+All channels share the same investigation engine — the interface differs but the diagnostic capability is identical.
+
+| Channel | Mode | Status |
+|---------|------|--------|
+| **Terminal (TUI)** | CLI | Stable |
+| **Web UI** | Gateway | Stable |
+| **Slack** | Gateway | Stable |
+| **Lark (Feishu)** | Gateway | Stable |
+| **Webhooks** | Gateway | Stable |
+
+## Web UI
+
+Available in Gateway mode (`siclaw-gateway` or Docker deployment):
+
+```bash
+npm run dev:gateway
+# Open http://localhost:3001
+```
+
+The Web UI provides:
+- Real-time investigation with streaming updates
+- Session history and investigation reports
+- Skill management (create, review, publish)
+- MCP server configuration
+- Cron job management
+
+## Slack Integration
+
+### Setup
+
+1. Create a Slack App at [api.slack.com/apps](https://api.slack.com/apps)
+2. Enable **Socket Mode** and **Event Subscriptions**
+3. Subscribe to events: `app_mention`, `message.im`
+4. Add bot scopes: `chat:write`, `app_mentions:read`, `im:history`
+5. Set environment variables:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+```
+
+### Usage
+
+Mention the bot in any channel:
+
+```
+@siclaw Pod payment-service is CrashLoopBackOff in prod
+```
+
+Or send a direct message for private investigations.
+
+## Lark (Feishu) Integration
+
+```bash
+LARK_APP_ID=cli_...
+LARK_APP_SECRET=...
+```
+
+Create a Lark bot app, enable message event subscriptions, and set the environment variables above.
+
+## Alert Webhooks
+
+Siclaw accepts alert webhooks from monitoring systems and automatically starts an investigation:
+
+```bash
+curl -X POST https://siclaw.example.com/api/webhook/alert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "High error rate on payment-service",
+    "severity": "critical",
+    "labels": {"namespace": "prod", "service": "payment"}
+  }'
+```
+
+Compatible with: **Prometheus Alertmanager**, **Grafana**, **PagerDuty**, and any custom webhook (JSON format).
+
+## Scheduled Patrols (Cron)
+
+Schedule recurring health checks using natural language:
+
+```
+"Check GPU utilization across all training nodes every 6 hours"
+"Verify pod health in the payments namespace every 30 minutes"
+"Run full cluster health check at 9am every Monday"
+```
+
+### Creating a Patrol
+
+**Via Web UI**: Go to **Cron** in the sidebar, click **New Patrol**, describe what to check and how often.
+
+**Via API**:
+
+```bash
+curl -X POST https://siclaw.example.com/api/cron \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Check GPU utilization every 6 hours",
+    "schedule": "0 */6 * * *",
+    "skills": ["gpu-health-check"]
+  }'
+```
+
+Each patrol run produces a status (success / warning / failure), output summary, and timestamp — all visible in the Web UI.
+
+## MCP Servers
+
+Siclaw supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for connecting external data sources — Prometheus metrics, GitHub issues, custom APIs — as investigation tools. The agent discovers and uses them automatically.
+
+See [MCP Servers](/configuration/mcp) for setup and examples.

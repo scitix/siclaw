@@ -1,3 +1,9 @@
+---
+title: "Architecture Invariants"
+sidebarTitle: "Invariants"
+description: "Constraints and contracts that every contributor and reviewer must understand."
+---
+
 # Architecture Invariants & Component Contracts
 
 > **Purpose**: Constraints and contracts that every contributor and reviewer must understand.
@@ -29,7 +35,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 **Consequences**:
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
 - `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skillsDir` before writing. This is designed for K8s pods with isolated filesystems
-- Per-user skill sync in local mode must write only to scoped subdirectories (`skills/team/` and `skills/user/{userId}/`) without touching `skills/core/`
+- Per-user skill sync in local mode must write only to scoped subdirectories (`skills/team/` and `skills/user/<userId>/`) without touching `skills/core/`
 - The sql.js SQLite lockfile prevents multi-process access; local mode is single-process by design
 
 **Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:90-129`
@@ -70,7 +76,7 @@ skills/
 └── extension/     ← Optional overlay builds
 ```
 
-**Loading priority** (highest wins): `user/{userId}` > `team` > `core`
+**Loading priority** (highest wins): `user/<userId>` > `team` > `core`
 
 ### 2.3 Skill Activation Gate
 
@@ -170,7 +176,7 @@ Siclaw maintains **two independent SQLite databases** with completely different 
 | Database | Purpose | Engine | Location |
 |----------|---------|--------|----------|
 | Gateway DB | Users, sessions, skills, channels, cron, MCP config | sql.js (WASM) | `.siclaw/data.sqlite` |
-| Memory DB | Embeddings, chunks, investigation records, FTS index | node:sqlite (native) | `{memoryDir}/.memory.db` |
+| Memory DB | Embeddings, chunks, investigation records, FTS index | node:sqlite (native) | `<memoryDir>/.memory.db` |
 
 These are never merged. Do not confuse them.
 
@@ -219,7 +225,7 @@ postReload(context)  Notify active sessions to pick up changes
 | `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
 | `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes entire skillsDir first |
 
-For local mode skills sync, write directly to `skills/team/` and `skills/user/{userId}/` without delegating to `skillsHandler.materialize()`.
+For local mode skills sync, write directly to `skills/team/` and `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`.
 
 ---
 
@@ -312,7 +318,7 @@ Memory-dependent features (investigations, `memory_search`) only work with pi-ag
 
 **Invariant**: mTLS is used **only between Gateway and AgentBox in K8s mode**. It is not used in LocalSpawner mode (same-machine, in-process) or TUI mode (no network).
 
-- CA: 10-year, stored in DB (`system_config` table), auto-renewed when <30 days remain
+- CA: 10-year, stored in DB (`system_config` table), auto-renewed when fewer than 30 days remain
 - Client certs: issued per-pod at spawn time, short-lived
 - Identity encoded in certificate CN/OU: `userId`, `workspaceId`, `boxId`
 - Protected endpoints: `/api/internal/*` on Gateway HTTPS port (3002)

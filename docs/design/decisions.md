@@ -1,3 +1,9 @@
+---
+title: "Architecture Decision Records"
+sidebarTitle: "ADRs"
+description: "Key architectural decisions with context, rationale, and consequences."
+---
+
 # Architecture Decision Records (ADR)
 
 > **Format**: Context → Decision → Consequences

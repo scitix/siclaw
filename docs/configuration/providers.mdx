@@ -1,0 +1,147 @@
+---
+title: "LLM Providers"
+sidebarTitle: "LLM Providers"
+description: "Configure Siclaw to use Anthropic, OpenAI, Ollama, or any compatible LLM."
+---
+
+Siclaw needs an LLM to power its investigation engine. Configure via `~/.siclaw/config/settings.json` or environment variable overrides.
+
+## Anthropic (Recommended)
+
+```json
+{
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "sk-ant-...",
+      "api": "anthropic",
+      "authHeader": true,
+      "models": [{
+        "id": "claude-sonnet-4-20250514",
+        "name": "Claude Sonnet 4",
+        "contextWindow": 200000,
+        "maxTokens": 16000
+      }]
+    }
+  }
+}
+```
+
+Recommended models: `claude-sonnet-4-20250514` (best balance) or `claude-opus-4-20250514` (highest quality).
+
+## OpenAI
+
+```json
+{
+  "providers": {
+    "default": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [{
+        "id": "gpt-4o",
+        "name": "GPT-4o",
+        "contextWindow": 128000,
+        "maxTokens": 16384
+      }]
+    }
+  }
+}
+```
+
+## OpenAI-Compatible Providers
+
+Any API that implements the OpenAI chat completions format works with Siclaw — Ollama, vLLM, LiteLLM, Azure OpenAI, Moonshot, DeepSeek, and many others.
+
+```json
+{
+  "providers": {
+    "default": {
+      "baseUrl": "http://localhost:11434/v1",
+      "apiKey": "ollama",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [{
+        "id": "llama3.1:70b",
+        "name": "Llama 3.1 70B",
+        "contextWindow": 131072,
+        "maxTokens": 8192
+      }]
+    }
+  }
+}
+```
+
+### Common Providers
+
+| Provider | `baseUrl` | Notes |
+|----------|-----------|-------|
+| **Ollama** | `http://localhost:11434/v1` | Local, free. Use 70B+ for best results. |
+| **vLLM** | `http://localhost:8000/v1` | Self-hosted GPU inference |
+| **Moonshot (Kimi)** | `https://api.moonshot.cn/v1` | `moonshot-v1-128k` |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| **Qwen (DashScope)** | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+
+<Tip>
+See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for a complete example with all fields.
+</Tip>
+
+## Environment Variable Overrides
+
+These override the default provider's settings at runtime (highest priority):
+
+```bash
+SICLAW_LLM_API_KEY=sk-...       # Override default provider's API key
+SICLAW_LLM_BASE_URL=https://... # Override default provider's base URL
+SICLAW_LLM_MODEL=gpt-4o         # Override default model ID
+```
+
+API keys also support `$VAR` / `${VAR}` references in `settings.json`:
+
+```json
+{
+  "providers": {
+    "default": {
+      "apiKey": "${MY_API_KEY}",
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
+    }
+  }
+}
+```
+
+## Embedding Provider
+
+<Warning>
+Without an embedding provider, Investigation Memory semantic search is disabled. All other features work normally.
+</Warning>
+
+Embedding is used for memory search — matching current symptoms against past investigation records. Any OpenAI-compatible embedding API works:
+
+```json
+{
+  "embedding": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "sk-...",
+    "model": "bge-m3",
+    "dimensions": 1024
+  }
+}
+```
+
+| Provider | Model | Dimensions | Notes |
+|----------|-------|------------|-------|
+| **BGE-M3** (recommended) | `bge-m3` | 1024 | Multilingual, good for technical content |
+| **OpenAI** | `text-embedding-3-small` | 1536 | Easy setup if you already have an OpenAI key |
+| **Ollama** | `nomic-embed-text` | 768 | Local, free |
+
+## Model Recommendations
+
+| Use Case | Recommended | Notes |
+|----------|-------------|-------|
+| **Production investigations** | Claude Sonnet 4 / GPT-4o | Best quality-to-speed ratio |
+| **Complex root cause analysis** | Claude Opus 4 | Highest reasoning capability |
+| **Cost-sensitive / air-gapped** | Llama 3.1 70B+ via Ollama | Local, no API costs |
+| **Testing / development** | Any available model | Smaller models work for basic checks |

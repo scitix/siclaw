@@ -1,0 +1,128 @@
+---
+title: "Kubernetes Deployment"
+sidebarTitle: "Kubernetes"
+description: "Deploy Siclaw on Kubernetes with full tenant isolation using Helm."
+---
+
+## Quick Start
+
+```bash
+helm install siclaw oci://scitix/siclaw/helm/siclaw \
+  --set llm.provider=anthropic \
+  --set llm.apiKey=sk-ant-... \
+  --set llm.model=claude-sonnet-4-20250514
+```
+
+## Architecture
+
+In Kubernetes mode, Siclaw uses `K8sSpawner` for full tenant isolation:
+
+```
+Gateway Pod (Deployment)
+  ├── API server (port 3001)
+  ├── HTTPS/mTLS server (port 3002)
+  ├── K8sSpawner → creates AgentBox pods on demand
+  └── MySQL connection (required for K8s mode)
+
+AgentBox Pod (per user)
+  ├── Isolated filesystem (emptyDir volume)
+  ├── mTLS client certificate (identity: userId + workspaceId)
+  ├── Skills synced via bundle API (team + personal only)
+  └── Auto-terminates after 5 minutes idle
+```
+
+## Helm Values
+
+Key configuration options:
+
+```yaml
+# values.yaml
+replicaCount: 1
+
+llm:
+  provider: anthropic
+  apiKey: sk-ant-...
+  model: claude-sonnet-4-20250514
+
+database:
+  type: mysql
+  host: mysql.default.svc.cluster.local
+  port: 3306
+  name: siclaw
+  user: siclaw
+  password: ...
+
+gateway:
+  image:
+    repository: scitix/siclaw-gateway
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 3001
+
+agentbox:
+  image:
+    repository: scitix/siclaw-agentbox
+    tag: latest
+  resources:
+    limits:
+      memory: 512Mi
+      cpu: 500m
+```
+
+## mTLS Security
+
+Gateway and AgentBox communicate over mutual TLS:
+
+- **CA certificate**: Auto-generated (10-year), stored in database, auto-renewed at 30-day threshold
+- **Client certificates**: Issued per-pod at spawn time, encode `userId` + `workspaceId` in CN/OU
+- **Protected endpoints**: `/api/internal/*` on Gateway port 3002
+
+No API keys in pod environment variables — identity is cryptographically bound to the certificate.
+
+## Database
+
+Kubernetes mode **requires MySQL** (SQLite is single-process only):
+
+```bash
+helm install siclaw ... \
+  --set database.type=mysql \
+  --set database.host=mysql.svc.cluster.local \
+  --set database.name=siclaw \
+  --set database.user=siclaw \
+  --set database.password=secret
+```
+
+<Warning>
+Common gotcha: use `--set-string` for numeric Helm values like image tags (e.g., `--set-string gateway.image.tag=20260301`). Also ensure `--set namespace=` matches the actual Kubernetes namespace.
+</Warning>
+
+## Ingress
+
+Example with nginx-ingress:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: siclaw
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  rules:
+    - host: siclaw.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: siclaw-gateway
+                port:
+                  number: 3001
+```
+
+<Note>
+WebSocket support is required for real-time investigation updates. Set appropriate proxy timeouts for long-running investigations (up to 5 minutes).
+</Note>

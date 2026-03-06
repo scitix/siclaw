@@ -1,0 +1,99 @@
+---
+title: "Skill System"
+sidebarTitle: "Skills"
+description: "Extend Siclaw with reusable diagnostic playbooks and custom scripts."
+---
+
+## What Are Skills?
+
+Skills are reusable diagnostic playbooks that extend Siclaw's capabilities. Each skill is a directory containing a description and optional executable scripts.
+
+```
+skills/core/k8s-pod-diagnostics/
+├── SKILL.md        ← Description, parameters, usage
+└── scripts/
+    └── check-pod.sh  ← Executable diagnostic script
+```
+
+## Skill Tiers
+
+```
+skills/
+├── core/             ← Built-in, read-only, ships with Siclaw
+├── team/             ← Team-managed via Web UI, admin-published
+├── user/&lt;userId&gt;/    ← Personal skills, per-user
+└── extension/        ← Optional overlay builds
+```
+
+**Loading priority** (highest wins): personal > `team` > `core`
+
+## Creating a Skill
+
+### 1. Write the SKILL.md
+
+```markdown
+# GPU Health Check
+
+Check NVIDIA GPU health status across cluster nodes.
+
+## Parameters
+
+- `namespace` (optional): Target namespace. Default: all namespaces.
+- `node` (optional): Specific node to check.
+
+## Usage
+
+Check all GPUs: `run_skill gpu-health-check`
+Check specific node: `run_skill gpu-health-check --node gpu-worker-01`
+```
+
+### 2. Add Scripts (Optional)
+
+```bash
+#!/bin/bash
+# scripts/check-gpu.sh
+# Arguments passed as positional parameters
+
+kubectl get nodes -l nvidia.com/gpu.present=true -o wide
+kubectl exec -n gpu-operator -- nvidia-smi --query-gpu=gpu_name,temperature.gpu,utilization.gpu,memory.used --format=csv
+```
+
+## Security Review Gate
+
+Scripts follow a mandatory review workflow before execution:
+
+```
+draft → request review → pending → AI + static analysis → approved/rejected
+```
+
+### Static Analysis
+
+Danger patterns are checked automatically:
+
+| Severity | Examples |
+|----------|---------|
+| Critical | `rm -rf`, `mkfs`, `dd if=`, fork bomb |
+| High | `chmod 777`, `curl | sh`, `eval`, `> /dev/sda` |
+| Medium | `kill -9`, `pkill`, `reboot`, `shutdown` |
+
+### AI Review
+
+An LLM reviews the script semantics with a mandatory rule: **"Skills MUST be strictly read-only."**
+
+### Human Approval
+
+A user with `skill_reviewer` role must approve before the skill can be executed.
+
+## Script Execution
+
+When a skill script is approved and executed via `run_skill`:
+
+- **Interpreter**: `bash` for `.sh`, `python3` for `.py` (detected automatically)
+- **Timeout**: Default 180s, max 300s
+- **Arguments**: Passed as array to `spawn()` — no shell interpolation (injection-safe)
+- **Max output**: 10 MB combined stdout + stderr
+- **Injected environment**: `KUBECONFIG`, `SICLAW_DEBUG_IMAGE`, `SICLAW_CREDENTIALS_DIR`
+
+<Note>
+Skill scripts are **exempt from the binary allowlist**. This is the only way to run otherwise-blocked binaries (like `sed` or `awk`) — the security review gate is the safety mechanism.
+</Note>

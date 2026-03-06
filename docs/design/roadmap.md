@@ -1,3 +1,9 @@
+---
+title: "Roadmap"
+sidebarTitle: "Roadmap"
+description: "Investigation Memory, Knowledge Base, and Persona roadmaps with current status."
+---
+
 # Siclaw Roadmap
 
 > **Last updated**: 2026-03-06
@@ -46,7 +52,7 @@ The knowledge feedback loop: every investigation produces structured experience 
 - Vector + FTS hybrid search over memory
 - Inject relevant memories into agent context at session start
 
-### IM Phase 1 — Structured Knowledge Extraction ✅ Complete (PR #17)
+### IM Phase 1 — Structured Knowledge Extraction ✅ Complete
 - Dual-output: raw markdown + structured `investigations` SQLite table
 - Schema: `question`, `root_cause_category`, `affected_entities`, `environment_tags`, `causal_chain`, `confidence`, `conclusion`
 - Hybrid retrieval: vector similarity + structured field filtering
