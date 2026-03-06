@@ -53,6 +53,7 @@ try {
 const gateway = await startGateway({
   config,
   agentBoxManager,
+  spawner,
   extraHttpHandlers,
 });
 

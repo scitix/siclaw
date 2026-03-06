@@ -15,6 +15,7 @@ import type {
   ResourceDescriptor,
   ResourceNotifier,
   NotifyResult,
+  ResourceType,
 } from "../shared/resource-sync.js";
 
 /**
@@ -28,14 +29,23 @@ export interface AgentBoxManagerLike {
 }
 
 /**
+ * Optional callback for local-mode resource reload.
+ * When provided, the notifier calls this instead of HTTP POST.
+ */
+export type LocalReloader = (type: ResourceType, userId?: string) => Promise<void>;
+
+/**
  * Create a ResourceNotifier backed by a live AgentBoxManager.
  *
  * @param manager  Something that can list active users / boxes.
  * @param tlsOpts  Optional mTLS options forwarded to AgentBoxClient.
+ * @param localReloader  Optional callback for local-mode in-process reload.
+ *                       When set, bypasses HTTP and calls the spawner directly.
  */
 export function createResourceNotifier(
   manager: AgentBoxManagerLike,
   tlsOpts?: AgentBoxTlsOptions,
+  localReloader?: LocalReloader,
 ): ResourceNotifier {
   // ── helpers ────────────────────────────────────────────────────────
 
@@ -95,6 +105,21 @@ export function createResourceNotifier(
 
   return {
     async notifyAll(descriptor: ResourceDescriptor): Promise<NotifyResult> {
+      // Local mode: in-process reload, no HTTP round-trip
+      if (localReloader) {
+        try {
+          await localReloader(descriptor.type);
+          const boxCount = Math.max(1, manager.activeUserIds().length);
+          console.log(`[resource-notify] ${descriptor.type} local reload OK (${boxCount} boxes)`);
+          return { resourceType: descriptor.type, success: boxCount, failed: 0 };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[resource-notify] ${descriptor.type} local reload failed: ${msg}`);
+          return { resourceType: descriptor.type, success: 0, failed: 1 };
+        }
+      }
+
+      // Remote mode: HTTP POST to each AgentBox
       // Try in-memory cache first (local dev), fall back to async list (K8s)
       let handles: AgentBoxHandle[] = [];
       const userIds = manager.activeUserIds();
@@ -111,6 +136,20 @@ export function createResourceNotifier(
     },
 
     async notifyUser(descriptor: ResourceDescriptor, userId: string): Promise<NotifyResult> {
+      // Local mode: in-process reload scoped to user
+      if (localReloader) {
+        try {
+          await localReloader(descriptor.type, userId);
+          console.log(`[resource-notify] ${descriptor.type} local reload OK for userId=${userId}`);
+          return { resourceType: descriptor.type, success: 1, failed: 0 };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[resource-notify] ${descriptor.type} local reload failed for userId=${userId}: ${msg}`);
+          return { resourceType: descriptor.type, success: 0, failed: 1 };
+        }
+      }
+
+      // Remote mode: HTTP POST to user's AgentBoxes
       // Try in-memory cache first (local dev), fall back to async list (K8s)
       let handles = manager.getForUser(userId);
       if (handles.length === 0) {
