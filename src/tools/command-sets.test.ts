@@ -125,6 +125,18 @@ describe("validateCommandRestrictions", () => {
       expect(err).not.toBeNull();
       expect(err).toContain("--output");
     });
+
+    it("blocks combined short flags that hide unsafe flags (sort -ro)", () => {
+      const err = validateCommandRestrictions("sort -ro /tmp/out file.txt");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-ro");
+    });
+
+    it("allows short flag with attached non-letter value (sort -k2,3)", () => {
+      expect(validateCommandRestrictions("sort -k2,3 file.txt")).toBeNull();
+      expect(validateCommandRestrictions("sort -t, -k2,2 data.csv")).toBeNull();
+      expect(validateCommandRestrictions("sort -k20,30 file.txt")).toBeNull();
+    });
   });
 
   describe("find restrictions", () => {
@@ -227,7 +239,7 @@ describe("validateCommandRestrictions", () => {
     it("blocks uniq with output file", () => {
       const err = validateCommandRestrictions("uniq input output");
       expect(err).not.toBeNull();
-      expect(err).toContain("output file");
+      expect(err).toContain("more than 1 positional");
     });
   });
 
@@ -360,13 +372,13 @@ describe("validateCommandRestrictions", () => {
     it("blocks ifconfig set (2+ positional args)", () => {
       const err = validateCommandRestrictions("ifconfig eth0 192.168.1.1");
       expect(err).not.toBeNull();
-      expect(err).toContain("configuration");
+      expect(err).toContain("more than 1 positional");
     });
 
     it("blocks ifconfig up/down", () => {
       const err = validateCommandRestrictions("ifconfig eth0 up");
       expect(err).not.toBeNull();
-      expect(err).toContain("configuration");
+      expect(err).toContain("more than 1 positional");
     });
   });
 
@@ -733,6 +745,30 @@ describe("validateCommandRestrictions", () => {
       expect(err).not.toBeNull();
       expect(err).toContain("-D");
     });
+
+    it("blocks combined short flags hiding unsafe ops (dmesg -Tc)", () => {
+      const err = validateCommandRestrictions("dmesg -Tc");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-Tc");
+    });
+
+    it("blocks dmesg -w (follow — hangs indefinitely)", () => {
+      const err = validateCommandRestrictions("dmesg -w");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-w");
+    });
+
+    it("blocks dmesg --follow", () => {
+      const err = validateCommandRestrictions("dmesg --follow");
+      expect(err).not.toBeNull();
+      expect(err).toContain("--follow");
+    });
+
+    it("blocks dmesg -W (follow-new)", () => {
+      const err = validateCommandRestrictions("dmesg -W");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-W");
+    });
   });
 
   describe("timedatectl restrictions", () => {
@@ -797,19 +833,19 @@ describe("validateCommandRestrictions", () => {
     it("blocks journalctl -f (follow)", () => {
       const err = validateCommandRestrictions("journalctl -f");
       expect(err).not.toBeNull();
-      expect(err).toContain("follow");
+      expect(err).toContain("-f");
     });
 
     it("blocks journalctl --follow", () => {
       const err = validateCommandRestrictions("journalctl --follow");
       expect(err).not.toBeNull();
-      expect(err).toContain("follow");
+      expect(err).toContain("--follow");
     });
 
     it("blocks journalctl -u kubelet -f", () => {
       const err = validateCommandRestrictions("journalctl -u kubelet -f");
       expect(err).not.toBeNull();
-      expect(err).toContain("follow");
+      expect(err).toContain("-f");
     });
 
     it("blocks journalctl --vacuum-size", () => {
@@ -950,6 +986,12 @@ describe("validateCommandRestrictions", () => {
       expect(err).not.toBeNull();
       expect(err).toContain("-A");
     });
+
+    it("blocks combined short flags hiding unsafe ops (iptables -LA)", () => {
+      const err = validateCommandRestrictions("iptables -LA");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-LA");
+    });
   });
 
   // ─── B4: Perftest ──────────────────────────────────────────
@@ -995,13 +1037,13 @@ describe("validateCommandRestrictions", () => {
     it("blocks top without -b (interactive mode)", () => {
       const err = validateCommandRestrictions("top");
       expect(err).not.toBeNull();
-      expect(err).toContain("batch mode");
+      expect(err).toContain("requires one of");
     });
 
     it("blocks top -n without -b", () => {
       const err = validateCommandRestrictions("top -n 1");
       expect(err).not.toBeNull();
-      expect(err).toContain("batch mode");
+      expect(err).toContain("requires one of");
     });
   });
 
@@ -1054,12 +1096,38 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("mount")).toBeNull();
       expect(validateCommandRestrictions("mount -l")).toBeNull();
       expect(validateCommandRestrictions("mount -t ext4")).toBeNull();
+      expect(validateCommandRestrictions("mount -v")).toBeNull();
+      expect(validateCommandRestrictions("mount -t=nfs")).toBeNull();
     });
 
     it("blocks actual mount", () => {
       const err = validateCommandRestrictions("mount /dev/sda1 /mnt");
       expect(err).not.toBeNull();
       expect(err).toContain("not allowed");
+    });
+
+    it("blocks mount -o remount,rw (remount attack)", () => {
+      const err = validateCommandRestrictions("mount -o remount,rw /");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-o");
+    });
+
+    it("blocks mount --options", () => {
+      const err = validateCommandRestrictions("mount --options remount,rw /");
+      expect(err).not.toBeNull();
+      expect(err).toContain("--options");
+    });
+
+    it("blocks mount --bind", () => {
+      const err = validateCommandRestrictions("mount --bind /src /dst");
+      expect(err).not.toBeNull();
+      expect(err).toContain("--bind");
+    });
+
+    it("blocks mount -a (mount all)", () => {
+      const err = validateCommandRestrictions("mount -a");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-a");
     });
   });
 
