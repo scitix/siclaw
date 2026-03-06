@@ -34,6 +34,20 @@ npm run dev:gateway
 npm run dev:agentbox
 ```
 
+## Design Documents
+
+Before making significant changes, read the relevant design doc:
+
+| Document | When to read |
+|----------|-------------|
+| [`docs/design/invariants.md`](docs/design/invariants.md) | Touching resource sync, skills, security, or DB schema |
+| [`docs/design/roadmap.md`](docs/design/roadmap.md) | Planning work or checking current priorities |
+| [`docs/design/decisions.md`](docs/design/decisions.md) | Wondering "why was X designed this way?" |
+
+New architectural decisions should get an ADR entry in `docs/design/decisions.md`.
+
+---
+
 ## Project Architecture
 
 Siclaw has four entry points, each serving a different deployment role:
