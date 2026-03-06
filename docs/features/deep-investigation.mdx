@@ -1,0 +1,94 @@
+---
+title: "Deep Investigation"
+sidebarTitle: "Deep Investigation"
+description: "How Siclaw's 4-phase hypothesis-driven investigation engine works."
+---
+
+## Overview
+
+Deep Investigation is Siclaw's core diagnostic engine. Instead of running a fixed playbook, it **thinks like an SRE**: gathers evidence, forms hypotheses, tests them independently, and synthesizes a conclusion.
+
+## The 4-Phase Pipeline
+
+### Phase 1: Context Gathering
+
+A sub-agent with tool access collects the current state of the environment:
+
+- Pod status, events, and logs
+- Node conditions and resource utilization
+- Recent deployments and config changes
+- Relevant metrics from Prometheus/monitoring
+
+**Budget**: Up to 8 tool calls (5 in Quick mode)
+
+### Phase 2: Hypothesis Generation
+
+A single LLM call analyzes the context and generates 3-5 ranked hypotheses:
+
+```
+H1  OOMKilled — memory limit too low          confidence: 78%
+H2  Config mount failure — missing key         confidence: 45%
+H3  Liveness probe mismatch                    confidence: 32%
+```
+
+If [Investigation Memory](/features/memory) has data, past investigations with similar patterns are injected here to improve hypothesis quality.
+
+### Phase 3: Parallel Validation
+
+Up to 3 sub-agents run simultaneously, each validating one hypothesis:
+
+- Each sub-agent has its own **independent tool budget** (up to 10 calls each)
+- Sub-agents don't share information — this prevents confirmation bias
+- Each agent produces a verdict: `validated`, `invalidated`, or `inconclusive`
+- Tool set is minimal: `read`, `restricted-bash`, `node_exec` only
+
+### Phase 4: Conclusion
+
+All evidence is synthesized into a structured report containing:
+
+- **Root cause** with confidence score
+- **Causal chain** (ordered steps from trigger to symptom)
+- **Evidence references** (which commands produced which findings)
+- **Remediation steps** (actionable next steps)
+- **Structured extraction** (category, affected entities, environment tags) → stored in Investigation Memory
+
+## Budget Controls
+
+| Metric | Normal | Quick |
+|--------|--------|-------|
+| Context tool calls | 8 | 5 |
+| Max hypotheses | 5 | 3 |
+| Calls per hypothesis | 10 | 8 |
+| Total tool calls | 60 | 30 |
+| Parallel sub-agents | 3 | 3 |
+| Max duration | 5 min | 3 min |
+
+## Triggering Deep Investigation
+
+### Automatic (via triage)
+
+The main agent triages the user's question. If it determines a deep investigation is needed, it calls `deep_search` with pre-gathered context and hypotheses, skipping Phases 1-2.
+
+### Manual
+
+```
+> /deep "Intermittent 5xx errors on API gateway every 30 minutes"
+```
+
+### Via Alert Webhook
+
+```bash
+curl -X POST https://siclaw.example.com/api/webhook/alert \
+  -H "Content-Type: application/json" \
+  -d '{"title": "High error rate on payment-service", "severity": "critical"}'
+```
+
+## Reports
+
+Every investigation produces a report saved to `~/.siclaw/reports/`:
+
+```
+~/.siclaw/reports/deep-search-2026-03-06T14-30-00.md
+```
+
+Reports include the full investigation trace: every tool call, its output, and the reasoning chain.

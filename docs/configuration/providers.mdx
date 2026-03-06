@@ -1,0 +1,141 @@
+---
+title: "LLM Providers"
+sidebarTitle: "LLM Providers"
+description: "Configure Siclaw to use Anthropic, OpenAI, Ollama, or any compatible LLM."
+---
+
+Siclaw needs an LLM to power its investigation engine. Configure via `~/.siclaw/config/settings.json` or environment variables.
+
+## Anthropic (Recommended)
+
+```json
+{
+  "llm": {
+    "provider": "anthropic",
+    "apiKey": "sk-ant-...",
+    "model": "claude-sonnet-4-20250514"
+  }
+}
+```
+
+Or via environment variable:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+```
+
+Recommended models: `claude-sonnet-4-20250514` (best balance of speed and quality) or `claude-opus-4-20250514` (highest quality for complex investigations).
+
+## OpenAI
+
+```json
+{
+  "llm": {
+    "provider": "openai",
+    "apiKey": "sk-...",
+    "model": "gpt-4o"
+  }
+}
+```
+
+Or:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+export OPENAI_MODEL="gpt-4o"
+```
+
+## OpenAI-Compatible Providers
+
+Any API that implements the OpenAI chat completions format works with Siclaw. This includes Ollama, vLLM, LiteLLM, Azure OpenAI, Moonshot, and many others.
+
+```json
+{
+  "llm": {
+    "provider": "openai-compatible",
+    "baseUrl": "http://localhost:11434/v1",
+    "apiKey": "ollama",
+    "model": "llama3.1:70b"
+  }
+}
+```
+
+Or:
+
+```bash
+export OPENAI_BASE_URL="http://localhost:11434/v1"
+export OPENAI_API_KEY="ollama"
+export OPENAI_MODEL="llama3.1:70b"
+```
+
+### Common Providers
+
+| Provider | `baseUrl` | Notes |
+|----------|-----------|-------|
+| **Ollama** | `http://localhost:11434/v1` | Local, free. Use 70B+ models for best results. |
+| **vLLM** | `http://localhost:8000/v1` | Self-hosted GPU inference |
+| **Azure OpenAI** | `https://{resource}.openai.azure.com/openai/deployments/{deployment}` | Set deployment as model |
+| **Moonshot (Kimi)** | `https://api.moonshot.cn/v1` | `moonshot-v1-128k` |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` |
+
+## Embedding Provider
+
+<Warning>
+Without an embedding provider, Investigation Memory semantic search is disabled. All other features work normally.
+</Warning>
+
+Embedding is used for memory search — matching current symptoms against past investigation records. Any OpenAI-compatible embedding API works:
+
+```json
+{
+  "embedding": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "sk-...",
+    "model": "bge-m3",
+    "dimensions": 1024
+  }
+}
+```
+
+| Provider | Model | Dimensions | Notes |
+|----------|-------|------------|-------|
+| **BGE-M3** (recommended) | `bge-m3` | 1024 | Multilingual, good for technical content |
+| **OpenAI** | `text-embedding-3-small` | 1536 | Easy setup if you already have an OpenAI key |
+| **Ollama** | `nomic-embed-text` | 768 | Local, free |
+
+## Environment Variables Reference
+
+All LLM settings can be overridden via environment variables:
+
+```bash
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+
+# OpenAI / Compatible
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.example.com/v1
+OPENAI_MODEL=gpt-4o
+
+# Database (Gateway / K8s mode)
+DB_TYPE=mysql
+DB_HOST=mysql.svc.cluster.local
+DB_PORT=3306
+DB_NAME=siclaw
+DB_USER=siclaw
+DB_PASSWORD=...
+
+# Channels
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+LARK_APP_ID=cli_...
+LARK_APP_SECRET=...
+```
+
+## Model Recommendations
+
+| Use Case | Recommended | Notes |
+|----------|-------------|-------|
+| **Production investigations** | Claude Sonnet 4 / GPT-4o | Best quality-to-speed ratio |
+| **Complex root cause analysis** | Claude Opus 4 | Highest reasoning capability |
+| **Cost-sensitive / air-gapped** | Llama 3.1 70B+ via Ollama | Local, no API costs |
+| **Testing / development** | Any available model | Smaller models work for basic checks |

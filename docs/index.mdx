@@ -1,0 +1,75 @@
+---
+title: "Siclaw"
+sidebarTitle: "Home"
+description: "AI-powered SRE copilot — hypothesis-driven deep investigation that learns from every incident."
+---
+
+# Siclaw
+
+An open-source AI agent that diagnoses Kubernetes infrastructure issues the way your best engineer does: gather context, form hypotheses, validate them in parallel, and produce evidence-backed conclusions.
+
+**Read-only by default.** Siclaw never modifies your cluster.
+
+## What Makes Siclaw Different
+
+Most AI ops tools are glorified chatbots — they run one command, show the output, and ask "what next?" Siclaw runs a **complete investigation autonomously**:
+
+```
+You: "Pod payment-service is CrashLoopBackOff after deploying v2.3"
+
+Siclaw:
+  Phase 1  Gathered 12 signals (pod status, events, logs, recent deploys)
+  Phase 2  Generated 3 hypotheses, ranked by evidence
+  Phase 3  3 sub-agents validated hypotheses in parallel (47s)
+  Phase 4  Root cause: OOMKilled — memory limit 256Mi insufficient for v2.3
+           Confidence: 92% | Evidence chain: 4 signals
+           Remediation: increase memory limit to 512Mi
+```
+
+## Key Capabilities
+
+<CardGroup cols={2}>
+  <Card title="Deep Investigation" icon="magnifying-glass" href="/features/deep-investigation">
+    4-phase pipeline with parallel sub-agents. Not just Q&A — full root cause analysis with confidence scoring.
+  </Card>
+  <Card title="Investigation Memory" icon="brain" href="/features/memory">
+    Learns from every investigation. Past diagnoses improve future hypotheses automatically.
+  </Card>
+  <Card title="Extensible Skills" icon="puzzle-piece" href="/features/skills">
+    Custom diagnostic playbooks with mandatory security review. Your team's runbooks, executable by AI.
+  </Card>
+  <Card title="Multi-Channel" icon="comments" href="/features/channels">
+    Terminal, Web UI, Slack, Lark. Same investigation engine, any interface.
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+```bash
+npx siclaw
+```
+
+Then describe your problem. Siclaw handles the rest.
+
+<CardGroup cols={2}>
+  <Card title="Getting Started" icon="rocket" href="/start/getting-started">
+    Install and configure in under 5 minutes.
+  </Card>
+  <Card title="Your First Investigation" icon="play" href="/start/first-investigation">
+    Walk through a complete diagnosis step by step.
+  </Card>
+</CardGroup>
+
+## When to Use Siclaw
+
+**Good fit:**
+- Kubernetes pod crashes, restarts, scheduling failures
+- Node issues (NotReady, resource pressure, kernel problems)
+- Network connectivity and DNS resolution problems
+- Deployment rollout failures and config drift
+- Recurring incidents where institutional knowledge matters
+
+**Not designed for:**
+- Real-time alerting (use Prometheus/Grafana for that)
+- Automated remediation (Siclaw diagnoses, humans fix)
+- Non-Kubernetes infrastructure (cloud VMs, bare metal)
