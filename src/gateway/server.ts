@@ -106,12 +106,14 @@ interface AuthenticatedWebSocket extends WebSocket {
 export interface StartGatewayOptions {
   config: GatewayConfig;
   agentBoxManager: AgentBoxManager;
+  /** Pass the spawner so server can wire local-mode resource sync */
+  spawner?: import("./agentbox/spawner.js").BoxSpawner;
   extraRpcMethods?: Map<string, RpcHandler>;
   extraHttpHandlers?: Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>;
 }
 
 export async function startGateway(opts: StartGatewayOptions): Promise<GatewayServer> {
-  const { config, agentBoxManager, extraRpcMethods, extraHttpHandlers } = opts;
+  const { config, agentBoxManager, spawner, extraRpcMethods, extraHttpHandlers } = opts;
 
   // Track users with active SSE prompt streams (web UI)
   const activePromptUsers = new Set<string>();
@@ -191,11 +193,31 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     ca: certManager.getCACertificate(),
   };
 
-  // Create resource notifier for unified AgentBox reload notifications
-  const resourceNotifier = createResourceNotifier(agentBoxManager, agentBoxTlsOptions);
+  // Wire local-mode resource sync: inject DB repo + localReloader
+  // For LocalSpawner, resources are synced in-process (no HTTP + mTLS round-trip).
+  const isLocalSpawner = spawner?.name === "local";
+  const localSpawner = isLocalSpawner
+    ? spawner as import("./agentbox/local-spawner.js").LocalSpawner
+    : null;
+
+  if (localSpawner && db) {
+    localSpawner.setMcpRepo(new McpServerRepository(db));
+  }
+
+  // Create resource notifier — pass localReloader for local-mode in-process reload
+  const localReloader = localSpawner
+    ? (type: import("../shared/resource-sync.js").ResourceType, userId?: string) =>
+        localSpawner.reloadResource(type, userId)
+    : undefined;
+  const resourceNotifier = createResourceNotifier(agentBoxManager, agentBoxTlsOptions, localReloader);
 
   // Create RPC methods using AgentBoxManager
   const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier);
+
+  // Wire skill bundle provider into LocalSpawner (getSkillBundle comes from createRpcMethods)
+  if (localSpawner) {
+    localSpawner.setSkillBundleProvider(getSkillBundle);
+  }
 
   // Apply DB-stored agentbox image override (takes effect on next pod spawn)
   if (sysConfigRepo) {

@@ -7,9 +7,15 @@
 
 import http from "node:http";
 import type { BoxSpawner } from "./spawner.js";
-import type { AgentBoxConfig, AgentBoxInfo, AgentBoxHandle } from "./types.js";
+import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
+// local-only shortcut: same process, import agentbox resource handlers directly
+// to avoid HTTP + mTLS round-trip that is only needed for cross-process (K8s) mode.
+import { mcpHandler, skillsHandler } from "../../agentbox/resource-handlers.js";
+import { buildMergedMcpConfig } from "../mcp-config-builder.js";
+import type { McpServerRepository } from "../db/repositories/mcp-server-repo.js";
+import type { ResourceType } from "../../shared/resource-sync.js";
 
 interface LocalBox {
   userId: string;
@@ -19,6 +25,13 @@ interface LocalBox {
   createdAt: Date;
 }
 
+/** Function type for fetching a skill bundle for a given user */
+export type SkillBundleProvider = (userId: string, env: "prod" | "dev") => Promise<{
+  version: string;
+  skills: Array<{ dirName: string; specs: string; scripts: Array<{ name: string; content: string }> }>;
+  disabledBuiltins: string[];
+}>;
+
 export class LocalSpawner implements BoxSpawner {
   readonly name = "local";
 
@@ -26,9 +39,24 @@ export class LocalSpawner implements BoxSpawner {
   private basePort: number;
   private nextPort: number;
 
+  /** Injected DB-backed MCP repository (set via setMcpRepo) */
+  private mcpRepo: McpServerRepository | null = null;
+  /** Injected skill bundle provider (set via setSkillBundleProvider) */
+  private skillBundleProvider: SkillBundleProvider | null = null;
+
   constructor(basePort = 4000) {
     this.basePort = basePort;
     this.nextPort = basePort;
+  }
+
+  /** Inject McpServerRepository for local resource sync */
+  setMcpRepo(repo: McpServerRepository | null): void {
+    this.mcpRepo = repo;
+  }
+
+  /** Inject skill bundle provider for local resource sync */
+  setSkillBundleProvider(provider: SkillBundleProvider): void {
+    this.skillBundleProvider = provider;
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
@@ -48,6 +76,9 @@ export class LocalSpawner implements BoxSpawner {
 
     // Allocate port
     const port = this.nextPort++;
+
+    // Sync resources from DB before starting the AgentBox
+    await this.syncResources(userId);
 
     // Create session manager and HTTP server
     const sessionManager = new AgentBoxSessionManager();
@@ -125,4 +156,72 @@ export class LocalSpawner implements BoxSpawner {
       await this.stop(boxId);
     }
   }
+
+  // ── Local resource sync (bypasses HTTP + mTLS) ─────────────────────
+
+  /**
+   * Sync MCP + Skills from DB directly into the AgentBox filesystem.
+   * Called on spawn (initial sync) and on reload (hot update).
+   */
+  private async syncResources(userId: string): Promise<void> {
+    await this.syncMcp();
+    await this.syncSkills(userId);
+  }
+
+  /** Sync MCP servers: read DB-only config, let materialize merge with local seed */
+  private async syncMcp(): Promise<void> {
+    try {
+      // Pass null as localConfig so buildMergedMcpConfig returns DB entries only.
+      // mcpHandler.materialize() will merge local seed internally.
+      const dbOnly = await buildMergedMcpConfig(null, this.mcpRepo);
+      const count = await mcpHandler.materialize({ mcpServers: dbOnly });
+      if (count > 0) {
+        console.log(`[local-spawner] MCP sync: ${count} servers materialized`);
+      }
+    } catch (err: any) {
+      console.warn(`[local-spawner] MCP sync failed: ${err.message}`);
+    }
+  }
+
+  /** Sync skills for a user */
+  private async syncSkills(userId: string): Promise<void> {
+    if (!this.skillBundleProvider) return;
+    try {
+      const bundle = await this.skillBundleProvider(userId, "prod");
+      const count = await skillsHandler.materialize(bundle);
+      if (count > 0) {
+        console.log(`[local-spawner] Skills sync for ${userId}: ${count} skills materialized`);
+      }
+    } catch (err: any) {
+      console.warn(`[local-spawner] Skills sync failed for ${userId}: ${err.message}`);
+    }
+  }
+
+  /**
+   * Reload a resource type across all local boxes.
+   * Called by the resource notifier's localReloader callback.
+   */
+  async reloadResource(type: ResourceType, userId?: string): Promise<void> {
+    if (type === "mcp") {
+      await this.syncMcp();
+      // postReload: reloadConfig so next session creation uses new MCP config
+      await mcpHandler.postReload?.({});
+    } else if (type === "skills") {
+      // Skills are user-scoped: sync for specific user or all users
+      const targetBoxes = userId
+        ? [...this.boxes.values()].filter((b) => b.userId === userId)
+        : [...this.boxes.values()];
+
+      for (const box of targetBoxes) {
+        await this.syncSkills(box.userId);
+        // postReload: tell active sessions to brain.reload()
+        const sessions = box.sessionManager.list().map((s) => ({
+          id: s.id,
+          brain: s.brain,
+        }));
+        await skillsHandler.postReload?.({ sessions });
+      }
+    }
+  }
+
 }

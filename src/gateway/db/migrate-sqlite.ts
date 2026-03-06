@@ -302,6 +302,23 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE (provider_id, model_id)
   )`,
+
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    transport TEXT NOT NULL,
+    url TEXT,
+    command TEXT,
+    args_json TEXT,
+    env_json TEXT,
+    headers_json TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    description TEXT,
+    source TEXT NOT NULL DEFAULT 'db',
+    created_by TEXT REFERENCES users(id),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
 ];
 
 const INDEX_STATEMENTS = [
