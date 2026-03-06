@@ -60,6 +60,8 @@ export class ModelConfigRepository {
     providerName: string,
     baseUrl?: string,
     apiKey?: string,
+    api?: string,
+    authHeader?: boolean,
   ) {
     const rows = await this.db
       .select()
@@ -74,8 +76,8 @@ export class ModelConfigRepository {
         name: providerName,
         baseUrl: baseUrl ?? null,
         apiKey: apiKey ?? null,
-        api: "openai-completions",
-        authHeader: false,
+        api: api ?? "openai-completions",
+        authHeader: authHeader ?? false,
         sortOrder: 0,
       });
       return;
@@ -85,6 +87,8 @@ export class ModelConfigRepository {
     const updates: Record<string, unknown> = { updatedAt: new Date() };
     if (baseUrl !== undefined) updates.baseUrl = baseUrl;
     if (apiKey !== undefined) updates.apiKey = apiKey;
+    if (api !== undefined) updates.api = api;
+    if (authHeader !== undefined) updates.authHeader = authHeader;
 
     await this.db
       .update(modelProviders)
