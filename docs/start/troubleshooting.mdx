@@ -1,0 +1,123 @@
+---
+title: "Troubleshooting"
+sidebarTitle: "Troubleshooting"
+description: "Solutions for common setup and runtime issues."
+---
+
+## Node.js Version
+
+Siclaw requires Node.js 22.12.0 or later.
+
+```bash
+node --version
+# Must be v22.12.0+
+```
+
+If you're on an older version, use [nvm](https://github.com/nvm-sh/nvm):
+
+```bash
+nvm install 22
+nvm use 22
+```
+
+## LLM Connection Failures
+
+**Symptom**: "Failed to connect to LLM provider" or empty responses.
+
+**Check**:
+1. Verify your API key is set correctly:
+   ```bash
+   echo $ANTHROPIC_API_KEY  # or $OPENAI_API_KEY
+   ```
+2. Test the API directly:
+   ```bash
+   curl https://api.anthropic.com/v1/messages \
+     -H "x-api-key: $ANTHROPIC_API_KEY" \
+     -H "content-type: application/json" \
+     -d '{"model":"claude-sonnet-4-20250514","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
+   ```
+3. For OpenAI-compatible providers, confirm `baseUrl` is correct and accessible from your machine.
+
+## kubectl Permission Denied
+
+**Symptom**: "Error from server (Forbidden)" during investigation.
+
+Siclaw uses your local kubeconfig. Verify:
+
+```bash
+# Check current context
+kubectl config current-context
+
+# Test basic read access
+kubectl get pods --all-namespaces
+```
+
+Siclaw needs **read-only** access. Minimum RBAC:
+```yaml
+rules:
+  - apiGroups: ["", "apps", "batch", "events.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log", "pods/exec"]
+    verbs: ["get", "create"]
+```
+
+## Memory Search Not Working
+
+**Symptom**: `memory_search` tool not available, or "embedding provider not configured".
+
+Investigation Memory requires an embedding provider. Add to `~/.siclaw/config/settings.json`:
+
+```json
+{
+  "embedding": {
+    "baseUrl": "https://api.example.com/v1",
+    "apiKey": "sk-...",
+    "model": "bge-m3",
+    "dimensions": 1024
+  }
+}
+```
+
+Without this, all other features work normally — only semantic memory search is disabled.
+
+## Port Conflicts
+
+**Symptom**: "EADDRINUSE" when starting Gateway.
+
+```bash
+# Check what's using the port
+lsof -i :3001
+# Kill the process or use a different port
+PORT=3005 npm run dev:gateway
+```
+
+## SQLite Lock Error
+
+**Symptom**: "Database is locked" or "Another instance is already running".
+
+Only one Siclaw process can use the same SQLite database at a time. Check for existing processes:
+
+```bash
+ps aux | grep siclaw
+# Kill stale processes if needed
+```
+
+The lockfile is at `~/.siclaw/data.sqlite.lock` — if the previous process crashed, you may need to delete it manually.
+
+## Skill Script Rejected
+
+**Symptom**: Script stuck in "pending" or "rejected" status.
+
+Skill scripts go through a 3-step review:
+1. **Static analysis** — 27 danger patterns checked (e.g., `rm -rf`, `chmod 777`, `curl | sh`)
+2. **AI review** — LLM checks for destructive operations
+3. **Human approval** — a `skill_reviewer` must approve
+
+If rejected, check the rejection reason in the Web UI and modify the script to be read-only.
+
+## Getting Help
+
+- [GitHub Issues](https://github.com/scitix/siclaw/issues) — bug reports and feature requests
+- [Slack Community](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw) — questions and discussion

@@ -1,0 +1,68 @@
+---
+title: "Core Concepts"
+sidebarTitle: "Core Concepts"
+description: "Key ideas behind Siclaw's investigation approach."
+---
+
+## How Siclaw Investigates
+
+Siclaw's core is a **4-phase hypothesis-driven investigation engine**:
+
+```
+Phase 1: Context Gathering    → Collects cluster state, events, logs, metrics
+Phase 2: Hypothesis Generation → Generates 3-5 ranked hypotheses from evidence
+Phase 3: Parallel Validation   → Up to 3 sub-agents independently test hypotheses
+Phase 4: Conclusion            → Structured report with root cause and remediation
+```
+
+Every investigation is **read-only** — Siclaw never modifies your cluster. See [Deep Investigation](/features/deep-investigation) for details.
+
+## Runtime Modes
+
+Siclaw runs in three modes sharing one agent core:
+
+| Mode | Use Case | Start Command |
+|------|----------|---------------|
+| **CLI (TUI)** | Personal terminal diagnostics | `npx siclaw` |
+| **Gateway** | Multi-user with Web UI, Slack, Lark | `siclaw-gateway` |
+| **Cron** | Scheduled health patrols | `siclaw-cron` |
+
+For team use, Gateway spawns an isolated **AgentBox** per user — either in-process (local dev) or as a Kubernetes pod (production).
+
+## Skills
+
+Skills are reusable diagnostic playbooks your team can create and share:
+
+```
+skills/
+├── core/              Built-in (kubectl checks, log analysis, etc.)
+├── team/              Team-managed via Web UI
+└── user/<userId>/     Personal skills
+```
+
+Each skill contains a `SKILL.md` description and optional scripts (`.sh`, `.py`). Scripts go through **mandatory security review** (static analysis + AI review + human approval) before they can execute.
+
+See [Skills](/features/skills) for details.
+
+## Investigation Memory
+
+Siclaw **learns from every investigation**:
+
+- Stores structured records (root cause, causal chain, confidence) in a local database
+- **Hybrid search** (vector similarity + keyword matching) retrieves relevant past incidents
+- Past findings feed into Phase 2 to improve hypothesis generation
+
+Requires an [embedding provider](/configuration/providers#embedding) to be configured. See [Memory](/features/memory) for details.
+
+## Security Model
+
+Siclaw uses a **whitelist-only** security model — commands must be explicitly approved to run:
+
+- **Shell**: ~80 approved binaries only. `sed`, `awk`, `nc` are intentionally excluded.
+- **kubectl**: Read-only (13 safe subcommands). All write operations permanently blocked.
+- **Skills**: Scripts exempt from the binary allowlist, but require the security review gate.
+- **Files**: Agent can only write to its own data directory.
+
+## MCP Integration
+
+Siclaw supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) for extending capabilities with external tools — Prometheus metrics, GitHub issues, custom data sources. See [MCP Servers](/configuration/mcp) for setup and examples.

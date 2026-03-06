@@ -1,0 +1,89 @@
+---
+title: "Getting Started"
+sidebarTitle: "Quick Start"
+description: "Install Siclaw and run your first investigation in under 5 minutes."
+---
+
+## Prerequisites
+
+- **Node.js** ≥ 22.12.0
+- **kubectl** configured with access to a Kubernetes cluster
+- An **LLM API key** (Anthropic, OpenAI, or any OpenAI-compatible provider)
+
+## Install
+
+### Option 1: npx (Fastest)
+
+```bash
+npx siclaw
+```
+
+This downloads and runs Siclaw in TUI (terminal) mode. No installation needed.
+
+### Option 2: npm global install
+
+```bash
+npm install -g siclaw
+siclaw
+```
+
+### Option 3: Clone and build
+
+```bash
+git clone https://github.com/scitix/siclaw.git
+cd siclaw
+npm ci && npm run build
+npm run dev
+```
+
+## Configure Your LLM
+
+On first run, Siclaw will prompt you to configure an LLM provider. You can also set it via environment variables:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+npx siclaw
+```
+
+Or configure manually in `~/.siclaw/config/settings.json`:
+
+```json
+{
+  "llm": {
+    "provider": "anthropic",
+    "apiKey": "sk-ant-...",
+    "model": "claude-sonnet-4-20250514"
+  }
+}
+```
+
+<Note>
+Siclaw supports any OpenAI-compatible API. See [LLM Providers](/configuration/providers) for Ollama, vLLM, Azure, and other setups.
+</Note>
+
+## Run Your First Investigation
+
+Start Siclaw and describe an issue:
+
+```
+$ npx siclaw
+
+? What would you like to investigate?
+> Pod CrashLoopBackOff in production cluster after deployment
+```
+
+Siclaw will:
+
+1. **Gather context** — cluster state, events, pod logs, recent deployments
+2. **Generate hypotheses** — ranked list of possible root causes
+3. **Validate in parallel** — up to 3 sub-agents independently test each hypothesis
+4. **Conclude** — structured report with root cause, confidence score, and remediation steps
+
+The full report is saved to `~/.siclaw/reports/`.
+
+## What's Next?
+
+- [Core Concepts](/start/core-concepts) — understand the investigation engine
+- [Your First Investigation](/start/first-investigation) — walk through a complete diagnosis
+- [LLM Providers](/configuration/providers) — detailed provider configuration
+- [Deploy for your team](/install/docker) — multi-user setup with Web UI

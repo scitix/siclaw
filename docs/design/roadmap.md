@@ -1,3 +1,9 @@
+---
+title: "Roadmap"
+sidebarTitle: "Roadmap"
+description: "Investigation Memory, Knowledge Base, and Persona roadmaps with current status."
+---
+
 # Siclaw Roadmap
 
 > **Last updated**: 2026-03-06

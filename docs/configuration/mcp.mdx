@@ -1,0 +1,175 @@
+---
+title: "MCP Servers"
+sidebarTitle: "MCP Servers"
+description: "Connect external data sources to Siclaw via Model Context Protocol."
+---
+
+[Model Context Protocol (MCP)](https://modelcontextprotocol.io/) lets you extend Siclaw with external tools and data sources. During investigation, the agent discovers and uses MCP tools automatically — querying Prometheus metrics, searching GitHub issues, reading files, or calling any custom API.
+
+## Supported Transports
+
+| Transport | Use Case | Config |
+|-----------|----------|--------|
+| **stdio** | Local processes (npx packages, Python scripts) | `command` + `args` |
+| **SSE** | Remote servers (Server-Sent Events) | `url` |
+| **streamable-http** | Remote servers (bidirectional HTTP) | `url` |
+
+## Configuration
+
+### Via Web UI (Recommended)
+
+In Gateway mode, go to **Settings** > **MCP Servers**:
+
+1. Click **New Server**
+2. Select transport type
+3. Enter a unique name and optional description
+4. Fill in transport-specific fields (command/args or URL)
+5. Add environment variables or HTTP headers as needed
+6. Save
+
+Changes take effect immediately — all active sessions reload automatically.
+
+<Note>
+Creating and managing MCP servers requires **admin** role. All users can use the tools they provide.
+</Note>
+
+### Via settings.json (CLI mode)
+
+For TUI / single-user mode, add MCP servers to `~/.siclaw/config/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "prometheus": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@prom-mcp/server"],
+      "env": {
+        "PROMETHEUS_URL": "http://prometheus:9090"
+      }
+    }
+  }
+}
+```
+
+### Environment Variable Substitution
+
+Use `${VAR_NAME}` in env values — Siclaw resolves them from the process environment at spawn time:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "transport": "streamable-http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+## Examples
+
+### Prometheus Metrics
+
+```json
+{
+  "prometheus": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@prom-mcp/server"],
+    "env": {
+      "PROMETHEUS_URL": "http://prometheus.monitoring:9090"
+    }
+  }
+}
+```
+
+The agent can then query metrics during investigation:
+
+```
+Phase 1: Context Gathering
+  [mcp:prometheus] rate(http_request_duration_seconds_sum{service="payment"}[5m])
+  [kubectl] get pods -n payments
+```
+
+### Filesystem Access
+
+```json
+{
+  "filesystem": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  }
+}
+```
+
+### GitHub
+
+```json
+{
+  "github": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@github/mcp-server"],
+    "env": {
+      "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+    }
+  }
+}
+```
+
+### Custom HTTP Service
+
+Any service implementing the MCP protocol can be connected:
+
+```json
+{
+  "my-service": {
+    "transport": "streamable-http",
+    "url": "https://mcp.internal.example.com/v1",
+    "headers": {
+      "Authorization": "Bearer ${MY_SERVICE_TOKEN}"
+    }
+  }
+}
+```
+
+## How It Works
+
+### Tool Discovery
+
+When a session starts, Siclaw connects to all enabled MCP servers and discovers their tools. MCP tools appear alongside built-in tools with a `mcp__` prefix:
+
+```
+mcp__prometheus__query        ← from Prometheus MCP server
+mcp__github__search_issues    ← from GitHub MCP server
+mcp__filesystem__read_file    ← from Filesystem MCP server
+```
+
+The agent decides which tools to use based on the investigation context — no manual tool selection needed.
+
+### Config Sync (Gateway Mode)
+
+In multi-user deployments, MCP configuration syncs automatically:
+
+```
+Admin creates/edits MCP server in Web UI
+  → Saved to database
+  → Gateway notifies all active AgentBoxes
+  → Each AgentBox fetches merged config
+  → Active sessions reload with new tools
+```
+
+The merge strategy: DB entries (managed via Web UI) override local seed entries with the same name. Disabling a DB entry removes it from the merged config.
+
+### Kubernetes Considerations
+
+<Warning>
+In Kubernetes mode, MCP server binaries must be available in the AgentBox container image. For `stdio` transport servers that use `npx`, ensure the package can be installed inside the pod (network access required) or pre-install it in the image.
+</Warning>
+
+For HTTP-based transports (`sse`, `streamable-http`), the MCP server runs externally — the AgentBox pod only needs network access to the URL.

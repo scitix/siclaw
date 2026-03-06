@@ -1,0 +1,132 @@
+---
+title: "Your First Investigation"
+sidebarTitle: "First Investigation"
+description: "Walk through a complete deep investigation from start to finish."
+---
+
+## Scenario
+
+A pod in your production cluster is stuck in `CrashLoopBackOff` after a deployment. Let's use Siclaw to diagnose it.
+
+## Start Siclaw
+
+```bash
+npx siclaw
+```
+
+## Describe the Problem
+
+```
+? What would you like to investigate?
+> Pod payment-service is CrashLoopBackOff in namespace prod after deploying v2.3
+```
+
+<Tip>
+Be specific. Include the pod name, namespace, and what changed (e.g., "after deploying v2.3"). More context = better hypotheses.
+</Tip>
+
+## Phase 1: Context Gathering
+
+Siclaw automatically runs diagnostic commands to understand the situation:
+
+```
+── Phase 1: Context Gathering ─────────────────────────────
+  kubectl get pods -n prod | grep payment-service
+  kubectl describe pod payment-service-xxx -n prod
+  kubectl logs payment-service-xxx -n prod --previous
+  kubectl get events -n prod --sort-by='.lastTimestamp'
+```
+
+All commands are **read-only** — nothing is modified.
+
+## Phase 2: Hypothesis Generation
+
+Based on the evidence, Siclaw generates ranked hypotheses:
+
+```
+── Phase 2: Hypothesis Generation ──────────────────────────
+  H1  OOMKilled — memory limit too low for v2.3      confidence: 78%
+  H2  Config mount failure — missing configmap key    confidence: 45%
+  H3  Liveness probe mismatch — endpoint changed      confidence: 32%
+```
+
+<Note>
+If Investigation Memory has data, Siclaw will also check past incidents for similar patterns and adjust hypothesis confidence accordingly.
+</Note>
+
+## Phase 3: Parallel Validation
+
+Up to 3 sub-agents independently validate each hypothesis:
+
+```
+── Phase 3: Parallel Validation (3 sub-agents) ─────────────
+  Agent-1 validating H1 · Agent-2 validating H2 · Agent-3 validating H3
+```
+
+Each sub-agent runs targeted commands to confirm or refute its hypothesis. They don't share information — this prevents confirmation bias.
+
+## Phase 4: Conclusion
+
+Siclaw synthesizes all evidence into a structured report:
+
+```
+── Phase 4: Conclusion ──────────────────────────────────────
+  Root Cause: OOMKilled — memory limit 256Mi insufficient for v2.3
+  Confidence: 92% · Evidence: 4 signals · Duration: 47s
+
+  Causal chain:
+    1. v2.3 deployment added new caching layer
+    2. Memory usage increased from ~180Mi to ~310Mi
+    3. Pod exceeded 256Mi memory limit
+    4. Kernel OOMKilled the process → container restart → CrashLoopBackOff
+
+  Remediation:
+    - Increase memory limit to 512Mi: kubectl set resources deploy/payment-service -n prod --limits=memory=512Mi
+    - Consider adding memory requests to match expected usage
+```
+
+The full report is saved to `~/.siclaw/reports/deep-search-{timestamp}.md`.
+
+## Deep Investigation Mode
+
+For complex issues, you can explicitly trigger a deep investigation:
+
+```
+> /deep "Intermittent 5xx errors on the API gateway, happening every 30 minutes"
+```
+
+This uses the full budget (up to 60 tool calls, 5 minutes) for thorough investigation.
+
+## More Examples
+
+Here are other common scenarios Siclaw handles well:
+
+### OOMKilled Pods
+
+```
+> Pods in namespace ml-training keep getting OOMKilled, happening more since yesterday
+```
+
+Siclaw will check memory limits vs actual usage, recent deployment changes, and correlate with node memory pressure.
+
+### Node NotReady
+
+```
+> Node worker-07 went NotReady 20 minutes ago, pods are being evicted
+```
+
+Siclaw will inspect node conditions, kubelet logs, kernel messages (dmesg), and network connectivity to the API server.
+
+### Intermittent Network Issues
+
+```
+> /deep "Service mesh intermittent 503 errors between order-service and inventory-service"
+```
+
+Using `/deep` triggers a full investigation with maximum budget — useful for complex cross-service issues.
+
+## What's Next?
+
+- [Deep Investigation](/features/deep-investigation) — budget controls, sub-agent architecture
+- [Skills](/features/skills) — create custom diagnostic playbooks
+- [Memory](/features/memory) — how investigation history improves future diagnoses
