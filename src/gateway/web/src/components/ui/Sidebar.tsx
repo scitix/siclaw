@@ -1,6 +1,5 @@
 import { NavLink, useNavigate, useLocation } from 'react-router-dom';
 import {
-    Radio,
     Sparkles,
     Settings,
     Timer,
@@ -43,26 +42,17 @@ interface NavGroup {
 
 const topItems: NavItem[] = [
     { icon: Compass, label: 'Pilot', to: '/pilot' },
+    { icon: Boxes, label: 'Workspace', to: '/workspace' },
+    { icon: Timer, label: 'Cron Jobs', to: '/cron' },
+    { icon: Zap, label: 'Triggers', to: '/triggers' },
 ];
 
 const groups: NavGroup[] = [
-    {
-        icon: Radio,
-        label: 'Control',
-        key: 'control',
-        items: [
-            { icon: Share2, label: 'Channels', to: '/channels', adminOnly: true },
-            // { icon: ListChecks, label: 'Sessions', to: '/sessions' },
-            { icon: Zap, label: 'Triggers', to: '/triggers' },
-            { icon: Timer, label: 'Cron Jobs', to: '/cron' },
-        ],
-    },
     {
         icon: Sparkles,
         label: 'Agent',
         key: 'agent',
         items: [
-            { icon: Boxes, label: 'Workspace', to: '/workspace' },
             { icon: LayoutGrid, label: 'Skills', to: '/skills' },
             { icon: Plug, label: 'MCP', to: '/mcp' },
         ],
@@ -72,10 +62,10 @@ const groups: NavGroup[] = [
         label: 'Settings',
         key: 'settings',
         items: [
+            { icon: Share2, label: 'Channels', to: '/channels', adminOnly: true },
             { icon: BrainCircuit, label: 'Brains', to: '/brains' },
             { icon: Cpu, label: 'Models', to: '/models', adminOnly: true },
             { icon: KeyRound, label: 'Credentials', to: '/credentials' },
-            // { icon: Server, label: 'Environments', to: '/environments' }, // Replaced by credential-based workspace system
             { icon: Shield, label: 'Permissions', to: '/permissions', adminOnly: true },
             { icon: Wrench, label: 'System', to: '/settings/system', adminOnly: true },
         ],
@@ -146,11 +136,10 @@ export function Sidebar() {
             .some(item => location.pathname.startsWith(item.to));
 
     // Must call hooks at top level — one per group
-    const controlGroup = useGroupExpanded('control', isGroupActive(groups[0]));
-    const agentGroup = useGroupExpanded('agent', isGroupActive(groups[1]));
-    const settingsGroup = useGroupExpanded('settings', isGroupActive(groups[2]));
+    const agentGroup = useGroupExpanded('agent', isGroupActive(groups[0]));
+    const settingsGroup = useGroupExpanded('settings', isGroupActive(groups[1]));
 
-    const groupStates = [controlGroup, agentGroup, settingsGroup];
+    const groupStates = [agentGroup, settingsGroup];
 
     useEffect(() => {
         const handleUpdate = () => setUser(getUser());
