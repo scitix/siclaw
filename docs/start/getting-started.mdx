@@ -12,22 +12,27 @@ description: "Install Siclaw and run your first investigation in under 5 minutes
 
 ## Install
 
-### Option 1: npx (Fastest)
-
-```bash
-npx siclaw
-```
-
-This downloads and runs Siclaw in TUI (terminal) mode. No installation needed.
-
-### Option 2: npm global install
-
 ```bash
 npm install -g siclaw
+```
+
+### Local Server (recommended for teams)
+
+```bash
+siclaw local
+```
+
+Launches the Web UI at `http://localhost:3000` with multi-user support, Slack/Lark channels, and all features enabled.
+
+### CLI
+
+```bash
 siclaw
 ```
 
-### Option 3: Clone and build
+TUI mode for personal terminal diagnostics.
+
+### From Source
 
 ```bash
 git clone https://github.com/scitix/siclaw.git
@@ -38,11 +43,11 @@ npm run dev
 
 ## Configure Your LLM
 
-On first run, Siclaw will prompt you to configure an LLM provider. You can also override via environment variables:
+On first run, Siclaw prompts you to configure an LLM provider. You can also set it via environment variables:
 
 ```bash
 export SICLAW_LLM_API_KEY="sk-ant-..."
-npx siclaw
+siclaw
 ```
 
 Or configure manually in `~/.siclaw/config/settings.json`:
@@ -66,23 +71,16 @@ Siclaw supports any OpenAI-compatible API. See [LLM Providers](/configuration/pr
 
 ## Run Your First Investigation
 
-Start Siclaw and describe an issue:
+Describe an issue:
 
 ```
-$ npx siclaw
-
 ? What would you like to investigate?
 > Pod CrashLoopBackOff in production cluster after deployment
 ```
 
-Siclaw will:
+Siclaw autonomously runs a [4-phase deep investigation](/features/deep-investigation) — gathering context, forming hypotheses, validating in parallel, and producing a structured report with root cause, confidence score, and remediation steps.
 
-1. **Gather context** — cluster state, events, pod logs, recent deployments
-2. **Generate hypotheses** — ranked list of possible root causes
-3. **Validate in parallel** — up to 3 sub-agents independently test each hypothesis
-4. **Conclude** — structured report with root cause, confidence score, and remediation steps
-
-The full report is saved to `~/.siclaw/reports/`.
+Reports are saved to `~/.siclaw/reports/`.
 
 ## What's Next?
 

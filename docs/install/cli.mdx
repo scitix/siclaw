@@ -1,25 +1,30 @@
 ---
-title: "CLI Installation"
-sidebarTitle: "CLI"
-description: "Run Siclaw as a terminal application for personal diagnostics."
+title: "CLI & Local Server"
+sidebarTitle: "CLI / Local"
+description: "Install Siclaw globally and run as CLI or local server."
 ---
 
-## Quick Install
-
-```bash
-npx siclaw
-```
-
-That's it. npx downloads and runs the latest version automatically.
-
-## Global Install
-
-If you prefer a permanent installation:
+## Install
 
 ```bash
 npm install -g siclaw
+```
+
+## Local Server (recommended)
+
+```bash
+siclaw local
+```
+
+Launches the Web UI at `http://localhost:3000` with multi-user support, channels (Slack/Lark), cron patrols, and all features.
+
+## CLI (TUI)
+
+```bash
 siclaw
 ```
+
+Personal terminal mode. Same investigation engine, no server.
 
 ## From Source
 
