@@ -662,6 +662,7 @@ export async function investigate(
         causalChain: conclusionResult.structured.causal_chain,
         confidence: conclusionResult.structured.confidence,
         conclusion: conclusionResult.text,
+        remediationSteps: conclusionResult.structured.remediation_steps,
         durationMs: totalDurationMs,
         totalToolCalls: globalCallsUsed,
         hypotheses: hypotheses.map((h) => ({

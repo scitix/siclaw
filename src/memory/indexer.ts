@@ -430,9 +430,9 @@ export class MemoryIndexer {
       .prepare(
         `INSERT OR REPLACE INTO investigations
          (id, question, root_cause_category, affected_entities, environment_tags,
-          causal_chain, confidence, conclusion, duration_ms, total_tool_calls,
+          causal_chain, confidence, conclusion, remediation_steps, duration_ms, total_tool_calls,
           hypotheses_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -443,6 +443,7 @@ export class MemoryIndexer {
         JSON.stringify(record.causalChain),
         record.confidence,
         record.conclusion,
+        record.remediationSteps ? JSON.stringify(record.remediationSteps) : null,
         record.durationMs,
         record.totalToolCalls,
         JSON.stringify(record.hypotheses),
@@ -474,25 +475,29 @@ export class MemoryIndexer {
 
     try {
       const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-      return rows.map((r) => ({
-        id: r.id as string,
-        question: r.question as string,
-        rootCauseCategory: (r.root_cause_category as string) ?? "unknown",
-        affectedEntities: safeJsonArray(r.affected_entities as string) as string[],
-        environmentTags: safeJsonArray(r.environment_tags as string) as string[],
-        causalChain: safeJsonArray(r.causal_chain as string) as string[],
-        confidence: (r.confidence as number) ?? 0,
-        conclusion: (r.conclusion as string) ?? "",
-        durationMs: (r.duration_ms as number) ?? 0,
-        totalToolCalls: (r.total_tool_calls as number) ?? 0,
-        hypotheses: safeJsonArray(r.hypotheses_json as string) as Array<{
-          id: string;
-          text: string;
-          status: string;
-          confidence: number;
-        }>,
-        createdAt: (r.created_at as number) ?? 0,
-      }));
+      return rows.map((r) => {
+        const remediation = safeJsonArray(r.remediation_steps as string) as string[];
+        return {
+          id: r.id as string,
+          question: r.question as string,
+          rootCauseCategory: (r.root_cause_category as string) ?? "unknown",
+          affectedEntities: safeJsonArray(r.affected_entities as string) as string[],
+          environmentTags: safeJsonArray(r.environment_tags as string) as string[],
+          causalChain: safeJsonArray(r.causal_chain as string) as string[],
+          confidence: (r.confidence as number) ?? 0,
+          conclusion: (r.conclusion as string) ?? "",
+          remediationSteps: remediation.length > 0 ? remediation : undefined,
+          durationMs: (r.duration_ms as number) ?? 0,
+          totalToolCalls: (r.total_tool_calls as number) ?? 0,
+          hypotheses: safeJsonArray(r.hypotheses_json as string) as Array<{
+            id: string;
+            text: string;
+            status: string;
+            confidence: number;
+          }>,
+          createdAt: (r.created_at as number) ?? 0,
+        };
+      });
     } catch (err) {
       console.warn(`[memory-indexer] searchInvestigations failed:`, err);
       return [];
