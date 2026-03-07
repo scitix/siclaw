@@ -324,8 +324,14 @@ export async function createSiclawSession(
     }
   }
 
-  // Load models from settings.json
+  // Ensure settings.json exists for ModelRegistry (pi-agent reads models from file).
+  // When env vars created a provider in memory but no file exists, materialize it.
   const configPath = getConfigPath();
+  if (!fs.existsSync(configPath) && Object.keys(config.providers).length > 0) {
+    const dir = path.dirname(configPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify({ providers: config.providers }, null, 2) + "\n");
+  }
   const modelsJson = fs.existsSync(configPath) ? configPath : undefined;
   const modelRegistry = new ModelRegistry(authStorage, modelsJson);
 
@@ -656,6 +662,14 @@ Follow the structured workflow described in the deep-investigation skill guide.`
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());
 
+  // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
+  const configuredModel = defaultLlm
+    ? modelRegistry.find(
+        config.default?.provider ?? Object.keys(config.providers)[0],
+        defaultLlm.model.id,
+      )
+    : undefined;
+
   const { session, modelFallbackMessage } = await createAgentSession({
     tools: restrictedFileTools,
     customTools,
@@ -663,6 +677,7 @@ Follow the structured workflow described in the deep-investigation skill guide.`
     sessionManager,
     authStorage,
     modelRegistry,
+    model: configuredModel,
     thinkingLevel: "high",
   });
 

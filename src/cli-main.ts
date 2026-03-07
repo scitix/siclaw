@@ -7,7 +7,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
 import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
-import { needsSetup, runInteractiveSetup } from "./cli-setup.js";
+import { needsSetup, runInteractiveSetup, printSetupInstructions } from "./cli-setup.js";
 import { saveSessionMemory } from "./memory/session-summarizer.js";
 import type { BrainType } from "./core/brain-session.js";
 
@@ -22,17 +22,16 @@ const brainIndex = args.indexOf("--brain");
 const brainArg = brainIndex >= 0 ? args[brainIndex + 1] : undefined;
 const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk" : undefined;
 
-// P0: Interactive setup — runs before anything else
-if (forceSetup || needsSetup()) {
+// P0: Setup — wizard only on explicit --setup; otherwise print instructions and exit
+if (forceSetup) {
   await runInteractiveSetup();
-  // Re-check after setup — user may have aborted
-  if (needsSetup()) {
-    console.log("No provider configured. Run again or edit .siclaw/config/settings.json manually.");
-    process.exit(1);
-  }
+}
+if (needsSetup()) {
+  printSetupInstructions();
+  process.exit(1);
 }
 
-// LLM config validation — warn early about missing keys
+// LLM config validation — warn early about issues
 const llmWarnings = validateLlmConfig();
 for (const w of llmWarnings) {
   console.warn(`[siclaw] ⚠ ${w}`);
