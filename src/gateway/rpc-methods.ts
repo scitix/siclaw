@@ -8,6 +8,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions, type AgentBoxTlsOptions } from "./agentbox/client.js";
 import type { WebSocket } from "ws";
@@ -154,10 +155,13 @@ export function createRpcMethods(
       console.error("[rpc] Failed to initialize skills:", err);
     });
 
-  // Resolve core/extension skills directory: prefer baked-in image path over NFS
-  const builtinCoreDir = path.join(process.cwd(), "skills", "core");
+  // Resolve core/extension skills directory: prefer baked-in package path over NFS
+  // Use import.meta.url to locate the npm package root (dist/gateway/rpc-methods.js → package root)
+  const __rpcDirname = path.dirname(fileURLToPath(import.meta.url));
+  const packageRoot = path.resolve(__rpcDirname, "..", "..");
+  const builtinCoreDir = path.join(packageRoot, "skills", "core");
   const coreSkillsDir = fs.existsSync(builtinCoreDir) ? builtinCoreDir : path.join(skillsDir, "core");
-  const builtinExtDir = path.join(process.cwd(), "skills", "extension");
+  const builtinExtDir = path.join(packageRoot, "skills", "extension");
   const extSkillsDir = fs.existsSync(builtinExtDir) ? builtinExtDir : path.join(skillsDir, "extension");
 
   /** Resolve the filesystem dir for a builtin skill dirName (core first, then extension) */
