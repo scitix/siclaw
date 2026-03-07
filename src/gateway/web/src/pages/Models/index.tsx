@@ -2,9 +2,9 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings, Layers, Globe, Key, Save, Trash2, Plus } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
-import { SettingsDialog } from './SettingsDialog';
 import { ModelsDialog } from './ModelsDialog';
-import { AddProviderDialog } from './AddProviderDialog';
+import { ProviderDrawer } from './ProviderDrawer';
+import { QuickSetupCard } from './QuickSetupCard';
 
 interface ProviderInfo {
     name: string;
@@ -12,6 +12,7 @@ interface ProviderInfo {
     apiKey: string;
     apiKeySet: boolean;
     api: string;
+    authHeader?: boolean;
     modelCount: number;
 }
 
@@ -37,21 +38,20 @@ export function ModelsPage() {
 
     const [providers, setProviders] = useState<ProviderInfo[]>([]);
     const [allModels, setAllModels] = useState<ModelEntry[]>([]);
-    const [defaultProvider, setDefaultProvider] = useState('');
-    const [defaultModelId, setDefaultModelId] = useState('');
-    const [savedDefault, setSavedDefault] = useState<{ provider: string; modelId: string } | null>(null);
+    const [defaultValue, setDefaultValue] = useState('');
+    const [savedDefault, setSavedDefault] = useState('');
     const [saving, setSaving] = useState(false);
 
-    const [settingsProvider, setSettingsProvider] = useState<ProviderInfo | null>(null);
-    const [modelsProvider, setModelsProvider] = useState<string | null>(null);
-    const [showAddProvider, setShowAddProvider] = useState(false);
-
     // Embedding state
-    const [embeddingProvider, setEmbeddingProvider] = useState('');
-    const [embeddingModel, setEmbeddingModel] = useState('');
+    const [embeddingValue, setEmbeddingValue] = useState('');
     const [embeddingDimensions, setEmbeddingDimensions] = useState(1024);
     const [savedEmbedding, setSavedEmbedding] = useState<EmbeddingConfig | null>(null);
     const [savingEmbedding, setSavingEmbedding] = useState(false);
+
+    // Drawer/dialog state
+    const [drawerOpen, setDrawerOpen] = useState(false);
+    const [drawerProvider, setDrawerProvider] = useState<ProviderInfo | null>(null);
+    const [modelsProvider, setModelsProvider] = useState<string | null>(null);
 
     const hasLoadedRef = useRef(false);
 
@@ -69,9 +69,9 @@ export function ModelsPage() {
             const result = await sendRpc<{ models: ModelEntry[]; default: { provider: string; modelId: string } | null }>('model.list');
             setAllModels(result.models ?? []);
             if (result.default) {
-                setDefaultProvider(result.default.provider);
-                setDefaultModelId(result.default.modelId);
-                setSavedDefault(result.default);
+                const val = `${result.default.provider}::${result.default.modelId}`;
+                setDefaultValue(val);
+                setSavedDefault(val);
             }
         } catch (err) {
             console.error('Failed to load models:', err);
@@ -82,8 +82,7 @@ export function ModelsPage() {
         try {
             const result = await sendRpc<{ config: EmbeddingConfig | null }>('embedding.getConfig');
             if (result.config) {
-                setEmbeddingProvider(result.config.provider);
-                setEmbeddingModel(result.config.model);
+                setEmbeddingValue(`${result.config.provider}::${result.config.model}`);
                 setEmbeddingDimensions(result.config.dimensions);
                 setSavedEmbedding(result.config);
             }
@@ -101,13 +100,20 @@ export function ModelsPage() {
         }
     }, [isConnected, loadProviders, loadModels, loadEmbeddingConfig]);
 
+    // Parse "provider::modelId" value
+    const parseValue = (val: string) => {
+        const idx = val.indexOf('::');
+        if (idx < 0) return { provider: '', modelId: '' };
+        return { provider: val.slice(0, idx), modelId: val.slice(idx + 2) };
+    };
+
     const handleSaveDefault = async () => {
-        if (!defaultProvider || !defaultModelId) return;
+        const { provider, modelId } = parseValue(defaultValue);
+        if (!provider || !modelId) return;
         setSaving(true);
         try {
-            await sendRpc('config.setDefaultModel', { provider: defaultProvider, modelId: defaultModelId });
-            setSavedDefault({ provider: defaultProvider, modelId: defaultModelId });
-            // Notify Pilot to refresh model selection
+            await sendRpc('config.setDefaultModel', { provider, modelId });
+            setSavedDefault(defaultValue);
             try { new BroadcastChannel('siclaw-model-config').postMessage('default-changed'); } catch { /* ignore */ }
         } catch (err) {
             console.error('Failed to save default model:', err);
@@ -116,9 +122,23 @@ export function ModelsPage() {
         }
     };
 
-    const handleSaveSettings = async (providerName: string, baseUrl: string, apiKey: string) => {
-        const params: Record<string, unknown> = { provider: providerName, baseUrl };
-        if (apiKey) params.apiKey = apiKey;
+    const handleSaveEmbedding = async () => {
+        const { provider, modelId } = parseValue(embeddingValue);
+        if (!provider || !modelId || !embeddingDimensions) return;
+        setSavingEmbedding(true);
+        try {
+            await sendRpc('embedding.setConfig', { provider, model: modelId, dimensions: embeddingDimensions });
+            setSavedEmbedding({ provider, model: modelId, dimensions: embeddingDimensions });
+        } catch (err) {
+            console.error('Failed to save embedding config:', err);
+        } finally {
+            setSavingEmbedding(false);
+        }
+    };
+
+    const handleSaveProvider = async (data: { name: string; baseUrl: string; apiKey: string; api: string; authHeader: boolean }) => {
+        const params: Record<string, unknown> = { provider: data.name, baseUrl: data.baseUrl, api: data.api, authHeader: data.authHeader };
+        if (data.apiKey) params.apiKey = data.apiKey;
         await sendRpc('provider.save', params);
         await loadProviders();
     };
@@ -143,174 +163,52 @@ export function ModelsPage() {
         }
     };
 
-    const handleSaveEmbedding = async () => {
-        if (!embeddingProvider || !embeddingModel || !embeddingDimensions) return;
-        setSavingEmbedding(true);
-        try {
-            await sendRpc('embedding.setConfig', {
-                provider: embeddingProvider,
-                model: embeddingModel,
-                dimensions: embeddingDimensions,
-            });
-            setSavedEmbedding({ provider: embeddingProvider, model: embeddingModel, dimensions: embeddingDimensions });
-        } catch (err) {
-            console.error('Failed to save embedding config:', err);
-        } finally {
-            setSavingEmbedding(false);
-        }
+    const handleQuickSetupComplete = () => {
+        loadProviders();
+        loadModels();
     };
 
-    // Models for selected default provider
-    const providerModels = allModels.filter(m => m.provider === defaultProvider && m.category !== 'embedding');
-    const embeddingModels = allModels.filter(m => m.provider === embeddingProvider && m.category === 'embedding');
-
-    // When provider changes, auto-select first model if current selection doesn't belong
-    const handleProviderChange = (prov: string) => {
-        setDefaultProvider(prov);
-        const modelsForProv = allModels.filter(m => m.provider === prov && m.category !== 'embedding');
-        if (modelsForProv.length > 0 && !modelsForProv.some(m => m.id === defaultModelId)) {
-            setDefaultModelId(modelsForProv[0].id);
-        }
+    const openAddDrawer = () => {
+        setDrawerProvider(null);
+        setDrawerOpen(true);
     };
 
-    const handleEmbeddingProviderChange = (prov: string) => {
-        setEmbeddingProvider(prov);
-        const modelsForProv = allModels.filter(m => m.provider === prov && m.category === 'embedding');
-        if (modelsForProv.length > 0 && !modelsForProv.some(m => m.id === embeddingModel)) {
-            setEmbeddingModel(modelsForProv[0].id);
-        }
+    const openEditDrawer = (p: ProviderInfo) => {
+        setDrawerProvider(p);
+        setDrawerOpen(true);
     };
 
-    const defaultChanged = savedDefault
-        ? defaultProvider !== savedDefault.provider || defaultModelId !== savedDefault.modelId
-        : !!(defaultProvider && defaultModelId);
+    // Build grouped model lists for selects
+    const llmModels = allModels.filter(m => m.category !== 'embedding');
+    const embeddingModels = allModels.filter(m => m.category === 'embedding');
 
+    // Group by provider
+    const groupByProvider = (models: ModelEntry[]) => {
+        const groups: Record<string, ModelEntry[]> = {};
+        for (const m of models) {
+            (groups[m.provider] ??= []).push(m);
+        }
+        return groups;
+    };
+
+    const llmGroups = groupByProvider(llmModels);
+    const embeddingGroups = groupByProvider(embeddingModels);
+
+    const defaultChanged = defaultValue !== savedDefault;
     const embeddingChanged = savedEmbedding
-        ? embeddingProvider !== savedEmbedding.provider || embeddingModel !== savedEmbedding.model || embeddingDimensions !== savedEmbedding.dimensions
-        : !!(embeddingProvider && embeddingModel);
+        ? embeddingValue !== `${savedEmbedding.provider}::${savedEmbedding.model}` || embeddingDimensions !== savedEmbedding.dimensions
+        : !!embeddingValue;
 
     return (
         <div className="h-full bg-white flex flex-col">
             <div className="flex-1 overflow-y-auto px-6 py-8 max-w-5xl mx-auto w-full">
-                {/* Default Chat Model */}
+                {/* Providers Section (primary, top) */}
                 <section className="mb-10">
-                    <h2 className="text-lg font-semibold text-gray-900 mb-4">Default Chat Model</h2>
-                    <div className="rounded-2xl border border-gray-200 bg-gray-50/50 p-6">
-                        <p className="text-sm text-gray-500 mb-4">
-                            The default model for new chat sessions.
-                        </p>
-                        <div className="flex flex-wrap items-end gap-4">
-                            <div className="flex-1 min-w-[180px]">
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
-                                <select
-                                    value={defaultProvider}
-                                    onChange={(e) => handleProviderChange(e.target.value)}
-                                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300"
-                                >
-                                    <option value="">Select provider</option>
-                                    {providers.map(p => (
-                                        <option key={p.name} value={p.name}>{p.name}</option>
-                                    ))}
-                                </select>
-                            </div>
-                            <div className="flex-1 min-w-[220px]">
-                                <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
-                                <select
-                                    value={defaultModelId}
-                                    onChange={(e) => setDefaultModelId(e.target.value)}
-                                    disabled={!defaultProvider}
-                                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
-                                >
-                                    <option value="">Select model</option>
-                                    {providerModels.map(m => (
-                                        <option key={m.id} value={m.id}>{m.name}</option>
-                                    ))}
-                                </select>
-                            </div>
-                            {isAdmin && (
-                                <button
-                                    onClick={handleSaveDefault}
-                                    disabled={saving || !defaultChanged || !defaultProvider || !defaultModelId}
-                                    className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    <Save className="w-4 h-4" />
-                                    {saving ? 'Saving...' : 'Save'}
-                                </button>
-                            )}
-                        </div>
-                    </div>
-                </section>
-
-                {/* Default Embedding Model */}
-                <section className="mb-10">
-                    <h2 className="text-lg font-semibold text-gray-900 mb-4">Default Embedding Model</h2>
-                    <div className="rounded-2xl border border-gray-200 bg-gray-50/50 p-6">
-                        <p className="text-sm text-gray-500 mb-4">
-                            Configure the embedding model used for memory search and semantic retrieval.
-                        </p>
-                        <div className="space-y-4">
-                            <div className="flex flex-wrap items-end gap-4">
-                                <div className="flex-1 min-w-[180px]">
-                                    <label className="block text-sm font-medium text-gray-700 mb-1">Provider</label>
-                                    <select
-                                        value={embeddingProvider}
-                                        onChange={(e) => handleEmbeddingProviderChange(e.target.value)}
-                                        disabled={!isAdmin}
-                                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
-                                    >
-                                        <option value="">Select provider</option>
-                                        {providers.map(p => (
-                                            <option key={p.name} value={p.name}>{p.name}</option>
-                                        ))}
-                                    </select>
-                                </div>
-                                <div className="flex-1 min-w-[220px]">
-                                    <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
-                                    <select
-                                        value={embeddingModel}
-                                        onChange={(e) => setEmbeddingModel(e.target.value)}
-                                        disabled={!isAdmin || !embeddingProvider}
-                                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
-                                    >
-                                        <option value="">Select model</option>
-                                        {embeddingModels.map(m => (
-                                            <option key={m.id} value={m.id}>{m.name}</option>
-                                        ))}
-                                    </select>
-                                </div>
-                                <div className="w-[120px]">
-                                    <label className="block text-sm font-medium text-gray-700 mb-1">Dimensions</label>
-                                    <input
-                                        type="number"
-                                        value={embeddingDimensions}
-                                        onChange={(e) => setEmbeddingDimensions(Number(e.target.value) || 0)}
-                                        disabled={!isAdmin}
-                                        placeholder="1024"
-                                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
-                                    />
-                                </div>
-                                {isAdmin && (
-                                    <button
-                                        onClick={handleSaveEmbedding}
-                                        disabled={savingEmbedding || !embeddingChanged || !embeddingProvider || !embeddingModel || !embeddingDimensions}
-                                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                                    >
-                                        <Save className="w-4 h-4" />
-                                        {savingEmbedding ? 'Saving...' : 'Save'}
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    </div>
-                </section>
-
-                {/* Provider Cards */}
-                <section>
                     <div className="flex items-center justify-between mb-4">
                         <h2 className="text-lg font-semibold text-gray-900">Providers</h2>
-                        {isAdmin && (
+                        {isAdmin && providers.length > 0 && (
                             <button
-                                onClick={() => setShowAddProvider(true)}
+                                onClick={openAddDrawer}
                                 className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors"
                             >
                                 <Plus className="w-4 h-4" />
@@ -318,8 +216,13 @@ export function ModelsPage() {
                             </button>
                         )}
                     </div>
+
                     {providers.length === 0 ? (
-                        <p className="text-sm text-gray-400 text-center py-12">No providers configured</p>
+                        isAdmin ? (
+                            <QuickSetupCard onComplete={handleQuickSetupComplete} />
+                        ) : (
+                            <p className="text-sm text-gray-400 text-center py-12">No providers configured</p>
+                        )
                     ) : (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                             {providers.map(p => (
@@ -354,7 +257,7 @@ export function ModelsPage() {
                                         {isAdmin && (
                                             <>
                                                 <button
-                                                    onClick={() => setSettingsProvider(p)}
+                                                    onClick={() => openEditDrawer(p)}
                                                     className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                                                 >
                                                     <Settings className="w-3.5 h-3.5" />
@@ -375,29 +278,114 @@ export function ModelsPage() {
                         </div>
                     )}
                 </section>
+
+                {/* Defaults Section (bottom, compact) */}
+                {providers.length > 0 && (
+                    <>
+                        <section className="mb-10">
+                            <h2 className="text-lg font-semibold text-gray-900 mb-4">Default Chat Model</h2>
+                            <div className="rounded-2xl border border-gray-200 bg-gray-50/50 p-6">
+                                <p className="text-sm text-gray-500 mb-4">
+                                    The default model for new chat sessions.
+                                </p>
+                                <div className="flex flex-wrap items-end gap-4">
+                                    <div className="flex-1 min-w-[300px]">
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+                                        <select
+                                            value={defaultValue}
+                                            onChange={(e) => setDefaultValue(e.target.value)}
+                                            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300"
+                                        >
+                                            <option value="">Select model</option>
+                                            {Object.entries(llmGroups).map(([provider, models]) => (
+                                                <optgroup key={provider} label={provider}>
+                                                    {models.map(m => (
+                                                        <option key={`${provider}::${m.id}`} value={`${provider}::${m.id}`}>
+                                                            {m.name}
+                                                        </option>
+                                                    ))}
+                                                </optgroup>
+                                            ))}
+                                        </select>
+                                    </div>
+                                    {isAdmin && (
+                                        <button
+                                            onClick={handleSaveDefault}
+                                            disabled={saving || !defaultChanged || !defaultValue}
+                                            className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        >
+                                            <Save className="w-4 h-4" />
+                                            {saving ? 'Saving...' : 'Save'}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        </section>
+
+                        <section className="mb-10">
+                            <h2 className="text-lg font-semibold text-gray-900 mb-4">Default Embedding Model</h2>
+                            <div className="rounded-2xl border border-gray-200 bg-gray-50/50 p-6">
+                                <p className="text-sm text-gray-500 mb-4">
+                                    Configure the embedding model used for memory search and semantic retrieval.
+                                </p>
+                                <div className="space-y-4">
+                                    <div className="flex flex-wrap items-end gap-4">
+                                        <div className="flex-1 min-w-[300px]">
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+                                            <select
+                                                value={embeddingValue}
+                                                onChange={(e) => setEmbeddingValue(e.target.value)}
+                                                disabled={!isAdmin}
+                                                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
+                                            >
+                                                <option value="">Select model</option>
+                                                {Object.entries(embeddingGroups).map(([provider, models]) => (
+                                                    <optgroup key={provider} label={provider}>
+                                                        {models.map(m => (
+                                                            <option key={`${provider}::${m.id}`} value={`${provider}::${m.id}`}>
+                                                                {m.name}
+                                                            </option>
+                                                        ))}
+                                                    </optgroup>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <div className="w-[120px]">
+                                            <label className="block text-sm font-medium text-gray-700 mb-1">Dimensions</label>
+                                            <input
+                                                type="number"
+                                                value={embeddingDimensions}
+                                                onChange={(e) => setEmbeddingDimensions(Number(e.target.value) || 0)}
+                                                disabled={!isAdmin}
+                                                placeholder="1024"
+                                                className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-300 focus:border-indigo-300 disabled:opacity-50"
+                                            />
+                                        </div>
+                                        {isAdmin && (
+                                            <button
+                                                onClick={handleSaveEmbedding}
+                                                disabled={savingEmbedding || !embeddingChanged || !embeddingValue || !embeddingDimensions}
+                                                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                            >
+                                                <Save className="w-4 h-4" />
+                                                {savingEmbedding ? 'Saving...' : 'Save'}
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+                    </>
+                )}
             </div>
 
-            {/* Add Provider Dialog */}
-            {showAddProvider && (
-                <AddProviderDialog
-                    onClose={() => setShowAddProvider(false)}
-                    onSave={async (name, baseUrl, apiKey) => {
-                        await handleSaveSettings(name, baseUrl, apiKey);
-                        setShowAddProvider(false);
-                    }}
-                />
-            )}
-
-            {/* Settings Dialog */}
-            {settingsProvider && (
-                <SettingsDialog
-                    provider={settingsProvider.name}
-                    baseUrl={settingsProvider.baseUrl}
-                    apiKeySet={settingsProvider.apiKeySet}
-                    onClose={() => setSettingsProvider(null)}
-                    onSave={(baseUrl, apiKey) => handleSaveSettings(settingsProvider.name, baseUrl, apiKey)}
-                />
-            )}
+            {/* Provider Drawer */}
+            <ProviderDrawer
+                isOpen={drawerOpen}
+                provider={drawerProvider}
+                onClose={() => setDrawerOpen(false)}
+                onSave={handleSaveProvider}
+            />
 
             {/* Models Dialog */}
             {modelsProvider && (

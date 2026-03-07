@@ -141,21 +141,14 @@ export function LoginPage() {
                     </button>
 
                     {!ssoEnabled && (
-                        <>
-                            <div className="relative">
-                                <div className="absolute inset-0 flex items-center">
-                                    <span className="w-full border-t border-gray-100" />
-                                </div>
-                                <div className="relative flex justify-center text-xs uppercase">
-                                    <span className="bg-white px-2 text-gray-400">Restricted Access</span>
-                                </div>
+                        <div className="relative">
+                            <div className="absolute inset-0 flex items-center">
+                                <span className="w-full border-t border-gray-100" />
                             </div>
-
-                            <p className="text-center text-xs text-gray-400 leading-relaxed">
-                                Default credentials: admin / admin<br />
-                                Contact administrator for custom accounts.
-                            </p>
-                        </>
+                            <div className="relative flex justify-center text-xs uppercase">
+                                <span className="bg-white px-2 text-gray-400">Restricted Access</span>
+                            </div>
+                        </div>
                     )}
                 </form>
             </div>

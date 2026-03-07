@@ -32,27 +32,37 @@ export class ModelConfigRepository {
   // ─── Providers ─────────────────────────────────
 
   async listProviders() {
-    const rows = await this.db
+    const provRows = await this.db
       .select({
+        id: modelProviders.id,
         name: modelProviders.name,
         baseUrl: modelProviders.baseUrl,
         apiKey: modelProviders.apiKey,
         api: modelProviders.api,
         authHeader: modelProviders.authHeader,
         sortOrder: modelProviders.sortOrder,
-        modelCount: sql<number>`(SELECT COUNT(*) FROM model_entries WHERE provider_id = ${modelProviders.id})`,
       })
       .from(modelProviders)
       .orderBy(modelProviders.sortOrder);
 
-    return rows.map((r) => ({
+    // Count models per provider (avoids sql.js subquery issues)
+    const countRows = await this.db
+      .select({
+        providerId: modelEntries.providerId,
+        count: sql<number>`COUNT(*)`,
+      })
+      .from(modelEntries)
+      .groupBy(modelEntries.providerId);
+    const countMap = new Map(countRows.map((r) => [r.providerId, Number(r.count)]));
+
+    return provRows.map((r) => ({
       name: r.name,
       baseUrl: r.baseUrl ?? "",
       apiKey: r.apiKey ? "••••••" + (r.apiKey.length > 6 ? r.apiKey.slice(-4) : "") : "",
       apiKeySet: !!r.apiKey,
       api: r.api,
       authHeader: r.authHeader,
-      modelCount: Number(r.modelCount),
+      modelCount: countMap.get(r.id) ?? 0,
     }));
   }
 
@@ -60,6 +70,8 @@ export class ModelConfigRepository {
     providerName: string,
     baseUrl?: string,
     apiKey?: string,
+    api?: string,
+    authHeader?: boolean,
   ) {
     const rows = await this.db
       .select()
@@ -74,8 +86,8 @@ export class ModelConfigRepository {
         name: providerName,
         baseUrl: baseUrl ?? null,
         apiKey: apiKey ?? null,
-        api: "openai-completions",
-        authHeader: false,
+        api: api ?? "openai-completions",
+        authHeader: authHeader ?? false,
         sortOrder: 0,
       });
       return;
@@ -85,6 +97,8 @@ export class ModelConfigRepository {
     const updates: Record<string, unknown> = { updatedAt: new Date() };
     if (baseUrl !== undefined) updates.baseUrl = baseUrl;
     if (apiKey !== undefined) updates.apiKey = apiKey;
+    if (api !== undefined) updates.api = api;
+    if (authHeader !== undefined) updates.authHeader = authHeader;
 
     await this.db
       .update(modelProviders)
