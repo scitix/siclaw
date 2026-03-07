@@ -15,7 +15,7 @@ GIT_DIRTY  := $(shell test -n "$$(git status --porcelain)" && echo "-dirty" || e
 VERSION    := $(shell node -p "require('./package.json').version" 2>/dev/null || echo "0.0.0")
 
 # ── Configurable variables ──
-REGISTRY  ?= scitix
+REGISTRY  ?= siclaw
 NAMESPACE ?= siclaw
 TAG       ?= $(if $(GIT_TAG),$(GIT_TAG),$(VERSION)-$(GIT_COMMIT)$(GIT_DIRTY))
 
