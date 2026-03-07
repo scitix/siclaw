@@ -5,7 +5,7 @@ namespace: siclaw
 
 # -- Container images
 image:
-  registry: ""          # e.g. "scitix" -> scitix/siclaw-gateway:latest; empty -> siclaw-gateway:latest
+  registry: ""          # e.g. "siclaw" -> siclaw/siclaw-gateway:latest; empty -> siclaw-gateway:latest
   pullPolicy: Always
   tag: "latest"
 

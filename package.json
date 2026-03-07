@@ -98,9 +98,9 @@
     "start:gateway": "node siclaw-gateway.mjs",
     "start:agentbox": "node dist/agentbox-main.js",
     "test": "vitest run",
-    "docker:build:gateway": "docker build -f Dockerfile.gateway -t siclaw-gateway:latest .",
-    "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw-agentbox:latest .",
-    "docker:push:gateway": "docker push siclaw-gateway:latest",
-    "docker:push:agentbox": "docker push siclaw-agentbox:latest"
+    "docker:build:gateway": "docker build -f Dockerfile.gateway -t siclaw/siclaw-gateway:latest .",
+    "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw/siclaw-agentbox:latest .",
+    "docker:push:gateway": "docker push siclaw/siclaw-gateway:latest",
+    "docker:push:agentbox": "docker push siclaw/siclaw-agentbox:latest"
   }
 }
