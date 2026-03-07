@@ -103,7 +103,7 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
     model,
     maxInputTokens,
     async embed(texts: string[]): Promise<number[][]> {
-      if (texts.length === 0) return [];
+      if (texts.length === 0 || !baseUrl) return [];
 
       // Truncate oversized texts
       const truncated = texts.map(truncateToLimit);
