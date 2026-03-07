@@ -672,9 +672,11 @@ export function createRpcMethods(
     const providerName = params.provider as string;
     const baseUrl = params.baseUrl as string | undefined;
     const apiKey = params.apiKey as string | undefined;
+    const api = params.api as string | undefined;
+    const authHeader = params.authHeader as boolean | undefined;
     if (!providerName) throw new Error("Missing provider name");
 
-    await modelConfigRepo.saveProvider(providerName, baseUrl, apiKey);
+    await modelConfigRepo.saveProvider(providerName, baseUrl, apiKey, api, authHeader);
     return { ok: true };
   });
 
@@ -719,6 +721,117 @@ export function createRpcMethods(
     if (!providerName || !modelId) throw new Error("Missing required params: provider, modelId");
 
     await modelConfigRepo.removeModel(providerName, modelId);
+    return { ok: true };
+  });
+
+  methods.set("provider.testConnection", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    const baseUrl = params.baseUrl as string;
+    const apiKey = params.apiKey as string;
+    const api = (params.api as string) ?? "openai-completions";
+    if (!baseUrl || !apiKey) throw new Error("Missing required params: baseUrl, apiKey");
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const base = baseUrl.replace(/\/+$/, "");
+
+    try {
+      if (api === "anthropic") {
+        // Anthropic: auth-only check via counting message tokens (free, no completion)
+        const res = await fetch(`${base}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            messages: [{ role: "user", content: "hi" }],
+          }),
+          signal: controller.signal,
+        });
+        if (res.ok) return { ok: true, message: "Connection successful" };
+        // 404 means endpoint not available — try a simple auth header check
+        if (res.status === 404) {
+          // Any authenticated GET that returns non-401 means key is valid
+          const fallback = await fetch(`${base}/v1/models`, {
+            headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+            signal: controller.signal,
+          });
+          if (fallback.status !== 401 && fallback.status !== 403) {
+            return { ok: true, message: "Connection successful" };
+          }
+        }
+        const body = await res.text().catch(() => "");
+        return { ok: false, message: `HTTP ${res.status}: ${body.slice(0, 200)}` };
+      }
+
+      // OpenAI-compatible: try GET /models (auth-only, no completion)
+      const modelsPaths = [`${base}/models`, `${base}/v1/models`];
+      for (const url of modelsPaths) {
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+          signal: controller.signal,
+        });
+        if (res.ok) {
+          return { ok: true, message: "Connection successful" };
+        }
+        // 401/403 = bad key — definitive failure
+        if (res.status === 401 || res.status === 403) {
+          const body = await res.text().catch(() => "");
+          return { ok: false, message: `Authentication failed (HTTP ${res.status})` };
+        }
+        // 404 = endpoint not found but server responded — try next path
+      }
+      // All paths returned 404: server is reachable and didn't reject the key
+      return { ok: true, message: "Connection successful" };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, message: msg.includes("abort") ? "Connection timed out (10s)" : msg };
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+
+  methods.set("provider.quickSetup", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!modelConfigRepo) throw new Error("Database not available");
+
+    const providerName = params.provider as string;
+    const baseUrl = params.baseUrl as string | undefined;
+    const apiKey = params.apiKey as string | undefined;
+    const api = (params.api as string) ?? "openai-completions";
+    const authHeader = (params.authHeader as boolean) ?? false;
+    const model = params.model as Record<string, unknown> | undefined;
+    const setAsDefault = (params.setAsDefault as boolean) ?? true;
+
+    if (!providerName) throw new Error("Missing provider name");
+
+    // 1. Save provider
+    await modelConfigRepo.saveProvider(providerName, baseUrl, apiKey, api, authHeader);
+
+    // 2. Add model if provided
+    if (model?.id && model?.name) {
+      try {
+        await modelConfigRepo.addModel(providerName, {
+          id: model.id as string,
+          name: model.name as string,
+          reasoning: (model.reasoning as boolean) ?? false,
+          contextWindow: (model.contextWindow as number) ?? 128000,
+          maxTokens: (model.maxTokens as number) ?? 65536,
+          category: (model.category as string) ?? "llm",
+        });
+      } catch {
+        // Model may already exist (e.g. re-running quick setup) — that's fine
+      }
+
+      // 3. Set as default
+      if (setAsDefault) {
+        await modelConfigRepo.setDefault(providerName, model.id as string);
+      }
+    }
+
     return { ok: true };
   });
 
@@ -807,20 +920,22 @@ export function createRpcMethods(
       };
     }
 
-    // Fallback: read from settings.json mcpServers (CLI / no-DB mode)
+    // Fallback: read local file (CLI / no-DB mode)
+    const mcpConfigPath = path.resolve(process.cwd(), "config", "mcp-servers.json");
     try {
-      const { loadConfig } = await import("../core/config.js");
-      const config = loadConfig();
+      const raw = fs.readFileSync(mcpConfigPath, "utf-8");
+      const config = JSON.parse(raw) as {
+        mcpServers: Record<string, { url?: string; command?: string; transport?: string }>;
+      };
       const servers: Array<Record<string, unknown>> = [];
       for (const [name, serverConfig] of Object.entries(config.mcpServers ?? {})) {
-        const cfg = serverConfig as { url?: string; command?: string; transport?: string };
         servers.push({
           id: name,
           name,
-          url: cfg.url,
-          transport: cfg.transport ?? (cfg.url ? "streamable-http" : "stdio"),
+          url: serverConfig.url,
+          transport: serverConfig.transport ?? (serverConfig.url ? "streamable-http" : "stdio"),
           enabled: true,
-          source: "settings",
+          source: "file",
         });
       }
       return { servers };
