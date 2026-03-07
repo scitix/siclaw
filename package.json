@@ -1,6 +1,7 @@
 {
   "name": "siclaw",
   "version": "0.1.0",
+  "description": "AI-powered SRE copilot for Kubernetes diagnostics via natural language",
   "type": "module",
   "bin": {
     "siclaw": "./siclaw.mjs"
@@ -12,6 +13,27 @@
     "settings.example.json"
   ],
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scitix/siclaw.git"
+  },
+  "homepage": "https://github.com/scitix/siclaw#readme",
+  "bugs": {
+    "url": "https://github.com/scitix/siclaw/issues"
+  },
+  "keywords": [
+    "sre",
+    "kubernetes",
+    "k8s",
+    "ai",
+    "copilot",
+    "diagnostics",
+    "claude",
+    "agent"
+  ],
   "engines": {
     "node": ">=22.12.0"
   },
@@ -22,21 +44,14 @@
     "@mariozechner/pi-coding-agent": "^0.55.3",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.34.0",
-    "@types/js-yaml": "^4.0.9",
-    "@types/node-forge": "^1.3.14",
-    "clsx": "^2.1.1",
     "diff": "^8.0.3",
     "drizzle-orm": "^0.45.1",
-    "framer-motion": "^12.31.0",
     "js-yaml": "^4.1.1",
-    "lucide-react": "^0.563.0",
     "markdown-it": "^14.1.0",
     "mysql2": "^3.16.3",
     "node-forge": "^1.3.3",
-    "react-router-dom": "^7.13.0",
     "sql.js": "^1.12.0",
     "sqlite-vec": "^0.1.7-alpha.2",
-    "tailwind-merge": "^3.4.0",
     "ws": "^8.18.0",
     "zod": "^3.24.0"
   },
@@ -51,14 +66,21 @@
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",
+    "@types/js-yaml": "^4.0.9",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.19.8",
+    "@types/node-forge": "^1.3.14",
     "@types/react-router-dom": "^5.3.3",
     "@types/sql.js": "^1.4.9",
     "@types/ws": "^8.5.0",
     "autoprefixer": "^10.4.24",
+    "clsx": "^2.1.1",
     "drizzle-kit": "^0.31.8",
+    "framer-motion": "^12.31.0",
+    "lucide-react": "^0.563.0",
     "postcss": "^8.5.6",
+    "react-router-dom": "^7.13.0",
+    "tailwind-merge": "^3.4.0",
     "tailwindcss": "^4.1.18",
     "tsx": "^4.21.0",
     "typescript": "^5.9.0",

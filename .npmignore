@@ -1,0 +1,42 @@
+# Source (compiled output is in dist/)
+src/
+tsconfig*.json
+
+# Docker & K8s
+Dockerfile.*
+Makefile
+helm/
+k8s/
+
+# Docs & GitHub
+docs/
+.github/
+.claude/
+CLAUDE.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+CHANGELOG.md
+AGENTS.md
+
+# Dev config
+.gitignore
+.env
+.env.*
+.vscode/
+.idea/
+
+# Tests
+**/*.test.ts
+**/*.test.js
+vitest.config.*
+
+# Runtime data
+.siclaw/
+*.sqlite
+*.db
+
+# Other entry points (only siclaw.mjs is needed)
+siclaw-tui.mjs
+siclaw-gateway.mjs
+siclaw-agentbox.mjs
