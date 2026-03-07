@@ -518,7 +518,7 @@ export async function createSiclawSession(
 
   const loader = new DefaultResourceLoader({
     cwd,
-    systemPromptOverride: () => buildSreSystemPrompt(memoryDir),
+    systemPromptOverride: () => buildSreSystemPrompt(memoryDir, mode),
     appendSystemPromptOverride: () => {
       const parts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
       if (workspaceSystemPromptAppend) {
@@ -557,7 +557,7 @@ export async function createSiclawSession(
       createEndInvestigationTool(dpState),
     );
 
-    const systemPrompt = buildSreSystemPrompt(memoryDir);
+    const systemPrompt = buildSreSystemPrompt(memoryDir, mode);
 
     // Build the same append content that pi-agent gets via appendSystemPromptOverride
     const appendParts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
