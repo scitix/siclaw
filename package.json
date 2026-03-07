@@ -1,6 +1,6 @@
 {
   "name": "siclaw",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI-powered SRE copilot for Kubernetes diagnostics via natural language",
   "type": "module",
   "bin": {
