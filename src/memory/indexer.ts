@@ -110,7 +110,9 @@ export class MemoryIndexer {
         ),
         deleteFile: this.db.prepare("DELETE FROM files WHERE path = ?"),
         insertChunk: this.db.prepare(
-          "INSERT INTO chunks (file_path, heading, content, embedding, model, start_line, end_line) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO chunks (file_path, heading, content, embedding, model, start_line, end_line) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(file_path, heading, content) DO UPDATE SET " +
+          "embedding=excluded.embedding, model=excluded.model, start_line=excluded.start_line, end_line=excluded.end_line",
         ),
         deleteChunks: this.db.prepare("DELETE FROM chunks WHERE file_path = ?"),
         allChunks: this.db.prepare("SELECT id, file_path, heading, content, embedding FROM chunks"),
