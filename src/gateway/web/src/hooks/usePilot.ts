@@ -993,32 +993,42 @@ export function usePilot() {
         }
     }, [isConnected, sendRpc, currentSessionKey, loadSessions]);
 
-    // Reset loading state when WebSocket disconnects mid-generation
-    // (e.g. model API error, backend crash, network drop)
+    // Reset loading state when WebSocket disconnects mid-generation.
+    // Give a 15s grace window for WS to auto-reconnect (SSH tunnel flaps,
+    // browser sleep, network blips). Backend SSE continues independently.
+    const disconnectTimerRef = useRef<ReturnType<typeof setTimeout>>();
     useEffect(() => {
         if (!isConnected && isLoading) {
-            setIsLoading(false);
-            isAbortingRef.current = false;
-            setPendingMessages([]);
-            setMessages(prev => prev.map(m =>
-                m.isStreaming
-                    ? { ...m, isStreaming: false, ...(m.role === 'tool' ? { toolStatus: 'error' as const } : {}) }
-                    : m
-            ));
-            clearDpTimers();
-            setDpChecklist(prev => {
-                if (!prev) return null;
-                return prev.map(item =>
-                    item.status === 'in_progress' || item.status === 'pending'
-                        ? { ...item, status: 'error' as const, summary: 'Connection lost' }
-                        : item
-                );
-            });
-            setDpFocus(null);
-            setInvestigationProgress(null);
-            dpTimeout(() => resetDpState(), 10_000);
+            disconnectTimerRef.current = setTimeout(() => {
+                setIsLoading(false);
+                isAbortingRef.current = false;
+                setPendingMessages([]);
+                setMessages(prev => prev.map(m =>
+                    m.isStreaming
+                        ? { ...m, isStreaming: false, ...(m.role === 'tool' ? { toolStatus: 'error' as const } : {}) }
+                        : m
+                ));
+                clearDpTimers();
+                setDpChecklist(prev => {
+                    if (!prev) return null;
+                    return prev.map(item =>
+                        item.status === 'in_progress' || item.status === 'pending'
+                            ? { ...item, status: 'error' as const, summary: 'Connection lost' }
+                            : item
+                    );
+                });
+                setDpFocus(null);
+                setInvestigationProgress(null);
+                dpTimeout(() => resetDpState(), 10_000);
+            }, 15_000);
         }
-    }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
+        return () => {
+            if (disconnectTimerRef.current) {
+                clearTimeout(disconnectTimerRef.current);
+                disconnectTimerRef.current = undefined;
+            }
+        };
+    }, [isConnected, isLoading]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Stale-loading watchdog: if isLoading but no agent events for too long,
     // the backend likely died silently — reset UI so user isn't stuck.
@@ -1062,11 +1072,19 @@ export function usePilot() {
         }
     }, [isLoading, staleTimeoutMs]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    /** Restore deep_search progress from gateway snapshot after WS reconnect */
+    /** Restore deep_search progress from gateway snapshot after WS reconnect / page refresh */
     const restoreDpProgress = useCallback(async () => {
         if (!isConnected) return;
         try {
-            const snap = await sendRpc<{ sessionId?: string; events: Array<Record<string, unknown>> | null }>('chat.dpProgress', { sessionId: currentSessionKeyRef.current });
+            const snap = await sendRpc<{
+                sessionId?: string;
+                events: Array<Record<string, unknown>> | null;
+                promptActive?: boolean;
+            }>('chat.dpProgress', { sessionId: currentSessionKeyRef.current });
+            // If prompt is still running on the backend, restore loading state
+            if (snap.promptActive) {
+                setIsLoading(true);
+            }
             if (!snap.events || snap.events.length === 0) return;
             // Replay events through the same reducer used for live progress
             let state: InvestigationProgress = { hypotheses: [] };
@@ -1074,6 +1092,31 @@ export function usePilot() {
                 state = reduceInvestigationProgress(state, ev);
             }
             setInvestigationProgress(state);
+
+            // Derive dpChecklist from restored investigation state so the
+            // DpChecklistCard renders (it gates hypothesis tree visibility).
+            // Phase values from engine: "Phase 1/4" .. "Phase 4/4"
+            const phase = state.phase;
+            const checklist = createDefaultDpChecklist();
+            const phaseNum = phase ? parseInt(phase.match(/(\d+)/)?.[1] ?? '0') : 0;
+            if (phaseNum >= 1) {
+                // Map engine phases to checklist items: 1→triage, 2→hypotheses, 3→deep_search, 4→conclusion
+                for (let i = 0; i < checklist.length; i++) {
+                    if (i < phaseNum - 1) {
+                        checklist[i].status = 'done';
+                    } else if (i === phaseNum - 1) {
+                        checklist[i].status = 'in_progress';
+                    }
+                }
+            } else if (state.hypotheses.length > 0) {
+                // Have hypotheses but no phase info — at least in deep_search
+                checklist[0].status = 'done';
+                checklist[1].status = 'done';
+                checklist[2].status = 'in_progress';
+            }
+            setDpChecklist(checklist);
+            const focus = checklist.find(i => i.status === 'in_progress');
+            setDpFocus(focus ? focus.id : null);
         } catch {
             // Ignore — gateway may not support this RPC yet
         }

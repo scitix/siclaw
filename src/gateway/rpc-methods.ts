@@ -1101,12 +1101,14 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const sessionId = params.sessionId as string | undefined;
     const snapKey = sessionId ? `${userId}:${sessionId}` : userId;
+    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
+    const promptActive = streamKey ? activeStreams.has(streamKey) : false;
     const snap = dpProgressSnapshots.get(snapKey);
     if (!snap || Date.now() - snap.updatedAt > 600_000) {
       dpProgressSnapshots.delete(snapKey);
-      return { events: null };
+      return { events: null, promptActive };
     }
-    return { sessionId: snap.sessionId, events: snap.events };
+    return { sessionId: snap.sessionId, events: snap.events, promptActive };
   });
 
   methods.set("chat.history", async (params, context: RpcContext) => {
@@ -3634,13 +3636,13 @@ export function createRpcMethods(
     return buildSkillBundle(userId, env, skillWriter, skillRepo, skillContentRepo, disabled);
   }
 
-  /** Abort all SSE streams associated with a specific WebSocket connection */
+  /** Detach WebSocket from SSE streams — SSE continues so DB persistence and
+   *  dpProgressSnapshots keep updating. User reconnect resumes live events. */
   function cleanupForWs(ws: WebSocket): void {
     for (const [key, stream] of activeStreams.entries()) {
       if (stream.ws === ws) {
-        console.log(`[rpc] Cleaning up SSE stream ${key} (WS closed)`);
-        stream.abort();
-        activeStreams.delete(key);
+        console.log(`[rpc] WS detached from SSE stream ${key} — SSE continues`);
+        stream.ws = undefined;
       }
     }
   }

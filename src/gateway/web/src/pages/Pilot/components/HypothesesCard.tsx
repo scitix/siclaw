@@ -233,7 +233,8 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
     const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
     const [confirmed, setConfirmed] = useState(false);
     const isRunning = message.toolStatus === 'running';
-    const isDone = message.toolStatus === 'success';
+    // toolStatus is undefined for messages loaded from DB history (not persisted)
+    const isDone = message.toolStatus === 'success' || (!message.toolStatus && !message.isStreaming);
 
     // Parse hypotheses: prefer toolDetails.hypotheses (gateway mode), fallback to toolInput
     const hypothesesSource = (message.toolDetails?.hypotheses as string) || message.toolInput || '';
