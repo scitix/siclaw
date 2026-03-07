@@ -1,13 +1,13 @@
 /**
- * Interactive first-run setup for TUI mode.
+ * Interactive setup wizard for TUI mode (`siclaw --setup`).
  *
- * Uses Node.js readline (no pi-agent dependency) because InteractiveMode
- * hasn't started yet when this runs.
+ * Writes plain values to `.siclaw/config/settings.json`.
+ * No $VAR indirection — env vars are handled by config.ts at load time.
  */
 
 import fs from "node:fs";
 import readline from "node:readline";
-import { getConfigPath, loadConfig, reloadConfig, type ProviderConfig, type SiclawConfig } from "./core/config.js";
+import { getConfigPath, reloadConfig, type ProviderConfig, type SiclawConfig } from "./core/config.js";
 
 // ---------------------------------------------------------------------------
 // Provider presets
@@ -15,17 +15,15 @@ import { getConfigPath, loadConfig, reloadConfig, type ProviderConfig, type Sicl
 
 interface ProviderPreset {
   label: string;
-  key: string;
   baseUrl: string;
   api: string;
   models: ProviderConfig["models"];
-  needsBaseUrl?: boolean; // true = prompt user for base URL
+  needsBaseUrl?: boolean;
 }
 
 const PRESETS: ProviderPreset[] = [
   {
     label: "OpenAI (GPT-4o, GPT-4o-mini)",
-    key: "openai",
     baseUrl: "https://api.openai.com/v1",
     api: "openai-completions",
     models: [
@@ -53,7 +51,6 @@ const PRESETS: ProviderPreset[] = [
   },
   {
     label: "Anthropic (Claude Sonnet 4, Claude Opus 4)",
-    key: "anthropic",
     baseUrl: "https://api.anthropic.com/v1",
     api: "anthropic",
     models: [
@@ -80,8 +77,7 @@ const PRESETS: ProviderPreset[] = [
     ],
   },
   {
-    label: "Compatible API (Qwen, DeepSeek, Ollama, etc.)",
-    key: "compatible",
+    label: "Compatible API (Qwen, DeepSeek, Kimi, Ollama, etc.)",
     baseUrl: "",
     api: "openai-completions",
     needsBaseUrl: true,
@@ -112,6 +108,22 @@ function ask(rl: readline.Interface, question: string): Promise<string> {
   return new Promise((resolve) => rl.question(question, (answer) => resolve(answer.trim())));
 }
 
+/** Like ask() but suppresses input echo (for API keys / secrets). */
+function askSecret(rl: readline.Interface, question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rlAny = rl as any;
+    const output = rlAny.output as NodeJS.WritableStream;
+    rlAny._writeToOutput = function (s: string) {
+      if (s === question) output.write(s);
+    };
+    rl.question(question, (answer) => {
+      rlAny._writeToOutput = (s: string) => output.write(s);
+      output.write("\n");
+      resolve(answer.trim());
+    });
+  });
+}
+
 function askSelect(rl: readline.Interface, prompt: string, options: string[]): Promise<number> {
   return new Promise((resolve) => {
     console.log(prompt);
@@ -137,11 +149,14 @@ function askSelect(rl: readline.Interface, prompt: string, options: string[]): P
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true if interactive setup should run:
- * - settings.json does not exist, OR
- * - providers object is empty
+ * Returns true if the user has no usable LLM configuration:
+ * - No SICLAW_API_KEY / SICLAW_LLM_API_KEY env var, AND
+ * - No settings.json with providers
  */
 export function needsSetup(): boolean {
+  // Env vars are sufficient — no settings.json needed
+  if (process.env.SICLAW_API_KEY || process.env.SICLAW_LLM_API_KEY) return false;
+
   const configPath = getConfigPath();
   if (!fs.existsSync(configPath)) return true;
 
@@ -151,73 +166,70 @@ export function needsSetup(): boolean {
     if (!providers || typeof providers !== "object" || Object.keys(providers).length === 0) {
       return true;
     }
+    // Check that at least one provider has an apiKey
+    for (const p of Object.values(providers) as any[]) {
+      if (p.apiKey) return false;
+    }
+    return true;
   } catch {
     return true;
   }
-  return false;
+}
+
+/**
+ * Print configuration instructions and exit.
+ */
+export function printSetupInstructions(): void {
+  console.error(`
+  No LLM provider configured.
+
+  Option 1 — environment variables (recommended):
+
+    export SICLAW_API_KEY=sk-...
+    export SICLAW_BASE_URL=https://api.openai.com/v1  # or your provider's URL
+    export SICLAW_MODEL=gpt-4o                         # optional
+    siclaw
+
+  Option 2 — setup wizard:
+
+    siclaw --setup
+`);
 }
 
 /**
  * Interactive provider configuration wizard.
- * Writes result to `.siclaw/config/settings.json`.
+ * Writes plain values to `.siclaw/config/settings.json`.
  */
 export async function runInteractiveSetup(): Promise<void> {
   const rl = createRl();
 
   try {
     console.log("");
-    console.log("  Welcome to Siclaw! Let's configure your AI provider.");
+    console.log("  Siclaw Setup");
     console.log("");
 
     // 1. Select provider type
     const presetIdx = await askSelect(
       rl,
-      "  Select provider type:",
+      "  Provider:",
       PRESETS.map((p) => p.label),
     );
     const preset = PRESETS[presetIdx];
 
-    // 2. API Key
-    const apiKeyInput = await ask(rl, `  API Key: `);
-    if (!apiKeyInput) {
-      console.log("  API key is required. Setup aborted.");
+    // 2. API Key (masked input)
+    const apiKey = await askSecret(rl, `  API Key: `);
+    if (!apiKey) {
+      console.log("  API key is required. Aborted.");
       return;
     }
 
-    // Offer env-var reference storage (recommended for security)
-    let apiKey: string;
-    if (!apiKeyInput.startsWith("$")) {
-      const storageChoice = await askSelect(rl, "  How to store the API key?", [
-        "As environment variable reference (recommended — key stays out of config files)",
-        "Store directly in settings.json (simple but less secure)",
-      ]);
-      if (storageChoice === 0) {
-        const envVarName = preset.key === "compatible"
-          ? "SICLAW_PROVIDER_API_KEY"
-          : `${preset.key.toUpperCase()}_API_KEY`;
-        const suggestedName = await ask(rl, `  Env var name [${envVarName}]: `);
-        const finalName = suggestedName || envVarName;
-        apiKey = `$${finalName}`;
-        console.log("");
-        console.log(`  Will store "$${finalName}" in config.`);
-        console.log(`  Make sure to set the env var before running siclaw:`);
-        console.log(`    export ${finalName}=${apiKeyInput}`);
-        console.log("");
-      } else {
-        apiKey = apiKeyInput;
-      }
-    } else {
-      // User already provided a $VAR reference
-      apiKey = apiKeyInput;
-    }
-
-    // 3. Base URL (only if needed or custom)
+    // 3. Base URL
     let baseUrl = preset.baseUrl;
     if (preset.needsBaseUrl) {
       const entered = await ask(rl, `  Base URL: `);
       if (entered) baseUrl = entered;
       if (!baseUrl) {
-        console.log("  Base URL is required for compatible providers. Setup aborted.");
+        console.log("  Base URL is required. Aborted.");
         return;
       }
     } else {
@@ -225,16 +237,16 @@ export async function runInteractiveSetup(): Promise<void> {
       if (entered) baseUrl = entered;
     }
 
-    // 4. Model ID for compatible provider
+    // 4. Model ID (compatible provider only)
     let models = preset.models;
-    if (preset.key === "compatible") {
+    if (preset.needsBaseUrl) {
       const modelId = await ask(rl, `  Model ID [default]: `);
       if (modelId) {
         models = [{ ...models[0], id: modelId, name: modelId }];
       }
     }
 
-    // 5. Build and write config
+    // 5. Write config
     const provider: ProviderConfig = {
       baseUrl,
       apiKey,
@@ -243,7 +255,6 @@ export async function runInteractiveSetup(): Promise<void> {
       models,
     };
 
-    // Load existing config or start from defaults
     const configPath = getConfigPath();
     let existing: Partial<SiclawConfig> = {};
     if (fs.existsSync(configPath)) {
@@ -264,13 +275,12 @@ export async function runInteractiveSetup(): Promise<void> {
       JSON.stringify({ ...existing, providers }, null, 2) + "\n",
     );
 
-    // Reload config cache so loadConfig() picks up the new settings
     reloadConfig();
 
     const modelName = models[0].name || models[0].id;
     console.log("");
     console.log(`  Saved to ${configPath}`);
-    console.log(`  Model: ${modelName} | Provider: ${preset.label.split(" (")[0]}`);
+    console.log(`  Provider: ${preset.label.split(" (")[0]} | Model: ${modelName}`);
     console.log("");
   } finally {
     rl.close();
