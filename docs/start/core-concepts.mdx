@@ -6,16 +6,9 @@ description: "Key ideas behind Siclaw's investigation approach."
 
 ## How Siclaw Investigates
 
-Siclaw's core is a **4-phase hypothesis-driven investigation engine**:
+Siclaw uses a **4-phase hypothesis-driven investigation engine**: gather context → generate hypotheses → validate in parallel with sub-agents → produce a structured report with root cause and remediation.
 
-```
-Phase 1: Context Gathering    → Collects cluster state, events, logs, metrics
-Phase 2: Hypothesis Generation → Generates 3-5 ranked hypotheses from evidence
-Phase 3: Parallel Validation   → Up to 3 sub-agents independently test hypotheses
-Phase 4: Conclusion            → Structured report with root cause and remediation
-```
-
-Every investigation is **read-only** — Siclaw never modifies your cluster. See [Deep Investigation](/features/deep-investigation) for details.
+Every investigation is **read-only** — Siclaw never modifies your cluster. See [Deep Investigation](/features/deep-investigation) for the full pipeline details and budget controls.
 
 ## Runtime Modes
 
@@ -23,8 +16,9 @@ Siclaw runs in three modes sharing one agent core:
 
 | Mode | Use Case | Start Command |
 |------|----------|---------------|
-| **CLI (TUI)** | Personal terminal diagnostics | `npx siclaw` |
-| **Gateway** | Multi-user with Web UI, Slack, Lark | `siclaw-gateway` |
+| **CLI (TUI)** | Personal terminal diagnostics | `siclaw` |
+| **Local Server** | Team use with Web UI, Slack, Lark | `siclaw local` |
+| **Gateway + K8s** | Production multi-tenant | `siclaw-gateway --k8s` |
 | **Cron** | Scheduled health patrols | `siclaw-cron` |
 
 For team use, Gateway spawns an isolated **AgentBox** per user — either in-process (local dev) or as a Kubernetes pod (production).
