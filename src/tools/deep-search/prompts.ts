@@ -99,18 +99,16 @@ ${getFormattedSkillsPrompt()}
 
 ${rdmaTroubleshootingPriority()}
 
-Output ONLY valid JSON (no markdown fences, no extra text before or after) in this exact format:
-{"hypotheses":[{"text":"Specific hypothesis description","confidence":70,"suggestedTools":["bash: skills/core/roce-mtu-compare/scripts/mtu-compare.sh --pod-a X --ns-a Y --pod-b Z --ns-b W","bash: skills/core/roce-port-counters/scripts/port-counters.sh --pod X --ns Y"]}]}
+Call the submit_hypotheses tool with your analysis.
+
+Field semantics:
+- text: specific hypothesis description ("Pod OOMKilled due to 256Mi limit" not "Pod has memory issues")
+- confidence: 0-100 prior belief, highest first
+- suggestedTools: MUST use real skill script paths from the skills listed above (e.g. "bash: skills/core/roce-mtu-compare/scripts/mtu-compare.sh --pod-a X --ns-a Y --pod-b Z --ns-b W"). Only fall back to raw kubectl/node_exec when no skill covers the check.
 
 RULES:
 - Exactly ${maxHypotheses} hypotheses, ranked by likelihood (highest confidence first).
-- confidence: 0-100 prior belief.
-- suggestedTools: MUST use real skill script paths from the skills listed above.
-  GOOD: "bash: skills/core/roce-mtu-compare/scripts/mtu-compare.sh --pod-a X --ns-a Y --pod-b Z --ns-b W"
-  BAD: "bash: cat /sys/class/net/net1/mtu" or "bash: ethtool -S eth0"
-  Only fall back to raw kubectl/node_exec when no skill covers the check.
 - Cover diverse failure modes — do not cluster hypotheses around a single root cause.
-- Be specific: "Pod OOMKilled due to 256Mi limit" > "Pod has memory issues".
 - For RDMA/RoCE: follow the troubleshooting priority order above.${relatedInvestigations ? "\n- If prior investigations revealed validated root causes for similar issues, include them with HIGHER initial confidence." : ""}`;
 }
 
@@ -243,24 +241,16 @@ export function conclusionPrompt(
 ${hypothesesSummary}
 </investigation_results>
 
-Write a clear, actionable conclusion that:
-1. Directly answers the original question.
-2. References the validated hypotheses and key evidence.
-3. Provides specific remediation steps if applicable.
-4. Notes any inconclusive areas that need further investigation.
+Call the submit_conclusion tool with your analysis.
 
-Keep it concise (3-5 paragraphs max). Do NOT repeat all the evidence — summarize the key findings.
-
-After your conclusion text, output a structured extraction in this exact format:
-
-STRUCTURED_EXTRACTION_START
-{"root_cause_category":"<category>","affected_entities":["<entity1>"],"environment_tags":["<tag1>"],"causal_chain":["<step1>","<step2>"],"confidence":<0-100>}
-STRUCTURED_EXTRACTION_END
-
-Rules for structured extraction:
+Field semantics:
+- conclusion_text: clear, actionable conclusion (3-5 paragraphs) that directly answers the original question, references validated hypotheses and key evidence, and notes inconclusive areas
 - root_cause_category: one of: mtu_mismatch, pcie_error, driver_issue, firmware_bug, config_error, resource_exhaustion, network_partition, scheduling_failure, hardware_failure, software_bug, permission_denied, unknown
 - affected_entities: K8s resource paths like "pod/name", "node/name", "ns/name", "svc/name"
 - environment_tags: cluster/infra identifiers found during investigation
-- causal_chain: ordered list of cause-effect steps leading to the root cause
-- confidence: your overall confidence in the root cause diagnosis (0-100)`;
+- causal_chain: ordered cause-effect steps leading to the root cause
+- confidence: overall confidence in the root cause diagnosis (0-100)
+- remediation_steps: specific steps to fix the issue
+
+Do NOT repeat all the evidence — summarize the key findings.`;
 }

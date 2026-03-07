@@ -28,8 +28,7 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { createRestrictedBashTool } from "../restricted-bash.js";
 import { createNodeExecTool } from "../node-exec.js";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
-import { loadProxyConfig } from "../../core/llm-proxy.js";
-import { getDefaultLlm } from "../../core/config.js";
+import { getDefaultLlm, type ProviderModelCompat } from "../../core/config.js";
 import type { Evidence, TraceStep } from "./types.js";
 import {
   LLM_COMPLETE_MAX_TOKENS,
@@ -426,9 +425,26 @@ interface ChatMessage {
   content: string;
 }
 
+interface ToolCallDef {
+  type: "function";
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+}
+
+interface ChatCompletionOptions {
+  tools?: ToolCallDef[];
+  tool_choice?: { type: "function"; function: { name: string } } | "auto" | "required";
+}
+
 interface ChatCompletionResponse {
   choices: Array<{
-    message: { content?: string | null };
+    message: {
+      content?: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: { name: string; arguments: string };
+      }>;
+    };
     finish_reason: string;
   }>;
 }
@@ -442,6 +458,7 @@ function resolveConfig(options?: SubAgentOptions) {
     model: options?.model ?? llm?.model?.id ?? "",
     apiKey: options?.apiKey ?? llm?.apiKey ?? "",
     baseUrl: options?.baseUrl ?? llm?.baseUrl ?? "",
+    compat: llm?.model?.compat,
   };
 }
 
@@ -450,15 +467,20 @@ async function chatCompletion(
   apiKey: string,
   model: string,
   messages: ChatMessage[],
+  options?: ChatCompletionOptions,
 ): Promise<ChatCompletionResponse> {
   const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const body: Record<string, unknown> = { model, messages, max_tokens: LLM_COMPLETE_MAX_TOKENS };
+  if (options?.tools) body.tools = options.tools;
+  if (options?.tool_choice) body.tool_choice = options.tool_choice;
+
   const response = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({ model, messages, max_tokens: LLM_COMPLETE_MAX_TOKENS }),
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
@@ -505,4 +527,157 @@ export async function llmComplete(
  */
 export function getFormattedSkillsPrompt(): string {
   return getSkillsPrompt();
+}
+
+// --- JSON extraction (used by llmCompleteWithTool fallback and engine.ts) ---
+
+/**
+ * Extract JSON from LLM output using multi-layer fallback:
+ * 1. Direct JSON.parse
+ * 2. Fenced code block (```json ... ```)
+ * 3. Balanced brace matching (first complete top-level object)
+ */
+export function extractJSON(text: string): string | null {
+  // 1. Direct parse — LLM sometimes returns pure JSON
+  try {
+    JSON.parse(text);
+    return text;
+  } catch {
+    // continue to next strategy
+  }
+
+  // 2. Fenced code block
+  const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
+  if (fenceMatch) {
+    try {
+      JSON.parse(fenceMatch[1]);
+      return fenceMatch[1];
+    } catch {
+      // fence content wasn't valid JSON, continue
+    }
+  }
+
+  // 3. Balanced brace extraction — find first complete top-level { ... }
+  const start = text.indexOf("{");
+  if (start >= 0) {
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === "\\" && inString) {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.slice(start, i + 1);
+          try {
+            JSON.parse(candidate);
+            return candidate;
+          } catch {
+            // Balanced braces but not valid JSON, give up
+            return null;
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+// --- LLM completion with function calling (tool_use) ---
+
+/**
+ * LLM completion with function calling (tool_use) for structured output.
+ *
+ * Tries OpenAI function calling first. Falls back to extractJSON() on the
+ * text content if the provider ignores the tools parameter or returns no
+ * tool_calls.
+ *
+ * When `supportsToolUse` is false in provider compat config, skips function
+ * calling entirely and goes straight to llmComplete() + extractJSON().
+ */
+export async function llmCompleteWithTool<T>(
+  systemPrompt: string | undefined,
+  userMessage: string,
+  toolName: string,
+  toolDescription: string,
+  toolSchema: Record<string, unknown>,
+  options?: SubAgentOptions,
+  onProgress?: ProgressCallback,
+): Promise<{ toolArgs: T | null; textContent: string }> {
+  const { model, apiKey, baseUrl, compat } = resolveConfig(options);
+
+  if (!apiKey) throw new Error("API key not configured. Configure providers in .siclaw/config/settings.json.");
+  if (!model) throw new Error("Model not configured. Configure a default model in .siclaw/config/settings.json.");
+  if (!baseUrl) throw new Error("Base URL not configured. Configure a provider in .siclaw/config/settings.json.");
+
+  // If provider doesn't support tool_use, fall back to plain completion + extractJSON
+  if (compat?.supportsToolUse === false) {
+    const text = await llmComplete(systemPrompt, userMessage, options, onProgress);
+    const jsonStr = extractJSON(text);
+    if (jsonStr) {
+      try {
+        return { toolArgs: JSON.parse(jsonStr) as T, textContent: text };
+      } catch { /* fall through */ }
+    }
+    return { toolArgs: null, textContent: text };
+  }
+
+  onProgress?.({ type: "llm_call", iteration: 0, maxCalls: 0 });
+
+  const messages: ChatMessage[] = [];
+  if (systemPrompt) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
+  messages.push({ role: "user", content: userMessage });
+
+  const toolDef: ToolCallDef = {
+    type: "function",
+    function: { name: toolName, description: toolDescription, parameters: toolSchema },
+  };
+
+  const response = await chatCompletion(baseUrl, apiKey, model, messages, {
+    tools: [toolDef],
+    tool_choice: { type: "function", function: { name: toolName } },
+  });
+
+  const choice = response.choices[0];
+  const textContent = choice?.message?.content ?? "";
+  onProgress?.({ type: "llm_text", text: textContent.slice(0, 200) });
+
+  // Primary path: extract from tool_calls
+  const toolCall = choice?.message?.tool_calls?.[0];
+  if (toolCall?.function?.arguments) {
+    try {
+      return { toolArgs: JSON.parse(toolCall.function.arguments) as T, textContent };
+    } catch {
+      // Malformed tool_call JSON — fall through to text extraction
+    }
+  }
+
+  // Fallback: provider returned no tool_calls, try extractJSON on text content
+  if (textContent) {
+    const jsonStr = extractJSON(textContent);
+    if (jsonStr) {
+      try {
+        return { toolArgs: JSON.parse(jsonStr) as T, textContent };
+      } catch { /* fall through */ }
+    }
+  }
+
+  return { toolArgs: null, textContent };
 }
