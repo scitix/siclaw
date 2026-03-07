@@ -1,9 +1,9 @@
 /**
  * Unified configuration loader for AgentBox / TUI.
  *
- * Configuration is read from `.siclaw/config/settings.json` with support for:
- * - `$VAR` / `${VAR}` env-var references in apiKey / baseUrl fields
- * - `SICLAW_LLM_*` runtime env-var overrides (highest priority)
+ * Priority (highest → lowest):
+ * 1. Environment variables: SICLAW_API_KEY, SICLAW_BASE_URL, SICLAW_MODEL
+ * 2. settings.json (plain values — no $VAR indirection)
  */
 
 import fs from "node:fs";
@@ -102,74 +102,52 @@ function deepMerge<T extends Record<string, unknown>>(base: T, override: Record<
 }
 
 // ---------------------------------------------------------------------------
-// Environment variable reference resolution
+// Environment variable overrides
 // ---------------------------------------------------------------------------
 
 /**
- * Expand `$VAR` and `${VAR}` references in a string to their process.env values.
- * Unset variables resolve to "" with a console warning.
- */
-function resolveEnvRef(value: string): string {
-  return value.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-    (_, braced, bare) => {
-      const name = braced || bare;
-      const val = process.env[name];
-      if (val === undefined) console.warn(`[config] env ${name} is not set`);
-      return val ?? "";
-    },
-  );
-}
-
-/**
- * Returns true if the value contains `$VAR` or `${VAR}` references.
- */
-function hasEnvRef(value: string): boolean {
-  return /\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*/.test(value);
-}
-
-/**
- * Resolve env-var references in provider apiKey / baseUrl fields,
- * and in the embedding config.
- */
-function resolveEnvRefs(config: SiclawConfig): void {
-  for (const provider of Object.values(config.providers)) {
-    if (provider.apiKey && hasEnvRef(provider.apiKey)) {
-      provider.apiKey = resolveEnvRef(provider.apiKey);
-    }
-    if (provider.baseUrl && hasEnvRef(provider.baseUrl)) {
-      provider.baseUrl = resolveEnvRef(provider.baseUrl);
-    }
-  }
-  if (config.embedding) {
-    if (config.embedding.apiKey && hasEnvRef(config.embedding.apiKey)) {
-      config.embedding.apiKey = resolveEnvRef(config.embedding.apiKey);
-    }
-    if (config.embedding.baseUrl && hasEnvRef(config.embedding.baseUrl)) {
-      config.embedding.baseUrl = resolveEnvRef(config.embedding.baseUrl);
-    }
-  }
-}
-
-/**
- * Apply `SICLAW_LLM_*` environment variable overrides (highest priority).
+ * Apply environment variable overrides (highest priority).
  *
- * - `SICLAW_LLM_API_KEY`  → overrides the default provider's apiKey
- * - `SICLAW_LLM_BASE_URL` → overrides the default provider's baseUrl
- * - `SICLAW_LLM_MODEL`    → overrides the default modelId
+ * Supports two naming conventions (shorter takes precedence):
+ * - SICLAW_API_KEY  / SICLAW_LLM_API_KEY
+ * - SICLAW_BASE_URL / SICLAW_LLM_BASE_URL
+ * - SICLAW_MODEL    / SICLAW_LLM_MODEL
+ *
+ * If env vars are set but no provider exists in settings.json,
+ * creates a default provider automatically.
  */
-function applySiclawLlmOverrides(config: SiclawConfig): void {
-  const envApiKey = process.env.SICLAW_LLM_API_KEY;
-  const envBaseUrl = process.env.SICLAW_LLM_BASE_URL;
-  const envModel = process.env.SICLAW_LLM_MODEL;
+function applyEnvOverrides(config: SiclawConfig): void {
+  const envApiKey = process.env.SICLAW_API_KEY ?? process.env.SICLAW_LLM_API_KEY;
+  const envBaseUrl = process.env.SICLAW_BASE_URL ?? process.env.SICLAW_LLM_BASE_URL;
+  const envModel = process.env.SICLAW_MODEL ?? process.env.SICLAW_LLM_MODEL;
 
   if (!envApiKey && !envBaseUrl && !envModel) return;
 
-  // Determine the default provider name
-  const providerName =
-    config.default?.provider ?? Object.keys(config.providers)[0];
-  if (!providerName || !config.providers[providerName]) return;
+  let providerName = config.default?.provider ?? Object.keys(config.providers)[0];
 
+  // No provider in config — create one from env vars
+  if (!providerName || !config.providers[providerName]) {
+    providerName = "default";
+    config.providers[providerName] = {
+      baseUrl: envBaseUrl ?? "",
+      apiKey: envApiKey ?? "",
+      api: "openai-completions",
+      authHeader: true,
+      models: [{
+        id: envModel ?? "default",
+        name: envModel ?? "default",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128000,
+        maxTokens: 8192,
+        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+      }],
+    };
+    return;
+  }
+
+  // Override existing provider fields
   const provider = config.providers[providerName];
   if (envApiKey) provider.apiKey = envApiKey;
   if (envBaseUrl) provider.baseUrl = envBaseUrl;
@@ -220,11 +198,8 @@ export function loadConfig(): SiclawConfig {
 
   cached = deepMerge(DEFAULTS as unknown as Record<string, unknown>, fileConfig) as unknown as SiclawConfig;
 
-  // Resolve $VAR / ${VAR} references in provider & embedding fields
-  resolveEnvRefs(cached);
-
-  // SICLAW_LLM_* env overrides — highest priority
-  applySiclawLlmOverrides(cached);
+  // Environment variable overrides (highest priority)
+  applyEnvOverrides(cached);
 
   // Environment variable overrides (used by process-spawner / k8s-spawner)
   if (process.env.SICLAW_AGENTBOX_PORT) {
@@ -335,8 +310,8 @@ export function getEmbeddingConfig(): EmbeddingConfig | null {
     if (defaultLlm) apiKey = defaultLlm.apiKey;
   }
 
-  // If no baseUrl and no apiKey, embeddings are effectively unconfigured
-  if (!baseUrl && !apiKey) return null;
+  // baseUrl is required for embedding API calls; without it, fall back to FTS-only
+  if (!baseUrl) return null;
 
   return { baseUrl, apiKey, model, dimensions };
 }
@@ -366,7 +341,7 @@ export function validateLlmConfig(): string[] {
   if (!provider.apiKey) {
     warnings.push(
       `Provider "${defaultProviderName}" has no apiKey. ` +
-      `Set SICLAW_LLM_API_KEY or use "$VAR" syntax in settings.json.`,
+      `Set SICLAW_API_KEY env var or run \`siclaw --setup\`.`,
     );
   }
 
