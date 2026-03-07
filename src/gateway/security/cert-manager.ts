@@ -284,7 +284,9 @@ export class CertificateManager {
 
     const cert = forge.pki.createCertificate();
     cert.publicKey = publicKeyForge;
-    cert.serialNumber = forge.util.bytesToHex(forge.random.getBytesSync(16));
+    // Ensure positive serial number: clear the high bit to avoid negative ASN.1 INTEGER
+    const serialBytes = forge.random.getBytesSync(16);
+    cert.serialNumber = "00" + forge.util.bytesToHex(serialBytes);
 
     const notBefore = new Date();
     const notAfter = new Date();
