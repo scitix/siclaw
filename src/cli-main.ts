@@ -26,6 +26,7 @@ const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk
 if (forceSetup) {
   await runInteractiveSetup();
 }
+
 if (needsSetup()) {
   printSetupInstructions();
   process.exit(1);
@@ -44,9 +45,12 @@ const sessionManager = continueSession
   ? SessionManager.continueRecent(process.cwd())
   : SessionManager.create(process.cwd());
 
+// Resolve credentials directory for TUI mode
+const credentialsDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
+
 // Create session via shared factory
 const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
-  await createSiclawSession({ sessionManager, mode: "cli", brainType });
+  await createSiclawSession({ sessionManager, mode: "cli", brainType, kubeconfigRef: { credentialsDir } });
 
 // P1-1: Startup status summary
 {
@@ -64,14 +68,24 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
     } catch { /* skip */ }
   }
   const memoryActive = fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
+
+  // Count registered kubeconfig credentials
+  let kubeCreds = 0;
+  const manifestPath = path.join(credentialsDir, "manifest.json");
+  try { kubeCreds = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).filter((e: any) => e.type === "kubeconfig").length; } catch {}
+
   const parts = [
     `Siclaw v${pkg.version}`,
     `Model: ${modelName} (${providerName})`,
     `Skills: ${skillCount}`,
     memoryActive ? "Memory: active" : "Memory: off",
+    kubeCreds > 0 ? `kubectl: ${kubeCreds} credential(s)` : "kubectl: no credentials",
   ];
   if (brainType) parts.push(`Brain: ${brainType}`);
   console.log(parts.join(" | "));
+  if (kubeCreds === 0) {
+    console.log("  Tip: siclaw --credentials  to manage cluster access");
+  }
 }
 
 // Debug: subscribe to all session events and write to log file

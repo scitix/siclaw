@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "@sinclair/typebox";
@@ -7,6 +6,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "./tool-render.js";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { loadConfig } from "../core/config.js";
+import { probeKubeconfig } from "./credential-manager.js";
 
 interface CredentialListParams {
   type?: string;
@@ -22,33 +22,6 @@ interface CredentialEntry {
   reachable?: boolean;
   server_version?: string;
   probe_error?: string;
-}
-
-/** Probe a kubeconfig with `kubectl version` (3s timeout, parallel-safe). */
-function probeKubeconfig(kubeconfigPath: string): Promise<{ reachable: boolean; version?: string; error?: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      "kubectl",
-      ["version", "--output=json", `--kubeconfig=${kubeconfigPath}`, "--request-timeout=3s"],
-      { timeout: 5000 },
-      (err, stdout) => {
-        if (err) {
-          const msg = err.message?.includes("timed out")
-            ? "connection timeout"
-            : err.message?.split("\n")[0] ?? "unknown error";
-          resolve({ reachable: false, error: msg });
-          return;
-        }
-        try {
-          const info = JSON.parse(stdout);
-          const ver = info.serverVersion?.gitVersion ?? "unknown";
-          resolve({ reachable: true, version: ver });
-        } catch {
-          resolve({ reachable: true, version: "unknown" });
-        }
-      },
-    );
-  });
 }
 
 /**
