@@ -1,0 +1,23 @@
+{{- if and .Values.metrics.enabled .Values.metrics.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "siclaw.fullname" . }}-agentbox
+  namespace: {{ .Values.metrics.podMonitor.namespace | default .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "agentbox") | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      siclaw.io/app: agentbox
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.metrics.podMonitor.interval | default "15s" }}
+      scheme: http
+{{- end }}

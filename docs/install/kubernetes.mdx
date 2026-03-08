@@ -126,3 +126,118 @@ spec:
 <Note>
 WebSocket support is required for real-time investigation updates. Set appropriate proxy timeouts for long-running investigations (up to 5 minutes).
 </Note>
+
+## Metrics & Observability
+
+Siclaw exposes Prometheus metrics out of the box. The Helm chart can automatically create monitoring resources for [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator).
+
+### Endpoints
+
+| Component | Port | Path | Protocol |
+|-----------|------|------|----------|
+| Gateway | 3000 | `/metrics` | HTTP |
+| AgentBox | 9090 | `/metrics` | HTTP (dedicated sidecar port, bypasses mTLS) |
+
+### Helm Configuration
+
+```yaml
+# values.yaml
+metrics:
+  enabled: true                # master switch for all monitoring resources
+
+  serviceMonitor:
+    enabled: true              # ServiceMonitor for Gateway
+    interval: 15s
+
+  podMonitor:
+    enabled: true              # PodMonitor for AgentBox (cross-namespace discovery)
+    interval: 15s
+
+  grafanaDashboard:
+    enabled: true              # auto-import dashboard via Grafana sidecar
+
+  prometheusRule:
+    enabled: false             # opt-in: preset alert rules
+    costThresholdPerHour: 10   # USD — alert when hourly LLM cost exceeds this
+```
+
+All monitoring resources are created by default when `metrics.enabled: true` (except `prometheusRule`, which is opt-in).
+
+### Grafana Dashboard
+
+When `grafanaDashboard.enabled: true`, the chart creates a ConfigMap with the `grafana_dashboard: "1"` label. If your Grafana is deployed via [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack), the sidecar will auto-discover and import the **Siclaw Overview** dashboard.
+
+The dashboard includes five sections:
+
+- **Overview** — active sessions, WebSocket connections, prompt rate, error rate, cost, stuck sessions
+- **Cost & Tokens** — cost over time by provider, token consumption rate by type (input/output/cache)
+- **Latency** — prompt duration percentiles (p50/p95/p99), prompt rate by outcome
+- **Tools** — top 10 tool calls per minute, tool error rate by name
+- **Health** — sessions over time, WebSocket connections over time, context window usage
+
+### Alert Rules
+
+Enable with `metrics.prometheusRule.enabled: true`. Three preset alerts:
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| `SiclawSessionStuck` | >3 stuck sessions in 10 min | warning |
+| `SiclawHighErrorRate` | Prompt error rate >10% for 10 min | warning |
+| `SiclawHighCost` | Hourly LLM cost exceeds threshold | warning |
+
+### Metrics Reference
+
+<Expandable title="All Siclaw metrics (11)">
+
+**Core metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `siclaw_tokens_total` | Counter | `type`, `provider`, `model`, `user_id` | Cumulative token consumption (delta per prompt) |
+| `siclaw_cost_usd_total` | Counter | `provider`, `model`, `user_id` | Cumulative LLM cost in USD |
+| `siclaw_prompt_duration_ms` | Histogram | `provider`, `model`, `outcome` | Prompt end-to-end latency (ms) |
+| `siclaw_prompts_total` | Counter | `provider`, `model`, `outcome` | Total prompts processed |
+| `siclaw_sessions_active` | Gauge | — | Current active sessions |
+| `siclaw_tool_calls_total` | Counter | `tool_name`, `outcome` | Tool invocation count |
+| `siclaw_ws_connections` | Gauge | — | Current WebSocket connections |
+
+**Health metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `siclaw_context_tokens_used` | Gauge | `provider`, `model` | Context window tokens used |
+| `siclaw_context_tokens_limit` | Gauge | `provider`, `model` | Context window token limit |
+| `siclaw_session_stuck_total` | Counter | — | Stuck sessions detected |
+| `siclaw_session_stuck_age_ms` | Histogram | — | Duration of stuck sessions (ms) |
+
+</Expandable>
+
+### Authentication
+
+Both Gateway and AgentBox `/metrics` endpoints support optional bearer token authentication via the `SICLAW_METRICS_TOKEN` environment variable:
+
+```yaml
+gateway:
+  env:
+    SICLAW_METRICS_TOKEN: "your-secret-token"
+```
+
+When set, Prometheus must include the token in scrape config:
+
+```yaml
+# prometheus scrape config
+authorization:
+  credentials: your-secret-token
+```
+
+<Warning>
+If `SICLAW_METRICS_TOKEN` is not set, the `/metrics` endpoint is unauthenticated. A warning is logged at startup. For production deployments with sensitive data in metric labels (e.g., `user_id`), setting a token is recommended.
+</Warning>
+
+### Privacy: User ID in Metrics
+
+By default, `user_id` is included as a label on token and cost metrics for per-user cost tracking. To disable:
+
+```bash
+helm install siclaw ... --set gateway.env.SICLAW_METRICS_USER_ID=false
+```

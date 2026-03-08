@@ -14,6 +14,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: agentbox
+    siclaw.io/app: agentbox
     user: ${USER_ID}
     managed-by: siclaw-gateway
 spec:
@@ -27,8 +28,11 @@ spec:
     imagePullPolicy: Always
 
     ports:
-    - name: http
+    - name: https
       containerPort: 3000
+      protocol: TCP
+    - name: metrics
+      containerPort: 9090
       protocol: TCP
 
     env:
