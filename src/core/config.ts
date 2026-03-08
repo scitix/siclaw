@@ -17,6 +17,7 @@ import { loadMcpServersConfig } from "./mcp-client.js";
 export interface ProviderModelCompat {
   supportsDeveloperRole?: boolean;
   supportsUsageInStreaming?: boolean;
+  supportsToolUse?: boolean;
   maxTokensField?: string;
   thinkingFormat?: string;
 }
