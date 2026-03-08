@@ -30,6 +30,7 @@ import { createResourceNotifier } from "./resource-notifier.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import "../shared/metrics.js"; // side-effect: register metrics subscriber
+import { MetricsAggregator } from "./metrics-aggregator.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -211,8 +212,40 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     : undefined;
   const resourceNotifier = createResourceNotifier(agentBoxManager, agentBoxTlsOptions, localReloader);
 
+  // Create MetricsAggregator (Local mode: proxy LocalCollector; K8s mode: pull loop)
+  const isK8sMode = !(spawner instanceof LocalSpawner);
+  let metricsAggregator: MetricsAggregator;
+  if (isK8sMode) {
+    metricsAggregator = new MetricsAggregator("k8s", undefined, agentBoxManager, {
+      async fetch(endpoint: string): Promise<import("../shared/metrics-types.js").MetricsSnapshot | null> {
+        try {
+          const client = new AgentBoxClient(endpoint, 3000, agentBoxTlsOptions);
+          return await client.getJson("/api/internal/metrics-snapshot");
+        } catch {
+          return null;
+        }
+      },
+    });
+  } else {
+    const { localCollector } = await import("../shared/local-collector.js");
+    metricsAggregator = new MetricsAggregator("local", localCollector);
+  }
+  if (db) metricsAggregator.setDb(db);
+
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator);
+
+  // Wrap system.saveSection to refresh CSP cache when grafanaUrl changes
+  const origSaveSection = rpcMethods.get("system.saveSection");
+  if (origSaveSection) {
+    rpcMethods.set("system.saveSection", async (params, context) => {
+      const result = await origSaveSection(params, context);
+      if ((params as { section?: string }).section === "system") {
+        await refreshCspCache();
+      }
+      return result;
+    });
+  }
 
   // Wire skill bundle provider into LocalSpawner (getSkillBundle comes from createRpcMethods)
   if (localSpawner) {
@@ -224,6 +257,19 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     const img = await sysConfigRepo.get("system.agentboxImage");
     if (img) agentBoxManager.setSpawnerImage(img);
   }
+
+  // CSP frame-src cache for Grafana iframe embedding
+  let cachedFrameSrc: string | null = null;
+  const refreshCspCache = async () => {
+    if (!sysConfigRepo) return;
+    try {
+      const url = await sysConfigRepo.get("system.grafanaUrl");
+      cachedFrameSrc = url ? new URL(url).origin : null;
+    } catch {
+      cachedFrameSrc = null;
+    }
+  };
+  await refreshCspCache();
 
   // Auth setup — auto-generate JWT secret on first run if not provided
   const jwtSecret = await resolveJwtSecret(sysConfigRepo);
@@ -364,6 +410,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    if (cachedFrameSrc) {
+      res.setHeader("Content-Security-Policy", `frame-src 'self' ${cachedFrameSrc}`);
+    }
   };
 
   // Create mTLS middleware for internal API (certManager + serverCert initialized earlier)

@@ -9,6 +9,7 @@ import {
   sqliteTable,
   text,
   integer,
+  real,
   primaryKey,
   uniqueIndex,
 } from "drizzle-orm/sqlite-core";
@@ -392,6 +393,25 @@ export const mcpServers = sqliteTable("mcp_servers", {
   createdBy: text("created_by").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
+// ─── Session Stats ────────────────────────────────
+
+export const sessionStats = sqliteTable("session_stats", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  userId: text("user_id").notNull(),
+  provider: text("provider"),
+  model: text("model"),
+  inputTokens: integer("input_tokens").default(0),
+  outputTokens: integer("output_tokens").default(0),
+  cacheReadTokens: integer("cache_read_tokens").default(0),
+  cacheWriteTokens: integer("cache_write_tokens").default(0),
+  costUsd: real("cost_usd").default(0),
+  durationMs: integer("duration_ms").default(0),
+  promptCount: integer("prompt_count").default(0),
+  toolCallCount: integer("tool_call_count").default(0),
+  createdAt: integer("created_at").notNull(),
 });
 
 // ─── System Config ────────────────────────────────

@@ -141,6 +141,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
+   * GET /api/internal/metrics-snapshot - export metrics snapshot for Gateway pull (K8s mode)
+   */
+  addRoute("GET", "/api/internal/metrics-snapshot", async (_req, res) => {
+    const { localCollector } = await import("../shared/local-collector.js");
+    sendJson(res, 200, localCollector.exportSnapshot());
+  });
+
+  /**
    * GET /health - health check
    */
   addRoute("GET", "/health", async (_req, res) => {
@@ -313,6 +321,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       const model = managed.brain.getModel();
       emitDiagnostic({
         type: "prompt_complete",
+        sessionId: managed.id,
         prev: prevStats,
         curr: currStats,
         model,

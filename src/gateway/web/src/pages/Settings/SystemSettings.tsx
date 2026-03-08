@@ -48,6 +48,7 @@ const SECTIONS: SectionConfig[] = [
             { key: 'baseUrl', label: 'Base URL', type: 'text', placeholder: 'https://your-domain.com' },
             { key: 'platformUrl', label: 'Platform URL', type: 'text', placeholder: 'https://your-platform-url' },
             { key: 'agentboxImage', label: 'AgentBox Image', type: 'text', placeholder: 'siclaw-agentbox:latest' },
+            { key: 'grafanaUrl', label: 'Grafana URL', type: 'text', placeholder: 'https://grafana.example.com/d/siclaw/overview?kiosk' },
         ],
     },
 ];

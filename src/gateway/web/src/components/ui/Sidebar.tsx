@@ -17,6 +17,7 @@ import {
     BrainCircuit,
     KeyRound,
     Wrench,
+    BarChart3,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -262,6 +263,24 @@ export function Sidebar() {
                         </div>
                     );
                 })}
+            </div>
+
+            {/* Metrics — fixed above user footer, does not scroll */}
+            <div className="px-3 pb-2">
+                <NavLink
+                    to="/metrics"
+                    className={({ isActive }) =>
+                        cn(
+                            "flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-normal transition-all",
+                            isActive
+                                ? "bg-primary-50 text-primary-700"
+                                : "text-gray-600 hover:text-gray-900 hover:bg-gray-50"
+                        )
+                    }
+                >
+                    <BarChart3 className="w-[18px] h-[18px] stroke-[1.25]" />
+                    Metrics
+                </NavLink>
             </div>
 
             {/* User Footer */}

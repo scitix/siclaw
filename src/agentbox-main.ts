@@ -15,6 +15,7 @@ import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
 import "./shared/metrics.js"; // side-effect: register metrics subscriber
+import "./shared/local-collector.js"; // side-effect: register monitoring collector
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
