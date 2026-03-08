@@ -16,6 +16,8 @@ import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import "../shared/metrics.js"; // side-effect: register metrics subscriber
 import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
@@ -120,6 +122,23 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   // ==================== Routes ====================
+
+  /**
+   * GET /metrics - Prometheus metrics endpoint
+   */
+  addRoute("GET", "/metrics", async (req, res) => {
+    const metricsToken = process.env.SICLAW_METRICS_TOKEN;
+    if (metricsToken) {
+      const auth = req.headers.authorization;
+      if (auth !== `Bearer ${metricsToken}`) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+    }
+    const { metricsRegistry } = await import("../shared/metrics.js");
+    res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+    res.end(await metricsRegistry.metrics());
+  });
 
   /**
    * GET /health - health check
@@ -280,8 +299,28 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     // Execute prompt asynchronously; notify SSE to close on completion
     console.log(`[agentbox-http] Starting prompt for session ${managed.id}`);
+
+    // Metrics: snapshot stats before prompt for delta calculation
+    const prevStats = managed.brain.getSessionStats();
+    const promptStartTime = Date.now();
+    let promptOutcome: "completed" | "error" = "completed";
+
     const actuallyFinish = () => {
       managed._promptDone = true;
+
+      // Emit prompt metrics via diagnostic event bus
+      const currStats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
+      emitDiagnostic({
+        type: "prompt_complete",
+        prev: prevStats,
+        curr: currStats,
+        model,
+        durationMs: Date.now() - promptStartTime,
+        outcome: promptOutcome,
+        userId: sessionManager.userId,
+      });
+
       // Stop buffering
       if (managed._bufferUnsub) {
         managed._bufferUnsub();
@@ -322,9 +361,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     };
     managed.brain.prompt(promptText).then(() => {
       console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
+      promptOutcome = "completed";
       onPromptFinish();
     }).catch((err) => {
       console.error(`[agentbox-http] Prompt error for session ${managed.id}:`, err);
+      promptOutcome = "error";
       onPromptFinish();
     });
 

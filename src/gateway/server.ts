@@ -28,6 +28,8 @@ import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import { createResourceNotifier } from "./resource-notifier.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import "../shared/metrics.js"; // side-effect: register metrics subscriber
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -394,6 +396,32 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     if (url === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    // Prometheus metrics endpoint
+    if (url === "/metrics" && method === "GET") {
+      const metricsToken = process.env.SICLAW_METRICS_TOKEN;
+      if (metricsToken) {
+        const authHeader = req.headers.authorization;
+        if (authHeader !== `Bearer ${metricsToken}`) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+      }
+      (async () => {
+        try {
+          const { metricsRegistry } = await import("../shared/metrics.js");
+          const metricsBody = await metricsRegistry.metrics();
+          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+          res.end(metricsBody);
+        } catch (err) {
+          console.error("[gateway] /metrics error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      })();
       return;
     }
 
@@ -949,6 +977,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   wss.on("connection", (ws: WebSocket, auth?: AuthContext) => {
     clients.add(ws);
     aliveClients.add(ws);
+    emitDiagnostic({ type: "ws_connected" });
     ws.on("pong", () => aliveClients.add(ws));
 
     const authWs = ws as AuthenticatedWebSocket;
@@ -1012,12 +1041,14 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
         }
       }
 
+      emitDiagnostic({ type: "ws_disconnected" });
       console.log(`[gateway] WS client disconnected (total: ${clients.size})`);
     });
 
     ws.on("error", (err) => {
       console.error("[gateway] WS error:", err.message);
       clients.delete(ws);
+      emitDiagnostic({ type: "ws_disconnected" });
     });
   });
 

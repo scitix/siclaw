@@ -22,6 +22,7 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionMemory } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
 
 export interface ManagedSession {
   id: string;
@@ -237,8 +238,30 @@ export class AgentBoxSessionManager {
       _releaseTimer: null,
     };
 
+    this.sessions.set(id, managed);
+    emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // Tool execution timing (for tool_call diagnostic events)
+    const toolStartTimes = new Map<string, number>();
+
     // Track agent lifecycle state + debug logging (works with both brain types)
     result.brain.subscribe((event: any) => {
+      // Update lastActiveAt on every event (used by Phase 2 stuck detection)
+      managed!.lastActiveAt = new Date();
+
+      // Tool execution metrics
+      if (event.type === "tool_execution_start") {
+        toolStartTimes.set(event.toolName, Date.now());
+      } else if (event.type === "tool_execution_end") {
+        const startTime = toolStartTimes.get(event.toolName);
+        toolStartTimes.delete(event.toolName);
+        emitDiagnostic({
+          type: "tool_call",
+          toolName: event.toolName ?? "unknown",
+          outcome: event.isError ? "error" : "success",
+          durationMs: startTime ? Date.now() - startTime : 0,
+        });
+      }
       if (event.type === "agent_start") {
         managed!.isAgentActive = true;
       } else if (event.type === "agent_end") {
@@ -310,7 +333,6 @@ export class AgentBoxSessionManager {
       }
     });
 
-    this.sessions.set(id, managed);
     return managed;
   }
 
@@ -414,6 +436,7 @@ export class AgentBoxSessionManager {
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
       this.sessions.delete(sessionId);
+      emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
       this.onSessionRelease?.();
@@ -482,6 +505,7 @@ export class AgentBoxSessionManager {
         }
       }
       this.sessions.delete(sessionId);
+      emitDiagnostic({ type: "session_released", sessionId });
     }
   }
 
@@ -497,6 +521,9 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+    }
+    for (const [id] of this.sessions) {
+      emitDiagnostic({ type: "session_released", sessionId: id });
     }
     this.sessions.clear();
 
