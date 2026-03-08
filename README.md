@@ -36,6 +36,7 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 - **Scheduled Tasks** — Cron-based recurring jobs for routine health checks, periodic diagnostics, or any agent task — manageable via Web UI or natural language
 - **Skill System** — AI-generated diagnostic skills with automated risk-level review, supporting creation, forking, and hot-reload via Web UI or natural language — organize across core / team / personal tiers to codify your team's operational expertise into reusable, shareable runbooks
 - **Extensible** — [MCP](https://modelcontextprotocol.io) tool servers for custom data source integrations
+- **Built-in Metrics** — Zero-dependency monitoring dashboard for token usage, cost, latency, and sessions — no Prometheus required; optional Grafana iframe embedding for teams with existing observability stacks
 - **Multi-Channel Access** — Terminal TUI, Web UI, or IM bots (Slack, Discord, Telegram, Lark)
 
 ## Architecture
