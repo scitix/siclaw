@@ -17,6 +17,7 @@ import { syncAllResources } from "./agentbox/resource-sync.js";
 // Side-effect: register metrics subscriber. Also imported in http-server.ts,
 // but ESM guarantees single module evaluation — the subscriber registers only once.
 import "./shared/metrics.js";
+import "./shared/local-collector.js"; // side-effect: register monitoring collector
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {

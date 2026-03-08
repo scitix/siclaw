@@ -39,6 +39,8 @@ import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import type { ResourceNotifier } from "../shared/resource-sync.js";
+import { sql } from "drizzle-orm";
+import type { MetricsAggregator } from "./metrics-aggregator.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -64,6 +66,7 @@ export function createRpcMethods(
   activePromptUsers?: Set<string>,
   agentBoxTlsOptions?: AgentBoxTlsOptions,
   resourceNotifier?: ResourceNotifier,
+  metricsAggregator?: MetricsAggregator,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
@@ -3602,7 +3605,7 @@ export function createRpcMethods(
 
     const ALLOWED_SECTIONS: Record<string, string[]> = {
       sso: ["sso.enabled", "sso.issuer", "sso.clientId", "sso.clientSecret", "sso.redirectUri"],
-      system: ["system.baseUrl", "system.platformUrl", "system.agentboxImage"],
+      system: ["system.baseUrl", "system.platformUrl", "system.agentboxImage", "system.grafanaUrl"],
     };
 
     const allowedKeys = ALLOWED_SECTIONS[section];
@@ -3644,6 +3647,107 @@ export function createRpcMethods(
       }
     }
   }
+
+  // ── Monitoring Dashboard ──
+
+  methods.set("metrics.timeseries", async (params, context: RpcContext) => {
+    requireAuth(context);
+    if (!metricsAggregator) return { buckets: [], snapshot: { activeSessions: 0, wsConnections: 0 }, topTools: [] };
+
+    const range = (params.range as string) || "1h";
+    if (range !== "1h" && range !== "6h" && range !== "24h") {
+      throw new Error("Invalid range: must be 1h, 6h, or 24h");
+    }
+
+    const buckets = metricsAggregator.query(range).map((b) => ({
+      timestamp: b.timestamp,
+      tokensInput: b.tokensInput,
+      tokensOutput: b.tokensOutput,
+      tokensCacheRead: b.tokensCacheRead,
+      tokensCacheWrite: b.tokensCacheWrite,
+      costUsd: b.costUsd,
+      promptCount: b.promptCount,
+      promptErrors: b.promptErrors,
+      promptDurationAvg:
+        b.promptCount + b.promptErrors > 0
+          ? b.promptDurationSum / (b.promptCount + b.promptErrors)
+          : 0,
+      promptDurationMax: b.promptDurationMax,
+      activeSessions: b.activeSessions,
+      wsConnections: b.wsConnections,
+      toolCalls: b.toolCalls,
+      toolErrors: b.toolErrors,
+    }));
+
+    return {
+      buckets,
+      snapshot: metricsAggregator.snapshot(),
+      topTools: metricsAggregator.topTools(10),
+    };
+  });
+
+  methods.set("metrics.summary", async (params, context: RpcContext) => {
+    requireAuth(context);
+    if (!db) return { totalTokens: 0, totalCostUsd: 0, totalPrompts: 0, totalSessions: 0, byModel: [] };
+
+    const period = (params.period as string) || "today";
+    const now = new Date();
+    let cutoffMs: number;
+    if (period === "7d") {
+      cutoffMs = now.getTime() - 7 * 86_400_000;
+    } else if (period === "30d") {
+      cutoffMs = now.getTime() - 30 * 86_400_000;
+    } else {
+      // "today" — UTC start of day
+      cutoffMs = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).getTime();
+    }
+
+    const sdb = db as any;
+    const rows = sdb.all(sql.raw(
+      `SELECT
+        provider,
+        model,
+        COUNT(*) as session_count,
+        SUM(input_tokens + output_tokens) as total_tokens,
+        SUM(cost_usd) as total_cost,
+        SUM(prompt_count) as total_prompts
+      FROM session_stats
+      WHERE created_at >= ${cutoffMs}
+      GROUP BY provider, model
+      ORDER BY total_tokens DESC`
+    ));
+
+    let totalTokens = 0;
+    let totalCostUsd = 0;
+    let totalPrompts = 0;
+    let totalSessions = 0;
+    const byModel: Array<{ provider: string; model: string; tokens: number; costUsd: number; percentage: number }> = [];
+
+    for (const row of rows) {
+      const tokens = Number(row.total_tokens) || 0;
+      const cost = Number(row.total_cost) || 0;
+      const prompts = Number(row.total_prompts) || 0;
+      const sessions = Number(row.session_count) || 0;
+      totalTokens += tokens;
+      totalCostUsd += cost;
+      totalPrompts += prompts;
+      totalSessions += sessions;
+      byModel.push({
+        provider: row.provider || "unknown",
+        model: row.model || "unknown",
+        tokens,
+        costUsd: cost,
+        percentage: 0, // filled below
+      });
+    }
+
+    // Calculate percentages
+    for (const entry of byModel) {
+      entry.percentage = totalTokens > 0 ? Math.round((entry.tokens / totalTokens) * 100) : 0;
+    }
+
+    return { totalTokens, totalCostUsd, totalPrompts, totalSessions, byModel };
+  });
 
   return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };
 }

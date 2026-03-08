@@ -18,6 +18,7 @@ export type DiagnosticEvent =
   // Prompt lifecycle
   | {
       type: "prompt_complete";
+      sessionId: string;
       prev: BrainSessionStats;
       curr: BrainSessionStats;
       model: BrainModelInfo | undefined;
@@ -27,7 +28,14 @@ export type DiagnosticEvent =
     }
   // Session lifecycle
   | { type: "session_created"; sessionId: string }
-  | { type: "session_released"; sessionId: string }
+  | {
+      type: "session_released";
+      sessionId: string;
+      stats: BrainSessionStats;
+      userId?: string;
+      model?: BrainModelInfo;
+      createdAt: number;
+    }
   // Tool execution
   | {
       type: "tool_call";

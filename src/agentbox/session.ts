@@ -443,8 +443,17 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
+      const stats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({ type: "session_released", sessionId });
+      emitDiagnostic({
+        type: "session_released",
+        sessionId,
+        stats,
+        userId: this.userId,
+        model,
+        createdAt: managed.createdAt.getTime(),
+      });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
       this.onSessionRelease?.();
@@ -512,8 +521,17 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] Memory sync on close failed:`, err);
         }
       }
+      const stats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({ type: "session_released", sessionId });
+      emitDiagnostic({
+        type: "session_released",
+        sessionId,
+        stats,
+        userId: this.userId,
+        model,
+        createdAt: managed.createdAt.getTime(),
+      });
     }
   }
 
@@ -533,7 +551,16 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
-      emitDiagnostic({ type: "session_released", sessionId: id });
+      const stats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
+      emitDiagnostic({
+        type: "session_released",
+        sessionId: id,
+        stats,
+        userId: this.userId,
+        model,
+        createdAt: managed.createdAt.getTime(),
+      });
     }
 
     // Close shared memory indexer
