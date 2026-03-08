@@ -924,22 +924,20 @@ export function createRpcMethods(
       };
     }
 
-    // Fallback: read local file (CLI / no-DB mode)
-    const mcpConfigPath = path.resolve(process.cwd(), "config", "mcp-servers.json");
+    // Fallback: read from settings.json mcpServers (CLI / no-DB mode)
     try {
-      const raw = fs.readFileSync(mcpConfigPath, "utf-8");
-      const config = JSON.parse(raw) as {
-        mcpServers: Record<string, { url?: string; command?: string; transport?: string }>;
-      };
+      const { loadConfig } = await import("../core/config.js");
+      const config = loadConfig();
       const servers: Array<Record<string, unknown>> = [];
       for (const [name, serverConfig] of Object.entries(config.mcpServers ?? {})) {
+        const cfg = serverConfig as { url?: string; command?: string; transport?: string };
         servers.push({
           id: name,
           name,
-          url: serverConfig.url,
-          transport: serverConfig.transport ?? (serverConfig.url ? "streamable-http" : "stdio"),
+          url: cfg.url,
+          transport: cfg.transport ?? (cfg.url ? "streamable-http" : "stdio"),
           enabled: true,
-          source: "file",
+          source: "settings",
         });
       }
       return { servers };
