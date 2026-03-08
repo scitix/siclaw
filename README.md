@@ -11,7 +11,9 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Slack](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white)](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
+[Website](https://www.siclaw.ai) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
 </div>
 
@@ -60,17 +62,17 @@ Siclaw supports three deployment profiles. Pick the one that fits your use case.
 Run the agent directly in your terminal. No server, no database. All operations are read-only by default — safe to run on your workstation.
 
 ```bash
-# Install
-npm install siclaw
+# Install globally
+npm install -g siclaw
 
 # Run (interactive — prompts for LLM provider on first launch)
-npx siclaw
+siclaw
 
 # Single-shot
-npx siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
+siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
 
 # Continue last session
-npx siclaw --continue
+siclaw --continue
 ```
 
 <details>
@@ -96,10 +98,10 @@ siclaw --prompt "..."    # single-shot mode
 A lightweight web UI backed by SQLite. No MySQL, no Docker required — just start the server and configure everything in the browser. Siclaw enforces strict read-only access by default (command whitelist, no write operations without approval), so you can safely deploy it on your own workstation without worrying about unintended changes to your clusters.
 
 ```bash
-npm install siclaw
+npm install -g siclaw
 
 # Start the server (SQLite database is created automatically)
-npx siclaw local
+siclaw local
 
 # Open http://localhost:3000
 # Login: admin / admin (default credentials)
@@ -128,7 +130,7 @@ The server uses SQLite by default and auto-generates a JWT secret on first run. 
 Full multi-user deployment with isolated AgentBox pods, SSO, and IM channels. Just prepare a MySQL database and deploy with Helm:
 
 ```bash
-helm upgrade --install siclaw ./helm/siclaw \
+helm install siclaw oci://scitix/siclaw/helm/siclaw \
   --namespace siclaw --create-namespace \
   --set database.url="mysql://user:pass@host:3306/siclaw"
 ```
@@ -258,10 +260,9 @@ Configure a Lark bot in **Settings > Channels** of the web UI. You'll need:
 
 ## Community
 
+- [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw) — Chat with the team and other users
 - [GitHub Issues](https://github.com/scitix/siclaw/issues) — Bug reports and feature requests
 - [GitHub Discussions](https://github.com/scitix/siclaw/discussions) — Questions, ideas, and general discussion
-
-<!-- TODO: Add Discord invite link once server is created -->
 
 ## Contributing
 
