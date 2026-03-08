@@ -20,6 +20,8 @@ import {
   rdmaTroubleshootingPriority,
 } from "./sre-knowledge.js";
 import { formatResult, formatSummary } from "./format.js";
+import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA, ROOT_CAUSE_CATEGORIES } from "./schemas.js";
+import { extractJSON } from "./sub-agent.js";
 
 // ─── types.ts ───
 
@@ -125,7 +127,7 @@ describe("prompts", () => {
     expect(prompt).toContain("test question");
     expect(prompt).toContain("some context");
     expect(prompt).toContain("3");
-    expect(prompt).toContain("hypotheses");
+    expect(prompt).toContain("submit_hypotheses");
   });
 
   it("hypothesisGenerationPrompt injects skills and troubleshooting priority", () => {
@@ -185,11 +187,14 @@ describe("prompts", () => {
     expect(prompt).not.toContain("avoid redundant work");
   });
 
-  it("conclusionPrompt includes question and hypotheses summary", () => {
+  it("conclusionPrompt includes question, hypotheses summary, and tool instruction", () => {
     const prompt = conclusionPrompt("Why crashed?", "H1: OOM - validated\nH2: Network - invalidated");
     expect(prompt).toContain("Why crashed?");
     expect(prompt).toContain("H1: OOM - validated");
-    expect(prompt).toContain("remediation");
+    expect(prompt).toContain("submit_conclusion");
+    expect(prompt).toContain("remediation_steps");
+    expect(prompt).not.toContain("STRUCTURED_EXTRACTION_START");
+    expect(prompt).not.toContain("STRUCTURED_EXTRACTION_END");
   });
 
   it("forceVerdictPrompt requires structured output and prohibits tool_call XML", () => {
@@ -423,5 +428,65 @@ describe("formatSummary", () => {
     const full = formatResult(result);
     const summary = formatSummary(result, "/tmp/report.md");
     expect(summary.length).toBeLessThan(full.length);
+  });
+});
+
+// ─── schemas.ts ───
+
+describe("schemas", () => {
+  it("HYPOTHESES_SCHEMA has required array", () => {
+    expect(HYPOTHESES_SCHEMA.required).toContain("hypotheses");
+    expect(HYPOTHESES_SCHEMA.properties.hypotheses.items.required).toContain("text");
+    expect(HYPOTHESES_SCHEMA.properties.hypotheses.items.required).toContain("confidence");
+    expect(HYPOTHESES_SCHEMA.properties.hypotheses.items.required).toContain("suggestedTools");
+  });
+
+  it("CONCLUSION_SCHEMA has required fields", () => {
+    expect(CONCLUSION_SCHEMA.required).toContain("conclusion_text");
+    expect(CONCLUSION_SCHEMA.required).toContain("root_cause_category");
+    expect(CONCLUSION_SCHEMA.required).toContain("confidence");
+  });
+
+  it("CONCLUSION_SCHEMA includes remediation_steps", () => {
+    expect(CONCLUSION_SCHEMA.properties.remediation_steps).toBeDefined();
+    expect(CONCLUSION_SCHEMA.properties.remediation_steps.type).toBe("array");
+  });
+
+  it("ROOT_CAUSE_CATEGORIES is non-empty and includes common categories", () => {
+    expect(ROOT_CAUSE_CATEGORIES.length).toBeGreaterThan(0);
+    expect(ROOT_CAUSE_CATEGORIES).toContain("mtu_mismatch");
+    expect(ROOT_CAUSE_CATEGORIES).toContain("unknown");
+  });
+
+  it("CONCLUSION_SCHEMA root_cause_category enum matches ROOT_CAUSE_CATEGORIES", () => {
+    expect(CONCLUSION_SCHEMA.properties.root_cause_category.enum).toEqual([...ROOT_CAUSE_CATEGORIES]);
+  });
+});
+
+// ─── extractJSON ───
+
+describe("extractJSON", () => {
+  it("parses pure JSON string", () => {
+    const json = '{"hypotheses":[{"text":"test","confidence":50,"suggestedTools":[]}]}';
+    expect(extractJSON(json)).toBe(json);
+  });
+
+  it("extracts JSON from fenced code block", () => {
+    const text = 'Some text\n```json\n{"key":"value"}\n```\nMore text';
+    expect(extractJSON(text)).toBe('{"key":"value"}');
+  });
+
+  it("extracts JSON from balanced braces in mixed text", () => {
+    const text = 'Here is the result: {"root_cause":"mtu_mismatch","confidence":85} end of response';
+    expect(extractJSON(text)).toBe('{"root_cause":"mtu_mismatch","confidence":85}');
+  });
+
+  it("returns null for text without JSON", () => {
+    expect(extractJSON("No JSON here at all")).toBeNull();
+  });
+
+  it("handles strings with escaped quotes inside JSON", () => {
+    const json = '{"text":"He said \\"hello\\""}';
+    expect(extractJSON(json)).toBe(json);
   });
 });

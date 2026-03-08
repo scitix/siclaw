@@ -1,4 +1,4 @@
-import { runSubAgent, llmComplete, type SubAgentOptions, type ProgressCallback, type ProgressEvent } from "./sub-agent.js";
+import { runSubAgent, llmComplete, llmCompleteWithTool, extractJSON, type SubAgentOptions, type ProgressCallback, type ProgressEvent } from "./sub-agent.js";
 import {
   contextGatheringPrompt,
   hypothesisGenerationPrompt,
@@ -27,6 +27,7 @@ import {
   TRACE_HEAD_CHARS,
   TRACE_TAIL_CHARS,
 } from "./types.js";
+import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA } from "./schemas.js";
 
 interface RawHypothesis {
   text: string;
@@ -42,6 +43,7 @@ interface ConclusionResult {
     environment_tags: string[];
     causal_chain: string[];
     confidence: number;
+    remediation_steps?: string[];
   };
 }
 
@@ -186,75 +188,8 @@ async function writeInvestigationToMemory(
 }
 
 /**
- * Extract JSON from LLM output using multi-layer fallback:
- * 1. Direct JSON.parse
- * 2. Fenced code block (```json ... ```)
- * 3. Balanced brace matching (first complete top-level object)
- */
-function extractJSON(text: string): string | null {
-  // 1. Direct parse — LLM sometimes returns pure JSON
-  try {
-    JSON.parse(text);
-    return text;
-  } catch {
-    // continue to next strategy
-  }
-
-  // 2. Fenced code block
-  const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  if (fenceMatch) {
-    try {
-      JSON.parse(fenceMatch[1]);
-      return fenceMatch[1];
-    } catch {
-      // fence content wasn't valid JSON, continue
-    }
-  }
-
-  // 3. Balanced brace extraction — find first complete top-level { ... }
-  const start = text.indexOf("{");
-  if (start >= 0) {
-    let depth = 0;
-    let inString = false;
-    let escape = false;
-    for (let i = start; i < text.length; i++) {
-      const ch = text[i];
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (ch === "\\" && inString) {
-        escape = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) continue;
-      if (ch === "{") depth++;
-      else if (ch === "}") {
-        depth--;
-        if (depth === 0) {
-          const candidate = text.slice(start, i + 1);
-          try {
-            JSON.parse(candidate);
-            return candidate;
-          } catch {
-            // Balanced braces but not valid JSON, give up
-            return null;
-          }
-        }
-      }
-    }
-  }
-
-  return null;
-}
-
-/**
- * Phase 2: Generate hypotheses using a single LLM call (no tools).
- * Includes robust JSON extraction and a single retry on parse failure.
+ * Phase 2: Generate hypotheses using LLM function calling (tool_use).
+ * Falls back to extractJSON if the provider doesn't support tool_use.
  */
 async function generateHypotheses(
   question: string,
@@ -265,46 +200,33 @@ async function generateHypotheses(
   relatedInvestigations?: string,
 ): Promise<RawHypothesis[]> {
   const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses, relatedInvestigations);
-  const fallback: RawHypothesis[] = [{ text: "Failed to parse hypotheses JSON", confidence: 0, suggestedTools: [] }];
+  const fallback: RawHypothesis[] = [{ text: "Failed to parse hypotheses", confidence: 0, suggestedTools: [] }];
 
-  const MAX_RETRIES = 1;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    let text: string;
-    try {
-      // Only forward onProgress on first attempt to avoid duplicate spinner events
-      text = await llmComplete(undefined, prompt, options, attempt === 0 ? onProgress : undefined);
-    } catch (err) {
-      if (attempt < MAX_RETRIES) continue;
-      const msg = err instanceof Error ? err.message : String(err);
-      return [{ text: `Hypothesis generation failed: ${msg}`, confidence: 0, suggestedTools: [] }];
-    }
+  try {
+    const { toolArgs } = await llmCompleteWithTool<{ hypotheses: RawHypothesis[] }>(
+      undefined,
+      prompt,
+      "submit_hypotheses",
+      "Submit ranked hypotheses for validation",
+      HYPOTHESES_SCHEMA,
+      options,
+      onProgress,
+    );
 
-    const jsonStr = extractJSON(text);
-    if (!jsonStr) {
-      if (attempt < MAX_RETRIES) continue;
-      return fallback;
-    }
+    if (!toolArgs) return fallback;
 
-    try {
-      const parsed = JSON.parse(jsonStr);
-      // Accept both { hypotheses: [...] } and bare array [...]
-      const hypotheses: RawHypothesis[] | null = Array.isArray(parsed.hypotheses)
-        ? parsed.hypotheses
-        : Array.isArray(parsed)
-          ? parsed
-          : null;
-      if (!hypotheses?.length || !hypotheses[0].text) {
-        if (attempt < MAX_RETRIES) continue;
-        return fallback;
-      }
-      return hypotheses.slice(0, maxHypotheses);
-    } catch {
-      if (attempt < MAX_RETRIES) continue;
-      return fallback;
-    }
+    // Accept both { hypotheses: [...] } and bare array [...]
+    const hypotheses: RawHypothesis[] | null = Array.isArray(toolArgs.hypotheses)
+      ? toolArgs.hypotheses
+      : Array.isArray(toolArgs)
+        ? (toolArgs as unknown as RawHypothesis[])
+        : null;
+    if (!hypotheses?.length || !hypotheses[0].text) return fallback;
+    return hypotheses.slice(0, maxHypotheses);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return [{ text: `Hypothesis generation failed: ${msg}`, confidence: 0, suggestedTools: [] }];
   }
-
-  return fallback; // unreachable, but satisfies TS
 }
 
 /**
@@ -349,9 +271,21 @@ function parseConclusionOutput(raw: string): ConclusionResult {
   }
 }
 
+/** TypeScript interface matching CONCLUSION_SCHEMA. */
+interface ConclusionToolArgs {
+  conclusion_text: string;
+  root_cause_category: string;
+  affected_entities?: string[];
+  environment_tags?: string[];
+  causal_chain?: string[];
+  confidence: number;
+  remediation_steps?: string[];
+}
+
 /**
- * Phase 4: Generate final conclusion using a single LLM call (no tools).
+ * Phase 4: Generate final conclusion using LLM function calling (tool_use).
  * Returns both human-readable text and optional structured extraction.
+ * Falls back to parseConclusionOutput() for providers without tool_use support.
  */
 async function generateConclusion(
   question: string,
@@ -370,8 +304,31 @@ async function generateConclusion(
   const prompt = conclusionPrompt(question, hypothesesSummary);
   // No onProgress here — Phase 4 conclusion text should NOT leak into spinner
   try {
-    const raw = await llmComplete(undefined, prompt, options);
-    return parseConclusionOutput(raw);
+    const { toolArgs, textContent } = await llmCompleteWithTool<ConclusionToolArgs>(
+      undefined,
+      prompt,
+      "submit_conclusion",
+      "Submit the final investigation conclusion with structured metadata",
+      CONCLUSION_SCHEMA,
+      options,
+    );
+
+    if (toolArgs) {
+      return {
+        text: toolArgs.conclusion_text,
+        structured: {
+          root_cause_category: toolArgs.root_cause_category ?? "unknown",
+          affected_entities: Array.isArray(toolArgs.affected_entities) ? toolArgs.affected_entities : [],
+          environment_tags: Array.isArray(toolArgs.environment_tags) ? toolArgs.environment_tags : [],
+          causal_chain: Array.isArray(toolArgs.causal_chain) ? toolArgs.causal_chain : [],
+          confidence: typeof toolArgs.confidence === "number" ? toolArgs.confidence : 0,
+          remediation_steps: Array.isArray(toolArgs.remediation_steps) ? toolArgs.remediation_steps : undefined,
+        },
+      };
+    }
+
+    // Fallback: marker-based parsing (for providers that returned text instead of tool_calls)
+    return parseConclusionOutput(textContent);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { text: `Conclusion generation failed: ${msg}` };
@@ -705,6 +662,7 @@ export async function investigate(
         causalChain: conclusionResult.structured.causal_chain,
         confidence: conclusionResult.structured.confidence,
         conclusion: conclusionResult.text,
+        remediationSteps: conclusionResult.structured.remediation_steps,
         durationMs: totalDurationMs,
         totalToolCalls: globalCallsUsed,
         hypotheses: hypotheses.map((h) => ({

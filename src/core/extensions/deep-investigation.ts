@@ -86,12 +86,12 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
     const confMatch = raw.match(/(\d+)\s*%/);
     // Strip markdown bold markers and leading/trailing punctuation like : —
     let title = raw.replace(/\*\*/g, "").replace(/(\d+)\s*%/, "").replace(/[()]/g, "").trim();
-    title = title.replace(/^[:\s—\-–]+/, "").replace(/[:\s—\-–]+$/, "").trim();
+    title = title.replace(/^[:：\s—\-–]+/, "").replace(/[:：\s—\-–]+$/, "").trim();
     return { title, confidence: confMatch ? parseInt(confMatch[1], 10) : undefined };
   }
 
-  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 / ## Hypothesis N
-  const headerPattern = /^#{2,3}\s*(?:Hypothesis|H)\s*\d[^:\n]*[:\s]*(.*)/gim;
+  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 (supports CJK)
+  const headerPattern = /^#{2,3}\s*(?:Hypothesis|假设|假說|H)\s*\d[^:：\n]*[:：\s]*(.*)/gim;
   let m: RegExpExecArray | null;
   while ((m = headerPattern.exec(text)) !== null) {
     const titleLine = m[1]?.trim();
@@ -107,8 +107,8 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
   }
   if (results.length > 0) return results;
 
-  // Strategy 3: Bold-prefixed — **Hypothesis 1**: ... / **H1**: ...
-  const boldPattern = /^\*\*(?:Hypothesis|H)\s*\d[^*]*\*\*[:\s]*(.*)/gim;
+  // Strategy 3: Bold-prefixed — **Hypothesis 1**: ... (supports CJK)
+  const boldPattern = /^\*\*(?:Hypothesis|假设|假說|H)\s*\d[^*]*\*\*[:：\s]*(.*)/gim;
   while ((m = boldPattern.exec(text)) !== null) {
     const line = m[1]?.trim();
     if (line) results.push(extract(line));
@@ -152,6 +152,7 @@ function formatHypothesesWidget(text: string, theme: any): string[] {
 export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- Mode state ---
   let checklist: DpChecklist | null = null;
+  let pendingActivation = false;
 
   // --- Progress rendering state ---
   let activeUI: ExtensionUIContext | null = null;
@@ -198,6 +199,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     updateStatus(ctx);
     persistState();
     if (ctx.hasUI) ctx.ui.notify("\uD83D\uDD0D Deep Investigation ON \u2014 Ctrl+I or /dp to exit");
+    pendingActivation = true;
   }
 
   function disableDpMode(ctx: ExtensionContext): void {
@@ -206,6 +208,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     updateStatus(ctx);
     persistState();
     if (ctx.hasUI) ctx.ui.notify("Deep Investigation OFF");
+    pendingActivation = false;
   }
 
   function toggleDpMode(ctx: ExtensionContext): void {
@@ -390,14 +393,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     },
   });
 
-  // --- propose_hypotheses tool: user interaction (simplified, no handshake) ---
+  // --- propose_hypotheses tool: interactive user review ---
 
   api.registerTool({
     name: "propose_hypotheses",
     label: "Propose Hypotheses",
     description:
-      "Present hypotheses to the user as a structured UI card. " +
-      "Use this to communicate your investigation thinking and align direction before committing to deep_search. " +
+      "Present hypotheses to the user as an interactive review card. " +
+      "The tool BLOCKS until the user makes a decision (proceed / adjust / skip). " +
+      "Use this to align investigation direction before committing to deep_search. " +
       "Works both inside and outside Deep Investigation mode. " +
       "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.",
     parameters: Type.Object({
@@ -407,7 +411,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
           "description, validation method (skill script paths), and confidence percentage.",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const isDpMode = checklist !== null;
 
       const { hypotheses: hypothesesText } = params as { hypotheses: string };
@@ -415,14 +419,48 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       const hasTUI = ctx.hasUI && isThemeUsable(ctx);
 
       if (hasTUI) {
-        // TUI mode: render formatted hypotheses as a persistent widget above editor
+        // Render hypotheses widget above editor
         const widgetLines = formatHypothesesWidget(hypothesesText, ctx.ui.theme);
         ctx.ui.setWidget("dp-hypotheses", widgetLines);
 
-        // Auto-dismiss widget after a short delay (non-blocking)
-        setTimeout(() => ctx.ui.setWidget("dp-hypotheses", undefined), 5000);
+        // Block until user reviews and decides
+        const choice = await ctx.ui.select(
+          "Review Hypotheses",
+          [
+            "Proceed to deep search",
+            "Adjust hypotheses",
+            "Skip to conclusion",
+          ],
+          { signal },
+        );
+
+        if (choice === "Adjust hypotheses") {
+          const feedback = await ctx.ui.input(
+            "What should be adjusted?",
+            "e.g., focus on #1 and #3, add a new hypothesis...",
+            { signal },
+          );
+          return {
+            content: [{ type: "text" as const, text: `User wants adjustments: ${feedback ?? "(no details)"}. Revise hypotheses and call propose_hypotheses again.` }],
+            details: { hypotheses: hypothesesText, userChoice: "adjust", feedback },
+          };
+        }
+
+        if (choice === "Skip to conclusion") {
+          return {
+            content: [{ type: "text" as const, text: "User chose to skip deep search. Present conclusion based on current findings." }],
+            details: { hypotheses: hypothesesText, userChoice: "skip" },
+          };
+        }
+
+        // "Proceed to deep search" or dismissed (undefined)
+        return {
+          content: [{ type: "text" as const, text: "User approved hypotheses. Proceed with deep_search to validate them." }],
+          details: { hypotheses: hypothesesText, userChoice: "proceed" },
+        };
       }
 
+      // Non-TUI mode (web UI, RPC): no interactive dialog
       const responseText = isDpMode
         ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."
         : "Hypotheses presented to user. Decide whether to proceed based on user engagement.";
@@ -432,6 +470,26 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
         details: { hypotheses: hypothesesText },
       };
     },
+  });
+
+  // --- input: inject DP workflow when activated via Ctrl+I or /dp (no args) ---
+
+  api.on("input", async (event, _ctx) => {
+    if (!pendingActivation) return { action: "continue" as const };
+    // Don't intercept if already has DP markers
+    if (event.text.startsWith("[Deep Investigation]") || event.text.startsWith("[DP_EXIT]")) {
+      return { action: "continue" as const };
+    }
+    pendingActivation = false;
+    // Directly build activation message (don't rely on handler chaining)
+    const question = event.text.trim();
+    if (!question) return { action: "continue" as const };
+    if (checklist) checklist.question = question;
+    persistState();
+    return {
+      action: "transform" as const,
+      text: buildActivationMessage(question),
+    };
   });
 
   // --- input: detect [Deep Investigation] marker from web UI toggle ---
@@ -531,6 +589,10 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
   // --- tool_call: progress rendering setup (no auto-mark) ---
 
   api.on("tool_call", (event, ctx) => {
+    // Clear hypotheses widget when model proceeds to next tool
+    if (event.toolName !== "propose_hypotheses") {
+      ctx.ui.setWidget("dp-hypotheses", undefined);
+    }
     // Set up progress rendering for deep_search regardless of DP mode
     if (event.toolName === "deep_search") {
       activeUI = ctx.ui;

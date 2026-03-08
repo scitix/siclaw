@@ -31,6 +31,7 @@ export interface InvestigationRecord {
   causalChain: string[];
   confidence: number;
   conclusion: string;
+  remediationSteps?: string[];
   durationMs: number;
   totalToolCalls: number;
   hypotheses: Array<{ id: string; text: string; status: string; confidence: number }>;
