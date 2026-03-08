@@ -67,6 +67,7 @@
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",
+    "@types/express": "^5.0.6",
     "@types/js-yaml": "^4.0.9",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.19.8",
