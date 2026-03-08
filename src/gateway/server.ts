@@ -1047,8 +1047,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
     ws.on("error", (err) => {
       console.error("[gateway] WS error:", err.message);
+      // Note: do NOT emit ws_disconnected here — the "close" event always
+      // fires after "error" and handles the decrement + cleanup.
       clients.delete(ws);
-      emitDiagnostic({ type: "ws_disconnected" });
     });
   });
 
@@ -1061,6 +1062,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     console.log(`[gateway] Listening on http://${config.host}:${config.port}`);
     console.log(`[gateway] Web UI: http://${config.host}:${config.port}/`);
     console.log(`[gateway] WebSocket: ws://${config.host}:${config.port}/ws`);
+    if (!process.env.SICLAW_METRICS_TOKEN) {
+      console.warn(`[gateway] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated`);
+    }
   });
 
   // HTTPS server for internal mTLS API (AgentBox connections)

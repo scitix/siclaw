@@ -241,8 +241,14 @@ export class AgentBoxSessionManager {
     this.sessions.set(id, managed);
     emitDiagnostic({ type: "session_created", sessionId: id });
 
-    // Tool execution timing (for tool_call diagnostic events)
-    const toolStartTimes = new Map<string, number>();
+    // Tool execution timing (for tool_call diagnostic events).
+    // NOTE: tool_execution_start/end events depend on the brain implementation.
+    // claude-sdk brain emits them reliably; pi-agent brain depends on the SDK's
+    // event stream — if these events aren't emitted, tool metrics will be zero
+    // for those sessions (best-effort, no incorrect data).
+    // Key by toolCallId (unique per invocation) to avoid concurrent same-name tool overwrites.
+    const toolStartTimes = new Map<string, { name: string; startMs: number }>();
+    let toolCallSeq = 0;
 
     // Track agent lifecycle state + debug logging (works with both brain types)
     result.brain.subscribe((event: any) => {
@@ -251,15 +257,17 @@ export class AgentBoxSessionManager {
 
       // Tool execution metrics
       if (event.type === "tool_execution_start") {
-        toolStartTimes.set(event.toolName, Date.now());
+        const callId = event.toolCallId ?? `seq-${++toolCallSeq}`;
+        toolStartTimes.set(callId, { name: event.toolName, startMs: Date.now() });
       } else if (event.type === "tool_execution_end") {
-        const startTime = toolStartTimes.get(event.toolName);
-        toolStartTimes.delete(event.toolName);
+        const callId = event.toolCallId ?? `seq-${toolCallSeq}`;
+        const entry = toolStartTimes.get(callId);
+        toolStartTimes.delete(callId);
         emitDiagnostic({
           type: "tool_call",
-          toolName: event.toolName ?? "unknown",
+          toolName: event.toolName ?? entry?.name ?? "unknown",
           outcome: event.isError ? "error" : "success",
-          durationMs: startTime ? Date.now() - startTime : 0,
+          durationMs: entry ? Date.now() - entry.startMs : 0,
         });
       }
       if (event.type === "agent_start") {
@@ -515,17 +523,18 @@ export class AgentBoxSessionManager {
    */
   async closeAll(): Promise<void> {
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
-    // Cancel all pending release timers, then clear
-    for (const managed of this.sessions.values()) {
+    // Snapshot and clear the map atomically — prevents in-flight release()
+    // from emitting a duplicate session_released for the same session.
+    const snapshot = new Map(this.sessions);
+    this.sessions.clear();
+
+    for (const [id, managed] of snapshot) {
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
-    }
-    for (const [id] of this.sessions) {
       emitDiagnostic({ type: "session_released", sessionId: id });
     }
-    this.sessions.clear();
 
     // Close shared memory indexer
     if (this._sharedMemoryIndexer) {
