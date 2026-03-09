@@ -21,7 +21,7 @@ import {
   createEmptyBucket,
 } from "../shared/metrics-types.js";
 import type { Database } from "./db/index.js";
-import { sessionStats } from "./db/schema-sqlite.js";
+import { sessionStats } from "./db/schema.js";
 
 const MAX_BUCKETS = 1440;
 
@@ -61,12 +61,10 @@ export class MetricsAggregator {
       if (event.type === "ws_connected") this.wsConnections++;
       if (event.type === "ws_disconnected") this.wsConnections = Math.max(0, this.wsConnections - 1);
 
-      // Local mode: consume session stats on release
+      // Local mode: consume session stats on release (fire-and-forget)
       if (mode === "local" && event.type === "session_released" && this.localRef && this.db) {
         const records = this.localRef.drainSessionStats();
-        for (const record of records) {
-          this.writeSessionStats(record);
-        }
+        void Promise.all(records.map((r) => this.writeSessionStats(r)));
       }
     });
 
@@ -162,12 +160,12 @@ export class MetricsAggregator {
 
     for (const result of results) {
       if (result.status === "fulfilled" && result.value) {
-        this.mergeSnapshot(result.value);
+        await this.mergeSnapshot(result.value);
       }
     }
   }
 
-  private mergeSnapshot(snapshot: MetricsSnapshot): void {
+  private async mergeSnapshot(snapshot: MetricsSnapshot): Promise<void> {
     // Merge buckets
     for (const bucket of snapshot.buckets) {
       const existing = this.ringBuffer.get(bucket.timestamp);
@@ -211,17 +209,16 @@ export class MetricsAggregator {
 
     // Write session stats to DB
     for (const record of snapshot.sessionStats) {
-      this.writeSessionStats(record);
+      await this.writeSessionStats(record);
     }
   }
 
   // ── DB write ──
 
-  private writeSessionStats(record: SessionStatsRecord): void {
+  private async writeSessionStats(record: SessionStatsRecord): Promise<void> {
     if (!this.db) return;
     try {
-      const sdb = this.db as any;
-      sdb.insert(sessionStats).values({
+      await this.db.insert(sessionStats).values({
         id: crypto.randomUUID(),
         sessionId: record.sessionId,
         userId: record.userId,
@@ -236,7 +233,7 @@ export class MetricsAggregator {
         promptCount: record.promptCount,
         toolCallCount: record.toolCallCount,
         createdAt: record.createdAt,
-      }).run();
+      });
     } catch (err) {
       console.warn("[metrics-aggregator] Failed to write session_stats:", err);
     }

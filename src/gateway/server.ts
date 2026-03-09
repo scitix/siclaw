@@ -49,7 +49,7 @@ const MIME_TYPES: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-function serveStatic(res: http.ServerResponse, urlPath: string): void {
+function serveStatic(res: http.ServerResponse, urlPath: string, frameSrc?: string | null): void {
   const withoutQuery = urlPath.split("?")[0];
   const safePath = path.normalize(withoutQuery).replace(/^(\.\.(\/|\\|$))+/, "");
   let filePath = path.join(WEB_DIR, safePath === "/" ? "index.html" : safePath);
@@ -79,7 +79,11 @@ function serveStatic(res: http.ServerResponse, urlPath: string): void {
   const ext = path.extname(filePath);
   const contentType = MIME_TYPES[ext] ?? "application/octet-stream";
   const content = fs.readFileSync(filePath);
-  res.writeHead(200, { "Content-Type": contentType });
+  const headers: Record<string, string> = { "Content-Type": contentType };
+  if (frameSrc && contentType.startsWith("text/html")) {
+    headers["Content-Security-Policy"] = `frame-src 'self' ${frameSrc}`;
+  }
+  res.writeHead(200, headers);
   res.end(content);
 }
 
@@ -407,9 +411,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    if (cachedFrameSrc) {
-      res.setHeader("Content-Security-Policy", `frame-src 'self' ${cachedFrameSrc}`);
-    }
   };
 
   // Create mTLS middleware for internal API (certManager + serverCert initialized earlier)
@@ -971,7 +972,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     }
 
     // Serve static web UI
-    serveStatic(res, url);
+    serveStatic(res, url, cachedFrameSrc);
   });
 
   // WebSocket server

@@ -39,7 +39,8 @@ import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import type { ResourceNotifier } from "../shared/resource-sync.js";
-import { sql } from "drizzle-orm";
+import { sql, gte, sum, count } from "drizzle-orm";
+import { sessionStats } from "./db/schema.js";
 import type { MetricsAggregator } from "./metrics-aggregator.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
@@ -3703,20 +3704,18 @@ export function createRpcMethods(
       cutoffMs = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).getTime();
     }
 
-    const sdb = db as any;
-    const rows = sdb.all(sql.raw(
-      `SELECT
-        provider,
-        model,
-        COUNT(*) as session_count,
-        SUM(input_tokens + output_tokens) as total_tokens,
-        SUM(cost_usd) as total_cost,
-        SUM(prompt_count) as total_prompts
-      FROM session_stats
-      WHERE created_at >= ${cutoffMs}
-      GROUP BY provider, model
-      ORDER BY total_tokens DESC`
-    ));
+    const rows = await db.select({
+      provider: sessionStats.provider,
+      model: sessionStats.model,
+      session_count: count(),
+      total_tokens: sum(sql`${sessionStats.inputTokens} + ${sessionStats.outputTokens}`),
+      total_cost: sum(sessionStats.costUsd),
+      total_prompts: sum(sessionStats.promptCount),
+    })
+      .from(sessionStats)
+      .where(gte(sessionStats.createdAt, cutoffMs))
+      .groupBy(sessionStats.provider, sessionStats.model)
+      .orderBy(sql`total_tokens DESC`);
 
     let totalTokens = 0;
     let totalCostUsd = 0;

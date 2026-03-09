@@ -131,7 +131,7 @@ class LocalCollector {
         }
 
         // Per-session counter (best-effort — tool_call has no sessionId)
-        // Tools run within a prompt, so increment the most recently active session.
+        // Increments the first session in Map iteration order (insertion order).
         // In practice each AgentBox has one active session at a time.
         for (const sc of this.perSessionCounters.values()) {
           sc.tools++;
@@ -254,6 +254,7 @@ class LocalCollector {
 
     // Tool call deltas: export current totals, then reset for next interval
     const toolCallDeltas = this.topTools(Infinity);
+    this.toolCallMap.clear();
 
     const sessionStats = this.sessionStatsQueue.splice(0);
 
