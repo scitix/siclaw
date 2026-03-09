@@ -1,0 +1,16 @@
+{{- if and .Values.metrics.enabled .Values.metrics.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "siclaw.fullname" . }}-grafana-dashboard
+  namespace: {{ .Values.metrics.grafanaDashboard.namespace | default .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    grafana_dashboard: "1"
+    {{- with .Values.metrics.grafanaDashboard.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  siclaw-overview.json: |-
+    {{- .Files.Get "dashboards/siclaw-overview.json" | nindent 4 }}
+{{- end }}

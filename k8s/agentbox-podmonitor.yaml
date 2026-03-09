@@ -1,0 +1,28 @@
+# PodMonitor for AgentBox metrics (raw manifest for non-Helm deployments).
+# If using Helm, use helm/siclaw/templates/agentbox-podmonitor.yaml instead.
+# Do NOT deploy both — this will result in duplicate scrape targets.
+#
+# Deployed in the monitoring namespace (same as Prometheus).
+# Discovers AgentBox Pods across ALL namespaces via namespaceSelector.any.
+#
+# Prerequisites:
+# 1. Prometheus podMonitorNamespaceSelector must allow this namespace
+#    (verify: kubectl get prometheus -n monitoring -o yaml | grep -A3 "podMonitor")
+# 2. AgentBox Pods must have label siclaw.io/app: agentbox
+# 3. AgentBox Pods must declare containerPort name: metrics (port 9090)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: siclaw-agentbox
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      siclaw.io/app: agentbox
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scheme: http

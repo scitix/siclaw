@@ -209,7 +209,10 @@ export class K8sSpawner implements BoxSpawner {
             name: "agentbox",
             image,
             imagePullPolicy,
-            ports: [{ containerPort: 3000, name: "http" }],
+            ports: [
+              { containerPort: 3000, name: "https" },
+              { containerPort: 9090, name: "metrics" },
+            ],
             env,
             volumeMounts: [
               {

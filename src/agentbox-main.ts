@@ -7,12 +7,16 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import http from "node:http";
 import https from "node:https";
 import { createHttpServer } from "./agentbox/http-server.js";
 import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
+// Side-effect: register metrics subscriber. Also imported in http-server.ts,
+// but ESM guarantees single module evaluation — the subscriber registers only once.
+import "./shared/metrics.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -80,11 +84,52 @@ async function main() {
     console.log(`[agentbox] Health check: ${protocol}://localhost:${PORT}/health`);
   });
 
-  // Graceful shutdown
+  // In K8s mode (HTTPS / mTLS), the main port requires Gateway client certs.
+  // Prometheus cannot present those certs, so we start a separate plain HTTP
+  // server on port 9090 that serves only /metrics.
+  let metricsServer: http.Server | null = null;
+  if (server instanceof https.Server) {
+    const metricsPort = parseInt(process.env.SICLAW_METRICS_PORT || "9090", 10);
+    const { checkMetricsAuth } = await import("./shared/metrics.js");
+
+    metricsServer = http.createServer(async (req, res) => {
+      if (req.method === "GET" && req.url === "/metrics") {
+        if (!checkMetricsAuth(req, res)) return;
+        try {
+          const { metricsRegistry } = await import("./shared/metrics.js");
+          const body = await metricsRegistry.metrics();
+          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+          res.end(body);
+        } catch (err) {
+          console.error("[agentbox] /metrics error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+    });
+
+    metricsServer.on("error", (err) => {
+      console.error("[agentbox] Metrics server error:", err);
+    });
+
+    metricsServer.listen(metricsPort, () => {
+      console.log(`[agentbox] Metrics HTTP server listening on port ${metricsPort} (Prometheus scrape target)`);
+      if (!process.env.SICLAW_METRICS_TOKEN) {
+        console.warn("[agentbox] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated");
+      }
+    });
+  }
+
+  // Graceful shutdown — close metrics server last so Prometheus can scrape
+  // the final state before the pod terminates.
   const shutdown = async () => {
     console.log("[agentbox] Shutting down...");
     await sessionManager.closeAll();
     server.close();
+    if (metricsServer) metricsServer.close();
     process.exit(0);
   };
 

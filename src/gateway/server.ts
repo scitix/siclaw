@@ -28,6 +28,8 @@ import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import { createResourceNotifier } from "./resource-notifier.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -394,6 +396,24 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     if (url === "/api/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    // Prometheus metrics endpoint
+    if (url === "/metrics" && method === "GET") {
+      if (!checkMetricsAuth(req, res)) return;
+      (async () => {
+        try {
+          const { metricsRegistry } = await import("../shared/metrics.js");
+          const metricsBody = await metricsRegistry.metrics();
+          res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
+          res.end(metricsBody);
+        } catch (err) {
+          console.error("[gateway] /metrics error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      })();
       return;
     }
 
@@ -949,6 +969,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   wss.on("connection", (ws: WebSocket, auth?: AuthContext) => {
     clients.add(ws);
     aliveClients.add(ws);
+    emitDiagnostic({ type: "ws_connected" });
     ws.on("pong", () => aliveClients.add(ws));
 
     const authWs = ws as AuthenticatedWebSocket;
@@ -1012,11 +1033,14 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
         }
       }
 
+      emitDiagnostic({ type: "ws_disconnected" });
       console.log(`[gateway] WS client disconnected (total: ${clients.size})`);
     });
 
     ws.on("error", (err) => {
       console.error("[gateway] WS error:", err.message);
+      // Note: do NOT emit ws_disconnected here — the "close" event always
+      // fires after "error" and handles the decrement + cleanup.
       clients.delete(ws);
     });
   });
@@ -1030,6 +1054,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     console.log(`[gateway] Listening on http://${config.host}:${config.port}`);
     console.log(`[gateway] Web UI: http://${config.host}:${config.port}/`);
     console.log(`[gateway] WebSocket: ws://${config.host}:${config.port}/ws`);
+    if (!process.env.SICLAW_METRICS_TOKEN) {
+      console.warn(`[gateway] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated`);
+    }
   });
 
   // HTTPS server for internal mTLS API (AgentBox connections)

@@ -1,0 +1,43 @@
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "siclaw.fullname" . }}
+  namespace: {{ .Values.metrics.prometheusRule.namespace | default .Values.namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: siclaw
+      rules:
+        - alert: SiclawSessionStuck
+          expr: increase(siclaw_session_stuck_total[10m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Siclaw sessions are getting stuck"
+            description: "More than 3 stuck sessions detected in the last 10 minutes."
+        - alert: SiclawHighErrorRate
+          expr: >
+            sum(rate(siclaw_prompts_total{outcome="error"}[5m]))
+            / sum(rate(siclaw_prompts_total[5m])) > 0.1
+            and sum(rate(siclaw_prompts_total[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Siclaw prompt error rate is above 10%"
+            description: "More than 10% of prompts have been failing for the last 10 minutes."
+        - alert: SiclawHighCost
+          expr: sum(rate(siclaw_cost_usd_total[1h])) * 3600 > {{ .Values.metrics.prometheusRule.costThresholdPerHour | default 10 }}
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Siclaw LLM cost exceeds threshold"
+            description: "Hourly LLM cost exceeds ${{ .Values.metrics.prometheusRule.costThresholdPerHour | default 10 }}/hour."
+{{- end }}

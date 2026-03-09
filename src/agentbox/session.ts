@@ -22,6 +22,7 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionMemory } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
 
 export interface ManagedSession {
   id: string;
@@ -237,8 +238,38 @@ export class AgentBoxSessionManager {
       _releaseTimer: null,
     };
 
+    this.sessions.set(id, managed);
+    emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // Tool execution timing (for tool_call diagnostic events).
+    // NOTE: tool_execution_start/end events depend on the brain implementation.
+    // claude-sdk brain emits them reliably; pi-agent brain depends on the SDK's
+    // event stream — if these events aren't emitted, tool metrics will be zero
+    // for those sessions (best-effort, no incorrect data).
+    // Key by toolCallId (unique per invocation) to avoid concurrent same-name tool overwrites.
+    const toolStartTimes = new Map<string, { name: string; startMs: number }>();
+    let toolCallSeq = 0;
+
     // Track agent lifecycle state + debug logging (works with both brain types)
     result.brain.subscribe((event: any) => {
+      // Update lastActiveAt on every event (used by Phase 2 stuck detection)
+      managed!.lastActiveAt = new Date();
+
+      // Tool execution metrics
+      if (event.type === "tool_execution_start") {
+        const callId = event.toolCallId ?? `seq-${++toolCallSeq}`;
+        toolStartTimes.set(callId, { name: event.toolName, startMs: Date.now() });
+      } else if (event.type === "tool_execution_end") {
+        const callId = event.toolCallId ?? `seq-${toolCallSeq}`;
+        const entry = toolStartTimes.get(callId);
+        toolStartTimes.delete(callId);
+        emitDiagnostic({
+          type: "tool_call",
+          toolName: event.toolName ?? entry?.name ?? "unknown",
+          outcome: event.isError ? "error" : "success",
+          durationMs: entry ? Date.now() - entry.startMs : 0,
+        });
+      }
       if (event.type === "agent_start") {
         managed!.isAgentActive = true;
       } else if (event.type === "agent_end") {
@@ -310,7 +341,6 @@ export class AgentBoxSessionManager {
       }
     });
 
-    this.sessions.set(id, managed);
     return managed;
   }
 
@@ -414,6 +444,7 @@ export class AgentBoxSessionManager {
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
       this.sessions.delete(sessionId);
+      emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
       this.onSessionRelease?.();
@@ -482,6 +513,7 @@ export class AgentBoxSessionManager {
         }
       }
       this.sessions.delete(sessionId);
+      emitDiagnostic({ type: "session_released", sessionId });
     }
   }
 
@@ -491,14 +523,18 @@ export class AgentBoxSessionManager {
    */
   async closeAll(): Promise<void> {
     console.log(`[agentbox-session] Closing all sessions (${this.sessions.size})`);
-    // Cancel all pending release timers, then clear
-    for (const managed of this.sessions.values()) {
+    // Snapshot and clear the map atomically — prevents in-flight release()
+    // from emitting a duplicate session_released for the same session.
+    const snapshot = new Map(this.sessions);
+    this.sessions.clear();
+
+    for (const [id, managed] of snapshot) {
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      emitDiagnostic({ type: "session_released", sessionId: id });
     }
-    this.sessions.clear();
 
     // Close shared memory indexer
     if (this._sharedMemoryIndexer) {

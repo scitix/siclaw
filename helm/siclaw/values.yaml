@@ -51,3 +51,35 @@ database:
   existingSecret:
     name: ""
     key: "database-url"
+
+# -- Metrics & Observability
+metrics:
+  enabled: true
+
+  # ServiceMonitor for Gateway (Prometheus Operator)
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    namespace: ""             # defaults to .Values.namespace
+    namespaceSelector: {}     # override to { any: true } for cross-namespace
+    additionalLabels: {}
+
+  # PodMonitor for AgentBox pods (Prometheus Operator)
+  podMonitor:
+    enabled: true
+    interval: 15s
+    namespace: ""             # defaults to .Values.namespace; set to "monitoring" for cross-namespace
+    additionalLabels: {}
+
+  # Grafana dashboard (auto-imported via sidecar with grafana_dashboard: "1" label)
+  grafanaDashboard:
+    enabled: true
+    namespace: ""             # defaults to .Values.namespace
+    additionalLabels: {}
+
+  # PrometheusRule alert rules
+  prometheusRule:
+    enabled: false            # opt-in — enable for production
+    namespace: ""             # defaults to .Values.namespace
+    additionalLabels: {}
+    costThresholdPerHour: 10  # USD — alert when hourly cost exceeds this
