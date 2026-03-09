@@ -107,22 +107,41 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 
 ## 3. Shell Security Model
 
-**Invariant**: The shell security system is **whitelist-only**, not blacklist-based. A command must be explicitly listed in `ALLOWED_COMMANDS` to execute. When in doubt, it is blocked.
+> **Full specification**: `docs/design/security.md` — read it before modifying execution tools,
+> Dockerfile, or K8s manifests.
 
-### 3.1 The 4-Pass Validation Pipeline
+**Invariant**: AgentBox security is **defense-in-depth with 6 independent layers**. The primary
+defense for credential protection is OS-level user isolation (dual-user + setgid kubectl).
+Application-level command validation is a secondary defense layer.
 
-Every command through `bash`, `node_exec`, `pod_exec`, or `pod_nsenter_exec` passes all 4 passes:
+### 3.1 OS-Level User Isolation (Primary Defense)
+
+Child processes run as `sandbox` user (via `runuser`), which cannot read credential files.
+The `kubectl` binary has setgid `kubecred` group, allowing it to read kubeconfig while other
+commands cannot. See ADR-010 and `docs/design/security.md` §3 for full design.
 
 ```
-Pass 1 — Shell Operators    Block: $(), backticks, <(), >(), file redirections
-Pass 2 — Binary Allowlist   Only ALLOWED_COMMANDS set can execute
-Pass 3 — kubectl Subcommands Read-only only: get, describe, logs, top, events, ...
-Pass 4 — Per-Command Flags  ~25 commands have flag-level restrictions
+agentbox user  → Main Node.js process, owns credentials
+sandbox user   → All child processes, no credential access
+kubectl setgid → kubecred group membership, reads kubeconfig only
 ```
 
-**Source**: `src/tools/command-sets.ts` (1146 lines)
+### 3.2 The 6-Pass Validation Pipeline (Secondary Defense)
 
-### 3.2 Explicitly Excluded Binaries
+Every command through `bash`, `node_exec`, `pod_exec`, or `pod_nsenter_exec` passes all 6 passes:
+
+```
+Pass 1 — Shell Operators      Block: $(), backticks, <(), >(), redirections, newlines
+Pass 2 — Pipeline Extraction   Pipe-position tracking (| vs && vs ||)
+Pass 3 — Binary Whitelist      Context-based: local | node | pod | nsenter | ssh
+Pass 4 — Pipeline Validators   kubectl subcommand + exec checks
+Pass 5 — COMMAND_RULES         Per-command: pipeOnly, noFilePaths, blockedFlags, allowedFlags
+Pass 6 — Sensitive Paths       Block commands targeting credential/config file paths
+```
+
+**Source**: `src/tools/command-validator.ts`, `src/tools/command-sets.ts`
+
+### 3.3 Explicitly Excluded Binaries
 
 These are **intentionally NOT in the allowlist** despite being common:
 
@@ -135,7 +154,7 @@ These are **intentionally NOT in the allowlist** despite being common:
 | `wget` | File download with write, recursive crawl |
 | `bash`/`sh` (direct) | Unrestricted shell — the restricted-bash tool wraps it with validation |
 
-### 3.3 kubectl Hard Restrictions
+### 3.4 kubectl Hard Restrictions
 
 Allowed subcommands (read-only):
 ```
@@ -145,9 +164,9 @@ cluster-info, config, version, explain, auth, exec
 
 **All write operations are permanently blocked**: `apply`, `create`, `delete`, `patch`, `scale`, `drain`, `cordon`, `edit`, `replace`, `label`, `taint`, `rollout undo`.
 
-`kubectl exec` commands pass through the binary allowlist (Pass 2) for the exec'd command.
+`kubectl exec` commands pass through the binary allowlist (Pass 3) for the exec'd command.
 
-### 3.4 Skill Script Exemption
+### 3.5 Skill Script Exemption
 
 Skill scripts (`skills/` directory) are **exempt from the binary allowlist** for `run_skill`. The path is verified via `fs.realpathSync()` to block symlink traversal. This is the only way to run otherwise-blocked binaries in a controlled manner — via the skill review gate.
 

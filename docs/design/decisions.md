@@ -261,3 +261,46 @@ Unchanged:
 - ⚠️ AgentBox must successfully fetch settings from Gateway before creating sessions — if Gateway is unreachable, AgentBox has no LLM config (this was already the case)
 
 **Revisit when**: A legitimate use case requires env-var-based config delivery to AgentBox (e.g., sidecar injection patterns that cannot use HTTP).
+
+---
+
+## ADR-010: Dual-User OS Isolation for AgentBox Child Processes
+
+**Status**: Accepted
+
+**Context**:
+The LLM agent executes shell commands inside the AgentBox container via `restricted-bash.ts`. Previously, child processes ran as the same `agentbox` user as the main Node.js process, meaning they could read kubeconfig files, mTLS certificates, and config files.
+
+A real incident demonstrated the vulnerability: the agent used `kubectl get pods | cut -c1-2000 ~/.siclaw/credentials/kubeconfig` to read credentials via a text-processing command after a pipe. Application-level fixes (pipeOnly rules, noFilePaths checks, blockedFlags) were implemented but cannot enumerate all bypass techniques — the attack surface is fundamentally too large for application-level-only defense.
+
+Options considered:
+- **Application-level only**: COMMAND_RULES with pipeOnly, noFilePaths, blockedFlags. Implemented but insufficient as primary defense (whack-a-mole against creative command combinations).
+- **kubectl proxy**: Main process runs `kubectl proxy`, child processes use HTTP. But `kubectl exec` requires direct API connection (not proxy-able), so this is incomplete.
+- **Separate kubectl tool**: Move kubectl out of bash into a dedicated tool. Breaks natural pipeline syntax (`kubectl get pods | grep Error`).
+- **Dual-user + setgid kubectl**: Run child processes as `sandbox` user; kubectl binary gets setgid `kubecred` group for kubeconfig access. Preserves pipeline syntax, provides OS-level isolation.
+
+**Decision**:
+Adopt dual-user model with setgid kubectl:
+- Main process runs as `agentbox` (UID 1000, groups: agentbox + kubecred)
+- Child processes run as `sandbox` (UID 1001, group: sandbox) via `runuser -u sandbox`
+- kubectl binary has setgid bit for `kubecred` group (`chmod 2755`, `chgrp kubecred`)
+- Kubeconfig files: `agentbox:kubecred 0640` (readable by agentbox and kubectl, not by sandbox)
+- Other credentials: `agentbox:agentbox 0600` (readable only by agentbox)
+
+Container requires `CAP_SETUID` + `CAP_SETGID` capabilities (all others dropped).
+
+Application-level command validation (COMMAND_RULES, whitelist, shell operator blocking) is retained as defense-in-depth, not as primary credential protection.
+
+**Consequences**:
+- ✅ Credential files are OS-protected — no application-level bypass possible for file reads
+- ✅ Pipeline syntax preserved: `kubectl get pods | grep Error` works naturally
+- ✅ Application-level rules become secondary defense, not sole defense
+- ✅ `sanitizeEnv()` still needed (env vars are in-memory, not file-based)
+- ⚠️ Container needs `CAP_SETUID` + `CAP_SETGID` — all other capabilities dropped
+- ⚠️ `allowPrivilegeEscalation` must be true for setgid to work (but no SUID binaries exist)
+- ⚠️ Node.js process compromise (agentbox user) still grants kubeconfig access — mitigate with K8s RBAC scope
+- ❌ Adds ~2ms overhead per command execution (runuser fork)
+
+**Full design**: `docs/design/security.md`
+
+**Revisit when**: Container runtime supports rootless user namespace mapping natively (e.g., Kubernetes UserNamespacesSupport GA), which would eliminate the need for CAP_SETUID.

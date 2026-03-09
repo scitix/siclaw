@@ -34,9 +34,11 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 
 `buildSkillBundle()` packages **only team + personal skills** (never core skills). Core skills are baked into the Docker image / repo checkout. Calling `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle.
 
-### 🔴 Shell Security: Whitelist-Only
+### 🔴 Shell Security: Defense-in-Depth
 
-The security model is whitelist-only (not blacklist). A binary must be explicitly listed in `ALLOWED_COMMANDS` (`src/tools/command-sets.ts`) to execute. `sed`, `awk`, `nc`, `wget` are **intentionally excluded**. kubectl is **read-only** (13 safe subcommands; all write ops permanently blocked).
+> Full spec: `docs/design/security.md` — read it before touching execution tools, Dockerfile, or K8s manifests.
+
+Primary defense: **OS-level user isolation** — child processes run as `sandbox` user (cannot read credentials); `kubectl` has setgid `kubecred` group (ADR-010). Secondary defense: **whitelist-only command validation** — binaries must be in `ALLOWED_COMMANDS` (`src/tools/command-sets.ts`). `sed`, `awk`, `nc`, `wget` are **intentionally excluded**. kubectl is **read-only** (13 safe subcommands; all write ops permanently blocked).
 
 ### 🔴 sql.js: Single-Process Lock
 
@@ -84,7 +86,7 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 **Before approving any PR, verify:**
 
 1. **Deployment mode awareness**: Does the change respect local vs K8s isolation? If it touches resource sync, skills materialization, or filesystem writes, re-read `docs/design/invariants.md §1-2`
-2. **Security model intact**: No new shell execution paths that bypass `command-sets.ts`. No weakening of the 4-pass pipeline. Skill scripts still go through review gate.
+2. **Security model intact**: No new shell execution paths that bypass `command-sets.ts`. No weakening of the 6-pass pipeline. OS user isolation preserved (ADR-010). Skill scripts still go through review gate. Read `docs/design/security.md` for full model.
 3. **PR description complete**: Must have Problem + Solution (not just diff summary). See `CONTRIBUTING.md` for format.
 4. **TypeScript conventions**: ESM-only (`.js` imports), strict mode, named exports, no default exports in barrels.
 5. **Both brain types**: Tool changes must work with both pi-agent (TypeBox) and claude-sdk (MCP/Zod) if applicable.
@@ -114,9 +116,11 @@ Agent Core
   src/core/brains/pi-agent-brain.ts
   src/core/brains/claude-sdk-brain.ts
 
-Security (read before touching)
-  src/tools/command-sets.ts    4-pass validation + ALLOWED_COMMANDS (1146 lines)
-  src/tools/restricted-bash.ts Shell tool using command-sets
+Security (read docs/design/security.md before touching)
+  src/tools/command-sets.ts    ALLOWED_COMMANDS + COMMAND_RULES + context categories
+  src/tools/command-validator.ts  6-pass validation pipeline
+  src/tools/restricted-bash.ts Shell tool (runuser sandbox + command validation)
+  src/tools/sanitize-env.ts    Environment variable sanitization
   src/gateway/skills/script-evaluator.ts  Skill script security review
 
 Resource Sync (read before touching)
@@ -167,12 +171,14 @@ DB (memory):  node:sqlite + FTS5
 **When starting a session as reviewer:**
 1. This file is already loaded (you're reading it)
 2. For architecture-sensitive PRs, load `docs/design/invariants.md`
-3. For roadmap/planning work, load `docs/design/roadmap.md`
-4. For "why was X designed this way", load `docs/design/decisions.md`
+3. For security-sensitive PRs (execution tools, Dockerfile, K8s manifests), load `docs/design/security.md`
+4. For roadmap/planning work, load `docs/design/roadmap.md`
+5. For "why was X designed this way", load `docs/design/decisions.md`
 
 **When starting a session as developer:**
 1. Check `docs/design/roadmap.md` for current phase priorities
 2. Before touching resource sync or skills: re-read invariants §1-3
-3. New architectural decisions should get an ADR in `docs/design/decisions.md`
+3. Before touching execution tools or container config: re-read `docs/design/security.md`
+4. New architectural decisions should get an ADR in `docs/design/decisions.md`
 
 **PR comments are posted via `gh` CLI as the authenticated GitHub user.**

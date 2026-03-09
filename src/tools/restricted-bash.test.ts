@@ -11,6 +11,7 @@ import {
   validateIpInPipeline,
   ALLOWED_BINARIES,
 } from "./restricted-bash.js";
+import { extractPipeline } from "./command-validator.js";
 
 describe("extractCommands", () => {
   it("splits pipe", () => {
@@ -70,6 +71,67 @@ describe("extractCommands", () => {
       "kubectl exec pod-a -- ib_write_bw & sleep 2 && kubectl exec pod-b -- ib_write_bw 10.0.0.1"
     );
     expect(cmds.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("extractPipeline", () => {
+  it("marks commands after | as piped", () => {
+    const result = extractPipeline("kubectl get pods | grep Error");
+    expect(result).toEqual([
+      { command: "kubectl get pods", piped: false },
+      { command: "grep Error", piped: true },
+    ]);
+  });
+
+  it("marks commands after && as not piped", () => {
+    const result = extractPipeline("sleep 2 && grep pattern file");
+    expect(result).toEqual([
+      { command: "sleep 2", piped: false },
+      { command: "grep pattern file", piped: false },
+    ]);
+  });
+
+  it("marks commands after || as not piped", () => {
+    const result = extractPipeline("cmd1 || grep fallback");
+    expect(result).toEqual([
+      { command: "cmd1", piped: false },
+      { command: "grep fallback", piped: false },
+    ]);
+  });
+
+  it("marks commands after ; as not piped", () => {
+    const result = extractPipeline("echo done; cut -f1 file");
+    expect(result).toEqual([
+      { command: "echo done", piped: false },
+      { command: "cut -f1 file", piped: false },
+    ]);
+  });
+
+  it("handles mixed operators", () => {
+    const result = extractPipeline("cmd1 | cmd2 && cmd3 | cmd4");
+    expect(result).toEqual([
+      { command: "cmd1", piped: false },
+      { command: "cmd2", piped: true },
+      { command: "cmd3", piped: false },
+      { command: "cmd4", piped: true },
+    ]);
+  });
+
+  it("handles triple pipe chain", () => {
+    const result = extractPipeline("kubectl get pods -A | grep error | wc -l");
+    expect(result).toEqual([
+      { command: "kubectl get pods -A", piped: false },
+      { command: "grep error", piped: true },
+      { command: "wc -l", piped: true },
+    ]);
+  });
+
+  it("handles >&2 fd duplication (not a separator)", () => {
+    const result = extractPipeline("echo error >&2 | grep error");
+    expect(result).toEqual([
+      { command: "echo error >&2", piped: false },
+      { command: "grep error", piped: true },
+    ]);
   });
 });
 
@@ -1088,4 +1150,117 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
     expect(result.content[0].text).toContain("disallowed command");
     expect((result.details as any).blocked).toBe(true);
   });
+});
+
+describe("createRestrictedBashTool — pipe-only text command enforcement", () => {
+  const tool = createRestrictedBashTool();
+
+  // Blocked: text commands used standalone (can read files directly)
+  const blockedStandalone = [
+    { cmd: "grep -r '' /app/.siclaw", bin: "grep" },
+    { cmd: "cut -c1-2000 /home/agentbox/.siclaw/credentials/kubeconfig", bin: "cut" },
+    { cmd: "head -n 100 /etc/siclaw/certs/tls.key", bin: "head" },
+    { cmd: "tail -f /var/log/syslog", bin: "tail" },
+    { cmd: "sort /etc/passwd", bin: "sort" },
+    { cmd: "wc -l /proc/self/environ", bin: "wc" },
+    { cmd: "jq . /app/.siclaw/config/settings.json", bin: "jq" },
+    { cmd: "uniq /some/file", bin: "uniq" },
+    { cmd: "column -t /etc/fstab", bin: "column" },
+    { cmd: "yq . /app/config.yaml", bin: "yq" },
+  ];
+
+  for (const { cmd, bin } of blockedStandalone) {
+    it(`blocks standalone: ${cmd}`, async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: cmd },
+        undefined,
+        {} as any
+      );
+      expect(result.content[0].text).toContain("can only be used after a pipe");
+      expect(result.content[0].text).toContain(bin);
+      expect((result.details as any).blocked).toBe(true);
+    });
+  }
+
+  // Blocked: text commands after && or ; (not piped)
+  it("blocks grep after && (not a pipe)", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "true && grep -r '' /app/.siclaw" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("can only be used after a pipe");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("blocks cut after ; (not a pipe)", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "echo done; cut -c1-2000 /etc/passwd" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("can only be used after a pipe");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  // Allowed: text commands after pipe |
+  const allowedPiped = [
+    "kubectl get pods -A | grep Running",
+    "kubectl get pods -o json | jq '.items[]'",
+    "kubectl get pods -A | grep -i error | wc -l",
+    "kubectl logs my-pod | tail -100",
+    "kubectl get nodes -o json | jq . | sort",
+    "echo test | cut -f1 -d,",
+    "echo 'hello world' | tr ' ' '\\n'",
+    "kubectl top pods | head -5",
+    "kubectl get pods -A | sort | uniq -c",
+    "echo 'a,b,c' | column -t -s,",
+    "kubectl get pods | grep Error | wc -l",
+    "echo test | grep test",
+  ];
+
+  for (const cmd of allowedPiped) {
+    it(`allows piped: ${cmd}`, async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: cmd },
+        undefined,
+        {} as any
+      );
+      expect(result.content[0].text).not.toContain("can only be used after a pipe");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+  }
+
+  // Blocked: piped text commands with file path arguments (bypass attempt)
+  const blockedPipedWithFiles = [
+    { cmd: "kubectl get pods | grep -rl '' /app/.siclaw", reason: "recursive" },
+    { cmd: "echo x | grep -rn pattern /etc/", reason: "recursive" },
+    { cmd: "echo x | grep -R secret /app/", reason: "recursive" },
+    { cmd: "echo x | grep --recursive pattern /var/", reason: "recursive" },
+    { cmd: "echo x | cut -c1-2000 /home/agentbox/.siclaw/credentials/kubeconfig", reason: "file path" },
+    { cmd: "echo x | head -n5 /etc/siclaw/certs/tls.key", reason: "file path" },
+    { cmd: "echo x | tail -100 /var/log/syslog", reason: "file path" },
+    { cmd: "echo x | sort /etc/passwd", reason: "file path" },
+    { cmd: "echo x | jq . /app/.siclaw/config/settings.json", reason: "file path" },
+    { cmd: "echo x | wc -l ./secret.txt", reason: "file path" },
+    { cmd: "echo x | head -n1 ../../../etc/passwd", reason: "file path" },
+    { cmd: "echo x | cut -f1 ~/credentials.txt", reason: "file path" },
+    { cmd: "echo x | grep -inR '' /app/.siclaw", reason: "recursive" },
+  ];
+
+  for (const { cmd, reason } of blockedPipedWithFiles) {
+    it(`blocks piped with ${reason}: ${cmd}`, async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: cmd },
+        undefined,
+        {} as any
+      );
+      expect((result.details as any).blocked).toBe(true);
+    });
+  }
 });

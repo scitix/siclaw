@@ -100,6 +100,86 @@ export function extractCommands(input: string): string[] {
   return commands;
 }
 
+// ── extractPipeline (pipe-position-aware command extraction) ──────────
+
+export interface PipelineSegment {
+  command: string;
+  /** true if this command was preceded by a pipe operator | (not ||) */
+  piped: boolean;
+}
+
+/**
+ * Extract individual commands from a shell pipeline, tracking whether each
+ * command follows a pipe (|) operator vs other separators (&&, ||, ;, &).
+ * Used by validateCommand to pass pipe position to COMMAND_RULES (pipeOnly).
+ */
+export function extractPipeline(input: string): PipelineSegment[] {
+  const segments: PipelineSegment[] = [];
+  let current = "";
+  let inQuote: string | null = null;
+  let parenDepth = 0;
+  let nextIsPiped = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+
+    if (inQuote) {
+      current += ch;
+      if (ch === inQuote && input[i - 1] !== "\\") {
+        inQuote = null;
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inQuote = ch;
+      current += ch;
+      continue;
+    }
+
+    if (ch === "(") { parenDepth++; current += ch; continue; }
+    if (ch === ")") { parenDepth--; current += ch; continue; }
+
+    if (parenDepth === 0) {
+      // Check for || and &&
+      if (
+        (ch === "&" && input[i + 1] === "&") ||
+        (ch === "|" && input[i + 1] === "|")
+      ) {
+        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        current = "";
+        nextIsPiped = false; // || and && are not pipes
+        i++; // skip next char
+        continue;
+      }
+      // Skip & when preceded by > (fd redirection like >&2, 2>&1)
+      if (ch === "&" && current.length > 0 && current[current.length - 1] === ">") {
+        current += ch;
+        continue;
+      }
+      // Single | — next command receives piped input
+      if (ch === "|") {
+        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        current = "";
+        nextIsPiped = true;
+        continue;
+      }
+      // & or ; — not pipes
+      if (ch === "&" || ch === ";") {
+        if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+        current = "";
+        nextIsPiped = false;
+        continue;
+      }
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) segments.push({ command: current.trim(), piped: nextIsPiped });
+  return segments;
+}
+
 // ── validateShellOperators (moved from restricted-bash.ts) ───────────
 
 /**
@@ -222,18 +302,26 @@ export function getContextCommands(context: ExecContext): ReadonlySet<string> {
   return cmds;
 }
 
-// ── Unified validation entry point ──────────────────────────────────
+// ── Sensitive path patterns (secondary defense) ──────────────────────
 
-const FILE_READING_CMDS = new Set(["cat", "head", "tail", "less", "more", "grep", "awk", "gawk"]);
+const FILE_READING_CMDS = new Set([
+  "cat", "head", "tail", "less", "more",
+  "grep", "egrep", "fgrep", "awk", "gawk",
+  "cut", "sort", "wc", "uniq", "column",
+  "jq", "yq", "strings", "diff",
+]);
+
+// ── Unified validation entry point ──────────────────────────────────
 
 /**
  * Validate a command string against context-based whitelist and restrictions.
  * Pipeline:
  *   1. validateShellOperators()
- *   2. extractCommands()
+ *   2. extractPipeline() (with pipe position tracking)
  *   3. Per-command: context whitelist + extraAllowed + isAllowed
  *   4. pipelineValidators (e.g. validateKubectlInPipeline)
- *   5. validateCommandRestrictions()
+ *   5. validateCommandRestrictions() — includes pipeOnly, noFilePaths,
+ *      blockedFlags via COMMAND_RULES (context + pipe-position-aware)
  *   6. sensitivePathPatterns check
  *
  * Returns an error message string if blocked, or null if allowed.
@@ -247,8 +335,9 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   const shellOpErr = validateShellOperators(command);
   if (shellOpErr) return shellOpErr;
 
-  // 2. Split pipeline
-  const commands = extractCommands(command);
+  // 2. Split pipeline (with pipe position tracking)
+  const pipeline = extractPipeline(command);
+  const commands = pipeline.map(s => s.command);
   if (commands.length === 0) {
     return "Command must not be empty.";
   }
@@ -289,13 +378,17 @@ export function validateCommand(command: string, options?: ValidateCommandOption
     }
   }
 
-  // 5. Per-command restrictions (find -exec, sysctl -w, curl -o, etc.)
-  for (const cmd of commands) {
-    const err = validateCommandRestrictions(cmd);
+  // 5. Per-command restrictions (pipeOnly, noFilePaths, blockedFlags,
+  //    allowedFlags, positionals, etc. — all via COMMAND_RULES)
+  for (const seg of pipeline) {
+    const err = validateCommandRestrictions(seg.command, {
+      context,
+      piped: seg.piped,
+    });
     if (err) return err;
   }
 
-  // 6. Sensitive path patterns
+  // 6. Sensitive path patterns (secondary defense layer)
   if (options?.sensitivePathPatterns) {
     for (const cmd of commands) {
       const binary = getCommandBinary(cmd);

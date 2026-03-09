@@ -158,9 +158,12 @@ export function isSkillScript(cmd: string): boolean {
 // ── Sensitive path patterns ──────────────────────────────────────────
 
 const SENSITIVE_PATH_RE = [
-  /\.siclaw\/config\/settings\.json/,
-  /\.siclaw\/credentials\//,
+  /\.siclaw\//,
   /\$\{?KUBECONFIG\}?/,
+  /\/etc\/siclaw\//,
+  /\.kube\//,
+  /\/proc\/self\/environ/,
+  /\.credentials\//,
 ];
 
 // ── Tool definition ─────────────────────────────────────────────────
