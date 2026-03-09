@@ -580,11 +580,15 @@ async function handleRequest(
 
     if (!upstreamRes.ok) {
       const errBody = await upstreamRes.text();
-      console.error(`[llm-proxy] Upstream error ${upstreamRes.status}: ${errBody.slice(0, 500)}`);
-      res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+      const status = upstreamRes.status;
+      console.error(`[llm-proxy] Upstream error ${status}: ${errBody.slice(0, 500)}`);
+      const hint = (status === 401 || status === 403)
+        ? ". Use /setup → Models to reconfigure your API key"
+        : "";
+      res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         type: "error",
-        error: { type: "api_error", message: `Upstream ${upstreamRes.status}: ${errBody.slice(0, 500)}` },
+        error: { type: "api_error", message: `Upstream ${status}: ${errBody.slice(0, 500)}${hint}` },
       }));
       return;
     }
