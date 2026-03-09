@@ -1,7 +1,6 @@
 import type { TimeseriesResponse, TimeRange } from './hooks/useMetrics';
 import { KpiCards } from './KpiCards';
 import { TokenChart } from './TokenChart';
-import { CostChart } from './CostChart';
 import { LatencyChart } from './LatencyChart';
 import { SessionsChart } from './SessionsChart';
 import { ToolCallsPanel } from './ToolCallsPanel';
@@ -32,23 +31,20 @@ export function DashboardTab({ data, range, loading }: DashboardTabProps) {
                 {/* Row 1: KPI Cards */}
                 <KpiCards buckets={buckets} snapshot={snapshot} range={range} />
 
-                {/* Row 2: Token Usage + Cost */}
+                {/* Row 2: Token Usage + Prompt Latency */}
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     <TokenChart buckets={buckets} />
-                    <CostChart buckets={buckets} />
-                </div>
-
-                {/* Row 3: Latency + Sessions */}
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     <LatencyChart buckets={buckets} />
-                    <SessionsChart buckets={buckets} />
                 </div>
 
-                {/* Row 4: Tool Calls + Cumulative */}
+                {/* Row 3: Sessions & Connections + Tool Calls Top 10 */}
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <SessionsChart buckets={buckets} />
                     <ToolCallsPanel topTools={topTools} />
-                    <CumulativePanel />
                 </div>
+
+                {/* Row 4: Cumulative Statistics (full width) */}
+                <CumulativePanel />
             </div>
         </div>
     );

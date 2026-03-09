@@ -3667,7 +3667,6 @@ export function createRpcMethods(
       tokensOutput: b.tokensOutput,
       tokensCacheRead: b.tokensCacheRead,
       tokensCacheWrite: b.tokensCacheWrite,
-      costUsd: b.costUsd,
       promptCount: b.promptCount,
       promptErrors: b.promptErrors,
       promptDurationAvg:
@@ -3690,7 +3689,7 @@ export function createRpcMethods(
 
   methods.set("metrics.summary", async (params, context: RpcContext) => {
     requireAuth(context);
-    if (!db) return { totalTokens: 0, totalCostUsd: 0, totalPrompts: 0, totalSessions: 0, byModel: [] };
+    if (!db) return { totalTokens: 0, totalPrompts: 0, totalSessions: 0, tokenBreakdown: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, byModel: [] };
 
     const period = (params.period as string) || "today";
     const now = new Date();
@@ -3708,35 +3707,43 @@ export function createRpcMethods(
       provider: sessionStats.provider,
       model: sessionStats.model,
       session_count: count(),
-      total_tokens: sum(sql`${sessionStats.inputTokens} + ${sessionStats.outputTokens}`),
-      total_cost: sum(sessionStats.costUsd),
+      total_input: sum(sessionStats.inputTokens),
+      total_output: sum(sessionStats.outputTokens),
+      total_cache_read: sum(sessionStats.cacheReadTokens),
+      total_cache_write: sum(sessionStats.cacheWriteTokens),
       total_prompts: sum(sessionStats.promptCount),
     })
       .from(sessionStats)
       .where(gte(sessionStats.createdAt, cutoffMs))
       .groupBy(sessionStats.provider, sessionStats.model)
-      .orderBy(sql`total_tokens DESC`);
+      .orderBy(sql`(SUM(${sessionStats.inputTokens}) + SUM(${sessionStats.outputTokens})) DESC`);
 
     let totalTokens = 0;
-    let totalCostUsd = 0;
     let totalPrompts = 0;
     let totalSessions = 0;
-    const byModel: Array<{ provider: string; model: string; tokens: number; costUsd: number; percentage: number }> = [];
+    const tokenBreakdown = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const byModel: Array<{ provider: string; model: string; tokens: number; sessions: number; percentage: number }> = [];
 
     for (const row of rows) {
-      const tokens = Number(row.total_tokens) || 0;
-      const cost = Number(row.total_cost) || 0;
+      const input = Number(row.total_input) || 0;
+      const output = Number(row.total_output) || 0;
+      const cacheRead = Number(row.total_cache_read) || 0;
+      const cacheWrite = Number(row.total_cache_write) || 0;
+      const tokens = input + output;
       const prompts = Number(row.total_prompts) || 0;
       const sessions = Number(row.session_count) || 0;
       totalTokens += tokens;
-      totalCostUsd += cost;
       totalPrompts += prompts;
       totalSessions += sessions;
+      tokenBreakdown.input += input;
+      tokenBreakdown.output += output;
+      tokenBreakdown.cacheRead += cacheRead;
+      tokenBreakdown.cacheWrite += cacheWrite;
       byModel.push({
         provider: row.provider || "unknown",
         model: row.model || "unknown",
         tokens,
-        costUsd: cost,
+        sessions,
         percentage: 0, // filled below
       });
     }
@@ -3746,7 +3753,7 @@ export function createRpcMethods(
       entry.percentage = totalTokens > 0 ? Math.round((entry.tokens / totalTokens) * 100) : 0;
     }
 
-    return { totalTokens, totalCostUsd, totalPrompts, totalSessions, byModel };
+    return { totalTokens, totalPrompts, totalSessions, tokenBreakdown, byModel };
   });
 
   return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };

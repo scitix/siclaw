@@ -52,13 +52,11 @@ class LocalCollector {
         const deltaOutput = event.curr.tokens.output - event.prev.tokens.output;
         const deltaCacheRead = event.curr.tokens.cacheRead - event.prev.tokens.cacheRead;
         const deltaCacheWrite = event.curr.tokens.cacheWrite - event.prev.tokens.cacheWrite;
-        const deltaCost = event.curr.cost - event.prev.cost;
 
         bucket.tokensInput += deltaInput;
         bucket.tokensOutput += deltaOutput;
         bucket.tokensCacheRead += deltaCacheRead;
         bucket.tokensCacheWrite += deltaCacheWrite;
-        bucket.costUsd += deltaCost;
         bucket.promptDurationSum += event.durationMs;
         bucket.promptDurationMax = Math.max(bucket.promptDurationMax, event.durationMs);
 
@@ -100,7 +98,6 @@ class LocalCollector {
           outputTokens: event.stats.tokens.output,
           cacheReadTokens: event.stats.tokens.cacheRead,
           cacheWriteTokens: event.stats.tokens.cacheWrite,
-          costUsd: event.stats.cost,
           durationMs: Date.now() - event.createdAt,
           promptCount: counters?.prompts ?? 0,
           toolCallCount: counters?.tools ?? 0,

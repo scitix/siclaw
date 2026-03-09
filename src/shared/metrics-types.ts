@@ -11,7 +11,6 @@ export interface MetricsBucket {
   tokensOutput: number;
   tokensCacheRead: number;
   tokensCacheWrite: number;
-  costUsd: number;
   promptCount: number;
   promptErrors: number;
   promptDurationSum: number;  // sum of all prompt durations in this minute (for avg)
@@ -40,7 +39,6 @@ export interface SessionStatsRecord {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  costUsd: number;
   durationMs: number;         // wall-clock time (created → released)
   promptCount: number;
   toolCallCount: number;
@@ -62,7 +60,6 @@ export function createEmptyBucket(timestamp: number): MetricsBucket {
     tokensOutput: 0,
     tokensCacheRead: 0,
     tokensCacheWrite: 0,
-    costUsd: 0,
     promptCount: 0,
     promptErrors: 0,
     promptDurationSum: 0,

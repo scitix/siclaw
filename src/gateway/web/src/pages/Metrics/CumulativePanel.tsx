@@ -11,9 +11,22 @@ function formatTokens(n: number): string {
     return String(Math.round(n));
 }
 
-function formatCost(n: number): string {
-    if (n < 1) return `$${n.toFixed(3)}`;
-    return `$${n.toFixed(2)}`;
+function TokenBreakdownBar({ label, value, total }: { label: string; value: number; total: number }) {
+    const pct = total > 0 ? (value / total) * 100 : 0;
+    return (
+        <div className="space-y-1">
+            <div className="flex items-center justify-between text-xs">
+                <span className="text-gray-600 font-medium">{label}</span>
+                <span className="text-gray-400">{formatTokens(value)} ({pct.toFixed(1)}%)</span>
+            </div>
+            <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                <div
+                    className="h-full rounded-full bg-indigo-400"
+                    style={{ width: `${Math.min(pct, 100)}%` }}
+                />
+            </div>
+        </div>
+    );
 }
 
 export function CumulativePanel() {
@@ -21,6 +34,9 @@ export function CumulativePanel() {
     const { data, loading } = useSummary(period);
 
     const periods: SummaryPeriod[] = ['today', '7d', '30d'];
+
+    const breakdown = data?.tokenBreakdown ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const breakdownTotal = breakdown.input + breakdown.output + breakdown.cacheRead + breakdown.cacheWrite;
 
     return (
         <div className="rounded-2xl border border-gray-200 bg-white p-5">
@@ -47,55 +63,69 @@ export function CumulativePanel() {
             {loading && !data ? (
                 <div className="text-sm text-gray-400 text-center py-8">Loading...</div>
             ) : (
-                <>
-                    {/* Summary cards */}
-                    <div className="grid grid-cols-3 gap-3 mb-4">
-                        <div className="rounded-xl bg-gray-50 p-3 text-center">
-                            <div className="text-xs text-gray-400 mb-1">Tokens</div>
-                            <div className="text-lg font-bold text-gray-900">
-                                {formatTokens(data?.totalTokens ?? 0)}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {/* Left: Summary + Token Breakdown */}
+                    <div>
+                        {/* Summary cards */}
+                        <div className="grid grid-cols-3 gap-3 mb-4">
+                            <div className="rounded-xl bg-gray-50 p-3 text-center">
+                                <div className="text-xs text-gray-400 mb-1">Tokens</div>
+                                <div className="text-lg font-bold text-gray-900">
+                                    {formatTokens(data?.totalTokens ?? 0)}
+                                </div>
+                            </div>
+                            <div className="rounded-xl bg-gray-50 p-3 text-center">
+                                <div className="text-xs text-gray-400 mb-1">Sessions</div>
+                                <div className="text-lg font-bold text-gray-900">
+                                    {data?.totalSessions ?? 0}
+                                </div>
+                            </div>
+                            <div className="rounded-xl bg-gray-50 p-3 text-center">
+                                <div className="text-xs text-gray-400 mb-1">Prompts</div>
+                                <div className="text-lg font-bold text-gray-900">
+                                    {data?.totalPrompts ?? 0}
+                                </div>
                             </div>
                         </div>
-                        <div className="rounded-xl bg-gray-50 p-3 text-center">
-                            <div className="text-xs text-gray-400 mb-1">Cost</div>
-                            <div className="text-lg font-bold text-gray-900">
-                                {formatCost(data?.totalCostUsd ?? 0)}
-                            </div>
-                        </div>
-                        <div className="rounded-xl bg-gray-50 p-3 text-center">
-                            <div className="text-xs text-gray-400 mb-1">Sessions</div>
-                            <div className="text-lg font-bold text-gray-900">
-                                {data?.totalSessions ?? 0}
-                            </div>
+
+                        {/* Token Breakdown */}
+                        <div className="text-xs text-gray-400 mb-2">Token Breakdown</div>
+                        <div className="space-y-2.5">
+                            <TokenBreakdownBar label="Input" value={breakdown.input} total={breakdownTotal} />
+                            <TokenBreakdownBar label="Output" value={breakdown.output} total={breakdownTotal} />
+                            <TokenBreakdownBar label="Cache Read" value={breakdown.cacheRead} total={breakdownTotal} />
+                            <TokenBreakdownBar label="Cache Write" value={breakdown.cacheWrite} total={breakdownTotal} />
                         </div>
                     </div>
 
-                    {/* Model distribution */}
-                    <div className="text-xs text-gray-400 mb-2">Model Distribution</div>
-                    <div className="space-y-3">
-                        {(!data?.byModel || data.byModel.length === 0) && (
-                            <div className="text-sm text-gray-400 text-center py-4">No data</div>
-                        )}
-                        {data?.byModel?.map((m, i) => (
-                            <div key={`${m.provider}-${m.model}`}>
-                                <div className="flex items-center justify-between mb-1">
-                                    <span className="text-xs font-medium text-gray-700 truncate">
-                                        {m.provider}/{m.model}
-                                    </span>
-                                    <span className="text-xs text-gray-400 ml-2 shrink-0">
-                                        {formatTokens(m.tokens)} · {formatCost(m.costUsd)} · {m.percentage.toFixed(1)}%
-                                    </span>
+                    {/* Right: Model Distribution */}
+                    <div>
+                        <div className="text-xs text-gray-400 mb-2">Model Distribution</div>
+                        <div className="space-y-3">
+                            {(!data?.byModel || data.byModel.length === 0) && (
+                                <div className="text-sm text-gray-400 text-center py-4">No data</div>
+                            )}
+                            {data?.byModel?.map((m, i) => (
+                                <div key={`${m.provider}-${m.model}`}>
+                                    <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs font-medium text-gray-700 truncate">
+                                            {m.provider}/{m.model}
+                                        </span>
+                                        <span className="text-xs text-gray-400 ml-2 shrink-0">
+                                            {formatTokens(m.tokens)} · {m.sessions} sessions · {m.percentage.toFixed(1)}%
+                                        </span>
+                                    </div>
+                                    <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+                                        <div
+                                            className={cn('h-full rounded-full', MODEL_COLORS[Math.min(i, MODEL_COLORS.length - 1)])}
+                                            style={{ width: `${m.percentage}%` }}
+                                        />
+                                    </div>
                                 </div>
-                                <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-                                    <div
-                                        className={cn('h-full rounded-full', MODEL_COLORS[Math.min(i, MODEL_COLORS.length - 1)])}
-                                        style={{ width: `${m.percentage}%` }}
-                                    />
-                                </div>
-                            </div>
-                        ))}
+                            ))}
+                        </div>
                     </div>
-                </>
+                </div>
             )}
         </div>
     );

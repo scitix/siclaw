@@ -407,7 +407,6 @@ export const sessionStats = sqliteTable("session_stats", {
   outputTokens: integer("output_tokens").default(0),
   cacheReadTokens: integer("cache_read_tokens").default(0),
   cacheWriteTokens: integer("cache_write_tokens").default(0),
-  costUsd: real("cost_usd").default(0),
   durationMs: integer("duration_ms").default(0),
   promptCount: integer("prompt_count").default(0),
   toolCallCount: integer("tool_call_count").default(0),

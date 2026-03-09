@@ -174,7 +174,6 @@ export class MetricsAggregator {
         existing.tokensOutput += bucket.tokensOutput;
         existing.tokensCacheRead += bucket.tokensCacheRead;
         existing.tokensCacheWrite += bucket.tokensCacheWrite;
-        existing.costUsd += bucket.costUsd;
         existing.promptCount += bucket.promptCount;
         existing.promptErrors += bucket.promptErrors;
         existing.promptDurationSum += bucket.promptDurationSum;
@@ -228,7 +227,6 @@ export class MetricsAggregator {
         outputTokens: record.outputTokens,
         cacheReadTokens: record.cacheReadTokens,
         cacheWriteTokens: record.cacheWriteTokens,
-        costUsd: record.costUsd,
         durationMs: record.durationMs,
         promptCount: record.promptCount,
         toolCallCount: record.toolCallCount,

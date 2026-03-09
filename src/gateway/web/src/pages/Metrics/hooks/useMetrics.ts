@@ -7,7 +7,6 @@ export interface TimeseriesBucket {
     tokensOutput: number;
     tokensCacheRead: number;
     tokensCacheWrite: number;
-    costUsd: number;
     promptCount: number;
     promptErrors: number;
     promptDurationAvg: number;
@@ -33,14 +32,19 @@ export interface TimeseriesResponse {
 
 export interface SummaryResponse {
     totalTokens: number;
-    totalCostUsd: number;
     totalPrompts: number;
     totalSessions: number;
+    tokenBreakdown: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+    };
     byModel: Array<{
         provider: string;
         model: string;
         tokens: number;
-        costUsd: number;
+        sessions: number;
         percentage: number;
     }>;
 }

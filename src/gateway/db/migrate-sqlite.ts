@@ -313,7 +313,6 @@ const DDL_STATEMENTS = [
     output_tokens     INTEGER DEFAULT 0,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
-    cost_usd          REAL DEFAULT 0,
     duration_ms       INTEGER DEFAULT 0,
     prompt_count      INTEGER DEFAULT 0,
     tool_call_count   INTEGER DEFAULT 0,
