@@ -95,6 +95,14 @@ function safeName(name: string): string {
   return cleaned;
 }
 
+/** Reject values that could inject SSH config directives (newlines, leading whitespace). */
+function sanitizeSshField(value: string, fieldName: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(`${fieldName} must not be empty`);
+  if (/[\r\n]/.test(trimmed)) throw new Error(`${fieldName} must not contain newlines`);
+  return trimmed;
+}
+
 function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -115,7 +123,8 @@ function readManifest(credentialsDir: string): CredentialManifestEntry[] {
   const manifestPath = path.join(credentialsDir, "manifest.json");
   if (!fs.existsSync(manifestPath)) return [];
   try {
-    return JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+    const parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
@@ -245,11 +254,15 @@ export function registerSshPassword(
 
   ensureDir(credentialsDir);
 
+  // Sanitize SSH fields against config injection
+  const host = sanitizeSshField(opts.host, "host");
+  const username = sanitizeSshField(opts.username, "username");
+
   // SSH config
   const sshConfigLines = [`Host ${safe}`];
-  sshConfigLines.push(`  HostName ${opts.host}`);
+  sshConfigLines.push(`  HostName ${host}`);
   if (opts.port) sshConfigLines.push(`  Port ${opts.port}`);
-  sshConfigLines.push(`  User ${opts.username}`);
+  sshConfigLines.push(`  User ${username}`);
   sshConfigLines.push("  StrictHostKeyChecking accept-new");
   const sshConfigFile = `${safe}.ssh_config`;
   writeCredentialFile(credentialsDir, sshConfigFile, sshConfigLines.join("\n") + "\n");
@@ -299,11 +312,15 @@ export function registerSshKey(
   writeCredentialFile(credentialsDir, keyFile, keyContent, 0o600);
   fileNames.push(keyFile);
 
+  // Sanitize SSH fields against config injection
+  const host = sanitizeSshField(opts.host, "host");
+  const username = sanitizeSshField(opts.username, "username");
+
   // SSH config
   const sshConfigLines = [`Host ${safe}`];
-  sshConfigLines.push(`  HostName ${opts.host}`);
+  sshConfigLines.push(`  HostName ${host}`);
   if (opts.port) sshConfigLines.push(`  Port ${opts.port}`);
-  sshConfigLines.push(`  User ${opts.username}`);
+  sshConfigLines.push(`  User ${username}`);
   sshConfigLines.push(`  IdentityFile ${path.join(credentialsDir, keyFile)}`);
   sshConfigLines.push("  StrictHostKeyChecking accept-new");
   const sshConfigFile = `${safe}.ssh_config`;

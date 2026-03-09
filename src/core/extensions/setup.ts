@@ -516,7 +516,7 @@ async function handleSetDefault(
 
   // Write to config
   const existing = readRawConfig();
-  (existing as any).default = {
+  existing.default = {
     provider: choice.provider,
     modelId: choice.modelId,
   };
@@ -561,7 +561,7 @@ async function handleRemoveProvider(
   delete providers[providerName];
 
   // Clear default if it pointed to the removed provider
-  if (existing.default && (existing.default as any).provider === providerName) {
+  if (existing.default?.provider === providerName) {
     delete existing.default;
   }
 
@@ -583,7 +583,8 @@ async function handleModelProvider(
   );
   if (!presetLabel) return;
 
-  const preset = PRESETS.find((p) => p.label === presetLabel)!;
+  const preset = PRESETS.find((p) => p.label === presetLabel);
+  if (!preset) return;
 
   // Provider name — auto-derive for known presets, only ask for Compatible
   let providerName: string;
