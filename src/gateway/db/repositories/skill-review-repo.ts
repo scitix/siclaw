@@ -3,7 +3,7 @@
  */
 
 import crypto from "node:crypto";
-import { eq, desc } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { skillReviews, type ReviewFinding } from "../schema.js";
 
@@ -53,5 +53,11 @@ export class SkillReviewRepository {
       .from(skillReviews)
       .where(eq(skillReviews.skillId, skillId))
       .orderBy(desc(skillReviews.createdAt));
+  }
+
+  async deleteAiReviewsForSkill(skillId: string) {
+    await this.db.delete(skillReviews).where(
+      and(eq(skillReviews.skillId, skillId), eq(skillReviews.reviewerType, "ai")),
+    );
   }
 }

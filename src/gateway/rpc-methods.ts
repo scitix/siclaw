@@ -2145,12 +2145,17 @@ export function createRpcMethods(
     }
 
     // 5. AI script review using staged files
+    // Clear old reviews first so the UI shows "in progress" while the new review runs
+    if (skillReviewRepo) {
+      await skillReviewRepo.deleteAiReviewsForSkill(skillId);
+    }
     let stagedFiles: SkillFiles | null = null;
     if (skillContentRepo) {
       stagedFiles = await skillContentRepo.read(skillId, "staging");
     }
-    if (stagedFiles?.scripts?.length) {
-      triggerScriptReview(skillId, meta.name, stagedFiles.scripts, stagedFiles.specs).catch(console.error);
+    if (stagedFiles?.scripts?.length || stagedFiles?.specs) {
+      // Review both scripts and specs — specs contain command templates the agent will follow
+      triggerScriptReview(skillId, meta.name, stagedFiles?.scripts ?? [], stagedFiles?.specs).catch(console.error);
     }
 
     // 6. Notify reviewers (only on first submit to avoid flooding)
@@ -2190,14 +2195,17 @@ export function createRpcMethods(
       throw new Error("This skill is not pending review");
     }
 
-    // Record reviewer decision
+    // Record reviewer decision — inherit riskLevel from the latest AI review if available
     if (skillReviewRepo) {
+      const reviews = await skillReviewRepo.listForSkill(skillId);
+      const aiReview = reviews.find((r) => r.reviewerType === "ai");
+      const riskLevel = (aiReview?.riskLevel as "low" | "medium" | "high" | "critical") ?? "low";
       await skillReviewRepo.create({
         skillId,
         version: meta.version,
         reviewerType: "admin",
         reviewerId,
-        riskLevel: "low",
+        riskLevel,
         summary: reason || (decision === "approve" ? "Approved by reviewer" : "Rejected by reviewer"),
         findings: [],
         decision,
