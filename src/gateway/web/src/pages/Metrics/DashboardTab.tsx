@@ -4,6 +4,7 @@ import { TokenChart } from './TokenChart';
 import { LatencyChart } from './LatencyChart';
 import { SessionsChart } from './SessionsChart';
 import { ToolCallsPanel } from './ToolCallsPanel';
+import { SkillCallsPanel } from './SkillCallsPanel';
 import { CumulativePanel } from './CumulativePanel';
 
 interface DashboardTabProps {
@@ -24,6 +25,7 @@ export function DashboardTab({ data, range, loading }: DashboardTabProps) {
     const buckets = data?.buckets ?? [];
     const snapshot = data?.snapshot ?? { activeSessions: 0, wsConnections: 0 };
     const topTools = data?.topTools ?? [];
+    const topSkills = data?.topSkills ?? [];
 
     return (
         <div className="flex-1 overflow-y-auto">
@@ -37,13 +39,16 @@ export function DashboardTab({ data, range, loading }: DashboardTabProps) {
                     <LatencyChart buckets={buckets} />
                 </div>
 
-                {/* Row 3: Sessions & Connections + Tool Calls Top 10 */}
+                {/* Row 3: Tool Calls + Skill Calls (side by side) */}
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    <SessionsChart buckets={buckets} />
                     <ToolCallsPanel topTools={topTools} />
+                    <SkillCallsPanel topSkills={topSkills} />
                 </div>
 
-                {/* Row 4: Cumulative Statistics (full width) */}
+                {/* Row 4: Sessions & Connections (full width) */}
+                <SessionsChart buckets={buckets} />
+
+                {/* Row 5: Cumulative Statistics (full width) */}
                 <CumulativePanel />
             </div>
         </div>

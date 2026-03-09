@@ -86,6 +86,22 @@ const wsConnections = new Gauge({
   registers: [metricsRegistry],
 });
 
+// ── Skill metrics ──
+
+const skillCallsTotal = new Counter({
+  name: "siclaw_skill_calls_total",
+  help: "Total skill invocations",
+  labelNames: ["skill_name", "scope", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
+const skillCallsByScopeTotal = new Counter({
+  name: "siclaw_skill_calls_by_scope_total",
+  help: "Total skill invocations aggregated by scope (low-cardinality fallback)",
+  labelNames: ["scope", "outcome"] as const,
+  registers: [metricsRegistry],
+});
+
 // ── Phase 2: Session health metrics (4) ──
 
 const contextTokensUsed = new Gauge({
@@ -160,6 +176,18 @@ function handleDiagnostic(event: DiagnosticEvent): void {
 
     case "tool_call":
       toolCallsTotal.inc({ tool_name: event.toolName, outcome: event.outcome });
+      break;
+
+    case "skill_call":
+      skillCallsTotal.inc({
+        skill_name: event.skillName,
+        scope: event.scope,
+        outcome: event.outcome,
+      });
+      skillCallsByScopeTotal.inc({
+        scope: event.scope,
+        outcome: event.outcome,
+      });
       break;
 
     case "ws_connected":

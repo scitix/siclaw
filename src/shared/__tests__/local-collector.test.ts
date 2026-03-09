@@ -98,6 +98,134 @@ describe("LocalCollector", () => {
     expect(localCollector.snapshot().wsConnections).toBe(before);
   });
 
+  it("should track skill calls", () => {
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "k8s-diagnostics",
+      scriptName: "check-pods",
+      scope: "builtin",
+      outcome: "success",
+      durationMs: 1500,
+      sessionId: "s-skill-1",
+    });
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "k8s-diagnostics",
+      scriptName: "check-pods",
+      scope: "builtin",
+      outcome: "error",
+      durationMs: 500,
+      sessionId: "s-skill-1",
+    });
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "my-custom-skill",
+      scriptName: "run",
+      scope: "personal",
+      outcome: "success",
+      durationMs: 300,
+    });
+
+    const skills = localCollector.topSkills(10);
+    const k8s = skills.find((s) => s.skillName === "k8s-diagnostics");
+    expect(k8s).toBeDefined();
+    expect(k8s!.success).toBeGreaterThanOrEqual(1);
+    expect(k8s!.error).toBeGreaterThanOrEqual(1);
+    expect(k8s!.scope).toBe("builtin");
+    expect(k8s!.avgDurationMs).toBeGreaterThan(0);
+
+    const custom = skills.find((s) => s.skillName === "my-custom-skill");
+    expect(custom).toBeDefined();
+    expect(custom!.scope).toBe("personal");
+    expect(custom!.total).toBeGreaterThanOrEqual(1);
+  });
+
+  it("should accumulate skill calls into buckets", () => {
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "test-skill",
+      scriptName: "run",
+      scope: "team",
+      outcome: "success",
+      durationMs: 100,
+    });
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "test-skill",
+      scriptName: "run",
+      scope: "team",
+      outcome: "error",
+      durationMs: 200,
+    });
+
+    const buckets = localCollector.query("1h");
+    expect(buckets.length).toBeGreaterThanOrEqual(1);
+    const last = buckets[buckets.length - 1];
+    expect(last.skillSuccesses).toBeGreaterThanOrEqual(1);
+    expect(last.skillErrors).toBeGreaterThanOrEqual(1);
+  });
+
+  it("should include skillCallCount in session stats", () => {
+    const sid = "s-skill-session-1";
+    emitDiagnostic({ type: "session_created", sessionId: sid });
+
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "some-skill",
+      scriptName: "run",
+      scope: "builtin",
+      outcome: "success",
+      durationMs: 100,
+      sessionId: sid,
+    });
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "some-skill",
+      scriptName: "run",
+      scope: "builtin",
+      outcome: "success",
+      durationMs: 100,
+      sessionId: sid,
+    });
+
+    emitDiagnostic({
+      type: "session_released",
+      sessionId: sid,
+      stats: makeStats(100, 50, 0.01),
+      userId: "user1",
+      model: testModel,
+      createdAt: Date.now() - 30000,
+    });
+
+    const records = localCollector.drainSessionStats();
+    const record = records.find((r) => r.sessionId === sid);
+    expect(record).toBeDefined();
+    expect(record!.skillCallCount).toBe(2);
+  });
+
+  it("should include skillCallDeltas in exported snapshot", () => {
+    emitDiagnostic({
+      type: "skill_call",
+      skillName: "snapshot-skill",
+      scriptName: "run",
+      scope: "team",
+      outcome: "success",
+      durationMs: 250,
+    });
+
+    const snapshot = localCollector.exportSnapshot();
+    expect(snapshot.skillCallDeltas).toBeDefined();
+    const entry = snapshot.skillCallDeltas.find((s) => s.skillName === "snapshot-skill");
+    expect(entry).toBeDefined();
+    expect(entry!.total).toBe(1);
+    expect(entry!.avgDurationMs).toBe(250);
+
+    // After export, skillCallMap should be cleared — next export should not contain it
+    const snapshot2 = localCollector.exportSnapshot();
+    const entry2 = snapshot2.skillCallDeltas.find((s) => s.skillName === "snapshot-skill");
+    expect(entry2).toBeUndefined();
+  });
+
   it("should export snapshot with only completed minute buckets", () => {
     // Emit an event to ensure current minute has data
     emitDiagnostic({

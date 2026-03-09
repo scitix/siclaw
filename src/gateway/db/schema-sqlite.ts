@@ -410,6 +410,7 @@ export const sessionStats = sqliteTable("session_stats", {
   durationMs: integer("duration_ms").default(0),
   promptCount: integer("prompt_count").default(0),
   toolCallCount: integer("tool_call_count").default(0),
+  skillCallCount: integer("skill_call_count").default(0),
   createdAt: integer("created_at").notNull(),
 });
 

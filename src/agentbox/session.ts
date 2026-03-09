@@ -204,6 +204,9 @@ export class AgentBoxSessionManager {
       userId: this.userId,
     });
 
+    // Populate sessionIdRef so skill_call events can associate with this session
+    result.sessionIdRef.current = id;
+
     // New session: re-sync memory index to pick up files from previous sessions
     if (isNewSession && this._sharedMemoryIndexer) {
       this._sharedMemoryIndexer.sync().catch((err) => {

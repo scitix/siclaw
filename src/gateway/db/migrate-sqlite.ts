@@ -316,6 +316,7 @@ const DDL_STATEMENTS = [
     duration_ms       INTEGER DEFAULT 0,
     prompt_count      INTEGER DEFAULT 0,
     tool_call_count   INTEGER DEFAULT 0,
+    skill_call_count  INTEGER DEFAULT 0,
     created_at        INTEGER NOT NULL
   )`,
 
@@ -369,6 +370,13 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
 
   for (const ddl of INDEX_STATEMENTS) {
     sdb.run(sql.raw(ddl));
+  }
+
+  // Column migrations (idempotent — ignore if column already exists)
+  try {
+    sdb.run(sql.raw("ALTER TABLE session_stats ADD COLUMN skill_call_count INTEGER DEFAULT 0"));
+  } catch {
+    // Column already exists (re-run of migration)
   }
 
   // Trigger: auto-update updated_at on mcp_servers UPDATE (mirrors MySQL ON UPDATE CURRENT_TIMESTAMP)
