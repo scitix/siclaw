@@ -10,6 +10,7 @@ import {
   text,
   timestamp,
   int,
+  bigint,
   json,
   mysqlEnum,
   boolean,
@@ -406,6 +407,24 @@ export const mcpServers = mysqlTable("mcp_servers", {
   createdBy: varchar("created_by", { length: 32 }).references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+// ─── Session Stats ───────────────────────────────
+
+export const sessionStats = mysqlTable("session_stats", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  sessionId: varchar("session_id", { length: 64 }).notNull(),
+  userId: varchar("user_id", { length: 32 }).notNull(),
+  provider: varchar("provider", { length: 64 }),
+  model: varchar("model", { length: 128 }),
+  inputTokens: int("input_tokens").default(0),
+  outputTokens: int("output_tokens").default(0),
+  cacheReadTokens: int("cache_read_tokens").default(0),
+  cacheWriteTokens: int("cache_write_tokens").default(0),
+  durationMs: int("duration_ms").default(0),
+  promptCount: int("prompt_count").default(0),
+  toolCallCount: int("tool_call_count").default(0),
+  createdAt: bigint("created_at", { mode: "number" }).notNull(),
 });
 
 // ─── System Config ────────────────────────────────

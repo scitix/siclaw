@@ -116,6 +116,14 @@ export class AgentBoxClient {
   }
 
   /**
+   * Generic GET request returning parsed JSON (used by metrics snapshot pull, etc.)
+   */
+  async getJson<T = unknown>(path: string): Promise<T> {
+    const resp = await this.fetch(path);
+    return resp.json();
+  }
+
+  /**
    * Health check
    */
   async health(): Promise<HealthResponse> {

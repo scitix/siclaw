@@ -47,6 +47,7 @@ export const {
   triggers,
   credentials,
   userPermissions,
+  sessionStats,
   systemConfig,
   mcpServers,
   skillReviews,

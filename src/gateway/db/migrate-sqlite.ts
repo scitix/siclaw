@@ -303,6 +303,22 @@ const DDL_STATEMENTS = [
     UNIQUE (provider_id, model_id)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS session_stats (
+    id                TEXT PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    user_id           TEXT NOT NULL,
+    provider          TEXT,
+    model             TEXT,
+    input_tokens      INTEGER DEFAULT 0,
+    output_tokens     INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_write_tokens INTEGER DEFAULT 0,
+    duration_ms       INTEGER DEFAULT 0,
+    prompt_count      INTEGER DEFAULT 0,
+    tool_call_count   INTEGER DEFAULT 0,
+    created_at        INTEGER NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS mcp_servers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -336,6 +352,8 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_skill_versions_skill ON skill_versions(skill_id, version)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_contents_skill ON skill_contents(skill_id)`,
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
+  `CREATE INDEX IF NOT EXISTS idx_session_stats_created ON session_stats(created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_session_stats_user ON session_stats(user_id, created_at)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
