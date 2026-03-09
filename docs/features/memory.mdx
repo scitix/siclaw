@@ -6,81 +6,31 @@ description: "How Siclaw learns from past investigations to improve future diagn
 
 ## Overview
 
-Every deep investigation automatically produces two outputs:
+Every deep investigation helps Siclaw get better at future investigations.
 
-1. **Raw markdown** — human-readable report saved to `~/.siclaw/reports/`
-2. **Structured record** — root cause category, causal chain, affected entities → SQLite
+Siclaw stores:
 
-This dual-output system means Siclaw **accumulates diagnostic experience** across sessions.
+- a human-readable investigation report
+- a structured summary of the incident
+- searchable memory used to improve future hypothesis generation
 
 ## How It Works
 
 ### Writing Memory
 
-After Phase 4 (Conclusion), the investigation engine extracts structured data:
+After an investigation finishes, Siclaw saves key facts such as:
 
-```json
-{
-  "root_cause_category": "resource_exhaustion",
-  "affected_entities": ["pod/payment-service", "node/worker-03"],
-  "environment_tags": ["cluster-prod", "namespace-payments"],
-  "causal_chain": [
-    "v2.3 added caching layer",
-    "Memory usage increased to 310Mi",
-    "Exceeded 256Mi limit",
-    "OOMKilled → CrashLoopBackOff"
-  ],
-  "confidence": 92
-}
-```
+- likely root cause
+- affected services or resources
+- important evidence
+- recommended next steps
 
 ### Reading Memory
 
-When a new investigation starts, Phase 2 (Hypothesis Generation) retrieves relevant past investigations using **hybrid search**:
+When a new investigation starts, Siclaw can look up similar past incidents and use them to improve hypothesis quality.
 
-1. **Structured query** — matches on root cause category, affected entities, environment tags
-2. **Semantic search** — vector similarity over investigation chunks (cosine similarity with BM25 boost)
-
-```
-finalScore = 0.70 × cosineSimilarity + 0.30 × bm25Score
-```
-
-Results above `0.35` threshold are injected into the hypothesis generation prompt.
-
-## Root Cause Categories
-
-Structured records use a fixed category taxonomy:
-
-| Category | Examples |
-|----------|---------|
-| `resource_exhaustion` | OOMKilled, CPU throttling, disk full |
-| `config_error` | Missing configmap, wrong env var, bad YAML |
-| `network_partition` | DNS failure, CNI issues, firewall rules |
-| `hardware_failure` | Disk failure, GPU error, NIC flap |
-| `pcie_error` | PCIe bus error, GPU fallen off bus |
-| `driver_issue` | NVIDIA driver mismatch, kernel module missing |
-| `software_bug` | Application crash, deadlock, race condition |
-| `permission_denied` | RBAC, PodSecurityPolicy, filesystem permissions |
-| `scheduling_failure` | Insufficient resources, affinity conflicts |
-| `unknown` | No clear root cause identified |
-
-## Storage
-
-| Component | Engine | Location |
-|-----------|--------|----------|
-| Structured records | node:sqlite (native) | `~/.siclaw/memory/.memory.db` |
-| Embeddings | node:sqlite + FTS5 | Same database |
-| Raw reports | Markdown files | `~/.siclaw/reports/` |
+This makes repeated incident patterns easier to recognize over time.
 
 <Warning>
-Memory search requires an [embedding provider](/configuration/providers#embedding) to be configured. Without it, structured field matching still works but semantic similarity search is disabled.
+Memory search works best with an [embedding provider](/configuration/providers#embedding). Without one, Siclaw still saves investigation history, but semantic recall is reduced.
 </Warning>
-
-## Chunking
-
-Memory files are split on heading boundaries for optimal retrieval:
-
-- Max chunk size: ~400 tokens (~1600 bytes)
-- Overlap: ~80 tokens between adjacent chunks
-- Each chunk tracks: file path, heading breadcrumb, start/end line
-- CJK queries use OR for bigrams; Latin queries use AND

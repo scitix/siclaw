@@ -14,6 +14,8 @@ A pod in your production cluster is stuck in `CrashLoopBackOff` after a deployme
 siclaw
 ```
 
+If you want Siclaw to inspect a Kubernetes cluster, import a kubeconfig first with `/setup`.
+
 ## Describe the Problem
 
 ```
@@ -80,9 +82,9 @@ Siclaw synthesizes all evidence into a structured report:
     3. Pod exceeded 256Mi memory limit
     4. Kernel OOMKilled the process → container restart → CrashLoopBackOff
 
-  Remediation:
-    - Increase memory limit to 512Mi: kubectl set resources deploy/payment-service -n prod --limits=memory=512Mi
-    - Consider adding memory requests to match expected usage
+  Recommended next steps:
+    - Increase the deployment memory limit to 512Mi
+    - Add memory requests to match expected usage
 ```
 
 The full report is saved to `~/.siclaw/reports/deep-search-{timestamp}.md`.
@@ -127,6 +129,6 @@ Using `/deep` triggers a full investigation with maximum budget — useful for c
 
 ## What's Next?
 
-- [Deep Investigation](/features/deep-investigation) — budget controls, sub-agent architecture
-- [Skills](/features/skills) — create custom diagnostic playbooks
+- [Deep Investigation](/features/deep-investigation) — how the investigation workflow works
+- [Skills](/features/skills) — create reusable diagnostic playbooks
 - [Memory](/features/memory) — how investigation history improves future diagnoses

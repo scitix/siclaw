@@ -98,17 +98,6 @@
             ]
           }
         ]
-      },
-      {
-        "tab": "Roadmap",
-        "groups": [
-          {
-            "group": "Project",
-            "pages": [
-              "design/roadmap"
-            ]
-          }
-        ]
       }
     ]
   },

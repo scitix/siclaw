@@ -25,34 +25,43 @@ nvm use 22
 **Symptom**: "Failed to connect to LLM provider" or empty responses.
 
 **Check**:
-1. Verify your API key is set correctly:
+1. Open the active config file:
    ```bash
-   echo $ANTHROPIC_API_KEY  # or $OPENAI_API_KEY
+   ls .siclaw/config/settings.json
    ```
-2. Test the API directly:
+2. Verify `baseUrl`, `api`, `apiKey`, and model ID are correct.
+3. Test the provider directly:
    ```bash
    curl https://api.anthropic.com/v1/messages \
-     -H "x-api-key: $ANTHROPIC_API_KEY" \
+     -H "x-api-key: YOUR_API_KEY" \
      -H "content-type: application/json" \
      -d '{"model":"claude-sonnet-4-20250514","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
    ```
-3. For OpenAI-compatible providers, confirm `baseUrl` is correct and accessible from your machine.
+4. For OpenAI-compatible providers, confirm `baseUrl` is correct and reachable from the machine running Siclaw.
 
 ## kubectl Permission Denied
 
 **Symptom**: "Error from server (Forbidden)" during investigation.
 
-Siclaw uses your local kubeconfig. Verify:
+Siclaw uses a kubeconfig imported into its credential store. Verify:
 
 ```bash
-# Check current context
-kubectl config current-context
-
-# Test basic read access
-kubectl get pods --all-namespaces
+# See whether Siclaw has imported credentials
+ls .siclaw/credentials/manifest.json
 ```
 
-Siclaw needs **read-only** access. Minimum RBAC:
+If no kubeconfig has been imported yet:
+
+- TUI: run `/setup`
+- Local Server: open **Credentials** in the Web UI
+
+Then verify the same kubeconfig can read your cluster:
+
+```bash
+kubectl --kubeconfig /path/to/imported.kubeconfig get pods --all-namespaces
+```
+
+Siclaw needs read-oriented access. A typical minimum RBAC baseline is:
 ```yaml
 rules:
   - apiGroups: ["", "apps", "batch", "events.k8s.io"]
@@ -67,7 +76,7 @@ rules:
 
 **Symptom**: `memory_search` tool not available, or "embedding provider not configured".
 
-Investigation Memory requires an embedding provider. Add to `~/.siclaw/config/settings.json`:
+Investigation Memory semantic search requires an embedding provider. Add to `.siclaw/config/settings.json`:
 
 ```json
 {
@@ -88,10 +97,10 @@ Without this, all other features work normally — only semantic memory search i
 
 ```bash
 # Check what's using the port
-lsof -i :3001
-# Kill the process or use a different port
-PORT=3005 npm run dev:gateway
+lsof -i :3000
 ```
+
+Current Gateway builds listen on `3000` by default. Stop the conflicting process, then start Siclaw again.
 
 ## SQLite Lock Error
 
@@ -104,7 +113,13 @@ ps aux | grep siclaw
 # Kill stale processes if needed
 ```
 
-The lockfile is at `~/.siclaw/data.sqlite.lock` — if the previous process crashed, you may need to delete it manually.
+The default lockfile is:
+
+```text
+.siclaw/data.sqlite.lock
+```
+
+This path is relative to the directory where you started Siclaw.
 
 ## Skill Script Rejected
 

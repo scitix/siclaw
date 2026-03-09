@@ -1,78 +1,62 @@
 ---
-title: "Docker Deployment"
-sidebarTitle: "Docker"
-description: "Run Siclaw as a multi-user server with Web UI using Docker Compose."
+title: "Container Images"
+sidebarTitle: "Images"
+description: "Build and publish Siclaw container images for Kubernetes deployment."
 ---
 
-## Quick Start
+## What Docker Supports Today
+
+Siclaw currently ships Dockerfiles for **building runtime images**:
+
+- `gateway` — Web UI + API server
+- `agentbox` — per-user execution runtime
+- `cron` — scheduled job runner
+
+For a single-machine setup, use [CLI & Local Server](/install/cli). The repository does **not** include a supported `docker compose` deployment.
+
+## Build Images
+
+From the repo root:
 
 ```bash
-git clone https://github.com/scitix/siclaw.git
-cd siclaw
-docker compose up -d
+make docker REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
-The Web UI is available at `http://localhost:3001`.
+That builds:
 
-## Docker Compose Configuration
+- `registry.example.com/myteam/siclaw-gateway:latest`
+- `registry.example.com/myteam/siclaw-agentbox:latest`
+- `registry.example.com/myteam/siclaw-cron:latest`
 
-```yaml
-# docker-compose.yml
-services:
-  siclaw-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile.gateway
-    ports:
-      - "3001:3001"    # Web UI + API
-    volumes:
-      - siclaw-data:/app/.siclaw
-      - ~/.kube/config:/app/.kube/config:ro
-    restart: unless-stopped
-
-volumes:
-  siclaw-data:
-```
-
-## Architecture
-
-In Docker mode, Siclaw runs with `LocalSpawner`:
-
-- **Gateway** serves the Web UI, API, and WebSocket connections
-- **AgentBox** instances run in-process (same container)
-- **SQLite** (sql.js) for session data, **node:sqlite** for memory
-
-<Warning>
-All users share the same filesystem in Docker mode. This is a development/small-team deployment model, not a production multi-tenant solution. Use [Kubernetes](/install/kubernetes) for production.
-</Warning>
-
-## Channels
-
-Connect messaging platforms by setting environment variables:
+To build one image only:
 
 ```bash
-# Slack (Socket Mode)
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-
-# Lark
-LARK_APP_ID=...
-LARK_APP_SECRET=...
+make docker-gateway REGISTRY=registry.example.com/myteam TAG=latest
+make docker-agentbox REGISTRY=registry.example.com/myteam TAG=latest
+make docker-cron REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
-See [Channels](/features/channels) for full configuration.
-
-## Persistence
-
-Mount a volume to `/app/.siclaw` to persist:
-- Session history
-- Investigation memory
-- Skill configurations
-- Cron job definitions
-
-## Updating
+## Push Images
 
 ```bash
-docker compose pull
-docker compose up -d
+make push REGISTRY=registry.example.com/myteam TAG=latest
 ```
+
+Or push individually:
+
+```bash
+make push-gateway REGISTRY=registry.example.com/myteam TAG=latest
+make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
+make push-cron REGISTRY=registry.example.com/myteam TAG=latest
+```
+
+## Runtime Notes
+
+- The Gateway image listens on container port `3000`.
+- The Gateway image starts in Kubernetes mode by default.
+- The AgentBox image is designed to be spawned by the Gateway inside Kubernetes.
+- Core skills are baked into the images; dynamic skills and credentials are synced at runtime.
+
+## Next Step
+
+After publishing images, continue with [Kubernetes Deployment](/install/kubernetes).

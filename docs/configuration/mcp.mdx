@@ -35,7 +35,7 @@ Creating and managing MCP servers requires **admin** role. All users can use the
 
 ### Via settings.json (CLI mode)
 
-For TUI / single-user mode, add MCP servers to `~/.siclaw/config/settings.json`:
+For TUI / single-user mode, add MCP servers to `.siclaw/config/settings.json`:
 
 ```json
 {
@@ -52,36 +52,20 @@ For TUI / single-user mode, add MCP servers to `~/.siclaw/config/settings.json`:
 }
 ```
 
-### Environment Variable Substitution
-
-Use `${VAR_NAME}` in env values — Siclaw resolves them from the process environment at spawn time:
-
-```json
-{
-  "mcpServers": {
-    "github": {
-      "transport": "streamable-http",
-      "url": "http://localhost:8000/mcp",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_TOKEN}"
-      }
-    }
-  }
-}
-```
-
 ## Examples
 
 ### Prometheus Metrics
 
 ```json
 {
-  "prometheus": {
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@prom-mcp/server"],
-    "env": {
-      "PROMETHEUS_URL": "http://prometheus.monitoring:9090"
+  "mcpServers": {
+    "prometheus": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@prom-mcp/server"],
+      "env": {
+        "PROMETHEUS_URL": "http://prometheus.monitoring:9090"
+      }
     }
   }
 }
@@ -99,10 +83,12 @@ Phase 1: Context Gathering
 
 ```json
 {
-  "filesystem": {
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+    }
   }
 }
 ```
@@ -111,12 +97,14 @@ Phase 1: Context Gathering
 
 ```json
 {
-  "github": {
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@github/mcp-server"],
-    "env": {
-      "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+  "mcpServers": {
+    "github": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@github/mcp-server"],
+      "env": {
+        "GITHUB_TOKEN": "your-token"
+      }
     }
   }
 }
@@ -128,11 +116,13 @@ Any service implementing the MCP protocol can be connected:
 
 ```json
 {
-  "my-service": {
-    "transport": "streamable-http",
-    "url": "https://mcp.internal.example.com/v1",
-    "headers": {
-      "Authorization": "Bearer ${MY_SERVICE_TOKEN}"
+  "mcpServers": {
+    "my-service": {
+      "transport": "streamable-http",
+      "url": "https://mcp.internal.example.com/v1",
+      "headers": {
+        "Authorization": "Bearer your-token"
+      }
     }
   }
 }
@@ -169,7 +159,7 @@ The merge strategy: DB entries (managed via Web UI) override local seed entries 
 ### Kubernetes Considerations
 
 <Warning>
-In Kubernetes mode, MCP server binaries must be available in the AgentBox container image. For `stdio` transport servers that use `npx`, ensure the package can be installed inside the pod (network access required) or pre-install it in the image.
+In Kubernetes mode, `stdio` MCP servers run inside AgentBox pods. Make sure the required binaries or packages are available in that runtime image, or use HTTP-based MCP transports instead.
 </Warning>
 
 For HTTP-based transports (`sse`, `streamable-http`), the MCP server runs externally — the AgentBox pod only needs network access to the URL.
