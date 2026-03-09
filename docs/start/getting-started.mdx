@@ -43,14 +43,8 @@ npm run dev
 
 ## Configure Your LLM
 
-On first run, Siclaw prompts you to configure an LLM provider. You can also set it via environment variables:
-
-```bash
-export SICLAW_LLM_API_KEY="sk-ant-..."
-siclaw
-```
-
-Or configure manually in `~/.siclaw/config/settings.json`:
+On first run, Siclaw launches a setup wizard to configure your LLM provider.
+You can also configure manually in `.siclaw/config/settings.json`, or use the `/setup` command inside a session:
 
 ```json
 {

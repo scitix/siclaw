@@ -26,9 +26,8 @@ services:
     ports:
       - "3001:3001"    # Web UI + API
     environment:
-      - SICLAW_LLM_API_KEY=sk-ant-...
-      - SICLAW_LLM_BASE_URL=https://api.anthropic.com/v1
-      - SICLAW_LLM_MODEL=claude-sonnet-4-20250514
+      - SICLAW_API_KEY=sk-ant-...
+      - SICLAW_BASE_URL=https://api.anthropic.com/v1
     volumes:
       - siclaw-data:/app/.siclaw
       - ~/.kube/config:/app/.kube/config:ro

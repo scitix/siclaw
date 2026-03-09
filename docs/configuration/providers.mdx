@@ -89,13 +89,14 @@ See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/setting
 
 ## Environment Variable Overrides
 
-These override the default provider's settings at runtime (highest priority):
+These override the default provider's settings at runtime (Gateway/Docker mode only):
 
 ```bash
-SICLAW_LLM_API_KEY=sk-...       # Override default provider's API key
-SICLAW_LLM_BASE_URL=https://... # Override default provider's base URL
-SICLAW_LLM_MODEL=gpt-4o         # Override default model ID
+SICLAW_API_KEY=sk-...       # Override default provider's API key
+SICLAW_BASE_URL=https://... # Override default provider's base URL
 ```
+
+For TUI mode, configure providers via the first-run wizard or `/setup` command.
 
 API keys also support `$VAR` / `${VAR}` references in `settings.json`:
 
