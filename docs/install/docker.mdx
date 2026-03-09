@@ -25,9 +25,6 @@ services:
       dockerfile: Dockerfile.gateway
     ports:
       - "3001:3001"    # Web UI + API
-    environment:
-      - SICLAW_API_KEY=sk-ant-...
-      - SICLAW_BASE_URL=https://api.anthropic.com/v1
     volumes:
       - siclaw-data:/app/.siclaw
       - ~/.kube/config:/app/.kube/config:ro

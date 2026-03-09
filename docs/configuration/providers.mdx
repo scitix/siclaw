@@ -87,18 +87,12 @@ Any API that implements the OpenAI chat completions format works with Siclaw —
 See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for a complete example with all fields.
 </Tip>
 
-## Environment Variable Overrides
+## Configuration Methods
 
-These override the default provider's settings at runtime (Gateway/Docker mode only):
+- **TUI mode**: First-run wizard or `/setup` command inside a session
+- **Gateway/Docker mode**: Edit `settings.json` directly or via the web UI
 
-```bash
-SICLAW_API_KEY=sk-...       # Override default provider's API key
-SICLAW_BASE_URL=https://... # Override default provider's base URL
-```
-
-For TUI mode, configure providers via the first-run wizard or `/setup` command.
-
-API keys also support `$VAR` / `${VAR}` references in `settings.json`:
+API keys support `$VAR` / `${VAR}` references in `settings.json`:
 
 ```json
 {

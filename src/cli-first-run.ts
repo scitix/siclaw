@@ -101,11 +101,12 @@ export async function runFirstRunSetup(): Promise<boolean> {
 
   const configDir = path.dirname(configPath);
   if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
   }
   fs.writeFileSync(
     configPath,
     JSON.stringify({ ...existing, providers }, null, 2) + "\n",
+    { mode: 0o600 },
   );
 
   reloadConfig();

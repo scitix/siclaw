@@ -90,7 +90,9 @@ export interface CredentialListEntry extends CredentialManifestEntry {
 // ---------------------------------------------------------------------------
 
 function safeName(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const cleaned = name.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/^_+|_+$/g, "");
+  if (!cleaned) throw new Error("Credential name must contain at least one alphanumeric character");
+  return cleaned;
 }
 
 function ensureDir(dir: string): void {
@@ -124,6 +126,7 @@ function writeManifest(credentialsDir: string, manifest: CredentialManifestEntry
   fs.writeFileSync(
     path.join(credentialsDir, "manifest.json"),
     JSON.stringify(manifest, null, 2) + "\n",
+    { mode: 0o600 },
   );
 }
 
@@ -247,7 +250,7 @@ export function registerSshPassword(
   sshConfigLines.push(`  HostName ${opts.host}`);
   if (opts.port) sshConfigLines.push(`  Port ${opts.port}`);
   sshConfigLines.push(`  User ${opts.username}`);
-  sshConfigLines.push("  StrictHostKeyChecking no");
+  sshConfigLines.push("  StrictHostKeyChecking accept-new");
   const sshConfigFile = `${safe}.ssh_config`;
   writeCredentialFile(credentialsDir, sshConfigFile, sshConfigLines.join("\n") + "\n");
   fileNames.push(sshConfigFile);
@@ -302,7 +305,7 @@ export function registerSshKey(
   if (opts.port) sshConfigLines.push(`  Port ${opts.port}`);
   sshConfigLines.push(`  User ${opts.username}`);
   sshConfigLines.push(`  IdentityFile ${path.join(credentialsDir, keyFile)}`);
-  sshConfigLines.push("  StrictHostKeyChecking no");
+  sshConfigLines.push("  StrictHostKeyChecking accept-new");
   const sshConfigFile = `${safe}.ssh_config`;
   writeCredentialFile(credentialsDir, sshConfigFile, sshConfigLines.join("\n") + "\n");
   fileNames.push(sshConfigFile);

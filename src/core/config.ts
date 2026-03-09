@@ -207,9 +207,9 @@ export function writeConfig(config: SiclawConfig): void {
   const configPath = getConfigPath();
   const dir = path.dirname(configPath);
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   cached = null;
 }
 
