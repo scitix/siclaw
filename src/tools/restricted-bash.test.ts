@@ -630,7 +630,7 @@ describe("createRestrictedBashTool — blocks dangerous options in pipelines", (
 describe("createRestrictedBashTool — find validation", () => {
   const tool = createRestrictedBashTool();
 
-  // find is in LOCAL_BLOCKED_COMMANDS (local file access blocked in restricted-bash).
+  // find is not in the "local" context whitelist (file category excluded).
   // These commands are allowed in node-exec/pod-exec (tested in command-sets.test.ts).
   it("blocks find in restricted-bash (local file access)", async () => {
     const result = await tool.execute(
@@ -883,7 +883,7 @@ describe("createRestrictedBashTool — sysctl/mount/env restrictions", () => {
     expect((result.details as any).blocked).toBe(true);
   });
 
-  // env is in LOCAL_BLOCKED_COMMANDS (may expose secrets locally).
+  // env is not in the "local" context whitelist (general-env category excluded).
   // The validateEnv restriction is tested in command-sets.test.ts for remote contexts.
   it("blocks env command in restricted-bash (local secret exposure)", async () => {
     const result = await tool.execute(
@@ -1054,7 +1054,7 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
     expect((result.details as any).blocked).toBe(true);
   });
 
-  // lsof and zcat are in LOCAL_BLOCKED_COMMANDS (local file/process inspection blocked).
+  // lsof and zcat are not in the "local" context whitelist (inspection/compressed categories excluded).
   // They are allowed in node-exec/pod-exec (tested in command-sets.test.ts).
   it("blocks lsof in restricted-bash (local file inspection)", async () => {
     const result = await tool.execute(
@@ -1067,7 +1067,7 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
     expect((result.details as any).blocked).toBe(true);
   });
 
-  // timedatectl is NOT in LOCAL_BLOCKED_COMMANDS, so it passes through
+  // timedatectl is in the "local" context whitelist (services category), so it passes through
   it("allows timedatectl (no validator needed)", async () => {
     const result = await tool.execute(
       "test-id",

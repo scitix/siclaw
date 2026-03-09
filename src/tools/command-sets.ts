@@ -138,6 +138,98 @@ export const ALLOWED_COMMANDS = new Set([
   "expr", "seq",
 ]);
 
+// ── Command categories and context-based whitelists ──────────────
+
+/** Map each command to its functional category. */
+export const COMMAND_CATEGORIES: Record<string, string> = {
+  // text processing
+  grep: "text", egrep: "text", fgrep: "text",
+  sort: "text", uniq: "text", wc: "text", head: "text", tail: "text",
+  cut: "text", tr: "text", jq: "text", yq: "text", column: "text",
+  // network
+  ip: "network", ifconfig: "network", ping: "network", traceroute: "network",
+  tracepath: "network", ss: "network", netstat: "network", route: "network",
+  arp: "network", ethtool: "network", mtr: "network", nslookup: "network",
+  dig: "network", host: "network", bridge: "network", tc: "network",
+  conntrack: "network", curl: "network",
+  // RDMA
+  ibstat: "rdma", ibstatus: "rdma", ibv_devinfo: "rdma", ibv_devices: "rdma",
+  rdma: "rdma", ibaddr: "rdma", iblinkinfo: "rdma", ibportstate: "rdma",
+  ibswitches: "rdma", ibroute: "rdma", show_gids: "rdma", ibdev2netdev: "rdma",
+  // perftest
+  ib_write_bw: "perftest", ib_write_lat: "perftest",
+  ib_read_bw: "perftest", ib_read_lat: "perftest",
+  ib_send_bw: "perftest", ib_send_lat: "perftest",
+  ib_atomic_bw: "perftest", ib_atomic_lat: "perftest",
+  raw_ethernet_bw: "perftest", raw_ethernet_lat: "perftest",
+  raw_ethernet_burst_lat: "perftest",
+  // GPU
+  "nvidia-smi": "gpu", gpustat: "gpu", nvtopo: "gpu",
+  // hardware
+  lspci: "hardware", lsusb: "hardware", lsblk: "hardware",
+  lscpu: "hardware", lsmem: "hardware", lshw: "hardware", dmidecode: "hardware",
+  // kernel
+  uname: "kernel", hostname: "kernel", uptime: "kernel",
+  dmesg: "kernel", sysctl: "kernel", lsmod: "kernel", modinfo: "kernel",
+  // process / resource
+  ps: "process", pgrep: "process", top: "process", free: "process",
+  vmstat: "process", iostat: "process", mpstat: "process",
+  df: "process", du: "process", mount: "process", findmnt: "process", nproc: "process",
+  // file (read-only) — blocked in local context
+  cat: "file", ls: "file", pwd: "file", stat: "file", file: "file",
+  find: "file", readlink: "file", realpath: "file", basename: "file", dirname: "file",
+  diff: "file", md5sum: "file", sha256sum: "file",
+  // diagnostic
+  // services
+  journalctl: "services", systemctl: "services",
+  timedatectl: "services", hostnamectl: "services",
+  // container
+  crictl: "container", ctr: "container",
+  // firewall
+  iptables: "firewall", ip6tables: "firewall",
+  // inspection — blocked in local context
+  lsof: "inspection", lsns: "inspection", strings: "inspection",
+  // compressed — blocked in local context
+  zcat: "compressed", zgrep: "compressed", bzcat: "compressed", xzcat: "compressed",
+  // activity
+  sar: "activity", blkid: "activity",
+  // stream
+  tee: "stream",
+  // general (env/printenv separated — blocked in local context)
+  date: "general", whoami: "general", id: "general", which: "general",
+  env: "general-env", printenv: "general-env",
+  // flow control
+  echo: "flow", printf: "flow", true: "flow", false: "flow",
+  sleep: "flow", wait: "flow", test: "flow", expr: "flow", seq: "flow",
+};
+
+/**
+ * Categories allowed per execution context.
+ * local:   agentbox / TUI process (no file/env access — use Read/Grep/Glob tools)
+ * node:    remote node via debug pod
+ * pod:     remote pod via kubectl exec
+ * nsenter: remote pod netns via debug pod
+ * ssh:     remote host via SSH (future)
+ */
+const ALL_REMOTE_CATEGORIES = [
+  "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+  "process", "file", "diagnostic", "services", "container", "firewall",
+  "inspection", "compressed", "activity", "stream", "general", "general-env",
+  "flow",
+] as const;
+
+export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = {
+  local: [
+    "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+    "process", "diagnostic", "services", "container", "firewall",
+    "activity", "stream", "general", "flow",
+  ],
+  node: [...ALL_REMOTE_CATEGORIES],
+  pod: [...ALL_REMOTE_CATEGORIES],
+  nsenter: [...ALL_REMOTE_CATEGORIES],
+  ssh: [...ALL_REMOTE_CATEGORIES],
+};
+
 // ── Declarative Command Rule Engine ──────────────────────────────
 
 /**

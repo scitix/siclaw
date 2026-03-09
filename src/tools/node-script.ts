@@ -1,69 +1,20 @@
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
-import { validateNodeName } from "./node-exec.js";
-import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
-import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
-import { sanitizeEnv } from "./sanitize-env.js";
+import { checkNodeReady } from "./k8s-checks.js";
 import { resolveScript } from "./script-resolver.js";
-import { processToolOutput, renderTextResult } from "./tool-render.js";
+import { renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
 import { parseArgs, shellEscape } from "./command-sets.js";
+import {
+  validateNodeName,
+  prepareExecEnv,
+  runInDebugPod,
+  formatExecOutput,
+} from "./exec-utils.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
-
-function spawnAsync(
-  cmd: string,
-  args: string[],
-  timeout: number,
-  env?: NodeJS.ProcessEnv,
-  signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env,
-    });
-    const onAbort = () => child.kill("SIGKILL");
-    signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-    }, timeout);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      if (code === 0) resolve({ stdout, stderr });
-      else
-        reject(
-          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }),
-        );
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(err);
-    });
-  });
-}
-
-function filterPodNoise(stderr: string): string {
-  return stderr
-    .split("\n")
-    .filter((line) => !line.match(/^pod "node-debug-.*" deleted$/))
-    .join("\n")
-    .trim();
-}
 
 interface NodeScriptParams {
   node: string;
@@ -132,13 +83,7 @@ Examples:
     }),
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeScriptParams;
-      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
-      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
-      const env = {
-        ...sanitizeEnv(process.env as Record<string, string>),
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-        KUBECONFIG: "/dev/null",
-      };
+      const env = prepareExecEnv(kubeconfigRef);
 
       // Validate node name format
       const nodeErr = validateNodeName(params.node);
@@ -150,7 +95,9 @@ Examples:
       }
 
       // Check node exists and is Ready
-      const nodeCheckErr = await checkNodeReady(params.node, env, kubeconfigPath ?? undefined);
+      const nodeCheckErr = await checkNodeReady(
+        params.node, env.childEnv, env.kubeconfigPath ?? undefined,
+      );
       if (nodeCheckErr) {
         return {
           content: [{ type: "text", text: `Error: ${nodeCheckErr}` }],
@@ -185,147 +132,25 @@ Examples:
         ? `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${escapedArgs}`
         : `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext}`;
 
-      const podId = randomBytes(4).toString("hex");
-      const podName = `node-debug-${podId}`;
+      const nsenterCmd = [
+        "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+        "--", "sh", "-c", innerCmd,
+      ];
 
-      const cleanup = () => {
-        spawnAsync(
-          "kubectl",
-          [...kubeconfigArgs, "delete", "pod", podName, "--force", "--grace-period=0"],
-          10_000,
-          env,
-        ).catch(() => {});
-      };
+      const execResult = await runInDebugPod(
+        { nodeName: params.node, command: nsenterCmd, image },
+        env,
+        { timeoutMs: timeout, signal },
+      );
 
-      const overrides = JSON.stringify({
-        spec: {
-          nodeName: params.node,
-          hostPID: true,
-          hostNetwork: true,
-          containers: [
-            {
-              name: podName,
-              image,
-              securityContext: { privileged: true },
-              command: [
-                "nsenter",
-                "-t",
-                "1",
-                "-m",
-                "-u",
-                "-i",
-                "-n",
-                "-p",
-                "--",
-                "sh",
-                "-c",
-                innerCmd,
-              ],
-            },
-          ],
-          restartPolicy: "Never",
-        },
-      });
-
-      try {
-        // Phase 1: Create pod
-        await spawnAsync(
-          "kubectl",
-          [
-            ...kubeconfigArgs,
-            "run",
-            podName,
-            "--restart=Never",
-            `--image=${image}`,
-            `--overrides=${overrides}`,
-          ],
-          30_000,
-          env,
-          signal,
-        );
-
-        // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
-        try {
-          await waitForPodDone(podName, timeout, env, signal, kubeconfigPath ?? undefined);
-        } catch {
-          // Timed out — still fetch logs before cleanup
-        }
-
-        if (signal?.aborted) {
-          cleanup();
-          return {
-            content: [{ type: "text", text: "Aborted." }],
-            details: { error: true },
-          };
-        }
-
-        // Phase 3: Fetch logs
-        let stdout = "";
-        let stderr = "";
-        try {
-          const logsResult = await spawnAsync(
-            "kubectl",
-            [...kubeconfigArgs, "logs", podName],
-            10_000,
-            env,
-          );
-          stdout = logsResult.stdout;
-          stderr = logsResult.stderr;
-        } catch (logErr: any) {
-          stdout = logErr.stdout ?? "";
-          stderr = logErr.stderr ?? "";
-        }
-
-        // Phase 4: Get exit code
-        let exitCode: number | null = null;
-        try {
-          const statusResult = await spawnAsync(
-            "kubectl",
-            [
-              ...kubeconfigArgs,
-              "get",
-              "pod",
-              podName,
-              "-o",
-              "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
-            ],
-            5_000,
-            env,
-          );
-          const code = parseInt(statusResult.stdout.trim(), 10);
-          if (!isNaN(code)) exitCode = code;
-        } catch {
-          // ignore
-        }
-
-        // Phase 5: Cleanup
-        cleanup();
-
-        const filteredStderr = filterPodNoise(stderr);
-        const output =
-          stdout.trim() +
-          (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
-
-        if (exitCode === 0 || (exitCode === null && stdout.trim())) {
-          return {
-            content: [{ type: "text", text: processToolOutput(output) }],
-            details: { exitCode: exitCode ?? 0 },
-          };
-        } else {
-          const errOutput = `Exit code: ${exitCode ?? "unknown"}\n${output}`;
-          return {
-            content: [{ type: "text", text: processToolOutput(errOutput) }],
-            details: { exitCode, error: true },
-          };
-        }
-      } catch (err: any) {
-        cleanup();
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+      if (signal?.aborted) {
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
-          details: { exitCode: err.code, error: true },
+          content: [{ type: "text", text: "Aborted." }],
+          details: { error: true },
         };
       }
+
+      return formatExecOutput(execResult);
     },
   };
 }
