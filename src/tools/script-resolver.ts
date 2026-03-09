@@ -116,7 +116,7 @@ export function skillExistsInBundle(skillName: string): boolean {
   const directDir = path.join(base, skillName);
   if (fs.existsSync(directDir) && fs.statSync(directDir).isDirectory()) return true;
   // Scope subdirectory layout
-  for (const scopeDir of ["user", "team"]) {
+  for (const scopeDir of ["user", "extension", "team"]) {
     const dir = path.join(base, scopeDir, skillName);
     if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
   }

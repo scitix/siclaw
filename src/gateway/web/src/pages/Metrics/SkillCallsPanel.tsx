@@ -32,7 +32,9 @@ export function SkillCallsPanel({ topSkills }: SkillCallsPanelProps) {
 
     // Scope aggregation for distribution bar
     const byScope = { builtin: 0, team: 0, personal: 0 };
-    for (const s of topSkills) byScope[s.scope] += s.total;
+    for (const s of topSkills) {
+        if (s.scope in byScope) byScope[s.scope as keyof typeof byScope] += s.total;
+    }
 
     return (
         <div className="rounded-2xl border border-gray-200 bg-white p-5">

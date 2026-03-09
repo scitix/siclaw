@@ -87,6 +87,9 @@ const wsConnections = new Gauge({
 });
 
 // ── Skill metrics ──
+// NOTE: siclaw_skill_calls_total uses skill_name label which is unbounded.
+// If personal skill count grows large, consider dropping this counter and
+// relying solely on the low-cardinality siclaw_skill_calls_by_scope_total.
 
 const skillCallsTotal = new Counter({
   name: "siclaw_skill_calls_total",
