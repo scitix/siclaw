@@ -7,7 +7,8 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
 import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
-import { needsSetup, printSetupInstructions } from "./cli-setup.js";
+import { needsSetup } from "./cli-setup.js";
+import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionMemory } from "./memory/session-summarizer.js";
 import type { BrainType } from "./core/brain-session.js";
 
@@ -21,11 +22,12 @@ const brainIndex = args.indexOf("--brain");
 const brainArg = brainIndex >= 0 ? args[brainIndex + 1] : undefined;
 const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk" : undefined;
 
-// P0: Setup — if no LLM config, print instructions and exit
-// (Model provider setup is now available in-session via /setup)
+// P0: First-run setup — if no LLM config, run interactive wizard
 if (needsSetup()) {
-  printSetupInstructions();
-  process.exit(1);
+  const ok = await runFirstRunSetup();
+  if (!ok || needsSetup()) {
+    process.exit(1);
+  }
 }
 
 // LLM config validation — warn early about issues
@@ -91,7 +93,11 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
   console.log(parts.join(" | "));
 
   if (credCount === 0) {
-    console.log("Tip: Use /setup to add kubeconfig, SSH, or API credentials");
+    console.log("\n┌─────────────────────────────────────────────────┐");
+    console.log("│  No credentials configured.                     │");
+    console.log("│  Use /setup → Credentials to add kubeconfig,    │");
+    console.log("│  SSH keys, or API tokens for diagnostics.       │");
+    console.log("└─────────────────────────────────────────────────┘");
   }
 }
 

@@ -1,5 +1,13 @@
 #!/usr/bin/env node
 
+// Suppress Node.js experimental warnings (node:sqlite)
+process.removeAllListeners("warning");
+const _origEmit = process.emit;
+process.emit = function (event, ...args) {
+  if (event === "warning" && args[0]?.name === "ExperimentalWarning") return false;
+  return _origEmit.apply(this, [event, ...args]);
+};
+
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

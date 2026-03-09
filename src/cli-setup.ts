@@ -149,14 +149,9 @@ function askSelect(rl: readline.Interface, prompt: string, options: string[]): P
 // ---------------------------------------------------------------------------
 
 /**
- * Returns true if the user has no usable LLM configuration:
- * - No SICLAW_API_KEY / SICLAW_LLM_API_KEY env var, AND
- * - No settings.json with providers
+ * Returns true if the user has no usable LLM configuration in settings.json.
  */
 export function needsSetup(): boolean {
-  // Env vars are sufficient — no settings.json needed
-  if (process.env.SICLAW_API_KEY || process.env.SICLAW_LLM_API_KEY) return false;
-
   const configPath = getConfigPath();
   if (!fs.existsSync(configPath)) return true;
 
@@ -182,15 +177,7 @@ export function needsSetup(): boolean {
 export function printSetupInstructions(): void {
   console.error(`
   No LLM provider configured.
-
-  Option 1 — environment variables (recommended):
-
-    export SICLAW_API_KEY=sk-...
-    export SICLAW_BASE_URL=https://api.openai.com/v1  # or your provider's URL
-    export SICLAW_MODEL=gpt-4o                         # optional
-    siclaw
-
-  Once inside the TUI, use /setup to add credentials and manage providers.
+  Run \`siclaw\` to start the setup wizard, or edit .siclaw/config/settings.json directly.
 `);
 }
 
