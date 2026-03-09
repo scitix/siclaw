@@ -7,6 +7,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
+import { useWorkspace } from '@/contexts/WorkspaceContext';
 
 
 export function PilotPage() {
@@ -14,6 +15,7 @@ export function PilotPage() {
     const [panelMessage, setPanelMessage] = useState<PilotMessage | null>(null);
     const navigate = useNavigate();
     const pilot = usePilot();
+    const { currentWorkspace } = useWorkspace();
 
     // Track which tool content we've already auto-opened the panel for
     // Uses content hash instead of message ID (IDs change when DB ID replaces temp ID)
@@ -192,6 +194,7 @@ export function PilotPage() {
                         onSkillSaved={handleSkillSaved}
                         onOpenSkillPanel={handleOpenSkillPanel}
                         onOpenSchedulePanel={handleOpenSkillPanel}
+                        selectedEnvId={currentWorkspace?.id ?? null}
                         panelMessage={panelMessage}
                         updateMessageMeta={pilot.updateMessageMeta}
                         pendingMessages={pilot.pendingMessages}
@@ -235,7 +238,7 @@ export function PilotPage() {
                             onDismiss={handlePanelDismiss}
                             onClose={() => setPanelMessage(null)}
                             updateMessageMeta={pilot.updateMessageMeta}
-                            selectedEnvId={undefined}
+                            selectedEnvId={currentWorkspace?.id ?? null}
                         />
                     );
                 }
