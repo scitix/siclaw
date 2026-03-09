@@ -372,13 +372,6 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     sdb.run(sql.raw(ddl));
   }
 
-  // Column migrations (idempotent — ignore if column already exists)
-  try {
-    sdb.run(sql.raw("ALTER TABLE session_stats ADD COLUMN skill_call_count INTEGER DEFAULT 0"));
-  } catch {
-    // Column already exists (re-run of migration)
-  }
-
   // Trigger: auto-update updated_at on mcp_servers UPDATE (mirrors MySQL ON UPDATE CURRENT_TIMESTAMP)
   sdb.run(sql.raw(`
     CREATE TRIGGER IF NOT EXISTS trg_mcp_servers_updated_at
