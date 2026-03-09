@@ -91,7 +91,8 @@ Two users exist inside the AgentBox container:
 | `sandbox` | 1001 | `sandbox` | All child processes (shell commands). No credential access. |
 
 The main process (Node.js) runs as `agentbox`. When executing shell commands, it uses
-`runuser -u sandbox -- bash -c "<command>"` to drop to the `sandbox` user.
+`sudo -E -u sandbox -- bash -c '<command>'` to drop to the `sandbox` user. The `-E` flag
+preserves the sanitized environment (allowed by `SETENV` in sudoers).
 
 ### 3.2 setgid kubectl
 
@@ -160,7 +161,7 @@ The dual-user model preserves natural shell pipeline syntax:
 
 ```bash
 # sandbox runs the entire pipeline; kubectl gains kubecred via setgid
-runuser -u sandbox -- bash -c "kubectl get pods -A | grep Error | wc -l"
+sudo -E -u sandbox -- bash -c 'kubectl get pods -A | grep Error | wc -l'
 ```
 
 `kubectl` (setgid kubecred) reads the kubeconfig. `grep` and `wc` (plain sandbox) cannot.
@@ -168,44 +169,64 @@ The pipe passes stdout data, not file access permissions.
 
 ### 3.5 Dockerfile Changes
 
+Key excerpts from `Dockerfile.agentbox` (see full file for build stage and other details):
+
 ```dockerfile
 FROM node:22-slim
 
-# Create groups and users
-RUN groupadd kubecred && \
-    groupadd sandbox && \
-    useradd -m -s /bin/bash -G kubecred agentbox && \
-    useradd -r -s /bin/false -g sandbox sandbox
+# System deps including sudo (for agentbox→sandbox user switching)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq python3 ca-certificates sudo && rm -rf /var/lib/apt/lists/*
 
-# Install kubectl with setgid
-COPY --from=bitnami/kubectl:latest /opt/bitnami/kubectl/bin/kubectl /usr/local/bin/kubectl
-RUN chgrp kubecred /usr/local/bin/kubectl && \
-    chmod 2755 /usr/local/bin/kubectl
+# Pin UIDs/GIDs for K8s securityContext compatibility
+RUN userdel -r node 2>/dev/null || true \
+    && groupadd --gid 1002 kubecred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred agentbox \
+    && useradd --uid 1001 -M -s /bin/false sandbox
 
-# Set credential permissions (entrypoint also enforces this)
-RUN mkdir -p /home/agentbox/.siclaw/credentials && \
-    chown agentbox:kubecred /home/agentbox/.siclaw/credentials && \
-    chmod 0750 /home/agentbox/.siclaw/credentials
+# sudoers: agentbox can run commands as sandbox (child process isolation)
+# SETENV allows -E flag to preserve sanitized environment
+RUN echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
+    && chmod 440 /etc/sudoers.d/sandbox-exec
 
-# Application code & skills: owned by agentbox, world-readable (sandbox can read)
-# COPY steps already produce agentbox-owned files when USER is set
-COPY --chown=agentbox:agentbox skills/ /app/skills/
-RUN chmod -R o+rX /app/ /app/skills/
+# kubectl setgid: sandbox user gains kubecred group when running kubectl
+RUN chgrp kubecred /usr/local/bin/kubectl && chmod 2755 /usr/local/bin/kubectl
 
-# User data: sandbox-writable (the only writable area for child processes)
-RUN mkdir -p /home/agentbox/.siclaw/user-data && \
-    chown agentbox:agentbox /home/agentbox/.siclaw/user-data && \
-    chmod 0777 /home/agentbox/.siclaw/user-data
+# Directory structure & permissions
+RUN mkdir -p .siclaw/skills .siclaw/credentials .siclaw/config .siclaw/user-data \
+    && chown -R agentbox:agentbox . \
+    && chown agentbox:kubecred .siclaw/credentials \
+    && chmod 0750 .siclaw/credentials \
+    && chmod 0700 .siclaw/config \
+    && chmod 0755 .siclaw/skills \
+    && chmod 0777 .siclaw/user-data
 
-USER agentbox
+# Strip all SUID except sudo; verify only kubectl has SGID
+RUN find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
+      case "$f" in /usr/bin/sudo) ;; *) chmod u-s "$f" ;; esac; done
+
+# Container starts as root — entrypoint fixes volume permissions then drops to agentbox
+ENTRYPOINT ["/usr/local/bin/agentbox-entrypoint.sh"]
+CMD ["node", "dist/agentbox-main.js"]
 ```
+
+**Why no `USER agentbox` directive**: The entrypoint must run as root to fix emptyDir volume
+permissions (chown/chmod), then drops to agentbox via `exec runuser -u agentbox -- "$@"`.
+The agentbox user then uses `sudo` (with its SUID bit) to run child processes as sandbox.
 
 ### 3.6 Code Changes
 
-In `src/tools/restricted-bash.ts`, the `exec()` call wraps commands with `runuser`:
+In `src/tools/restricted-bash.ts`, the `exec()` call wraps commands with `sudo` in production:
 
 ```typescript
-const finalCommand = `runuser -u sandbox -- bash -c ${shellEscape(command)}`;
+// In production (K8s pods), run child processes as sandbox user.
+// sudo's SUID elevates to root, then drops to sandbox.
+// -E preserves our sanitized env (allowed by SETENV in sudoers).
+let execCommand = finalCommand;
+if (process.env.NODE_ENV === "production") {
+  const escaped = finalCommand.replace(/'/g, "'\\''");
+  execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+}
 ```
 
 The `KUBECONFIG` environment variable is still set (kubectl reads it), but the kubeconfig
@@ -310,33 +331,50 @@ However, they remain as defense-in-depth.
 ```yaml
 spec:
   securityContext:
-    runAsNonRoot: false          # Main process needs runuser (requires root or CAP_SETUID)
     seccompProfile:
       type: RuntimeDefault
+  initContainers:
+  - name: init-permissions         # Fixes emptyDir ownership as root
+    securityContext:
+      runAsUser: 0
   containers:
   - name: agentbox
     securityContext:
       capabilities:
         drop: ["ALL"]
-        add: ["SETUID", "SETGID"]  # Required for runuser -u sandbox
+        add: ["SETUID", "SETGID"]  # Required for sudo -u sandbox
       readOnlyRootFilesystem: true
     volumeMounts:
     - name: tmp
       mountPath: /tmp
-    - name: siclaw-data
-      mountPath: /home/agentbox/.siclaw
+    - name: credentials
+      mountPath: /app/.siclaw/credentials
+    - name: skills-local
+      mountPath: /app/.siclaw/skills
+    - name: user-data
+      mountPath: /app/.siclaw/user-data
   volumes:
   - name: tmp
     emptyDir:
       sizeLimit: 100Mi
+  - name: credentials
+    emptyDir: {}
+  - name: skills-local
+    emptyDir: {}
+  - name: user-data
+    emptyDir: {}
 ```
+
+**Why `readOnlyRootFilesystem`**: Prevents filesystem tampering if the agent process is
+compromised. All writable paths are explicit emptyDir mounts. `sudo` with `NOPASSWD`
+does not need timestamp caching, so no additional writable paths are needed for it.
 
 ### 5.2 Capability Justification
 
 | Capability | Why needed | Risk |
 |------------|-----------|------|
-| `SETUID` | `runuser -u sandbox` requires switching effective UID | Low — only used to drop privileges, not gain them |
-| `SETGID` | `runuser` also switches GID; kubectl setgid requires kernel enforcement | Low — setgid only grants kubecred group |
+| `SETUID` | `sudo`'s SUID bit requires this cap to switch effective UID (agentbox → sandbox) | Low — only used to drop privileges, not gain them |
+| `SETGID` | `sudo` also switches GID; kubectl's setgid bit requires kernel enforcement | Low — setgid only grants kubecred group |
 | All others | Dropped | N/A |
 
 ### 5.3 What Is Blocked
@@ -447,7 +485,7 @@ certificates and tokens in plaintext.
 | Node.js RCE (prototype pollution) | Medium — if LLM triggers Node.js vulnerability, gains agentbox user | agentbox can read kubeconfig (by design), but K8s RBAC limits cluster access |
 | kubectl vulnerability | Low — static Go binary, read-only ops, limited subcommands | Keep kubectl updated |
 | `/proc/self/environ` in child | Blocked — `sanitizeEnv()` strips secrets | Layer 5 |
-| SUID/SGID binary exploitation | Blocked — `readOnlyRootFilesystem: true`, no SUID binaries in image | Layer 3 |
+| SUID/SGID binary exploitation | Mitigated — `readOnlyRootFilesystem: true`, only `/usr/bin/sudo` retains SUID (required for user switching), all others stripped | Layer 3 |
 | Container runtime escape | Very low — standard containerd/runc, non-root child processes | Infrastructure concern, not app-level |
 | Network exfiltration | Medium — sandbox can reach network | `curl -d` blocked (Layer 2); Network Policy recommended |
 | Mount namespace manipulation | Blocked — `CAP_SYS_ADMIN` dropped | Layer 3 |
@@ -505,43 +543,47 @@ spec:
 
 ### 10.1 Dockerfile
 
-- [ ] Create `kubecred` and `sandbox` groups/users
-- [ ] Install kubectl with `chmod 2755` + `chgrp kubecred`
-- [ ] Credential dirs: `agentbox:kubecred 0750` (sandbox: no access, kubectl: read via group)
-- [ ] Config/cert files: `agentbox:agentbox 0600` (sandbox: no access)
-- [ ] Skills dirs: `agentbox:agentbox 0755/0644` (sandbox: read-only)
-- [ ] App code: `agentbox:agentbox 0755/0644` (sandbox: read-only)
-- [ ] User data dir: `agentbox:agentbox 0777` (sandbox: read-write — the only writable area)
-- [ ] Verify no SUID binaries in final image: `find / -perm /4000 -type f`
+- [x] Create `kubecred` (GID 1002), `agentbox` (UID 1000), `sandbox` (UID 1001)
+- [x] Install `sudo` + sudoers: `agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL`
+- [x] Install kubectl with `chmod 2755` + `chgrp kubecred`
+- [x] Credential dirs: `agentbox:kubecred 0750` (sandbox: no access, kubectl: read via group)
+- [x] Config: `agentbox:agentbox 0700` (sandbox: no access)
+- [x] Skills dirs: `agentbox:agentbox 0755/0644` (sandbox: read-only)
+- [x] App code: `agentbox:agentbox 0755/0644` (sandbox: read-only via `chmod -R o+rX`)
+- [x] User data dir: `agentbox:agentbox 0777` (sandbox: read-write — the only writable area)
+- [x] Strip all SUID except `/usr/bin/sudo`; verify only kubectl has SGID
+- [x] Entrypoint: fixes volume permissions as root, drops to agentbox via `runuser`
 
 ### 10.2 K8s Manifests
 
-- [ ] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID"] }`
-- [ ] Add `readOnlyRootFilesystem: true` with emptyDir for `/tmp`
-- [ ] Add `seccompProfile: { type: RuntimeDefault }`
-- [ ] Keep `automountServiceAccountToken: false`
+- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID"] }`
+- [x] Add `seccompProfile: { type: RuntimeDefault }`
+- [x] Add initContainer for volume permission fixing
+- [x] Kubeconfig mounted into credentials emptyDir (0640 agentbox:kubecred)
+- [x] Keep `automountServiceAccountToken: false`
+- [x] Add `readOnlyRootFilesystem: true` with emptyDir for `/tmp`
 - [ ] Deploy NetworkPolicy for egress restriction
 
 ### 10.3 Application Code
 
-- [ ] `restricted-bash.ts`: Wrap commands with `runuser -u sandbox --`
-- [ ] Verify `sanitizeEnv()` still strips all sensitive vars (Layer 5 remains)
-- [ ] Verify `assertPathAllowed()` still scopes file tools (Layer 4 remains)
-- [ ] Entrypoint script: enforce file permissions on startup (defense against volume mount issues)
+- [x] `restricted-bash.ts`: Wrap commands with `sudo -E -u sandbox --` in production
+- [x] Verify `sanitizeEnv()` still strips all sensitive vars (Layer 5 remains)
+- [x] Verify `assertPathAllowed()` still scopes file tools (Layer 4 remains)
+- [x] Entrypoint script: enforce file permissions on startup (best-effort in K8s, full in standalone Docker)
 
 ### 10.4 Validation
 
-File permission verification:
-- [ ] Sandbox cannot read credentials: `runuser -u sandbox -- cat .siclaw/credentials/*.kubeconfig` → Permission denied
-- [ ] Sandbox cannot read config: `runuser -u sandbox -- cat .siclaw/config/settings.json` → Permission denied
-- [ ] Sandbox cannot write skills: `runuser -u sandbox -- touch skills/core/test` → Permission denied
-- [ ] Sandbox cannot write app code: `runuser -u sandbox -- touch /app/test` → Permission denied
-- [ ] Sandbox **can** read skills: `runuser -u sandbox -- cat skills/core/cluster-events/SKILL.md` → Success
-- [ ] Sandbox **can** write user-data: `runuser -u sandbox -- touch .siclaw/user-data/test` → Success
+File permission verification (run inside agentbox container):
+- [ ] Sandbox cannot read credentials: `sudo -u sandbox cat .siclaw/credentials/*.kubeconfig` → Permission denied
+- [ ] Sandbox cannot read config: `sudo -u sandbox cat .siclaw/config/settings.json` → Permission denied
+- [ ] Sandbox cannot write skills: `sudo -u sandbox touch skills/core/test` → Permission denied
+- [ ] Sandbox cannot write app code: `sudo -u sandbox touch /app/test` → Permission denied
+- [ ] Sandbox **can** read skills: `sudo -u sandbox cat skills/core/cluster-events/SKILL.md` → Success
+- [ ] Sandbox **can** write user-data: `sudo -u sandbox touch .siclaw/user-data/test` → Success
 
 Functional verification:
-- [ ] kubectl can read kubeconfig (setgid): `runuser -u sandbox -- kubectl get pods` → Success
-- [ ] grep cannot read kubeconfig: `runuser -u sandbox -- grep "" .siclaw/credentials/*.kubeconfig` → Permission denied
-- [ ] Pipeline works: `runuser -u sandbox -- bash -c "kubectl get pods | grep Error"` → Success
-- [ ] No SUID binaries: `runuser -u sandbox -- find / -perm /4000 -type f` → Empty
+- [ ] kubectl can read kubeconfig (setgid): `sudo -u sandbox kubectl get pods` → Success
+- [ ] grep cannot read kubeconfig: `sudo -u sandbox grep "" .siclaw/credentials/*.kubeconfig` → Permission denied
+- [ ] Pipeline works: `sudo -E -u sandbox bash -c 'kubectl get pods | grep Error'` → Success
+- [ ] Only sudo has SUID: `find / -perm /4000 -type f ! -path '/proc/*'` → `/usr/bin/sudo`
 - [ ] Run full test suite: `npm test`

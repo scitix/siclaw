@@ -282,7 +282,7 @@ Options considered:
 **Decision**:
 Adopt dual-user model with setgid kubectl:
 - Main process runs as `agentbox` (UID 1000, groups: agentbox + kubecred)
-- Child processes run as `sandbox` (UID 1001, group: sandbox) via `runuser -u sandbox`
+- Child processes run as `sandbox` (UID 1001, group: sandbox) via `sudo -E -u sandbox`
 - kubectl binary has setgid bit for `kubecred` group (`chmod 2755`, `chgrp kubecred`)
 - Kubeconfig files: `agentbox:kubecred 0640` (readable by agentbox and kubectl, not by sandbox)
 - Other credentials: `agentbox:agentbox 0600` (readable only by agentbox)
@@ -297,9 +297,9 @@ Application-level command validation (COMMAND_RULES, whitelist, shell operator b
 - ✅ Application-level rules become secondary defense, not sole defense
 - ✅ `sanitizeEnv()` still needed (env vars are in-memory, not file-based)
 - ⚠️ Container needs `CAP_SETUID` + `CAP_SETGID` — all other capabilities dropped
-- ⚠️ `allowPrivilegeEscalation` must be true for setgid to work (but no SUID binaries exist)
+- ⚠️ `allowPrivilegeEscalation` must be true for sudo's SUID and kubectl's setgid to work
 - ⚠️ Node.js process compromise (agentbox user) still grants kubeconfig access — mitigate with K8s RBAC scope
-- ❌ Adds ~2ms overhead per command execution (runuser fork)
+- ❌ Adds ~2ms overhead per command execution (sudo fork)
 
 **Full design**: `docs/design/security.md`
 
