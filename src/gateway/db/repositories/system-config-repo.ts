@@ -14,6 +14,7 @@ import { isUniqueViolation } from "../dialect-helpers.js";
 const SENSITIVE_KEYS = new Set([
   "jwt.secret",
   "sso.clientSecret",
+  "metrics.token",
   "ca.cert",
   "ca.key",
 ]);

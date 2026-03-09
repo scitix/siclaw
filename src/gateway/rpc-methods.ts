@@ -3606,6 +3606,7 @@ export function createRpcMethods(
     const ALLOWED_SECTIONS: Record<string, string[]> = {
       sso: ["sso.enabled", "sso.issuer", "sso.clientId", "sso.clientSecret", "sso.redirectUri"],
       system: ["system.baseUrl", "system.platformUrl", "system.agentboxImage", "system.grafanaUrl"],
+      metrics: ["metrics.port", "metrics.token", "metrics.includeUserId"],
     };
 
     const allowedKeys = ALLOWED_SECTIONS[section];

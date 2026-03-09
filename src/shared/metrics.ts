@@ -16,8 +16,8 @@ import { onDiagnostic, type DiagnosticEvent } from "./diagnostic-events.js";
  * Returns true if the request is authorized (or no token is configured).
  * Returns false and sends 401 response if unauthorized.
  */
-export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  const token = process.env.SICLAW_METRICS_TOKEN;
+export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResponse, configuredToken?: string): boolean {
+  const token = configuredToken || process.env.SICLAW_METRICS_TOKEN;
   if (token && req.headers.authorization !== `Bearer ${token}`) {
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Unauthorized" }));
@@ -28,8 +28,13 @@ export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResp
 
 export const metricsRegistry = new Registry();
 
-/** Whether to include user_id label on token/cost metrics */
-const INCLUDE_USER_ID = process.env.SICLAW_METRICS_USER_ID !== "false";
+/** Whether to include user_id label on token/cost metrics (dynamic, refreshable) */
+let includeUserId = process.env.SICLAW_METRICS_USER_ID !== "false";
+
+/** Update the includeUserId flag at runtime (called by Gateway when DB config changes) */
+export function setIncludeUserId(value: boolean): void {
+  includeUserId = value;
+}
 
 // ── Phase 1: Core metrics (7) ──
 
@@ -125,7 +130,7 @@ function handleDiagnostic(event: DiagnosticEvent): void {
       const dCacheRead = curr.tokens.cacheRead - prev.tokens.cacheRead;
       const dCacheWrite = curr.tokens.cacheWrite - prev.tokens.cacheWrite;
 
-      const baseLabels = INCLUDE_USER_ID && userId
+      const baseLabels = includeUserId && userId
         ? { provider, model: modelId, user_id: userId }
         : { provider, model: modelId };
 

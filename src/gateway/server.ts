@@ -152,6 +152,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   // Config repo for webhook route
   const configRepo = db ? new ConfigRepository(db) : null;
 
+  // System config repo (used by JWT, SSO, cert-manager, metrics cache, etc.)
+  const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
+
   // Clean orphan model entries on startup
   if (db) {
     const modelConfigRepo = new ModelConfigRepository(db);
@@ -160,9 +163,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
   // Workspace repo (used by internal API to resolve default workspace)
   const internalWorkspaceRepo = db ? new WorkspaceRepository(db) : null;
-
-  // System config repo (used by JWT, SSO, cert-manager, etc.)
-  const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
 
   // Initialize Certificate Manager for mTLS (CA persisted in DB)
   const certManager = await CertificateManager.create(sysConfigRepo);
@@ -212,26 +212,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   }
   if (db) metricsAggregator.setDb(db);
 
-  // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator);
-
-  // Wrap system.saveSection to refresh CSP cache when grafanaUrl changes
-  const origSaveSection = rpcMethods.get("system.saveSection");
-  if (origSaveSection) {
-    rpcMethods.set("system.saveSection", async (params, context) => {
-      const result = await origSaveSection(params, context);
-      if ((params as { section?: string }).section === "system") {
-        await refreshCspCache();
-      }
-      return result;
-    });
-  }
-
-  // Wire skill bundle provider into LocalSpawner (getSkillBundle comes from createRpcMethods)
-  if (localSpawner) {
-    localSpawner.setSkillBundleProvider(getSkillBundle);
-  }
-
   // Apply DB-stored agentbox image override (takes effect on next pod spawn)
   if (sysConfigRepo) {
     const img = await sysConfigRepo.get("system.agentboxImage");
@@ -250,6 +230,43 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     }
   };
   await refreshCspCache();
+
+  // Metrics config cache — Gateway reads from DB, falls back to env var
+  let cachedMetricsToken: string | undefined;
+  const refreshMetricsConfig = async () => {
+    if (!sysConfigRepo) return;
+    try {
+      cachedMetricsToken = (await sysConfigRepo.get("metrics.token")) ?? undefined;
+    } catch { /* keep previous cachedMetricsToken */ }
+    try {
+      const userIdVal = await sysConfigRepo.get("metrics.includeUserId");
+      if (userIdVal !== null) {
+        const { setIncludeUserId } = await import("../shared/metrics.js");
+        setIncludeUserId(userIdVal !== "false");
+      }
+    } catch { /* keep previous includeUserId */ }
+  };
+  await refreshMetricsConfig();
+
+  // Create RPC methods using AgentBoxManager
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator);
+
+  // Wrap system.saveSection to refresh caches when settings change
+  const origSaveSection = rpcMethods.get("system.saveSection");
+  if (origSaveSection) {
+    rpcMethods.set("system.saveSection", async (params, context) => {
+      const result = await origSaveSection(params, context);
+      const section = (params as { section?: string }).section;
+      if (section === "system") await refreshCspCache();
+      if (section === "metrics") await refreshMetricsConfig();
+      return result;
+    });
+  }
+
+  // Wire skill bundle provider into LocalSpawner (getSkillBundle comes from createRpcMethods)
+  if (localSpawner) {
+    localSpawner.setSkillBundleProvider(getSkillBundle);
+  }
 
   // Auth setup — auto-generate JWT secret on first run if not provided
   const jwtSecret = await resolveJwtSecret(sysConfigRepo);
@@ -430,7 +447,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
     // Prometheus metrics endpoint
     if (url === "/metrics" && method === "GET") {
-      if (!checkMetricsAuth(req, res)) return;
+      if (!checkMetricsAuth(req, res, cachedMetricsToken)) return;
       (async () => {
         try {
           const { metricsRegistry } = await import("../shared/metrics.js");
@@ -1083,8 +1100,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     console.log(`[gateway] Listening on http://${config.host}:${config.port}`);
     console.log(`[gateway] Web UI: http://${config.host}:${config.port}/`);
     console.log(`[gateway] WebSocket: ws://${config.host}:${config.port}/ws`);
-    if (!process.env.SICLAW_METRICS_TOKEN) {
-      console.warn(`[gateway] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated`);
+    if (!cachedMetricsToken && !process.env.SICLAW_METRICS_TOKEN) {
+      console.warn(`[gateway] WARNING: metrics token is not configured — /metrics endpoint is unauthenticated`);
     }
   });
 

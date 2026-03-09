@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Save, Loader2, ShieldCheck, Globe, KeyRound } from 'lucide-react';
+import { Save, Loader2, ShieldCheck, Globe, KeyRound, BarChart3 } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
 
@@ -49,6 +49,16 @@ const SECTIONS: SectionConfig[] = [
             { key: 'platformUrl', label: 'Platform URL', type: 'text', placeholder: 'https://your-platform-url' },
             { key: 'agentboxImage', label: 'AgentBox Image', type: 'text', placeholder: 'siclaw-agentbox:latest' },
             { key: 'grafanaUrl', label: 'Grafana URL', type: 'text', placeholder: 'https://grafana.example.com/d/siclaw/overview?kiosk' },
+        ],
+    },
+    {
+        key: 'metrics',
+        title: 'Metrics & Monitoring',
+        icon: BarChart3,
+        fields: [
+            { key: 'port', label: 'Metrics Port (AgentBox only)', type: 'text', placeholder: '9090' },
+            { key: 'token', label: 'Bearer Token', type: 'password', writeOnly: true },
+            { key: 'includeUserId', label: 'Include User ID in Metrics', type: 'toggle' },
         ],
     },
 ];
