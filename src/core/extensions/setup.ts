@@ -289,7 +289,12 @@ async function addSshPassword(
   const password = await ctx.ui.input("Password");
   if (!password) return;
 
-  registerSshPassword(credentialsDir, { name, host, port, username, password });
+  try {
+    registerSshPassword(credentialsDir, { name, host, port, username, password });
+  } catch (err) {
+    ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
   ctx.ui.notify(`SSH password credential "${name}" added`);
 }
 
@@ -332,7 +337,12 @@ async function addApiToken(
   const token = await ctx.ui.input("Token");
   if (!token) return;
 
-  registerApiToken(credentialsDir, { name, url: url || undefined, token });
+  try {
+    registerApiToken(credentialsDir, { name, url: url || undefined, token });
+  } catch (err) {
+    ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
   ctx.ui.notify(`API token credential "${name}" added`);
 }
 
@@ -348,9 +358,14 @@ async function addApiBasicAuth(
   const password = await ctx.ui.input("Password");
   if (!password) return;
 
-  registerApiBasicAuth(credentialsDir, {
-    name, url: url || undefined, username, password,
-  });
+  try {
+    registerApiBasicAuth(credentialsDir, {
+      name, url: url || undefined, username, password,
+    });
+  } catch (err) {
+    ctx.ui.notify(err instanceof Error ? err.message : String(err), "error");
+    return;
+  }
   ctx.ui.notify(`API basic auth credential "${name}" added`);
 }
 

@@ -202,7 +202,7 @@ if (isPrintMode && initialMessage) {
 // Auto-save session memory (mirrors AgentBox release flow)
 if (session.sessionFile) {
   const sessionDir = path.dirname(session.sessionFile);
-  const memoryDir = path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory");
+  const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {
     const saved = await saveSessionMemory({ sessionDir, memoryDir });
     if (saved) {
