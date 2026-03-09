@@ -393,11 +393,12 @@ async function handleRemoveCredential(
     return;
   }
 
-  const names = entries.map((e) => `${e.name} (${e.type})`);
-  const selected = await ctx.ui.select("Remove credential", names);
+  const labels = entries.map((e) => `${e.name} (${e.type})`);
+  const selected = await ctx.ui.select("Remove credential", labels);
   if (!selected) return;
 
-  const name = selected.split(" (")[0];
+  const idx = labels.indexOf(selected);
+  const name = entries[idx].name;
 
   const confirmed = await ctx.ui.confirm(
     "Confirm removal",
@@ -414,30 +415,35 @@ async function handleRemoveCredential(
 }
 
 // ---------------------------------------------------------------------------
-// Config write helper
+// Config read/write helpers
 // ---------------------------------------------------------------------------
 
-function saveProviderToConfig(providerName: string, provider: ProviderConfig): void {
+/** Read the raw settings.json (not merged with defaults like loadConfig). */
+function readRawConfig(): Partial<SiclawConfig> {
   const configPath = getConfigPath();
-  let existing: Partial<SiclawConfig> = {};
-  if (fs.existsSync(configPath)) {
-    try {
-      existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    } catch { /* start fresh */ }
+  try {
+    return JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch {
+    return {};
   }
+}
 
-  const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
-  providers[providerName] = provider;
-
+/** Write a partial config object back to settings.json and reload cache. */
+function writeRawConfig(config: Partial<SiclawConfig>): void {
+  const configPath = getConfigPath();
   const configDir = path.dirname(configPath);
   if (!fs.existsSync(configDir)) {
     fs.mkdirSync(configDir, { recursive: true });
   }
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
-  );
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
   reloadConfig();
+}
+
+function saveProviderToConfig(providerName: string, provider: ProviderConfig): void {
+  const existing = readRawConfig();
+  const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
+  providers[providerName] = provider;
+  writeRawConfig({ ...existing, providers });
 }
 
 // ---------------------------------------------------------------------------
@@ -509,26 +515,12 @@ async function handleSetDefault(
   if (!choice) return;
 
   // Write to config
-  const configPath = getConfigPath();
-  let existing: Partial<SiclawConfig> = {};
-  try {
-    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch { /* ignore */ }
-
+  const existing = readRawConfig();
   (existing as any).default = {
     provider: choice.provider,
     modelId: choice.modelId,
   };
-
-  const configDir = path.dirname(configPath);
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
-  }
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify(existing, null, 2) + "\n",
-  );
-  reloadConfig();
+  writeRawConfig(existing);
 
   ctx.ui.notify(`Default set to: ${choice.provider} / ${choice.modelId}\nRestart session to activate.`);
 }
@@ -548,15 +540,15 @@ async function handleRemoveProvider(
     return;
   }
 
-  const names = entries.map(([name, p]) => {
+  const labels = entries.map(([name, p]) => {
     const model = p.models[0]?.name || p.models[0]?.id || "?";
     return `${name} (${model})`;
   });
 
-  const selected = await ctx.ui.select("Remove provider", names);
+  const selected = await ctx.ui.select("Remove provider", labels);
   if (!selected) return;
 
-  const providerName = selected.split(" (")[0];
+  const providerName = entries[labels.indexOf(selected)][0];
 
   const confirmed = await ctx.ui.confirm(
     "Confirm removal",
@@ -564,12 +556,7 @@ async function handleRemoveProvider(
   );
   if (!confirmed) return;
 
-  const configPath = getConfigPath();
-  let existing: Partial<SiclawConfig> = {};
-  try {
-    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch { /* start fresh */ }
-
+  const existing = readRawConfig();
   const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
   delete providers[providerName];
 
@@ -578,11 +565,7 @@ async function handleRemoveProvider(
     delete existing.default;
   }
 
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
-  );
-  reloadConfig();
+  writeRawConfig({ ...existing, providers });
 
   ctx.ui.notify(`Provider "${providerName}" removed. Restart session to take effect.`);
 }
@@ -674,13 +657,11 @@ async function handleAddModel(
   }
 
   // Select provider
-  const providerLabel = await ctx.ui.select(
-    "Add model to",
-    entries.map(([name, p]) => `${name} (${p.baseUrl || "no URL"})`),
-  );
+  const addLabels = entries.map(([name, p]) => `${name} (${p.baseUrl || "no URL"})`);
+  const providerLabel = await ctx.ui.select("Add model to", addLabels);
   if (!providerLabel) return;
 
-  const providerName = providerLabel.split(" (")[0];
+  const providerName = entries[addLabels.indexOf(providerLabel)][0];
 
   // Model details
   const rawModelId = await ctx.ui.input("Model ID");
@@ -716,12 +697,7 @@ async function handleAddModel(
   };
 
   // Write to config
-  const configPath = getConfigPath();
-  let existing: Partial<SiclawConfig> = {};
-  try {
-    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch { /* start fresh */ }
-
+  const existing = readRawConfig();
   const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
   if (!providers[providerName]) {
     ctx.ui.notify(`Provider "${providerName}" not found`, "error");
@@ -729,16 +705,7 @@ async function handleAddModel(
   }
 
   providers[providerName].models.push(newModel);
-
-  const configDir = path.dirname(configPath);
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
-  }
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
-  );
-  reloadConfig();
+  writeRawConfig({ ...existing, providers });
 
   const allModels = providers[providerName].models.map((m) => m.name || m.id).join(", ");
   ctx.ui.notify(`Model "${modelName || modelId}" added to "${providerName}".\nModels: ${allModels}\nRestart session to activate.`);
@@ -760,15 +727,13 @@ async function handleRemoveModel(
   }
 
   // Select provider
-  const providerLabel = await ctx.ui.select(
-    "Remove model from",
-    entries.map(([name, p]) => `${name} (${p.models.length} models)`),
-  );
+  const rmProvLabels = entries.map(([name, p]) => `${name} (${p.models.length} models)`);
+  const providerLabel = await ctx.ui.select("Remove model from", rmProvLabels);
   if (!providerLabel) return;
 
-  const providerName = providerLabel.split(" (")[0];
-  const provider = entries.find(([n]) => n === providerName)?.[1];
-  if (!provider) return;
+  const provIdx = rmProvLabels.indexOf(providerLabel);
+  const providerName = entries[provIdx][0];
+  const provider = entries[provIdx][1];
 
   if (provider.models.length <= 1) {
     ctx.ui.notify(`Provider "${providerName}" has only one model. Remove the provider instead.`, "warning");
@@ -780,7 +745,8 @@ async function handleRemoveModel(
   const modelLabel = await ctx.ui.select("Remove model", modelLabels);
   if (!modelLabel) return;
 
-  const modelId = modelLabel.split(" (").pop()?.replace(")", "") ?? "";
+  const modelIdx = modelLabels.indexOf(modelLabel);
+  const modelId = provider.models[modelIdx].id;
 
   const confirmed = await ctx.ui.confirm(
     "Confirm removal",
@@ -789,12 +755,7 @@ async function handleRemoveModel(
   if (!confirmed) return;
 
   // Write to config
-  const configPath = getConfigPath();
-  let existing: Partial<SiclawConfig> = {};
-  try {
-    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-  } catch { /* ignore */ }
-
+  const existing = readRawConfig();
   const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
   if (!providers[providerName]) {
     ctx.ui.notify(`Provider "${providerName}" not found`, "error");
@@ -802,12 +763,7 @@ async function handleRemoveModel(
   }
 
   providers[providerName].models = providers[providerName].models.filter((m) => m.id !== modelId);
-
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
-  );
-  reloadConfig();
+  writeRawConfig({ ...existing, providers });
 
   const remaining = providers[providerName].models.map((m) => m.name || m.id).join(", ");
   ctx.ui.notify(`Model "${modelId}" removed from "${providerName}".\nRemaining: ${remaining}\nRestart session to activate.`);

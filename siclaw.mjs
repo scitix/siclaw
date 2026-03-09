@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-// Suppress Node.js experimental warnings (node:sqlite)
-process.removeAllListeners("warning");
+// Suppress Node.js ExperimentalWarning (node:sqlite) without removing other warning listeners
 const _origEmit = process.emit;
 process.emit = function (event, ...args) {
   if (event === "warning" && args[0]?.name === "ExperimentalWarning") return false;
