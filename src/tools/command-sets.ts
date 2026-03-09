@@ -742,7 +742,17 @@ function checkCurlDataValue(flag: string, value: string | undefined): string | n
 function validateCurl(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) continue;
+    if (!arg.startsWith("-")) {
+      // Positional argument — must be a URL. Only allow http(s)://.
+      // Block file://, ftp://, dict://, gopher://, etc.
+      const lower = arg.toLowerCase();
+      if (lower.includes("://") && !lower.startsWith("http://") && !lower.startsWith("https://")) {
+        return JSON.stringify({
+          error: `curl "${arg}" uses a blocked protocol. Only http:// and https:// URLs are allowed.`,
+        }, null, 2);
+      }
+      continue;
+    }
 
     // ── Long flags (--xxx) ──────────────────────────────────
     if (arg.startsWith("--")) {
