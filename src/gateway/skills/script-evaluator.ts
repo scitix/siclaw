@@ -115,12 +115,10 @@ export class ScriptEvaluator {
   }
 
   private async getConfig(): Promise<LlmConfig> {
-    if (this.config === undefined) {
-      if (this.modelConfigRepo) {
-        this.config = await this.modelConfigRepo.getResolvedDefaultConfig();
-      } else {
-        this.config = null;
-      }
+    // Don't cache null results — config may become available after startup
+    if (this.config) return this.config;
+    if (this.modelConfigRepo) {
+      this.config = await this.modelConfigRepo.getResolvedDefaultConfig();
     }
     if (!this.config) throw new Error("No LLM provider configured — add one via WebUI or DB");
     return this.config;
@@ -128,7 +126,12 @@ export class ScriptEvaluator {
 
   /** Run both static and AI analysis on skill scripts */
   async evaluate(req: EvaluateRequest): Promise<ScriptReviewResult> {
-    const staticFindings = this.staticAnalysis(req.scripts);
+    // Static analysis on both scripts and specs (specs contain command templates the agent follows)
+    const allContent = [...req.scripts];
+    if (req.specs) {
+      allContent.push({ name: "skill.md", content: req.specs });
+    }
+    const staticFindings = this.staticAnalysis(allContent);
 
     try {
       return await this.aiAnalysis(req, staticFindings);
@@ -192,7 +195,7 @@ export class ScriptEvaluator {
 
     const userContent = `Review the following scripts for skill "${req.skillName}":\n\n${scriptContents}${req.specs ? `\nSkill specification:\n${req.specs}` : ""}${staticContext}`;
 
-    const resp = await fetch(`${config.baseUrl}/v1/chat/completions`, {
+    const resp = await fetch(`${config.baseUrl.replace(/\/+$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
