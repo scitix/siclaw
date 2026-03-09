@@ -103,6 +103,9 @@ export interface SiclawSessionResult {
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Mutable ref — populated when session ID is assigned (for skill_call events) */
+  sessionIdRef: { current: string };
+
 }
 
 /**
@@ -338,6 +341,7 @@ export async function createSiclawSession(
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const llmConfigRef: LlmConfigRef = {};
+  const sessionIdRef: { current: string } = { current: "" };
   const mode = opts?.mode ?? "web";
   // Mutable ref — populated after memoryIndexer is created (below), so deep_search
   // can retrieve past investigations and persist new ones.
@@ -351,7 +355,7 @@ export async function createSiclawSession(
     createNetnsScriptTool(kubeconfigRef),
     createPodExecTool(kubeconfigRef),
     createPodNsenterExecTool(kubeconfigRef),
-    createRunSkillTool(kubeconfigRef),
+    createRunSkillTool(kubeconfigRef, sessionIdRef),
     createManageScheduleTool(kubeconfigRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createCredentialListTool(kubeconfigRef),
@@ -628,6 +632,7 @@ Follow the structured workflow described in the deep-investigation skill guide.`
       mode,
       mcpManager,
       dpState,
+      sessionIdRef,
     };
   }
 
@@ -686,5 +691,5 @@ Follow the structured workflow described in the deep-investigation skill guide.`
   });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef };
 }

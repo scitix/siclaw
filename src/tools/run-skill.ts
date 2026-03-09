@@ -13,6 +13,7 @@ import {
   listSkillScripts,
   listAllSkillsWithScripts,
 } from "./script-resolver.js";
+import { emitDiagnostic } from "../shared/diagnostic-events.js";
 
 interface RunSkillParams {
   skill: string;
@@ -21,7 +22,10 @@ interface RunSkillParams {
   timeout_seconds?: number;
 }
 
-export function createRunSkillTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createRunSkillTool(
+  kubeconfigRef?: KubeconfigRef,
+  sessionIdRef?: { current: string },
+): ToolDefinition {
   return {
     name: "run_skill",
     label: "Run Skill",
@@ -116,6 +120,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       const cmdArgs = args ? parseArgs(args) : [];
 
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
+      const startMs = Date.now();
 
       try {
         const child = spawn(resolved.interpreter, [resolved.path, ...cmdArgs], {
@@ -167,12 +172,30 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
 
         const output = stdout.trim() +
           (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+        emitDiagnostic({
+          type: "skill_call",
+          skillName: skill,
+          scriptName: script,
+          scope: resolved.scope,
+          outcome: "success",
+          durationMs: Date.now() - startMs,
+          sessionId: sessionIdRef?.current,
+        });
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+        emitDiagnostic({
+          type: "skill_call",
+          skillName: skill,
+          scriptName: script,
+          scope: resolved.scope,
+          outcome: "error",
+          durationMs: Date.now() - startMs,
+          sessionId: sessionIdRef?.current,
+        });
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode: err.code, error: true },

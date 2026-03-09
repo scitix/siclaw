@@ -16,6 +16,7 @@ import { onDiagnostic } from "../shared/diagnostic-events.js";
 import {
   type MetricsBucket,
   type ToolCallStats,
+  type SkillCallStats,
   type SessionStatsRecord,
   type MetricsSnapshot,
   createEmptyBucket,
@@ -30,6 +31,7 @@ export interface LocalCollectorRef {
   query(range: "1h" | "6h" | "24h"): MetricsBucket[];
   snapshot(): { activeSessions: number; wsConnections: number };
   topTools(n: number): ToolCallStats[];
+  topSkills(n: number): SkillCallStats[];
   drainSessionStats(): SessionStatsRecord[];
 }
 
@@ -46,6 +48,12 @@ export interface SnapshotFetcher {
 export class MetricsAggregator {
   private ringBuffer = new Map<number, MetricsBucket>();
   private toolCallMap = new Map<string, { success: number; error: number }>();
+  private skillCallMap = new Map<string, {
+    scope: "builtin" | "team" | "personal";
+    success: number;
+    error: number;
+    totalDurationMs: number;
+  }>();
   private wsConnections = 0;
   private pullTimer?: ReturnType<typeof setInterval>;
   private db?: Database;
@@ -138,6 +146,27 @@ export class MetricsAggregator {
     return result.slice(0, n);
   }
 
+  topSkills(n: number): SkillCallStats[] {
+    if (this.mode === "local" && this.localRef) {
+      return this.localRef.topSkills(n);
+    }
+
+    return [...this.skillCallMap.entries()]
+      .map(([skillName, v]) => {
+        const total = v.success + v.error;
+        return {
+          skillName,
+          scope: v.scope,
+          success: v.success,
+          error: v.error,
+          total,
+          avgDurationMs: total > 0 ? Math.round(v.totalDurationMs / total) : 0,
+        };
+      })
+      .sort((a, b) => b.total - a.total)
+      .slice(0, n);
+  }
+
   // ── K8s pull loop ──
 
   private startPullLoop(): void {
@@ -181,6 +210,8 @@ export class MetricsAggregator {
         existing.activeSessions += bucket.activeSessions;
         existing.toolCalls += bucket.toolCalls;
         existing.toolErrors += bucket.toolErrors;
+        existing.skillSuccesses += bucket.skillSuccesses;
+        existing.skillErrors += bucket.skillErrors;
       } else {
         this.ringBuffer.set(bucket.timestamp, { ...bucket });
       }
@@ -203,6 +234,24 @@ export class MetricsAggregator {
         existing.error += delta.error;
       } else {
         this.toolCallMap.set(delta.toolName, { success: delta.success, error: delta.error });
+      }
+    }
+
+    // Merge skill call deltas
+    for (const delta of snapshot.skillCallDeltas) {
+      const totalDelta = delta.success + delta.error;
+      const existing = this.skillCallMap.get(delta.skillName);
+      if (existing) {
+        existing.success += delta.success;
+        existing.error += delta.error;
+        existing.totalDurationMs += delta.avgDurationMs * totalDelta;
+      } else {
+        this.skillCallMap.set(delta.skillName, {
+          scope: delta.scope,
+          success: delta.success,
+          error: delta.error,
+          totalDurationMs: delta.avgDurationMs * totalDelta,
+        });
       }
     }
 
@@ -230,6 +279,7 @@ export class MetricsAggregator {
         durationMs: record.durationMs,
         promptCount: record.promptCount,
         toolCallCount: record.toolCallCount,
+        skillCallCount: record.skillCallCount,
         createdAt: record.createdAt,
       });
     } catch (err) {

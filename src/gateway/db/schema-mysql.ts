@@ -424,6 +424,7 @@ export const sessionStats = mysqlTable("session_stats", {
   durationMs: int("duration_ms").default(0),
   promptCount: int("prompt_count").default(0),
   toolCallCount: int("tool_call_count").default(0),
+  skillCallCount: int("skill_call_count").default(0),
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
 });
 

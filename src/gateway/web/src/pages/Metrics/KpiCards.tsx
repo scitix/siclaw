@@ -1,4 +1,4 @@
-import { Zap, MessageSquare, Wrench, Users } from 'lucide-react';
+import { Zap, MessageSquare, Wrench, LayoutGrid, Users } from 'lucide-react';
 import type { TimeseriesBucket, TimeRange } from './hooks/useMetrics';
 
 interface KpiCardsProps {
@@ -41,8 +41,12 @@ export function KpiCards({ buckets, snapshot, range }: KpiCardsProps) {
     const toolErrors = buckets.reduce((s, b) => s + b.toolErrors, 0);
     const toolTrend = getTrend(buckets, (b) => b.toolCalls + b.toolErrors);
 
+    const totalSkillCalls = buckets.reduce((s, b) => s + b.skillSuccesses + b.skillErrors, 0);
+    const skillErrors = buckets.reduce((s, b) => s + b.skillErrors, 0);
+    const skillErrorRate = totalSkillCalls > 0 ? ((skillErrors / totalSkillCalls) * 100).toFixed(1) : '0';
+
     return (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
             {/* Total Tokens */}
             <div className="rounded-2xl border border-gray-200 bg-white p-5">
                 <div className="flex items-center justify-between mb-3">
@@ -97,6 +101,29 @@ export function KpiCards({ buckets, snapshot, range }: KpiCardsProps) {
                         <span className="text-xs text-red-500 font-medium">{toolErrors} errors</span>
                     ) : toolTrend ? (
                         <span className={`text-xs font-medium ${toolTrend.color}`}>{toolTrend.label}</span>
+                    ) : (
+                        <span className="text-xs text-gray-400">No data</span>
+                    )}
+                </div>
+            </div>
+
+            {/* Skill Calls */}
+            <div className="rounded-2xl border border-gray-200 bg-white p-5">
+                <div className="flex items-center justify-between mb-3">
+                    <span className="text-sm text-gray-500">Skill Calls</span>
+                    <div className="w-8 h-8 rounded-lg bg-purple-50 flex items-center justify-center">
+                        <LayoutGrid className="w-4 h-4 text-purple-600" />
+                    </div>
+                </div>
+                <div className="text-2xl font-bold text-gray-900">{totalSkillCalls}</div>
+                <div className="flex items-center gap-1 mt-1">
+                    {skillErrors > 0 ? (
+                        <>
+                            <span className="text-xs text-red-500 font-medium">{skillErrors} errors</span>
+                            <span className="text-xs text-gray-400 ml-1">({skillErrorRate}%)</span>
+                        </>
+                    ) : totalSkillCalls > 0 ? (
+                        <span className="text-xs text-green-600 font-medium">No errors</span>
                     ) : (
                         <span className="text-xs text-gray-400">No data</span>
                     )}

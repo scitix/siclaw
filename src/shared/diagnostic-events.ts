@@ -54,6 +54,16 @@ export type DiagnosticEvent =
       tokensUsed: number;
       tokensLimit: number;
     }
+  // Skill execution (Skill Metrics)
+  | {
+      type: "skill_call";
+      skillName: string;
+      scriptName: string;
+      scope: "builtin" | "team" | "personal";
+      outcome: "success" | "error";
+      durationMs: number;
+      sessionId?: string;
+    }
   // Stuck session detection (Phase 2)
   | { type: "session_stuck"; sessionId: string; idleMs: number };
 
