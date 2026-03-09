@@ -107,19 +107,6 @@ function deepMerge<T extends Record<string, unknown>>(base: T, override: Record<
 // Environment variable overrides
 // ---------------------------------------------------------------------------
 
-/**
- * Apply environment variable overrides for deployment/infrastructure settings.
- *
- * NOTE: LLM credentials (API key, base URL, model) are NOT configurable via
- * environment variables — they must be set in settings.json (via /setup or
- * the first-run wizard). This prevents accidental credential leakage through
- * process environment.
- */
-function applyEnvOverrides(_config: SiclawConfig): void {
-  // LLM env vars (SICLAW_API_KEY, SICLAW_BASE_URL, SICLAW_MODEL) intentionally
-  // removed — all LLM config goes through settings.json only.
-}
-
 // ---------------------------------------------------------------------------
 // Singleton cache
 // ---------------------------------------------------------------------------
@@ -161,10 +148,7 @@ export function loadConfig(): SiclawConfig {
 
   cached = deepMerge(DEFAULTS as unknown as Record<string, unknown>, fileConfig) as unknown as SiclawConfig;
 
-  // Environment variable overrides (highest priority)
-  applyEnvOverrides(cached);
-
-  // Environment variable overrides (used by process-spawner / k8s-spawner)
+  // Environment variable overrides (deployment/infrastructure only — NOT LLM config)
   if (process.env.SICLAW_AGENTBOX_PORT) {
     cached.server.port = parseInt(process.env.SICLAW_AGENTBOX_PORT, 10);
   }

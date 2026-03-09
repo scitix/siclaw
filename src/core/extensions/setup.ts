@@ -7,7 +7,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+
+/** Shorthand for the UI subset of ExtensionCommandContext used by setup handlers. */
+type SetupCtx = Pick<ExtensionCommandContext, "ui" | "hasUI">;
 import {
   listCredentials,
   registerKubeconfig,
@@ -93,7 +96,7 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
 // ---------------------------------------------------------------------------
 
 async function credentialsSubmenu(
-  ctx: { ui: { select: Function; input: Function; editor: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   let running = true;
@@ -125,7 +128,7 @@ async function credentialsSubmenu(
 }
 
 async function modelsSubmenu(
-  ctx: { ui: { select: Function; input: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   let running = true;
   while (running) {
@@ -172,7 +175,7 @@ async function modelsSubmenu(
 // ---------------------------------------------------------------------------
 
 async function handleAddCredential(
-  ctx: { ui: { select: Function; input: Function; editor: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const typeLabel = await ctx.ui.select(
@@ -205,7 +208,7 @@ async function handleAddCredential(
 }
 
 async function addKubeconfig(
-  ctx: { ui: { select: Function; input: Function; editor: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const inputMethod = await ctx.ui.select("Kubeconfig source", [
@@ -272,7 +275,7 @@ async function addKubeconfig(
 }
 
 async function addSshPassword(
-  ctx: { ui: { input: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const name = await ctx.ui.input("Credential name", "my-server");
@@ -291,7 +294,7 @@ async function addSshPassword(
 }
 
 async function addSshKey(
-  ctx: { ui: { input: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const name = await ctx.ui.input("Credential name", "my-server");
@@ -320,7 +323,7 @@ async function addSshKey(
 }
 
 async function addApiToken(
-  ctx: { ui: { input: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const name = await ctx.ui.input("Credential name", "my-api");
@@ -334,7 +337,7 @@ async function addApiToken(
 }
 
 async function addApiBasicAuth(
-  ctx: { ui: { input: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const name = await ctx.ui.input("Credential name", "my-api");
@@ -356,7 +359,7 @@ async function addApiBasicAuth(
 // ---------------------------------------------------------------------------
 
 async function handleListCredentials(
-  ctx: { ui: { notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const entries = await listCredentials(credentialsDir);
@@ -383,7 +386,7 @@ async function handleListCredentials(
 // ---------------------------------------------------------------------------
 
 async function handleRemoveCredential(
-  ctx: { ui: { select: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): Promise<void> {
   const entries = await listCredentials(credentialsDir);
@@ -451,7 +454,7 @@ function saveProviderToConfig(providerName: string, provider: ProviderConfig): v
 // ---------------------------------------------------------------------------
 
 function handleListProviders(
-  ctx: { ui: { notify: Function } },
+  ctx: SetupCtx,
 ): void {
   const config = loadConfig();
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
@@ -483,7 +486,7 @@ function handleListProviders(
 // ---------------------------------------------------------------------------
 
 async function handleSetDefault(
-  ctx: { ui: { select: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   const config = loadConfig();
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
@@ -530,7 +533,7 @@ async function handleSetDefault(
 // ---------------------------------------------------------------------------
 
 async function handleRemoveProvider(
-  ctx: { ui: { select: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   const config = loadConfig();
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
@@ -575,7 +578,7 @@ async function handleRemoveProvider(
 // ---------------------------------------------------------------------------
 
 async function handleModelProvider(
-  ctx: { ui: { select: Function; input: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   const presetLabel = await ctx.ui.select(
     "Provider",
@@ -647,7 +650,7 @@ async function handleModelProvider(
 // ---------------------------------------------------------------------------
 
 async function handleAddModel(
-  ctx: { ui: { select: Function; input: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   const config = loadConfig();
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
@@ -717,7 +720,7 @@ async function handleAddModel(
 // ---------------------------------------------------------------------------
 
 async function handleRemoveModel(
-  ctx: { ui: { select: Function; confirm: Function; notify: Function } },
+  ctx: SetupCtx,
 ): Promise<void> {
   const config = loadConfig();
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
@@ -775,7 +778,7 @@ async function handleRemoveModel(
 // ---------------------------------------------------------------------------
 
 function updateSetupStatus(
-  ctx: { ui: { setStatus: Function } },
+  ctx: SetupCtx,
   credentialsDir: string,
 ): void {
   const config = loadConfig();

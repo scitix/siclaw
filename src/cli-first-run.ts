@@ -16,8 +16,6 @@ import { PRESETS } from "./core/provider-presets.js";
  * Run the first-run setup wizard. Returns true if setup completed successfully.
  */
 export async function runFirstRunSetup(): Promise<boolean> {
-  // Clear any prior console output (e.g. mcp-client logs) to avoid clack rendering artifacts
-  console.clear();
   intro("Welcome to Siclaw");
 
   // 1. Select provider (use selectKey to avoid scroll rendering bugs)
