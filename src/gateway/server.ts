@@ -1140,7 +1140,20 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             (async () => {
               try {
                 const modelConfigRepo = new ModelConfigRepository(db);
-                const settings = await modelConfigRepo.exportSettingsConfig();
+                const settings: Record<string, unknown> = await modelConfigRepo.exportSettingsConfig();
+                // Append metrics config from system_config table
+                if (sysConfigRepo) {
+                  const metricsPort = await sysConfigRepo.get("metrics.port");
+                  const metricsToken = await sysConfigRepo.get("metrics.token");
+                  const includeUserId = await sysConfigRepo.get("metrics.includeUserId");
+                  if (metricsPort || metricsToken || includeUserId) {
+                    settings.metrics = {
+                      ...(metricsPort ? { port: parseInt(metricsPort, 10) } : {}),
+                      ...(metricsToken ? { token: metricsToken } : {}),
+                      ...(includeUserId ? { includeUserId: includeUserId === "true" } : {}),
+                    };
+                  }
+                }
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(settings));
               } catch (err) {

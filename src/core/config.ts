@@ -58,6 +58,7 @@ export interface SiclawConfig {
   debugImage: string;
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
+  metrics?: { port?: number; token?: string; includeUserId?: boolean };
   debug: boolean;
   userId: string;
 }

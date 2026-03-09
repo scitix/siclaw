@@ -90,12 +90,18 @@ async function main() {
   // server on port 9090 that serves only /metrics.
   let metricsServer: http.Server | null = null;
   if (server instanceof https.Server) {
-    const metricsPort = parseInt(process.env.SICLAW_METRICS_PORT || "9090", 10);
-    const { checkMetricsAuth } = await import("./shared/metrics.js");
+    // Read metrics config from settings.json (fetched from Gateway), fall back to env vars
+    const latestConfig = loadConfig();
+    const metricsPort = latestConfig.metrics?.port ?? parseInt(process.env.SICLAW_METRICS_PORT || "9090", 10);
+    const metricsToken = latestConfig.metrics?.token ?? process.env.SICLAW_METRICS_TOKEN;
+    const { checkMetricsAuth, setIncludeUserId } = await import("./shared/metrics.js");
+    if (latestConfig.metrics?.includeUserId !== undefined) {
+      setIncludeUserId(latestConfig.metrics.includeUserId);
+    }
 
     metricsServer = http.createServer(async (req, res) => {
       if (req.method === "GET" && req.url === "/metrics") {
-        if (!checkMetricsAuth(req, res)) return;
+        if (!checkMetricsAuth(req, res, metricsToken)) return;
         try {
           const { metricsRegistry } = await import("./shared/metrics.js");
           const body = await metricsRegistry.metrics();
@@ -118,8 +124,8 @@ async function main() {
 
     metricsServer.listen(metricsPort, () => {
       console.log(`[agentbox] Metrics HTTP server listening on port ${metricsPort} (Prometheus scrape target)`);
-      if (!process.env.SICLAW_METRICS_TOKEN) {
-        console.warn("[agentbox] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated");
+      if (!metricsToken) {
+        console.warn("[agentbox] WARNING: No metrics token configured — /metrics endpoint is unauthenticated");
       }
     });
   }
