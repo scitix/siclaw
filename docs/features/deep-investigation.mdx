@@ -6,7 +6,7 @@ description: "How Siclaw's 4-phase hypothesis-driven investigation engine works.
 
 ## Overview
 
-Deep Investigation is Siclaw's core diagnostic engine. Instead of running a fixed playbook, it **thinks like an SRE**: gathers evidence, forms hypotheses, tests them independently, and synthesizes a conclusion.
+Deep Investigation is Siclaw's core diagnostic engine. Instead of running a fixed playbook, it follows a structured investigation process: gather evidence, form hypotheses, test them independently, and synthesize a conclusion.
 
 ## The 4-Phase Pipeline
 
@@ -18,8 +18,6 @@ A sub-agent with tool access collects the current state of the environment:
 - Node conditions and resource utilization
 - Recent deployments and config changes
 - Relevant metrics from Prometheus/monitoring
-
-**Budget**: Up to 8 tool calls (5 in Quick mode)
 
 ### Phase 2: Hypothesis Generation
 
@@ -37,10 +35,8 @@ If [Investigation Memory](/features/memory) has data, past investigations with s
 
 Up to 3 sub-agents run simultaneously, each validating one hypothesis:
 
-- Each sub-agent has its own **independent tool budget** (up to 10 calls each)
 - Sub-agents don't share information — this prevents confirmation bias
 - Each agent produces a verdict: `validated`, `invalidated`, or `inconclusive`
-- Tool set is minimal: `read`, `restricted-bash`, `node_exec` only
 
 ### Phase 4: Conclusion
 
@@ -52,22 +48,11 @@ All evidence is synthesized into a structured report containing:
 - **Remediation steps** (actionable next steps)
 - **Structured extraction** (category, affected entities, environment tags) → stored in Investigation Memory
 
-## Budget Controls
-
-| Metric | Normal | Quick |
-|--------|--------|-------|
-| Context tool calls | 8 | 5 |
-| Max hypotheses | 5 | 3 |
-| Calls per hypothesis | 10 | 8 |
-| Total tool calls | 60 | 30 |
-| Parallel sub-agents | 3 | 3 |
-| Max duration | 5 min | 3 min |
-
 ## Triggering Deep Investigation
 
 ### Automatic (via triage)
 
-The main agent triages the user's question. If it determines a deep investigation is needed, it calls `deep_search` with pre-gathered context and hypotheses, skipping Phases 1-2.
+The main agent decides when a deeper investigation is needed and expands into the full workflow automatically.
 
 ### Manual
 
@@ -78,7 +63,8 @@ The main agent triages the user's question. If it determines a deep investigatio
 ### Via Alert Webhook
 
 ```bash
-curl -X POST https://siclaw.example.com/api/webhook/alert \
+curl -X POST https://siclaw.example.com/hooks/v1/<trigger-id> \
+  -H "Authorization: Bearer <trigger-secret>" \
   -H "Content-Type: application/json" \
   -d '{"title": "High error rate on payment-service", "severity": "critical"}'
 ```
@@ -91,4 +77,4 @@ Every investigation produces a report saved to `~/.siclaw/reports/`:
 ~/.siclaw/reports/deep-search-2026-03-06T14-30-00.md
 ```
 
-Reports include the full investigation trace: every tool call, its output, and the reasoning chain.
+Reports include the investigation summary, evidence, and recommended next steps.

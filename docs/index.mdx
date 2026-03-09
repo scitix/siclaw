@@ -12,7 +12,7 @@ An open-source AI agent that diagnoses Kubernetes infrastructure issues the way 
 
 ## What Makes Siclaw Different
 
-Most AI ops tools are glorified chatbots — they run one command, show the output, and ask "what next?" Siclaw runs a **complete investigation autonomously**:
+Siclaw runs a **complete investigation workflow**, not just a single command followed by another prompt:
 
 ```
 You: "Pod payment-service is CrashLoopBackOff after deploying v2.3"
@@ -30,7 +30,7 @@ Siclaw:
 
 <CardGroup cols={2}>
   <Card title="Deep Investigation" icon="magnifying-glass" href="/features/deep-investigation">
-    4-phase pipeline with parallel sub-agents. Not just Q&A — full root cause analysis with confidence scoring.
+    4-phase workflow for evidence gathering, hypothesis testing, and root-cause analysis.
   </Card>
   <Card title="Investigation Memory" icon="brain" href="/features/memory">
     Learns from every investigation. Past diagnoses improve future hypotheses automatically.
@@ -39,7 +39,7 @@ Siclaw:
     Custom diagnostic playbooks with mandatory security review. Your team's runbooks, executable by AI.
   </Card>
   <Card title="Multi-Channel" icon="comments" href="/features/channels">
-    Terminal, Web UI, Slack, Lark. Same investigation engine, any interface.
+    Terminal, Web UI, Slack, Lark, Discord, Telegram. Same investigation engine, any interface.
   </Card>
 </CardGroup>
 
@@ -52,6 +52,7 @@ Siclaw:
 ## Quick Start
 
 ```bash
+mkdir -p ~/siclaw-work && cd ~/siclaw-work
 npm install -g siclaw
 siclaw local        # Web UI at http://localhost:3000
 ```

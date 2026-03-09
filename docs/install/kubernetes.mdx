@@ -4,217 +4,135 @@ sidebarTitle: "Kubernetes"
 description: "Deploy Siclaw on Kubernetes with full tenant isolation using Helm."
 ---
 
-## Quick Start
-
-```bash
-helm install siclaw oci://ghcr.io/scitix/siclaw/helm/siclaw \
-  --set llm.provider=anthropic \
-  --set llm.apiKey=sk-ant-... \
-  --set llm.model=claude-sonnet-4-20250514
-```
-
 ## Architecture
 
-In Kubernetes mode, Siclaw uses `K8sSpawner` for full tenant isolation:
+Kubernetes is the production deployment model for Siclaw:
 
 ```
-Gateway Pod (Deployment)
-  ├── API server (port 3001)
-  ├── HTTPS/mTLS server (port 3002)
-  ├── K8sSpawner → creates AgentBox pods on demand
-  └── MySQL connection (required for K8s mode)
+Gateway Deployment
+  ├── Web UI + API
+  ├── K8sSpawner
+  ├── Cron coordination
+  └── MySQL connection
 
-AgentBox Pod (per user)
-  ├── Isolated filesystem (emptyDir volume)
-  ├── mTLS client certificate (identity: userId + workspaceId)
-  ├── Skills synced via bundle API (team + personal only)
-  └── Auto-terminates after 5 minutes idle
+Cron Deployment
+  └── Executes scheduled jobs
+
+AgentBox Pod (spawned per user / workspace)
+  ├── Isolated runtime
+  ├── Synced skills and credentials
+  └── Internal mTLS back to Gateway
 ```
 
-## Helm Values
+## Prerequisites
 
-Key configuration options:
+- A Kubernetes cluster
+- A MySQL database reachable from the cluster
+- Published Siclaw images for `gateway`, `agentbox`, and `cron`
 
-```yaml
-# values.yaml
-replicaCount: 1
-
-llm:
-  provider: anthropic
-  apiKey: sk-ant-...
-  model: claude-sonnet-4-20250514
-
-database:
-  type: mysql
-  host: mysql.default.svc.cluster.local
-  port: 3306
-  name: siclaw
-  user: siclaw
-  password: ...
-
-gateway:
-  image:
-    repository: siclaw/siclaw-gateway
-    tag: latest
-  service:
-    type: ClusterIP
-    port: 3001
-
-agentbox:
-  image:
-    repository: siclaw/siclaw-agentbox
-    tag: latest
-  resources:
-    limits:
-      memory: 512Mi
-      cpu: 500m
-```
-
-## mTLS Security
-
-Gateway and AgentBox communicate over mutual TLS:
-
-- **CA certificate**: Auto-generated (10-year), stored in database, auto-renewed at 30-day threshold
-- **Client certificates**: Issued per-pod at spawn time, encode `userId` + `workspaceId` in CN/OU
-- **Protected endpoints**: `/api/internal/*` on Gateway port 3002
-
-No API keys in pod environment variables — identity is cryptographically bound to the certificate.
-
-## Database
-
-Kubernetes mode **requires MySQL** (SQLite is single-process only):
+Build and push images first if you are using your own registry:
 
 ```bash
-helm install siclaw ... \
-  --set database.type=mysql \
-  --set database.host=mysql.svc.cluster.local \
-  --set database.name=siclaw \
-  --set database.user=siclaw \
-  --set database.password=secret
+make docker REGISTRY=registry.example.com/myteam TAG=latest
+make push REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
-<Warning>
-Common gotcha: use `--set-string` for numeric Helm values like image tags (e.g., `--set-string gateway.image.tag=20260301`). Also ensure `--set namespace=` matches the actual Kubernetes namespace.
-</Warning>
+## Quick Start
 
-## Ingress
+Install from the chart in this repository:
 
-Example with nginx-ingress:
+```bash
+helm upgrade --install siclaw ./helm/siclaw \
+  --namespace siclaw \
+  --create-namespace \
+  --set image.registry=registry.example.com/myteam \
+  --set image.tag=latest \
+  --set database.url="mysql://user:pass@mysql.svc.cluster.local:3306/siclaw"
+```
+
+The chart expects all three images to share the same registry and tag unless you explicitly override `agentbox.image.*`.
+
+## Important Values
+
+Current top-level values look like this:
 
 ```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: siclaw
-  annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
-spec:
-  rules:
-    - host: siclaw.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: siclaw-gateway
-                port:
-                  number: 3001
+image:
+  registry: registry.example.com/myteam
+  tag: latest
+
+gateway:
+  replicas: 1
+  service:
+    type: NodePort
+    port: 80
+    nodePort: 31000
+
+cron:
+  replicas: 2
+
+database:
+  url: mysql://user:pass@mysql.svc.cluster.local:3306/siclaw
+```
+
+Use `database.existingSecret.name` if you do not want to pass the connection string on the command line.
+
+## Accessing the UI
+
+By default the chart exposes the Gateway Service on port `80` inside the cluster.
+
+- If you keep the default `NodePort`, the UI is available on node port `31000`
+- If you add an Ingress, route it to the Gateway Service on service port `80`
+
+Example Ingress backend:
+
+```yaml
+backend:
+  service:
+    name: siclaw-gateway
+    port:
+      number: 80
 ```
 
 <Note>
-WebSocket support is required for real-time investigation updates. Set appropriate proxy timeouts for long-running investigations (up to 5 minutes).
+WebSocket support is required for live investigation updates. Keep proxy read/send timeouts high enough for multi-minute investigations.
 </Note>
 
-## Metrics & Observability
+## Authentication
 
-Siclaw exposes Prometheus metrics out of the box. The Helm chart can automatically create monitoring resources for [Prometheus Operator](https://github.com/prometheus-operator/prometheus-operator).
+On first startup, Siclaw creates a default local admin account:
 
-### Endpoints
+- Username: `admin`
+- Password: `admin`
 
-| Component | Port | Path | Protocol |
-|-----------|------|------|----------|
-| Gateway | 3000 | `/metrics` | HTTP |
-| AgentBox | 9090 | `/metrics` | HTTP (dedicated sidecar port, bypasses mTLS) |
-
-### Helm Configuration
+To change the bootstrap password, set:
 
 ```yaml
-# values.yaml
-metrics:
-  enabled: true                # master switch for all monitoring resources
-
-  serviceMonitor:
-    enabled: true              # ServiceMonitor for Gateway
-    interval: 15s
-
-  podMonitor:
-    enabled: true              # PodMonitor for AgentBox (cross-namespace discovery)
-    interval: 15s
-
-  grafanaDashboard:
-    enabled: true              # auto-import dashboard via Grafana sidecar
-
-  prometheusRule:
-    enabled: false             # opt-in: preset alert rules
-    costThresholdPerHour: 10   # USD — alert when hourly LLM cost exceeds this
+gateway:
+  env:
+    SICLAW_ADMIN_PASSWORD: "change-me"
 ```
 
-All monitoring resources are created by default when `metrics.enabled: true` (except `prometheusRule`, which is opt-in).
+## Metrics
 
-### Grafana Dashboard
+The Gateway exposes Prometheus metrics at `/metrics`. The chart can create ServiceMonitor, PodMonitor, Grafana dashboard, and PrometheusRule resources under the `metrics.*` values block.
 
-When `grafanaDashboard.enabled: true`, the chart creates a ConfigMap with the `grafana_dashboard: "1"` label. If your Grafana is deployed via [kube-prometheus-stack](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack), the sidecar will auto-discover and import the **Siclaw Overview** dashboard.
+Common settings:
 
-The dashboard includes five sections:
+```yaml
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  podMonitor:
+    enabled: true
+  grafanaDashboard:
+    enabled: true
+  prometheusRule:
+    enabled: false
+```
 
-- **Overview** — active sessions, WebSocket connections, prompt rate, error rate, cost, stuck sessions
-- **Cost & Tokens** — cost over time by provider, token consumption rate by type (input/output/cache)
-- **Latency** — prompt duration percentiles (p50/p95/p99), prompt rate by outcome
-- **Tools** — top 10 tool calls per minute, tool error rate by name
-- **Health** — sessions over time, WebSocket connections over time, context window usage
-
-### Alert Rules
-
-Enable with `metrics.prometheusRule.enabled: true`. Three preset alerts:
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| `SiclawSessionStuck` | >3 stuck sessions in 10 min | warning |
-| `SiclawHighErrorRate` | Prompt error rate >10% for 10 min | warning |
-| `SiclawHighCost` | Hourly LLM cost exceeds threshold | warning |
-
-### Metrics Reference
-
-<Expandable title="All Siclaw metrics (11)">
-
-**Core metrics:**
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `siclaw_tokens_total` | Counter | `type`, `provider`, `model`, `user_id` | Cumulative token consumption (delta per prompt) |
-| `siclaw_cost_usd_total` | Counter | `provider`, `model`, `user_id` | Cumulative LLM cost in USD |
-| `siclaw_prompt_duration_ms` | Histogram | `provider`, `model`, `outcome` | Prompt end-to-end latency (ms) |
-| `siclaw_prompts_total` | Counter | `provider`, `model`, `outcome` | Total prompts processed |
-| `siclaw_sessions_active` | Gauge | — | Current active sessions |
-| `siclaw_tool_calls_total` | Counter | `tool_name`, `outcome` | Tool invocation count |
-| `siclaw_ws_connections` | Gauge | — | Current WebSocket connections |
-
-**Health metrics:**
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `siclaw_context_tokens_used` | Gauge | `provider`, `model` | Context window tokens used |
-| `siclaw_context_tokens_limit` | Gauge | `provider`, `model` | Context window token limit |
-| `siclaw_session_stuck_total` | Counter | — | Stuck sessions detected |
-| `siclaw_session_stuck_age_ms` | Histogram | — | Duration of stuck sessions (ms) |
-
-</Expandable>
-
-### Authentication
-
-Both Gateway and AgentBox `/metrics` endpoints support optional bearer token authentication via the `SICLAW_METRICS_TOKEN` environment variable:
+If you want bearer-token protection for `/metrics`, add:
 
 ```yaml
 gateway:
@@ -222,35 +140,17 @@ gateway:
     SICLAW_METRICS_TOKEN: "your-secret-token"
 ```
 
-When set, Prometheus must include the token in scrape config:
+To remove the `user_id` label from token and cost metrics:
 
 ```yaml
-# prometheus scrape config
-authorization:
-  credentials: your-secret-token
+gateway:
+  env:
+    SICLAW_METRICS_USER_ID: "false"
 ```
 
-<Warning>
-If `SICLAW_METRICS_TOKEN` is not set, the `/metrics` endpoint is unauthenticated. A warning is logged at startup. For production deployments with sensitive data in metric labels (e.g., `user_id`), setting a token is recommended.
-</Warning>
+## Operational Notes
 
-### Privacy: User ID in Metrics
-
-By default, `user_id` is included as a label on token and cost metrics for per-user cost tracking. To disable:
-
-```bash
-helm install siclaw ... --set gateway.env.SICLAW_METRICS_USER_ID=false
-```
-
-<Warning>
-**Cardinality warning**: With `user_id` enabled (default), `siclaw_tokens_total` and `siclaw_cost_usd_total` create one time series per user × provider × model × type. For deployments with more than 500 active users, this can increase Prometheus storage and memory usage significantly. Consider setting `SICLAW_METRICS_USER_ID=false` in large-scale environments and using application-level cost reporting instead.
-</Warning>
-
-### Monitoring Resource Deployment
-
-The Helm chart and the `k8s/` directory both include PodMonitor and ServiceMonitor definitions. These are **alternative deployment methods** — use one or the other, not both:
-
-- **Helm chart** (`helm install`): Monitoring resources are created automatically when `metrics.enabled: true`
-- **Raw manifests** (`k8s/*.yaml`): Apply manually with `kubectl apply -f` for non-Helm deployments
-
-Deploying both simultaneously will result in duplicate scrape targets in Prometheus.
+- Kubernetes mode requires MySQL. SQLite is only for single-process local use.
+- AgentBox pods are created on demand by the Gateway.
+- Internal service-to-service communication is secured automatically.
+- If you deploy monitoring resources from the chart, do not also apply duplicate monitor manifests manually.

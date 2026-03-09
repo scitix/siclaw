@@ -4,7 +4,10 @@ sidebarTitle: "LLM Providers"
 description: "Configure Siclaw to use Anthropic, OpenAI, Ollama, or any compatible LLM."
 ---
 
-Siclaw needs an LLM to power its investigation engine. Configure via `~/.siclaw/config/settings.json` or environment variable overrides.
+Siclaw needs an LLM to power its investigation engine.
+
+- **TUI mode** reads `.siclaw/config/settings.json`
+- **Local Server / Gateway** is typically configured through the **Models** page in the Web UI
 
 ## Anthropic (Recommended)
 
@@ -90,22 +93,7 @@ See [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/setting
 ## Configuration Methods
 
 - **TUI mode**: First-run wizard or `/setup` command inside a session
-- **Gateway/Docker mode**: Edit `settings.json` directly or via the web UI
-
-API keys support `$VAR` / `${VAR}` references in `settings.json`:
-
-```json
-{
-  "providers": {
-    "default": {
-      "apiKey": "${MY_API_KEY}",
-      "baseUrl": "https://api.openai.com/v1",
-      "api": "openai-completions",
-      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
-    }
-  }
-}
-```
+- **Local Server / Gateway**: Configure providers and models in the Web UI
 
 ## Embedding Provider
 
@@ -125,6 +113,8 @@ Embedding is used for memory search — matching current symptoms against past i
   }
 }
 ```
+
+If `embedding.apiKey` is omitted, Siclaw falls back to the default provider API key.
 
 | Provider | Model | Dimensions | Notes |
 |----------|-------|------------|-------|
