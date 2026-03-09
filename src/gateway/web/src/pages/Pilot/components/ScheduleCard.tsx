@@ -79,16 +79,18 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
         // ignore
     }
 
-    // Auto-execute on mount
+    // Auto-execute on mount — only for pause/resume (other actions require manual confirmation via View panel)
+    const isPauseResume = parsed?.action === 'pause' || parsed?.action === 'resume';
     useEffect(() => {
         if (!parsed || parsed.error || !sendRpc || !updateMessageMeta) return;
         if (autoExecRef.current) return;
         if (status === 'saved' || status === 'dismissed' || status === 'superseded') return;
+        if (!isPauseResume) return;
 
         autoExecRef.current = true;
         autoExecute();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [status]);
+    }, [status, isPauseResume]);
 
     const autoExecute = async () => {
         if (!parsed || !sendRpc || !updateMessageMeta) return;
