@@ -6,9 +6,8 @@ import type { KubeconfigRef } from "../core/agent-factory.js";
 import { resolveScript } from "./script-resolver.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
-import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
-import { sanitizeEnv } from "./sanitize-env.js";
 import { parseArgs, shellEscape } from "./command-sets.js";
+import { validatePodName, prepareExecEnv } from "./exec-utils.js";
 
 interface PodScriptParams {
   pod: string;
@@ -19,9 +18,6 @@ interface PodScriptParams {
   args?: string;
   timeout_seconds?: number;
 }
-
-// Valid pod name: RFC 1123 subdomain
-const POD_NAME_RE = /^[a-z0-9][a-z0-9.\-]*$/;
 
 export function createPodScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
   return {
@@ -87,17 +83,18 @@ Examples:
     }),
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as PodScriptParams;
+      const env = prepareExecEnv(kubeconfigRef);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 
-      if (!pod || !POD_NAME_RE.test(pod)) {
+      // Validate pod name
+      const podErr = validatePodName(pod);
+      if (podErr) {
         return {
-          content: [
-            {
-              type: "text",
-              text: `Error: invalid pod name "${pod}". Pod names may only contain lowercase letters, digits, hyphens, and dots.`,
-            },
-          ],
+          content: [{
+            type: "text",
+            text: `Error: invalid pod name "${pod}". Pod names may only contain lowercase letters, digits, hyphens, and dots.`,
+          }],
           details: { error: true },
         };
       }
@@ -120,14 +117,9 @@ Examples:
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
 
       // Pre-check: pod exists and is Running
-      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
-      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
-      const childEnv = {
-        ...sanitizeEnv(process.env as Record<string, string>),
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-        KUBECONFIG: "/dev/null",
-      };
-      const podCheckErr = await checkPodRunning(pod, namespace, childEnv, kubeconfigPath ?? undefined);
+      const podCheckErr = await checkPodRunning(
+        pod, namespace, env.childEnv, env.kubeconfigPath ?? undefined,
+      );
       if (podCheckErr) {
         return {
           content: [{ type: "text", text: `Error: ${podCheckErr}` }],
@@ -136,7 +128,7 @@ Examples:
       }
 
       // Build kubectl exec args
-      const kubectlArgs = [...kubeconfigArgs, "exec", "-i", pod, "-n", namespace];
+      const kubectlArgs = [...env.kubeconfigArgs, "exec", "-i", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }
@@ -154,7 +146,7 @@ Examples:
 
         const child = spawn("kubectl", kubectlArgs, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: childEnv,
+          env: env.childEnv,
         });
 
         const onAbort = () => child.kill("SIGKILL");

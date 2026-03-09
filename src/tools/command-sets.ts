@@ -138,6 +138,98 @@ export const ALLOWED_COMMANDS = new Set([
   "expr", "seq",
 ]);
 
+// ── Command categories and context-based whitelists ──────────────
+
+/** Map each command to its functional category. */
+export const COMMAND_CATEGORIES: Record<string, string> = {
+  // text processing
+  grep: "text", egrep: "text", fgrep: "text",
+  sort: "text", uniq: "text", wc: "text", head: "text", tail: "text",
+  cut: "text", tr: "text", jq: "text", yq: "text", column: "text",
+  // network
+  ip: "network", ifconfig: "network", ping: "network", traceroute: "network",
+  tracepath: "network", ss: "network", netstat: "network", route: "network",
+  arp: "network", ethtool: "network", mtr: "network", nslookup: "network",
+  dig: "network", host: "network", bridge: "network", tc: "network",
+  conntrack: "network", curl: "network",
+  // RDMA
+  ibstat: "rdma", ibstatus: "rdma", ibv_devinfo: "rdma", ibv_devices: "rdma",
+  rdma: "rdma", ibaddr: "rdma", iblinkinfo: "rdma", ibportstate: "rdma",
+  ibswitches: "rdma", ibroute: "rdma", show_gids: "rdma", ibdev2netdev: "rdma",
+  // perftest
+  ib_write_bw: "perftest", ib_write_lat: "perftest",
+  ib_read_bw: "perftest", ib_read_lat: "perftest",
+  ib_send_bw: "perftest", ib_send_lat: "perftest",
+  ib_atomic_bw: "perftest", ib_atomic_lat: "perftest",
+  raw_ethernet_bw: "perftest", raw_ethernet_lat: "perftest",
+  raw_ethernet_burst_lat: "perftest",
+  // GPU
+  "nvidia-smi": "gpu", gpustat: "gpu", nvtopo: "gpu",
+  // hardware
+  lspci: "hardware", lsusb: "hardware", lsblk: "hardware",
+  lscpu: "hardware", lsmem: "hardware", lshw: "hardware", dmidecode: "hardware",
+  // kernel
+  uname: "kernel", hostname: "kernel", uptime: "kernel",
+  dmesg: "kernel", sysctl: "kernel", lsmod: "kernel", modinfo: "kernel",
+  // process / resource
+  ps: "process", pgrep: "process", top: "process", free: "process",
+  vmstat: "process", iostat: "process", mpstat: "process",
+  df: "process", du: "process", mount: "process", findmnt: "process", nproc: "process",
+  // file (read-only) — blocked in local context
+  cat: "file", ls: "file", pwd: "file", stat: "file", file: "file",
+  find: "file", readlink: "file", realpath: "file", basename: "file", dirname: "file",
+  diff: "file", md5sum: "file", sha256sum: "file",
+  // diagnostic
+  // services
+  journalctl: "services", systemctl: "services",
+  timedatectl: "services", hostnamectl: "services",
+  // container
+  crictl: "container", ctr: "container",
+  // firewall
+  iptables: "firewall", ip6tables: "firewall",
+  // inspection — blocked in local context
+  lsof: "inspection", lsns: "inspection", strings: "inspection",
+  // compressed — blocked in local context
+  zcat: "compressed", zgrep: "compressed", bzcat: "compressed", xzcat: "compressed",
+  // activity
+  sar: "activity", blkid: "activity",
+  // stream
+  tee: "stream",
+  // general (env/printenv separated — blocked in local context)
+  date: "general", whoami: "general", id: "general", which: "general",
+  env: "general-env", printenv: "general-env",
+  // flow control
+  echo: "flow", printf: "flow", true: "flow", false: "flow",
+  sleep: "flow", wait: "flow", test: "flow", expr: "flow", seq: "flow",
+};
+
+/**
+ * Categories allowed per execution context.
+ * local:   agentbox / TUI process (no file/env access — use Read/Grep/Glob tools)
+ * node:    remote node via debug pod
+ * pod:     remote pod via kubectl exec
+ * nsenter: remote pod netns via debug pod
+ * ssh:     remote host via SSH (future)
+ */
+const ALL_REMOTE_CATEGORIES = [
+  "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+  "process", "file", "diagnostic", "services", "container", "firewall",
+  "inspection", "compressed", "activity", "stream", "general", "general-env",
+  "flow",
+] as const;
+
+export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = {
+  local: [
+    "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+    "process", "diagnostic", "services", "container", "firewall",
+    "activity", "stream", "general", "flow",
+  ],
+  node: [...ALL_REMOTE_CATEGORIES],
+  pod: [...ALL_REMOTE_CATEGORIES],
+  nsenter: [...ALL_REMOTE_CATEGORIES],
+  ssh: [...ALL_REMOTE_CATEGORIES],
+};
+
 // ── Declarative Command Rule Engine ──────────────────────────────
 
 /**
@@ -149,6 +241,18 @@ export interface CommandRule {
   command: string;
   category?: string;
   description?: string;
+
+  /** Execution contexts where this rule applies. Absent → all contexts. */
+  contexts?: string[];
+
+  /** If true, command must appear after a pipe | operator (stdin-only). */
+  pipeOnly?: boolean;
+
+  /** If true, block positional args that look like file paths (/, ./, ../, ~). */
+  noFilePaths?: boolean;
+
+  /** Flags that are explicitly blocked (checked per-character for short flags). */
+  blockedFlags?: string[];
 
   /** Flag whitelist. Present → check flags; absent → all flags allowed. */
   allowedFlags?: string[];
@@ -169,30 +273,51 @@ export interface CommandRule {
   customValidator?: string;
 }
 
-export const COMMAND_RULES: Record<string, CommandRule> = {
+export const COMMAND_RULES: Record<string, CommandRule | CommandRule[]> = {
+
+  // ── Text commands: local-context stdin-only rules ──
+  // In local (agentbox) context, text commands must only process piped stdin.
+  // They cannot read files directly or traverse directories.
+
+  grep:   { command: "grep",   contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
+  egrep:  { command: "egrep",  contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
+  fgrep:  { command: "fgrep",  contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
+  cut:    { command: "cut",    contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  head:   { command: "head",   contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  tail:   { command: "tail",   contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  wc:     { command: "wc",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  tr:     { command: "tr",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  column: { command: "column", contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  jq:     { command: "jq",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
 
   // ── Flag whitelist ──
 
-  sort: {
-    command: "sort", category: "text",
-    allowedFlags: [
-      "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
-      "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
-      "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
-      "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
-    ],
-  },
+  sort: [
+    {
+      command: "sort", category: "text",
+      allowedFlags: [
+        "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
+        "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
+        "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
+        "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
+      ],
+    },
+    { command: "sort", contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  ],
 
-  yq: {
-    command: "yq", category: "text",
-    allowedFlags: [
-      "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
-      "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
-      "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
-      "--xml-attribute-prefix", "--xml-content-name",
-      "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
-    ],
-  },
+  yq: [
+    {
+      command: "yq", category: "text",
+      allowedFlags: [
+        "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
+        "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
+        "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
+        "--xml-attribute-prefix", "--xml-content-name",
+        "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
+      ],
+    },
+    { command: "yq", contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  ],
 
   ethtool: {
     command: "ethtool", category: "network",
@@ -274,10 +399,10 @@ export const COMMAND_RULES: Record<string, CommandRule> = {
     positionals: 1,
   },
 
-  uniq: {
-    command: "uniq", category: "text",
-    positionals: 1,
-  },
+  uniq: [
+    { command: "uniq", category: "text", positionals: 1 },
+    { command: "uniq", contexts: ["local"], pipeOnly: true, noFilePaths: true },
+  ],
 
   // ── Subcommand whitelist (position: 0) ──
 
@@ -378,8 +503,19 @@ for (const bin of [
 
 // ── Generic rule engine ──────────────────────────────────────────
 
-function validateByRule(args: string[], rule: CommandRule): string | null {
+function validateByRule(
+  args: string[],
+  rule: CommandRule,
+  options?: { piped?: boolean },
+): string | null {
   const cmd = rule.command;
+
+  // 0. pipeOnly: must appear after a pipe |
+  if (rule.pipeOnly && options?.piped !== undefined && !options.piped) {
+    return JSON.stringify({
+      error: `"${cmd}" can only be used after a pipe (|). Direct file reading is not allowed — use the dedicated file tools instead.`,
+    }, null, 2);
+  }
 
   // 1. requiredFlags: at least one must be present
   if (rule.requiredFlags?.length) {
@@ -428,10 +564,43 @@ function validateByRule(args: string[], rule: CommandRule): string | null {
           error: `${cmd} does not allow more than ${positionalPolicy} positional argument(s).`,
         }, null, 2);
       }
+      // noFilePaths: block positional args that look like file/directory paths
+      if (rule.noFilePaths && arg !== "") {
+        if (
+          arg.startsWith("/") ||
+          arg.startsWith("./") ||
+          arg.startsWith("../") ||
+          arg.startsWith("~")
+        ) {
+          return JSON.stringify({
+            error: `${cmd} cannot take file path arguments — it should only process piped input. Use the dedicated file tools instead.`,
+          }, null, 2);
+        }
+      }
       continue;
     }
 
-    // flag check — skip if no allowedFlags defined
+    // blockedFlags: explicitly forbidden flags (checked before allowedFlags)
+    if (rule.blockedFlags) {
+      if (arg.startsWith("--")) {
+        if (rule.blockedFlags.includes(extractFlag(arg))) {
+          return JSON.stringify({
+            error: `${cmd} "${extractFlag(arg)}" is not allowed.`,
+          }, null, 2);
+        }
+      } else if (arg.length > 1) {
+        // Combined short flags: -rl → check each char against blocked list
+        for (const ch of arg.slice(1)) {
+          if (rule.blockedFlags.includes(`-${ch}`)) {
+            return JSON.stringify({
+              error: `${cmd} "-${ch}" is not allowed.`,
+            }, null, 2);
+          }
+        }
+      }
+    }
+
+    // allowedFlags check — skip if no allowedFlags defined
     if (!rule.allowedFlags) continue;
 
     const flag = extractFlag(arg);
@@ -573,7 +742,17 @@ function checkCurlDataValue(flag: string, value: string | undefined): string | n
 function validateCurl(args: string[]): string | null {
   for (let i = 1; i < args.length; i++) {
     const arg = args[i];
-    if (!arg.startsWith("-")) continue;
+    if (!arg.startsWith("-")) {
+      // Positional argument — must be a URL. Only allow http(s)://.
+      // Block file://, ftp://, dict://, gopher://, etc.
+      const lower = arg.toLowerCase();
+      if (lower.includes("://") && !lower.startsWith("http://") && !lower.startsWith("https://")) {
+        return JSON.stringify({
+          error: `curl "${arg}" uses a blocked protocol. Only http:// and https:// URLs are allowed.`,
+        }, null, 2);
+      }
+      continue;
+    }
 
     // ── Long flags (--xxx) ──────────────────────────────────
     if (arg.startsWith("--")) {
@@ -924,20 +1103,39 @@ const CUSTOM_VALIDATORS: Record<string, (args: string[], baseName: string) => st
 /**
  * Apply extra security restrictions to whitelisted commands.
  * Takes a raw command string, parses it internally.
+ * Optionally accepts context (for context-specific rules) and piped
+ * (for pipe-only enforcement).
  * Returns an error message string if blocked, or null if allowed.
  */
-export function validateCommandRestrictions(cmd: string): string | null {
+export function validateCommandRestrictions(
+  cmd: string,
+  options?: { context?: string; piped?: boolean },
+): string | null {
   const args = parseArgs(cmd);
   if (args.length === 0) return null;
 
   const baseName = args[0].split("/").pop()?.toLowerCase() ?? "";
 
-  const rule = COMMAND_RULES[baseName];
-  if (!rule) return null;
+  const entry = COMMAND_RULES[baseName];
+  if (!entry) return null;
 
-  if (rule.customValidator) {
-    return CUSTOM_VALIDATORS[rule.customValidator]?.(args, baseName) ?? null;
+  const rules = Array.isArray(entry) ? entry : [entry];
+
+  for (const rule of rules) {
+    // Skip rules that don't apply to the current context
+    if (rule.contexts && (!options?.context || !rule.contexts.includes(options.context))) {
+      continue;
+    }
+
+    if (rule.customValidator) {
+      const err = CUSTOM_VALIDATORS[rule.customValidator]?.(args, baseName) ?? null;
+      if (err) return err;
+      continue;
+    }
+
+    const err = validateByRule(args, rule, { piped: options?.piped });
+    if (err) return err;
   }
 
-  return validateByRule(args, rule);
+  return null;
 }

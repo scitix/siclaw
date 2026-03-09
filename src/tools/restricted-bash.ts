@@ -10,183 +10,26 @@ import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand } from "./kubectl.js";
 import { loadConfig } from "../core/config.js";
 import {
-  ALLOWED_COMMANDS,
-  parseArgs,
   getCommandBinary,
+  parseArgs,
   validateCommandRestrictions,
 } from "./command-sets.js";
 import { resolveKubeconfigPath, resolveKubeconfigByName } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
+import {
+  validateCommand as _validateCommand,
+  extractCommands as _extractCommands,
+  validateShellOperators as _validateShellOperators,
+} from "./command-validator.js";
 
 const execAsync = promisify(exec);
 
-/**
- * Extract individual commands from a shell pipeline.
- * Splits on |, &&, ;, || while respecting quotes and subshells.
- */
-export function extractCommands(input: string): string[] {
-  const commands: string[] = [];
-  let current = "";
-  let inQuote: string | null = null;
-  let parenDepth = 0;
+// ── Re-exports for backward compatibility ────────────────────────────
 
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-
-    if (inQuote) {
-      current += ch;
-      if (ch === inQuote && input[i - 1] !== "\\") {
-        inQuote = null;
-      }
-      continue;
-    }
-
-    if (ch === '"' || ch === "'" || ch === "`") {
-      inQuote = ch;
-      current += ch;
-      continue;
-    }
-
-    if (ch === "(") {
-      parenDepth++;
-      current += ch;
-      continue;
-    }
-    if (ch === ")") {
-      parenDepth--;
-      current += ch;
-      continue;
-    }
-
-    // Only split at top-level (not inside subshells)
-    if (parenDepth === 0) {
-      // Check for ||, &&
-      if (
-        (ch === "&" && input[i + 1] === "&") ||
-        (ch === "|" && input[i + 1] === "|")
-      ) {
-        if (current.trim()) commands.push(current.trim());
-        current = "";
-        i++; // skip next char
-        continue;
-      }
-      // Check for single & (background), | and ;
-      // But skip & when preceded by > (fd redirection like >&2, 2>&1)
-      if (ch === "&" && current.length > 0 && current[current.length - 1] === ">") {
-        current += ch;
-        continue;
-      }
-      if (ch === "&" || ch === "|" || ch === ";") {
-        if (current.trim()) commands.push(current.trim());
-        current = "";
-        continue;
-      }
-    }
-
-    current += ch;
-  }
-
-  if (current.trim()) commands.push(current.trim());
-  return commands;
-}
-
-/**
- * Validate that a command does not use dangerous shell operators.
- * Scans character-by-character respecting quotes.
- * Blocks: > >> (output redirection, except >&N fd duplication and >/dev/null),
- *         $() and backticks (command substitution), <() >() (process substitution).
- * Returns an error message if blocked, or null if safe.
- */
-export function validateShellOperators(command: string): string | null {
-  let inQuote: string | null = null;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-
-    // Block newline/carriage-return characters — bash interprets them as command
-    // separators, but extractCommands() does not split on them, so they can be
-    // used to smuggle commands past whitelist validation.
-    if (ch === "\n" || ch === "\r") {
-      return JSON.stringify({
-        error: "Newline characters are not allowed in commands.",
-      }, null, 2);
-    }
-
-    // Block backtick command substitution everywhere (including inside quotes)
-    if (ch === "`") {
-      return JSON.stringify({
-        error: "Backtick command substitution is not allowed.",
-      }, null, 2);
-    }
-
-    // Block $() command substitution everywhere (including inside quotes)
-    if (ch === "$" && command[i + 1] === "(") {
-      return JSON.stringify({
-        error: "$() command substitution is not allowed.",
-      }, null, 2);
-    }
-
-    // Track quote state for redirection checks only
-    if (inQuote) {
-      if (ch === inQuote && command[i - 1] !== "\\") {
-        inQuote = null;
-      }
-      continue;
-    }
-
-    if (ch === "'" || ch === '"') {
-      inQuote = ch;
-      continue;
-    }
-
-    // Block <() process substitution
-    if (ch === "<" && command[i + 1] === "(") {
-      return JSON.stringify({
-        error: "<() process substitution is not allowed.",
-      }, null, 2);
-    }
-
-    // Block bare < input redirection (but not <( which is already handled above)
-    if (ch === "<" && command[i + 1] !== "(") {
-      return JSON.stringify({
-        error: "Input redirection (<) is not allowed.",
-      }, null, 2);
-    }
-
-    // Check output redirection: > and >>
-    if (ch === ">") {
-      // Allow >() process substitution — already blocked above when preceded by nothing,
-      // but >( after a word is process substitution too
-      if (command[i + 1] === "(") {
-        return JSON.stringify({
-          error: ">() process substitution is not allowed.",
-        }, null, 2);
-      }
-
-      // Allow fd duplication: >&N (e.g. 2>&1, >&2)
-      if (command[i + 1] === "&") continue;
-
-      // Determine the redirect target (skip optional second > for >>)
-      let j = i + 1;
-      if (command[j] === ">") j++; // >>
-      // Skip whitespace
-      while (j < command.length && command[j] === " ") j++;
-
-      // Allow redirect to /dev/null
-      const target = command.substring(j);
-      if (/^\/dev\/null\b/.test(target)) continue;
-
-      return JSON.stringify({
-        error: "Output redirection (> or >>) to files is not allowed.",
-      }, null, 2);
-    }
-  }
-
-  return null;
-}
-
-// Compatibility re-exports — keep old import paths working
+export { extractCommands, validateShellOperators } from "./command-validator.js";
 export { getCommandBinary, ALLOWED_COMMANDS as ALLOWED_BINARIES } from "./command-sets.js";
+
+// ── kubectl pipeline validator ───────────────────────────────────────
 
 /**
  * Validate kubectl commands within a pipeline.
@@ -231,10 +74,8 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
   return null;
 }
 
-/**
- * Compatibility wrappers — delegate to shared validateCommandRestrictions.
- * Keeps old imports (validateFindInPipeline etc.) working for tests.
- */
+// ── Compatibility wrappers ───────────────────────────────────────────
+
 export function validateFindInPipeline(commands: string[]): string | null {
   for (const cmd of commands) {
     const binary = getCommandBinary(cmd);
@@ -264,6 +105,8 @@ export function validateIpInPipeline(commands: string[]): string | null {
   }
   return null;
 }
+
+// ── Skill script detection ───────────────────────────────────────────
 
 /**
  * Check if a shell command invokes a script under <cwd>/skills/.
@@ -312,27 +155,19 @@ export function isSkillScript(cmd: string): boolean {
   }
 }
 
-/**
- * Commands blocked in local bash — these can read local files or expose secrets,
- * bypassing the path-restricted Read/Grep/Glob tools.
- * Use dedicated tools instead: Read (cat), Glob (find/ls), Grep (grep on files).
- *
- * NOTE: ALLOWED_COMMANDS is shared with node-exec/pod-exec (remote contexts)
- * where these commands are legitimate. Only restricted-bash (local) blocks them.
- */
-const LOCAL_BLOCKED_COMMANDS = new Set([
-  // file reading — use Read tool (path-restricted to cwd)
-  "cat", "ls", "find", "stat", "file",
-  "readlink", "realpath", "basename", "dirname",
-  "diff", "md5sum", "sha256sum",
-  "strings", "lsof", "lsns",
-  // compressed file reading
-  "zcat", "zgrep", "bzcat", "xzcat",
-  // environment variable exposure — may contain API keys, DB passwords
-  "env", "printenv",
-  // not useful in restricted context
-  "pwd",
-]);
+// ── Sensitive path patterns ──────────────────────────────────────────
+
+const SENSITIVE_PATH_RE = [
+  /\.siclaw\/credentials\//,
+  /\.siclaw\/config\//,
+  /\$\{?KUBECONFIG\}?/,
+  /\/etc\/siclaw\//,
+  /\.kube\//,
+  /\/proc\/self\/environ/,
+  /\.credentials\//,
+];
+
+// ── Tool definition ─────────────────────────────────────────────────
 
 interface RestrictedBashParams {
   command: string;
@@ -390,97 +225,24 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         };
       }
 
-      // Validate shell operators on raw command (before splitting)
-      const shellOpError = validateShellOperators(command);
-      if (shellOpError) {
+      // Unified validation: context-based whitelist + shell operators +
+      // kubectl subcommands + command restrictions + sensitive paths
+      const cmdErr = _validateCommand(command, {
+        context: "local",
+        extraAllowed: new Set(["kubectl"]),
+        isAllowed: (cmd) => isSkillScript(cmd),
+        pipelineValidators: [validateKubectlInPipeline],
+        sensitivePathPatterns: SENSITIVE_PATH_RE,
+      });
+      if (cmdErr) {
         return {
-          content: [{ type: "text", text: shellOpError }],
+          content: [{ type: "text", text: cmdErr }],
           details: { blocked: true },
         };
-      }
-
-      // Validate all commands in the pipeline
-      const commands = extractCommands(command);
-      const violations: string[] = [];
-
-      for (const cmd of commands) {
-        const binary = getCommandBinary(cmd);
-        if (!binary) continue;
-        // Block local file-access commands (use Read/Grep/Glob tools instead)
-        if (LOCAL_BLOCKED_COMMANDS.has(binary)) {
-          violations.push(binary);
-          continue;
-        }
-        if (ALLOWED_COMMANDS.has(binary) || binary === "kubectl") continue;
-        // Allow skill scripts (skills/...) — both "bash script.sh" and direct invocation
-        if (isSkillScript(cmd)) {
-          continue;
-        }
-        violations.push(binary);
-      }
-
-      if (violations.length > 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  error: `Blocked: disallowed command(s): ${[...new Set(violations)].join(", ")}`,
-                  allowed: ["kubectl", ...ALLOWED_COMMANDS].sort(),
-                },
-                null,
-                2
-              ),
-            },
-          ],
-          details: { blocked: true, violations },
-        };
-      }
-
-      // Validate kubectl subcommands (read-only whitelist)
-      const kubectlError = validateKubectlInPipeline(commands);
-      if (kubectlError) {
-        return {
-          content: [{ type: "text", text: kubectlError }],
-          details: { blocked: true },
-        };
-      }
-
-      // Validate command-level restrictions (find -exec, awk system(), etc.)
-      for (const cmd of commands) {
-        const err = validateCommandRestrictions(cmd);
-        if (err) {
-          return {
-            content: [{ type: "text", text: err }],
-            details: { blocked: true },
-          };
-        }
-      }
-
-      // Block reading sensitive credential/config files via any file-reading command.
-      // Also catches $KUBECONFIG / ${KUBECONFIG} shell variable expansion.
-      const SENSITIVE_PATH_RE = [
-        /\.siclaw\/config\/settings\.json/,
-        /\.siclaw\/credentials\//,
-        /\$\{?KUBECONFIG\}?/,
-      ];
-      const FILE_READING_CMDS = ["cat", "head", "tail", "less", "more", "grep", "awk", "gawk"];
-      for (const cmd of commands) {
-        const binary = getCommandBinary(cmd);
-        if (binary && FILE_READING_CMDS.includes(binary)) {
-          if (SENSITIVE_PATH_RE.some((re) => re.test(cmd))) {
-            return {
-              content: [{ type: "text", text: JSON.stringify({
-                error: "Reading credential or config files is not allowed.",
-              }, null, 2) }],
-              details: { blocked: true },
-            };
-          }
-        }
       }
 
       // Skill scripts (debug pods, perftest, etc.) need longer timeouts
+      const commands = _extractCommands(command);
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
       const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
@@ -512,7 +274,16 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           );
         }
 
-        const child = exec(finalCommand, execOpts as any);
+        // In production (K8s pods), run child processes as sandbox user.
+        // sudo's SUID elevates to root, then drops to sandbox.
+        // -E preserves our sanitized env (allowed by SETENV in sudoers).
+        let execCommand = finalCommand;
+        if (process.env.NODE_ENV === "production") {
+          const escaped = finalCommand.replace(/'/g, "'\\''");
+          execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+        }
+
+        const child = exec(execCommand, execOpts as any);
 
         // Kill the entire process group (shell + all child processes like kubectl exec)
         // detached: true makes the shell a process group leader, so -pid kills the whole group

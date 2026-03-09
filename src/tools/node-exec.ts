@@ -1,141 +1,25 @@
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
-import { renderTextResult, processToolOutput } from "./tool-render.js";
-import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
-import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
-import { sanitizeEnv } from "./sanitize-env.js";
+import { renderTextResult } from "./tool-render.js";
+import { checkNodeReady } from "./k8s-checks.js";
 import { loadConfig } from "../core/config.js";
+import { parseArgs } from "./command-sets.js";
+import { validateCommand, extractCommands } from "./command-validator.js";
 import {
-  ALLOWED_COMMANDS,
-  parseArgs,
-  getCommandBinary,
-  validateCommandRestrictions,
-} from "./command-sets.js";
-import { validateShellOperators, extractCommands } from "./restricted-bash.js";
-
-function spawnAsync(
-  cmd: string,
-  args: string[],
-  timeout: number,
-  env?: NodeJS.ProcessEnv,
-  signal?: AbortSignal,
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env,
-    });
-    const onAbort = () => child.kill("SIGKILL");
-    signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-    }, timeout);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      if (code === 0) resolve({ stdout, stderr });
-      else
-        reject(
-          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr })
-        );
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(err);
-    });
-  });
-}
+  validateNodeName,
+  prepareExecEnv,
+  runInDebugPod,
+  formatExecOutput,
+} from "./exec-utils.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
 
-// Re-export shared ALLOWED_COMMANDS for backward compatibility
+// Re-export for backward compatibility (tests + downstream imports)
 export { ALLOWED_COMMANDS } from "./command-sets.js";
-
-// Valid node name: alphanumeric, hyphens, dots only
-const NODE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-]*$/;
-
-/**
- * Validate a Kubernetes node name.
- * Returns an error message if invalid, or null if valid.
- */
-export function validateNodeName(node: string): string | null {
-  if (!node || !node.trim()) {
-    return "Node name must not be empty.";
-  }
-  if (!NODE_NAME_RE.test(node)) {
-    return `Invalid node name "${node}". Node names may only contain letters, digits, hyphens, and dots.`;
-  }
-  return null;
-}
-
-/**
- * Validate a command intended for node-exec.
- * Uses the same validation pipeline as restricted-bash:
- * 1. validateShellOperators — blocks dangerous shell constructs
- * 2. extractCommands — splits pipelines
- * 3. Per-command: whitelist check + validateCommandRestrictions
- * Returns an error message if blocked, or null if allowed.
- */
-export function validateCommand(command: string): string | null {
-  if (!command || !command.trim()) {
-    return "Command must not be empty.";
-  }
-
-  // Block dangerous shell operators ($(), backticks, redirections, process substitution)
-  const shellOpErr = validateShellOperators(command);
-  if (shellOpErr) return shellOpErr;
-
-  // Split pipelines (|, &&, ;, ||) and validate each sub-command
-  const commands = extractCommands(command);
-  if (commands.length === 0) {
-    return "Command must not be empty.";
-  }
-
-  for (const cmd of commands) {
-    const baseName = getCommandBinary(cmd);
-    if (!baseName) continue;
-
-    if (!ALLOWED_COMMANDS.has(baseName)) {
-      return JSON.stringify(
-        {
-          error: `Command "${baseName}" is not in the allowed command list.`,
-          allowed_categories: {
-            network: "ip, ifconfig, ping, traceroute, tracepath, ss, netstat, route, arp, ethtool, mtr, bridge, tc, conntrack, nslookup, dig, host, curl",
-            rdma: "ibstat, ibstatus, ibv_devinfo, ibv_devices, rdma, ibaddr, iblinkinfo, ibportstate, ibswitches, ibroute, show_gids, ibdev2netdev",
-            perftest: "ib_write_bw, ib_write_lat, ib_read_bw, ib_read_lat, ib_send_bw, ib_send_lat, ib_atomic_bw, ib_atomic_lat, raw_ethernet_bw, raw_ethernet_lat, raw_ethernet_burst_lat",
-            gpu: "nvidia-smi, gpustat, nvtopo",
-            hardware: "lspci, lsusb, lsblk, lscpu, lsmem, lshw, dmidecode",
-            kernel: "uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo",
-            process: "ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc",
-            file: "cat, ls, pwd, stat, file, find, readlink, realpath, basename, dirname, diff, md5sum, sha256sum",
-            general: "date, whoami, id, env, printenv, which",
-          },
-        },
-        null,
-        2
-      );
-    }
-
-    // Apply unified command-level restrictions (find -exec, sysctl -w, curl -o, etc.)
-    const restrictionErr = validateCommandRestrictions(cmd);
-    if (restrictionErr) return restrictionErr;
-  }
-
-  return null;
-}
+export { validateNodeName, validatePodName } from "./exec-utils.js";
+export { validateCommand } from "./command-validator.js";
 
 interface NodeExecParams {
   node: string;
@@ -228,13 +112,7 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
-      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
-      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
-      const childEnv = {
-        ...sanitizeEnv(process.env as Record<string, string>),
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-        KUBECONFIG: "/dev/null",
-      };
+      const env = prepareExecEnv(kubeconfigRef);
 
       // Validate node name
       const nodeErr = validateNodeName(params.node);
@@ -246,7 +124,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command);
+      const cmdErr = validateCommand(params.command, { context: "node" });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -254,8 +132,10 @@ Examples:
         };
       }
 
-      // Check node exists and is Ready (after all local validation passes)
-      const nodeCheckErr = await checkNodeReady(params.node, childEnv, kubeconfigPath ?? undefined);
+      // Check node exists and is Ready
+      const nodeCheckErr = await checkNodeReady(
+        params.node, env.childEnv, env.kubeconfigPath ?? undefined,
+      );
       if (nodeCheckErr) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: nodeCheckErr }, null, 2) }],
@@ -269,126 +149,25 @@ Examples:
       const needsShell = commands.length > 1;
       const cmdArgs = parseArgs(params.command);
 
-      // Generate a unique pod name
-      const podId = randomBytes(4).toString("hex");
-      const podName = `node-debug-${podId}`;
-
-      const cleanup = () => {
-        spawnAsync("kubectl", [
-          ...kubeconfigArgs, "delete", "pod", podName, "--force", "--grace-period=0",
-        ], 10_000, childEnv).catch(() => {});
-      };
-
-      // Build overrides: privileged + hostPID + hostNetwork + nsenter
-      // Single command: pass args directly (no shell overhead)
-      // Pipeline: wrap in sh -c for shell interpretation
+      // Build nsenter command
       const nsenterCmd = needsShell
         ? ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", params.command]
         : ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...cmdArgs];
-      const overrides = JSON.stringify({
-        spec: {
-          nodeName: params.node,
-          hostPID: true,
-          hostNetwork: true,
-          containers: [{
-            name: podName,
-            image,
-            securityContext: { privileged: true },
-            command: nsenterCmd,
-          }],
-        },
-      });
 
-      try {
-        // Phase 1: Create pod
-        await spawnAsync("kubectl", [
-          ...kubeconfigArgs,
-          "run", podName,
-          "--restart=Never",
-          `--image=${image}`,
-          `--overrides=${overrides}`,
-        ], 30_000, childEnv, signal);
+      const execResult = await runInDebugPod(
+        { nodeName: params.node, command: nsenterCmd, image },
+        env,
+        { timeoutMs: timeout, signal },
+      );
 
-        // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
-        try {
-          await waitForPodDone(podName, timeout, childEnv, signal, kubeconfigPath ?? undefined);
-        } catch {
-          // Timed out — still fetch logs before cleanup
-        }
-
-        if (signal?.aborted) {
-          cleanup();
-          return {
-            content: [{ type: "text", text: "Aborted." }],
-            details: { error: true },
-          };
-        }
-
-        // Phase 3: Fetch logs
-        let stdout = "";
-        let stderr = "";
-        try {
-          const logsResult = await spawnAsync("kubectl", [
-            ...kubeconfigArgs, "logs", podName,
-          ], 10_000, childEnv);
-          stdout = logsResult.stdout;
-          stderr = logsResult.stderr;
-        } catch (logErr: any) {
-          stdout = logErr.stdout ?? "";
-          stderr = logErr.stderr ?? "";
-        }
-
-        // Phase 4: Get exit code from pod status
-        let exitCode: number | null = null;
-        try {
-          const statusResult = await spawnAsync("kubectl", [
-            ...kubeconfigArgs, "get", "pod", podName,
-            "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
-          ], 5_000, childEnv);
-          const code = parseInt(statusResult.stdout.trim(), 10);
-          if (!isNaN(code)) exitCode = code;
-        } catch {
-          // ignore — exitCode stays null
-        }
-
-        // Phase 5: Cleanup
-        cleanup();
-
-        const filteredStderr = filterPodNoise(stderr);
-        const output = stdout.trim() + (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
-
-        if (exitCode === 0 || (exitCode === null && stdout.trim())) {
-          return {
-            content: [{ type: "text", text: processToolOutput(output) }],
-            details: { exitCode: exitCode ?? 0 },
-          };
-        } else {
-          const errOutput = `Exit code: ${exitCode ?? "unknown"}\n${output}`;
-          return {
-            content: [{ type: "text", text: processToolOutput(errOutput) }],
-            details: { exitCode, error: true },
-          };
-        }
-      } catch (err: any) {
-        cleanup();
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+      if (signal?.aborted) {
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
-          details: { exitCode: err.code, error: true },
+          content: [{ type: "text", text: "Aborted." }],
+          details: { error: true },
         };
       }
+
+      return formatExecOutput(execResult);
     },
   };
-}
-
-/**
- * Filter out kubectl run informational lines from stderr
- * (e.g. 'pod "node-debug-xxx" deleted').
- */
-function filterPodNoise(stderr: string): string {
-  return stderr
-    .split("\n")
-    .filter((line) => !line.match(/^pod "node-debug-.*" deleted$/))
-    .join("\n")
-    .trim();
 }
