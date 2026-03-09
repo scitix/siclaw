@@ -151,30 +151,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   // Config repo for webhook route
   const configRepo = db ? new ConfigRepository(db) : null;
 
-  // Clean orphan model entries on startup, then set up env resolver
+  // Clean orphan model entries on startup
   if (db) {
     const modelConfigRepo = new ModelConfigRepository(db);
     await modelConfigRepo.cleanOrphanModels();
-    agentBoxManager.setEnvResolver(async () => {
-      const env: Record<string, string> = {};
-
-      const llm = await modelConfigRepo.getResolvedDefaultConfig();
-      if (llm) {
-        if (llm.baseUrl) env.SICLAW_LLM_BASE_URL = llm.baseUrl;
-        if (llm.apiKey) env.SICLAW_LLM_API_KEY = resolveApiKey(llm.apiKey);
-        if (llm.model) env.SICLAW_LLM_MODEL = llm.model;
-      }
-
-      const emb = await modelConfigRepo.getResolvedEmbeddingConfig();
-      if (emb) {
-        if (emb.baseUrl) env.SICLAW_EMBEDDING_BASE_URL = emb.baseUrl;
-        if (emb.apiKey) env.SICLAW_EMBEDDING_API_KEY = resolveApiKey(emb.apiKey);
-        if (emb.model) env.SICLAW_EMBEDDING_MODEL = emb.model;
-        if (emb.dimensions) env.SICLAW_EMBEDDING_DIMENSIONS = String(emb.dimensions);
-      }
-
-      return env;
-    });
   }
 
   // Workspace repo (used by internal API to resolve default workspace)
@@ -1307,24 +1287,3 @@ async function resolveJwtSecret(sysConfigRepo: SystemConfigRepository | null): P
   return generated;
 }
 
-/**
- * Resolve an API key value — if it looks like an env var name (no slashes,
- * no dots, all uppercase/underscores), resolve it from process.env.
- */
-function resolveApiKey(value: string): string {
-  // Legacy: bare ALL_CAPS_NAME treated as env var name
-  if (/^[A-Z_][A-Z0-9_]*$/.test(value)) {
-    return process.env[value] ?? value;
-  }
-  // $VAR / ${VAR} syntax — inline env-var references
-  if (/\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*/.test(value)) {
-    return value.replace(
-      /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-      (_, braced, bare) => {
-        const name = braced || bare;
-        return process.env[name] ?? "";
-      },
-    );
-  }
-  return value;
-}

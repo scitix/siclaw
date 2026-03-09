@@ -31,8 +31,6 @@ interface ManagedBox {
   createdAt: Date;
 }
 
-export type EnvResolver = () => Promise<Record<string, string>>;
-
 export class AgentBoxManager {
   private spawner: BoxSpawner;
   private config: Required<AgentBoxManagerConfig>;
@@ -46,9 +44,6 @@ export class AgentBoxManager {
   /** Health check timer (local dev only) */
   private healthCheckTimer?: ReturnType<typeof setInterval>;
 
-  /** Optional async resolver that provides extra env vars for new AgentBoxes */
-  private envResolver?: EnvResolver;
-
   /** Whether the spawner is K8s-based (stateless, no in-memory cache) */
   private readonly isK8s: boolean;
 
@@ -58,14 +53,6 @@ export class AgentBoxManager {
     this.isK8s = spawner.name === "k8s";
 
     console.log(`[agentbox-manager] Initialized with spawner: ${spawner.name}${this.isK8s ? " (stateless, K8s API discovery)" : " (in-memory cache)"}`);
-  }
-
-  /**
-   * Set an async resolver that provides extra env vars injected into every new AgentBox.
-   * The resolved env is merged after config.env, so it takes precedence.
-   */
-  setEnvResolver(resolver: EnvResolver): void {
-    this.envResolver = resolver;
   }
 
   /** Update the spawner's AgentBox image at runtime (takes effect on next spawn) */
@@ -163,7 +150,7 @@ export class AgentBoxManager {
     // 2. Pod doesn't exist or not running → create
     console.log(`[agentbox-manager] Creating new AgentBox for user: ${userId} workspace: ${workspaceId}`);
 
-    const resolvedEnv = await this.resolveEnv(config?.env);
+    const resolvedEnv = this.resolveEnv(config?.env);
     const handle = await this.spawner.spawn({
       userId,
       workspaceId,
@@ -194,7 +181,7 @@ export class AgentBoxManager {
 
     console.log(`[agentbox-manager] Creating new AgentBox for user: ${userId} workspace: ${workspaceId}`);
 
-    const resolvedEnv = await this.resolveEnv(config?.env);
+    const resolvedEnv = this.resolveEnv(config?.env);
     const handle = await this.spawner.spawn({
       userId,
       workspaceId,
@@ -212,16 +199,8 @@ export class AgentBoxManager {
   }
 
   /** Resolve merged env vars */
-  private async resolveEnv(configEnv?: Record<string, string>): Promise<Record<string, string>> {
-    let resolvedEnv: Record<string, string> | undefined;
-    if (this.envResolver) {
-      try {
-        resolvedEnv = await this.envResolver();
-      } catch (err) {
-        console.warn("[agentbox-manager] envResolver failed, continuing without extra env:", err);
-      }
-    }
-    return { ...configEnv, ...resolvedEnv };
+  private resolveEnv(configEnv?: Record<string, string>): Record<string, string> {
+    return configEnv ?? {};
   }
 
   /**
