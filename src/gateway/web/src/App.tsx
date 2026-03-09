@@ -15,7 +15,7 @@ import { SettingsLayout } from './pages/Settings/SettingsLayout';
 import { SystemSettings } from './pages/Settings/SystemSettings';
 import { PermissionsPage } from './pages/Permissions';
 import { ModelsPage } from './pages/Models';
-import { BrainsPage } from './pages/Brains';
+// import { BrainsPage } from './pages/Brains';  // hidden until claude-sdk brain is polished
 import { CredentialsPage } from './pages/Credentials';
 import { WorkspacesPage } from './pages/Workspaces';
 import { McpServersPage } from './pages/McpServers';
@@ -69,7 +69,7 @@ const router = createBrowserRouter([
                     { path: 'sessions', element: <ComingSoonPage title="Sessions" /> },
                     { path: 'workspace', element: <WorkspacesPage /> },
                     { path: 'mcp', element: <McpServersPage /> },
-                    { path: 'brains', element: <BrainsPage /> },
+                    // { path: 'brains', element: <BrainsPage /> },  // hidden until claude-sdk brain is polished
                     { path: 'models', element: <ModelsPage /> },
                 ],
             },

@@ -14,7 +14,7 @@ import {
     Plug,
     Cpu,
     Compass,
-    BrainCircuit,
+    // BrainCircuit,  // hidden until claude-sdk brain is polished
     KeyRound,
     Wrench,
 } from 'lucide-react';
@@ -63,7 +63,7 @@ const groups: NavGroup[] = [
         key: 'settings',
         items: [
             { icon: Share2, label: 'Channels', to: '/channels', adminOnly: true },
-            { icon: BrainCircuit, label: 'Brains', to: '/brains' },
+            // { icon: BrainCircuit, label: 'Brains', to: '/brains' },  // hidden until claude-sdk brain is polished
             { icon: Cpu, label: 'Models', to: '/models', adminOnly: true },
             { icon: KeyRound, label: 'Credentials', to: '/credentials' },
             { icon: Shield, label: 'Permissions', to: '/permissions', adminOnly: true },
