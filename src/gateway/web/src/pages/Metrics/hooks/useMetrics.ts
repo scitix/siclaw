@@ -15,6 +15,8 @@ export interface TimeseriesBucket {
     wsConnections: number;
     toolCalls: number;
     toolErrors: number;
+    skillSuccesses: number;
+    skillErrors: number;
 }
 
 export interface ToolCallStats {
@@ -24,10 +26,20 @@ export interface ToolCallStats {
     total: number;
 }
 
+export interface SkillCallStats {
+    skillName: string;
+    scope: 'builtin' | 'team' | 'personal';
+    success: number;
+    error: number;
+    total: number;
+    avgDurationMs: number;
+}
+
 export interface TimeseriesResponse {
     buckets: TimeseriesBucket[];
     snapshot: { activeSessions: number; wsConnections: number };
     topTools: ToolCallStats[];
+    topSkills: SkillCallStats[];
 }
 
 export interface SummaryResponse {

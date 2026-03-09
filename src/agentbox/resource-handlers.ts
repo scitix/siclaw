@@ -72,6 +72,7 @@ interface SkillBundlePayload {
   version: string;
   skills: Array<{
     dirName: string;
+    scope: "team" | "personal";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
   }>;
@@ -91,18 +92,23 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     const config = loadConfig();
     const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
 
-    // Clear existing skill dirs (but not hidden files like .gitkeep)
+    // Clear only bundle-managed scope subdirectories (team/ and user/)
+    // Never wipe the entire skillsDir — that would destroy core/ and other dirs
     if (fs.existsSync(skillsDir)) {
-      for (const entry of fs.readdirSync(skillsDir)) {
-        if (entry.startsWith(".")) continue;
-        fs.rmSync(path.join(skillsDir, entry), { recursive: true });
+      for (const scopeDir of ["team", "user"]) {
+        const scopePath = path.join(skillsDir, scopeDir);
+        if (fs.existsSync(scopePath)) {
+          fs.rmSync(scopePath, { recursive: true });
+        }
       }
     } else {
       fs.mkdirSync(skillsDir, { recursive: true });
     }
 
     for (const skill of payload.skills) {
-      const skillDir = path.join(skillsDir, skill.dirName);
+      // Write into scope subdirectory so getSkillScriptDirs() layer 2 matches naturally
+      const scopeDir = skill.scope === "personal" ? "user" : "team";
+      const skillDir = path.join(skillsDir, scopeDir, skill.dirName);
       fs.mkdirSync(skillDir, { recursive: true });
 
       if (skill.specs) {

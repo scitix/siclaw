@@ -3662,7 +3662,7 @@ export function createRpcMethods(
 
   methods.set("metrics.timeseries", async (params, context: RpcContext) => {
     requireAuth(context);
-    if (!metricsAggregator) return { buckets: [], snapshot: { activeSessions: 0, wsConnections: 0 }, topTools: [] };
+    if (!metricsAggregator) return { buckets: [], snapshot: { activeSessions: 0, wsConnections: 0 }, topTools: [], topSkills: [] };
 
     const range = (params.range as string) || "1h";
     if (range !== "1h" && range !== "6h" && range !== "24h") {
@@ -3686,12 +3686,15 @@ export function createRpcMethods(
       wsConnections: b.wsConnections,
       toolCalls: b.toolCalls,
       toolErrors: b.toolErrors,
+      skillSuccesses: b.skillSuccesses,
+      skillErrors: b.skillErrors,
     }));
 
     return {
       buckets,
       snapshot: metricsAggregator.snapshot(),
       topTools: metricsAggregator.topTools(10),
+      topSkills: metricsAggregator.topSkills(10),
     };
   });
 

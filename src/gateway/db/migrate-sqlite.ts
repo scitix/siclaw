@@ -316,6 +316,7 @@ const DDL_STATEMENTS = [
     duration_ms       INTEGER DEFAULT 0,
     prompt_count      INTEGER DEFAULT 0,
     tool_call_count   INTEGER DEFAULT 0,
+    skill_call_count  INTEGER DEFAULT 0,
     created_at        INTEGER NOT NULL
   )`,
 

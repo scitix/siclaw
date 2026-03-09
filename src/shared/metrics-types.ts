@@ -19,6 +19,8 @@ export interface MetricsBucket {
   wsConnections: number;      // last sampled value (only meaningful on Gateway side)
   toolCalls: number;
   toolErrors: number;
+  skillSuccesses: number;
+  skillErrors: number;
 }
 
 /** Tool call ranking entry */
@@ -27,6 +29,16 @@ export interface ToolCallStats {
   success: number;
   error: number;
   total: number;
+}
+
+/** Skill call ranking entry */
+export interface SkillCallStats {
+  skillName: string;
+  scope: "builtin" | "team" | "personal";
+  success: number;
+  error: number;
+  total: number;
+  avgDurationMs: number;
 }
 
 /** Session stats record — written to Gateway DB when a session is released */
@@ -42,6 +54,7 @@ export interface SessionStatsRecord {
   durationMs: number;         // wall-clock time (created → released)
   promptCount: number;
   toolCallCount: number;
+  skillCallCount: number;
   createdAt: number;          // session creation timestamp (Unix ms)
 }
 
@@ -51,6 +64,7 @@ export interface MetricsSnapshot {
   activeSessions: number;
   sessionStats: SessionStatsRecord[];
   toolCallDeltas: ToolCallStats[];
+  skillCallDeltas: SkillCallStats[];
 }
 
 export function createEmptyBucket(timestamp: number): MetricsBucket {
@@ -68,5 +82,7 @@ export function createEmptyBucket(timestamp: number): MetricsBucket {
     wsConnections: 0,
     toolCalls: 0,
     toolErrors: 0,
+    skillSuccesses: 0,
+    skillErrors: 0,
   };
 }

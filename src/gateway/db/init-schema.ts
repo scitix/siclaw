@@ -348,6 +348,23 @@ const DDL_STATEMENTS = [
     FOREIGN KEY (created_by) REFERENCES users(id)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS session_stats (
+    id VARCHAR(64) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(32) NOT NULL,
+    provider VARCHAR(64),
+    model VARCHAR(128),
+    input_tokens INT DEFAULT 0,
+    output_tokens INT DEFAULT 0,
+    cache_read_tokens INT DEFAULT 0,
+    cache_write_tokens INT DEFAULT 0,
+    duration_ms INT DEFAULT 0,
+    prompt_count INT DEFAULT 0,
+    tool_call_count INT DEFAULT 0,
+    skill_call_count INT DEFAULT 0,
+    created_at BIGINT NOT NULL
+  )`,
+
 ];
 
 // Indexes — handled separately since MySQL lacks CREATE INDEX IF NOT EXISTS
@@ -366,6 +383,8 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE skill_versions ADD INDEX idx_skill_versions_skill (skill_id, version)`,
   `ALTER TABLE skill_contents ADD INDEX idx_skill_contents_skill (skill_id)`,
   `ALTER TABLE credentials ADD INDEX idx_credentials_user (user_id, type)`,
+  `ALTER TABLE session_stats ADD INDEX idx_session_stats_created (created_at)`,
+  `ALTER TABLE session_stats ADD INDEX idx_session_stats_user (user_id, created_at)`,
 ];
 
 export async function initSchema(db: Database): Promise<void> {

@@ -15,6 +15,7 @@ import { onDiagnostic, type DiagnosticEvent } from "./diagnostic-events.js";
 import {
   type MetricsBucket,
   type ToolCallStats,
+  type SkillCallStats,
   type SessionStatsRecord,
   type MetricsSnapshot,
   createEmptyBucket,
@@ -29,7 +30,13 @@ function minuteTs(now?: number): number {
 class LocalCollector {
   private ringBuffer = new Map<number, MetricsBucket>();
   private toolCallMap = new Map<string, { success: number; error: number }>();
-  private perSessionCounters = new Map<string, { prompts: number; tools: number }>();
+  private skillCallMap = new Map<string, {
+    scope: "builtin" | "team" | "personal";
+    success: number;
+    error: number;
+    totalDurationMs: number;
+  }>();
+  private perSessionCounters = new Map<string, { prompts: number; tools: number; skills: number }>();
   private sessionStatsQueue: SessionStatsRecord[] = [];
 
   private currentSessions = 0;
@@ -76,7 +83,7 @@ class LocalCollector {
         this.currentSessions++;
         const bucket = this.getOrCreateBucket();
         bucket.activeSessions = this.currentSessions;
-        this.perSessionCounters.set(event.sessionId, { prompts: 0, tools: 0 });
+        this.perSessionCounters.set(event.sessionId, { prompts: 0, tools: 0, skills: 0 });
         break;
       }
 
@@ -101,6 +108,7 @@ class LocalCollector {
           durationMs: Date.now() - event.createdAt,
           promptCount: counters?.prompts ?? 0,
           toolCallCount: counters?.tools ?? 0,
+          skillCallCount: counters?.skills ?? 0,
           createdAt: event.createdAt,
         };
         this.sessionStatsQueue.push(record);
@@ -133,6 +141,36 @@ class LocalCollector {
         for (const sc of this.perSessionCounters.values()) {
           sc.tools++;
           break; // increment first (most recent) only
+        }
+        break;
+      }
+
+      case "skill_call": {
+        const bucket = this.getOrCreateBucket();
+        if (event.outcome === "error") {
+          bucket.skillErrors++;
+        } else {
+          bucket.skillSuccesses++;
+        }
+
+        // Per-skill cumulative
+        const key = event.skillName;
+        let skillEntry = this.skillCallMap.get(key);
+        if (!skillEntry) {
+          skillEntry = { scope: event.scope, success: 0, error: 0, totalDurationMs: 0 };
+          this.skillCallMap.set(key, skillEntry);
+        }
+        if (event.outcome === "error") {
+          skillEntry.error++;
+        } else {
+          skillEntry.success++;
+        }
+        skillEntry.totalDurationMs += event.durationMs;
+
+        // Per-session counter (skill_call carries sessionId for precise matching)
+        if (event.sessionId) {
+          const sc = this.perSessionCounters.get(event.sessionId);
+          if (sc) sc.skills++;
         }
         break;
       }
@@ -216,6 +254,24 @@ class LocalCollector {
     return result.slice(0, n);
   }
 
+  /** Return skill call rankings, sorted by total descending, top N */
+  topSkills(n: number): SkillCallStats[] {
+    return [...this.skillCallMap.entries()]
+      .map(([skillName, v]) => {
+        const total = v.success + v.error;
+        return {
+          skillName,
+          scope: v.scope,
+          success: v.success,
+          error: v.error,
+          total,
+          avgDurationMs: total > 0 ? Math.round(v.totalDurationMs / total) : 0,
+        };
+      })
+      .sort((a, b) => b.total - a.total)
+      .slice(0, n);
+  }
+
   /**
    * Drain the session stats queue — returns all pending records and clears the queue.
    * Used by MetricsAggregator in Local mode to consume and write to DB.
@@ -253,6 +309,10 @@ class LocalCollector {
     const toolCallDeltas = this.topTools(Infinity);
     this.toolCallMap.clear();
 
+    // Skill call deltas: export current totals, then reset for next interval
+    const skillCallDeltas = this.topSkills(Infinity);
+    this.skillCallMap.clear();
+
     const sessionStats = this.sessionStatsQueue.splice(0);
 
     return {
@@ -260,6 +320,7 @@ class LocalCollector {
       activeSessions: this.currentSessions,
       sessionStats,
       toolCallDeltas,
+      skillCallDeltas,
     };
   }
 }
