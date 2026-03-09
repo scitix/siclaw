@@ -151,10 +151,17 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   // Config repo for webhook route
   const configRepo = db ? new ConfigRepository(db) : null;
 
-  // Clean orphan model entries on startup
+  // Clean orphan model entries on startup, then set up env resolver
   if (db) {
     const modelConfigRepo = new ModelConfigRepository(db);
     await modelConfigRepo.cleanOrphanModels();
+    agentBoxManager.setEnvResolver(async () => {
+      // LLM and embedding config is fetched by AgentBox via mTLS
+      // (gatewayClient.fetchSettings() → settings.json), NOT via env vars.
+      // Env vars are only used for deployment/infrastructure settings below.
+      const env: Record<string, string> = {};
+      return env;
+    });
   }
 
   // Workspace repo (used by internal API to resolve default workspace)
