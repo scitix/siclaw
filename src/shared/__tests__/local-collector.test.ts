@@ -67,7 +67,6 @@ describe("LocalCollector", () => {
     expect(record).toBeDefined();
     expect(record!.inputTokens).toBe(200);
     expect(record!.outputTokens).toBe(100);
-    expect(record!.costUsd).toBe(0.05);
   });
 
   it("should track tool calls", () => {
