@@ -6,25 +6,14 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
 import { checkPodRunning } from "./k8s-checks.js";
-import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
-import { sanitizeEnv } from "./sanitize-env.js";
-import { validateCommand } from "./node-exec.js";
 import { parseArgs } from "./command-sets.js";
+import { validateCommand } from "./command-validator.js";
+import { validatePodName, prepareExecEnv } from "./exec-utils.js";
 
 const execFileAsync = promisify(execFile);
 
-// Valid pod name: RFC 1123 subdomain
-const POD_NAME_RE = /^[a-z0-9][a-z0-9.\-]*$/;
-
-export function validatePodName(pod: string): string | null {
-  if (!pod || !pod.trim()) {
-    return "Pod name must not be empty.";
-  }
-  if (!POD_NAME_RE.test(pod)) {
-    return `Invalid pod name "${pod}". Pod names may only contain lowercase letters, digits, hyphens, and dots.`;
-  }
-  return null;
-}
+// Re-export for backward compatibility (tests + downstream imports)
+export { validatePodName } from "./exec-utils.js";
 
 interface PodExecParams {
   pod: string;
@@ -105,13 +94,7 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams) {
       const params = rawParams as PodExecParams;
-      const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
-      const kubeconfigArgs = kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : [];
-      const childEnv = {
-        ...sanitizeEnv(process.env as Record<string, string>),
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-        KUBECONFIG: "/dev/null",
-      };
+      const env = prepareExecEnv(kubeconfigRef);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 
@@ -124,8 +107,8 @@ Examples:
         };
       }
 
-      // Validate command (reuse node-exec's validation — same whitelist + metachar + restrictions)
-      const cmdErr = validateCommand(params.command);
+      // Validate command
+      const cmdErr = validateCommand(params.command, { context: "pod" });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -134,7 +117,9 @@ Examples:
       }
 
       // Check pod exists and is Running
-      const podCheckErr = await checkPodRunning(pod, namespace, childEnv, kubeconfigPath ?? undefined);
+      const podCheckErr = await checkPodRunning(
+        pod, namespace, env.childEnv, env.kubeconfigPath ?? undefined,
+      );
       if (podCheckErr) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: podCheckErr }, null, 2) }],
@@ -146,7 +131,7 @@ Examples:
       const cmdArgs = parseArgs(params.command);
 
       // Build kubectl exec args
-      const kubectlArgs = [...kubeconfigArgs, "exec", pod, "-n", namespace];
+      const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }
@@ -156,7 +141,7 @@ Examples:
         const { stdout, stderr } = await execFileAsync(
           "kubectl",
           kubectlArgs,
-          { timeout, env: childEnv },
+          { timeout, env: env.childEnv },
         );
 
         const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");

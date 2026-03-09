@@ -1,6 +1,11 @@
 # AgentBox Docker Image — multi-stage build
 # Stage 1: build (tsc)
 # Stage 2: production runtime
+#
+# Security: dual-user model (ADR-010, docs/design/security.md)
+#   agentbox — main Node.js process, owns credentials
+#   sandbox  — all child processes (shell commands), no credential access
+#   kubectl  — setgid kubecred group, reads kubeconfig via group permission
 
 # ── Build stage ──────────────────────────────────────────────────
 FROM node:22-slim AS builder
@@ -27,12 +32,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     python3 \
     ca-certificates \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl
 RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
     && chmod +x kubectl \
     && mv kubectl /usr/local/bin/
+
+# ── User & group setup (dual-user isolation) ─────────────────────
+# kubecred group: kubectl setgid grants membership to read kubeconfig
+# sandbox user:   all child processes run as this user
+# agentbox user:  main Node.js process, member of kubecred group
+# node:22-slim has UID 1000 (node user) — remove it first to avoid conflicts
+RUN userdel -r node 2>/dev/null || true \
+    && groupadd --gid 1002 kubecred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred agentbox \
+    && useradd --uid 1001 -M -s /bin/false sandbox
+
+# sudoers: agentbox can run commands as sandbox (child process isolation)
+# SETENV allows -E flag to preserve sanitized environment
+RUN echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
+    && chmod 440 /etc/sudoers.d/sandbox-exec
+
+# kubectl setgid: sandbox user gains kubecred group when running kubectl
+RUN chgrp kubecred /usr/local/bin/kubectl \
+    && chmod 2755 /usr/local/bin/kubectl
 
 # Create app directory
 WORKDIR /app
@@ -46,8 +71,30 @@ COPY --from=builder /app/dist/ ./dist/
 
 # Builtin skills baked into image (always available, no Gateway dependency)
 COPY skills/core/ ./skills/core/
-# Dynamic skills (team + personal) delivered via Gateway bundle API at startup
-RUN mkdir -p ./.siclaw/skills ./.siclaw/credentials
+
+# ── Directory structure & permissions ────────────────────────────
+# Credentials: agentbox:kubecred 0750 (sandbox: no access, kubectl: read via setgid)
+# Config/data: agentbox:agentbox 0700 (sandbox: no access)
+# Skills:      agentbox:agentbox 0755 (sandbox: read-only)
+# User data:   agentbox:agentbox 0777 (sandbox: read-write — only writable area)
+RUN mkdir -p ./.siclaw/skills ./.siclaw/credentials ./.siclaw/config ./.siclaw/user-data \
+    && chown -R agentbox:agentbox . \
+    && chown agentbox:kubecred ./.siclaw/credentials \
+    && chmod 0750 ./.siclaw/credentials \
+    && chmod 0700 ./.siclaw/config \
+    && chmod 0755 ./.siclaw/skills \
+    && chmod 0777 ./.siclaw/user-data
+
+# Application code: world-readable (sandbox can read, not write)
+RUN chmod -R o+rX ./dist/ ./skills/ ./node_modules/
+
+# Strip all SUID bits except sudo; verify only kubectl has SGID
+RUN find / -perm /4000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
+      case "$f" in /usr/bin/sudo) ;; *) echo "Stripping SUID: $f"; chmod u-s "$f" ;; esac; \
+    done \
+    && find / -perm /2000 -type f ! -path '/proc/*' 2>/dev/null | while read -r f; do \
+         case "$f" in /usr/local/bin/kubectl) ;; *) echo "Stripping SGID: $f"; chmod g-s "$f" ;; esac; \
+       done
 
 # Environment variables
 ENV NODE_ENV=production
@@ -59,10 +106,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 3000
 
-# Run as non-root user for security
-RUN useradd -m -s /bin/bash agentbox
-RUN chown -R agentbox:agentbox ./.siclaw/
-USER agentbox
+# Entrypoint enforces permissions at startup (defense against volume mount issues)
+COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh
 
-# Start agentbox
+# Container starts as root — entrypoint fixes volume permissions then drops to agentbox.
+# The agentbox user uses sudo to run child processes as sandbox.
+# K8s securityContext drops all capabilities except SETUID/SETGID.
+ENTRYPOINT ["/usr/local/bin/agentbox-entrypoint.sh"]
 CMD ["node", "dist/agentbox-main.js"]

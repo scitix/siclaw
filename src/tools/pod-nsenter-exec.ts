@@ -1,66 +1,20 @@
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
-import { renderTextResult, processToolOutput } from "./tool-render.js";
-import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
-import { validateCommand } from "./node-exec.js";
-import { parseArgs } from "./command-sets.js";
-import { validatePodName } from "./pod-exec.js";
+import { renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
-import { sanitizeEnv } from "./sanitize-env.js";
+import { parseArgs } from "./command-sets.js";
+import { validateCommand } from "./command-validator.js";
+import {
+  validatePodName,
+  prepareExecEnv,
+  resolveContainerNetns,
+  runInDebugPod,
+  formatExecOutput,
+} from "./exec-utils.js";
 
 const DEFAULT_IMAGE = loadConfig().debugImage;
-
-// Valid pod name: RFC 1123 subdomain
-const POD_NAME_RE = /^[a-z0-9][a-z0-9.\-]*$/;
-
-function spawnAsync(
-  cmd: string,
-  args: string[],
-  timeout: number,
-  env?: NodeJS.ProcessEnv,
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
-    const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env,
-    });
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-    }, timeout);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve({ stdout, stderr });
-      else
-        reject(
-          Object.assign(new Error(`exit ${code}`), { code, stdout, stderr }),
-        );
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-function filterPodNoise(stderr: string): string {
-  return stderr
-    .split("\n")
-    .filter((line) => !line.match(/^pod "node-debug-.*" deleted$/))
-    .join("\n")
-    .trim();
-}
 
 interface PodNsenterExecParams {
   pod: string;
@@ -143,13 +97,9 @@ Examples:
       );
     },
     renderResult: renderTextResult,
-    async execute(_toolCallId, rawParams) {
+    async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as PodNsenterExecParams;
-      const env = {
-        ...sanitizeEnv(process.env as Record<string, string>),
-        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-        KUBECONFIG: "/dev/null",
-      };
+      const env = prepareExecEnv(kubeconfigRef);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 
@@ -163,7 +113,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command);
+      const cmdErr = validateCommand(params.command, { context: "nsenter" });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -171,106 +121,15 @@ Examples:
         };
       }
 
-      // Step 1: Get pod phase + node in one call
-      let nodeName: string;
-      try {
-        const result = await spawnAsync(
-          "kubectl",
-          [
-            "get", "pod", pod, "-n", namespace,
-            "-o", "jsonpath={.status.phase},{.spec.nodeName}",
-          ],
-          10_000,
-          env,
-        );
-        const parts = result.stdout.trim().split(",");
-        const phase = parts[0];
-        nodeName = parts[1] || "";
-        if (phase !== "Running") {
-          return {
-            content: [{
-              type: "text",
-              text: `Error: Pod "${pod}" in namespace "${namespace}" is not Running (phase: ${phase || "unknown"}). Cannot enter its network namespace.`,
-            }],
-            details: { error: true },
-          };
-        }
-        if (!nodeName) {
-          return {
-            content: [{
-              type: "text",
-              text: `Error: could not determine node for pod "${pod}" in namespace "${namespace}".`,
-            }],
-            details: { error: true },
-          };
-        }
-      } catch (err: any) {
-        const stderr = (err.stderr?.trim() || err.message) as string;
-        if (stderr.includes("not found")) {
-          return {
-            content: [{
-              type: "text",
-              text: `Error: Pod "${pod}" not found in namespace "${namespace}". Check the pod name and namespace.`,
-            }],
-            details: { error: true },
-          };
-        }
+      // Resolve container network namespace (pod phase + node + container ID)
+      const netns = await resolveContainerNetns(pod, namespace, params.container, env);
+      if ("error" in netns) {
         return {
-          content: [{
-            type: "text",
-            text: `Error: failed to get pod info: ${stderr}`,
-          }],
+          content: [{ type: "text", text: `Error: ${netns.error}` }],
           details: { error: true },
         };
       }
 
-      // Check node is Ready before creating debug pod
-      const nodeCheckErr = await checkNodeReady(nodeName, env);
-      if (nodeCheckErr) {
-        return {
-          content: [{ type: "text", text: `Error: ${nodeCheckErr}` }],
-          details: { error: true },
-        };
-      }
-
-      // Step 2: Get the container ID
-      let containerID: string;
-      try {
-        const jsonpathExpr = params.container?.trim()
-          ? `{.status.containerStatuses[?(@.name=="${params.container.trim()}")].containerID}`
-          : "{.status.containerStatuses[0].containerID}";
-        const result = await spawnAsync(
-          "kubectl",
-          ["get", "pod", pod, "-n", namespace, "-o", `jsonpath=${jsonpathExpr}`],
-          10_000,
-          env,
-        );
-        containerID = result.stdout.trim();
-        if (!containerID) {
-          return {
-            content: [{
-              type: "text",
-              text: `Error: could not determine container ID for pod "${pod}". Is the pod running?`,
-            }],
-            details: { error: true },
-          };
-        }
-        // Strip the runtime prefix (e.g. "containerd://")
-        const prefixIdx = containerID.indexOf("://");
-        if (prefixIdx !== -1) {
-          containerID = containerID.slice(prefixIdx + 3);
-        }
-      } catch (err: any) {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: failed to get container ID: ${err.stderr?.trim() || err.message}`,
-          }],
-          details: { error: true },
-        };
-      }
-
-      // Step 3: Build debug pod with nsenter into pod's netns
       const image = params.image || DEFAULT_IMAGE;
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const cmdArgs = parseArgs(params.command);
@@ -282,7 +141,7 @@ Examples:
       // then uses inner nsenter to enter only the pod's network namespace.
       // unshare --mount + sysfs remount ensures /sys reflects the pod's netns.
       const innerScript = `
-CONTAINER_ID="${containerID}"
+CONTAINER_ID="${netns.containerID}"
 PID=$(crictl inspect "$CONTAINER_ID" 2>/dev/null | jq -r ".info.pid")
 if [ -z "$PID" ] || [ "$PID" = "null" ]; then
   echo "Error: cannot find PID for container $CONTAINER_ID" >&2
@@ -291,119 +150,25 @@ fi
 unshare --mount sh -c 'nsenter -t '"$PID"' -n -- mount -t sysfs none /sys 2>/dev/null; nsenter -t '"$PID"' -n -- ${escapedArgs}'
 `.trim();
 
-      const podId = randomBytes(4).toString("hex");
-      const podName = `node-debug-${podId}`;
+      const nsenterCmd = [
+        "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+        "--", "sh", "-c", innerScript,
+      ];
 
-      const overrides = JSON.stringify({
-        spec: {
-          nodeName,
-          hostPID: true,
-          hostNetwork: true,
-          containers: [{
-            name: podName,
-            image,
-            securityContext: { privileged: true },
-            command: [
-              "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
-              "--", "sh", "-c", innerScript,
-            ],
-          }],
-          restartPolicy: "Never",
-        },
-      });
+      const execResult = await runInDebugPod(
+        { nodeName: netns.nodeName, command: nsenterCmd, image },
+        env,
+        { timeoutMs: timeout, signal },
+      );
 
-      try {
-        // Phase 1: Create pod
-        await spawnAsync(
-          "kubectl",
-          [
-            "run", podName,
-            "--restart=Never",
-            `--image=${image}`,
-            `--overrides=${overrides}`,
-          ],
-          30_000,
-          env,
-        );
-
-        // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
-        try {
-          await waitForPodDone(podName, timeout, env);
-        } catch {
-          // Timed out — still fetch logs before cleanup
-        }
-
-        // Phase 3: Fetch logs
-        let stdout = "";
-        let stderr = "";
-        try {
-          const logsResult = await spawnAsync(
-            "kubectl", ["logs", podName], 10_000, env,
-          );
-          stdout = logsResult.stdout;
-          stderr = logsResult.stderr;
-        } catch (logErr: any) {
-          stdout = logErr.stdout ?? "";
-          stderr = logErr.stderr ?? "";
-        }
-
-        // Phase 4: Get exit code
-        let exitCode: number | null = null;
-        try {
-          const statusResult = await spawnAsync(
-            "kubectl",
-            [
-              "get", "pod", podName,
-              "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
-            ],
-            5_000,
-            env,
-          );
-          const code = parseInt(statusResult.stdout.trim(), 10);
-          if (!isNaN(code)) exitCode = code;
-        } catch {
-          // ignore
-        }
-
-        // Phase 5: Cleanup
-        spawnAsync(
-          "kubectl",
-          ["delete", "pod", podName, "--force", "--grace-period=0"],
-          10_000,
-          env,
-        ).catch(() => {});
-
-        const filteredStderr = filterPodNoise(stderr);
-        const output =
-          stdout.trim() +
-          (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
-
-        if (exitCode === 0 || (exitCode === null && stdout.trim())) {
-          return {
-            content: [{ type: "text", text: processToolOutput(output) }],
-            details: { exitCode: exitCode ?? 0 },
-          };
-        } else {
-          const errOutput = `Exit code: ${exitCode ?? "unknown"}\n${output}`;
-          return {
-            content: [{ type: "text", text: processToolOutput(errOutput) }],
-            details: { exitCode, error: true },
-          };
-        }
-      } catch (err: any) {
-        // Cleanup on unexpected error
-        spawnAsync(
-          "kubectl",
-          ["delete", "pod", podName, "--force", "--grace-period=0"],
-          10_000,
-          env,
-        ).catch(() => {});
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+      if (signal?.aborted) {
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
-          details: { exitCode: err.code, error: true },
+          content: [{ type: "text", text: "Aborted." }],
+          details: { error: true },
         };
       }
+
+      return formatExecOutput(execResult);
     },
   };
 }
