@@ -26,93 +26,7 @@ import {
   type ProviderConfig,
   type SiclawConfig,
 } from "../config.js";
-
-// ---------------------------------------------------------------------------
-// Provider presets (extracted from cli-setup.ts)
-// ---------------------------------------------------------------------------
-
-interface ProviderPreset {
-  label: string;
-  baseUrl: string;
-  api: string;
-  models: ProviderConfig["models"];
-  needsBaseUrl?: boolean;
-}
-
-const PRESETS: ProviderPreset[] = [
-  {
-    label: "OpenAI (GPT-4o, GPT-4o-mini)",
-    baseUrl: "https://api.openai.com/v1",
-    api: "openai-completions",
-    models: [
-      {
-        id: "gpt-4o",
-        name: "GPT-4o",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 16384,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      },
-      {
-        id: "gpt-4o-mini",
-        name: "GPT-4o-mini",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 16384,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      },
-    ],
-  },
-  {
-    label: "Anthropic (Claude Sonnet 4, Claude Opus 4)",
-    baseUrl: "https://api.anthropic.com/v1",
-    api: "anthropic",
-    models: [
-      {
-        id: "claude-sonnet-4-20250514",
-        name: "Claude Sonnet 4",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 16000,
-        compat: { supportsDeveloperRole: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      },
-      {
-        id: "claude-opus-4-20250514",
-        name: "Claude Opus 4",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 16000,
-        compat: { supportsDeveloperRole: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      },
-    ],
-  },
-  {
-    label: "Compatible API (Qwen, DeepSeek, Kimi, Ollama, etc.)",
-    baseUrl: "",
-    api: "openai-completions",
-    needsBaseUrl: true,
-    models: [
-      {
-        id: "default",
-        name: "Default Model",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 8192,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      },
-    ],
-  },
-];
+import { PRESETS } from "../provider-presets.js";
 
 // ---------------------------------------------------------------------------
 // Credential type labels
@@ -131,6 +45,11 @@ const CREDENTIAL_TYPE_LABELS: Record<CredentialType, string> = {
 // ---------------------------------------------------------------------------
 
 export default function setupExtension(api: ExtensionAPI, credentialsDir: string): void {
+  // --- Status bar: show config summary on session start ---
+  api.on("session_start", async (_event, ctx) => {
+    updateSetupStatus(ctx, credentialsDir);
+  });
+
   api.registerCommand("setup", {
     description: "Configure credentials and model provider",
     handler: async (_args, ctx) => {
@@ -162,6 +81,9 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
             break;
         }
       }
+
+      // Refresh status bar after any config changes
+      updateSetupStatus(ctx, credentialsDir);
     },
   });
 }
@@ -208,9 +130,11 @@ async function modelsSubmenu(
   let running = true;
   while (running) {
     const action = await ctx.ui.select("Models", [
-      "List providers",
-      "Configure provider",
+      "List",
+      "Set default",
       "Add model",
+      "Add provider",
+      "Remove model",
       "Remove provider",
       "Back",
     ]);
@@ -221,14 +145,20 @@ async function modelsSubmenu(
     }
 
     switch (action) {
-      case "List providers":
+      case "List":
         handleListProviders(ctx);
         break;
-      case "Configure provider":
-        await handleModelProvider(ctx);
+      case "Set default":
+        await handleSetDefault(ctx);
         break;
       case "Add model":
         await handleAddModel(ctx);
+        break;
+      case "Add provider":
+        await handleModelProvider(ctx);
+        break;
+      case "Remove model":
+        await handleRemoveModel(ctx);
         break;
       case "Remove provider":
         await handleRemoveProvider(ctx);
@@ -531,8 +461,8 @@ function handleListProviders(
   const lines: string[] = ["Providers:"];
   for (const [name, provider] of entries) {
     const isDefault = name === defaultProvider;
-    const models = provider.models.map((m) => {
-      const active = isDefault && (!defaultModelId || defaultModelId === m.id);
+    const models = provider.models.map((m, i) => {
+      const active = isDefault && (defaultModelId ? defaultModelId === m.id : i === 0);
       return active ? `*${m.name || m.id}` : (m.name || m.id);
     });
     lines.push(`  ${isDefault ? ">" : " "} ${name}: ${provider.baseUrl || "(no URL)"}`);
@@ -540,6 +470,67 @@ function handleListProviders(
   }
 
   ctx.ui.notify(lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Set default provider/model
+// ---------------------------------------------------------------------------
+
+async function handleSetDefault(
+  ctx: { ui: { select: Function; notify: Function } },
+): Promise<void> {
+  const config = loadConfig();
+  const entries = Object.entries(config.providers) as [string, ProviderConfig][];
+
+  if (entries.length === 0) {
+    ctx.ui.notify("No providers configured.", "warning");
+    return;
+  }
+
+  // Build flat list: "providerName / modelName (modelId)"
+  const options: { label: string; provider: string; modelId: string }[] = [];
+  for (const [name, provider] of entries) {
+    for (const m of provider.models) {
+      options.push({
+        label: `${name} / ${m.name || m.id}`,
+        provider: name,
+        modelId: m.id,
+      });
+    }
+  }
+
+  const selected = await ctx.ui.select(
+    "Set default model",
+    options.map((o) => o.label),
+  );
+  if (!selected) return;
+
+  const choice = options.find((o) => o.label === selected);
+  if (!choice) return;
+
+  // Write to config
+  const configPath = getConfigPath();
+  let existing: Partial<SiclawConfig> = {};
+  try {
+    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch { /* ignore */ }
+
+  (existing as any).default = {
+    provider: choice.provider,
+    modelId: choice.modelId,
+  };
+
+  const configDir = path.dirname(configPath);
+  if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { recursive: true });
+  }
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify(existing, null, 2) + "\n",
+  );
+  reloadConfig();
+
+  ctx.ui.notify(`Default set to: ${choice.provider} / ${choice.modelId}\nRestart session to activate.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,10 +602,15 @@ async function handleModelProvider(
 
   const preset = PRESETS.find((p) => p.label === presetLabel)!;
 
-  // Provider name
-  const defaultName = presetLabel.split(" (")[0].toLowerCase().replace(/\s+/g, "-");
-  const providerName = await ctx.ui.input("Provider name", defaultName);
-  if (!providerName) return;
+  // Provider name — auto-derive for known presets, only ask for Compatible
+  let providerName: string;
+  if (preset.needsBaseUrl) {
+    const entered = await ctx.ui.input("Provider name");
+    if (!entered) return;
+    providerName = entered;
+  } else {
+    providerName = preset.name;
+  }
 
   // API Key
   const apiKey = await ctx.ui.input("API Key");
@@ -731,11 +727,119 @@ async function handleAddModel(
 
   providers[providerName].models.push(newModel);
 
+  const configDir = path.dirname(configPath);
+  if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { recursive: true });
+  }
   fs.writeFileSync(
     configPath,
     JSON.stringify({ ...existing, providers }, null, 2) + "\n",
   );
   reloadConfig();
 
-  ctx.ui.notify(`Model "${modelName || modelId}" added to provider "${providerName}".\nRestart session to activate.`);
+  const allModels = providers[providerName].models.map((m) => m.name || m.id).join(", ");
+  ctx.ui.notify(`Model "${modelName || modelId}" added to "${providerName}".\nModels: ${allModels}\nRestart session to activate.`);
+}
+
+// ---------------------------------------------------------------------------
+// Remove model from existing provider
+// ---------------------------------------------------------------------------
+
+async function handleRemoveModel(
+  ctx: { ui: { select: Function; confirm: Function; notify: Function } },
+): Promise<void> {
+  const config = loadConfig();
+  const entries = Object.entries(config.providers) as [string, ProviderConfig][];
+
+  if (entries.length === 0) {
+    ctx.ui.notify("No providers configured.", "warning");
+    return;
+  }
+
+  // Select provider
+  const providerLabel = await ctx.ui.select(
+    "Remove model from",
+    entries.map(([name, p]) => `${name} (${p.models.length} models)`),
+  );
+  if (!providerLabel) return;
+
+  const providerName = providerLabel.split(" (")[0];
+  const provider = entries.find(([n]) => n === providerName)?.[1];
+  if (!provider) return;
+
+  if (provider.models.length <= 1) {
+    ctx.ui.notify(`Provider "${providerName}" has only one model. Remove the provider instead.`, "warning");
+    return;
+  }
+
+  // Select model
+  const modelLabels = provider.models.map((m) => `${m.name || m.id} (${m.id})`);
+  const modelLabel = await ctx.ui.select("Remove model", modelLabels);
+  if (!modelLabel) return;
+
+  const modelId = modelLabel.split(" (").pop()?.replace(")", "") ?? "";
+
+  const confirmed = await ctx.ui.confirm(
+    "Confirm removal",
+    `Remove model "${modelId}" from provider "${providerName}"?`,
+  );
+  if (!confirmed) return;
+
+  // Write to config
+  const configPath = getConfigPath();
+  let existing: Partial<SiclawConfig> = {};
+  try {
+    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch { /* ignore */ }
+
+  const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
+  if (!providers[providerName]) {
+    ctx.ui.notify(`Provider "${providerName}" not found`, "error");
+    return;
+  }
+
+  providers[providerName].models = providers[providerName].models.filter((m) => m.id !== modelId);
+
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
+  );
+  reloadConfig();
+
+  const remaining = providers[providerName].models.map((m) => m.name || m.id).join(", ");
+  ctx.ui.notify(`Model "${modelId}" removed from "${providerName}".\nRemaining: ${remaining}\nRestart session to activate.`);
+}
+
+// ---------------------------------------------------------------------------
+// Status bar helper
+// ---------------------------------------------------------------------------
+
+function updateSetupStatus(
+  ctx: { ui: { setStatus: Function } },
+  credentialsDir: string,
+): void {
+  const config = loadConfig();
+
+  // Count credentials
+  let credCount = 0;
+  try {
+    const manifestPath = path.join(credentialsDir, "manifest.json");
+    if (fs.existsSync(manifestPath)) {
+      credCount = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).length;
+    }
+  } catch { /* ignore */ }
+
+  // Count providers
+  const providerCount = Object.keys(config.providers).length;
+
+  // Build status parts
+  const missing: string[] = [];
+  if (providerCount === 0) missing.push("model");
+  if (credCount === 0) missing.push("credentials");
+
+  if (missing.length > 0) {
+    ctx.ui.setStatus("setup", `/setup: ${missing.join(" + ")} not configured`);
+  } else {
+    ctx.ui.setStatus("setup", undefined);
+  }
 }
