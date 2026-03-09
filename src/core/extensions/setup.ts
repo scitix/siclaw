@@ -143,12 +143,8 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
       let running = true;
       while (running) {
         const action = await ctx.ui.select("Setup", [
-          "Add credential",
-          "List credentials",
-          "Remove credential",
-          "List providers",
-          "Configure provider",
-          "Remove provider",
+          "Credentials",
+          "Models",
           "Exit",
         ]);
 
@@ -158,28 +154,87 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
         }
 
         switch (action) {
-          case "Add credential":
-            await handleAddCredential(ctx, credentialsDir);
+          case "Credentials":
+            await credentialsSubmenu(ctx, credentialsDir);
             break;
-          case "List credentials":
-            await handleListCredentials(ctx, credentialsDir);
-            break;
-          case "Remove credential":
-            await handleRemoveCredential(ctx, credentialsDir);
-            break;
-          case "List providers":
-            handleListProviders(ctx);
-            break;
-          case "Configure provider":
-            await handleModelProvider(ctx);
-            break;
-          case "Remove provider":
-            await handleRemoveProvider(ctx);
+          case "Models":
+            await modelsSubmenu(ctx);
             break;
         }
       }
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Sub-menus
+// ---------------------------------------------------------------------------
+
+async function credentialsSubmenu(
+  ctx: { ui: { select: Function; input: Function; editor: Function; confirm: Function; notify: Function } },
+  credentialsDir: string,
+): Promise<void> {
+  let running = true;
+  while (running) {
+    const action = await ctx.ui.select("Credentials", [
+      "Add",
+      "List",
+      "Remove",
+      "Back",
+    ]);
+
+    if (!action || action === "Back") {
+      running = false;
+      continue;
+    }
+
+    switch (action) {
+      case "Add":
+        await handleAddCredential(ctx, credentialsDir);
+        break;
+      case "List":
+        await handleListCredentials(ctx, credentialsDir);
+        break;
+      case "Remove":
+        await handleRemoveCredential(ctx, credentialsDir);
+        break;
+    }
+  }
+}
+
+async function modelsSubmenu(
+  ctx: { ui: { select: Function; input: Function; confirm: Function; notify: Function } },
+): Promise<void> {
+  let running = true;
+  while (running) {
+    const action = await ctx.ui.select("Models", [
+      "List providers",
+      "Configure provider",
+      "Add model",
+      "Remove provider",
+      "Back",
+    ]);
+
+    if (!action || action === "Back") {
+      running = false;
+      continue;
+    }
+
+    switch (action) {
+      case "List providers":
+        handleListProviders(ctx);
+        break;
+      case "Configure provider":
+        await handleModelProvider(ctx);
+        break;
+      case "Add model":
+        await handleAddModel(ctx);
+        break;
+      case "Remove provider":
+        await handleRemoveProvider(ctx);
+        break;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +484,33 @@ async function handleRemoveCredential(
 }
 
 // ---------------------------------------------------------------------------
+// Config write helper
+// ---------------------------------------------------------------------------
+
+function saveProviderToConfig(providerName: string, provider: ProviderConfig): void {
+  const configPath = getConfigPath();
+  let existing: Partial<SiclawConfig> = {};
+  if (fs.existsSync(configPath)) {
+    try {
+      existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    } catch { /* start fresh */ }
+  }
+
+  const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
+  providers[providerName] = provider;
+
+  const configDir = path.dirname(configPath);
+  if (!fs.existsSync(configDir)) {
+    fs.mkdirSync(configDir, { recursive: true });
+  }
+  fs.writeFileSync(
+    configPath,
+    JSON.stringify({ ...existing, providers }, null, 2) + "\n",
+  );
+  reloadConfig();
+}
+
+// ---------------------------------------------------------------------------
 // List providers flow
 // ---------------------------------------------------------------------------
 
@@ -529,6 +611,11 @@ async function handleModelProvider(
 
   const preset = PRESETS.find((p) => p.label === presetLabel)!;
 
+  // Provider name
+  const defaultName = presetLabel.split(" (")[0].toLowerCase().replace(/\s+/g, "-");
+  const providerName = await ctx.ui.input("Provider name", defaultName);
+  if (!providerName) return;
+
   // API Key
   const apiKey = await ctx.ui.input("API Key");
   if (!apiKey) {
@@ -568,28 +655,87 @@ async function handleModelProvider(
     models,
   };
 
+  saveProviderToConfig(providerName, provider);
+
+  const modelName = models[0].name || models[0].id;
+  ctx.ui.notify(`Provider "${providerName}" saved | Model: ${modelName}\nRestart session to activate.`);
+}
+
+// ---------------------------------------------------------------------------
+// Add model to existing provider
+// ---------------------------------------------------------------------------
+
+async function handleAddModel(
+  ctx: { ui: { select: Function; input: Function; notify: Function } },
+): Promise<void> {
+  const config = loadConfig();
+  const entries = Object.entries(config.providers) as [string, ProviderConfig][];
+
+  if (entries.length === 0) {
+    ctx.ui.notify("No providers configured. Use Configure provider first.", "warning");
+    return;
+  }
+
+  // Select provider
+  const providerLabel = await ctx.ui.select(
+    "Add model to",
+    entries.map(([name, p]) => `${name} (${p.baseUrl || "no URL"})`),
+  );
+  if (!providerLabel) return;
+
+  const providerName = providerLabel.split(" (")[0];
+
+  // Model details
+  const modelId = await ctx.ui.input("Model ID");
+  if (!modelId) return;
+
+  const modelName = await ctx.ui.input("Model name", modelId);
+  const ctxWindowStr = await ctx.ui.input("Context window", "128000");
+  const contextWindow = parseInt(ctxWindowStr || "128000", 10);
+  const maxTokensStr = await ctx.ui.input("Max output tokens", "8192");
+  const maxTokens = parseInt(maxTokensStr || "8192", 10);
+
+  // Read existing provider to inherit api type and compat defaults
+  const existingProvider = entries.find(([n]) => n === providerName)?.[1];
+  if (!existingProvider) return;
+
+  const isAnthropic = existingProvider.api === "anthropic";
+
+  const newModel: ProviderConfig["models"][number] = {
+    id: modelId,
+    name: modelName || modelId,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens,
+    compat: {
+      supportsDeveloperRole: !isAnthropic,
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+    },
+  };
+
+  // Write to config
   const configPath = getConfigPath();
   let existing: Partial<SiclawConfig> = {};
-  if (fs.existsSync(configPath)) {
-    try {
-      existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    } catch { /* start fresh */ }
-  }
+  try {
+    existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+  } catch { /* start fresh */ }
 
   const providers = (existing.providers as Record<string, ProviderConfig>) ?? {};
-  providers["default"] = provider;
-
-  const configDir = path.dirname(configPath);
-  if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
+  if (!providers[providerName]) {
+    ctx.ui.notify(`Provider "${providerName}" not found`, "error");
+    return;
   }
+
+  providers[providerName].models.push(newModel);
+
   fs.writeFileSync(
     configPath,
     JSON.stringify({ ...existing, providers }, null, 2) + "\n",
   );
-
   reloadConfig();
 
-  const modelName = models[0].name || models[0].id;
-  ctx.ui.notify(`Provider saved: ${presetLabel.split(" (")[0]} | Model: ${modelName}\nRestart session to activate the new provider.`);
+  ctx.ui.notify(`Model "${modelName || modelId}" added to provider "${providerName}".\nRestart session to activate.`);
 }
