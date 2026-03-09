@@ -7,7 +7,8 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
 import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
-import { needsSetup, runInteractiveSetup, printSetupInstructions } from "./cli-setup.js";
+import { needsSetup } from "./cli-setup.js";
+import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionMemory } from "./memory/session-summarizer.js";
 import type { BrainType } from "./core/brain-session.js";
 
@@ -17,19 +18,16 @@ const promptIndex = args.indexOf("--prompt");
 const initialMessage = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
 const isPrintMode = args.includes("--print") || !!initialMessage;
 const continueSession = args.includes("--continue");
-const forceSetup = args.includes("--setup");
 const brainIndex = args.indexOf("--brain");
 const brainArg = brainIndex >= 0 ? args[brainIndex + 1] : undefined;
 const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk" : undefined;
 
-// P0: Setup — wizard only on explicit --setup; otherwise print instructions and exit
-if (forceSetup) {
-  await runInteractiveSetup();
-}
-
+// P0: First-run setup — if no LLM config, run interactive wizard
 if (needsSetup()) {
-  printSetupInstructions();
-  process.exit(1);
+  const ok = await runFirstRunSetup();
+  if (!ok || needsSetup()) {
+    process.exit(1);
+  }
 }
 
 // LLM config validation — warn early about issues
@@ -45,12 +43,18 @@ const sessionManager = continueSession
   ? SessionManager.continueRecent(process.cwd())
   : SessionManager.create(process.cwd());
 
-// Resolve credentials directory for TUI mode
-const credentialsDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
+// Resolve credentialsDir from config and pass to session (fixes TUI credential_list + kubectl)
+const config = loadConfig();
+const credentialsDir = path.resolve(process.cwd(), config.paths.credentialsDir);
 
 // Create session via shared factory
 const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
-  await createSiclawSession({ sessionManager, mode: "cli", brainType, kubeconfigRef: { credentialsDir } });
+  await createSiclawSession({
+    sessionManager,
+    mode: "cli",
+    brainType,
+    kubeconfigRef: { credentialsDir },
+  });
 
 // P1-1: Startup status summary
 {
@@ -69,22 +73,31 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
   }
   const memoryActive = fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
 
-  // Count registered kubeconfig credentials
-  let kubeCreds = 0;
-  const manifestPath = path.join(credentialsDir, "manifest.json");
-  try { kubeCreds = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).filter((e: any) => e.type === "kubeconfig").length; } catch {}
+  // Count credentials
+  let credCount = 0;
+  try {
+    const manifestPath = path.join(credentialsDir, "manifest.json");
+    if (fs.existsSync(manifestPath)) {
+      credCount = JSON.parse(fs.readFileSync(manifestPath, "utf-8")).length;
+    }
+  } catch { /* ignore */ }
 
   const parts = [
     `Siclaw v${pkg.version}`,
     `Model: ${modelName} (${providerName})`,
     `Skills: ${skillCount}`,
     memoryActive ? "Memory: active" : "Memory: off",
-    kubeCreds > 0 ? `kubectl: ${kubeCreds} credential(s)` : "kubectl: no credentials",
+    `Credentials: ${credCount}`,
   ];
   if (brainType) parts.push(`Brain: ${brainType}`);
   console.log(parts.join(" | "));
-  if (kubeCreds === 0) {
-    console.log("  Tip: siclaw --credentials  to manage cluster access");
+
+  if (credCount === 0) {
+    console.log("\n┌─────────────────────────────────────────────────┐");
+    console.log("│  No credentials configured.                     │");
+    console.log("│  Use /setup → Credentials to add kubeconfig,    │");
+    console.log("│  SSH keys, or API tokens for diagnostics.       │");
+    console.log("└─────────────────────────────────────────────────┘");
   }
 }
 
@@ -188,7 +201,6 @@ if (isPrintMode && initialMessage) {
 // -- Cleanup on exit --
 // Auto-save session memory (mirrors AgentBox release flow)
 if (session.sessionFile) {
-  const config = loadConfig();
   const sessionDir = path.dirname(session.sessionFile);
   const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {
