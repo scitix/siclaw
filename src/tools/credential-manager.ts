@@ -99,6 +99,16 @@ function ensureDir(dir: string): void {
   }
 }
 
+/** Resolve a path and assert it stays under the credentials directory. */
+function resolveUnderDir(credentialsDir: string, filename: string): string {
+  const resolved = path.resolve(credentialsDir, filename);
+  const resolvedDir = path.resolve(credentialsDir);
+  if (resolved !== resolvedDir && !resolved.startsWith(resolvedDir + path.sep)) {
+    throw new Error(`Path traversal blocked: "${filename}" escapes credentials directory`);
+  }
+  return resolved;
+}
+
 function readManifest(credentialsDir: string): CredentialManifestEntry[] {
   const manifestPath = path.join(credentialsDir, "manifest.json");
   if (!fs.existsSync(manifestPath)) return [];
@@ -117,10 +127,9 @@ function writeManifest(credentialsDir: string, manifest: CredentialManifestEntry
   );
 }
 
-function writeCredentialFile(credentialsDir: string, filename: string, content: string, mode?: number): void {
-  const filePath = path.join(credentialsDir, filename);
-  fs.writeFileSync(filePath, content);
-  if (mode) fs.chmodSync(filePath, mode);
+function writeCredentialFile(credentialsDir: string, filename: string, content: string, mode: number = 0o600): void {
+  const filePath = resolveUnderDir(credentialsDir, filename);
+  fs.writeFileSync(filePath, content, { mode });
 }
 
 // ---------------------------------------------------------------------------
@@ -158,10 +167,14 @@ export function probeKubeconfig(kubeconfigPath: string): Promise<ProbeResult> {
 // Registration — type-specific handlers
 // ---------------------------------------------------------------------------
 
+type RegisterResult =
+  | { entry: CredentialManifestEntry; error?: undefined }
+  | { entry?: undefined; error: string };
+
 export function registerKubeconfig(
   credentialsDir: string,
   opts: RegisterKubeconfigOpts,
-): { entry: CredentialManifestEntry; error?: string } {
+): RegisterResult {
   let content: string;
 
   if (opts.content) {
@@ -169,11 +182,11 @@ export function registerKubeconfig(
   } else if (opts.sourcePath) {
     const resolvedPath = path.resolve(opts.sourcePath);
     if (!fs.existsSync(resolvedPath)) {
-      return { entry: null as any, error: `File not found: ${resolvedPath}` };
+      return { error: `File not found: ${resolvedPath}` };
     }
     content = fs.readFileSync(resolvedPath, "utf-8");
   } else {
-    return { entry: null as any, error: "Either sourcePath or content is required" };
+    return { error: "Either sourcePath or content is required" };
   }
 
   // Validate YAML
@@ -181,7 +194,7 @@ export function registerKubeconfig(
   try {
     const kc = yaml.load(content) as Record<string, unknown>;
     if (!kc || typeof kc !== "object") {
-      return { entry: null as any, error: "Invalid kubeconfig: not a YAML object" };
+      return { error: "Invalid kubeconfig: not a YAML object" };
     }
     const clusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
     const contexts = (kc?.contexts as Array<{ name: string; context?: { cluster?: string; namespace?: string } }>) ?? [];
@@ -195,7 +208,7 @@ export function registerKubeconfig(
       currentContext: kc?.["current-context"] as string | undefined,
     };
   } catch (err) {
-    return { entry: null as any, error: `Invalid kubeconfig YAML: ${err instanceof Error ? err.message : String(err)}` };
+    return { error: `Invalid kubeconfig YAML: ${err instanceof Error ? err.message : String(err)}` };
   }
 
   const safe = safeName(opts.name);
@@ -266,10 +279,10 @@ export function registerSshPassword(
 export function registerSshKey(
   credentialsDir: string,
   opts: RegisterSshKeyOpts,
-): { entry: CredentialManifestEntry; error?: string } {
+): RegisterResult {
   const resolvedKeyPath = path.resolve(opts.keyPath);
   if (!fs.existsSync(resolvedKeyPath)) {
-    return { entry: null as any, error: `Key file not found: ${resolvedKeyPath}` };
+    return { error: `Key file not found: ${resolvedKeyPath}` };
   }
 
   const safe = safeName(opts.name);
@@ -389,12 +402,12 @@ export function removeCredential(
   const entry = manifest.find((e) => e.name === name);
   if (!entry) return { removed: false };
 
-  // Delete credential files
+  // Delete credential files (with path traversal check)
   for (const file of entry.files) {
-    const filePath = path.join(credentialsDir, file);
     try {
+      const filePath = resolveUnderDir(credentialsDir, file);
       fs.unlinkSync(filePath);
-    } catch { /* file may already be gone */ }
+    } catch { /* file may already be gone or path invalid */ }
   }
 
   // Update manifest
