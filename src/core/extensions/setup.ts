@@ -250,17 +250,17 @@ async function addKubeconfig(
   const name = await ctx.ui.input("Credential name", defaultName);
   if (!name) return;
 
-  const { entry, error } = registerKubeconfig(credentialsDir, {
+  const result = registerKubeconfig(credentialsDir, {
     name,
     ...(kubeconfigContent ? { content: kubeconfigContent } : { sourcePath: resolvedPath }),
   });
-  if (error) {
-    ctx.ui.notify(error, "error");
+  if (result.error || !result.entry) {
+    ctx.ui.notify(result.error ?? "Registration failed", "error");
     return;
   }
 
   // Probe connectivity
-  const kubeconfigFile = path.join(credentialsDir, entry.files[0]);
+  const kubeconfigFile = path.join(credentialsDir, result.entry.files[0]);
   ctx.ui.notify(`Probing ${name}...`);
   const probe = await probeKubeconfig(kubeconfigFile);
 
@@ -451,7 +451,7 @@ function handleListProviders(
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
 
   if (entries.length === 0) {
-    ctx.ui.notify("No providers configured. Use /setup → Configure provider.");
+    ctx.ui.notify("No providers configured. Use /setup → Models → Add provider.");
     return;
   }
 
@@ -607,7 +607,7 @@ async function handleModelProvider(
   if (preset.needsBaseUrl) {
     const entered = await ctx.ui.input("Provider name");
     if (!entered) return;
-    providerName = entered;
+    providerName = entered.trim();
   } else {
     providerName = preset.name;
   }
@@ -627,10 +627,10 @@ async function handleModelProvider(
       ctx.ui.notify("Base URL is required", "warning");
       return;
     }
-    baseUrl = entered;
+    baseUrl = entered.trim();
   } else {
     const entered = await ctx.ui.input("Base URL (Enter to keep default)", preset.baseUrl);
-    if (entered) baseUrl = entered;
+    if (entered) baseUrl = entered.trim();
   }
 
   // Model ID (for compatible APIs)
@@ -638,7 +638,8 @@ async function handleModelProvider(
   if (preset.needsBaseUrl) {
     const modelId = await ctx.ui.input("Model ID", "default");
     if (modelId && modelId !== "default") {
-      models = [{ ...models[0], id: modelId, name: modelId }];
+      const trimmed = modelId.trim();
+      models = [{ ...models[0], id: trimmed, name: trimmed }];
     }
   }
 
@@ -668,7 +669,7 @@ async function handleAddModel(
   const entries = Object.entries(config.providers) as [string, ProviderConfig][];
 
   if (entries.length === 0) {
-    ctx.ui.notify("No providers configured. Use Configure provider first.", "warning");
+    ctx.ui.notify("No providers configured. Use Add provider first.", "warning");
     return;
   }
 
@@ -682,10 +683,12 @@ async function handleAddModel(
   const providerName = providerLabel.split(" (")[0];
 
   // Model details
-  const modelId = await ctx.ui.input("Model ID");
-  if (!modelId) return;
+  const rawModelId = await ctx.ui.input("Model ID");
+  if (!rawModelId) return;
+  const modelId = rawModelId.trim();
 
-  const modelName = await ctx.ui.input("Model name", modelId);
+  const rawModelName = await ctx.ui.input("Model name", modelId);
+  const modelName = rawModelName ? rawModelName.trim() : modelId;
   const ctxWindowStr = await ctx.ui.input("Context window", "128000");
   const contextWindow = parseInt(ctxWindowStr || "128000", 10);
   const maxTokensStr = await ctx.ui.input("Max output tokens", "8192");
