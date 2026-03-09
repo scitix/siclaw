@@ -179,7 +179,46 @@ export class K8sSpawner implements BoxSpawner {
         subdomain: "agentbox-hs",
         automountServiceAccountToken: false,
         restartPolicy: "Never",
+        // ── Security: dual-user isolation (ADR-010) ─────────────────
+        // Container starts as root (entrypoint fixes volume permissions,
+        // then drops to agentbox via runuser). Child processes run as
+        // sandbox user via sudo. Capabilities restricted to SETUID/SETGID
+        // only — the minimum needed for user switching.
+        securityContext: {
+          seccompProfile: { type: "RuntimeDefault" },
+        },
+        initContainers: [
+          {
+            name: "init-permissions",
+            image,
+            imagePullPolicy,
+            securityContext: {
+              runAsUser: 0,
+            },
+            command: ["sh", "-c", [
+              // Credentials dir: agentbox:kubecred 0750 (sandbox can't read)
+              "chown -R 1000:1002 /app/.siclaw/credentials",
+              "chmod 0750 /app/.siclaw/credentials",
+              "find /app/.siclaw/credentials -type f -exec chmod 0640 {} \\;",
+              // Skills dir: agentbox:agentbox 0755 (sandbox can read)
+              "chown -R 1000:1000 /app/.siclaw/skills",
+              "chmod 0755 /app/.siclaw/skills",
+              // User data: world-writable (sandbox needs write access)
+              "chown -R 1000:1000 /app/.siclaw/user-data",
+              "chmod 0777 /app/.siclaw/user-data",
+            ].join(" && ")],
+            volumeMounts: [
+              { name: "credentials", mountPath: "/app/.siclaw/credentials" },
+              { name: "skills-local", mountPath: "/app/.siclaw/skills" },
+              { name: "user-data", mountPath: "/app/.siclaw/user-data" },
+            ],
+          },
+        ],
         volumes: [
+          {
+            name: "credentials",
+            emptyDir: {},
+          },
           {
             name: "skills-local",
             emptyDir: {},
@@ -198,12 +237,22 @@ export class K8sSpawner implements BoxSpawner {
             name: "agentbox",
             image,
             imagePullPolicy,
+            securityContext: {
+              capabilities: {
+                drop: ["ALL"],
+                add: ["SETUID", "SETGID"],
+              },
+            },
             ports: [
               { containerPort: 3000, name: "https" },
               { containerPort: 9090, name: "metrics" },
             ],
             env,
             volumeMounts: [
+              {
+                name: "credentials",
+                mountPath: "/app/.siclaw/credentials",
+              },
               {
                 name: "skills-local",
                 mountPath: "/app/.siclaw/skills",
@@ -244,7 +293,8 @@ export class K8sSpawner implements BoxSpawner {
       },
     };
 
-    // If a kubeconfig is provided, mount it as a Secret
+    // If a kubeconfig is provided, mount it via the init container
+    // into the credentials volume (agentbox:kubecred 0640).
     if (boxConfig.kubeconfigBase64) {
       const secretName = `${podName}-kubeconfig`;
 
@@ -259,16 +309,29 @@ export class K8sSpawner implements BoxSpawner {
         },
       });
 
-      // Append kubeconfig volume and mount
+      // Mount the kubeconfig Secret into the init container at a temp path,
+      // and copy it to credentials dir with correct ownership/permissions
       pod.spec!.volumes!.push({
-        name: "kubeconfig",
+        name: "kubeconfig-secret",
         secret: { secretName },
       });
-      pod.spec!.containers[0].volumeMounts!.push({
-        name: "kubeconfig",
-        mountPath: "/home/agentbox/.kube",
+      pod.spec!.initContainers![0].volumeMounts!.push({
+        name: "kubeconfig-secret",
+        mountPath: "/tmp/kubeconfig",
         readOnly: true,
       });
+      // Extend init command to copy kubeconfig with proper permissions
+      const initCmd = pod.spec!.initContainers![0].command![2] as string;
+      pod.spec!.initContainers![0].command![2] = initCmd +
+        " && cp /tmp/kubeconfig/config /app/.siclaw/credentials/kubeconfig" +
+        " && chown 1000:1002 /app/.siclaw/credentials/kubeconfig" +
+        " && chmod 0640 /app/.siclaw/credentials/kubeconfig";
+
+      // Add KUBECONFIG and SICLAW_CREDENTIALS_DIR env vars
+      env.push(
+        { name: "KUBECONFIG", value: "/app/.siclaw/credentials/kubeconfig" },
+        { name: "SICLAW_CREDENTIALS_DIR", value: "/app/.siclaw/credentials" },
+      );
     }
 
     // Create Pod (handle 409 Conflict if another process created it concurrently)

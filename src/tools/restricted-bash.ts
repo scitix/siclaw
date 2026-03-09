@@ -273,7 +273,16 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           );
         }
 
-        const child = exec(finalCommand, execOpts as any);
+        // In production (K8s pods), run child processes as sandbox user.
+        // sudo's SUID elevates to root, then drops to sandbox.
+        // -E preserves our sanitized env (allowed by SETENV in sudoers).
+        let execCommand = finalCommand;
+        if (process.env.NODE_ENV === "production") {
+          const escaped = finalCommand.replace(/'/g, "'\\''");
+          execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+        }
+
+        const child = exec(execCommand, execOpts as any);
 
         // Kill the entire process group (shell + all child processes like kubectl exec)
         // detached: true makes the shell a process group leader, so -pid kills the whole group
