@@ -14,7 +14,9 @@ import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
-import "./shared/metrics.js"; // side-effect: register metrics subscriber
+// Side-effect: register metrics subscriber. Also imported in http-server.ts,
+// but ESM guarantees single module evaluation — the subscriber registers only once.
+import "./shared/metrics.js";
 
 // Use /tmp for config in containers where cwd may be read-only
 if (!process.env.SICLAW_CONFIG_DIR) {
@@ -88,18 +90,11 @@ async function main() {
   let metricsServer: http.Server | null = null;
   if (server instanceof https.Server) {
     const metricsPort = parseInt(process.env.SICLAW_METRICS_PORT || "9090", 10);
-    const metricsToken = process.env.SICLAW_METRICS_TOKEN;
+    const { checkMetricsAuth } = await import("./shared/metrics.js");
 
     metricsServer = http.createServer(async (req, res) => {
       if (req.method === "GET" && req.url === "/metrics") {
-        if (metricsToken) {
-          const auth = req.headers.authorization;
-          if (auth !== `Bearer ${metricsToken}`) {
-            res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Unauthorized" }));
-            return;
-          }
-        }
+        if (!checkMetricsAuth(req, res)) return;
         try {
           const { metricsRegistry } = await import("./shared/metrics.js");
           const body = await metricsRegistry.metrics();
@@ -116,8 +111,15 @@ async function main() {
       res.end(JSON.stringify({ error: "Not found" }));
     });
 
+    metricsServer.on("error", (err) => {
+      console.error("[agentbox] Metrics server error:", err);
+    });
+
     metricsServer.listen(metricsPort, () => {
       console.log(`[agentbox] Metrics HTTP server listening on port ${metricsPort} (Prometheus scrape target)`);
+      if (!process.env.SICLAW_METRICS_TOKEN) {
+        console.warn("[agentbox] WARNING: SICLAW_METRICS_TOKEN is not set — /metrics endpoint is unauthenticated");
+      }
     });
   }
 

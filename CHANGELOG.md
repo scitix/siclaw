@@ -8,6 +8,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+#### Prometheus Observability Layer
+
+Integrated Prometheus metrics via a decoupled event bus architecture. Business code emits diagnostic events; a single prom-client subscriber maps them to 11 Prometheus metrics covering token usage, cost, latency, tool calls, sessions, and health.
+
+**New Components:**
+- `diagnostic-events.ts` — zero-dependency event bus (`emitDiagnostic()` / `onDiagnostic()`)
+- `metrics.ts` — prom-client subscriber, the only file that depends on prom-client
+- Dedicated metrics HTTP server on port 9090 for AgentBox (K8s mode only, bypasses mTLS)
+
+**Helm Chart:**
+- ServiceMonitor for Gateway, PodMonitor for AgentBox (cross-namespace discovery)
+- Grafana dashboard auto-import via ConfigMap with `grafana_dashboard: "1"` label
+- PrometheusRule with preset alerts (opt-in)
+
+**Breaking Changes:**
+- AgentBox container port name changed from `http` to `https` in K8s manifests and `k8s-spawner.ts`. If you have external configurations (NetworkPolicies, custom Services, Istio VirtualServices) that reference the AgentBox port by name `http`, update them to `https`.
+- New container port `metrics` (9090) added to AgentBox pods.
+
+**Dependencies:**
+- Added `prom-client` for Prometheus metrics
+
+---
+
 #### mTLS Authentication for Gateway-AgentBox Communication
 
 Implemented mutual TLS (mTLS) authentication to secure internal APIs between Gateway and AgentBox instances. This provides certificate-based authentication and authorization for all internal endpoints.

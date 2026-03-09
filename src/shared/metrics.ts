@@ -7,8 +7,24 @@
  * Importing this module (side-effect import) registers the subscriber automatically.
  */
 
+import http from "node:http";
 import { Counter, Gauge, Histogram, Registry } from "prom-client";
 import { onDiagnostic, type DiagnosticEvent } from "./diagnostic-events.js";
+
+/**
+ * Check bearer token authentication for /metrics endpoints.
+ * Returns true if the request is authorized (or no token is configured).
+ * Returns false and sends 401 response if unauthorized.
+ */
+export function checkMetricsAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  const token = process.env.SICLAW_METRICS_TOKEN;
+  if (token && req.headers.authorization !== `Bearer ${token}`) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Unauthorized" }));
+    return false;
+  }
+  return true;
+}
 
 export const metricsRegistry = new Registry();
 

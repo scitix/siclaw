@@ -241,3 +241,16 @@ By default, `user_id` is included as a label on token and cost metrics for per-u
 ```bash
 helm install siclaw ... --set gateway.env.SICLAW_METRICS_USER_ID=false
 ```
+
+<Warning>
+**Cardinality warning**: With `user_id` enabled (default), `siclaw_tokens_total` and `siclaw_cost_usd_total` create one time series per user × provider × model × type. For deployments with more than 500 active users, this can increase Prometheus storage and memory usage significantly. Consider setting `SICLAW_METRICS_USER_ID=false` in large-scale environments and using application-level cost reporting instead.
+</Warning>
+
+### Monitoring Resource Deployment
+
+The Helm chart and the `k8s/` directory both include PodMonitor and ServiceMonitor definitions. These are **alternative deployment methods** — use one or the other, not both:
+
+- **Helm chart** (`helm install`): Monitoring resources are created automatically when `metrics.enabled: true`
+- **Raw manifests** (`k8s/*.yaml`): Apply manually with `kubectl apply -f` for non-Helm deployments
+
+Deploying both simultaneously will result in duplicate scrape targets in Prometheus.

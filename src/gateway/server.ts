@@ -29,7 +29,7 @@ import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import { createResourceNotifier } from "./resource-notifier.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import "../shared/metrics.js"; // side-effect: register metrics subscriber
+import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Static files: web React build
@@ -401,15 +401,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
     // Prometheus metrics endpoint
     if (url === "/metrics" && method === "GET") {
-      const metricsToken = process.env.SICLAW_METRICS_TOKEN;
-      if (metricsToken) {
-        const authHeader = req.headers.authorization;
-        if (authHeader !== `Bearer ${metricsToken}`) {
-          res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unauthorized" }));
-          return;
-        }
-      }
+      if (!checkMetricsAuth(req, res)) return;
       (async () => {
         try {
           const { metricsRegistry } = await import("../shared/metrics.js");

@@ -17,7 +17,7 @@ import { deepSearchEvents } from "../tools/deep-search/events.js";
 import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import "../shared/metrics.js"; // side-effect: register metrics subscriber
+import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
@@ -127,14 +127,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * GET /metrics - Prometheus metrics endpoint
    */
   addRoute("GET", "/metrics", async (req, res) => {
-    const metricsToken = process.env.SICLAW_METRICS_TOKEN;
-    if (metricsToken) {
-      const auth = req.headers.authorization;
-      if (auth !== `Bearer ${metricsToken}`) {
-        sendJson(res, 401, { error: "Unauthorized" });
-        return;
-      }
-    }
+    if (!checkMetricsAuth(req, res)) return;
     const { metricsRegistry } = await import("../shared/metrics.js");
     res.writeHead(200, { "Content-Type": metricsRegistry.contentType });
     res.end(await metricsRegistry.metrics());

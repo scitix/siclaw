@@ -22,10 +22,10 @@ spec:
             summary: "Siclaw sessions are getting stuck"
             description: "More than 3 stuck sessions detected in the last 10 minutes."
         - alert: SiclawHighErrorRate
-          expr: |
-            siclaw_prompts_total > 0
-            and rate(siclaw_prompts_total{outcome="error"}[5m])
-              / rate(siclaw_prompts_total[5m]) > 0.1
+          expr: >
+            sum(rate(siclaw_prompts_total{outcome="error"}[5m]))
+            / sum(rate(siclaw_prompts_total[5m])) > 0.1
+            and sum(rate(siclaw_prompts_total[5m])) > 0
           for: 10m
           labels:
             severity: warning

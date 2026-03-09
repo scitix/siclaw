@@ -1,4 +1,7 @@
-# PodMonitor for AgentBox metrics
+# PodMonitor for AgentBox metrics (raw manifest for non-Helm deployments).
+# If using Helm, use helm/siclaw/templates/agentbox-podmonitor.yaml instead.
+# Do NOT deploy both — this will result in duplicate scrape targets.
+#
 # Deployed in the monitoring namespace (same as Prometheus).
 # Discovers AgentBox Pods across ALL namespaces via namespaceSelector.any.
 #
