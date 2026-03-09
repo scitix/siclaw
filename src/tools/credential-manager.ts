@@ -470,3 +470,10 @@ export async function listCredentials(
 
   return entries;
 }
+
+// ---------------------------------------------------------------------------
+// Test-only exports (not part of public API)
+// ---------------------------------------------------------------------------
+
+/** @internal Exposed for unit testing only. */
+export const _testing = { safeName, sanitizeSshField, resolveUnderDir, readManifest };
