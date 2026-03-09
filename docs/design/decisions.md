@@ -239,13 +239,15 @@ Removed:
 - `EnvResolver` type and `setEnvResolver()` in `AgentBoxManager`
 - `resolveApiKey()` function (no longer needed — DB stores plain API keys)
 - `SICLAW_SKILLS_DIR` and `SICLAW_USER_DATA_DIR` from K8s pod env (match defaults)
+- `SICLAW_AGENTBOX_PORT` — K8s always uses default 3000
+- `SICLAW_CERT_PATH` — code default is already `/etc/siclaw/certs`
+- `SICLAW_CREDENTIALS_DIR` — switched to default `.siclaw/credentials` (Dockerfile already creates it; `restricted-bash.ts` blocks agent access)
+- `USER_ID` — was injected but never read by AgentBox code
+- `SICLAW_WORKSPACE_ALLOWED_TOOLS` — was injected but never read by AgentBox code
 
-Kept as env vars (bootstrap or infrastructure):
+Kept as env vars (bootstrap or third-party library):
 - `SICLAW_GATEWAY_URL` — needed before settings can be fetched (bootstrap dependency)
-- `SICLAW_AGENTBOX_PORT` — per-process port assignment (ProcessSpawner)
-- `SICLAW_CERT_PATH` — K8s Secret volume mount path
-- `SICLAW_CREDENTIALS_DIR` — differs from default in K8s (`/home/agentbox/.credentials`)
-- `SICLAW_METRICS_PORT` / `SICLAW_METRICS_TOKEN` — ops config, not agent-accessible
+- `PI_CODING_AGENT_DIR` — pi-coding-agent library reads this env var to determine its config/session storage directory; no config file alternative available
 
 Unchanged:
 - TUI mode: `applyEnvOverrides()` in `config.ts` still reads `SICLAW_API_KEY` etc. for users who set env vars directly
