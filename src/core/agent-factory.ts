@@ -46,6 +46,7 @@ import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
+import setupExtension from "./extensions/setup.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
 import type { BrainSession, BrainType } from "./brain-session.js";
@@ -513,6 +514,9 @@ export async function createSiclawSession(
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};
 
+  // Resolve credentials directory for tools and /setup extension
+  const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
+
   // Workspace system prompt append (shared between pi-agent and SDK brain)
   const workspaceSystemPromptAppend = opts?.systemPromptAppend;
 
@@ -526,7 +530,7 @@ export async function createSiclawSession(
       }
       return parts;
     },
-    extensionFactories: [contextPruningExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), deepInvestigationExtension],
+    extensionFactories: [contextPruningExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), deepInvestigationExtension, (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();

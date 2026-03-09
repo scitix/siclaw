@@ -1,9 +1,10 @@
 /**
  * Unified configuration loader for AgentBox / TUI.
  *
- * Priority (highest → lowest):
- * 1. Environment variables: SICLAW_API_KEY, SICLAW_BASE_URL, SICLAW_MODEL
- * 2. settings.json (plain values — no $VAR indirection)
+ * LLM provider config (API key, base URL, models) is stored exclusively in
+ * settings.json — environment variables are NOT used for sensitive credentials.
+ * Deployment env vars (SICLAW_CONFIG_DIR, SICLAW_AGENTBOX_PORT, etc.) are
+ * still supported for infrastructure/container orchestration.
  */
 
 import fs from "node:fs";
@@ -103,62 +104,6 @@ function deepMerge<T extends Record<string, unknown>>(base: T, override: Record<
 }
 
 // ---------------------------------------------------------------------------
-// Environment variable overrides
-// ---------------------------------------------------------------------------
-
-/**
- * Apply environment variable overrides (highest priority).
- *
- * Supports two naming conventions (shorter takes precedence):
- * - SICLAW_API_KEY  / SICLAW_LLM_API_KEY
- * - SICLAW_BASE_URL / SICLAW_LLM_BASE_URL
- * - SICLAW_MODEL    / SICLAW_LLM_MODEL
- *
- * If env vars are set but no provider exists in settings.json,
- * creates a default provider automatically.
- */
-function applyEnvOverrides(config: SiclawConfig): void {
-  const envApiKey = process.env.SICLAW_API_KEY ?? process.env.SICLAW_LLM_API_KEY;
-  const envBaseUrl = process.env.SICLAW_BASE_URL ?? process.env.SICLAW_LLM_BASE_URL;
-  const envModel = process.env.SICLAW_MODEL ?? process.env.SICLAW_LLM_MODEL;
-
-  if (!envApiKey && !envBaseUrl && !envModel) return;
-
-  let providerName = config.default?.provider ?? Object.keys(config.providers)[0];
-
-  // No provider in config — create one from env vars
-  if (!providerName || !config.providers[providerName]) {
-    providerName = "default";
-    config.providers[providerName] = {
-      baseUrl: envBaseUrl ?? "",
-      apiKey: envApiKey ?? "",
-      api: "openai-completions",
-      authHeader: true,
-      models: [{
-        id: envModel ?? "default",
-        name: envModel ?? "default",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 128000,
-        maxTokens: 8192,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
-      }],
-    };
-    return;
-  }
-
-  // Override existing provider fields
-  const provider = config.providers[providerName];
-  if (envApiKey) provider.apiKey = envApiKey;
-  if (envBaseUrl) provider.baseUrl = envBaseUrl;
-  if (envModel) {
-    if (!config.default) config.default = { provider: providerName, modelId: envModel };
-    else config.default.modelId = envModel;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Singleton cache
 // ---------------------------------------------------------------------------
 
@@ -199,10 +144,7 @@ export function loadConfig(): SiclawConfig {
 
   cached = deepMerge(DEFAULTS as unknown as Record<string, unknown>, fileConfig) as unknown as SiclawConfig;
 
-  // Environment variable overrides (highest priority)
-  applyEnvOverrides(cached);
-
-  // Environment variable overrides (used by process-spawner / k8s-spawner)
+  // Environment variable overrides (deployment/infrastructure only — NOT LLM config)
   if (process.env.SICLAW_AGENTBOX_PORT) {
     cached.server.port = parseInt(process.env.SICLAW_AGENTBOX_PORT, 10);
   }
@@ -245,9 +187,9 @@ export function writeConfig(config: SiclawConfig): void {
   const configPath = getConfigPath();
   const dir = path.dirname(configPath);
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   cached = null;
 }
 
@@ -327,7 +269,7 @@ export function validateLlmConfig(): string[] {
 
   const providerEntries = Object.entries(config.providers);
   if (providerEntries.length === 0) {
-    warnings.push("No LLM providers configured. Run `siclaw --setup` or edit .siclaw/config/settings.json.");
+    warnings.push("No LLM providers configured. Use /setup → Models to configure.");
     return warnings;
   }
 
@@ -342,7 +284,7 @@ export function validateLlmConfig(): string[] {
   if (!provider.apiKey) {
     warnings.push(
       `Provider "${defaultProviderName}" has no apiKey. ` +
-      `Set SICLAW_API_KEY env var or run \`siclaw --setup\`.`,
+      `Use /setup → Models to configure.`,
     );
   }
 
