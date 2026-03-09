@@ -317,6 +317,8 @@ export function usePilot() {
     // Ref to track current sessionKey for WS event filtering (avoids stale closures)
     const currentSessionKeyRef = useRef(currentSessionKey);
     useEffect(() => { currentSessionKeyRef.current = currentSessionKey; }, [currentSessionKey]);
+    // Guards async session switches: only the latest loadHistory request may write UI state.
+    const loadHistoryRequestIdRef = useRef(0);
     // Ref for restoring DP progress (used by loadHistory to call restoreDpProgress which is defined later)
     const restoreDpProgressRef = useRef<(sessionKey?: string | null) => Promise<void>>(async () => {});
     // DP-related timeout refs (for cleanup on abort/session switch)
@@ -749,6 +751,7 @@ export function usePilot() {
 
     const loadHistory = useCallback(async (sessionKey: string) => {
         if (!isConnected) return;
+        const requestId = ++loadHistoryRequestIdRef.current;
         setCurrentSessionKey(sessionKey);
         setMessages([]);
         setHasMore(false);
@@ -759,21 +762,28 @@ export function usePilot() {
         resetDpState();
         try {
             const result = await sendRpc<{ messages: PilotMessage[]; hasMore: boolean }>('chat.history', { sessionId: sessionKey });
+            if (loadHistoryRequestIdRef.current !== requestId) return;
             setMessages(mapMessages(result.messages ?? []));
             setHasMore(result.hasMore ?? false);
         } catch (err) {
-            console.error('Failed to load history:', err);
+            if (loadHistoryRequestIdRef.current === requestId) {
+                console.error('Failed to load history:', err);
+            }
         } finally {
-            setIsLoadingHistory(false);
+            if (loadHistoryRequestIdRef.current === requestId) {
+                setIsLoadingHistory(false);
+            }
         }
         // Fetch current model + brain type for this session
         try {
             const result = await sendRpc<{ model: ModelInfo | null; brainType?: BrainType }>('model.get', { sessionId: sessionKey });
+            if (loadHistoryRequestIdRef.current !== requestId) return;
             if (result.model) setSelectedModel(result.model);
             if (result.brainType) setSessionBrainType(result.brainType);
         } catch { /* ignore */ }
         // Restore deep investigation progress (checklist cards, hypothesis tree).
         // Pass sessionKey explicitly to avoid race with async currentSessionKeyRef update.
+        if (loadHistoryRequestIdRef.current !== requestId) return;
         await restoreDpProgressRef.current(sessionKey);
     }, [isConnected, sendRpc]);
 
@@ -1097,6 +1107,10 @@ export function usePilot() {
             if (snap.promptActive) {
                 setIsLoading(true);
             }
+            // Snapshot data is only meaningful while a deep investigation is still active.
+            // If the prompt has already finished, restoring the old phase/checklist leaves
+            // the UI stuck showing a stale "Present findings" card for completed sessions.
+            if (!snap.promptActive) return;
             if (!snap.events || snap.events.length === 0) return;
             // Replay events through the same reducer used for live progress
             let state: InvestigationProgress = { hypotheses: [] };
