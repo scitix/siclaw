@@ -190,9 +190,7 @@ export function printSetupInstructions(): void {
     export SICLAW_MODEL=gpt-4o                         # optional
     siclaw
 
-  Option 2 — setup wizard:
-
-    siclaw --setup
+  Once inside the TUI, use /setup to add credentials and manage providers.
 `);
 }
 
