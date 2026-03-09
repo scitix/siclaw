@@ -990,6 +990,24 @@ function ScriptReviewApprovalCard({
 
     const aiReview = reviews.find(r => r.reviewerType === 'ai');
 
+    // Poll for AI review while it's in progress (expanded + no AI review yet)
+    useEffect(() => {
+        if (!expanded || aiReview || !skill.id) return;
+        const interval = setInterval(async () => {
+            try {
+                const result = await rpcGetSkillReview(sendRpc, String(skill.id));
+                if (result?.reviews) {
+                    const ai = result.reviews.find((r: any) => r.reviewerType === 'ai');
+                    if (ai) {
+                        setReviews(result.reviews);
+                        clearInterval(interval);
+                    }
+                }
+            } catch { /* ignore */ }
+        }, 3000);
+        return () => clearInterval(interval);
+    }, [expanded, aiReview, skill.id, sendRpc]);
+
     // Scope display config
     const scopeConfig = {
         builtin: { label: 'System Skills', cls: 'bg-gray-100 text-gray-700', icon: Lock },
