@@ -231,6 +231,10 @@ export class K8sSpawner implements BoxSpawner {
             name: "client-cert",
             secret: { secretName: certSecretName },
           },
+          {
+            name: "tmp",
+            emptyDir: { sizeLimit: "100Mi" },
+          },
         ],
         containers: [
           {
@@ -242,6 +246,7 @@ export class K8sSpawner implements BoxSpawner {
                 drop: ["ALL"],
                 add: ["SETUID", "SETGID"],
               },
+              readOnlyRootFilesystem: true,
             },
             ports: [
               { containerPort: 3000, name: "https" },
@@ -266,6 +271,10 @@ export class K8sSpawner implements BoxSpawner {
                 name: "client-cert",
                 mountPath: "/etc/siclaw/certs",
                 readOnly: true,
+              },
+              {
+                name: "tmp",
+                mountPath: "/tmp",
               },
             ],
             resources: {

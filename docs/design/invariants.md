@@ -116,7 +116,7 @@ Application-level command validation is a secondary defense layer.
 
 ### 3.1 OS-Level User Isolation (Primary Defense)
 
-Child processes run as `sandbox` user (via `runuser`), which cannot read credential files.
+Child processes run as `sandbox` user (via `sudo`), which cannot read credential files.
 The `kubectl` binary has setgid `kubecred` group, allowing it to read kubeconfig while other
 commands cannot. See ADR-010 and `docs/design/security.md` §3 for full design.
 

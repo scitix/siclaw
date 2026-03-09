@@ -119,7 +119,7 @@ Agent Core
 Security (read docs/design/security.md before touching)
   src/tools/command-sets.ts    ALLOWED_COMMANDS + COMMAND_RULES + context categories
   src/tools/command-validator.ts  6-pass validation pipeline
-  src/tools/restricted-bash.ts Shell tool (runuser sandbox + command validation)
+  src/tools/restricted-bash.ts Shell tool (sudo sandbox + command validation)
   src/tools/sanitize-env.ts    Environment variable sanitization
   src/gateway/skills/script-evaluator.ts  Skill script security review
 
