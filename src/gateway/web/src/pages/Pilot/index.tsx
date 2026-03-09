@@ -206,6 +206,7 @@ export function PilotPage() {
                         systemStatus={pilot.systemStatus}
                         onNavigateModels={() => navigate('/models')}
                         onNavigateCredentials={() => navigate('/credentials')}
+                        sessionKey={pilot.currentSessionKey}
                     />
                 </div>
             </div>

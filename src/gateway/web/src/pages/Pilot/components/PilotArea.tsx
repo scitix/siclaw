@@ -50,6 +50,8 @@ export interface PilotAreaProps {
     systemStatus?: SystemStatus | null;
     onNavigateModels?: () => void;
     onNavigateCredentials?: () => void;
+    /** Current session key — used to reset scroll position on session switch */
+    sessionKey?: string | null;
 }
 
 /** Compute superseded status for skill messages */
@@ -149,13 +151,41 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
     const prevMsgCountRef = useRef(0);
     // Track whether user has manually scrolled away from bottom
     const userScrolledAwayRef = useRef(false);
+    // Flag: session switched, force scroll to bottom when messages arrive
+    const needsScrollOnLoadRef = useRef(false);
+    // During session restore, DP cards can continue growing after messages load.
+    // Keep auto-scrolling briefly until restored content settles.
+    const pendingRestoreScrollRef = useRef(false);
+    const restoreScrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const prevSessionKeyRef = useRef(sessionKey);
+    useEffect(() => {
+        if (prevSessionKeyRef.current !== sessionKey) {
+            prevSessionKeyRef.current = sessionKey;
+            userScrolledAwayRef.current = false;
+            prevMsgCountRef.current = 0;
+            needsScrollOnLoadRef.current = true;
+            pendingRestoreScrollRef.current = true;
+            if (restoreScrollTimerRef.current) {
+                clearTimeout(restoreScrollTimerRef.current);
+                restoreScrollTimerRef.current = null;
+            }
+        }
+    }, [sessionKey]);
+
+    useEffect(() => {
+        return () => {
+            if (restoreScrollTimerRef.current) {
+                clearTimeout(restoreScrollTimerRef.current);
+            }
+        };
+    }, []);
 
     const scrollToBottom = useCallback((smooth = true) => {
         requestAnimationFrame(() => {
@@ -190,8 +220,13 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             const diff = container.scrollHeight - prevScrollHeightRef.current;
             if (diff > 0) container.scrollTop += diff;
             prevScrollHeightRef.current = 0;
+        } else if (needsScrollOnLoadRef.current && messages.length > 0) {
+            // Session switch: force scroll to bottom when messages finish loading
+            needsScrollOnLoadRef.current = false;
+            userScrolledAwayRef.current = false;
+            scrollToBottom(false);
         } else if (prevMsgCountRef.current === 0 && messages.length > 0) {
-            // Initial load / session switch: scroll to bottom after DOM renders
+            // Initial load (page refresh): scroll to bottom after DOM renders
             userScrolledAwayRef.current = false;
             scrollToBottom(false);
         } else if (messages.length > prevMsgCountRef.current) {
@@ -212,6 +247,40 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         prevMsgCountRef.current = messages.length;
     }, [messages, scrollToBottom]);
 
+    // Session restore is multi-step: messages load first, then DP progress restores,
+    // and the checklist card may grow as hypotheses/current action arrive. Keep the
+    // viewport pinned during this short restore window unless the user scrolls away.
+    useEffect(() => {
+        if (!pendingRestoreScrollRef.current) return;
+        if (userScrolledAwayRef.current) {
+            pendingRestoreScrollRef.current = false;
+            if (restoreScrollTimerRef.current) {
+                clearTimeout(restoreScrollTimerRef.current);
+                restoreScrollTimerRef.current = null;
+            }
+            return;
+        }
+        if (messages.length === 0) return;
+
+        scrollToBottom(false);
+
+        if (restoreScrollTimerRef.current) {
+            clearTimeout(restoreScrollTimerRef.current);
+        }
+        restoreScrollTimerRef.current = setTimeout(() => {
+            pendingRestoreScrollRef.current = false;
+            restoreScrollTimerRef.current = null;
+        }, 180);
+    }, [
+        messages.length,
+        dpChecklist?.length,
+        investigationProgress?.phase,
+        investigationProgress?.hypotheses.length,
+        investigationProgress?.currentAction,
+        isLoadingHistory,
+        scrollToBottom,
+    ]);
+
     // Detect if user manually scrolls away from bottom
     const handleScroll = useCallback(() => {
         const container = scrollContainerRef.current;
@@ -221,6 +290,13 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         const distanceFromBottom = scrollHeight - scrollTop - clientHeight;
         // User is "at bottom" if within 300px (generous threshold for input area height)
         userScrolledAwayRef.current = distanceFromBottom > 300;
+        if (userScrolledAwayRef.current) {
+            pendingRestoreScrollRef.current = false;
+            if (restoreScrollTimerRef.current) {
+                clearTimeout(restoreScrollTimerRef.current);
+                restoreScrollTimerRef.current = null;
+            }
+        }
 
         // Load more when near top
         if (!hasMore || isLoadingMore || !loadMoreHistory) return;
