@@ -154,8 +154,6 @@ export class K8sSpawner implements BoxSpawner {
       { name: "USER_ID", value: boxConfig.userId },
       { name: "SICLAW_AGENTBOX_PORT", value: "3000" },
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
-      { name: "SICLAW_SKILLS_DIR", value: ".siclaw/skills" },
-      { name: "SICLAW_USER_DATA_DIR", value: ".siclaw/user-data" },
       { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-gateway.${namespace}.svc.cluster.local:3002` },
       { name: "SICLAW_CREDENTIALS_DIR", value: "/home/agentbox/.credentials" },
       { name: "SICLAW_CERT_PATH", value: "/etc/siclaw/certs" },

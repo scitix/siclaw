@@ -209,3 +209,53 @@ DB-based coordination with heartbeat. Each cron instance:
 - ✅ Job ownership is explicit and auditable
 - ⚠️ Up to 90s delay in job reassignment after a crash (dead threshold)
 - ⚠️ Duplicate firing possible in edge case: instance A marks job "executing" but crashes before updating `lastRunAt`; instance B reclaims and fires again. Acceptable for SRE automation use cases; add idempotency guards in critical skill scripts.
+
+---
+
+## ADR-009: AgentBox Config via Settings File, Not Environment Variables
+
+**Status**: Active
+
+**Context**:
+AgentBox needs LLM provider config (API keys, base URLs, models) and embedding config from Gateway. Previously, Gateway delivered this through two redundant channels:
+
+1. **settings.json** — `GET /api/internal/settings` (mTLS-protected) returns full provider/embedding config; AgentBox writes it to `.siclaw/config/settings.json`
+2. **Environment variables** — Gateway's `envResolver` injected `SICLAW_LLM_API_KEY`, `SICLAW_LLM_BASE_URL`, `SICLAW_LLM_MODEL`, `SICLAW_EMBEDDING_*` into spawned pods/processes
+
+The env var channel has a larger attack surface:
+- `kubectl describe pod` shows all env vars in plain text
+- `/proc/self/environ` is readable from within the container
+- `ProcessSpawner` inherited Gateway's entire `process.env` (including secrets) into child processes
+
+Meanwhile, `.siclaw/config/settings.json` is protected: `restricted-bash.ts` blocks agent shell commands from reading it.
+
+Additionally, K8s DIR env vars (`SICLAW_SKILLS_DIR`, `SICLAW_USER_DATA_DIR`) were injected with values identical to `config.ts` defaults — redundant since each pod is isolated.
+
+**Decision**:
+Remove the env var delivery channel for LLM/embedding config. Settings.json (via mTLS `GET /api/internal/settings`) is the sole channel for delivering sensitive config to AgentBox in K8s mode.
+
+Removed:
+- `envResolver` in `server.ts` (injected `SICLAW_LLM_*`, `SICLAW_EMBEDDING_*`)
+- `EnvResolver` type and `setEnvResolver()` in `AgentBoxManager`
+- `resolveApiKey()` function (no longer needed — DB stores plain API keys)
+- `SICLAW_SKILLS_DIR` and `SICLAW_USER_DATA_DIR` from K8s pod env (match defaults)
+
+Kept as env vars (bootstrap or infrastructure):
+- `SICLAW_GATEWAY_URL` — needed before settings can be fetched (bootstrap dependency)
+- `SICLAW_AGENTBOX_PORT` — per-process port assignment (ProcessSpawner)
+- `SICLAW_CERT_PATH` — K8s Secret volume mount path
+- `SICLAW_CREDENTIALS_DIR` — differs from default in K8s (`/home/agentbox/.credentials`)
+- `SICLAW_METRICS_PORT` / `SICLAW_METRICS_TOKEN` — ops config, not agent-accessible
+
+Unchanged:
+- TUI mode: `applyEnvOverrides()` in `config.ts` still reads `SICLAW_API_KEY` etc. for users who set env vars directly
+- ProcessSpawner: still injects `SICLAW_USER_DATA_DIR` per-user for dev isolation
+
+**Consequences**:
+- ✅ API keys no longer visible via `kubectl describe pod`
+- ✅ Single delivery channel eliminates redundancy and reduces confusion
+- ✅ Settings file is protected from agent access by `restricted-bash.ts`
+- ✅ K8s pod spec is simpler (fewer env vars)
+- ⚠️ AgentBox must successfully fetch settings from Gateway before creating sessions — if Gateway is unreachable, AgentBox has no LLM config (this was already the case)
+
+**Revisit when**: A legitimate use case requires env-var-based config delivery to AgentBox (e.g., sidecar injection patterns that cannot use HTTP).
