@@ -6,30 +6,24 @@ description: "Extend Siclaw with reusable diagnostic playbooks and custom script
 
 ## What Are Skills?
 
-Skills are reusable diagnostic playbooks that extend Siclaw's capabilities. Each skill is a directory containing a description and optional executable scripts.
+Skills are reusable diagnostic playbooks. They let your team package recurring investigation steps into a named capability that Siclaw can run on demand.
 
-```
-skills/core/k8s-pod-diagnostics/
-├── SKILL.md        ← Description, parameters, usage
-└── scripts/
-    └── check-pod.sh  ← Executable diagnostic script
-```
+Typical examples:
 
-## Skill Tiers
+- Check why a deployment rollout is stuck
+- Review GPU health across training nodes
+- Validate a service's DNS and network path
+- Collect the same evidence bundle every time an alert fires
 
-```
-skills/
-├── core/             ← Built-in, read-only, ships with Siclaw
-├── team/             ← Team-managed via Web UI, admin-published
-├── user/&lt;userId&gt;/    ← Personal skills, per-user
-└── extension/        ← Optional overlay builds
-```
+## How Teams Use Skills
 
-**Loading priority** (highest wins): personal > `team` > `core`
+Siclaw ships with built-in skills, and teams can add their own through the Web UI.
+
+- **Core skills**: built-in and maintained by Siclaw
+- **Team skills**: shared across your organization after review
+- **Personal skills**: private to one user unless promoted later
 
 ## Creating a Skill
-
-### 1. Write the SKILL.md
 
 ```markdown
 # GPU Health Check
@@ -47,53 +41,36 @@ Check all GPUs: `run_skill gpu-health-check`
 Check specific node: `run_skill gpu-health-check --node gpu-worker-01`
 ```
 
-### 2. Add Scripts (Optional)
+You can create and edit skills in the Web UI, then describe:
 
-```bash
-#!/bin/bash
-# scripts/check-gpu.sh
-# Arguments passed as positional parameters
+- what the skill is for
+- which parameters it accepts
+- how Siclaw should use it during an investigation
+- optional scripts when a structured workflow needs custom execution
 
-kubectl get nodes -l nvidia.com/gpu.present=true -o wide
-kubectl exec -n gpu-operator -- nvidia-smi --query-gpu=gpu_name,temperature.gpu,utilization.gpu,memory.used --format=csv
-```
+## Review and Approval
 
-## Security Review Gate
-
-Scripts follow a mandatory review workflow before execution:
+Skills with scripts go through a mandatory review workflow before they become available:
 
 ```
 draft → request review → pending → AI + static analysis → approved/rejected
 ```
 
-### Static Analysis
+The review process checks for risky behavior such as destructive shell commands, unsafe script patterns, or actions that would violate Siclaw's read-only model.
 
-Danger patterns are checked automatically:
-
-| Severity | Examples |
-|----------|---------|
-| Critical | `rm -rf`, `mkfs`, `dd if=`, fork bomb |
-| High | `chmod 777`, `curl | sh`, `eval`, `> /dev/sda` |
-| Medium | `kill -9`, `pkill`, `reboot`, `shutdown` |
-
-### AI Review
-
-An LLM reviews the script semantics with a mandatory rule: **"Skills MUST be strictly read-only."**
-
-### Human Approval
-
-A user with `skill_reviewer` role must approve before the skill can be executed.
-
-## Script Execution
-
-When a skill script is approved and executed via `run_skill`:
-
-- **Interpreter**: `bash` for `.sh`, `python3` for `.py` (detected automatically)
-- **Timeout**: Default 180s, max 300s
-- **Arguments**: Passed as array to `spawn()` — no shell interpolation (injection-safe)
-- **Max output**: 10 MB combined stdout + stderr
-- **Injected environment**: `KUBECONFIG`, `SICLAW_DEBUG_IMAGE`, `SICLAW_CREDENTIALS_DIR`
+Only approved skills can be used in shared environments.
 
 <Note>
-Skill scripts are **exempt from the binary allowlist**. This is the only way to run otherwise-blocked binaries (like `sed` or `awk`) — the security review gate is the safety mechanism.
+Siclaw is designed for read-only diagnostics. Team skills should follow the same model: investigate, summarize, and recommend actions rather than change production systems directly.
 </Note>
+
+## Running Skills
+
+Skills can be used in several ways:
+
+- directly during a conversation
+- as part of a deeper investigation
+- from scheduled patrols
+- from webhook-triggered workflows
+
+This makes them a good fit for turning repeated incident response habits into reusable, reviewable runbooks.

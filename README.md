@@ -4,7 +4,7 @@
 
 # Siclaw
 
-**AI Agent platform for SRE — the collaborative AI foundation for your team**
+**Read-only investigation copilot for SRE teams**
 
 [![npm](https://img.shields.io/npm/v/siclaw?logo=npm)](https://www.npmjs.com/package/siclaw)
 [![CI](https://github.com/scitix/siclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/scitix/siclaw/actions/workflows/ci.yml)
@@ -19,7 +19,7 @@
 
 ---
 
-Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://github.com/openclaw) and designed to be the collaborative AI foundation for engineering teams. Unlike general-purpose coding agents, Siclaw is built for **read-only infrastructure diagnostics** — the agent observes, analyzes, and reports, but never mutates your environment directly. When remediation is needed, Siclaw integrates with your existing change management systems to execute changes through established, auditable workflows. Describe a problem in plain language and the agent runs kubectl, reads logs, traces network paths, and delivers a root-cause analysis — from a terminal, a web UI, or your team's IM workspace.
+Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the terminal, the web UI, or your team's chat channels.
 
 <div align="center">
 <img src="docs/assets/demo.gif" alt="Siclaw Demo" width="800" />
@@ -28,16 +28,13 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 
 ## Features
 
-- **Deep Investigation** — Hypothesis-driven 4-phase diagnostic engine (context gathering → hypothesis generation → parallel validation → root-cause conclusion), bringing Deep Research to SRE with cross-system, multi-dimensional fault analysis
-- **Investigation Memory** — Accumulates structured knowledge from every deep investigation into a local hybrid store (vector + full-text); surfaces relevant past experience during hypothesis generation so the agent gets smarter with every incident resolved
-- **Security Governance** — Strict permission layer between agent and infrastructure: read-only by default, command whitelist, write operations require per-item approval, credentials isolated by workspace — zero accidental mutations in production
-- **Team Collaboration** — Multi-workspace, multi-user management (SSO/OAuth2), isolated AgentBox sandboxes per user, designed for multi-team, multi-environment enterprise scenarios
-- **Alert-Driven Operations** — Webhook triggers connect to your existing monitoring stack (Prometheus, PagerDuty, custom), automatically launching agent investigations when alerts fire
-- **Scheduled Tasks** — Cron-based recurring jobs for routine health checks, periodic diagnostics, or any agent task — manageable via Web UI or natural language
-- **Skill System** — AI-generated diagnostic skills with automated risk-level review, supporting creation, forking, and hot-reload via Web UI or natural language — organize across core / team / personal tiers to codify your team's operational expertise into reusable, shareable runbooks
-- **Extensible** — [MCP](https://modelcontextprotocol.io) tool servers for custom data source integrations
-- **Built-in Metrics** — Zero-dependency monitoring dashboard for token usage, cost, latency, and sessions — no Prometheus required; optional Grafana iframe embedding for teams with existing observability stacks
-- **Multi-Channel Access** — Terminal TUI, Web UI, or IM bots (Slack, Discord, Telegram, Lark)
+- **Deep Investigation** — A 4-phase workflow for evidence gathering, hypothesis testing, and root-cause analysis
+- **Investigation Memory** — Learns from past incidents to improve future investigations
+- **Read-Only by Default** — Investigates and recommends next steps without changing your environment directly
+- **Team Workflows** — Shared web UI, credentials, channels, triggers, and scheduled patrols
+- **Reusable Skills** — Turn repeated diagnostic playbooks into reviewable runbooks
+- **Extensible** — Connect external tools and data sources through [MCP](https://modelcontextprotocol.io)
+- **Multi-Channel Access** — Use Siclaw from the terminal, web UI, or chat channels
 
 ## Architecture
 
@@ -52,11 +49,16 @@ Siclaw is an AI Agent platform for DevOps / SRE, inspired by [OpenClaw](https://
 
 - **Node.js >= 22.12.0** — [Download](https://nodejs.org/)
 - **npm** — Comes with Node.js
-- **kubectl** + **kubeconfig** — Required for Kubernetes diagnostics only ([Install guide](https://kubernetes.io/docs/tasks/tools/)); not needed for TUI or Local Server mode without K8s access
+- **kubectl** — Optional, only needed if you want Siclaw to investigate Kubernetes clusters
 
 ## Quick Start
 
-Siclaw supports three deployment profiles. Pick the one that fits your use case.
+Siclaw supports three deployment profiles. For local usage, start from a dedicated working directory because Siclaw stores most runtime data in `.siclaw/` relative to where you launch it.
+
+```bash
+mkdir -p ~/siclaw-work
+cd ~/siclaw-work
+```
 
 ### 1. TUI Mode — Personal, local, lowest barrier
 
@@ -81,7 +83,7 @@ siclaw --continue
 
 ```bash
 git clone https://github.com/scitix/siclaw.git && cd siclaw
-npm ci && npm run build
+npm ci && npm run build:web && npm run build
 npm link                 # register `siclaw` command globally
 
 siclaw                   # TUI mode
@@ -96,17 +98,18 @@ siclaw --prompt "..."    # single-shot mode
 
 ### 2. Local Server — VM or laptop, recommended for daily use
 
-A lightweight web UI backed by SQLite. No MySQL, no Docker required — just start the server and configure everything in the browser. Siclaw enforces strict read-only access by default (command whitelist, no write operations without approval), so you can safely deploy it on your own workstation without worrying about unintended changes to your clusters.
+A lightweight web UI backed by SQLite. No MySQL, no Docker required.
 
 ```bash
 npm install -g siclaw
 
-# Start the server (SQLite database is created automatically)
+# Start the server
 siclaw local
 
 # Open http://localhost:3000
 # Login: admin / admin (default credentials)
-# Go to Settings to configure your LLM provider
+# Configure providers in Models
+# Import kubeconfigs in Credentials
 ```
 
 <details>
@@ -114,7 +117,7 @@ siclaw local
 
 ```bash
 git clone https://github.com/scitix/siclaw.git && cd siclaw
-npm ci && npm run build && npm run build:web
+npm ci && npm run build:web && npm run build
 npm link                 # register `siclaw` command globally
 
 siclaw local             # start local server
@@ -124,43 +127,47 @@ siclaw local             # start local server
 
 </details>
 
-The server uses SQLite by default and auto-generates a JWT secret on first run. All configuration — LLM providers, models, credentials — is done through the **Settings** page in the web UI.
+On first startup, Siclaw creates a local admin account:
+
+- Username: `admin`
+- Password: `admin`
+
+Set `SICLAW_ADMIN_PASSWORD` before first launch if you want a different bootstrap password.
 
 ### 3. Kubernetes — Team / enterprise
 
-Full multi-user deployment with isolated AgentBox pods, SSO, and IM channels. Just prepare a MySQL database and deploy with Helm:
+Production deployment uses Helm plus three container images: `gateway`, `agentbox`, and `cron`.
+
+Build and push images if you are using your own registry:
 
 ```bash
-helm install siclaw oci://scitix/siclaw/helm/siclaw \
-  --namespace siclaw --create-namespace \
-  --set database.url="mysql://user:pass@host:3306/siclaw"
+make docker REGISTRY=registry.example.com/myteam TAG=latest
+make push REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
-<details>
-<summary><b>Using a custom image registry</b></summary>
-
-If you need to build and push images to your own registry:
+Then deploy the chart with a MySQL URL:
 
 ```bash
-# Build and push images
-make docker push REGISTRY=registry.example.com/myteam
-
-# Deploy with custom registry
 helm upgrade --install siclaw ./helm/siclaw \
-  --namespace siclaw --create-namespace \
-  --set image.registry="registry.example.com/myteam" \
+  --namespace siclaw \
+  --create-namespace \
+  --set image.registry=registry.example.com/myteam \
+  --set image.tag=latest \
   --set database.url="mysql://user:pass@host:3306/siclaw"
 ```
 
-</details>
-
-See [`helm/siclaw/`](helm/siclaw/) for values reference, and [`k8s/README.md`](k8s/README.md) for the full deployment guide.
+The default chart exposes the Gateway Service on service port `80` and NodePort `31000`.
 
 ## Configuration
 
-### settings.json (TUI mode)
+### TUI / CLI
 
-Minimal example — copy `settings.example.json` to `.siclaw/config/settings.json`:
+- TUI reads `.siclaw/config/settings.json`
+- The first-run wizard can generate this file for you
+- Kubernetes credentials should be imported through `/setup`
+- Investigation reports are written to `~/.siclaw/reports/`
+
+Minimal example:
 
 ```json
 {
@@ -168,82 +175,28 @@ Minimal example — copy `settings.example.json` to `.siclaw/config/settings.jso
     "default": {
       "baseUrl": "https://api.openai.com/v1",
       "apiKey": "sk-YOUR-KEY",
+      "api": "openai-completions",
       "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
     }
   }
 }
 ```
 
-<details>
-<summary><b>Full settings.json reference</b></summary>
+### Local Server / Kubernetes
 
-```json
-{
-  "providers": {
-    "provider-name": {
-      "baseUrl": "https://api.example.com/v1",
-      "apiKey": "your-key",
-      "api": "openai-completions",
-      "authHeader": true,
-      "models": [
-        {
-          "id": "model-id",
-          "name": "Display Name",
-          "reasoning": false,
-          "contextWindow": 128000,
-          "maxTokens": 16384,
-          "cost": { "input": 2.5, "output": 10.0, "cacheRead": 0.5, "cacheWrite": 3.0 }
-        }
-      ]
-    }
-  },
-  "default": { "provider": "provider-name", "modelId": "model-id" },
-  "embedding": {
-    "baseUrl": "https://api.example.com/v1",
-    "apiKey": "your-key",
-    "model": "BAAI/bge-m3",
-    "dimensions": 1024
-  },
-  "mcpServers": {
-    "server-name": {
-      "command": "npx",
-      "args": ["-y", "@some/mcp-server"]
-    }
-  },
-  "debugImage": "busybox:latest",
-  "debug": false
-}
-```
+- Configure providers in the **Models** page
+- Import kubeconfigs, API tokens, and SSH credentials in **Credentials**
+- Configure Slack, Lark, Discord, and Telegram in **Channels**
+- Create inbound webhook endpoints in **Triggers**
+- Configure MCP servers in **MCP Servers**
 
-</details>
+## Documentation
 
-<details>
-<summary><b>IM Channels — Slack / Discord / Telegram / Lark</b></summary>
-
-### Slack
-
-Configure a Slack bot in **Settings > Channels**. You'll need:
-- Bot token and signing secret from the [Slack API](https://api.slack.com/apps)
-
-### Discord
-
-Configure a Discord bot in **Settings > Channels**. You'll need:
-- Bot token from the [Discord Developer Portal](https://discord.com/developers/applications)
-- Scopes: `bot`, `messages.read`
-
-### Telegram
-
-Configure a Telegram bot in **Settings > Channels**. You'll need:
-- Bot token from [@BotFather](https://t.me/BotFather)
-
-### Lark
-
-Configure a Lark bot in **Settings > Channels** of the web UI. You'll need:
-- App ID and App Secret from the [Lark Open Platform](https://open.larksuite.com/)
-- Event subscription URL: `https://your-domain/api/channels/feishu/event`
-- Scopes: `im:message`, `im:message.group_at_msg`, `im:resource`
-
-</details>
+- [Getting Started](https://docs.siclaw.ai/start/getting-started)
+- [CLI & Local Server](https://docs.siclaw.ai/install/cli)
+- [Kubernetes Deployment](https://docs.siclaw.ai/install/kubernetes)
+- [LLM Providers](https://docs.siclaw.ai/configuration/providers)
+- [MCP Servers](https://docs.siclaw.ai/configuration/mcp)
 
 ## Tech Stack
 

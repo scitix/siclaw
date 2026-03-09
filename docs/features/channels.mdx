@@ -14,15 +14,17 @@ All channels share the same investigation engine — the interface differs but t
 | **Web UI** | Gateway | Stable |
 | **Slack** | Gateway | Stable |
 | **Lark (Feishu)** | Gateway | Stable |
+| **Discord** | Gateway | Stable |
+| **Telegram** | Gateway | Stable |
 | **Webhooks** | Gateway | Stable |
 
 ## Web UI
 
-Available in Gateway mode (`siclaw-gateway` or Docker deployment):
+Available in Local Server mode (`siclaw local`) and Kubernetes deployments:
 
 ```bash
 npm run dev:gateway
-# Open http://localhost:3001
+# Open http://localhost:3000
 ```
 
 The Web UI provides:
@@ -41,12 +43,10 @@ The Web UI provides:
 2. Enable **Socket Mode** and **Event Subscriptions**
 3. Subscribe to events: `app_mention`, `message.im`
 4. Add bot scopes: `chat:write`, `app_mentions:read`, `im:history`
-5. Set environment variables:
+5. In Siclaw Web UI, open **Channels** and save the bot credentials for Slack:
 
-```bash
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-```
+   - `botToken`
+   - `appToken`
 
 ### Usage
 
@@ -60,19 +60,35 @@ Or send a direct message for private investigations.
 
 ## Lark (Feishu) Integration
 
-```bash
-LARK_APP_ID=cli_...
-LARK_APP_SECRET=...
-```
+Create a Lark bot app, enable message event subscriptions, then configure it in **Channels** with:
 
-Create a Lark bot app, enable message event subscriptions, and set the environment variables above.
+- `appId`
+- `appSecret`
+
+## Discord Integration
+
+Configure a Discord bot in **Channels** with:
+
+- `token`
+
+## Telegram Integration
+
+Configure a Telegram bot in **Channels** with:
+
+- `botToken`
 
 ## Alert Webhooks
 
-Siclaw accepts alert webhooks from monitoring systems and automatically starts an investigation:
+Create a Trigger in the **Triggers** page. Siclaw will generate:
+
+- a unique webhook URL
+- a bearer secret
+
+Requests should be sent to the generated endpoint:
 
 ```bash
-curl -X POST https://siclaw.example.com/api/webhook/alert \
+curl -X POST https://siclaw.example.com/hooks/v1/<trigger-id> \
+  -H "Authorization: Bearer <trigger-secret>" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "High error rate on payment-service",
@@ -96,18 +112,6 @@ Schedule recurring health checks using natural language:
 ### Creating a Patrol
 
 **Via Web UI**: Go to **Cron** in the sidebar, click **New Patrol**, describe what to check and how often.
-
-**Via API**:
-
-```bash
-curl -X POST https://siclaw.example.com/api/cron \
-  -H "Content-Type: application/json" \
-  -d '{
-    "description": "Check GPU utilization every 6 hours",
-    "schedule": "0 */6 * * *",
-    "skills": ["gpu-health-check"]
-  }'
-```
 
 Each patrol run produces a status (success / warning / failure), output summary, and timestamp — all visible in the Web UI.
 

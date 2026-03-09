@@ -4,6 +4,15 @@ sidebarTitle: "CLI / Local"
 description: "Install Siclaw globally and run as CLI or local server."
 ---
 
+## Recommended Working Directory
+
+Siclaw stores most runtime data in a `.siclaw/` folder **relative to the directory where you start it**. Create a dedicated working directory and reuse it:
+
+```bash
+mkdir -p ~/siclaw-work
+cd ~/siclaw-work
+```
+
 ## Install
 
 ```bash
@@ -16,7 +25,14 @@ npm install -g siclaw
 siclaw local
 ```
 
-Launches the Web UI at `http://localhost:3000` with multi-user support, channels (Slack/Lark), cron patrols, and all features.
+Launches the Web UI at `http://localhost:3000`.
+
+On first startup, the local server creates a default admin account:
+
+- Username: `admin`
+- Password: `admin`
+
+Change it after logging in, or set `SICLAW_ADMIN_PASSWORD` before the first start.
 
 ## CLI (TUI)
 
@@ -32,34 +48,48 @@ Personal terminal mode. Same investigation engine, no server.
 git clone https://github.com/scitix/siclaw.git
 cd siclaw
 npm ci
+npm run build:web
 npm run build
-npm run dev
+
+# TUI
+node siclaw.mjs
+
+# Local server
+node siclaw.mjs local
 ```
 
 ## Configuration
 
-Siclaw stores its configuration and data in `~/.siclaw/`:
+By default, Siclaw reads and writes these paths relative to your current working directory:
 
 ```
-~/.siclaw/
+.siclaw/
 ├── config/
 │   └── settings.json     ← LLM provider, model, API key
-├── data.sqlite            ← Session data (Gateway mode, sql.js)
-├── memory/
-│   ├── .memory.db         ← Investigation memory (node:sqlite)
-│   └── *.md               ← Raw memory files
-└── reports/
-    └── deep-search-*.md   ← Investigation reports
+├── credentials/           ← Imported kubeconfigs, SSH keys, API tokens
+├── skills/
+└── user-data/
+    ├── memory/
+    │   └── .memory.db
+    └── ...
 ```
 
 ### LLM Configuration
 
-Edit `~/.siclaw/config/settings.json` (see [`settings.example.json`](https://github.com/scitix/siclaw/blob/main/settings.example.json) for full format):
+TUI mode reads `.siclaw/config/settings.json`. The easiest path is to let the first-run wizard create it for you.
+
+Minimal example:
 
 ```json
 {
   "providers": {
-    "default": {
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "sk-...",
+      "api": "openai-completions",
+      "models": [{ "id": "gpt-4o", "name": "GPT-4o" }]
+    },
+    "anthropic": {
       "baseUrl": "https://api.anthropic.com/v1",
       "apiKey": "sk-ant-...",
       "api": "anthropic",
@@ -71,15 +101,18 @@ Edit `~/.siclaw/config/settings.json` (see [`settings.example.json`](https://git
 
 Once inside the TUI session, use `/setup` to manage providers, models, and credentials.
 
-See [LLM Providers](/configuration/providers) for Ollama, vLLM, and other setups.
+In Local Server mode, configure providers and models in the **Models** page of the Web UI.
 
-### Kubeconfig
+See [LLM Providers](/configuration/providers) for provider examples.
 
-Siclaw uses your default kubeconfig (`~/.kube/config`). To use a specific context:
+### Kubernetes Credentials
 
-```bash
-KUBECONFIG=/path/to/kubeconfig siclaw
-```
+Siclaw tools resolve kubeconfig from its own credential store, not from your shell's `KUBECONFIG`.
+
+- In TUI mode, use `/setup` to import a kubeconfig
+- In Local Server mode, add it in **Credentials**
+
+After import, Siclaw can route `kubectl` calls through that stored credential.
 
 ## Embedding (Optional)
 
@@ -96,4 +129,12 @@ To enable Investigation Memory with semantic search, add an embedding config:
 }
 ```
 
-Without embedding, memory features are disabled but all other functionality works normally.
+If `embedding.apiKey` is omitted, Siclaw falls back to the default LLM provider key.
+
+## Reports
+
+Deep investigation reports are written to:
+
+```text
+~/.siclaw/reports/
+```
