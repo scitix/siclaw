@@ -60,13 +60,14 @@ async function resolveSchedule(
     }
 }
 
-export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMessageMeta, selectedEnvId }: {
+export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMessageMeta, selectedEnvId, selectedWorkspaceId }: {
     message: PilotMessage;
     status: ScheduleCardStatus;
     onOpenPanel?: (msg: PilotMessage) => void;
     sendRpc?: RpcSendFn;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     selectedEnvId?: string | null;
+    selectedWorkspaceId?: string | null;
 }) {
     const [execState, setExecState] = useState<'idle' | 'executing' | 'done' | 'error'>('idle');
     const [errorMsg, setErrorMsg] = useState('');
@@ -94,9 +95,9 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
 
     const autoExecute = async () => {
         if (!parsed || !sendRpc || !updateMessageMeta) return;
-        if (!selectedEnvId) {
+        if (!selectedWorkspaceId) {
             setExecState('error');
-            setErrorMsg('Please select an environment first');
+            setErrorMsg('Please select a workspace first');
             return;
         }
         setExecState('executing');
@@ -109,6 +110,7 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
                     schedule: parsed.schedule.schedule,
                     status: parsed.schedule.status || 'active',
                     envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (action === 'update' && parsed.schedule) {
                 const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name, selectedEnvId);
@@ -120,6 +122,7 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
                     schedule: parsed.schedule.schedule,
                     status: parsed.schedule.status || 'active',
                     envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (action === 'delete') {
                 const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name, selectedEnvId);

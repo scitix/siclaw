@@ -194,7 +194,8 @@ export function PilotPage() {
                         onSkillSaved={handleSkillSaved}
                         onOpenSkillPanel={handleOpenSkillPanel}
                         onOpenSchedulePanel={handleOpenSkillPanel}
-                        selectedEnvId={currentWorkspace?.id ?? null}
+                        selectedEnvId={null}
+                        selectedWorkspaceId={currentWorkspace?.id ?? null}
                         panelMessage={panelMessage}
                         updateMessageMeta={pilot.updateMessageMeta}
                         pendingMessages={pilot.pendingMessages}
@@ -238,7 +239,7 @@ export function PilotPage() {
                             onDismiss={handlePanelDismiss}
                             onClose={() => setPanelMessage(null)}
                             updateMessageMeta={pilot.updateMessageMeta}
-                            selectedEnvId={currentWorkspace?.id ?? null}
+                            selectedEnvId={null}
                             selectedWorkspaceId={currentWorkspace?.id ?? null}
                         />
                     );

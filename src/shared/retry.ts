@@ -1,5 +1,5 @@
 /**
- * Retry with exponential backoff — generic utility for cron service HTTP calls.
+ * Retry with exponential backoff — generic utility for HTTP calls.
  *
  * Pattern borrowed from src/memory/embeddings.ts.
  */
@@ -69,16 +69,28 @@ export async function withRetry<T>(
 }
 
 /**
+ * Typed HTTP error with status code — avoids fragile regex on message strings.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
+/**
  * Default shouldRetry predicate for HTTP calls:
  * retry on network errors and 5xx / 429, skip on other 4xx.
  */
 export function shouldRetryHttp(err: unknown): boolean {
-  if (!(err instanceof Error)) return true;
-  // Check for HTTP status codes in error message pattern: "returned NNN:"
-  const match = err.message.match(/returned (\d{3}):/);
-  if (!match) return true; // Network error or non-HTTP — retry
-  const status = parseInt(match[1], 10);
-  if (status === 429) return true; // Rate limited — retry
-  if (status >= 400 && status < 500) return false; // Client error — don't retry
-  return true; // 5xx — retry
+  if (err instanceof HttpError) {
+    if (err.status === 429) return true; // Rate limited — retry
+    if (err.status >= 400 && err.status < 500) return false; // Client error — don't retry
+    return true; // 5xx — retry
+  }
+  // Network error or non-HTTP — retry
+  return true;
 }

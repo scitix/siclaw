@@ -664,6 +664,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             }
 
             if (cronPath === "lock-job") {
+              if (!data.jobId || !data.executionId) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
+                return;
+              }
               const locked = await configRepo.lockJobForExecution(data.jobId, data.executionId);
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ locked }));
@@ -671,6 +676,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             }
 
             if (cronPath === "unlock-job") {
+              if (!data.jobId || !data.executionId) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
+                return;
+              }
               await configRepo.unlockJob(data.jobId, data.executionId);
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ status: "ok" }));
@@ -678,6 +688,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             }
 
             if (cronPath === "clear-stale-locks") {
+              if (typeof data.thresholdMs !== "number" || data.thresholdMs <= 0) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "thresholdMs must be a positive number" }));
+                return;
+              }
               await configRepo.clearStaleLocks(data.thresholdMs);
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ status: "ok" }));

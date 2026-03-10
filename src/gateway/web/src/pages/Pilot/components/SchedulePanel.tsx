@@ -160,9 +160,9 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
 
     const handleSave = async () => {
         if (!parsed) return;
-        if (!selectedEnvId) {
+        if (!selectedWorkspaceId) {
             setSaveState('error');
-            setErrorMsg('Please select an environment first');
+            setErrorMsg('Please select a workspace first');
             return;
         }
         setSaveState('saving');

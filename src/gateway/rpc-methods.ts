@@ -2556,8 +2556,10 @@ export function createRpcMethods(
 
     if (!configRepo) return { jobs: [] };
 
+    const envId = params.envId as string | undefined;
     const workspaceId = params.workspaceId as string | undefined;
-    const rows = await configRepo.listCronJobs(userId, workspaceId ? { workspaceId } : undefined);
+    const opts = (envId || workspaceId) ? { envId, workspaceId } : undefined;
+    const rows = await configRepo.listCronJobs(userId, opts);
 
     return {
       jobs: rows.map((r) => ({
