@@ -122,37 +122,32 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   // ── Credential materialization helper (shared by prompt and reload-credentials) ──
-  // Uses atomic write-to-temp-then-rename to avoid partial state if interrupted.
+  // Writes to credDir atomically: clear existing files, write new ones.
+  // Uses a staging approach within the same directory to avoid permission issues
+  // in the container (parent dir /app/.siclaw/ has restricted permissions).
   function materializeCredentials(
     payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
     kubeconfigRef: { credentialsDir?: string },
   ): number {
     const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-    const tmpDir = `${credDir}.tmp.${Date.now()}`;
+    fs.mkdirSync(credDir, { recursive: true });
 
-    // Write to temp directory first
-    fs.mkdirSync(tmpDir, { recursive: true });
+    // Clear existing files
+    for (const entry of fs.readdirSync(credDir)) {
+      fs.rmSync(path.join(credDir, entry), { recursive: true });
+    }
+
+    // Write credential files with path traversal validation
     for (const file of payload.files) {
-      // Defense-in-depth: reject path traversal in file names from network payload
-      const resolved = path.resolve(tmpDir, file.name);
-      if (!resolved.startsWith(tmpDir + path.sep) && resolved !== tmpDir) {
+      const resolved = path.resolve(credDir, file.name);
+      if (!resolved.startsWith(credDir + path.sep) && resolved !== credDir) {
         throw new Error(`Invalid credential file name: ${file.name}`);
       }
       fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
     }
-    fs.writeFileSync(path.join(tmpDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
 
-    // Atomic swap: remove old dir, rename temp → final
-    const oldDir = `${credDir}.old.${Date.now()}`;
-    if (fs.existsSync(credDir)) {
-      fs.renameSync(credDir, oldDir);
-    }
-    fs.renameSync(tmpDir, credDir);
-    // Clean up old dir
-    if (fs.existsSync(oldDir)) {
-      fs.rmSync(oldDir, { recursive: true, force: true });
-    }
-
+    // Write manifest
+    fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
     kubeconfigRef.credentialsDir = credDir;
     return payload.files.length;
   }
