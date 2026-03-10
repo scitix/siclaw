@@ -131,7 +131,7 @@ const DDL_STATEMENTS = [
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     is_test INTEGER NOT NULL DEFAULT 0,
-    api_server TEXT NOT NULL,
+    api_server TEXT NOT NULL DEFAULT '',
     created_by TEXT,
     allowed_servers TEXT,
     default_kubeconfig TEXT,

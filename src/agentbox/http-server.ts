@@ -133,7 +133,12 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     // Write to temp directory first
     fs.mkdirSync(tmpDir, { recursive: true });
     for (const file of payload.files) {
-      fs.writeFileSync(path.join(tmpDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
+      // Defense-in-depth: reject path traversal in file names from network payload
+      const resolved = path.resolve(tmpDir, file.name);
+      if (!resolved.startsWith(tmpDir + path.sep) && resolved !== tmpDir) {
+        throw new Error(`Invalid credential file name: ${file.name}`);
+      }
+      fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
     }
     fs.writeFileSync(path.join(tmpDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
 
@@ -690,21 +695,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     const payload = { manifest: body.manifest, files: body.files ?? [] };
 
-    if (payload.files.length > 0) {
-      const count = materializeCredentials(payload, kubeconfigRef);
+    // Use atomic materializeCredentials for both populate and clear paths
+    const count = materializeCredentials(payload, kubeconfigRef);
+    if (count > 0) {
       console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
     } else {
-      // Empty payload = clear all credentials
-      const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-      if (fs.existsSync(credDir)) {
-        for (const entry of fs.readdirSync(credDir)) {
-          fs.rmSync(path.join(credDir, entry), { recursive: true });
-        }
-      }
-      // Write empty manifest
-      fs.mkdirSync(credDir, { recursive: true });
-      fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify([], null, 2));
-      kubeconfigRef.credentialsDir = credDir;
       console.log("[agentbox-http] Credentials cleared (empty payload)");
     }
 

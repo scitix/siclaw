@@ -74,8 +74,8 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
     const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
     return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
   } catch {
-    // Fallback: exact string match if URLs are malformed
-    return kubeconfigServer === envApiServer;
+    // If URL parsing fails, reject the match — don't fall back to loose comparison
+    return false;
   }
 }
 
@@ -3324,7 +3324,7 @@ export function createRpcMethods(
       : existing.allowedServers;
     let defaultKubeconfig = params.defaultKubeconfig !== undefined ? params.defaultKubeconfig as string | null : existing.defaultKubeconfig;
 
-    if (apiServer && typeof apiServer === "string" && !apiServer.trim()) {
+    if (!apiServer?.trim()) {
       throw new Error("apiServer must be a non-empty string");
     }
 
@@ -3555,6 +3555,17 @@ export function createRpcMethods(
         const dbUser = await userRepo.getById(userId);
         if (dbUser?.testOnly && params.envType === "prod") {
           throw new Error("Test-only users cannot create production workspaces");
+        }
+      }
+      // If changing to "test", verify all bound environments are test
+      if (params.envType === "test" && envRepo && workspaceRepo) {
+        const boundEnvIds = await workspaceRepo.getEnvironments(id);
+        if (boundEnvIds.length > 0) {
+          const boundEnvs = await envRepo.listByIds(boundEnvIds);
+          const nonTest = boundEnvs.filter((e) => !e.isTest);
+          if (nonTest.length > 0) {
+            throw new Error(`Cannot change to test type: workspace has ${nonTest.length} non-test environment(s) bound. Unbind them first.`);
+          }
         }
       }
       updates.envType = params.envType as string;
