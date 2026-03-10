@@ -1153,6 +1153,9 @@ export function usePilot() {
     // and auto-select the most recent session if one exists.
     useEffect(() => {
         if (prevWorkspaceIdRef.current !== workspaceId && prevWorkspaceIdRef.current !== undefined) {
+            // Invalidate any in-flight loadHistory requests from the previous workspace
+            // to prevent stale responses from overwriting the cleared UI state.
+            ++loadHistoryRequestIdRef.current;
             setCurrentSessionKey(null);
             setMessages([]);
             setContextUsage(null);
