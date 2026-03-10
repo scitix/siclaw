@@ -11,8 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { loadMcpServersConfig } from "../core/mcp-client.js";
-import { loadConfig, reloadConfig } from "../core/config.js";
+import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import type {
   ResourceType,
   AgentBoxResourceHandler,
@@ -40,20 +39,15 @@ export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
   },
 
   async materialize(payload: McpPayload): Promise<number> {
-    // Merge local seed with remote
-    const localMcp = loadMcpServersConfig(undefined, { localOnly: true });
+    const config = loadConfig();
     const merged: Record<string, unknown> = {};
-    if (localMcp?.mcpServers) Object.assign(merged, localMcp.mcpServers);
+    // Preserve existing mcpServers from settings.json as base
+    if (config.mcpServers) Object.assign(merged, config.mcpServers);
+    // Gateway payload overwrites
     if (payload?.mcpServers) Object.assign(merged, payload.mcpServers);
 
-    const mcpDir = process.env.SICLAW_MCP_DIR || path.resolve(process.cwd(), ".siclaw", "mcp");
-    if (!process.env.SICLAW_MCP_DIR) process.env.SICLAW_MCP_DIR = mcpDir;
-    if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
-    fs.writeFileSync(
-      path.resolve(mcpDir, "mcp-servers.json"),
-      JSON.stringify({ mcpServers: merged }, null, 2),
-      "utf-8",
-    );
+    config.mcpServers = merged;
+    writeConfig(config);
     return Object.keys(merged).length;
   },
 
