@@ -1016,7 +1016,7 @@ function ScriptReviewApprovalCard({
     }[skill.scope] || { label: skill.scope, cls: 'bg-gray-100 text-gray-600', icon: User };
 
     return (
-        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden hover:shadow-sm transition-shadow">
+        <div className="bg-white rounded-xl border border-gray-200 hover:shadow-sm transition-shadow">
             <ConfirmDialog
                 isOpen={confirmDialog.isOpen}
                 onClose={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
