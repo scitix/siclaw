@@ -167,6 +167,7 @@ export class K8sSpawner implements BoxSpawner {
         labels: {
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/user`]: boxConfig.userId,
+          [`${labelPrefix}/workspace`]: boxConfig.workspaceId || "default",
         },
       },
       spec: {
@@ -508,12 +509,14 @@ export class K8sSpawner implements BoxSpawner {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
       const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
+      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId,
         userId,
+        workspaceId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
@@ -542,12 +545,14 @@ export class K8sSpawner implements BoxSpawner {
 
     return podList.items.map((pod: k8s.V1Pod) => {
       const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
+      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId: pod.metadata?.name || "",
         userId,
+        workspaceId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp

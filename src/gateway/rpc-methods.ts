@@ -99,11 +99,11 @@ export function createRpcMethods(
   const userEnvConfigRepo = db ? new UserEnvConfigRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
-  /** Resolve workspaceId for a session from DB, falling back to "default" */
-  async function resolveSessionWorkspace(sessionId: string): Promise<string> {
-    if (!chatRepo) return "default";
+  /** Resolve workspaceId for a session from DB */
+  async function resolveSessionWorkspace(sessionId: string): Promise<string | undefined> {
+    if (!chatRepo) return undefined;
     const session = await chatRepo.getSession(sessionId);
-    return session?.workspaceId ?? "default";
+    return session?.workspaceId ?? undefined;
   }
 
   /** Find an AgentBox handle for a user, trying session workspace first, then any active box */
@@ -154,6 +154,60 @@ export function createRpcMethods(
       console.warn(`[resource-notify] All skill reload failed:`, err.message);
     });
   }
+
+  /**
+   * Push updated credentials to all active AgentBoxes for a user (fire-and-forget).
+   * Builds the credential payload per workspace and POSTs to each box's /api/reload-credentials.
+   */
+  function pushCredentialsToUser(userId: string): void {
+    if (!workspaceRepo) return;
+
+    // Async fire-and-forget
+    (async () => {
+      // Local mode: handles carry workspaceId from cache key
+      let handles = agentBoxManager.getForUser(userId);
+      if (handles.length === 0) {
+        // K8s mode: find running pods via list(), workspace label provides workspaceId
+        const allBoxes = await agentBoxManager.list();
+        const userBoxes = allBoxes.filter((b) => b.userId === userId && b.status === "running" && b.endpoint);
+        if (userBoxes.length === 0) return;
+
+        for (const box of userBoxes) {
+          handles.push({
+            boxId: box.boxId,
+            userId: box.userId,
+            endpoint: box.endpoint,
+            workspaceId: box.workspaceId,
+          });
+        }
+      }
+      if (handles.length === 0) return;
+
+      for (const handle of handles) {
+        try {
+          // Resolve workspace for this box
+          const wsId = handle.workspaceId;
+          const ws = wsId
+            ? (await workspaceRepo!.getById(wsId)) ?? (await workspaceRepo!.getOrCreateDefault(userId))
+            : await workspaceRepo!.getOrCreateDefault(userId);
+          if (!ws) continue;
+
+          const payload = await buildCredentialPayload(userId, ws.id, ws.isDefault);
+          const client = new AgentBoxClient(handle.endpoint, 15000, agentBoxTlsOptions);
+          await client.reloadCredentials(payload);
+          console.log(`[credential-push] Pushed credentials to box=${handle.boxId} ws=${ws.name} (${payload.files.length} files)`);
+        } catch (err) {
+          console.warn(
+            `[credential-push] Failed for box=${handle.boxId}:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    })().catch((err) => {
+      console.warn(`[credential-push] Unexpected error for userId=${userId}:`, err instanceof Error ? err.message : err);
+    });
+  }
+
   // Initialize skills dir
   skillWriter.init()
     .then(async () => {
@@ -330,7 +384,8 @@ export function createRpcMethods(
         workspace = null;
       }
     }
-    const effectiveWorkspaceId = workspace?.id ?? "default";
+    if (!workspace) throw new Error("Failed to resolve workspace");
+    const effectiveWorkspaceId = workspace.id;
 
     // Ensure session exists in DB
     if (chatRepo) {
@@ -358,7 +413,7 @@ export function createRpcMethods(
       });
     }
 
-    if (!sessionId) sessionId = "default";
+    if (!sessionId) throw new Error("Failed to create session");
 
     // Forward model selection and brain type from frontend
     // Use workspace default model if user didn't specify one
@@ -1171,39 +1226,28 @@ export function createRpcMethods(
 
   methods.set("session.list", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
+
     const workspaceId = params?.workspaceId as string | undefined;
-
-    if (chatRepo) {
-      const rows = await chatRepo.listSessions(userId, 20, workspaceId);
-      return {
-        sessions: rows.map((s) => ({
-          key: s.id,
-          title: s.title,
-          preview: s.preview,
-          createdAt: s.createdAt?.toISOString(),
-          lastActiveAt: s.lastActiveAt?.toISOString(),
-          messageCount: s.messageCount,
-        })),
-      };
-    }
-
-    // Fallback: get from AgentBox
-    const handle = await agentBoxManager.getAsync(userId, workspaceId ?? "default");
-    if (!handle) return { sessions: [] };
-
-    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-    return client.listSessions();
+    const rows = await chatRepo.listSessions(userId, 20, workspaceId);
+    return {
+      sessions: rows.map((s) => ({
+        key: s.id,
+        title: s.title,
+        preview: s.preview,
+        createdAt: s.createdAt?.toISOString(),
+        lastActiveAt: s.lastActiveAt?.toISOString(),
+        messageCount: s.messageCount,
+      })),
+    };
   });
 
   methods.set("session.create", async (_params, context: RpcContext) => {
     const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
 
-    if (chatRepo) {
-      const session = await chatRepo.createSession(userId);
-      return { sessionId: session.id, sessionKey: session.id };
-    }
-
-    return { sessionId: "default", sessionKey: "default" };
+    const session = await chatRepo.createSession(userId);
+    return { sessionId: session.id, sessionKey: session.id };
   });
 
   methods.set("session.delete", async (params, context: RpcContext) => {
@@ -1225,7 +1269,7 @@ export function createRpcMethods(
 
   methods.set("box.status", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    const workspaceId = (params?.workspaceId as string) ?? "default";
+    const workspaceId = params?.workspaceId as string | undefined;
 
     const handle = await agentBoxManager.getAsync(userId, workspaceId);
     if (!handle) return { boxStatus: "not_created" };
@@ -3131,7 +3175,7 @@ export function createRpcMethods(
     validateCredentialConfig(type, configJson);
 
     const id = await credRepo.create({ userId, name, type, description, configJson });
-
+    pushCredentialsToUser(userId);
     return { id, name, type };
   });
 
@@ -3155,7 +3199,7 @@ export function createRpcMethods(
     }
 
     await credRepo.update(userId, id, updates);
-
+    pushCredentialsToUser(userId);
     return { status: "updated" };
   });
 
@@ -3170,7 +3214,7 @@ export function createRpcMethods(
     if (!existing) throw new Error("Credential not found");
 
     await credRepo.delete(userId, id);
-
+    pushCredentialsToUser(userId);
     return { status: "deleted" };
   });
 
@@ -3189,7 +3233,7 @@ export function createRpcMethods(
         name: e.name,
         isTest: e.isTest,
         apiServer: e.apiServer,
-        allowedServers: e.allowedServers,
+        allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
         hasDefaultKubeconfig: !!e.defaultKubeconfig,
         createdBy: e.createdBy,
         createdAt: e.createdAt,
@@ -3205,7 +3249,8 @@ export function createRpcMethods(
     const name = params.name as string;
     const isTest = params.isTest as boolean | undefined;
     const apiServer = params.apiServer as string;
-    const allowedServers = params.allowedServers as string | undefined;
+    const rawAllowedServers = params.allowedServers;
+    const allowedServers = Array.isArray(rawAllowedServers) ? rawAllowedServers.join(", ") : (rawAllowedServers as string | undefined);
     const defaultKubeconfig = params.defaultKubeconfig as string | undefined;
 
     if (!name) throw new Error("Missing required param: name");
@@ -3217,7 +3262,7 @@ export function createRpcMethods(
     }
 
     const id = await envRepo.save(
-      { name, isTest, apiServer, allowedServers: allowedServers ?? null, defaultKubeconfig: defaultKubeconfig ?? null },
+      { name, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null },
       userId,
     );
     return { id, name };
@@ -3236,7 +3281,10 @@ export function createRpcMethods(
     const name = (params.name as string | undefined) ?? existing.name;
     const apiServer = (params.apiServer as string | undefined) ?? existing.apiServer;
     const isTest = params.isTest !== undefined ? params.isTest as boolean : existing.isTest;
-    const allowedServers = params.allowedServers !== undefined ? params.allowedServers as string | null : existing.allowedServers;
+    const rawAllowed = params.allowedServers;
+    const allowedServers = rawAllowed !== undefined
+      ? (Array.isArray(rawAllowed) ? rawAllowed.join(", ") : rawAllowed as string | null)
+      : existing.allowedServers;
     let defaultKubeconfig = params.defaultKubeconfig !== undefined ? params.defaultKubeconfig as string | null : existing.defaultKubeconfig;
 
     if (apiServer && typeof apiServer === "string" && !apiServer.trim()) {
@@ -3347,6 +3395,7 @@ export function createRpcMethods(
     }
 
     await userEnvConfigRepo.set(userId, envId, kubeconfig);
+    pushCredentialsToUser(userId);
     return { status: "saved" };
   });
 
@@ -3358,6 +3407,7 @@ export function createRpcMethods(
     if (!envId) throw new Error("Missing required param: envId");
 
     await userEnvConfigRepo.remove(userId, envId);
+    pushCredentialsToUser(userId);
     return { status: "removed" };
   });
 
@@ -3672,11 +3722,19 @@ export function createRpcMethods(
     }
 
     // ── Step 2: Kubeconfigs from environments ──
-    if (workspaceRepo && envRepo && userEnvConfigRepo) {
-      const boundEnvIds = await workspaceRepo.getEnvironments(workspaceId);
-      if (boundEnvIds.length > 0) {
-        const boundEnvs = await envRepo.listByIds(boundEnvIds);
-        for (const env of boundEnvs) {
+    if (envRepo && userEnvConfigRepo) {
+      // Default workspace: all environments; non-default: only workspace-bound
+      let envs: Awaited<ReturnType<typeof envRepo.list>>;
+      if (isDefault) {
+        envs = await envRepo.list();
+      } else if (workspaceRepo) {
+        const boundEnvIds = await workspaceRepo.getEnvironments(workspaceId);
+        envs = boundEnvIds.length > 0 ? await envRepo.listByIds(boundEnvIds) : [];
+      } else {
+        envs = [];
+      }
+      if (envs.length > 0) {
+        for (const env of envs) {
           // Runtime filter: test workspace skips prod environments
           if (envType === "test" && !env.isTest) continue;
 

@@ -166,6 +166,18 @@ export class AgentBoxClient {
   }
 
   /**
+   * Push updated credentials to AgentBox (re-materializes credential files)
+   */
+  async reloadCredentials(payload: PromptOptions["credentials"]): Promise<{ ok: boolean; count: number }> {
+    const resp = await this.fetch("/api/reload-credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return resp.json();
+  }
+
+  /**
    * Get context usage
    */
   async getContextUsage(sessionId: string): Promise<ContextUsageResponse> {

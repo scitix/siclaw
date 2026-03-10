@@ -141,6 +141,7 @@ const DDL_STATEMENTS = [
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     is_test BOOLEAN NOT NULL DEFAULT FALSE,
+    api_server VARCHAR(512) NOT NULL DEFAULT '',
     created_by VARCHAR(32),
     allowed_servers TEXT,
     default_kubeconfig LONGTEXT,
@@ -268,6 +269,7 @@ const DDL_STATEMENTS = [
     user_id VARCHAR(32) NOT NULL,
     name VARCHAR(100) NOT NULL,
     is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    env_type VARCHAR(10) NOT NULL DEFAULT 'prod',
     config_json JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -406,6 +408,9 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal') NOT NULL DEFAULT 'personal'`,
     `ALTER TABLE skills MODIFY COLUMN review_status ENUM('draft','pending','approved') NOT NULL DEFAULT 'draft'`,
     `ALTER TABLE skills ADD COLUMN labels_json JSON NULL`,
+    // ADR-011: environment isolation
+    `ALTER TABLE workspaces ADD COLUMN env_type VARCHAR(10) NOT NULL DEFAULT 'prod' AFTER is_default`,
+    `ALTER TABLE environments ADD COLUMN api_server VARCHAR(512) NOT NULL DEFAULT '' AFTER is_test`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
