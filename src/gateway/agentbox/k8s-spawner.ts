@@ -50,11 +50,6 @@ export class K8sSpawner implements BoxSpawner {
     this.certManager = cm;
   }
 
-  /** Update the AgentBox image at runtime (takes effect on next spawn) */
-  setImage(image: string): void {
-    this.config.image = image;
-  }
-
   /**
    * Generate Pod name
    */
