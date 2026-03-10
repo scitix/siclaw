@@ -3614,7 +3614,7 @@ export function createRpcMethods(
 
     const ALLOWED_SECTIONS: Record<string, string[]> = {
       sso: ["sso.enabled", "sso.issuer", "sso.clientId", "sso.clientSecret", "sso.redirectUri"],
-      system: ["system.baseUrl", "system.platformUrl", "system.agentboxImage", "system.grafanaUrl"],
+      system: ["system.grafanaUrl"],
       metrics: ["metrics.port", "metrics.token", "metrics.includeUserId"],
     };
 
@@ -3631,11 +3631,6 @@ export function createRpcMethods(
     }
 
     await sysConfigRepo.setMany(entries);
-
-    // Apply agentbox image change at runtime
-    if (section === "system" && entries["system.agentboxImage"]) {
-      agentBoxManager.setSpawnerImage(entries["system.agentboxImage"]);
-    }
 
     return { ok: true };
   });
