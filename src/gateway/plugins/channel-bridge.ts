@@ -1,5 +1,5 @@
 import type { AgentBoxManager } from "../agentbox/manager.js";
-import { AgentBoxClient } from "../agentbox/client.js";
+import { AgentBoxClient, type AgentBoxTlsOptions } from "../agentbox/client.js";
 import type { BroadcastFn } from "../ws-protocol.js";
 import type { ChannelPlugin, StreamingCard } from "./api.js";
 import type { UserStore } from "../auth/user-store.js";
@@ -85,6 +85,7 @@ export function createChannelBridge(
   configRepo?: ConfigRepository,
   buildCredentialPayload?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>,
   workspaceRepo?: WorkspaceRepository,
+  agentBoxTlsOptions?: AgentBoxTlsOptions,
 ): ChannelBridge {
   // channelId → outbound sender
   const outbounds = new Map<string, ChannelPlugin>();
@@ -152,7 +153,7 @@ export function createChannelBridge(
       // Channel and web share the same AgentBox — mode-driven skill loading
       // handles tool/skill differences per session.
       const handle = await agentBoxManager.getOrCreate(boundUser.id, defaultWs.id);
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
       const plugin = outbounds.get(channelId);
 

@@ -103,6 +103,8 @@ export interface GatewayServer {
   onCronNotify?: (data: { userId: string; jobName: string; result: string; resultText: string; error?: string }) => void;
   /** Build credential payload for a specific workspace (sent in prompt body) */
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
+  /** TLS options for AgentBox mTLS connections (K8s mode only) */
+  agentBoxTlsOptions?: import("./agentbox/client.js").AgentBoxTlsOptions;
   close(): Promise<void>;
 }
 
@@ -854,7 +856,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           if (!data.workspaceId && !internalWorkspaceRepo) throw new Error("Database not available");
           const wsId = data.workspaceId || (await internalWorkspaceRepo!.getOrCreateDefault(userId)).id;
           const handle = await agentBoxManager.getOrCreate(userId, wsId);
-          client = new AgentBoxClient(handle.endpoint);
+          client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
           // 2. Send prompt
           const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
@@ -1336,6 +1338,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     db,
     rpcMethods,
     buildCredentialPayload,
+    agentBoxTlsOptions,
     async close() {
       bindCodeStore.dispose();
       await agentBoxManager.cleanup();
