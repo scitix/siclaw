@@ -390,6 +390,20 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
      VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
   ));
 
+  // Schema migrations — handle existing databases missing new columns
+  const MIGRATIONS = [
+    // ADR-011: environment isolation
+    `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
+    `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
+  ];
+  for (const stmt of MIGRATIONS) {
+    try {
+      sdb.run(sql.raw(stmt));
+    } catch (_err: any) {
+      // Ignore "duplicate column name" errors (column already exists)
+    }
+  }
+
   // Persist schema changes to disk immediately (sql.js is in-memory)
   flushSqliteDb();
 

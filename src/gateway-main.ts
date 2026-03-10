@@ -7,6 +7,7 @@ import { ChannelStore } from "./gateway/channels/channel-store.js";
 import { ChannelManager } from "./gateway/channels/channel-manager.js";
 import { createChannelRpcMethods } from "./gateway/channels/channel-rpc.js";
 import { ConfigRepository } from "./gateway/db/repositories/config-repo.js";
+import { WorkspaceRepository } from "./gateway/db/repositories/workspace-repo.js";
 
 
 // Parse arguments
@@ -62,11 +63,12 @@ const gateway = await startGateway({
 const channelStore = new ChannelStore(gateway.db);
 await channelStore.init();
 
-// ConfigRepository for schedule auto-execution in channel bridge
+// Repositories for channel bridge
 const configRepo = gateway.db ? new ConfigRepository(gateway.db) : undefined;
+const wsRepo = gateway.db ? new WorkspaceRepository(gateway.db) : undefined;
 
 // Create channel bridge (routes through AgentBox pods, not in-process sessions)
-const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.buildCredentialPayload);
+const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.buildCredentialPayload, wsRepo);
 
 // Auto-remember chatId from inbound messages for notifications
 channelBridge.onInbound = (channelId, chatId) => {

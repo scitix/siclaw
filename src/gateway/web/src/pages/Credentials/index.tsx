@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { KeyRound, Loader2, Plus, Pencil, Trash2, Search } from 'lucide-react';
+import { KeyRound, Loader2, Plus, Pencil, Trash2, Search, Upload } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { useCredentials } from '../../hooks/useCredentials';
@@ -14,6 +14,15 @@ const TYPE_BADGE_COLORS: Record<CredentialType, string> = {
     api_basic_auth: 'bg-amber-50 text-amber-700',
 };
 
+interface EnvConfig {
+    envId: string;
+    envName: string;
+    isTest: boolean;
+    apiServer: string;
+    hasKubeconfig: boolean;
+    updatedAt: string | null;
+}
+
 export function CredentialsPage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { credentials, loading, loadCredentials, createCredential, updateCredential, deleteCredential } = useCredentials(sendRpc);
@@ -24,22 +33,20 @@ export function CredentialsPage() {
     const [editingCredential, setEditingCredential] = useState<Credential | null>(null);
     const [deleting, setDeleting] = useState<string | null>(null);
 
-    const [envConfigs, setEnvConfigs] = useState<Array<{
-        envId: string;
-        envName: string;
-        isTest: boolean;
-        apiServer: string;
-        hasKubeconfig: boolean;
-        updatedAt: string | null;
-    }>>([]);
-    const [uploadEnvId, setUploadEnvId] = useState<string | null>(null);
+    // All env configs (for upload dialog env selector)
+    const [allEnvConfigs, setAllEnvConfigs] = useState<EnvConfig[]>([]);
+    const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+    const [uploadEnvId, setUploadEnvId] = useState('');
     const [kubeContent, setKubeContent] = useState('');
     const [envSaving, setEnvSaving] = useState(false);
 
+    // Only configured environments shown in the table
+    const configuredEnvs = useMemo(() => allEnvConfigs.filter(c => c.hasKubeconfig), [allEnvConfigs]);
+
     const loadEnvConfigs = useCallback(async () => {
         try {
-            const result = await sendRpc<{ configs: typeof envConfigs }>('userEnvConfig.list');
-            setEnvConfigs(result.configs ?? []);
+            const result = await sendRpc<{ configs: EnvConfig[] }>('userEnvConfig.list');
+            setAllEnvConfigs(result.configs ?? []);
         } catch (err) {
             console.error('Failed to load env configs:', err);
         }
@@ -93,12 +100,19 @@ export function CredentialsPage() {
         }
     };
 
+    const openUploadDialog = (envId?: string) => {
+        setUploadEnvId(envId ?? '');
+        setKubeContent('');
+        setUploadDialogOpen(true);
+    };
+
     const handleEnvUpload = async () => {
         if (!uploadEnvId || !kubeContent.trim()) return;
         setEnvSaving(true);
         try {
             await sendRpc('userEnvConfig.set', { envId: uploadEnvId, kubeconfig: kubeContent });
-            setUploadEnvId(null);
+            setUploadDialogOpen(false);
+            setUploadEnvId('');
             setKubeContent('');
             await loadEnvConfigs();
         } catch (err: any) {
@@ -118,6 +132,8 @@ export function CredentialsPage() {
         }
     };
 
+    const selectedEnvForUpload = allEnvConfigs.find(e => e.envId === uploadEnvId);
+
     return (
         <div className="h-full bg-white flex flex-col">
             <header className="h-16 flex items-center justify-between px-6 bg-white sticky top-0 z-10 border-b border-gray-100">
@@ -127,22 +143,33 @@ export function CredentialsPage() {
                     </div>
                     <div>
                         <h1 className="text-lg font-bold text-gray-900">Credentials</h1>
-                        <p className="text-xs text-gray-500">Manage your SSH and API credentials</p>
+                        <p className="text-xs text-gray-500">Manage SSH, API credentials and K8s kubeconfigs</p>
                     </div>
                 </div>
-                <button
-                    onClick={openCreate}
-                    className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
-                >
-                    <Plus className="w-4 h-4" />
-                    New Credential
-                </button>
+                <div className="flex items-center gap-2">
+                    {allEnvConfigs.length > 0 && (
+                        <button
+                            onClick={() => openUploadDialog()}
+                            className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-indigo-700 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition-colors"
+                        >
+                            <Upload className="w-4 h-4" />
+                            Upload Kubeconfig
+                        </button>
+                    )}
+                    <button
+                        onClick={openCreate}
+                        className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
+                    >
+                        <Plus className="w-4 h-4" />
+                        New Credential
+                    </button>
+                </div>
             </header>
 
             <div className="flex-1 overflow-y-auto p-8">
                 <div className="max-w-5xl mx-auto">
-                    {/* K8s Environments — kubeconfig management */}
-                    {envConfigs.length > 0 && (
+                    {/* K8s Environments — only configured ones */}
+                    {configuredEnvs.length > 0 && (
                         <div className="mb-8">
                             <h2 className="text-sm font-semibold text-gray-900 mb-3">K8s Environments</h2>
                             <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
@@ -152,12 +179,11 @@ export function CredentialsPage() {
                                             <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Environment</th>
                                             <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Type</th>
                                             <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">API Server</th>
-                                            <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Status</th>
                                             <th className="text-center px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {envConfigs.map(env => (
+                                        {configuredEnvs.map(env => (
                                             <tr key={env.envId} className="border-b border-gray-50 last:border-0">
                                                 <td className="px-6 py-4">
                                                     <span className="text-sm font-medium text-gray-900">{env.envName}</span>
@@ -173,29 +199,20 @@ export function CredentialsPage() {
                                                 <td className="px-6 py-4">
                                                     <span className="text-sm text-gray-500 font-mono text-xs">{env.apiServer}</span>
                                                 </td>
-                                                <td className="px-6 py-4">
-                                                    {env.hasKubeconfig ? (
-                                                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700">Configured</span>
-                                                    ) : (
-                                                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500">Not configured</span>
-                                                    )}
-                                                </td>
                                                 <td className="px-6 py-4 text-center">
                                                     <div className="inline-flex items-center gap-1">
                                                         <button
-                                                            onClick={() => { setUploadEnvId(env.envId); setKubeContent(''); }}
+                                                            onClick={() => openUploadDialog(env.envId)}
                                                             className="px-2 py-1 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded transition-colors"
                                                         >
-                                                            {env.hasKubeconfig ? 'Replace' : 'Upload'}
+                                                            Replace
                                                         </button>
-                                                        {env.hasKubeconfig && (
-                                                            <button
-                                                                onClick={() => handleEnvRemove(env.envId)}
-                                                                className="px-2 py-1 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded transition-colors"
-                                                            >
-                                                                Remove
-                                                            </button>
-                                                        )}
+                                                        <button
+                                                            onClick={() => handleEnvRemove(env.envId)}
+                                                            className="px-2 py-1 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded transition-colors"
+                                                        >
+                                                            Remove
+                                                        </button>
                                                     </div>
                                                 </td>
                                             </tr>
@@ -206,15 +223,36 @@ export function CredentialsPage() {
                         </div>
                     )}
 
-                    {/* Kubeconfig upload dialog */}
-                    {uploadEnvId && (
-                        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => setUploadEnvId(null)}>
+                    {/* Kubeconfig upload dialog — with environment selector */}
+                    {uploadDialogOpen && (
+                        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => setUploadDialogOpen(false)}>
                             <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6" onClick={e => e.stopPropagation()}>
-                                <h3 className="text-lg font-semibold text-gray-900 mb-1">Upload Kubeconfig</h3>
-                                <p className="text-sm text-gray-500 mb-4">
-                                    Environment: {envConfigs.find(e => e.envId === uploadEnvId)?.envName}{' '}
-                                    ({envConfigs.find(e => e.envId === uploadEnvId)?.apiServer})
-                                </p>
+                                <h3 className="text-lg font-semibold text-gray-900 mb-4">Upload Kubeconfig</h3>
+
+                                {/* Environment selector */}
+                                <div className="mb-4">
+                                    <label className="block text-sm font-medium text-gray-700 mb-1">Environment</label>
+                                    <select
+                                        value={uploadEnvId}
+                                        onChange={e => setUploadEnvId(e.target.value)}
+                                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-white"
+                                    >
+                                        <option value="">Select an environment...</option>
+                                        {allEnvConfigs.map(env => (
+                                            <option key={env.envId} value={env.envId}>
+                                                {env.envName} ({env.apiServer}) {env.hasKubeconfig ? '— replace' : ''}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                {selectedEnvForUpload && (
+                                    <p className="text-xs text-gray-400 mb-3">
+                                        API Server: <span className="font-mono">{selectedEnvForUpload.apiServer}</span>
+                                        {selectedEnvForUpload.hasKubeconfig && ' — existing kubeconfig will be replaced'}
+                                    </p>
+                                )}
+
                                 <textarea
                                     value={kubeContent}
                                     onChange={e => setKubeContent(e.target.value)}
@@ -223,10 +261,10 @@ export function CredentialsPage() {
                                     className="w-full px-3 py-2 border border-gray-200 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none mb-4"
                                 />
                                 <div className="flex justify-end gap-3">
-                                    <button onClick={() => setUploadEnvId(null)} className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg">Cancel</button>
+                                    <button onClick={() => setUploadDialogOpen(false)} className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg">Cancel</button>
                                     <button
                                         onClick={handleEnvUpload}
-                                        disabled={!kubeContent.trim() || envSaving}
+                                        disabled={!uploadEnvId || !kubeContent.trim() || envSaving}
                                         className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg disabled:opacity-50"
                                     >
                                         {envSaving ? 'Uploading...' : 'Upload'}

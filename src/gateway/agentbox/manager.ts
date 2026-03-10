@@ -137,7 +137,7 @@ export class AgentBoxManager {
     // 1. Check if pod already exists and is running
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint) {
-      return { boxId: name, userId, endpoint: info.endpoint };
+      return { boxId: name, userId, endpoint: info.endpoint, workspaceId };
     }
 
     // 2. Pod doesn't exist or not running → create
@@ -152,6 +152,7 @@ export class AgentBoxManager {
     });
 
     // 3. Return handle with Pod IP endpoint (from spawner.spawn → waitForPodReady)
+    handle.workspaceId = workspaceId;
     return handle;
   }
 
@@ -227,7 +228,7 @@ export class AgentBoxManager {
       const name = this.podName(userId, workspaceId);
       const info = await this.spawner.get(name);
       if (info && info.status === "running" && info.endpoint) {
-        return { boxId: name, userId, endpoint: info.endpoint };
+        return { boxId: name, userId, endpoint: info.endpoint, workspaceId };
       }
       return undefined;
     }
@@ -304,6 +305,10 @@ export class AgentBoxManager {
     const handles: AgentBoxHandle[] = [];
     for (const [key, managed] of this.boxes) {
       if (key.startsWith(userId + ":")) {
+        // Ensure workspaceId is populated from cache key
+        if (!managed.handle.workspaceId) {
+          managed.handle.workspaceId = key.slice(userId.length + 1);
+        }
         handles.push(managed.handle);
       }
     }
