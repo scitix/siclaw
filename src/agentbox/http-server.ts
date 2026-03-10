@@ -122,22 +122,32 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   // ── Credential materialization helper (shared by prompt and reload-credentials) ──
+  // Uses atomic write-to-temp-then-rename to avoid partial state if interrupted.
   function materializeCredentials(
     payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
     kubeconfigRef: { credentialsDir?: string },
   ): number {
     const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-    fs.mkdirSync(credDir, { recursive: true });
-    // Clear existing files
-    for (const entry of fs.readdirSync(credDir)) {
-      fs.rmSync(path.join(credDir, entry), { recursive: true });
-    }
-    // Write credential files
+    const tmpDir = `${credDir}.tmp.${Date.now()}`;
+
+    // Write to temp directory first
+    fs.mkdirSync(tmpDir, { recursive: true });
     for (const file of payload.files) {
-      fs.writeFileSync(path.join(credDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
+      fs.writeFileSync(path.join(tmpDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
     }
-    // Write manifest
-    fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
+    fs.writeFileSync(path.join(tmpDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
+
+    // Atomic swap: remove old dir, rename temp → final
+    const oldDir = `${credDir}.old.${Date.now()}`;
+    if (fs.existsSync(credDir)) {
+      fs.renameSync(credDir, oldDir);
+    }
+    fs.renameSync(tmpDir, credDir);
+    // Clean up old dir
+    if (fs.existsSync(oldDir)) {
+      fs.rmSync(oldDir, { recursive: true, force: true });
+    }
+
     kubeconfigRef.credentialsDir = credDir;
     return payload.files.length;
   }
@@ -670,7 +680,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       return;
     }
 
-    // Find any active session's kubeconfigRef to update
+    // Each AgentBox pod serves exactly one user (one-pod-per-workspace in K8s mode,
+    // one in-process instance per user in local mode). All sessions within this
+    // AgentBox belong to the same user, so updating any session's kubeconfigRef is correct.
     const sessions = sessionManager.list();
     const kubeconfigRef = sessions.length > 0
       ? sessions[0].kubeconfigRef

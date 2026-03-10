@@ -379,7 +379,7 @@ user.testOnly === true       → can only create workspaces with envType="test"
 
 ### 12.5 Investigation Memory Isolation
 
-Each workspace has its own memory database (`<userDataDir>/<workspaceId>/.memory.db`). Investigations do not cross workspace boundaries.
+**Planned (not yet implemented):** Each workspace will have its own memory database (`<userDataDir>/<workspaceId>/.memory.db`). Investigations will not cross workspace boundaries.
 
 ### 12.6 What NOT to Do
 

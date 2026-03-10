@@ -55,9 +55,28 @@ function requireAuth(context: RpcContext): string {
 
 function requireAdmin(context: RpcContext): string {
   const userId = requireAuth(context);
-  if (context.auth?.username !== "admin")
+  if (!isAdminUser(context))
     throw new Error("Forbidden: admin access required");
   return userId;
+}
+
+function isAdminUser(context: RpcContext): boolean {
+  return context.auth?.username === "admin";
+}
+
+/**
+ * Compare two Kubernetes API server URLs by hostname (and port if present).
+ * Prevents substring bypass (e.g. "evil-https://real-server:6443" matching "real-server:6443").
+ */
+function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boolean {
+  try {
+    const a = new URL(kubeconfigServer);
+    const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
+    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
+  } catch {
+    // Fallback: exact string match if URLs are malformed
+    return kubeconfigServer === envApiServer;
+  }
 }
 
 
@@ -3226,7 +3245,7 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     if (!envRepo) return { environments: [], isAdmin: false };
 
-    const isAdmin = context.auth?.username === "admin";
+    const isAdmin = isAdminUser(context);
 
     // Check testOnly
     let isTestOnly = false;
@@ -3251,8 +3270,6 @@ export function createRpcMethods(
         apiServer: e.apiServer,
         allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
         hasDefaultKubeconfig: !!e.defaultKubeconfig,
-        // Only expose defaultKubeconfig content to admins (never to non-admin)
-        ...(isAdmin ? {} : {}),
         hasUserKubeconfig: configMap.has(e.id),
         userConfigUpdatedAt: configMap.get(e.id)?.updatedAt?.toISOString?.() ?? configMap.get(e.id)?.updatedAt ?? null,
         createdBy: e.createdBy,
@@ -3334,7 +3351,7 @@ export function createRpcMethods(
           const parsed = yaml.load(cfg.kubeconfig) as Record<string, unknown>;
           const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
           const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
-          const matches = servers.some((s) => s.includes(apiServer) || apiServer.includes(s));
+          const matches = servers.some((s) => apiServerHostMatch(s, apiServer));
           if (!matches) {
             await userEnvConfigRepo.remove(cfg.userId, id);
             affectedUserIds.add(cfg.userId);
@@ -3451,7 +3468,7 @@ export function createRpcMethods(
     // Validate apiServer appears in kubeconfig clusters
     const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
     const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
-    if (!servers.some((s) => s.includes(env.apiServer) || env.apiServer.includes(s))) {
+    if (!servers.some((s) => apiServerHostMatch(s, env.apiServer))) {
       throw new Error(`Kubeconfig does not contain a cluster matching apiServer "${env.apiServer}"`);
     }
 
@@ -3687,6 +3704,9 @@ export function createRpcMethods(
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
     // Validate: if workspace is test, all bound environments must be test
+    if (envIds.length > 0 && !envRepo) {
+      throw new Error("Environment database not available");
+    }
     if (envIds.length > 0 && envRepo) {
       const envs = await envRepo.listByIds(envIds);
       if (envs.length !== envIds.length) {

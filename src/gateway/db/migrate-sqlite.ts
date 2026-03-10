@@ -396,11 +396,22 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
     `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
   ];
+  // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
+  const BACKFILLS = [
+    `UPDATE environments SET api_server = TRIM(SUBSTR(allowed_servers, 1, CASE WHEN INSTR(allowed_servers, ',') > 0 THEN INSTR(allowed_servers, ',') - 1 ELSE LENGTH(allowed_servers) END)) WHERE api_server = '' AND allowed_servers != ''`,
+  ];
   for (const stmt of MIGRATIONS) {
     try {
       sdb.run(sql.raw(stmt));
     } catch (_err: any) {
       // Ignore "duplicate column name" errors (column already exists)
+    }
+  }
+  for (const stmt of BACKFILLS) {
+    try {
+      sdb.run(sql.raw(stmt));
+    } catch (_err: any) {
+      // Backfill may fail on empty tables — safe to ignore
     }
   }
 
