@@ -3521,6 +3521,9 @@ export function createRpcMethods(
 
     // Determine envType — testOnly users forced to "test"
     let envType = (params.envType as string) ?? "prod";
+    if (envType !== "prod" && envType !== "test") {
+      throw new Error("envType must be 'prod' or 'test'");
+    }
     if (userRepo) {
       const dbUser = await userRepo.getById(userId);
       if (dbUser?.testOnly) envType = "test";
@@ -3550,10 +3553,14 @@ export function createRpcMethods(
     if (params.name !== undefined) updates.name = params.name as string;
     if (params.config !== undefined) updates.configJson = params.config as typeof ws.configJson;
     if (params.envType !== undefined) {
+      const envType = params.envType as string;
+      if (envType !== "prod" && envType !== "test") {
+        throw new Error("envType must be 'prod' or 'test'");
+      }
       // testOnly users cannot set envType to "prod"
       if (userRepo) {
         const dbUser = await userRepo.getById(userId);
-        if (dbUser?.testOnly && params.envType === "prod") {
+        if (dbUser?.testOnly && envType === "prod") {
           throw new Error("Test-only users cannot create production workspaces");
         }
       }
@@ -3700,6 +3707,9 @@ export function createRpcMethods(
 
     await workspaceRepo.setCredentials(workspaceId, credentialIds);
 
+    // Push updated credentials to running AgentBox for this workspace
+    pushCredentialsToUser(userId);
+
     return { status: "updated" };
   });
 
@@ -3742,6 +3752,10 @@ export function createRpcMethods(
     }
 
     await workspaceRepo.setEnvironments(workspaceId, envIds);
+
+    // Push updated credentials to running AgentBox for this workspace
+    pushCredentialsToUser(userId);
+
     return { status: "updated" };
   });
 
