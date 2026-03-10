@@ -2,7 +2,7 @@
  * System Config Repository — key/value config stored in DB.
  *
  * Used for SSO, system URLs, CA certs, etc.
- * Keys follow dotted notation: "sso.issuer", "system.baseUrl", etc.
+ * Keys follow dotted notation: "sso.issuer", "system.agentboxImage", etc.
  */
 
 import { eq, like } from "drizzle-orm";

@@ -55,13 +55,6 @@ export class AgentBoxManager {
     console.log(`[agentbox-manager] Initialized with spawner: ${spawner.name}${this.isK8s ? " (stateless, K8s API discovery)" : " (in-memory cache)"}`);
   }
 
-  /** Update the spawner's AgentBox image at runtime (takes effect on next spawn) */
-  setSpawnerImage(image: string): void {
-    if ('setImage' in this.spawner) {
-      (this.spawner as any).setImage(image);
-    }
-  }
-
   /** Inject CertificateManager into spawner (for mTLS, K8s spawner only) */
   setCertManager(cm: unknown): void {
     if ('setCertManager' in this.spawner) {
