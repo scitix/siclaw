@@ -1149,9 +1149,13 @@ export function usePilot() {
     }, [isConnected, sendRpc]);
     restoreDpProgressRef.current = restoreDpProgress;
 
-    // When workspace changes: clear messages, reload sessions for new workspace
+    // When workspace changes: clear messages, reload sessions for new workspace,
+    // and auto-select the most recent session if one exists.
     useEffect(() => {
         if (prevWorkspaceIdRef.current !== workspaceId && prevWorkspaceIdRef.current !== undefined) {
+            // Invalidate any in-flight loadHistory requests from the previous workspace
+            // to prevent stale responses from overwriting the cleared UI state.
+            ++loadHistoryRequestIdRef.current;
             setCurrentSessionKey(null);
             setMessages([]);
             setContextUsage(null);
@@ -1160,7 +1164,21 @@ export function usePilot() {
             clearDpTimers();
             resetDpState();
             if (isConnected) {
-                loadSessions();
+                (async () => {
+                    try {
+                        const params: Record<string, unknown> = {};
+                        if (workspaceId) params.workspaceId = workspaceId;
+                        const result = await sendRpc<{ sessions: Session[] }>('session.list', params);
+                        const newSessions = result.sessions ?? [];
+                        setSessions(newSessions);
+                        // Auto-load most recent session (first in list, sorted by recency)
+                        if (newSessions.length > 0) {
+                            loadHistory(newSessions[0].key);
+                        }
+                    } catch (err) {
+                        console.error('Failed to load sessions:', err);
+                    }
+                })();
             }
         }
         prevWorkspaceIdRef.current = workspaceId;

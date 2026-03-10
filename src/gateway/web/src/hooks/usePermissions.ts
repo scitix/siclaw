@@ -4,6 +4,7 @@ interface PermissionState {
     isAdmin: boolean;
     permissions: string[];
     isReviewer: boolean;
+    testOnly: boolean;
     loaded: boolean;
 }
 
@@ -15,13 +16,14 @@ export function usePermissions(
         isAdmin: false,
         permissions: [],
         isReviewer: false,
+        testOnly: false,
         loaded: false,
     });
 
     useEffect(() => {
         if (!isConnected) return;
 
-        sendRpc<{ isAdmin: boolean; permissions: string[] }>('permission.mine')
+        sendRpc<{ isAdmin: boolean; permissions: string[]; testOnly?: boolean }>('permission.mine')
             .then((result) => {
                 const isAdmin = result.isAdmin;
                 const permissions = result.permissions;
@@ -29,6 +31,7 @@ export function usePermissions(
                     isAdmin,
                     permissions,
                     isReviewer: isAdmin || permissions.includes('skill_reviewer'),
+                    testOnly: result.testOnly ?? false,
                     loaded: true,
                 });
             })

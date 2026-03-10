@@ -121,6 +121,37 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     });
   }
 
+  // ── Credential materialization helper (shared by prompt and reload-credentials) ──
+  // Writes to credDir atomically: clear existing files, write new ones.
+  // Uses a staging approach within the same directory to avoid permission issues
+  // in the container (parent dir /app/.siclaw/ has restricted permissions).
+  function materializeCredentials(
+    payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
+    kubeconfigRef: { credentialsDir?: string },
+  ): number {
+    const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
+    fs.mkdirSync(credDir, { recursive: true });
+
+    // Clear existing files
+    for (const entry of fs.readdirSync(credDir)) {
+      fs.rmSync(path.join(credDir, entry), { recursive: true });
+    }
+
+    // Write credential files with path traversal validation
+    for (const file of payload.files) {
+      const resolved = path.resolve(credDir, file.name);
+      if (!resolved.startsWith(credDir + path.sep) && resolved !== credDir) {
+        throw new Error(`Invalid credential file name: ${file.name}`);
+      }
+      fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
+    }
+
+    // Write manifest
+    fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
+    kubeconfigRef.credentialsDir = credDir;
+    return payload.files.length;
+  }
+
   // ==================== Routes ====================
 
   /**
@@ -184,20 +215,8 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     // Materialize credential files from payload (sent by gateway in prompt body)
     if (body.credentials?.files?.length) {
-      const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-      fs.mkdirSync(credDir, { recursive: true });
-      // Clear existing files
-      for (const entry of fs.readdirSync(credDir)) {
-        fs.rmSync(path.join(credDir, entry), { recursive: true });
-      }
-      // Write credential files
-      for (const file of body.credentials.files) {
-        fs.writeFileSync(path.join(credDir, file.name), file.content, file.mode ? { mode: file.mode } : undefined);
-      }
-      // Write manifest
-      fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(body.credentials.manifest, null, 2));
-      managed.kubeconfigRef.credentialsDir = credDir;
-      console.log(`[agentbox-http] Materialized ${body.credentials.files.length} credential files to ${credDir}`);
+      const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
+      console.log(`[agentbox-http] Materialized ${count} credential files`);
     }
 
     // Dynamically register provider config from gateway DB (before findModel)
@@ -641,6 +660,51 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     });
   }
+
+  /**
+   * POST /api/reload-credentials — push-based credential update from Gateway
+   *
+   * Accepts the same {manifest, files} payload as the prompt body's credentials
+   * field and re-materializes credential files on disk. This allows the Gateway
+   * to push credential changes (kubeconfig upload/delete, credential CRUD)
+   * without waiting for the next prompt.
+   */
+  addRoute("POST", "/api/reload-credentials", async (req, res) => {
+    const body = (await parseJsonBody(req)) as {
+      manifest?: Array<Record<string, unknown>>;
+      files?: Array<{ name: string; content: string; mode?: number }>;
+    };
+
+    if (!body.manifest) {
+      sendJson(res, 400, { error: "Missing 'manifest' field" });
+      return;
+    }
+
+    // Each AgentBox pod serves exactly one user (one-pod-per-workspace in K8s mode,
+    // one in-process instance per user in local mode). All sessions within this
+    // AgentBox belong to the same user, so updating any session's kubeconfigRef is correct.
+    const sessions = sessionManager.list();
+    const kubeconfigRef = sessions.length > 0
+      ? sessions[0].kubeconfigRef
+      : { credentialsDir: undefined as string | undefined };
+
+    const payload = { manifest: body.manifest, files: body.files ?? [] };
+
+    // Use atomic materializeCredentials for both populate and clear paths
+    const count = materializeCredentials(payload, kubeconfigRef);
+    if (count > 0) {
+      console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
+    } else {
+      console.log("[agentbox-http] Credentials cleared (empty payload)");
+    }
+
+    // Update kubeconfigRef on all active sessions
+    for (const session of sessions) {
+      session.kubeconfigRef.credentialsDir = kubeconfigRef.credentialsDir;
+    }
+
+    sendJson(res, 200, { ok: true, count: payload.files.length });
+  });
 
   /**
    * GET /api/models - list available models (read from settings.json)

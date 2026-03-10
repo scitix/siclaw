@@ -3,7 +3,7 @@
  */
 
 import crypto from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { environments } from "../schema.js";
 
@@ -16,6 +16,7 @@ export class EnvironmentRepository {
         id: environments.id,
         name: environments.name,
         isTest: environments.isTest,
+        apiServer: environments.apiServer,
         allowedServers: environments.allowedServers,
         defaultKubeconfig: environments.defaultKubeconfig,
         createdBy: environments.createdBy,
@@ -34,13 +35,25 @@ export class EnvironmentRepository {
     return rows[0] ?? null;
   }
 
+  async listByIds(ids: string[]) {
+    if (ids.length === 0) return [];
+    return this.db
+      .select()
+      .from(environments)
+      .where(inArray(environments.id, ids));
+  }
+
   async save(
-    env: { id?: string; name: string; isTest?: boolean; allowedServers?: string | null; defaultKubeconfig?: string | null },
+    env: { id?: string; name: string; isTest?: boolean; apiServer: string; allowedServers?: string | null; defaultKubeconfig?: string | null },
     createdBy?: string,
   ): Promise<string> {
+    if (!env.apiServer || typeof env.apiServer !== "string" || !env.apiServer.trim()) {
+      throw new Error("apiServer is required and must be a non-empty string");
+    }
+
     if (env.id) {
       // Update existing
-      const updates: Record<string, unknown> = { name: env.name };
+      const updates: Record<string, unknown> = { name: env.name, apiServer: env.apiServer };
       if (env.isTest !== undefined) updates.isTest = env.isTest;
       if (env.allowedServers !== undefined) updates.allowedServers = env.allowedServers;
       if (env.defaultKubeconfig !== undefined) updates.defaultKubeconfig = env.defaultKubeconfig;
@@ -57,6 +70,7 @@ export class EnvironmentRepository {
       id,
       name: env.name,
       isTest: env.isTest ?? false,
+      apiServer: env.apiServer,
       allowedServers: env.allowedServers ?? null,
       defaultKubeconfig: env.defaultKubeconfig ?? null,
       createdBy: createdBy ?? null,

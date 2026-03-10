@@ -131,6 +131,7 @@ const DDL_STATEMENTS = [
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     is_test INTEGER NOT NULL DEFAULT 0,
+    api_server TEXT NOT NULL DEFAULT '',
     created_by TEXT,
     allowed_servers TEXT,
     default_kubeconfig TEXT,
@@ -249,6 +250,7 @@ const DDL_STATEMENTS = [
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     is_default INTEGER NOT NULL DEFAULT 0,
+    env_type TEXT NOT NULL DEFAULT 'prod',
     config_json TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -387,6 +389,31 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)
      VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
   ));
+
+  // Schema migrations — handle existing databases missing new columns
+  const MIGRATIONS = [
+    // ADR-011: environment isolation
+    `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
+    `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
+  ];
+  // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
+  const BACKFILLS = [
+    `UPDATE environments SET api_server = TRIM(SUBSTR(allowed_servers, 1, CASE WHEN INSTR(allowed_servers, ',') > 0 THEN INSTR(allowed_servers, ',') - 1 ELSE LENGTH(allowed_servers) END)) WHERE api_server = '' AND allowed_servers != ''`,
+  ];
+  for (const stmt of MIGRATIONS) {
+    try {
+      sdb.run(sql.raw(stmt));
+    } catch (_err: any) {
+      // Ignore "duplicate column name" errors (column already exists)
+    }
+  }
+  for (const stmt of BACKFILLS) {
+    try {
+      sdb.run(sql.raw(stmt));
+    } catch (_err: any) {
+      // Backfill may fail on empty tables — safe to ignore
+    }
+  }
 
   // Persist schema changes to disk immediately (sql.js is in-memory)
   flushSqliteDb();

@@ -21,14 +21,16 @@ export interface AgentBoxConfig {
     cpu?: string;
     memory?: string;
   };
-  /** Pod environment type — determines which skills are available via bundle API */
-  podEnv?: "prod" | "dev";
+  /** Pod environment type — encoded in mTLS cert, determines credential/skill scoping */
+  podEnv?: "prod" | "dev" | "test";
 }
 
 /** AgentBox information */
 export interface AgentBoxInfo {
   boxId: string;
   userId: string;
+  /** Workspace ID this box serves (from K8s label or cache key) */
+  workspaceId?: string;
   status: AgentBoxStatus;
   endpoint: string;
   createdAt: Date;
@@ -40,4 +42,6 @@ export interface AgentBoxHandle {
   boxId: string;
   userId: string;
   endpoint: string;
+  /** Workspace ID this box serves (used for credential push) */
+  workspaceId?: string;
 }

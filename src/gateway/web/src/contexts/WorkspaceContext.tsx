@@ -7,6 +7,7 @@ export interface Workspace {
     userId: string;
     name: string;
     isDefault: boolean;
+    envType?: string;
     configJson: {
         defaultModel?: { provider: string; modelId: string };
         systemPrompt?: string;

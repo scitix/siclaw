@@ -26,6 +26,8 @@ import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { CredentialRepository } from "./db/repositories/credential-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
+import { EnvironmentRepository } from "./db/repositories/env-repo.js";
+import { UserEnvConfigRepository } from "./db/repositories/user-env-config-repo.js";
 import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
@@ -53,9 +55,28 @@ function requireAuth(context: RpcContext): string {
 
 function requireAdmin(context: RpcContext): string {
   const userId = requireAuth(context);
-  if (context.auth?.username !== "admin")
+  if (!isAdminUser(context))
     throw new Error("Forbidden: admin access required");
   return userId;
+}
+
+function isAdminUser(context: RpcContext): boolean {
+  return context.auth?.username === "admin";
+}
+
+/**
+ * Compare two Kubernetes API server URLs by hostname (and port if present).
+ * Prevents substring bypass (e.g. "evil-https://real-server:6443" matching "real-server:6443").
+ */
+function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boolean {
+  try {
+    const a = new URL(kubeconfigServer);
+    const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
+    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
+  } catch {
+    // If URL parsing fails, reject the match — don't fall back to loose comparison
+    return false;
+  }
 }
 
 
@@ -71,7 +92,7 @@ export function createRpcMethods(
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
-  getSkillBundle: (userId: string, env: "prod" | "dev") => Promise<SkillBundle>;
+  getSkillBundle: (userId: string, env: "prod" | "dev" | "test") => Promise<SkillBundle>;
   /** Abort all SSE streams associated with a specific WebSocket connection */
   cleanupForWs: (ws: WebSocket) => void;
 } {
@@ -93,13 +114,15 @@ export function createRpcMethods(
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
   const mcpRepo = db ? new McpServerRepository(db) : null;
   const skillContentRepo = db ? new SkillContentRepository(db) : null;
+  const envRepo = db ? new EnvironmentRepository(db) : null;
+  const userEnvConfigRepo = db ? new UserEnvConfigRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
-  /** Resolve workspaceId for a session from DB, falling back to "default" */
-  async function resolveSessionWorkspace(sessionId: string): Promise<string> {
-    if (!chatRepo) return "default";
+  /** Resolve workspaceId for a session from DB */
+  async function resolveSessionWorkspace(sessionId: string): Promise<string | undefined> {
+    if (!chatRepo) return undefined;
     const session = await chatRepo.getSession(sessionId);
-    return session?.workspaceId ?? "default";
+    return session?.workspaceId ?? undefined;
   }
 
   /** Find an AgentBox handle for a user, trying session workspace first, then any active box */
@@ -150,6 +173,60 @@ export function createRpcMethods(
       console.warn(`[resource-notify] All skill reload failed:`, err.message);
     });
   }
+
+  /**
+   * Push updated credentials to all active AgentBoxes for a user (fire-and-forget).
+   * Builds the credential payload per workspace and POSTs to each box's /api/reload-credentials.
+   */
+  function pushCredentialsToUser(userId: string): void {
+    if (!workspaceRepo) return;
+
+    // Async fire-and-forget
+    (async () => {
+      // Local mode: handles carry workspaceId from cache key
+      let handles = agentBoxManager.getForUser(userId);
+      if (handles.length === 0) {
+        // K8s mode: find running pods via list(), workspace label provides workspaceId
+        const allBoxes = await agentBoxManager.list();
+        const userBoxes = allBoxes.filter((b) => b.userId === userId && b.status === "running" && b.endpoint);
+        if (userBoxes.length === 0) return;
+
+        for (const box of userBoxes) {
+          handles.push({
+            boxId: box.boxId,
+            userId: box.userId,
+            endpoint: box.endpoint,
+            workspaceId: box.workspaceId,
+          });
+        }
+      }
+      if (handles.length === 0) return;
+
+      for (const handle of handles) {
+        try {
+          // Resolve workspace for this box
+          const wsId = handle.workspaceId;
+          const ws = wsId
+            ? (await workspaceRepo!.getById(wsId)) ?? (await workspaceRepo!.getOrCreateDefault(userId))
+            : await workspaceRepo!.getOrCreateDefault(userId);
+          if (!ws) continue;
+
+          const payload = await buildCredentialPayload(userId, ws.id, ws.isDefault);
+          const client = new AgentBoxClient(handle.endpoint, 15000, agentBoxTlsOptions);
+          await client.reloadCredentials(payload);
+          console.log(`[credential-push] Pushed credentials to box=${handle.boxId} ws=${ws.name} (${payload.files.length} files)`);
+        } catch (err) {
+          console.warn(
+            `[credential-push] Failed for box=${handle.boxId}:`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    })().catch((err) => {
+      console.warn(`[credential-push] Unexpected error for userId=${userId}:`, err instanceof Error ? err.message : err);
+    });
+  }
+
   // Initialize skills dir
   skillWriter.init()
     .then(async () => {
@@ -326,7 +403,8 @@ export function createRpcMethods(
         workspace = null;
       }
     }
-    const effectiveWorkspaceId = workspace?.id ?? "default";
+    if (!workspace) throw new Error("Failed to resolve workspace");
+    const effectiveWorkspaceId = workspace.id;
 
     // Ensure session exists in DB
     if (chatRepo) {
@@ -354,7 +432,7 @@ export function createRpcMethods(
       });
     }
 
-    if (!sessionId) sessionId = "default";
+    if (!sessionId) throw new Error("Failed to create session");
 
     // Forward model selection and brain type from frontend
     // Use workspace default model if user didn't specify one
@@ -395,9 +473,12 @@ export function createRpcMethods(
     }
 
     // Get or create AgentBox (per workspace)
+    // Encode workspace envType into cert so Gateway trusts the cert, not AgentBox's self-declaration
+    const podEnv = (workspace?.envType === "test" ? "test" : "prod") as "prod" | "dev" | "test";
     const handle = await agentBoxManager.getOrCreate(userId, effectiveWorkspaceId, {
       workspaceId: effectiveWorkspaceId,
       allowedTools,
+      podEnv,
     });
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
@@ -1164,39 +1245,28 @@ export function createRpcMethods(
 
   methods.set("session.list", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
+
     const workspaceId = params?.workspaceId as string | undefined;
-
-    if (chatRepo) {
-      const rows = await chatRepo.listSessions(userId, 20, workspaceId);
-      return {
-        sessions: rows.map((s) => ({
-          key: s.id,
-          title: s.title,
-          preview: s.preview,
-          createdAt: s.createdAt?.toISOString(),
-          lastActiveAt: s.lastActiveAt?.toISOString(),
-          messageCount: s.messageCount,
-        })),
-      };
-    }
-
-    // Fallback: get from AgentBox
-    const handle = await agentBoxManager.getAsync(userId, workspaceId ?? "default");
-    if (!handle) return { sessions: [] };
-
-    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-    return client.listSessions();
+    const rows = await chatRepo.listSessions(userId, 20, workspaceId);
+    return {
+      sessions: rows.map((s) => ({
+        key: s.id,
+        title: s.title,
+        preview: s.preview,
+        createdAt: s.createdAt?.toISOString(),
+        lastActiveAt: s.lastActiveAt?.toISOString(),
+        messageCount: s.messageCount,
+      })),
+    };
   });
 
   methods.set("session.create", async (_params, context: RpcContext) => {
     const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
 
-    if (chatRepo) {
-      const session = await chatRepo.createSession(userId);
-      return { sessionId: session.id, sessionKey: session.id };
-    }
-
-    return { sessionId: "default", sessionKey: "default" };
+    const session = await chatRepo.createSession(userId);
+    return { sessionId: session.id, sessionKey: session.id };
   });
 
   methods.set("session.delete", async (params, context: RpcContext) => {
@@ -1218,7 +1288,7 @@ export function createRpcMethods(
 
   methods.set("box.status", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    const workspaceId = (params?.workspaceId as string) ?? "default";
+    const workspaceId = params?.workspaceId as string | undefined;
 
     const handle = await agentBoxManager.getAsync(userId, workspaceId);
     if (!handle) return { boxStatus: "not_created" };
@@ -3113,6 +3183,9 @@ export function createRpcMethods(
     const configJson = params.configJson as Record<string, unknown>;
 
     if (!name) throw new Error("Missing required param: name");
+    if (type === "kubeconfig") {
+      throw new Error("Kubeconfig credentials are now managed via Environments. Use userEnvConfig.set instead.");
+    }
     if (!type || !(CREDENTIAL_TYPES as readonly string[]).includes(type)) {
       throw new Error(`Invalid credential type. Must be one of: ${CREDENTIAL_TYPES.join(", ")}`);
     }
@@ -3121,7 +3194,7 @@ export function createRpcMethods(
     validateCredentialConfig(type, configJson);
 
     const id = await credRepo.create({ userId, name, type, description, configJson });
-
+    pushCredentialsToUser(userId);
     return { id, name, type };
   });
 
@@ -3145,7 +3218,7 @@ export function createRpcMethods(
     }
 
     await credRepo.update(userId, id, updates);
-
+    pushCredentialsToUser(userId);
     return { status: "updated" };
   });
 
@@ -3160,8 +3233,260 @@ export function createRpcMethods(
     if (!existing) throw new Error("Credential not found");
 
     await credRepo.delete(userId, id);
+    pushCredentialsToUser(userId);
+    return { status: "deleted" };
+  });
+
+  // ─────────────────────────────────────────────────
+  // Environment Methods (admin-only)
+  // ─────────────────────────────────────────────────
+
+  methods.set("environment.list", async (_params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!envRepo) return { environments: [], isAdmin: false };
+
+    const isAdmin = isAdminUser(context);
+
+    // Check testOnly
+    let isTestOnly = false;
+    if (userRepo) {
+      const dbUser = await userRepo.getById(userId);
+      isTestOnly = dbUser?.testOnly ?? false;
+    }
+
+    const allEnvs = await envRepo.list();
+    const visibleEnvs = isTestOnly ? allEnvs.filter((e) => e.isTest) : allEnvs;
+
+    // Fetch user's kubeconfig status
+    const userConfigs = userEnvConfigRepo ? await userEnvConfigRepo.listForUser(userId) : [];
+    const configMap = new Map(userConfigs.map((c) => [c.envId, c]));
+
+    return {
+      isAdmin,
+      environments: visibleEnvs.map((e) => ({
+        id: e.id,
+        name: e.name,
+        isTest: e.isTest,
+        apiServer: e.apiServer,
+        allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
+        hasDefaultKubeconfig: !!e.defaultKubeconfig,
+        hasUserKubeconfig: configMap.has(e.id),
+        userConfigUpdatedAt: configMap.get(e.id)?.updatedAt?.toISOString?.() ?? configMap.get(e.id)?.updatedAt ?? null,
+        createdBy: e.createdBy,
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt,
+      })),
+    };
+  });
+
+  methods.set("environment.create", async (params, context: RpcContext) => {
+    const userId = requireAdmin(context);
+    if (!envRepo) throw new Error("Database not available");
+
+    const name = params.name as string;
+    const isTest = params.isTest as boolean | undefined;
+    const apiServer = params.apiServer as string;
+    const rawAllowedServers = params.allowedServers;
+    const allowedServers = Array.isArray(rawAllowedServers) ? rawAllowedServers.join(", ") : (rawAllowedServers as string | undefined);
+    const defaultKubeconfig = params.defaultKubeconfig as string | undefined;
+
+    if (!name) throw new Error("Missing required param: name");
+    if (!apiServer) throw new Error("Missing required param: apiServer");
+
+    // defaultKubeconfig only accepted for test environments
+    if (defaultKubeconfig && !isTest) {
+      throw new Error("defaultKubeconfig can only be set for test environments");
+    }
+
+    const id = await envRepo.save(
+      { name, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null },
+      userId,
+    );
+    return { id, name };
+  });
+
+  methods.set("environment.update", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!envRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    const existing = await envRepo.getById(id);
+    if (!existing) throw new Error("Environment not found");
+
+    const name = (params.name as string | undefined) ?? existing.name;
+    const apiServer = (params.apiServer as string | undefined) ?? existing.apiServer;
+    const isTest = params.isTest !== undefined ? params.isTest as boolean : existing.isTest;
+    const rawAllowed = params.allowedServers;
+    const allowedServers = rawAllowed !== undefined
+      ? (Array.isArray(rawAllowed) ? rawAllowed.join(", ") : rawAllowed as string | null)
+      : existing.allowedServers;
+    let defaultKubeconfig = params.defaultKubeconfig !== undefined ? params.defaultKubeconfig as string | null : existing.defaultKubeconfig;
+
+    if (!apiServer?.trim()) {
+      throw new Error("apiServer must be a non-empty string");
+    }
+
+    // If promoting from test to prod, auto-clear defaultKubeconfig
+    if (existing.isTest && !isTest) {
+      defaultKubeconfig = null;
+    }
+
+    // defaultKubeconfig only valid for test environments
+    if (defaultKubeconfig && !isTest) {
+      throw new Error("defaultKubeconfig can only be set for test environments");
+    }
+
+    const oldApiServer = existing.apiServer;
+    await envRepo.save({ id, name, isTest, apiServer, allowedServers, defaultKubeconfig });
+
+    // If apiServer changed, invalidate mismatched user kubeconfigs
+    if (userEnvConfigRepo && apiServer !== oldApiServer) {
+      const fullConfigs = await userEnvConfigRepo.listFullForEnv(id);
+      const affectedUserIds = new Set<string>();
+
+      for (const cfg of fullConfigs) {
+        try {
+          const parsed = yaml.load(cfg.kubeconfig) as Record<string, unknown>;
+          const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+          const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
+          const matches = servers.some((s) => apiServerHostMatch(s, apiServer));
+          if (!matches) {
+            await userEnvConfigRepo.remove(cfg.userId, id);
+            affectedUserIds.add(cfg.userId);
+          }
+        } catch {
+          // If kubeconfig can't be parsed, remove it as invalid
+          await userEnvConfigRepo.remove(cfg.userId, id);
+          affectedUserIds.add(cfg.userId);
+        }
+      }
+
+      // Push updated credentials to affected users
+      for (const uid of affectedUserIds) {
+        pushCredentialsToUser(uid);
+      }
+    }
+
+    return { status: "updated" };
+  });
+
+  methods.set("environment.delete", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!envRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    const existing = await envRepo.getById(id);
+    if (!existing) throw new Error("Environment not found");
+
+    // Collect affected users before cleanup
+    const affectedUserIds = new Set<string>();
+    if (userEnvConfigRepo) {
+      const envConfigs = await userEnvConfigRepo.listForEnv(id);
+      for (const c of envConfigs) affectedUserIds.add(c.userId);
+      await userEnvConfigRepo.removeAllForEnv(id);
+    }
+
+    await envRepo.delete(id);
+
+    // Push updated credentials to all affected users
+    for (const uid of affectedUserIds) {
+      pushCredentialsToUser(uid);
+    }
 
     return { status: "deleted" };
+  });
+
+  // ─────────────────────────────────────────────────
+  // User Environment Config Methods (kubeconfig upload)
+  // ─────────────────────────────────────────────────
+
+  methods.set("userEnvConfig.list", async (_params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!envRepo || !userEnvConfigRepo) return { configs: [] };
+
+    // Fetch all environments and user's configs
+    const allEnvs = await envRepo.list();
+    const userConfigs = await userEnvConfigRepo.listForUser(userId);
+
+    // Check if user is testOnly
+    let isTestOnly = false;
+    if (userRepo) {
+      const dbUser = await userRepo.getById(userId);
+      isTestOnly = dbUser?.testOnly ?? false;
+    }
+
+    // Filter out production environments for testOnly users
+    const visibleEnvs = isTestOnly ? allEnvs.filter((e) => e.isTest) : allEnvs;
+
+    const configMap = new Map(userConfigs.map((c) => [c.envId, c]));
+
+    return {
+      configs: visibleEnvs.map((env) => ({
+        envId: env.id,
+        envName: env.name,
+        isTest: env.isTest,
+        apiServer: env.apiServer,
+        hasKubeconfig: configMap.has(env.id),
+        updatedAt: configMap.get(env.id)?.updatedAt ?? null,
+      })),
+    };
+  });
+
+  methods.set("userEnvConfig.set", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!envRepo || !userEnvConfigRepo) throw new Error("Database not available");
+
+    const envId = params.envId as string;
+    const kubeconfig = params.kubeconfig as string;
+    if (!envId) throw new Error("Missing required param: envId");
+    if (!kubeconfig) throw new Error("Missing required param: kubeconfig");
+
+    // Fetch environment
+    const env = await envRepo.getById(envId);
+    if (!env) throw new Error("Environment not found");
+
+    // testOnly user check
+    if (userRepo) {
+      const dbUser = await userRepo.getById(userId);
+      if (dbUser?.testOnly && !env.isTest) {
+        throw new Error("Test-only users cannot configure production environments");
+      }
+    }
+
+    // Parse and validate kubeconfig YAML
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = yaml.load(kubeconfig) as Record<string, unknown>;
+    } catch {
+      throw new Error("Invalid kubeconfig: YAML parse error");
+    }
+
+    // Validate apiServer appears in kubeconfig clusters
+    const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+    const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
+    if (!servers.some((s) => apiServerHostMatch(s, env.apiServer))) {
+      throw new Error(`Kubeconfig does not contain a cluster matching apiServer "${env.apiServer}"`);
+    }
+
+    await userEnvConfigRepo.set(userId, envId, kubeconfig);
+    pushCredentialsToUser(userId);
+    return { status: "saved" };
+  });
+
+  methods.set("userEnvConfig.remove", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!userEnvConfigRepo) throw new Error("Database not available");
+
+    const envId = params.envId as string;
+    if (!envId) throw new Error("Missing required param: envId");
+
+    await userEnvConfigRepo.remove(userId, envId);
+    pushCredentialsToUser(userId);
+    return { status: "removed" };
   });
 
   // ─────────────────────────────────────────────────
@@ -3175,7 +3500,13 @@ export function createRpcMethods(
     let list = await workspaceRepo.list(userId);
     // Auto-create default workspace if none exists
     if (list.length === 0) {
-      await workspaceRepo.getOrCreateDefault(userId);
+      // testOnly users get a test-type default workspace
+      let defaultEnvType: string | undefined;
+      if (userRepo) {
+        const dbUser = await userRepo.getById(userId);
+        if (dbUser?.testOnly) defaultEnvType = "test";
+      }
+      await workspaceRepo.getOrCreateDefault(userId, defaultEnvType);
       list = await workspaceRepo.list(userId);
     }
     return { workspaces: list };
@@ -3188,8 +3519,18 @@ export function createRpcMethods(
     const name = params.name as string;
     if (!name) throw new Error("Missing required param: name");
 
+    // Determine envType — testOnly users forced to "test"
+    let envType = (params.envType as string) ?? "prod";
+    if (envType !== "prod" && envType !== "test") {
+      throw new Error("envType must be 'prod' or 'test'");
+    }
+    if (userRepo) {
+      const dbUser = await userRepo.getById(userId);
+      if (dbUser?.testOnly) envType = "test";
+    }
+
     const config = params.config as typeof import("./db/schema.js").workspaces.$inferSelect["configJson"] | undefined;
-    const ws = await workspaceRepo.create(userId, name, config);
+    const ws = await workspaceRepo.create(userId, name, config, envType);
 
     // Build workspace skills directory
     await syncWorkspaceSkills(userId, ws.id, ws.isDefault, [], []);
@@ -3208,9 +3549,34 @@ export function createRpcMethods(
     const ws = await workspaceRepo.getById(id);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    const updates: { name?: string; configJson?: typeof ws.configJson } = {};
+    const updates: { name?: string; configJson?: typeof ws.configJson; envType?: string } = {};
     if (params.name !== undefined) updates.name = params.name as string;
     if (params.config !== undefined) updates.configJson = params.config as typeof ws.configJson;
+    if (params.envType !== undefined) {
+      const envType = params.envType as string;
+      if (envType !== "prod" && envType !== "test") {
+        throw new Error("envType must be 'prod' or 'test'");
+      }
+      // testOnly users cannot set envType to "prod"
+      if (userRepo) {
+        const dbUser = await userRepo.getById(userId);
+        if (dbUser?.testOnly && envType === "prod") {
+          throw new Error("Test-only users cannot create production workspaces");
+        }
+      }
+      // If changing to "test", verify all bound environments are test
+      if (params.envType === "test" && envRepo && workspaceRepo) {
+        const boundEnvIds = await workspaceRepo.getEnvironments(id);
+        if (boundEnvIds.length > 0) {
+          const boundEnvs = await envRepo.listByIds(boundEnvIds);
+          const nonTest = boundEnvs.filter((e) => !e.isTest);
+          if (nonTest.length > 0) {
+            throw new Error(`Cannot change to test type: workspace has ${nonTest.length} non-test environment(s) bound. Unbind them first.`);
+          }
+        }
+      }
+      updates.envType = params.envType as string;
+    }
 
     await workspaceRepo.update(id, updates);
     return { status: "updated" };
@@ -3246,17 +3612,27 @@ export function createRpcMethods(
     const ws = await workspaceRepo.getById(id);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    const [wsSkills, wsTools, wsCreds] = await Promise.all([
+    const [wsSkills, wsTools, wsCreds, wsEnvIds] = await Promise.all([
       workspaceRepo.getSkills(id),
       workspaceRepo.getTools(id),
       workspaceRepo.getCredentials(id),
+      workspaceRepo.getEnvironments(id),
     ]);
+
+    // Fetch full environment details for bound environments
+    let envDetails: Array<{ id: string; name: string; isTest: boolean; apiServer: string }> = [];
+    if (envRepo && wsEnvIds.length > 0) {
+      const envs = await envRepo.listByIds(wsEnvIds);
+      envDetails = envs.map((e) => ({ id: e.id, name: e.name, isTest: e.isTest, apiServer: e.apiServer }));
+    }
 
     return {
       workspace: ws,
       skills: wsSkills,
       tools: wsTools,
       credentials: wsCreds,
+      environments: wsEnvIds,
+      environmentDetails: envDetails,
     };
   });
 
@@ -3331,6 +3707,55 @@ export function createRpcMethods(
 
     await workspaceRepo.setCredentials(workspaceId, credentialIds);
 
+    // Push updated credentials to running AgentBox for this workspace
+    pushCredentialsToUser(userId);
+
+    return { status: "updated" };
+  });
+
+  methods.set("workspace.setEnvironments", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!workspaceRepo) throw new Error("Database not available");
+
+    const workspaceId = params.workspaceId as string;
+    const envIds = params.envIds as string[];
+    if (!workspaceId || !Array.isArray(envIds)) throw new Error("Missing required params");
+
+    const ws = await workspaceRepo.getById(workspaceId);
+    if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
+
+    // Validate: if workspace is test, all bound environments must be test
+    if (envIds.length > 0 && !envRepo) {
+      throw new Error("Environment database not available");
+    }
+    if (envIds.length > 0 && envRepo) {
+      const envs = await envRepo.listByIds(envIds);
+      if (envs.length !== envIds.length) {
+        throw new Error("One or more environments not found");
+      }
+      if (ws.envType === "test") {
+        const nonTest = envs.filter((e) => !e.isTest);
+        if (nonTest.length > 0) {
+          throw new Error("Test workspaces can only bind test environments");
+        }
+      }
+      // testOnly user check
+      if (userRepo) {
+        const dbUser = await userRepo.getById(userId);
+        if (dbUser?.testOnly) {
+          const nonTest = envs.filter((e) => !e.isTest);
+          if (nonTest.length > 0) {
+            throw new Error("Test-only users cannot bind production environments");
+          }
+        }
+      }
+    }
+
+    await workspaceRepo.setEnvironments(workspaceId, envIds);
+
+    // Push updated credentials to running AgentBox for this workspace
+    pushCredentialsToUser(userId);
+
     return { status: "updated" };
   });
 
@@ -3373,8 +3798,12 @@ export function createRpcMethods(
 
   /**
    * Build credential payload for a workspace.
-   * Default workspace: returns ALL user credentials.
-   * Custom workspace: returns only linked credentials.
+   *
+   * Kubeconfigs: sourced from environment-bound userEnvConfigs (NOT credentials table).
+   * Other credentials: from credentials table, filtered by workspace envType.
+   *   - prod workspace: all workspace-linked credentials
+   *   - test workspace: NO non-kubeconfig credentials (SSH, API tokens hidden)
+   *
    * Returns data only — does NOT write to disk. Agentbox materializes files locally.
    */
   async function buildCredentialPayload(
@@ -3388,14 +3817,83 @@ export function createRpcMethods(
       fs.mkdirSync(agentDataDir, { recursive: true });
     }
 
-    if (!credRepo) return { manifest: [], files: [] };
+    const manifest: CredentialManifestEntry[] = [];
+    const files: CredentialFile[] = [];
 
-    // Determine which credentials to provision
+    // ── Step 1: Determine workspace envType ──
+    let envType = "prod";
+    if (workspaceRepo) {
+      const ws = await workspaceRepo.getById(workspaceId);
+      if (ws) envType = ws.envType ?? "prod";
+    }
+
+    // ── Step 2: Kubeconfigs from environments ──
+    if (envRepo && userEnvConfigRepo) {
+      // Default workspace: all environments; non-default: only workspace-bound
+      let envs: Awaited<ReturnType<typeof envRepo.list>>;
+      if (isDefault) {
+        envs = await envRepo.list();
+      } else if (workspaceRepo) {
+        const boundEnvIds = await workspaceRepo.getEnvironments(workspaceId);
+        envs = boundEnvIds.length > 0 ? await envRepo.listByIds(boundEnvIds) : [];
+      } else {
+        envs = [];
+      }
+      if (envs.length > 0) {
+        for (const env of envs) {
+          // Runtime filter: test workspace skips prod environments
+          if (envType === "test" && !env.isTest) continue;
+
+          // Get user's kubeconfig for this environment
+          const userConfig = await userEnvConfigRepo.get(userId, env.id);
+          let kubeconfigContent = userConfig?.kubeconfig ?? null;
+
+          // Fallback to defaultKubeconfig for test environments
+          if (!kubeconfigContent && env.isTest && env.defaultKubeconfig) {
+            kubeconfigContent = env.defaultKubeconfig;
+          }
+
+          if (kubeconfigContent) {
+            const safeName = env.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const filename = `${safeName}.kubeconfig`;
+            files.push({ name: filename, content: kubeconfigContent });
+            const fileNames = [filename];
+            let metadata: Record<string, unknown> | undefined;
+            try {
+              const kc = yaml.load(kubeconfigContent) as Record<string, unknown>;
+              const clusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+              const contexts = (kc?.contexts as Array<{ name: string; context?: { cluster?: string; namespace?: string } }>) ?? [];
+              metadata = {
+                clusters: clusters.map((c) => ({ name: c.name, server: c.cluster?.server })),
+                contexts: contexts.map((c) => ({ name: c.name, cluster: c.context?.cluster, namespace: c.context?.namespace })),
+                currentContext: kc?.["current-context"] as string | undefined,
+              };
+            } catch {
+              // ignore parse errors
+            }
+            manifest.push({
+              name: env.name,
+              type: "kubeconfig",
+              description: `Kubeconfig for environment: ${env.name}`,
+              files: fileNames,
+              ...(metadata ? { metadata } : {}),
+            });
+          }
+        }
+      }
+    }
+
+    // ── Step 3: Non-kubeconfig credentials from credentials table ──
+    // Test workspaces get NO non-kubeconfig credentials
+    if (envType === "test" || !credRepo) {
+      return { manifest, files };
+    }
+
     let creds: Awaited<ReturnType<CredentialRepository["listForUser"]>>;
     if (isDefault) {
       creds = await credRepo.listForUser(userId);
     } else {
-      if (!workspaceRepo) return { manifest: [], files: [] };
+      if (!workspaceRepo) return { manifest, files };
       const linkedIds = await workspaceRepo.getCredentials(workspaceId);
       if (linkedIds.length === 0) {
         creds = [];
@@ -3407,10 +3905,10 @@ export function createRpcMethods(
     // IdentityFile path used inside agentbox (resolves to .siclaw/credentials/)
     const credsDirInBox = path.resolve(process.cwd(), ".siclaw/credentials");
 
-    const manifest: CredentialManifestEntry[] = [];
-    const files: CredentialFile[] = [];
-
     for (const cred of creds) {
+      // Skip kubeconfig type credentials (now handled via environments)
+      if (cred.type === "kubeconfig") continue;
+
       const config = (cred.configJson ?? {}) as Record<string, unknown>;
       const safeName = cred.name.replace(/[^a-zA-Z0-9_-]/g, "_");
       const fileNames: string[] = [];
@@ -3418,34 +3916,6 @@ export function createRpcMethods(
       let metadata: Record<string, unknown> | undefined;
 
       switch (cred.type) {
-        case "kubeconfig": {
-          const content = config.content as string;
-          if (content) {
-            const filename = `${safeName}.kubeconfig`;
-            files.push({ name: filename, content });
-            fileNames.push(filename);
-            try {
-              const kc = yaml.load(content) as Record<string, unknown>;
-              const clusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
-              const contexts = (kc?.contexts as Array<{ name: string; context?: { cluster?: string; namespace?: string } }>) ?? [];
-              metadata = {
-                clusters: clusters.map((c) => ({
-                  name: c.name,
-                  server: c.cluster?.server,
-                })),
-                contexts: contexts.map((c) => ({
-                  name: c.name,
-                  cluster: c.context?.cluster,
-                  namespace: c.context?.namespace,
-                })),
-                currentContext: kc?.["current-context"] as string | undefined,
-              };
-            } catch {
-              // ignore parse errors
-            }
-          }
-          break;
-        }
         case "ssh_key": {
           const privateKey = config.privateKey as string;
           if (privateKey) {
@@ -3582,12 +4052,18 @@ export function createRpcMethods(
     const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
     const hasProfile = fs.existsSync(profilePath);
 
-    // Credentials by type count
+    // Credentials by type count (SSH/API + kubeconfigs)
     const credentials: Record<string, number> = {};
     if (credRepo) {
       const creds = await credRepo.listForUser(userId);
       for (const c of creds) {
         credentials[c.type] = (credentials[c.type] || 0) + 1;
+      }
+    }
+    if (userEnvConfigRepo) {
+      const envConfigs = await userEnvConfigRepo.listForUser(userId);
+      if (envConfigs.length > 0) {
+        credentials["kubeconfig"] = envConfigs.length;
       }
     }
 
@@ -3635,11 +4111,14 @@ export function createRpcMethods(
     return { ok: true };
   });
 
-  /** Build a skill bundle for a given user and environment (used by mTLS bundle API) */
-  async function getSkillBundle(userId: string, env: "prod" | "dev"): Promise<SkillBundle> {
+  /** Build a skill bundle for a given user and environment (used by mTLS bundle API).
+   *  "test" maps to "dev" behavior (working copies of personal skills). */
+  async function getSkillBundle(userId: string, env: "prod" | "dev" | "test"): Promise<SkillBundle> {
     if (!skillRepo || !skillContentRepo) throw new Error("Database not available");
     const disabled = new Set(await skillRepo.listDisabledSkills(userId));
-    return buildSkillBundle(userId, env, skillWriter, skillRepo, skillContentRepo, disabled);
+    // Map "test" → "dev" for skill bundle purposes (test = dev-like skill access)
+    const bundleEnv: "prod" | "dev" = env === "test" ? "dev" : env;
+    return buildSkillBundle(userId, bundleEnv, skillWriter, skillRepo, skillContentRepo, disabled);
   }
 
   /** Detach WebSocket from SSE streams — SSE continues so DB persistence and

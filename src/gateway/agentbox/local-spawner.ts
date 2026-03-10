@@ -29,7 +29,7 @@ interface LocalBox {
 }
 
 /** Function type for fetching a skill bundle for a given user */
-export type SkillBundleProvider = (userId: string, env: "prod" | "dev") => Promise<{
+export type SkillBundleProvider = (userId: string, env: "prod" | "dev" | "test") => Promise<{
   version: string;
   skills: Array<{ dirName: string; specs: string; scripts: Array<{ name: string; content: string }> }>;
   disabledBuiltins: string[];

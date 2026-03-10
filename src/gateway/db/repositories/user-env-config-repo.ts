@@ -82,4 +82,16 @@ export class UserEnvConfigRepository {
       .from(userEnvConfigs)
       .where(eq(userEnvConfigs.envId, envId));
   }
+
+  /**
+   * Get full records (including kubeconfig content) for all users with configs for the given envId.
+   * Separate from listForEnv() which omits the large kubeconfig blob for lightweight queries.
+   * Used by environment.update to validate kubeconfigs against a changed apiServer.
+   */
+  async listFullForEnv(envId: string) {
+    return this.db
+      .select()
+      .from(userEnvConfigs)
+      .where(eq(userEnvConfigs.envId, envId));
+  }
 }
