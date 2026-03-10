@@ -1,12 +1,12 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Globe, Plus, Pencil, Trash2, Loader2, Search, Upload } from 'lucide-react';
+import { Globe, KeyRound, Plus, Pencil, Trash2, Loader2, Search, Upload } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
 import { EnvironmentDialog } from './components/EnvironmentDialog';
 import { KubeconfigUploadDialog } from './components/KubeconfigUploadDialog';
-import { CredentialsSection } from './components/CredentialsSection';
+// import { CredentialsSection } from './components/CredentialsSection';
 
 /* ---------- Types ---------- */
 
@@ -29,7 +29,7 @@ const TYPE_BADGE_COLORS = {
     testing: 'bg-amber-50 text-amber-700',
 } as const;
 
-type TabKey = 'environments' | 'credentials';
+type TabKey = 'environments' | 'ssh' | 'api';
 
 /* ---------- Page ---------- */
 
@@ -38,7 +38,8 @@ export function EnvironmentsPage() {
     const { isAdmin, loaded: permLoaded } = usePermissions(sendRpc, isConnected);
 
     const [searchParams, setSearchParams] = useSearchParams();
-    const activeTab: TabKey = searchParams.get('tab') === 'credentials' ? 'credentials' : 'environments';
+    const rawTab = searchParams.get('tab');
+    const activeTab: TabKey = rawTab === 'ssh' ? 'ssh' : rawTab === 'api' ? 'api' : rawTab === 'credentials' ? 'ssh' : 'environments';
     const setActiveTab = (tab: TabKey) => {
         if (tab === 'environments') {
             setSearchParams({});
@@ -177,57 +178,52 @@ export function EnvironmentsPage() {
             <header className="h-16 flex items-center justify-between px-6 bg-white sticky top-0 z-10 border-b border-gray-100">
                 <div className="flex items-center gap-3">
                     <div className="p-2 bg-primary-50 rounded-lg">
-                        <Globe className="w-5 h-5 text-primary-600" />
+                        <KeyRound className="w-5 h-5 text-primary-600" />
                     </div>
                     <div>
-                        <h1 className="text-lg font-bold text-gray-900">Environments</h1>
-                        <p className="text-xs text-gray-500">Manage Kubernetes environments and credentials</p>
+                        <h1 className="text-lg font-bold text-gray-900">Credentials</h1>
+                        <p className="text-xs text-gray-500">Manage Kubernetes environments, SSH and API credentials</p>
                     </div>
                 </div>
-                {activeTab === 'environments' && showAdmin && (
-                    <button
-                        onClick={openCreate}
-                        className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
-                    >
-                        <Plus className="w-4 h-4" />
-                        New Environment
-                    </button>
-                )}
             </header>
 
             {/* Tab bar */}
             <div className="border-b border-gray-200 bg-white px-6">
                 <nav className="flex gap-6 -mb-px">
-                    <button
-                        onClick={() => setActiveTab('environments')}
-                        className={cn(
-                            'py-3 text-sm font-medium border-b-2 transition-colors',
-                            activeTab === 'environments'
-                                ? 'border-primary-600 text-primary-600'
-                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
-                        )}
-                    >
-                        Environments
-                    </button>
-                    <button
-                        onClick={() => setActiveTab('credentials')}
-                        className={cn(
-                            'py-3 text-sm font-medium border-b-2 transition-colors',
-                            activeTab === 'credentials'
-                                ? 'border-primary-600 text-primary-600'
-                                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
-                        )}
-                    >
-                        Credentials
-                    </button>
+                    {([
+                        { key: 'environments' as TabKey, label: 'Kubernetes' },
+                        { key: 'ssh' as TabKey, label: 'SSH' },
+                        { key: 'api' as TabKey, label: 'API' },
+                    ]).map(tab => (
+                        <button
+                            key={tab.key}
+                            onClick={() => setActiveTab(tab.key)}
+                            className={cn(
+                                'py-3 text-sm font-medium border-b-2 transition-colors',
+                                activeTab === tab.key
+                                    ? 'border-primary-600 text-primary-600'
+                                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300',
+                            )}
+                        >
+                            {tab.label}
+                        </button>
+                    ))}
                 </nav>
             </div>
 
             <div className="flex-1 overflow-y-auto p-8">
                 <div className="max-w-5xl mx-auto">
-                    {activeTab === 'environments' ? (
+                    {activeTab !== 'environments' ? (
+                        <div className="text-center py-20">
+                            <Globe className="w-12 h-12 text-gray-200 mx-auto mb-4" />
+                            <div className="text-lg font-medium text-gray-500 mb-1">
+                                {activeTab === 'ssh' ? 'SSH Credentials' : 'API Credentials'}
+                            </div>
+                            <div className="text-sm text-gray-400">Coming soon</div>
+                        </div>
+                    ) : (
                         <>
-                            {/* Search + Upload button */}
+                            {/* Search + New button */}
                             <div className="flex items-center gap-3 mb-6">
                                 <div className="relative flex-1 max-w-xs">
                                     <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -239,13 +235,14 @@ export function EnvironmentsPage() {
                                         className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                                     />
                                 </div>
-                                {environments.length > 0 && (
+                                <div className="flex-1" />
+                                {showAdmin && (
                                     <button
-                                        onClick={() => openUploadDialog()}
-                                        className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-indigo-700 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition-colors"
+                                        onClick={openCreate}
+                                        className="inline-flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 transition-colors"
                                     >
-                                        <Upload className="w-4 h-4" />
-                                        Upload Kubeconfig
+                                        <Plus className="w-4 h-4" />
+                                        New Kubernetes
                                     </button>
                                 )}
                             </div>
@@ -370,8 +367,6 @@ export function EnvironmentsPage() {
                                 </div>
                             )}
                         </>
-                    ) : (
-                        <CredentialsSection sendRpc={sendRpc} isConnected={isConnected} />
                     )}
                 </div>
             </div>

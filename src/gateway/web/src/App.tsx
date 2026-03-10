@@ -66,11 +66,11 @@ const router = createBrowserRouter([
                             { path: 'system', element: <SystemSettings /> },
                         ],
                     },
-                    { path: 'credentials', element: <Navigate to="/environments?tab=credentials" replace /> },
+                    { path: 'credentials', element: <EnvironmentsPage /> },
                     { path: 'sessions', element: <ComingSoonPage title="Sessions" /> },
                     { path: 'workspace', element: <WorkspacesPage /> },
                     { path: 'mcp', element: <McpServersPage /> },
-                    { path: 'environments', element: <EnvironmentsPage /> },
+                    { path: 'environments', element: <Navigate to="/credentials" replace /> },
                     // { path: 'brains', element: <BrainsPage /> },  // hidden until claude-sdk brain is polished
                     { path: 'models', element: <ModelsPage /> },
                     { path: 'metrics', element: <MetricsPage /> },

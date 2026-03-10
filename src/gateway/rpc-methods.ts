@@ -4007,12 +4007,18 @@ export function createRpcMethods(
     const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
     const hasProfile = fs.existsSync(profilePath);
 
-    // Credentials by type count
+    // Credentials by type count (SSH/API + kubeconfigs)
     const credentials: Record<string, number> = {};
     if (credRepo) {
       const creds = await credRepo.listForUser(userId);
       for (const c of creds) {
         credentials[c.type] = (credentials[c.type] || 0) + 1;
+      }
+    }
+    if (userEnvConfigRepo) {
+      const envConfigs = await userEnvConfigRepo.listForUser(userId);
+      if (envConfigs.length > 0) {
+        credentials["kubeconfig"] = envConfigs.length;
       }
     }
 
