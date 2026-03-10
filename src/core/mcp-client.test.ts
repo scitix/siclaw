@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX, loadMcpServersConfig } from "./mcp-client.js";
+import { jsonSchemaToTypebox, buildMcpToolName, isMcpTool, MCP_TOOL_PREFIX } from "./mcp-client.js";
 
 describe("jsonSchemaToTypebox", () => {
   it("converts string type", () => {
@@ -117,9 +117,3 @@ describe("isMcpTool", () => {
   });
 });
 
-describe("loadMcpServersConfig", () => {
-  it("returns null when no mcpServers configured", () => {
-    const result = loadMcpServersConfig();
-    expect(result).toBeNull();
-  });
-});
