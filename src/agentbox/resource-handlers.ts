@@ -43,8 +43,7 @@ export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
     // Gateway payload is the source of truth — replace, not merge.
     // Object.assign would keep stale keys when Gateway returns {} (all disabled).
     const mcpServers = payload?.mcpServers ?? {};
-    config.mcpServers = mcpServers;
-    writeConfig(config);
+    writeConfig({ ...config, mcpServers });
     return Object.keys(mcpServers).length;
   },
 

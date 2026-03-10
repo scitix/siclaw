@@ -87,6 +87,8 @@ spec:
     - name: kubeconfig
       mountPath: /home/agentbox/.kube
       readOnly: true
+    - name: config
+      mountPath: /app/.siclaw/config
     - name: tmp
       mountPath: /tmp
     - name: workspace
@@ -126,6 +128,9 @@ spec:
     secret:
       secretName: user-${USER_ID}-kubeconfig
       optional: true
+  # Config directory (settings.json written at runtime)
+  - name: config
+    emptyDir: {}
   # Temp directory
   - name: tmp
     emptyDir:
