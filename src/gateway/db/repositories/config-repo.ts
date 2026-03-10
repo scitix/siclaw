@@ -3,7 +3,7 @@
  */
 
 import crypto from "node:crypto";
-import { eq, and, isNull, gt, asc, sql } from "drizzle-orm";
+import { eq, and, isNull, isNotNull, gt, lte, asc, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { channels, cronJobs, cronInstances, triggers } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
@@ -307,8 +307,8 @@ export class ConfigRepository {
       .set({ lockedBy: null, lockedAt: null })
       .where(
         and(
-          sql`${cronJobs.lockedBy} IS NOT NULL`,
-          sql`${cronJobs.lockedAt} <= ${cutoff}`,
+          isNotNull(cronJobs.lockedBy),
+          lte(cronJobs.lockedAt, cutoff),
         ),
       );
   }

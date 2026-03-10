@@ -14,7 +14,7 @@ import { CronExecutor } from "./cron/cron-executor.js";
 import { CronCoordinator } from "./cron/cron-coordinator.js";
 import { createCronApi } from "./cron/cron-api.js";
 import { GatewayClient } from "./cron/gateway-client.js";
-import { withRetry } from "./cron/retry.js";
+import { withRetry } from "./shared/retry.js";
 
 const apiPort = parseInt(process.env.SICLAW_CRON_API_PORT || "3100", 10);
 
