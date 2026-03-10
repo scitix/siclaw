@@ -52,8 +52,6 @@ export interface PilotAreaProps {
     onNavigateCredentials?: () => void;
     /** Current session key — used to reset scroll position on session switch */
     sessionKey?: string | null;
-    /** Current environment ID for cron job operations */
-    selectedEnvId?: string | null;
     /** Current workspace ID for cron job operations */
     selectedWorkspaceId?: string | null;
 }
@@ -155,7 +153,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedEnvId, selectedWorkspaceId }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -383,7 +381,6 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     dpFocus={dpFocus}
                                     onHypothesesConfirmed={onHypothesesConfirmed}
                                     hypothesesSuperseded={latestHypothesesId != null && msg.toolName === 'propose_hypotheses' && msg.id !== latestHypothesesId}
-                                    selectedEnvId={selectedEnvId}
                                     selectedWorkspaceId={selectedWorkspaceId}
                                 />
                             ))}
@@ -451,7 +448,7 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
     return { isDeepInvestigation: false, text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, onHypothesesConfirmed, hypothesesSuperseded, selectedEnvId, selectedWorkspaceId }: {
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, onHypothesesConfirmed, hypothesesSuperseded, selectedWorkspaceId }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -470,7 +467,6 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     dpFocus?: string | null;
     onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void;
     hypothesesSuperseded?: boolean;
-    selectedEnvId?: string | null;
     selectedWorkspaceId?: string | null;
 }) {
     const isUser = message.role === 'user';
@@ -487,7 +483,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
             );
         }
         if (message.toolName === 'manage_schedule' && !message.isStreaming) {
-            return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} selectedEnvId={selectedEnvId} selectedWorkspaceId={selectedWorkspaceId} />;
+            return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} selectedWorkspaceId={selectedWorkspaceId} />;
         }
         if (message.toolName === 'deep_search') {
             // In DP mode, DpChecklistCard handles the running display — hide duplicate InvestigationCard
