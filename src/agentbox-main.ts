@@ -19,27 +19,18 @@ import { syncAllResources } from "./agentbox/resource-sync.js";
 import "./shared/metrics.js";
 import "./shared/local-collector.js"; // side-effect: register monitoring collector
 
-// Use /tmp for config in containers where cwd may be read-only
-if (!process.env.SICLAW_CONFIG_DIR) {
-  const cwdConfigDir = path.resolve(process.cwd(), ".siclaw", "config");
-  try {
-    fs.mkdirSync(cwdConfigDir, { recursive: true });
-  } catch {
-    process.env.SICLAW_CONFIG_DIR = "/tmp/.siclaw/config";
-  }
-}
-
 const config = loadConfig();
 const PORT = config.server.port;
 
 async function main() {
   // If gatewayUrl is configured, fetch the latest settings.json from Gateway (with mTLS)
   if (config.server.gatewayUrl) {
-    try {
-      const gatewayClient = new GatewayClient({
-        gatewayUrl: config.server.gatewayUrl,
-      });
+    const gatewayClient = new GatewayClient({
+      gatewayUrl: config.server.gatewayUrl,
+    });
 
+    // Step 1: Fetch and persist settings.json
+    try {
       const remoteConfig = await gatewayClient.fetchSettings();
       const configPath = getConfigPath();
       const dir = path.dirname(configPath);
@@ -47,14 +38,18 @@ async function main() {
       fs.writeFileSync(configPath, JSON.stringify(remoteConfig, null, 2) + "\n");
       reloadConfig();
       console.log(`[agentbox] Fetched settings from Gateway via mTLS: ${config.server.gatewayUrl}`);
+    } catch (err) {
+      console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
+    }
 
-      // Sync all resources (MCP, skills) from Gateway with retry
+    // Step 2: Sync resources (MCP, skills) — independent of settings fetch
+    try {
       const { failed } = await syncAllResources(gatewayClient.toClientLike());
       if (failed.length > 0) {
         console.warn(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
       }
     } catch (err) {
-      console.warn(`[agentbox] Failed to fetch settings from Gateway, using local config:`, err);
+      console.warn(`[agentbox] Resource sync failed:`, err);
     }
   }
 

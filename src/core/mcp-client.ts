@@ -7,8 +7,6 @@
  * Config loaded from .siclaw/config/settings.json mcpServers field.
  */
 
-import fs from "fs";
-import path from "path";
 import { Type, type TSchema } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 
@@ -106,79 +104,6 @@ export function jsonSchemaToTypebox(schema: any): TSchema {
       }
       return Type.Any();
   }
-}
-
-// ---------------------------------------------------------------------------
-// Config loading
-// ---------------------------------------------------------------------------
-
-/**
- * Try loading an MCP servers config from a single path.
- */
-function tryLoadConfig(configPath: string): McpServersConfig | null {
-  if (!fs.existsSync(configPath)) {
-    console.log(`[mcp-client] Config not found: ${configPath}`);
-    return null;
-  }
-
-  try {
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const json = JSON.parse(raw) as McpServersConfig;
-    if (!json.mcpServers || typeof json.mcpServers !== "object") {
-      console.warn(`[mcp-client] Invalid config (no mcpServers object): ${configPath}`);
-      return null;
-    }
-
-    // Resolve env var references in headers (e.g. "${API_TOKEN}" → process.env.API_TOKEN)
-    for (const [, config] of Object.entries(json.mcpServers)) {
-      if ("headers" in config && config.headers) {
-        for (const [key, value] of Object.entries(config.headers)) {
-          const match = value.match(/^\$\{(\w+)\}$/);
-          if (match) {
-            config.headers[key] = process.env[match[1]] ?? "";
-          }
-        }
-      }
-    }
-
-    const serverNames = Object.keys(json.mcpServers);
-    if (serverNames.length === 0) {
-      console.log(`[mcp-client] Config has no servers: ${configPath}`);
-      return null;
-    }
-    console.log(`[mcp-client] Loaded config from ${configPath}: ${serverNames.length} servers [${serverNames.join(", ")}]`);
-    return json;
-  } catch (err) {
-    console.warn(`[mcp-client] Failed to load config from ${configPath}: ${err}`);
-    return null;
-  }
-}
-
-/**
- * Load MCP servers config from SICLAW_MCP_DIR/mcp-servers.json.
- *
- * This file is written by the agentbox resource-handler after fetching
- * the merged config from the Gateway API. In CLI mode (no Gateway),
- * mcpServers are configured directly in `.siclaw/config/settings.json`.
- */
-export function loadMcpServersConfig(
-  _cwd?: string,
-  opts?: { localOnly?: boolean },
-): McpServersConfig | null {
-  const mcpDir = process.env.SICLAW_MCP_DIR;
-  console.log(`[mcp-client] loadMcpServersConfig: SICLAW_MCP_DIR=${mcpDir || "(unset)"}, localOnly=${opts?.localOnly ?? false}`);
-
-  if (opts?.localOnly || !mcpDir) {
-    return null;
-  }
-
-  const mcpPath = path.resolve(mcpDir, "mcp-servers.json");
-  const config = tryLoadConfig(mcpPath);
-  if (config) {
-    console.log(`[mcp-client] Using config: ${mcpPath}`);
-    return config;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
