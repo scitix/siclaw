@@ -812,9 +812,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           console.log(`[gateway] agent-prompt from=${caller} user=${userId} session=${data.sessionId}`);
 
           // 1. Get or create user's AgentBox (resolve real workspace ID from DB)
-          const wsId = internalWorkspaceRepo
-            ? (await internalWorkspaceRepo.getOrCreateDefault(userId)).id
-            : "default";
+          if (!internalWorkspaceRepo) throw new Error("Database not available");
+          const wsId = (await internalWorkspaceRepo.getOrCreateDefault(userId)).id;
           const handle = await agentBoxManager.getOrCreate(userId, wsId);
           const client = new AgentBoxClient(handle.endpoint);
 

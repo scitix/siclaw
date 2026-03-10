@@ -343,3 +343,48 @@ Memory-dependent features (investigations, `memory_search`) only work with pi-ag
 - Protected endpoints: `/api/internal/*` on Gateway HTTPS port (3002)
 
 **Source**: `src/gateway/security/cert-manager.ts`
+
+---
+
+## 12. Production/Test Environment Isolation (ADR-011)
+
+**Invariant**: Environment isolation is enforced at the **workspace level via credential scoping**, not at the tool level or via LLM prompts.
+
+### 12.1 Workspace envType
+
+Every workspace has an `envType` (`"prod"` or `"test"`) set at creation time. This determines the credential visibility boundary for the workspace's AgentBox.
+
+### 12.2 Credential Visibility Rules
+
+```
+Prod workspace  → sees all kubeconfigs (prod + test envs) + all non-kubeconfig credentials
+Test workspace  → sees only test kubeconfigs; no SSH keys, API tokens, or prod kubeconfigs
+```
+
+Production can see test credentials (for comparison/debugging). Test cannot see production credentials.
+
+### 12.3 Environment Governance
+
+- **Admin-only**: Only admins can create/modify/delete environments. Users cannot.
+- **apiServer required**: Every environment must have an `apiServer` address. Kubeconfig uploads are validated against this anchor — the kubeconfig's `clusters[].cluster.server` must match.
+- **isTest immutable by users**: The `isTest` flag is set by admin and determines credential routing.
+
+### 12.4 Binding Constraints
+
+```
+workspace.envType === "test" → can only bind environments where isTest=true
+workspace.envType === "prod" → can bind any environment
+user.testOnly === true       → can only create workspaces with envType="test"
+```
+
+### 12.5 Investigation Memory Isolation
+
+**Planned (not yet implemented):** Each workspace will have its own memory database (`<userDataDir>/<workspaceId>/.memory.db`). Investigations will not cross workspace boundaries.
+
+### 12.6 What NOT to Do
+
+- Do NOT add per-tool environment guards in `restricted-bash.ts` or other tools — credential scoping is the isolation mechanism
+- Do NOT inject environment info into LLM system prompts as a security measure — models forget
+- Do NOT allow users to create environments or change `isTest`/`apiServer`
+
+**Source**: `docs/design/decisions.md` ADR-011

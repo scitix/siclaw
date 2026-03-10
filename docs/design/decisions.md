@@ -304,3 +304,126 @@ Application-level command validation (COMMAND_RULES, whitelist, shell operator b
 **Full design**: `docs/design/security.md`
 
 **Revisit when**: Container runtime supports rootless user namespace mapping natively (e.g., Kubernetes UserNamespacesSupport GA), which would eliminate the need for CAP_SETUID.
+
+---
+
+## ADR-011: Production/Test Environment Isolation via Workspace-Level AgentBox Credential Scoping
+
+**Status**: Accepted
+
+**Context**:
+Siclaw manages multiple K8s clusters (environments) for SRE diagnosis. Some are production, some are test/staging. Without isolation, a single AgentBox receives all credentials — an agent operating on test data could accidentally (or be tricked into) accessing production clusters, and test-only users have no enforcement boundary.
+
+Three isolation strategies were evaluated:
+
+- **Prompt-based**: Inject environment awareness into the LLM system prompt. Rejected — models forget instructions, no hard guarantee.
+- **Per-tool guard**: Check environment permissions in each tool (`restricted-bash.ts`, `ssh_exec`, `metrics_query`, etc.) before execution. Rejected — too many tools to guard, high maintenance cost, easy to miss a path.
+- **AgentBox-level credential scoping**: Filter credentials at injection time so the AgentBox only sees what its workspace type allows. The agent physically cannot access credentials it was never given.
+
+**Decision**:
+Environment isolation is enforced at the **workspace level** via credential scoping. Each workspace has an `envType` ("prod" or "test") that determines which credentials are injected into its AgentBox.
+
+### Data Model Changes
+
+**1. `workspaces` table — add `envType`**
+```sql
+ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod';
+-- Values: 'prod' | 'test'
+```
+
+**2. `environments` table — add `apiServer` (required)**
+```sql
+ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL;
+```
+Admin must provide the K8s API server address when creating an environment. This anchors the environment to a specific cluster and enables kubeconfig upload validation.
+
+### Credential Scoping Rules
+
+**Kubeconfig credentials** (managed via `userEnvConfigs`):
+- Bound to an `environment` record. The environment's `isTest` flag determines whether it is a prod or test credential.
+- On upload, the kubeconfig's `clusters[].cluster.server` is validated against `environment.apiServer`. Mismatch → rejected.
+
+**Non-kubeconfig credentials** (SSH keys, API tokens — in `credentials` table):
+- Phase 1: only injected into prod workspaces. Test workspaces get kubeconfig access only.
+- Phase 2 (future): add `envScope` field to `credentials` table when SSH/API template governance is designed.
+
+### Visibility Matrix
+
+| Credential source | Prod workspace | Test workspace |
+|---|---|---|
+| Kubeconfig for `isTest=false` environment | ✅ | ❌ |
+| Kubeconfig for `isTest=true` environment | ✅ | ✅ |
+| Non-kubeconfig credential (Phase 1) | ✅ | ❌ |
+
+Production workspaces see everything (may need to compare prod vs test). Test workspaces see only test kubeconfigs (cannot touch production).
+
+### Environment ↔ Workspace Binding Constraint
+
+```
+workspace.envType === "test" → can only bind environments where isTest=true
+workspace.envType === "prod" → can bind any environment (prod or test)
+```
+
+### Kubeconfig Upload Validation
+
+```
+User uploads kubeconfig for environment E:
+  1. E.apiServer must be non-null (enforced at environment creation)
+  2. Parse kubeconfig YAML → extract clusters[].cluster.server
+  3. E.apiServer must appear in the extracted server list
+  4. Mismatch → reject with error showing expected vs actual
+```
+
+This prevents a user from uploading a kubeconfig for cluster D while claiming it is for cluster A.
+
+### testOnly User Enforcement
+
+```
+user.testOnly === true → can only create workspaces with envType="test"
+```
+
+Checked at workspace creation time in the Gateway API layer. No enforcement needed inside AgentBox — the credential set is already filtered.
+
+### Investigation Memory Isolation
+
+Each workspace has its own memory database. Investigations in a prod workspace do not appear in a test workspace's context, and vice versa. Memory DB path: `<userDataDir>/<workspaceId>/.memory.db`.
+
+### Credential Payload Building (Gateway)
+
+```typescript
+function buildCredentialPayload(userId, workspace) {
+  const { envType } = workspace;
+  const envs = getWorkspaceEnvironments(workspace.id);
+
+  // Kubeconfigs: filter by workspace envType
+  const kubeconfigs = [];
+  for (const env of envs) {
+    const config = getUserEnvConfig(userId, env.id);
+    if (config) kubeconfigs.push({ name: env.name, content: config.kubeconfig });
+  }
+  // Binding constraint already ensures test workspace has no prod envs
+
+  // Non-kubeconfig credentials: prod only (Phase 1)
+  const otherCreds = envType === "prod"
+    ? getWorkspaceCredentials(workspace.id)
+    : [];
+
+  return [...kubeconfigs, ...otherCreds];
+}
+```
+
+### Cron Job Isolation
+
+Cron jobs are bound to a workspace (`cronJobs.workspaceId`). The workspace's `envType` determines which AgentBox (and therefore which credentials) the cron job runs with. No additional cron-specific isolation logic needed.
+
+**Consequences**:
+- ✅ Zero changes to spawner layer — boxKey, podName, AgentBox lifecycle all unchanged
+- ✅ Zero changes to tool layer — no per-tool environment guards needed
+- ✅ Hard isolation — AgentBox physically cannot access credentials it was not given
+- ✅ Admin governance — users cannot create environments, cannot change isTest/apiServer
+- ✅ Kubeconfig validation — prevents credential spoofing via apiServer anchoring
+- ⚠️ Users who need both prod and test access must maintain two workspaces
+- ⚠️ Non-kubeconfig credentials are prod-only in Phase 1 (SSH/API governance deferred)
+- ⚠️ Memory isolation means investigation insights do not transfer across workspace types — acceptable tradeoff for security
+
+**Revisit when**: Non-kubeconfig credential types (SSH, API) need environment-aware governance. At that point, add `envScope` to `credentials` table or extend the environment template model with endpoint validation anchors (similar to apiServer for K8s).

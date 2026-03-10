@@ -4,6 +4,7 @@ import type { BroadcastFn } from "../ws-protocol.js";
 import type { ChannelPlugin, StreamingCard } from "./api.js";
 import type { UserStore } from "../auth/user-store.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
+import type { WorkspaceRepository } from "../db/repositories/workspace-repo.js";
 import { notifyCronService } from "../cron/notify.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "../output-redactor.js";
 
@@ -83,6 +84,7 @@ export function createChannelBridge(
   userStore?: UserStore,
   configRepo?: ConfigRepository,
   buildCredentialPayload?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>,
+  workspaceRepo?: WorkspaceRepository,
 ): ChannelBridge {
   // channelId → outbound sender
   const outbounds = new Map<string, ChannelPlugin>();
@@ -129,9 +131,13 @@ export function createChannelBridge(
         return;
       }
 
+      // Resolve user's default workspace
+      if (!workspaceRepo) throw new Error("Database not available");
+      const defaultWs = await workspaceRepo.getOrCreateDefault(boundUser.id);
+
       // Build credential payload to send in prompt body
       const credentials = buildCredentialPayload
-        ? await buildCredentialPayload(boundUser.id, "default", true).catch((err) => {
+        ? await buildCredentialPayload(boundUser.id, defaultWs.id, defaultWs.isDefault).catch((err) => {
             console.warn("[channel-bridge] credential payload build failed:", err instanceof Error ? err.message : err);
             return undefined;
           })
@@ -145,7 +151,7 @@ export function createChannelBridge(
 
       // Channel and web share the same AgentBox — mode-driven skill loading
       // handles tool/skill differences per session.
-      const handle = await agentBoxManager.getOrCreate(boundUser.id, "default");
+      const handle = await agentBoxManager.getOrCreate(boundUser.id, defaultWs.id);
       const client = new AgentBoxClient(handle.endpoint);
 
       const plugin = outbounds.get(channelId);

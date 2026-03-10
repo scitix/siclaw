@@ -22,7 +22,7 @@ export interface CertificateIdentity {
   userId: string;
   workspaceId: string;
   boxId: string;
-  env: "prod" | "dev";
+  env: "prod" | "dev" | "test";
   issuedAt: Date;
   expiresAt: Date;
 }
@@ -163,7 +163,7 @@ export class CertificateManager {
   /**
    * Issue a client certificate for an AgentBox instance
    */
-  issueAgentBoxCertificate(userId: string, workspaceId: string, boxId: string, env: "prod" | "dev" = "prod"): CertificateBundle {
+  issueAgentBoxCertificate(userId: string, workspaceId: string, boxId: string, env: "prod" | "dev" | "test" = "prod"): CertificateBundle {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
       publicKeyEncoding: { type: "spki", format: "pem" },
@@ -240,7 +240,7 @@ export class CertificateManager {
       const workspaceId = subject.find((attr: any) => attr.name === "organizationalUnitName")?.value as string | undefined;
       const boxId = subject.find((attr: any) => attr.name === "serialNumber")?.value as string | undefined;
       const envRaw = subject.find((attr: any) => attr.name === "localityName")?.value as string | undefined;
-      const env = (envRaw === "dev" ? "dev" : "prod") as "prod" | "dev";
+      const env = (envRaw === "dev" ? "dev" : envRaw === "test" ? "test" : "prod") as "prod" | "dev" | "test";
 
       if (!userId || !workspaceId || !boxId) {
         console.warn("[cert-manager] Certificate missing required identity fields");

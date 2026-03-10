@@ -109,6 +109,12 @@ export function WorkspacesPage() {
                                     <div className="flex items-center gap-2">
                                         <span className={`w-3 h-3 rounded-full ${getColorClass(ws.configJson?.color)}`} />
                                         <h3 className="text-base font-semibold text-gray-900">{ws.name}</h3>
+                                        {ws.envType === 'test' && (
+                                            <span className="text-xs px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600 font-medium">TEST</span>
+                                        )}
+                                        {ws.envType === 'prod' && !ws.isDefault && (
+                                            <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 font-medium">PROD</span>
+                                        )}
                                     </div>
                                     {ws.isDefault && (
                                         <span className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-600">
