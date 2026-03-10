@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { KeyRound, Loader2, Plus, Pencil, Trash2, Search } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useCredentials } from '@/hooks/useCredentials';
@@ -28,11 +28,12 @@ export function CredentialsSection({ sendRpc, isConnected }: CredentialsSectionP
     const [deleting, setDeleting] = useState<string | null>(null);
     const [hasLoaded, setHasLoaded] = useState(false);
 
-    // Load on first render when connected
-    if (isConnected && !hasLoaded) {
-        setHasLoaded(true);
-        loadCredentials();
-    }
+    useEffect(() => {
+        if (isConnected && !hasLoaded) {
+            setHasLoaded(true);
+            loadCredentials();
+        }
+    }, [isConnected, hasLoaded, loadCredentials]);
 
     const filtered = useMemo(() => {
         let list = credentials;

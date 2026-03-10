@@ -6,7 +6,6 @@ import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
 import { EnvironmentDialog } from './components/EnvironmentDialog';
 import { KubeconfigUploadDialog } from './components/KubeconfigUploadDialog';
-// import { CredentialsSection } from './components/CredentialsSection';
 
 /* ---------- Types ---------- */
 
