@@ -19,6 +19,7 @@ import { ModelsPage } from './pages/Models';
 import { CredentialsPage } from './pages/Credentials';
 import { WorkspacesPage } from './pages/Workspaces';
 import { McpServersPage } from './pages/McpServers';
+import { EnvironmentsPage } from './pages/Environments';
 import { MetricsPage } from './pages/Metrics';
 
 function ComingSoonPage({ title }: { title: string }) {
@@ -70,6 +71,7 @@ const router = createBrowserRouter([
                     { path: 'sessions', element: <ComingSoonPage title="Sessions" /> },
                     { path: 'workspace', element: <WorkspacesPage /> },
                     { path: 'mcp', element: <McpServersPage /> },
+                    { path: 'environments', element: <EnvironmentsPage /> },
                     // { path: 'brains', element: <BrainsPage /> },  // hidden until claude-sdk brain is polished
                     { path: 'models', element: <ModelsPage /> },
                     { path: 'metrics', element: <MetricsPage /> },

@@ -16,6 +16,7 @@ import {
     Compass,
     // BrainCircuit,  // hidden until claude-sdk brain is polished
     KeyRound,
+    Globe,
     Wrench,
     BarChart3,
 } from 'lucide-react';
@@ -67,6 +68,7 @@ const groups: NavGroup[] = [
             // { icon: BrainCircuit, label: 'Brains', to: '/brains' },  // hidden until claude-sdk brain is polished
             { icon: Cpu, label: 'Models', to: '/models', adminOnly: true },
             { icon: KeyRound, label: 'Credentials', to: '/credentials' },
+            { icon: Globe, label: 'Environments', to: '/environments', adminOnly: true },
             { icon: Shield, label: 'Permissions', to: '/permissions', adminOnly: true },
             { icon: Wrench, label: 'System', to: '/settings/system', adminOnly: true },
         ],
@@ -186,6 +188,9 @@ export function Sidebar() {
                                     >
                                         <span className={cn('w-2 h-2 rounded-full shrink-0', COLORS[ws.configJson?.color ?? 'indigo'] ?? 'bg-indigo-500')} />
                                         <span className="truncate">{ws.name}</span>
+                                        {ws.envType === 'test' && (
+                                            <span className="text-xs px-1 py-0.5 rounded bg-amber-50 text-amber-600 ml-1">TEST</span>
+                                        )}
                                         {ws.isDefault && <span className="text-xs text-gray-400 ml-auto">default</span>}
                                     </button>
                                 ))}

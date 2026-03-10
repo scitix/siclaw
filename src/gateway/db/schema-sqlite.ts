@@ -249,6 +249,7 @@ export const workspaces = sqliteTable("workspaces", {
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   name: text("name").notNull(),
   isDefault: integer("is_default", { mode: "boolean" }).notNull().default(false),
+  envType: text("env_type").notNull().default("prod"),
   configJson: text("config_json", { mode: "json" }).$type<{
     defaultModel?: { provider: string; modelId: string };
     systemPrompt?: string;
@@ -306,6 +307,7 @@ export const environments = sqliteTable("environments", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   isTest: integer("is_test", { mode: "boolean" }).notNull().default(false),
+  apiServer: text("api_server").notNull(),
   allowedServers: text("allowed_servers"),
   defaultKubeconfig: text("default_kubeconfig"),
   createdBy: text("created_by"),

@@ -14,7 +14,7 @@ interface Credential {
     type: string;
 }
 
-type Tab = 'general' | 'skills' | 'tools' | 'credentials';
+type Tab = 'general' | 'skills' | 'tools' | 'credentials' | 'environments';
 
 const COLOR_OPTIONS = [
     { name: 'indigo', class: 'bg-indigo-500' },
@@ -43,6 +43,9 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
     const [color, setColor] = useState(workspace?.configJson?.color ?? 'indigo');
     const [systemPrompt, setSystemPrompt] = useState(workspace?.configJson?.systemPrompt ?? '');
     const [saving, setSaving] = useState(false);
+    const [envType, setEnvType] = useState<string>(workspace?.envType ?? 'prod');
+    const [selectedEnvs, setSelectedEnvs] = useState<Set<string>>(new Set());
+    const [allEnvs, setAllEnvs] = useState<Array<{ id: string; name: string; isTest: boolean; apiServer: string }>>([]);
 
     // Allow-lists
     const [selectedSkills, setSelectedSkills] = useState<Set<string>>(new Set());
@@ -71,14 +74,20 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             .then(r => setAllCreds(r.credentials ?? []))
             .catch(() => {});
 
+        // Load available environments (admin endpoint)
+        sendRpc<{ environments: Array<{ id: string; name: string; isTest: boolean; apiServer: string }> }>('environment.list')
+            .then(r => setAllEnvs(r.environments ?? []))
+            .catch(() => {});
+
         // Load existing config if editing
         if (workspace && !workspace.isDefault) {
-            sendRpc<{ skills: string[]; tools: string[]; credentials: string[] }>(
+            sendRpc<{ skills: string[]; tools: string[]; credentials: string[]; environments: string[] }>(
                 'workspace.getConfig', { id: workspace.id }
             ).then(cfg => {
                 setSelectedSkills(new Set(cfg.skills ?? []));
                 setSelectedTools(new Set(cfg.tools ?? []));
                 setSelectedCreds(new Set(cfg.credentials ?? []));
+                setSelectedEnvs(new Set(cfg.environments ?? []));
             }).catch(() => {});
         }
     }, [sendRpc, workspace]);
@@ -107,6 +116,14 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         });
     }, []);
 
+    const toggleEnv = useCallback((envId: string) => {
+        setSelectedEnvs(prev => {
+            const next = new Set(prev);
+            next.has(envId) ? next.delete(envId) : next.add(envId);
+            return next;
+        });
+    }, []);
+
     const handleSave = async () => {
         if (!name.trim()) return;
         setSaving(true);
@@ -115,6 +132,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                 // Create
                 const result = await sendRpc<{ workspace: Workspace }>('workspace.create', {
                     name: name.trim(),
+                    envType,
                     config: {
                         color,
                         systemPrompt: systemPrompt || undefined,
@@ -126,12 +144,14 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     sendRpc('workspace.setSkills', { workspaceId: wsId, skills: [...selectedSkills] }),
                     sendRpc('workspace.setTools', { workspaceId: wsId, tools: [...selectedTools] }),
                     sendRpc('workspace.setCredentials', { workspaceId: wsId, credentialIds: [...selectedCreds] }),
+                    sendRpc('workspace.setEnvironments', { workspaceId: wsId, envIds: [...selectedEnvs] }),
                 ]);
             } else if (!isDefault) {
                 // Update
                 await sendRpc('workspace.update', {
                     id: workspace!.id,
                     name: name.trim(),
+                    envType,
                     config: {
                         ...workspace!.configJson,
                         color,
@@ -143,6 +163,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     sendRpc('workspace.setSkills', { workspaceId: workspace!.id, skills: [...selectedSkills] }),
                     sendRpc('workspace.setTools', { workspaceId: workspace!.id, tools: [...selectedTools] }),
                     sendRpc('workspace.setCredentials', { workspaceId: workspace!.id, credentialIds: [...selectedCreds] }),
+                    sendRpc('workspace.setEnvironments', { workspaceId: workspace!.id, envIds: [...selectedEnvs] }),
                 ]);
             }
             onSaved();
@@ -159,6 +180,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             { key: 'skills' as Tab, label: `Skills (${selectedSkills.size})` },
             { key: 'tools' as Tab, label: `Tools (${selectedTools.size})` },
             { key: 'credentials' as Tab, label: `Credentials (${selectedCreds.size})` },
+            { key: 'environments' as Tab, label: `Environments (${selectedEnvs.size})` },
         ] : []),
     ];
 
@@ -210,6 +232,33 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                     className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-50"
                                 />
                             </div>
+                            {!isDefault && (
+                                <div>
+                                    <label className="block text-sm font-medium text-gray-700 mb-2">Environment Type</label>
+                                    <div className="flex gap-2">
+                                        <button
+                                            onClick={() => setEnvType('prod')}
+                                            className={`px-4 py-2 rounded-lg text-sm font-medium border ${
+                                                envType === 'prod'
+                                                    ? 'border-blue-500 bg-blue-50 text-blue-700'
+                                                    : 'border-gray-200 text-gray-600 hover:border-gray-300'
+                                            }`}
+                                        >
+                                            Production
+                                        </button>
+                                        <button
+                                            onClick={() => { setEnvType('test'); setSelectedEnvs(new Set()); }}
+                                            className={`px-4 py-2 rounded-lg text-sm font-medium border ${
+                                                envType === 'test'
+                                                    ? 'border-amber-500 bg-amber-50 text-amber-700'
+                                                    : 'border-gray-200 text-gray-600 hover:border-gray-300'
+                                            }`}
+                                        >
+                                            Testing
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
                             <div>
                                 <label className="block text-sm font-medium text-gray-700 mb-2">Color</label>
                                 <div className="flex gap-2">
@@ -314,6 +363,39 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                         <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">{cred.type}</span>
                                     </label>
                                 ))
+                            )}
+                        </div>
+                    )}
+
+                    {tab === 'environments' && (
+                        <div className="space-y-1">
+                            {allEnvs.filter(env => envType === 'test' ? env.isTest : true).length === 0 ? (
+                                <p className="text-sm text-gray-400 py-4 text-center">No environments available</p>
+                            ) : (
+                                allEnvs
+                                    .filter(env => envType === 'test' ? env.isTest : true)
+                                    .map(env => (
+                                        <label
+                                            key={env.id}
+                                            className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedEnvs.has(env.id)}
+                                                onChange={() => toggleEnv(env.id)}
+                                                className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                                            />
+                                            <span className="text-sm text-gray-900 flex-1">{env.name}</span>
+                                            <span className={`text-xs px-1.5 py-0.5 rounded ${
+                                                env.isTest
+                                                    ? 'bg-amber-50 text-amber-600'
+                                                    : 'bg-blue-50 text-blue-600'
+                                            }`}>
+                                                {env.isTest ? 'test' : 'prod'}
+                                            </span>
+                                            <span className="text-xs text-gray-400 font-mono">{env.apiServer}</span>
+                                        </label>
+                                    ))
                             )}
                         </div>
                     )}

@@ -261,6 +261,7 @@ export const workspaces = mysqlTable("workspaces", {
   userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id, { onDelete: "cascade" }),
   name: varchar("name", { length: 100 }).notNull(),
   isDefault: boolean("is_default").notNull().default(false),
+  envType: varchar("env_type", { length: 10 }).notNull().default("prod"),
   configJson: json("config_json").$type<{
     defaultModel?: { provider: string; modelId: string };
     systemPrompt?: string;
@@ -318,6 +319,7 @@ export const environments = mysqlTable("environments", {
   id: varchar("id", { length: 64 }).primaryKey(),
   name: varchar("name", { length: 255 }).notNull(),
   isTest: boolean("is_test").notNull().default(false),
+  apiServer: varchar("api_server", { length: 512 }).notNull(),
   allowedServers: text("allowed_servers"),  // JSON array: ["10.0.0.1","k8s.example.com"]
   defaultKubeconfig: text("default_kubeconfig"),  // nullable, only when isTest=true
   createdBy: varchar("created_by", { length: 32 }),

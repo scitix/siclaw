@@ -1,4 +1,4 @@
-import { X, Save, Terminal, FileKey, Globe, KeyRound, ShieldCheck } from 'lucide-react';
+import { X, Save, Terminal, Globe, KeyRound, ShieldCheck } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { Credential, CredentialType } from '../credentialData';
 import { CREDENTIAL_TYPE_OPTIONS } from '../credentialData';
@@ -25,7 +25,6 @@ interface CredentialDrawerProps {
 const TYPE_ICONS: Record<CredentialType, typeof Terminal> = {
     ssh_password: Terminal,
     ssh_key: ShieldCheck,
-    kubeconfig: FileKey,
     api_token: Globe,
     api_basic_auth: KeyRound,
 };
@@ -49,9 +48,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
     const [sshKeyUsername, setSshKeyUsername] = useState('');
     const [sshKeyPrivateKey, setSshKeyPrivateKey] = useState('');
     const [sshKeyPassphrase, setSshKeyPassphrase] = useState('');
-
-    // Kubeconfig fields
-    const [kubeContent, setKubeContent] = useState('');
 
     // API Token fields
     const [tokenUrl, setTokenUrl] = useState('');
@@ -88,9 +84,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                         setSshKeyPrivateKey('');
                         setSshKeyPassphrase('');
                         break;
-                    case 'kubeconfig':
-                        setKubeContent('');
-                        break;
                     case 'api_token':
                         setTokenUrl((cfg.url as string) ?? '');
                         setTokenValue('');
@@ -114,7 +107,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                 setSshKeyUsername('');
                 setSshKeyPrivateKey('');
                 setSshKeyPassphrase('');
-                setKubeContent('');
                 setTokenUrl('');
                 setTokenValue('');
                 setBasicUrl('');
@@ -139,8 +131,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                 if (sshKeyPassphrase) cfg.passphrase = sshKeyPassphrase;
                 return cfg;
             }
-            case 'kubeconfig':
-                return { content: kubeContent };
             case 'api_token':
                 return { url: tokenUrl, token: tokenValue };
             case 'api_basic_auth':
@@ -155,8 +145,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                 return !!(sshUsername && (isEditing || sshPassword));
             case 'ssh_key':
                 return !!(sshKeyUsername && (isEditing || sshKeyPrivateKey));
-            case 'kubeconfig':
-                return isEditing || !!kubeContent;
             case 'api_token':
                 return !!(tokenUrl && (isEditing || tokenValue));
             case 'api_basic_auth':
@@ -178,7 +166,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                 const cfg = buildConfigJson();
                 const hasNewSecrets = type === 'ssh_password' ? !!sshPassword
                     : type === 'ssh_key' ? !!sshKeyPrivateKey
-                    : type === 'kubeconfig' ? !!kubeContent
                     : type === 'api_token' ? !!tokenValue
                     : !!basicPassword;
                 if (hasNewSecrets) {
@@ -405,24 +392,6 @@ export function CredentialDrawer({ credential, isOpen, onClose, onSave, onUpdate
                                             className="w-full px-3 py-2 bg-white border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                                         />
                                     </div>
-                                </div>
-                            )}
-
-                            {type === 'kubeconfig' && (
-                                <div className="space-y-1.5">
-                                    <label className="text-sm font-medium text-gray-700">
-                                        Kubeconfig Content <span className="text-red-500">*</span>
-                                    </label>
-                                    {isEditing && (
-                                        <p className="text-xs text-gray-400">Kubeconfig is stored. Paste new content to replace it.</p>
-                                    )}
-                                    <textarea
-                                        value={kubeContent}
-                                        onChange={(e) => setKubeContent(e.target.value)}
-                                        placeholder={isEditing ? '(unchanged) Paste new kubeconfig to replace...' : 'Paste kubeconfig YAML content...'}
-                                        rows={12}
-                                        className="w-full px-3 py-2 bg-white border border-gray-200 rounded-lg text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 resize-none"
-                                    />
                                 </div>
                             )}
 

@@ -34,7 +34,7 @@ export class WorkspaceRepository {
     return rows[0] ?? null;
   }
 
-  async getOrCreateDefault(userId: string): Promise<Workspace> {
+  async getOrCreateDefault(userId: string, envType?: string): Promise<Workspace> {
     // Check if default workspace exists
     const rows = await this.db
       .select()
@@ -50,6 +50,7 @@ export class WorkspaceRepository {
       userId,
       name: "Default",
       isDefault: true,
+      envType: envType ?? "prod",
     });
 
     const created = await this.getById(id);
@@ -60,6 +61,7 @@ export class WorkspaceRepository {
     userId: string,
     name: string,
     configJson?: Workspace["configJson"],
+    envType?: string,
   ): Promise<Workspace> {
     const id = crypto.randomUUID();
     await this.db.insert(workspaces).values({
@@ -67,6 +69,7 @@ export class WorkspaceRepository {
       userId,
       name,
       isDefault: false,
+      envType: envType ?? "prod",
       configJson: configJson ?? null,
     });
     return (await this.getById(id))!;
@@ -74,11 +77,12 @@ export class WorkspaceRepository {
 
   async update(
     id: string,
-    data: { name?: string; configJson?: Workspace["configJson"] },
+    data: { name?: string; configJson?: Workspace["configJson"]; envType?: string },
   ): Promise<void> {
     const updates: Record<string, unknown> = {};
     if (data.name !== undefined) updates.name = data.name;
     if (data.configJson !== undefined) updates.configJson = data.configJson;
+    if (data.envType !== undefined) updates.envType = data.envType;
     if (Object.keys(updates).length === 0) return;
     updates.updatedAt = new Date();
 

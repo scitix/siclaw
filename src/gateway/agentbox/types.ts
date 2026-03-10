@@ -21,8 +21,8 @@ export interface AgentBoxConfig {
     cpu?: string;
     memory?: string;
   };
-  /** Pod environment type — determines which skills are available via bundle API */
-  podEnv?: "prod" | "dev";
+  /** Pod environment type — encoded in mTLS cert, determines credential/skill scoping */
+  podEnv?: "prod" | "dev" | "test";
 }
 
 /** AgentBox information */
