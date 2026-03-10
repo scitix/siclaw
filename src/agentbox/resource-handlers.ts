@@ -40,15 +40,12 @@ export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
 
   async materialize(payload: McpPayload): Promise<number> {
     const config = loadConfig();
-    const merged: Record<string, unknown> = {};
-    // Preserve existing mcpServers from settings.json as base
-    if (config.mcpServers) Object.assign(merged, config.mcpServers);
-    // Gateway payload overwrites
-    if (payload?.mcpServers) Object.assign(merged, payload.mcpServers);
-
-    config.mcpServers = merged;
+    // Gateway payload is the source of truth — replace, not merge.
+    // Object.assign would keep stale keys when Gateway returns {} (all disabled).
+    const mcpServers = payload?.mcpServers ?? {};
+    config.mcpServers = mcpServers;
     writeConfig(config);
-    return Object.keys(merged).length;
+    return Object.keys(mcpServers).length;
   },
 
   async postReload(): Promise<void> {
