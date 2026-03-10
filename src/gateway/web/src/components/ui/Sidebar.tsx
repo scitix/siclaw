@@ -15,7 +15,6 @@ import {
     Cpu,
     Compass,
     // BrainCircuit,  // hidden until claude-sdk brain is polished
-    KeyRound,
     Globe,
     Wrench,
     BarChart3,
@@ -67,8 +66,7 @@ const groups: NavGroup[] = [
             { icon: Share2, label: 'Channels', to: '/channels', adminOnly: true },
             // { icon: BrainCircuit, label: 'Brains', to: '/brains' },  // hidden until claude-sdk brain is polished
             { icon: Cpu, label: 'Models', to: '/models', adminOnly: true },
-            { icon: KeyRound, label: 'Credentials', to: '/credentials' },
-            { icon: Globe, label: 'Environments', to: '/environments', adminOnly: true },
+            { icon: Globe, label: 'Environments', to: '/environments' },
             { icon: Shield, label: 'Permissions', to: '/permissions', adminOnly: true },
             { icon: Wrench, label: 'System', to: '/settings/system', adminOnly: true },
         ],

@@ -3223,18 +3223,38 @@ export function createRpcMethods(
   // ─────────────────────────────────────────────────
 
   methods.set("environment.list", async (_params, context: RpcContext) => {
-    requireAdmin(context);
-    if (!envRepo) return { environments: [] };
+    const userId = requireAuth(context);
+    if (!envRepo) return { environments: [], isAdmin: false };
 
-    const envs = await envRepo.list();
+    const isAdmin = context.auth?.username === "admin";
+
+    // Check testOnly
+    let isTestOnly = false;
+    if (userRepo) {
+      const dbUser = await userRepo.getById(userId);
+      isTestOnly = dbUser?.testOnly ?? false;
+    }
+
+    const allEnvs = await envRepo.list();
+    const visibleEnvs = isTestOnly ? allEnvs.filter((e) => e.isTest) : allEnvs;
+
+    // Fetch user's kubeconfig status
+    const userConfigs = userEnvConfigRepo ? await userEnvConfigRepo.listForUser(userId) : [];
+    const configMap = new Map(userConfigs.map((c) => [c.envId, c]));
+
     return {
-      environments: envs.map((e) => ({
+      isAdmin,
+      environments: visibleEnvs.map((e) => ({
         id: e.id,
         name: e.name,
         isTest: e.isTest,
         apiServer: e.apiServer,
         allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
         hasDefaultKubeconfig: !!e.defaultKubeconfig,
+        // Only expose defaultKubeconfig content to admins (never to non-admin)
+        ...(isAdmin ? {} : {}),
+        hasUserKubeconfig: configMap.has(e.id),
+        userConfigUpdatedAt: configMap.get(e.id)?.updatedAt?.toISOString?.() ?? configMap.get(e.id)?.updatedAt ?? null,
         createdBy: e.createdBy,
         createdAt: e.createdAt,
         updatedAt: e.updatedAt,
@@ -3301,7 +3321,37 @@ export function createRpcMethods(
       throw new Error("defaultKubeconfig can only be set for test environments");
     }
 
+    const oldApiServer = existing.apiServer;
     await envRepo.save({ id, name, isTest, apiServer, allowedServers, defaultKubeconfig });
+
+    // If apiServer changed, invalidate mismatched user kubeconfigs
+    if (userEnvConfigRepo && apiServer !== oldApiServer) {
+      const fullConfigs = await userEnvConfigRepo.listFullForEnv(id);
+      const affectedUserIds = new Set<string>();
+
+      for (const cfg of fullConfigs) {
+        try {
+          const parsed = yaml.load(cfg.kubeconfig) as Record<string, unknown>;
+          const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+          const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
+          const matches = servers.some((s) => s.includes(apiServer) || apiServer.includes(s));
+          if (!matches) {
+            await userEnvConfigRepo.remove(cfg.userId, id);
+            affectedUserIds.add(cfg.userId);
+          }
+        } catch {
+          // If kubeconfig can't be parsed, remove it as invalid
+          await userEnvConfigRepo.remove(cfg.userId, id);
+          affectedUserIds.add(cfg.userId);
+        }
+      }
+
+      // Push updated credentials to affected users
+      for (const uid of affectedUserIds) {
+        pushCredentialsToUser(uid);
+      }
+    }
+
     return { status: "updated" };
   });
 
@@ -3315,9 +3365,20 @@ export function createRpcMethods(
     const existing = await envRepo.getById(id);
     if (!existing) throw new Error("Environment not found");
 
-    // Explicit cleanup (FK CASCADE should handle, but be safe)
-    if (userEnvConfigRepo) await userEnvConfigRepo.removeAllForEnv(id);
+    // Collect affected users before cleanup
+    const affectedUserIds = new Set<string>();
+    if (userEnvConfigRepo) {
+      const envConfigs = await userEnvConfigRepo.listForEnv(id);
+      for (const c of envConfigs) affectedUserIds.add(c.userId);
+      await userEnvConfigRepo.removeAllForEnv(id);
+    }
+
     await envRepo.delete(id);
+
+    // Push updated credentials to all affected users
+    for (const uid of affectedUserIds) {
+      pushCredentialsToUser(uid);
+    }
 
     return { status: "deleted" };
   });
