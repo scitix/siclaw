@@ -143,7 +143,7 @@ export class AgentBoxSessionManager {
       console.warn(`[agentbox-session] Shared memory indexer init failed:`, err);
       this._sharedMemoryIndexer = null;
     }
-    // MCP is initialized per-session inside createSiclawSession via loadMcpServersConfig.
+    // MCP is initialized per-session inside createSiclawSession via loadConfig().mcpServers.
   }
 
   /**

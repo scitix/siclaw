@@ -11,8 +11,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { loadMcpServersConfig } from "../core/mcp-client.js";
-import { loadConfig, reloadConfig } from "../core/config.js";
+import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import type {
   ResourceType,
   AgentBoxResourceHandler,
@@ -40,21 +39,12 @@ export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
   },
 
   async materialize(payload: McpPayload): Promise<number> {
-    // Merge local seed with remote
-    const localMcp = loadMcpServersConfig(undefined, { localOnly: true });
-    const merged: Record<string, unknown> = {};
-    if (localMcp?.mcpServers) Object.assign(merged, localMcp.mcpServers);
-    if (payload?.mcpServers) Object.assign(merged, payload.mcpServers);
-
-    const mcpDir = process.env.SICLAW_MCP_DIR || path.resolve(process.cwd(), ".siclaw", "mcp");
-    if (!process.env.SICLAW_MCP_DIR) process.env.SICLAW_MCP_DIR = mcpDir;
-    if (!fs.existsSync(mcpDir)) fs.mkdirSync(mcpDir, { recursive: true });
-    fs.writeFileSync(
-      path.resolve(mcpDir, "mcp-servers.json"),
-      JSON.stringify({ mcpServers: merged }, null, 2),
-      "utf-8",
-    );
-    return Object.keys(merged).length;
+    const config = loadConfig();
+    // Gateway payload is the source of truth — replace, not merge.
+    // Object.assign would keep stale keys when Gateway returns {} (all disabled).
+    const mcpServers = payload?.mcpServers ?? {};
+    writeConfig({ ...config, mcpServers });
+    return Object.keys(mcpServers).length;
   },
 
   async postReload(): Promise<void> {

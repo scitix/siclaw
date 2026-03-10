@@ -195,6 +195,9 @@ export class K8sSpawner implements BoxSpawner {
               "chown -R 1000:1002 /app/.siclaw/credentials",
               "chmod 0750 /app/.siclaw/credentials",
               "find /app/.siclaw/credentials -type f -exec chmod 0640 {} \\;",
+              // Config dir: agentbox:agentbox 0700 (settings.json written at runtime)
+              "chown -R 1000:1000 /app/.siclaw/config",
+              "chmod 0700 /app/.siclaw/config",
               // Skills dir: agentbox:agentbox 0755 (sandbox can read)
               "chown -R 1000:1000 /app/.siclaw/skills",
               "chmod 0755 /app/.siclaw/skills",
@@ -204,6 +207,7 @@ export class K8sSpawner implements BoxSpawner {
             ].join(" && ")],
             volumeMounts: [
               { name: "credentials", mountPath: "/app/.siclaw/credentials" },
+              { name: "config", mountPath: "/app/.siclaw/config" },
               { name: "skills-local", mountPath: "/app/.siclaw/skills" },
               { name: "user-data", mountPath: "/app/.siclaw/user-data" },
             ],
@@ -212,6 +216,10 @@ export class K8sSpawner implements BoxSpawner {
         volumes: [
           {
             name: "credentials",
+            emptyDir: {},
+          },
+          {
+            name: "config",
             emptyDir: {},
           },
           {
@@ -252,6 +260,10 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "credentials",
                 mountPath: "/app/.siclaw/credentials",
+              },
+              {
+                name: "config",
+                mountPath: "/app/.siclaw/config",
               },
               {
                 name: "skills-local",

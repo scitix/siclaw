@@ -22,7 +22,7 @@ import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
-import { loadMcpServersConfig } from "../core/mcp-client.js";
+import { loadConfig } from "../core/config.js";
 import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
@@ -1239,7 +1239,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             (async () => {
               try {
-                const localConfig = loadMcpServersConfig(undefined, { localOnly: true });
+                const config = loadConfig();
+                const localConfig = Object.keys(config.mcpServers).length > 0
+                  ? { mcpServers: config.mcpServers }
+                  : null;
                 const mcpRepo = db ? new McpServerRepository(db) : null;
                 const merged = await buildMergedMcpConfig(localConfig, mcpRepo);
 
