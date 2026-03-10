@@ -82,4 +82,12 @@ export class UserEnvConfigRepository {
       .from(userEnvConfigs)
       .where(eq(userEnvConfigs.envId, envId));
   }
+
+  /** Get full records (including kubeconfig) for all users with configs for the given envId */
+  async listFullForEnv(envId: string) {
+    return this.db
+      .select()
+      .from(userEnvConfigs)
+      .where(eq(userEnvConfigs.envId, envId));
+  }
 }
