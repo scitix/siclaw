@@ -216,12 +216,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   }
   if (db) metricsAggregator.setDb(db);
 
-  // Apply DB-stored agentbox image override (takes effect on next pod spawn)
-  if (sysConfigRepo) {
-    const img = await sysConfigRepo.get("system.agentboxImage");
-    if (img) agentBoxManager.setSpawnerImage(img);
-  }
-
   // CSP frame-src cache for Grafana iframe embedding
   let cachedFrameSrc: string | null = null;
   const refreshCspCache = async () => {
