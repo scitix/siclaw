@@ -56,10 +56,13 @@ export class ConfigRepository {
 
   // ─── Cron Jobs ────────────────────────────────
 
-  async listCronJobs(userId: string, envId?: string) {
+  async listCronJobs(userId: string, opts?: { envId?: string; workspaceId?: string }) {
     const conditions = [eq(cronJobs.userId, userId)];
-    if (envId !== undefined) {
-      conditions.push(eq(cronJobs.envId, envId));
+    if (opts?.envId !== undefined) {
+      conditions.push(eq(cronJobs.envId, opts.envId));
+    }
+    if (opts?.workspaceId !== undefined) {
+      conditions.push(eq(cronJobs.workspaceId, opts.workspaceId));
     }
     return this.db
       .select()
@@ -77,6 +80,7 @@ export class ConfigRepository {
       skillId?: string;
       status?: "active" | "paused";
       envId?: string | null;
+      workspaceId?: string | null;
     },
   ) {
     const id = job.id || crypto.randomUUID();
@@ -98,6 +102,7 @@ export class ConfigRepository {
           skillId: job.skillId ?? null,
           status: job.status ?? "active",
           envId: job.envId ?? null,
+          workspaceId: job.workspaceId ?? null,
         })
         .where(eq(cronJobs.id, id));
     } else {
@@ -110,6 +115,7 @@ export class ConfigRepository {
         skillId: job.skillId ?? null,
         status: job.status ?? "active",
         envId: job.envId ?? null,
+        workspaceId: job.workspaceId ?? null,
       });
     }
     return id;
@@ -264,6 +270,47 @@ export class ConfigRepository {
       .select()
       .from(cronJobs)
       .where(and(eq(cronJobs.status, "active"), isNull(cronJobs.assignedTo)));
+  }
+
+  /** Atomically lock a job for execution — returns true if locked by us */
+  async lockJobForExecution(jobId: string, executionId: string): Promise<boolean> {
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: executionId, lockedAt: new Date() })
+      .where(
+        and(eq(cronJobs.id, jobId), isNull(cronJobs.lockedBy)),
+      );
+    // Verify by reading back (same pattern as claimUnassignedJob)
+    const row = await this.db
+      .select({ lockedBy: cronJobs.lockedBy })
+      .from(cronJobs)
+      .where(eq(cronJobs.id, jobId))
+      .limit(1);
+    return row[0]?.lockedBy === executionId;
+  }
+
+  /** Unlock a job after execution (only if still locked by us) */
+  async unlockJob(jobId: string, executionId: string): Promise<void> {
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: null, lockedAt: null })
+      .where(
+        and(eq(cronJobs.id, jobId), eq(cronJobs.lockedBy, executionId)),
+      );
+  }
+
+  /** Clear locks older than thresholdMs (stale lock cleanup) */
+  async clearStaleLocks(thresholdMs: number): Promise<void> {
+    const cutoff = new Date(Date.now() - thresholdMs);
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: null, lockedAt: null })
+      .where(
+        and(
+          sql`${cronJobs.lockedBy} IS NOT NULL`,
+          sql`${cronJobs.lockedAt} <= ${cutoff}`,
+        ),
+      );
   }
 
   // ─── Triggers ─────────────────────────────────

@@ -5,6 +5,7 @@
  * which is the single owner of all AgentBox lifecycles.
  */
 
+import crypto from "node:crypto";
 import type { GatewayClient } from "./gateway-client.js";
 import type { CronJobRow } from "./cron-scheduler.js";
 
@@ -27,9 +28,18 @@ export class CronExecutor {
       return;
     }
 
+    // Acquire execution lock (idempotency guard)
+    const executionId = crypto.randomUUID();
+    const locked = await this.client.lockJobForExecution(job.id, executionId);
+    if (!locked) {
+      console.log(`[cron-executor] Job ${job.id} already locked by another executor, skipping`);
+      return;
+    }
+
     // Use fresh DB record for execution (envId may have been updated since scheduler loaded)
     const envId = current.envId ?? undefined;
-    console.log(`[cron-executor] Executing job ${job.id} (${job.name}) for user ${job.userId}${envId ? ` env=${envId}` : ""}`);
+    const workspaceId = current.workspaceId ?? undefined;
+    console.log(`[cron-executor] Executing job ${job.id} (${job.name}) for user ${job.userId}${envId ? ` env=${envId}` : ""}${workspaceId ? ` ws=${workspaceId}` : ""}`);
 
     try {
       const sessionId = `cron-${job.id}`;
@@ -45,6 +55,7 @@ export class CronExecutor {
           timeoutMs: EXECUTION_TIMEOUT_MS,
           caller: "cron",
           envId,
+          workspaceId,
         }),
         signal: AbortSignal.timeout(EXECUTION_TIMEOUT_MS + 10_000), // HTTP timeout slightly longer
       });
@@ -72,6 +83,13 @@ export class CronExecutor {
       console.error(`[cron-executor] Job ${job.id} failed:`, err);
       await this.client.updateCronJobRun(job.id, "failure");
       this.notifyGateway(job, "failure", "", err instanceof Error ? err.message : String(err));
+    } finally {
+      // Release execution lock (best-effort)
+      try {
+        await this.client.unlockJob(job.id, executionId);
+      } catch (err) {
+        console.warn(`[cron-executor] Failed to unlock job ${job.id}:`, err instanceof Error ? err.message : err);
+      }
     }
   }
 

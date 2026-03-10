@@ -41,6 +41,7 @@ export interface SchedulePanelProps {
     onClose: () => void;
     updateMessageMeta: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     selectedEnvId?: string | null;
+    selectedWorkspaceId?: string | null;
 }
 
 /** Look up a schedule by ID or name via cron.list (fuzzy name matching) */
@@ -78,7 +79,7 @@ async function resolveSchedule(
     }
 }
 
-export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, updateMessageMeta, selectedEnvId }: SchedulePanelProps) {
+export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, updateMessageMeta, selectedEnvId, selectedWorkspaceId }: SchedulePanelProps) {
     const metaState = (message.metadata as Record<string, unknown> | undefined)?.scheduleCard as string | undefined;
     const initialState: SaveState = (metaState === 'saved' || metaState === 'dismissed') ? 'saved' : 'idle';
 
@@ -174,6 +175,7 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
                     schedule: scheduleInfo.schedule,
                     status: scheduleInfo.status || 'active',
                     envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (isUpdate && scheduleInfo) {
                 const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);
@@ -185,6 +187,7 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
                     schedule: scheduleInfo.schedule,
                     status: scheduleInfo.status || 'active',
                     envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (isDelete) {
                 const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);

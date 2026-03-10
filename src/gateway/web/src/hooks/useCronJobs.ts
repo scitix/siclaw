@@ -33,6 +33,7 @@ export function useCronJobs(
         skillId: job.skillId,
         status: job.status,
         envId: job.envId ?? null,
+        workspaceId: job.workspaceId ?? null,
       },
     );
     await loadJobs();

@@ -663,6 +663,27 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
               return;
             }
 
+            if (cronPath === "lock-job") {
+              const locked = await configRepo.lockJobForExecution(data.jobId, data.executionId);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ locked }));
+              return;
+            }
+
+            if (cronPath === "unlock-job") {
+              await configRepo.unlockJob(data.jobId, data.executionId);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "ok" }));
+              return;
+            }
+
+            if (cronPath === "clear-stale-locks") {
+              await configRepo.clearStaleLocks(data.thresholdMs);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "ok" }));
+              return;
+            }
+
             res.writeHead(404, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Unknown cron POST endpoint" }));
           } catch (err) {
@@ -794,10 +815,13 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       req.on("end", async () => {
         const startTime = Date.now();
         let userId = "";
+        let client: AgentBoxClient | null = null;
+        let sessionId: string | undefined;
         try {
           const data = JSON.parse(body) as {
             userId: string; sessionId: string; text: string;
             timeoutMs?: number; caller?: string; envId?: string;
+            workspaceId?: string;
           };
           userId = data.userId;
           const timeoutMs = data.timeoutMs || 300_000;
@@ -812,25 +836,39 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           console.log(`[gateway] agent-prompt from=${caller} user=${userId} session=${data.sessionId}`);
 
           // 1. Get or create user's AgentBox (resolve real workspace ID from DB)
-          if (!internalWorkspaceRepo) throw new Error("Database not available");
-          const wsId = (await internalWorkspaceRepo.getOrCreateDefault(userId)).id;
+          if (!data.workspaceId && !internalWorkspaceRepo) throw new Error("Database not available");
+          const wsId = data.workspaceId || (await internalWorkspaceRepo!.getOrCreateDefault(userId)).id;
           const handle = await agentBoxManager.getOrCreate(userId, wsId);
-          const client = new AgentBoxClient(handle.endpoint);
+          client = new AgentBoxClient(handle.endpoint);
 
           // 2. Send prompt
           const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
+          sessionId = promptResult.sessionId;
 
-          // 3. Wait for completion with timeout
-          const resultText = await Promise.race([
-            waitForAgentCompletion(client, promptResult.sessionId),
-            rejectAfterTimeout(timeoutMs, data.sessionId),
-          ]);
+          // 3. Wait for completion with cancellable timeout
+          const timeout = rejectAfterTimeout(timeoutMs, data.sessionId);
+          try {
+            const resultText = await Promise.race([
+              waitForAgentCompletion(client, promptResult.sessionId),
+              timeout.promise,
+            ]);
 
-          const durationMs = Date.now() - startTime;
-          console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
+            timeout.cancel();
+            const durationMs = Date.now() - startTime;
+            console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "success", resultText, durationMs }));
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "success", resultText, durationMs }));
+          } catch (innerErr) {
+            timeout.cancel();
+            // On timeout, attempt to abort + close the orphaned agent session
+            if (client && sessionId && innerErr instanceof Error && innerErr.message.includes("timed out")) {
+              try { await client.abortSession(sessionId); } catch { /* best-effort */ }
+              try { await client.closeSession(sessionId); } catch { /* best-effort */ }
+              console.log(`[gateway] agent-prompt session=${sessionId} aborted after timeout`);
+            }
+            throw innerErr;
+          }
         } catch (err) {
           const durationMs = Date.now() - startTime;
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -1327,11 +1365,17 @@ async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string)
   return resultText;
 }
 
-/** Returns a promise that rejects after the given timeout */
-function rejectAfterTimeout(ms: number, sessionId: string): Promise<never> {
-  return new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`)), ms),
-  );
+/** Returns a cancellable promise that rejects after the given timeout */
+function rejectAfterTimeout(ms: number, sessionId: string): { promise: Promise<never>; cancel: () => void } {
+  let timer: NodeJS.Timeout | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`)), ms);
+    timer.unref();
+  });
+  return {
+    promise,
+    cancel: () => { if (timer) clearTimeout(timer); },
+  };
 }
 
 /**

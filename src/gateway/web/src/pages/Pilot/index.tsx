@@ -239,6 +239,7 @@ export function PilotPage() {
                             onClose={() => setPanelMessage(null)}
                             updateMessageMeta={pilot.updateMessageMeta}
                             selectedEnvId={currentWorkspace?.id ?? null}
+                            selectedWorkspaceId={currentWorkspace?.id ?? null}
                         />
                     );
                 }

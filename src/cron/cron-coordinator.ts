@@ -13,6 +13,7 @@ import type { CronScheduler } from "./cron-scheduler.js";
 const HEARTBEAT_INTERVAL_MS = 30_000; // 30s
 const RECONCILE_INTERVAL_MS = 60_000; // 60s
 const DEAD_THRESHOLD_MS = 90_000; // 90s
+const STALE_LOCK_THRESHOLD_MS = 6 * 60 * 1000; // 6 min (slightly > 5min execution timeout)
 
 export class CronCoordinator {
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -111,6 +112,13 @@ export class CronCoordinator {
 
   /** Detect dead instances and claim their orphaned jobs */
   private async reconcile(): Promise<void> {
+    // 0. Clear stale execution locks (from crashed executors)
+    try {
+      await this.configRepo.clearStaleLocks(STALE_LOCK_THRESHOLD_MS);
+    } catch (err) {
+      console.warn("[coordinator] clearStaleLocks failed:", err);
+    }
+
     // 1. Find dead instances
     const deadInstances = await this.configRepo.getDeadInstances(
       DEAD_THRESHOLD_MS,

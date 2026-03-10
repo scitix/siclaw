@@ -2551,12 +2551,13 @@ export function createRpcMethods(
     notifyCronServiceImpl(payload, configRepo);
   }
 
-  methods.set("cron.list", async (_params, context: RpcContext) => {
+  methods.set("cron.list", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
 
     if (!configRepo) return { jobs: [] };
 
-    const rows = await configRepo.listCronJobs(userId);
+    const workspaceId = params.workspaceId as string | undefined;
+    const rows = await configRepo.listCronJobs(userId, workspaceId ? { workspaceId } : undefined);
 
     return {
       jobs: rows.map((r) => ({
@@ -2581,6 +2582,7 @@ export function createRpcMethods(
     const existingJob = existingId ? await configRepo.getCronJobById(existingId) : null;
 
     const envId = params.envId as string | null | undefined;
+    const workspaceId = params.workspaceId as string | null | undefined;
 
     const id = await configRepo.saveCronJob(userId, {
       id: existingId,
@@ -2590,6 +2592,7 @@ export function createRpcMethods(
       skillId: params.skillId as string | undefined,
       status,
       envId: envId ?? null,
+      workspaceId: workspaceId ?? null,
     });
 
     if (status === "paused") {
@@ -2621,6 +2624,7 @@ export function createRpcMethods(
           skillId: params.skillId ?? null, assignedTo,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
           envId: envId ?? null,
+          workspaceId: workspaceId ?? null,
         },
       });
     }
@@ -2672,6 +2676,7 @@ export function createRpcMethods(
       skillId: job.skillId ?? undefined,
       status,
       envId: job.envId ?? null,
+      workspaceId: job.workspaceId ?? null,
     });
 
     // Notify cron service
@@ -2684,6 +2689,7 @@ export function createRpcMethods(
           assignedTo: job.assignedTo ?? null,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
           envId: job.envId ?? null,
+          workspaceId: job.workspaceId ?? null,
         },
       }),
     });
@@ -2715,6 +2721,7 @@ export function createRpcMethods(
       skillId: job.skillId ?? undefined,
       status: job.status as "active" | "paused",
       envId: job.envId ?? null,
+      workspaceId: job.workspaceId ?? null,
     });
 
     // Notify cron service
@@ -2726,6 +2733,7 @@ export function createRpcMethods(
         assignedTo: job.assignedTo ?? null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
         envId: job.envId ?? null,
+        workspaceId: job.workspaceId ?? null,
       },
     });
 

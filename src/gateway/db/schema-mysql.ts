@@ -169,6 +169,7 @@ export const cronJobs = mysqlTable("cron_jobs", {
   lockedBy: varchar("locked_by", { length: 64 }),
   lockedAt: timestamp("locked_at"),
   envId: varchar("env_id", { length: 64 }),
+  workspaceId: varchar("workspace_id", { length: 64 }),
 });
 
 // ─── Cron Instances ─────────────────────────────────

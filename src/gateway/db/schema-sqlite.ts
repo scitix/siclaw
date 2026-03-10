@@ -157,6 +157,7 @@ export const cronJobs = sqliteTable("cron_jobs", {
   lockedBy: text("locked_by"),
   lockedAt: integer("locked_at", { mode: "timestamp" }),
   envId: text("env_id"),
+  workspaceId: text("workspace_id").references(() => workspaces.id),
 });
 
 // ─── Cron Instances ─────────────────────────────────

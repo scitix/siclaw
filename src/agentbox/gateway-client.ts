@@ -22,6 +22,7 @@ export interface CronJob {
   description?: string | null;
   lastRunAt?: string | null;
   lastResult?: string | null;
+  workspaceId?: string | null;
 }
 
 export class GatewayClient {

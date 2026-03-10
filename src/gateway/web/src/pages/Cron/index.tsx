@@ -7,10 +7,12 @@ import type { CronJob } from './cronData';
 import { CronDrawer } from './components/CronDrawer';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { useWorkspace } from '@/contexts/WorkspaceContext';
 
 export function CronPage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { jobs, loading, error, loadJobs, saveJob, deleteJob } = useCronJobs(sendRpc);
+    const { currentWorkspace } = useWorkspace();
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [selectedJob, setSelectedJob] = useState<CronJob | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
@@ -35,7 +37,7 @@ export function CronPage() {
 
     const handleSave = async (updated: Partial<CronJob>) => {
         try {
-            await saveJob(updated);
+            await saveJob({ ...updated, workspaceId: updated.workspaceId ?? currentWorkspace?.id ?? null });
             setIsDrawerOpen(false);
         } catch (err) {
             console.error('[CronPage] Save failed:', err);
