@@ -16,6 +16,7 @@ import { createDb, closeDb, type Database } from "./db/index.js";
 import { initSchema } from "./db/init-schema.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
 import { NotificationRepository } from "./db/repositories/notification-repo.js";
+import { ChatRepository } from "./db/repositories/chat-repo.js";
 import { PermissionRepository } from "./db/repositories/permission-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
@@ -888,6 +889,45 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           res.end(JSON.stringify({ status: "ok", deleted, cutoff: cutoff.toISOString() }));
         } catch (err) {
           console.error("[gateway] notifications/purge error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
+    // Internal session/stats purge endpoint: POST /api/internal/sessions/purge
+    if (url === "/api/internal/sessions/purge" && method === "POST") {
+      if (!db) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Database not available" }));
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", async () => {
+        try {
+          const {
+            softDeleteInactiveDays = 180,
+            statsRetentionDays = 90,
+            hardDeleteAfterDays = 30,
+          } = body ? JSON.parse(body) : {};
+          const chatRepo = new ChatRepository(db);
+
+          // Step 1: soft-delete inactive sessions
+          const softDeleted = await chatRepo.softDeleteInactiveSessions(softDeleteInactiveDays);
+          // Step 2: hard-delete old session_stats
+          const statsPurged = await chatRepo.purgeOldSessionStats(statsRetentionDays);
+          // Step 3: hard-delete soft-deleted sessions (messages cascade)
+          const sessionsPurged = await chatRepo.purgeDeletedSessions(hardDeleteAfterDays);
+
+          console.log(
+            `[gateway] Session purge: softDeleted=${softDeleted}, statsPurged=${statsPurged}, sessionsPurged=${sessionsPurged}`,
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "ok", softDeleted, statsPurged, sessionsPurged }));
+        } catch (err) {
+          console.error("[gateway] sessions/purge error:", err);
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Internal server error" }));
         }

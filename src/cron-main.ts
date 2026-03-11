@@ -77,7 +77,36 @@ purgeOldNotifications();
 const purgeTimer = setInterval(purgeOldNotifications, PURGE_INTERVAL_MS);
 purgeTimer.unref();
 
-// 7. Graceful shutdown — release jobs immediately so other instances can claim them
+// 7. Built-in daily purge: clean up old sessions, messages, and session_stats
+const SESSION_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+async function purgeOldSessions() {
+  try {
+    const resp = await fetch(`${gatewayUrl}/api/internal/sessions/purge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        statsRetentionDays: 90,
+        softDeleteInactiveDays: 180,
+        hardDeleteAfterDays: 30,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const data = (await resp.json()) as Record<string, number>;
+    console.log(
+      `[cron] Session purge: softDeleted=${data.softDeleted}, ` +
+        `statsPurged=${data.statsPurged}, sessionsPurged=${data.sessionsPurged}`,
+    );
+  } catch (err) {
+    console.warn("[cron] Session purge failed:", err instanceof Error ? err.message : err);
+  }
+}
+
+purgeOldSessions();
+const sessionPurgeTimer = setInterval(purgeOldSessions, SESSION_PURGE_INTERVAL_MS);
+sessionPurgeTimer.unref();
+
+// 8. Graceful shutdown — release jobs immediately so other instances can claim them
 async function shutdown() {
   console.log("\n[cron] Shutting down...");
   scheduler.stop();

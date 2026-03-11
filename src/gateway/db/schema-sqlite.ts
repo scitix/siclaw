@@ -61,7 +61,7 @@ export const messages = sqliteTable("messages", {
   id: text("id").primaryKey(),
   sessionId: text("session_id")
     .notNull()
-    .references(() => sessions.id),
+    .references(() => sessions.id, { onDelete: "cascade" }),
   role: text("role").notNull(), // "user" | "assistant" | "tool"
   content: text("content").notNull(),
   toolName: text("tool_name"),
