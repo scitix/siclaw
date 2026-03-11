@@ -3,9 +3,9 @@
  */
 
 import crypto from "node:crypto";
-import { eq, desc, asc, and, lt, isNull, sql } from "drizzle-orm";
+import { eq, desc, and, lt, lte, gte, isNull, or, like, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { sessions, messages } from "../schema.js";
+import { sessions, messages, users } from "../schema.js";
 
 export class ChatRepository {
   constructor(private db: Database) {}
@@ -106,6 +106,9 @@ export class ChatRepository {
     toolName?: string;
     toolInput?: string;
     metadata?: Record<string, unknown>;
+    userId?: string;
+    outcome?: "success" | "error" | "blocked";
+    durationMs?: number;
   }) {
     const id = crypto.randomUUID();
     await this.db.insert(messages).values({
@@ -116,8 +119,75 @@ export class ChatRepository {
       toolName: msg.toolName ?? null,
       toolInput: msg.toolInput ?? null,
       metadata: msg.metadata ?? null,
+      userId: msg.userId ?? null,
+      outcome: msg.outcome ?? null,
+      durationMs: msg.durationMs ?? null,
     });
     return id;
+  }
+
+  async getMessageById(messageId: string) {
+    const rows = await this.db
+      .select()
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  async queryAuditLogs(opts: {
+    userId?: string;
+    userName?: string;
+    toolName?: string;
+    outcome?: string;
+    startDate?: number;
+    endDate?: number;
+    cursorTs?: number;
+    cursorId?: string;
+    limit: number;
+  }) {
+    const conditions = [eq(messages.role, "tool")];
+
+    if (opts.userId) conditions.push(eq(messages.userId, opts.userId));
+    if (opts.userName) {
+      const escaped = opts.userName.replace(/[%_]/g, "\\$&");
+      conditions.push(like(users.username, `%${escaped}%`));
+    }
+    if (opts.toolName) conditions.push(eq(messages.toolName, opts.toolName));
+    if (opts.outcome) conditions.push(eq(messages.outcome, opts.outcome));
+    if (opts.startDate) conditions.push(gte(messages.timestamp, new Date(opts.startDate * 1000)));
+    if (opts.endDate) conditions.push(lte(messages.timestamp, new Date(opts.endDate * 1000)));
+
+    if (opts.cursorTs != null) {
+      const cursorDate = new Date(opts.cursorTs * 1000);
+      if (opts.cursorId) {
+        conditions.push(
+          or(
+            lt(messages.timestamp, cursorDate),
+            and(eq(messages.timestamp, cursorDate), lt(messages.id, opts.cursorId)),
+          )!,
+        );
+      } else {
+        conditions.push(lt(messages.timestamp, cursorDate));
+      }
+    }
+
+    return this.db
+      .select({
+        id: messages.id,
+        userId: messages.userId,
+        userName: users.username,
+        toolName: messages.toolName,
+        toolInput: messages.toolInput,
+        outcome: messages.outcome,
+        durationMs: messages.durationMs,
+        timestamp: messages.timestamp,
+      })
+      .from(messages)
+      .leftJoin(users, eq(messages.userId, users.id))
+      .where(and(...conditions))
+      .orderBy(desc(messages.timestamp), desc(messages.id))
+      .limit(opts.limit + 1);
   }
 
   async updateMetadata(

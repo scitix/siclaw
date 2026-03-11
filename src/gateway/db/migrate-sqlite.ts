@@ -50,7 +50,10 @@ const DDL_STATEMENTS = [
     tool_name TEXT,
     tool_input TEXT,
     metadata TEXT,
-    timestamp INTEGER NOT NULL DEFAULT (unixepoch())
+    timestamp INTEGER NOT NULL DEFAULT (unixepoch()),
+    user_id TEXT,
+    outcome TEXT,
+    duration_ms INTEGER
   )`,
 
   `CREATE TABLE IF NOT EXISTS skills (
@@ -357,6 +360,8 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_created ON session_stats(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_user ON session_stats(user_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_audit ON messages(role, user_id, timestamp, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_tool_name ON messages(tool_name)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
@@ -370,27 +375,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     sdb.run(sql.raw(ddl));
   }
 
-  for (const ddl of INDEX_STATEMENTS) {
-    sdb.run(sql.raw(ddl));
-  }
-
-  // Trigger: auto-update updated_at on mcp_servers UPDATE (mirrors MySQL ON UPDATE CURRENT_TIMESTAMP)
-  sdb.run(sql.raw(`
-    CREATE TRIGGER IF NOT EXISTS trg_mcp_servers_updated_at
-    AFTER UPDATE ON mcp_servers
-    FOR EACH ROW
-    BEGIN
-      UPDATE mcp_servers SET updated_at = unixepoch() WHERE id = NEW.id;
-    END
-  `));
-
-  // Seed default embedding config if not present
-  sdb.run(sql.raw(
-    `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)
-     VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
-  ));
-
-  // Schema migrations — handle existing databases missing new columns
+  // Schema migrations — handle existing databases missing new columns.
+  // Must run BEFORE index creation, since some indexes reference new columns.
   const MIGRATIONS = [
     // ADR-011: environment isolation
     `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
@@ -414,6 +400,26 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       // Backfill may fail on empty tables — safe to ignore
     }
   }
+
+  for (const ddl of INDEX_STATEMENTS) {
+    sdb.run(sql.raw(ddl));
+  }
+
+  // Trigger: auto-update updated_at on mcp_servers UPDATE (mirrors MySQL ON UPDATE CURRENT_TIMESTAMP)
+  sdb.run(sql.raw(`
+    CREATE TRIGGER IF NOT EXISTS trg_mcp_servers_updated_at
+    AFTER UPDATE ON mcp_servers
+    FOR EACH ROW
+    BEGIN
+      UPDATE mcp_servers SET updated_at = unixepoch() WHERE id = NEW.id;
+    END
+  `));
+
+  // Seed default embedding config if not present
+  sdb.run(sql.raw(
+    `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)
+     VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
+  ));
 
   // Persist schema changes to disk immediately (sql.js is in-memory)
   flushSqliteDb();

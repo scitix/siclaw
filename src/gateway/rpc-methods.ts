@@ -518,7 +518,9 @@ export function createRpcMethods(
     // Async SSE processing
     (async () => {
       let assistantContent = "";
-      let pendingToolInput = ""; // Capture tool input from start event for DB persistence
+      // Map keyed by toolName to handle parallel tool calls correctly
+      const pendingToolInputs = new Map<string, string>();
+      const pendingToolStartTimes = new Map<string, number>();
       let sseEventCount = 0;
       const sseStartTime = Date.now();
       // Mark user as having an active prompt so WS teardown won't kill the pod
@@ -542,6 +544,7 @@ export function createRpcMethods(
           if (chatRepo && eventType === "tool_execution_end") {
             const toolResult = eventData.result as {
               content?: Array<{ type: string; text?: string }>;
+              details?: { blocked?: boolean; error?: boolean };
             } | undefined;
             const text =
               toolResult?.content
@@ -549,15 +552,33 @@ export function createRpcMethods(
                 .map((c) => c.text ?? "")
                 .join("") ?? "";
             const toolName = (eventData.toolName as string) || "tool";
+
+            // Audit: determine outcome
+            let outcome: "success" | "error" | "blocked" = "success";
+            if (toolResult?.details?.blocked) {
+              outcome = "blocked";
+            } else if (toolResult?.details?.error) {
+              outcome = "error";
+            }
+            const startTime = pendingToolStartTimes.get(toolName);
+            const durationMs = startTime != null
+              ? Date.now() - startTime
+              : undefined;
+            const toolInput = pendingToolInputs.get(toolName) || "";
+
             dbMessageId = await chatRepo.appendMessage({
               sessionId: result.sessionId,
               role: "tool",
               content: redactText(text, redactionConfig),
               toolName,
-              toolInput: pendingToolInput ? redactText(pendingToolInput, redactionConfig) : undefined,
+              toolInput: toolInput ? redactText(toolInput, redactionConfig) : undefined,
+              userId,
+              outcome,
+              durationMs,
             });
             await chatRepo.incrementMessageCount(result.sessionId);
-            pendingToolInput = "";
+            pendingToolInputs.delete(toolName);
+            pendingToolStartTimes.delete(toolName);
           }
 
           // Forward event to frontend via sendToUser (targets all WS connections
@@ -630,9 +651,11 @@ export function createRpcMethods(
                 assistantContent = "";
               }
             } else if (eventType === "tool_execution_start") {
-              // Capture tool input for DB persistence
+              // Capture tool input and start time for DB persistence (keyed by toolName for parallel calls)
+              const startToolName = (eventData.toolName as string) || "tool";
               const args = eventData.args as Record<string, unknown> | undefined;
-              pendingToolInput = args ? JSON.stringify(args) : "";
+              pendingToolInputs.set(startToolName, args ? JSON.stringify(args) : "");
+              pendingToolStartTimes.set(startToolName, Date.now());
             }
             // tool_execution_end already handled above
           }
@@ -4239,6 +4262,75 @@ export function createRpcMethods(
     }
 
     return { totalTokens, totalPrompts, totalSessions, tokenBreakdown, byModel };
+  });
+
+  // ── Audit ──────────────────────────────────────────────────────────
+
+  methods.set("audit.list", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
+
+    const p = params as {
+      userId?: string;
+      userName?: string;
+      toolName?: string;
+      outcome?: string;
+      startDate?: string;
+      endDate?: string;
+      limit?: number;
+      cursorTs?: number;
+      cursorId?: string;
+    };
+
+    const queryUserId = isAdminUser(context) ? (p.userId || undefined) : userId;
+    const limit = Math.min(p.limit ?? 50, 200);
+    const validOutcomes = ["success", "error", "blocked"];
+    const outcome = p.outcome && validOutcomes.includes(p.outcome) ? p.outcome : undefined;
+
+    const rows = await chatRepo.queryAuditLogs({
+      userId: queryUserId,
+      userName: isAdminUser(context) ? p.userName : undefined,
+      toolName: p.toolName,
+      outcome,
+      startDate: p.startDate ? Math.floor(new Date(p.startDate).getTime() / 1000) : undefined,
+      endDate: p.endDate ? Math.floor(new Date(p.endDate).getTime() / 1000) : undefined,
+      cursorTs: p.cursorTs,
+      cursorId: p.cursorId,
+      limit,
+    });
+
+    const hasMore = rows.length > limit;
+    const logs = hasMore ? rows.slice(0, limit) : rows;
+    return { logs, hasMore };
+  });
+
+  methods.set("audit.detail", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!chatRepo) throw new Error("Database not available");
+
+    const { messageId } = params as { messageId: string };
+    if (!messageId) throw new Error("messageId is required");
+
+    const msg = await chatRepo.getMessageById(messageId);
+    if (!msg || msg.role !== "tool") throw new Error("Message not found");
+
+    // Ownership check via session
+    const session = await chatRepo.getSession(msg.sessionId);
+    if (!session) throw new Error("Session not found");
+    if (!isAdminUser(context) && session.userId !== userId) {
+      throw new Error("Forbidden: not your message");
+    }
+
+    return {
+      id: msg.id,
+      userId: msg.userId,
+      content: msg.content,
+      toolName: msg.toolName,
+      toolInput: msg.toolInput,
+      outcome: msg.outcome,
+      durationMs: msg.durationMs,
+      timestamp: msg.timestamp,
+    };
   });
 
   return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };

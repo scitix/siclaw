@@ -68,6 +68,10 @@ export const messages = sqliteTable("messages", {
   toolInput: text("tool_input"),
   metadata: text("metadata", { mode: "json" }).$type<Record<string, unknown>>(),
   timestamp: integer("timestamp", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  // ── Audit fields (nullable — only populated for role='tool') ──
+  userId: text("user_id"),
+  outcome: text("outcome"),       // "success" | "error" | "blocked"
+  durationMs: integer("duration_ms"),
 });
 
 // ─── Skills ──────────────────────────────────────────

@@ -54,6 +54,9 @@ const DDL_STATEMENTS = [
     tool_input TEXT,
     metadata JSON DEFAULT NULL,
     timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user_id VARCHAR(64),
+    outcome VARCHAR(16),
+    duration_ms INT,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
   )`,
 
@@ -387,6 +390,8 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE credentials ADD INDEX idx_credentials_user (user_id, type)`,
   `ALTER TABLE session_stats ADD INDEX idx_session_stats_created (created_at)`,
   `ALTER TABLE session_stats ADD INDEX idx_session_stats_user (user_id, created_at)`,
+  `ALTER TABLE messages ADD INDEX idx_messages_audit (role, user_id, timestamp, id)`,
+  `ALTER TABLE messages ADD INDEX idx_messages_tool_name (tool_name)`,
 ];
 
 export async function initSchema(db: Database): Promise<void> {

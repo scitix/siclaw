@@ -71,6 +71,10 @@ export const messages = mysqlTable("messages", {
   toolInput: text("tool_input"),
   metadata: json("metadata").$type<Record<string, unknown>>(),
   timestamp: timestamp("timestamp").notNull().defaultNow(),
+  // ── Audit fields (nullable — only populated for role='tool') ──
+  userId: varchar("user_id", { length: 64 }),
+  outcome: varchar("outcome", { length: 16 }),   // "success" | "error" | "blocked"
+  durationMs: int("duration_ms"),
 });
 
 // ─── Skills ──────────────────────────────────────────
