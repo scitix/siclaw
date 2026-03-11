@@ -178,6 +178,9 @@ export class K8sSpawner implements BoxSpawner {
 
     // Ensure per-user PVC if persistence is enabled
     if (this.config.persistence?.enabled) {
+      if (!workspaceId || workspaceId === "default" && !boxConfig.workspaceId) {
+        console.warn(`[k8s-spawner] Persistence enabled but no explicit workspaceId — using "default"`);
+      }
       await this.ensureUserPvc(userId);
     }
 
