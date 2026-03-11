@@ -184,6 +184,7 @@ export function AuditTab() {
                         placeholder="Username"
                         value={filterUser}
                         onChange={e => setFilterUser(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') doSearch(); }}
                         className="h-8 px-3 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 w-36"
                     />
                 )}
