@@ -50,7 +50,10 @@ const DDL_STATEMENTS = [
     tool_name TEXT,
     tool_input TEXT,
     metadata TEXT,
-    timestamp INTEGER NOT NULL DEFAULT (unixepoch())
+    timestamp INTEGER NOT NULL DEFAULT (unixepoch()),
+    user_id TEXT,
+    outcome TEXT CHECK(outcome IN ('success', 'error', 'blocked')),
+    duration_ms INTEGER
   )`,
 
   `CREATE TABLE IF NOT EXISTS skills (
@@ -357,6 +360,8 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_created ON session_stats(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_user ON session_stats(user_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_audit ON messages(role, user_id, timestamp)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_tool_name ON messages(tool_name)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
@@ -395,6 +400,10 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     // ADR-011: environment isolation
     `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
     `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
+    // Command audit fields
+    `ALTER TABLE messages ADD COLUMN user_id TEXT`,
+    `ALTER TABLE messages ADD COLUMN outcome TEXT`,
+    `ALTER TABLE messages ADD COLUMN duration_ms INTEGER`,
   ];
   // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
   const BACKFILLS = [

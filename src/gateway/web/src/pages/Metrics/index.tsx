@@ -4,9 +4,10 @@ import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useMetrics, type TimeRange } from './hooks/useMetrics';
 import { DashboardTab } from './DashboardTab';
+import { AuditTab } from './AuditTab';
 import { GrafanaTab } from './GrafanaTab';
 
-type Tab = 'dashboard' | 'grafana';
+type Tab = 'dashboard' | 'audit' | 'grafana';
 
 export function MetricsPage() {
     const [tab, setTab] = useState<Tab>('dashboard');
@@ -52,6 +53,17 @@ export function MetricsPage() {
                             )}
                         >
                             Dashboard
+                        </button>
+                        <button
+                            onClick={() => setTab('audit')}
+                            className={cn(
+                                'pb-[13px] pt-[14px] text-sm px-1 transition border-b-2',
+                                tab === 'audit'
+                                    ? 'border-primary-600 text-primary-600 font-semibold'
+                                    : 'border-transparent text-gray-500 hover:text-gray-700',
+                            )}
+                        >
+                            Audit
                         </button>
                         {grafanaUrl && (
                             <button
@@ -99,6 +111,8 @@ export function MetricsPage() {
             {/* Content */}
             {tab === 'dashboard' ? (
                 <DashboardTab data={data} range={range} loading={loading} />
+            ) : tab === 'audit' ? (
+                <AuditTab />
             ) : (
                 <GrafanaTab grafanaUrl={grafanaUrl} />
             )}
