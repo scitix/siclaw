@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import type { GatewayConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
-import { AgentBoxClient } from "./agentbox/client.js";
+import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { createBroadcaster, buildEvent, parseFrame, dispatchRpc, MAX_BUFFERED_BYTES, type RpcHandler, type RpcContext } from "./ws-protocol.js";
 import { createRpcMethods } from "./rpc-methods.js";
 import type { SkillBundle } from "./skills/skill-bundle.js";
@@ -871,8 +871,31 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             return undefined;
           });
 
-          // 3. Send prompt with credentials
-          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials });
+          // 3. Resolve model config (workspace default → global default)
+          let modelProvider: string | undefined;
+          let modelId: string | undefined;
+          let modelConfig: PromptOptions["modelConfig"];
+          if (db) {
+            const mcRepo = new ModelConfigRepository(db);
+            // Try workspace default model first, then global default
+            const wsDefault = workspace?.configJson?.defaultModel;
+            const defaultModel = wsDefault?.provider && wsDefault?.modelId
+              ? { provider: wsDefault.provider, modelId: wsDefault.modelId }
+              : await mcRepo.getDefault();
+            if (defaultModel) {
+              modelProvider = defaultModel.provider;
+              modelId = defaultModel.modelId;
+              try {
+                const providerConfig = await mcRepo.getProviderWithModels(modelProvider);
+                if (providerConfig) modelConfig = providerConfig;
+              } catch (err) {
+                console.warn(`[gateway] agent-prompt provider config resolve failed:`, err instanceof Error ? err.message : err);
+              }
+            }
+          }
+
+          // 4. Send prompt with credentials and model config
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig });
           sessionId = promptResult.sessionId;
 
           // 4. Wait for completion with cancellable timeout
