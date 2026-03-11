@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Timer, ThumbsUp, ThumbsDown, Undo2, Bell, ChevronRight, X, ShieldCheck, ShieldX, XCircle, ShieldAlert, Users } from 'lucide-react';
+import { Timer, ThumbsUp, ThumbsDown, Undo2, Bell, ChevronRight, X, ShieldCheck, ShieldX, XCircle, ShieldAlert, Users, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useNavigate } from 'react-router-dom';
+import { Markdown } from './Markdown';
 import type { Notification, NotificationGroup } from '../hooks/useNotifications';
 
 // ─── Type config ────────────────────────────────────
@@ -16,6 +17,23 @@ interface TypeConfig {
 }
 
 const TYPE_CONFIG: Record<string, TypeConfig> = {
+    cron_success: {
+        icon: CheckCircle2,
+        chipLabel: 'Scheduled Task',
+        bgClass: 'bg-green-100',
+        textClass: 'text-green-600',
+        chipBg: 'bg-green-50',
+        chipText: 'text-green-700',
+    },
+    cron_failure: {
+        icon: AlertTriangle,
+        chipLabel: 'Scheduled Task',
+        bgClass: 'bg-red-100',
+        textClass: 'text-red-600',
+        chipBg: 'bg-red-50',
+        chipText: 'text-red-700',
+    },
+    // Legacy: before type split
     cron_result: {
         icon: Timer,
         chipLabel: 'Scheduled Task',
@@ -103,6 +121,9 @@ function getConfig(type: string): TypeConfig {
     return TYPE_CONFIG[type] ?? DEFAULT_CONFIG;
 }
 
+/** Types that are cron-related (render message as markdown) */
+const CRON_TYPES = new Set(['cron_success', 'cron_failure', 'cron_result']);
+
 // ─── Time format ────────────────────────────────────
 
 function formatTime(iso?: string): string {
@@ -148,6 +169,7 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
     const cfg = getConfig(notif.type);
     const Icon = cfg.icon;
     const isLong = (notif.message?.length ?? 0) > MESSAGE_COLLAPSE_LEN;
+    const isCron = CRON_TYPES.has(notif.type);
     const canNavigate = (SKILL_NAV_TYPES.has(notif.type) || APPROVAL_NAV_TYPES.has(notif.type)) && notif.relatedId;
 
     const handleClick = () => {
@@ -183,14 +205,30 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                     </div>
                 )}
 
-                {/* Content — title and message on separate rows, no truncation */}
+                {/* Nested: small status dot */}
+                {nested && isCron && (
+                    <div className={cn(
+                        'w-2 h-2 rounded-full mt-1.5 flex-shrink-0',
+                        notif.type === 'cron_success' ? 'bg-green-500' : notif.type === 'cron_failure' ? 'bg-red-500' : 'bg-blue-500',
+                    )} />
+                )}
+
+                {/* Content */}
                 <div className="flex-1 min-w-0">
-                    {/* Row 1: chip + time */}
+                    {/* Row 1: chip + status + time */}
                     <div className="flex items-center justify-between gap-1.5 mb-0.5">
                         <div className="flex items-center gap-1.5">
                             {!nested && (
                                 <span className={cn('inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0', cfg.chipBg, cfg.chipText)}>
                                     {cfg.chipLabel}
+                                </span>
+                            )}
+                            {isCron && (
+                                <span className={cn(
+                                    'text-[10px] font-medium',
+                                    notif.type === 'cron_success' ? 'text-green-600' : notif.type === 'cron_failure' ? 'text-red-600' : 'text-gray-500',
+                                )}>
+                                    {notif.type === 'cron_success' ? 'Success' : notif.type === 'cron_failure' ? 'Failed' : ''}
                                 </span>
                             )}
                             <span className="text-[10px] text-gray-400">{formatTime(notif.createdAt)}</span>
@@ -205,18 +243,27 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                         </button>
                     </div>
 
-                    {/* Row 2: title — full display, word-wrap */}
+                    {/* Row 2: title */}
                     <p className="text-sm text-gray-900 leading-snug break-words">{notif.title}</p>
 
-                    {/* Row 3: message — full display by default, collapse only if very long */}
+                    {/* Row 3: message — markdown for cron, plain text for others */}
                     {notif.message && (
                         <div className="mt-1">
-                            <p className={cn(
-                                'text-xs text-gray-500 leading-relaxed break-words whitespace-pre-wrap',
-                                collapsed && isLong && 'line-clamp-5',
-                            )}>
-                                {notif.message}
-                            </p>
+                            {isCron ? (
+                                <div className={cn(
+                                    'text-xs text-gray-600 leading-relaxed overflow-hidden',
+                                    collapsed && isLong && 'max-h-28',
+                                )}>
+                                    <Markdown>{notif.message}</Markdown>
+                                </div>
+                            ) : (
+                                <p className={cn(
+                                    'text-xs text-gray-500 leading-relaxed break-words whitespace-pre-wrap',
+                                    collapsed && isLong && 'line-clamp-5',
+                                )}>
+                                    {notif.message}
+                                </p>
+                            )}
                             {isLong && (
                                 <button
                                     onClick={(e) => { e.stopPropagation(); setCollapsed(!collapsed); }}
@@ -228,7 +275,7 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                         </div>
                     )}
 
-                    {/* Row 4: navigation link for skill-related notifications (hide once read/handled) */}
+                    {/* Row 4: navigation link for skill-related notifications */}
                     {canNavigate && !notif.isRead && (
                         <button
                             onClick={(e) => { e.stopPropagation(); handleClick(); }}
@@ -269,6 +316,11 @@ export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose }: 
 
     const cfg = getConfig(group.type);
     const Icon = cfg.icon;
+    const isCron = CRON_TYPES.has(group.type);
+
+    // For cron groups, count successes and failures
+    const successCount = isCron ? group.notifications.filter(n => n.type === 'cron_success').length : 0;
+    const failureCount = isCron ? group.notifications.filter(n => n.type === 'cron_failure').length : 0;
 
     return (
         <div className="border-b border-gray-50">
@@ -300,7 +352,13 @@ export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose }: 
                     </div>
                     <p className="text-sm text-gray-900 leading-snug break-words">{group.title}</p>
                     <div className="flex items-center gap-2 mt-0.5">
-                        <span className="text-[10px] text-gray-400">{group.notifications.length} notifications</span>
+                        <span className="text-[10px] text-gray-400">{group.notifications.length} runs</span>
+                        {isCron && successCount > 0 && (
+                            <span className="text-[10px] text-green-600 font-medium">{successCount} passed</span>
+                        )}
+                        {isCron && failureCount > 0 && (
+                            <span className="text-[10px] text-red-600 font-medium">{failureCount} failed</span>
+                        )}
                         {group.unreadCount > 0 && (
                             <span className="text-[10px] text-blue-500 font-medium">{group.unreadCount} unread</span>
                         )}

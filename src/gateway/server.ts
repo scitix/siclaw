@@ -788,22 +788,25 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           // 1. Write notification to DB
           if (db) {
             const notifRepo = new NotificationRepository(db);
+            const notifType = data.result === "success" ? "cron_success" : "cron_failure";
+            const notifMessage = data.result === "success" ? data.resultText : (data.error || "Unknown error");
             const notifId = await notifRepo.create({
               userId: data.userId,
-              type: "cron_result",
+              type: notifType,
               title: data.jobName,
-              message: data.result === "success" ? data.resultText : (data.error || "Unknown error"),
+              message: notifMessage,
               relatedId: data.jobId,
             });
 
-            // 2. Push via WebSocket
+            // 2. Push via WebSocket (include all fields so frontend renders correctly)
             sendToUser(data.userId, "notification", {
               id: notifId,
-              type: "cron_result",
+              type: notifType,
               title: data.jobName,
-              message: data.result === "success" ? data.resultText : (data.error || "Unknown error"),
-              result: data.result,
+              message: notifMessage,
               relatedId: data.jobId,
+              isRead: false,
+              createdAt: new Date().toISOString(),
             });
           }
 
