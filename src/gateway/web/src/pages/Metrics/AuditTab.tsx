@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Search, ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -141,6 +141,11 @@ export function AuditTab() {
             setLoading(false);
         }
     }, [sendRpc, isAdmin, filterUser, filterTool, filterStatus, filterRange]);
+
+    // Auto-load on mount when connected
+    useEffect(() => {
+        if (isConnected && !searched) doSearch();
+    }, [isConnected, searched, doSearch]);
 
     const loadMore = useCallback(() => {
         if (logs.length === 0) return;
