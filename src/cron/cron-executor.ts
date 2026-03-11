@@ -42,7 +42,7 @@ export class CronExecutor {
     console.log(`[cron-executor] Executing job ${job.id} (${job.name}) for user ${job.userId}${envId ? ` env=${envId}` : ""}${workspaceId ? ` ws=${workspaceId}` : ""}`);
 
     try {
-      const sessionId = `cron-${job.id}`;
+      const sessionId = `cron-${job.id}-${Date.now()}`;
       const prompt = buildCronPrompt(current);
 
       const resp = await fetch(`${this.gatewayUrl}/api/internal/agent-prompt`, {
