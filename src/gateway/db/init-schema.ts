@@ -54,6 +54,9 @@ const DDL_STATEMENTS = [
     tool_input TEXT,
     metadata JSON DEFAULT NULL,
     timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user_id VARCHAR(64),
+    outcome VARCHAR(16),
+    duration_ms INT,
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
   )`,
 

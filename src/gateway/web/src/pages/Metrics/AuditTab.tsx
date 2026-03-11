@@ -399,6 +399,15 @@ function DetailPanel({ detail }: { detail: AuditDetail }) {
                 <span className="text-gray-700">{formatDuration(detail.durationMs)}</span>
             </div>
 
+            {detail.toolInput && (
+                <div>
+                    <div className="text-xs text-gray-400 mb-1">Command</div>
+                    <pre className="p-3 bg-gray-900 text-gray-100 rounded-lg text-xs font-mono overflow-auto max-h-64">
+                        {detail.toolInput}
+                    </pre>
+                </div>
+            )}
+
             {content && (
                 <div>
                     <div className="text-xs text-gray-400 mb-1">Output</div>
