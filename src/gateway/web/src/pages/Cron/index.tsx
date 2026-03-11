@@ -1,4 +1,4 @@
-import { Plus, Timer, Play, Pause, Trash2, Search } from 'lucide-react';
+import { Plus, Timer, Play, Pause, Trash2, Search, Boxes } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useState, useEffect, useRef } from 'react';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -130,10 +130,12 @@ export function CronPage() {
                                         <Timer className="w-3 h-3 text-gray-400" />
                                         {job.schedule}
                                     </div>
-                                    <div className="flex items-center gap-1.5 text-gray-500 font-medium">
-                                        <Play className="w-3 h-3" />
-                                        <span>Bot Automated</span>
-                                    </div>
+                                    {job.workspaceName && (
+                                        <div className="flex items-center gap-1.5 text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded font-medium">
+                                            <Boxes className="w-3 h-3" />
+                                            {job.workspaceName}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
 
