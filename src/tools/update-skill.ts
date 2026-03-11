@@ -17,22 +17,33 @@ export function createUpdateSkillTool(): ToolDefinition {
     name: "update_skill",
     label: "Update Skill",
     description: `Update an existing Siclaw skill definition.
+
+**Skill directories are read-only. All skill modifications must go through skill management tools (create_skill, update_skill, fork_skill).**
+
 This tool outputs a structured skill update that the user can preview and confirm. It does NOT persist anything — the user must confirm via the UI.
 
 Use this tool (NOT create_skill) when the user asks to modify, update, change, or fix an existing skill. This includes:
-- When the user message contains [Editing Skill: <name> (id:<id>)] context from the UI
+- When the user message contains \`[Skill: <name>]\` context from the UI (the user selected a skill to edit)
 - When the user asks to change a skill that was created earlier in the conversation
 - When the user asks to modify or replace an existing skill
 
-**IMPORTANT — Identify the target skill FIRST**:
-Before calling this tool, you MUST know the exact name of the skill to update. Check the Skill Scripts Reference in your context for existing skills. If the user's request is ambiguous (e.g. "update that skill", "update it"), ASK the user to clarify which skill they mean. Never guess — a wrong target will corrupt the wrong skill.
+**Identify the target skill FIRST**:
+Before calling this tool, you MUST know the exact name of the skill to update. Check \`<available_skills>\` in your system prompt, or \`read\` the skill's SKILL.md for details. If the user's request is ambiguous, ASK them to clarify which skill they mean.
 
-Do NOT use read, edit, write, or bash on files under .siclaw/skills/ — the filesystem is read-only. Always use this tool instead.
+## Environments and Approval Workflow
 
-**Approval required**: When scripts are changed, the update enters a "staged" review state and requires admin approval before the new version becomes active. The old version of the skill remains usable during review. After updating, do NOT attempt to test the new version — it will not take effect until an admin approves it. Inform the user that the update is pending review.
+| Environment | Behavior |
+|-------------|----------|
+| **Dev / Test** | Updated content (working copy) is immediately visible and testable. |
+| **Production** | Only the **approved** version is active. Updates enter a staged review state and the OLD version remains in use until the new version is approved. |
+
+- When scripts are changed, the update enters a **staged review** state and requires admin approval before the new version becomes active in production.
+- The **old version** of the skill remains usable in production during review.
+- In dev/test, the working copy is immediately available for testing.
+- After updating in production context, inform the user that the update is pending review.
 
 Parameters:
-- id: The skill ID from [Editing Skill: ... (id:<id>)] context, OR the skill's kebab-case name (for name-based lookup).
+- id: The skill ID from the UI context, OR the skill's kebab-case name (for name-based lookup).
 - name: the skill name in kebab-case (cannot be changed after creation).
 - description: one-line summary
 - type: category (Monitoring, Network, Security, Database, Core, Utility, Automation, Custom)

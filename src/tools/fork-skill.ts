@@ -24,10 +24,22 @@ This tool outputs a structured fork definition that the user can preview and sav
 
 **When to use this tool vs others:**
 - \`fork_skill\`: Fork an existing builtin/team skill to personal (with or without modifications)
-- \`create_skill\`: Create a brand-new skill from scratch
+- \`create_skill\`: Create a brand-new skill from scratch (only when no existing skill covers the same functionality)
 - \`update_skill\`: Update an existing personal skill
 
-**IMPORTANT**: Before calling this tool, check the Skill Scripts Reference in your context and read the source skill's SKILL.md to understand its current content. You need the exact skill name.
+**IMPORTANT**: Before calling this tool, check \`<available_skills>\` in your system prompt and read the source skill's SKILL.md to understand its current content. You need the exact skill name.
+
+**Prefer forking over creating**: If a user wants to create a skill that overlaps with an existing builtin or team skill, recommend forking instead. This avoids duplicate skills that confuse the model. Fork lets them customize while keeping a clear lineage.
+
+## Environments and Approval Workflow
+
+| Environment | Behavior |
+|-------------|----------|
+| **Dev / Test** | Forked skill (draft) is immediately visible and testable. |
+| **Production** | Forked skill must be **approved** before it appears. |
+
+- Forked skills with scripts require admin approval before production use.
+- In dev/test, the forked copy is available immediately for testing.
 
 Parameters:
 - source: The exact name of the builtin or team skill to fork (e.g. "find-node", "roce-perftest-pod")

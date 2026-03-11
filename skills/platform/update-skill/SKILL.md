@@ -2,27 +2,37 @@
 name: update-skill
 description: >-
   Procedure for modifying, updating, or fixing an existing Siclaw skill.
-  Skills are on a read-only filesystem — use the update_skill tool,
-  never edit files directly.
+  Use the update_skill tool — never edit skill files directly.
 ---
 
 # Update Skill
 
 ## When to Use
 
-When the user's message contains `[Editing Skill: <name> (id:<id>)]` followed by the current skill content, or when the user asks to modify/update/fix an existing skill.
+When the user's message contains `[Skill: <name>]` (UI skill editing context), or when the user asks to modify/update/fix an existing skill.
+
+## Environments and Approval Workflow
+
+| Environment | Behavior |
+|-------------|----------|
+| **Dev / Test** | Updated content (working copy) is immediately visible and testable. |
+| **Production** | Only the **approved** version is active. Updates enter a staged review state; the old version remains in use until the new version is approved by an admin. |
+
+- When scripts are changed, the update enters a **staged review** state.
+- The **old version** of the skill remains usable in production during review.
+- In dev/test, the working copy is available immediately for testing.
 
 ## How to Update
 
 Call the `update_skill` tool (NOT `create_skill`) with the skill ID and the complete updated definition.
 
-**Do NOT use `read`, `edit`, `write`, or `bash` on files under `/mnt/skills/` — the filesystem is read-only.**
+**Skill directories are read-only. All skill modifications must go through skill management tools (create_skill, update_skill, fork_skill).**
 
 ### Tool Call Format
 
 ```
 update_skill({
-  id: "<skill-id>",                // Required — from [Editing Skill: ... (id:<id>)]
+  id: "<skill-id>",                // From [Skill: ...] context, or the skill's kebab-case name
   name: "skill-name",              // Keep original name unless user wants rename
   description: "What the skill does",
   type: "Monitoring",
@@ -31,7 +41,8 @@ update_skill({
     { name: "run.sh", content: "#!/bin/bash\n..." },   // Changed: provide full content
     { name: "check.sh" }                                // Unchanged: name only
     // Omitted scripts are deleted
-  ]
+  ],
+  labels: ["monitoring", "memory"] // Optional labels/tags
 })
 ```
 
