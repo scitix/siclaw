@@ -178,7 +178,7 @@ export class K8sSpawner implements BoxSpawner {
 
     // Ensure per-user PVC if persistence is enabled
     if (this.config.persistence?.enabled) {
-      if (!workspaceId || workspaceId === "default" && !boxConfig.workspaceId) {
+      if (!workspaceId || (workspaceId === "default" && !boxConfig.workspaceId)) {
         console.warn(`[k8s-spawner] Persistence enabled but no explicit workspaceId — using "default"`);
       }
       await this.ensureUserPvc(userId);
@@ -275,7 +275,9 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                subPath: this.config.persistence?.enabled ? workspaceId : `user/${userId}/agent-data`,
+                subPath: this.config.persistence?.enabled
+                  ? workspaceId.replace(/[^a-zA-Z0-9-]/g, "_")
+                  : `user/${userId}/agent-data`,
               },
               {
                 name: "client-cert",
@@ -369,7 +371,7 @@ export class K8sSpawner implements BoxSpawner {
             },
             spec: {
               accessModes: [this.config.persistence!.accessMode],
-              storageClassName: this.config.persistence!.storageClass,
+              storageClassName: this.config.persistence!.storageClass || undefined,
               resources: {
                 requests: { storage: this.config.persistence!.size },
               },

@@ -1,0 +1,8 @@
+Thank you for installing {{ include "siclaw.fullname" . }}!
+
+{{- if and .Values.agentbox.persistence.enabled (not .Values.agentbox.persistence.storageClass) }}
+
+⚠️  WARNING: agentbox.persistence is enabled but storageClass is empty.
+   The cluster default StorageClass will be used. Set agentbox.persistence.storageClass
+   explicitly for production deployments.
+{{- end }}

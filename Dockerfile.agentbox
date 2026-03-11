@@ -112,6 +112,6 @@ RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh
 
 # Container starts as root — entrypoint fixes volume permissions then drops to agentbox.
 # The agentbox user uses sudo to run child processes as sandbox.
-# K8s securityContext drops all capabilities except SETUID/SETGID.
+# K8s securityContext drops all capabilities except SETUID/SETGID/CHOWN/FOWNER.
 ENTRYPOINT ["/usr/local/bin/agentbox-entrypoint.sh"]
 CMD ["node", "dist/agentbox-main.js"]
