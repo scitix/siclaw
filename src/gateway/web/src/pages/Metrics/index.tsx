@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
+import { usePermissions } from '@/hooks/usePermissions';
 import { useMetrics, type TimeRange } from './hooks/useMetrics';
 import { DashboardTab } from './DashboardTab';
 import { AuditTab } from './AuditTab';
@@ -14,6 +15,7 @@ export function MetricsPage() {
     const [range, setRange] = useState<TimeRange>('1h');
     const [grafanaUrl, setGrafanaUrl] = useState<string | null>(null);
     const { sendRpc, isConnected } = useWebSocket();
+    const { isAdmin } = usePermissions(sendRpc, isConnected);
     const { data, loading, refresh } = useMetrics(range);
 
     // Load grafanaUrl from system config
@@ -54,17 +56,19 @@ export function MetricsPage() {
                         >
                             Dashboard
                         </button>
-                        <button
-                            onClick={() => setTab('audit')}
-                            className={cn(
-                                'pb-[13px] pt-[14px] text-sm px-1 transition border-b-2',
-                                tab === 'audit'
-                                    ? 'border-primary-600 text-primary-600 font-semibold'
-                                    : 'border-transparent text-gray-500 hover:text-gray-700',
-                            )}
-                        >
-                            Audit
-                        </button>
+                        {isAdmin && (
+                            <button
+                                onClick={() => setTab('audit')}
+                                className={cn(
+                                    'pb-[13px] pt-[14px] text-sm px-1 transition border-b-2',
+                                    tab === 'audit'
+                                        ? 'border-primary-600 text-primary-600 font-semibold'
+                                        : 'border-transparent text-gray-500 hover:text-gray-700',
+                                )}
+                            >
+                                Audit
+                            </button>
+                        )}
                         {grafanaUrl && (
                             <button
                                 onClick={() => setTab('grafana')}
