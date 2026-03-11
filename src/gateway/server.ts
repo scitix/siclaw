@@ -1374,24 +1374,50 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 /** Consume SSE stream from AgentBox and extract final assistant text */
 async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string): Promise<string> {
   let resultText = "";
+  // Accumulate text deltas per message (claude-sdk brain emits text via
+  // message_update/text_delta and sends empty content in message_end)
+  let currentMsgText = "";
   for await (const event of client.streamEvents(sessionId)) {
     const evt = event as Record<string, unknown>;
+
+    // Accumulate streaming text deltas
+    if (evt.type === "message_update") {
+      const ame = evt.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (ame?.type === "text_delta" && typeof ame.delta === "string") {
+        currentMsgText += ame.delta;
+      }
+    }
+
+    if (evt.type === "message_start") {
+      // New message — reset accumulated text
+      currentMsgText = "";
+    }
+
     if (evt.type === "message_end" || evt.type === "turn_end") {
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "assistant") {
+        // Try to extract from message.content first (pi-agent brain)
+        let extracted = "";
         const content = message.content;
-        if (typeof content === "string") {
-          resultText = content;
+        if (typeof content === "string" && content) {
+          extracted = content;
         } else if (Array.isArray(content)) {
-          const text = (content as Array<{ type: string; text?: string }>)
+          extracted = (content as Array<{ type: string; text?: string }>)
             .filter((c) => c.type === "text")
             .map((c) => c.text ?? "")
             .join("");
-          if (text) resultText = text;
         }
+        // Use extracted content, or fall back to accumulated text deltas
+        // (claude-sdk brain sends empty content in message_end)
+        resultText = extracted || currentMsgText || resultText;
       }
+      currentMsgText = "";
     }
     if (evt.type === "agent_end") break;
+  }
+  // Final fallback: if no message_end was captured but we have accumulated text
+  if (!resultText && currentMsgText) {
+    resultText = currentMsgText;
   }
   return resultText;
 }
