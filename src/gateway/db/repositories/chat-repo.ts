@@ -107,7 +107,7 @@ export class ChatRepository {
     toolInput?: string;
     metadata?: Record<string, unknown>;
     userId?: string;
-    outcome?: string;
+    outcome?: "success" | "error" | "blocked";
     durationMs?: number;
   }) {
     const id = crypto.randomUUID();
@@ -149,7 +149,10 @@ export class ChatRepository {
     const conditions = [eq(messages.role, "tool")];
 
     if (opts.userId) conditions.push(eq(messages.userId, opts.userId));
-    if (opts.userName) conditions.push(like(users.username, `%${opts.userName}%`));
+    if (opts.userName) {
+      const escaped = opts.userName.replace(/[%_]/g, "\\$&");
+      conditions.push(like(users.username, `%${escaped}%`));
+    }
     if (opts.toolName) conditions.push(eq(messages.toolName, opts.toolName));
     if (opts.outcome) conditions.push(eq(messages.outcome, opts.outcome));
     if (opts.startDate) conditions.push(gte(messages.timestamp, new Date(opts.startDate * 1000)));

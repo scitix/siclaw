@@ -52,7 +52,7 @@ const DDL_STATEMENTS = [
     metadata TEXT,
     timestamp INTEGER NOT NULL DEFAULT (unixepoch()),
     user_id TEXT,
-    outcome TEXT CHECK(outcome IN ('success', 'error', 'blocked')),
+    outcome TEXT,
     duration_ms INTEGER
   )`,
 
@@ -360,7 +360,7 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_created ON session_stats(created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_session_stats_user ON session_stats(user_id, created_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_messages_audit ON messages(role, user_id, timestamp)`,
+  `CREATE INDEX IF NOT EXISTS idx_messages_audit ON messages(role, user_id, timestamp, id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_tool_name ON messages(tool_name)`,
 ];
 

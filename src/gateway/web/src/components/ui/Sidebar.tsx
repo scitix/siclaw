@@ -282,7 +282,7 @@ export function Sidebar() {
                     }
                 >
                     <BarChart3 className="w-[18px] h-[18px] stroke-[1.25]" />
-                    Metrics
+                    Dashboard
                 </NavLink>
             </div>
 

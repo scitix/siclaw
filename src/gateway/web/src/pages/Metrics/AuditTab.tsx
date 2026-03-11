@@ -166,7 +166,11 @@ export function AuditTab() {
         setDetailLoading(true);
         try {
             const detail = await sendRpc<AuditDetail>('audit.detail', { messageId: id });
-            setDetailCache(prev => ({ ...prev, [id]: detail }));
+            setDetailCache(prev => {
+                const entries = Object.entries(prev);
+                const trimmed = entries.length >= 50 ? Object.fromEntries(entries.slice(-49)) : prev;
+                return { ...trimmed, [id]: detail };
+            });
         } catch (err) {
             console.error('[AuditTab] detail load failed:', err);
         } finally {
@@ -376,13 +380,6 @@ function DetailPanel({ detail }: { detail: AuditDetail }) {
                                 <span className="font-mono text-gray-700">{(parsedInput as any).args}</span>
                             </>
                         )}
-                    </>
-                )}
-
-                {parsedInput && (detail.toolName === 'bash' || detail.toolName === 'restricted_bash') && (
-                    <>
-                        <span className="text-gray-400">Command</span>
-                        <span className="font-mono text-gray-700 break-all">{(parsedInput as any).command}</span>
                     </>
                 )}
 

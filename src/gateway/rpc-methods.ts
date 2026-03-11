@@ -518,8 +518,9 @@ export function createRpcMethods(
     // Async SSE processing
     (async () => {
       let assistantContent = "";
-      let pendingToolInput = ""; // Capture tool input from start event for DB persistence
-      let pendingToolStartTime = 0; // Capture start time for duration calculation
+      // Map keyed by toolName to handle parallel tool calls correctly
+      const pendingToolInputs = new Map<string, string>();
+      const pendingToolStartTimes = new Map<string, number>();
       let sseEventCount = 0;
       const sseStartTime = Date.now();
       // Mark user as having an active prompt so WS teardown won't kill the pod
@@ -559,23 +560,25 @@ export function createRpcMethods(
             } else if (toolResult?.details?.error) {
               outcome = "error";
             }
-            const durationMs = pendingToolStartTime > 0
-              ? Date.now() - pendingToolStartTime
+            const startTime = pendingToolStartTimes.get(toolName);
+            const durationMs = startTime != null
+              ? Date.now() - startTime
               : undefined;
+            const toolInput = pendingToolInputs.get(toolName) || "";
 
             dbMessageId = await chatRepo.appendMessage({
               sessionId: result.sessionId,
               role: "tool",
               content: redactText(text, redactionConfig),
               toolName,
-              toolInput: pendingToolInput ? redactText(pendingToolInput, redactionConfig) : undefined,
+              toolInput: toolInput ? redactText(toolInput, redactionConfig) : undefined,
               userId,
               outcome,
               durationMs,
             });
             await chatRepo.incrementMessageCount(result.sessionId);
-            pendingToolInput = "";
-            pendingToolStartTime = 0;
+            pendingToolInputs.delete(toolName);
+            pendingToolStartTimes.delete(toolName);
           }
 
           // Forward event to frontend via sendToUser (targets all WS connections
@@ -648,10 +651,11 @@ export function createRpcMethods(
                 assistantContent = "";
               }
             } else if (eventType === "tool_execution_start") {
-              // Capture tool input and start time for DB persistence
+              // Capture tool input and start time for DB persistence (keyed by toolName for parallel calls)
+              const startToolName = (eventData.toolName as string) || "tool";
               const args = eventData.args as Record<string, unknown> | undefined;
-              pendingToolInput = args ? JSON.stringify(args) : "";
-              pendingToolStartTime = Date.now();
+              pendingToolInputs.set(startToolName, args ? JSON.stringify(args) : "");
+              pendingToolStartTimes.set(startToolName, Date.now());
             }
             // tool_execution_end already handled above
           }
@@ -4280,12 +4284,14 @@ export function createRpcMethods(
 
     const queryUserId = isAdminUser(context) ? (p.userId || undefined) : userId;
     const limit = Math.min(p.limit ?? 50, 200);
+    const validOutcomes = ["success", "error", "blocked"];
+    const outcome = p.outcome && validOutcomes.includes(p.outcome) ? p.outcome : undefined;
 
     const rows = await chatRepo.queryAuditLogs({
       userId: queryUserId,
       userName: isAdminUser(context) ? p.userName : undefined,
       toolName: p.toolName,
-      outcome: p.outcome,
+      outcome,
       startDate: p.startDate ? Math.floor(new Date(p.startDate).getTime() / 1000) : undefined,
       endDate: p.endDate ? Math.floor(new Date(p.endDate).getTime() / 1000) : undefined,
       cursorTs: p.cursorTs,
@@ -4317,6 +4323,7 @@ export function createRpcMethods(
 
     return {
       id: msg.id,
+      userId: msg.userId,
       content: msg.content,
       toolName: msg.toolName,
       toolInput: msg.toolInput,
