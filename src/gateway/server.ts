@@ -854,15 +854,25 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
           // 1. Get or create user's AgentBox (resolve real workspace ID from DB)
           if (!data.workspaceId && !internalWorkspaceRepo) throw new Error("Database not available");
-          const wsId = data.workspaceId || (await internalWorkspaceRepo!.getOrCreateDefault(userId)).id;
+          const workspace = data.workspaceId
+            ? await internalWorkspaceRepo?.getById(data.workspaceId) ?? null
+            : await internalWorkspaceRepo!.getOrCreateDefault(userId);
+          const wsId = workspace?.id || data.workspaceId!;
+          const isDefaultWs = workspace?.isDefault ?? true;
           const handle = await agentBoxManager.getOrCreate(userId, wsId);
           client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
-          // 2. Send prompt
-          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
+          // 2. Build credential payload so AgentBox has kubeconfig etc.
+          const credentials = await buildCredentialPayload(userId, wsId, isDefaultWs).catch((err) => {
+            console.warn(`[gateway] agent-prompt credential build failed:`, err instanceof Error ? err.message : err);
+            return undefined;
+          });
+
+          // 3. Send prompt with credentials
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials });
           sessionId = promptResult.sessionId;
 
-          // 3. Wait for completion with cancellable timeout
+          // 4. Wait for completion with cancellable timeout
           const timeout = rejectAfterTimeout(timeoutMs, data.sessionId);
           try {
             const resultText = await Promise.race([
