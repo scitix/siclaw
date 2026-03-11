@@ -4268,6 +4268,7 @@ export function createRpcMethods(
 
     const p = params as {
       userId?: string;
+      userName?: string;
       toolName?: string;
       outcome?: string;
       startDate?: string;
@@ -4282,6 +4283,7 @@ export function createRpcMethods(
 
     const rows = await chatRepo.queryAuditLogs({
       userId: queryUserId,
+      userName: isAdminUser(context) ? p.userName : undefined,
       toolName: p.toolName,
       outcome: p.outcome,
       startDate: p.startDate ? Math.floor(new Date(p.startDate).getTime() / 1000) : undefined,

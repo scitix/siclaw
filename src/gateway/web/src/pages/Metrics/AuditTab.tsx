@@ -120,7 +120,7 @@ export function AuditTab() {
                 endDate,
                 limit: 50,
             };
-            if (isAdmin && filterUser) params.userId = filterUser;
+            if (isAdmin && filterUser) params.userName = filterUser;
             if (filterTool !== 'All') params.toolName = filterTool;
             if (filterStatus !== 'All') params.outcome = filterStatus;
             if (cursor) {
@@ -181,7 +181,7 @@ export function AuditTab() {
                 {isAdmin && (
                     <input
                         type="text"
-                        placeholder="User ID"
+                        placeholder="Username"
                         value={filterUser}
                         onChange={e => setFilterUser(e.target.value)}
                         className="h-8 px-3 text-sm border border-gray-200 rounded-lg bg-white focus:outline-none focus:ring-1 focus:ring-primary-500 w-36"

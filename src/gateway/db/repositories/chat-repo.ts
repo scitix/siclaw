@@ -3,7 +3,7 @@
  */
 
 import crypto from "node:crypto";
-import { eq, desc, and, lt, lte, gte, isNull, or, sql } from "drizzle-orm";
+import { eq, desc, and, lt, lte, gte, isNull, or, like, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { sessions, messages, users } from "../schema.js";
 
@@ -137,6 +137,7 @@ export class ChatRepository {
 
   async queryAuditLogs(opts: {
     userId?: string;
+    userName?: string;
     toolName?: string;
     outcome?: string;
     startDate?: number;
@@ -148,6 +149,7 @@ export class ChatRepository {
     const conditions = [eq(messages.role, "tool")];
 
     if (opts.userId) conditions.push(eq(messages.userId, opts.userId));
+    if (opts.userName) conditions.push(like(users.username, `%${opts.userName}%`));
     if (opts.toolName) conditions.push(eq(messages.toolName, opts.toolName));
     if (opts.outcome) conditions.push(eq(messages.outcome, opts.outcome));
     if (opts.startDate) conditions.push(gte(messages.timestamp, new Date(opts.startDate * 1000)));
