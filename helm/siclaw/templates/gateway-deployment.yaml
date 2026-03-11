@@ -40,6 +40,16 @@ spec:
                   fieldPath: metadata.namespace
             - name: SICLAW_AGENTBOX_IMAGE
               value: {{ include "siclaw.agentboxImage" . }}
+            {{- if .Values.agentbox.persistence.enabled }}
+            - name: SICLAW_PERSISTENCE_ENABLED
+              value: "true"
+            - name: SICLAW_PERSISTENCE_STORAGE_CLASS
+              value: {{ .Values.agentbox.persistence.storageClass | quote }}
+            - name: SICLAW_PERSISTENCE_ACCESS_MODE
+              value: {{ .Values.agentbox.persistence.accessMode | quote }}
+            - name: SICLAW_PERSISTENCE_SIZE
+              value: {{ .Values.agentbox.persistence.size | quote }}
+            {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
             - name: SICLAW_CRON_SERVICE_URL
