@@ -2660,6 +2660,13 @@ export function createRpcMethods(
 
     await configRepo.deleteCronJob(id);
     notifyCronService({ action: "delete", jobId: id });
+
+    // Auto-dismiss notifications for the deleted job
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("cron_success", id);
+      await notifRepo.dismissByTypeAndRelatedId("cron_failure", id);
+    }
+
     return { status: "deleted" };
   });
 

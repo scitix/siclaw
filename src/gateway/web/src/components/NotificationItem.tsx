@@ -243,6 +243,7 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
             onClose?.();
             navigate(`/skills/${notif.relatedId}`);
         } else if (isCron && notif.message) {
+            onClose?.();
             setShowDetail(true);
         }
     };
@@ -320,7 +321,7 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                                         {extractSummary(notif.message)}
                                     </p>
                                     <button
-                                        onClick={(e) => { e.stopPropagation(); if (!notif.isRead) onMarkRead(notif.id); setShowDetail(true); }}
+                                        onClick={(e) => { e.stopPropagation(); if (!notif.isRead) onMarkRead(notif.id); onClose?.(); setShowDetail(true); }}
                                         className="flex items-center gap-0.5 text-[10px] text-primary-600 hover:text-primary-700 font-medium flex-shrink-0"
                                     >
                                         <FileText className="w-3 h-3" />
