@@ -30,7 +30,14 @@ agentbox:
   image:
     # Override registry/tag if agentbox image differs from gateway
     registry: ""        # defaults to image.registry
+    repository: ""      # defaults to "siclaw-agentbox"
     tag: ""             # defaults to image.tag
+  # User data persistence (memory, investigations, sessions)
+  persistence:
+    enabled: false          # set to true to persist user memory across pod restarts
+    storageClass: ""        # required when enabled (e.g. "nfs-client", "efs-sc", "cephfs")
+    accessMode: ReadWriteMany
+    size: "1Gi"             # per-user PVC size
 
 # -- Cron
 cron:

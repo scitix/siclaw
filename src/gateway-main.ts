@@ -24,6 +24,14 @@ const spawner = useK8s
   ? new K8sSpawner({
       namespace: process.env.SICLAW_K8S_NAMESPACE || "default",
       image: process.env.SICLAW_AGENTBOX_IMAGE || "siclaw-agentbox:latest",
+      persistence: process.env.SICLAW_PERSISTENCE_ENABLED === "true"
+        ? {
+            enabled: true,
+            storageClass: process.env.SICLAW_PERSISTENCE_STORAGE_CLASS || "",
+            accessMode: process.env.SICLAW_PERSISTENCE_ACCESS_MODE || "ReadWriteMany",
+            size: process.env.SICLAW_PERSISTENCE_SIZE || "1Gi",
+          }
+        : undefined,
     })
   : useProcess
     ? new ProcessSpawner()

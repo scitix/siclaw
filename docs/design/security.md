@@ -342,7 +342,7 @@ spec:
     securityContext:
       capabilities:
         drop: ["ALL"]
-        add: ["SETUID", "SETGID"]  # Required for sudo -u sandbox
+        add: ["SETUID", "SETGID", "CHOWN", "FOWNER"]  # SETUID/SETGID for sudo; CHOWN/FOWNER for entrypoint volume permissions
       readOnlyRootFilesystem: true
     volumeMounts:
     - name: tmp
@@ -375,11 +375,13 @@ does not need timestamp caching, so no additional writable paths are needed for 
 |------------|-----------|------|
 | `SETUID` | `sudo`'s SUID bit requires this cap to switch effective UID (agentbox → sandbox) | Low — only used to drop privileges, not gain them |
 | `SETGID` | `sudo` also switches GID; kubectl's setgid bit requires kernel enforcement | Low — setgid only grants kubecred group |
+| `CHOWN` | Entrypoint fixes volume mount ownership (runs as root before `runuser`) | Low — kernel clears effective/permitted caps on UID transition via `runuser` |
+| `FOWNER` | Entrypoint fixes volume mount permissions regardless of ownership | Low — same as CHOWN, cleared after `runuser` |
 | All others | Dropped | N/A |
 
 ### 5.3 What Is Blocked
 
-With `drop: ALL` + only SETUID/SETGID:
+With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER (CHOWN/FOWNER used only during root entrypoint, cleared after `runuser`):
 
 - `CAP_NET_RAW` dropped — no raw sockets, no packet sniffing
 - `CAP_SYS_PTRACE` dropped — no debugging/attaching to other processes
@@ -556,10 +558,9 @@ spec:
 
 ### 10.2 K8s Manifests
 
-- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID"] }`
+- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID", "CHOWN", "FOWNER"] }`
 - [x] Add `seccompProfile: { type: RuntimeDefault }`
-- [x] Add initContainer for volume permission fixing
-- [x] Kubeconfig mounted into credentials emptyDir (0640 agentbox:kubecred)
+- [x] Entrypoint handles volume permission fixing (no init container needed; CHOWN/FOWNER cleared after `runuser`)
 - [x] Keep `automountServiceAccountToken: false`
 - [x] Add `readOnlyRootFilesystem: true` with emptyDir for `/tmp`
 - [ ] Deploy NetworkPolicy for egress restriction

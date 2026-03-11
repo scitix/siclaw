@@ -65,13 +65,15 @@ Usage: {{ include "siclaw.image" (dict "component" "gateway" "ctx" .) }}
 {{/*
 Build agentbox image string.
 Uses agentbox-specific overrides if set, otherwise falls back to global image settings.
+Supports custom repository name (e.g. "siclaw-agentbox-debug" for Node debug image).
 */}}
 {{- define "siclaw.agentboxImage" -}}
 {{- $registry := default .Values.image.registry .Values.agentbox.image.registry -}}
+{{- $repo := default "siclaw-agentbox" .Values.agentbox.image.repository -}}
 {{- $tag := default .Values.image.tag .Values.agentbox.image.tag -}}
 {{- if $registry -}}
-{{- printf "%s/siclaw-agentbox:%s" $registry $tag -}}
+{{- printf "%s/%s:%s" $registry $repo $tag -}}
 {{- else -}}
-{{- printf "siclaw-agentbox:%s" $tag -}}
+{{- printf "%s:%s" $repo $tag -}}
 {{- end -}}
 {{- end }}

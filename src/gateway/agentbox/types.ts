@@ -12,8 +12,6 @@ export interface AgentBoxConfig {
   workspaceId?: string;
   /** Allowed tools list for this workspace (null = all) */
   allowedTools?: string[] | null;
-  /** Optional kubeconfig content (base64) */
-  kubeconfigBase64?: string;
   /** Environment variables */
   env?: Record<string, string>;
   /** Resource limits */
