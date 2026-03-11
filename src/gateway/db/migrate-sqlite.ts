@@ -381,10 +381,6 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     // ADR-011: environment isolation
     `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
     `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
-    // Command audit fields
-    `ALTER TABLE messages ADD COLUMN user_id TEXT`,
-    `ALTER TABLE messages ADD COLUMN outcome TEXT`,
-    `ALTER TABLE messages ADD COLUMN duration_ms INTEGER`,
   ];
   // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
   const BACKFILLS = [
