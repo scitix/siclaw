@@ -7,6 +7,7 @@ import { usePermissions } from '@/hooks/usePermissions';
 interface AuditLog {
     id: string;
     userId: string | null;
+    userName: string | null;
     toolName: string | null;
     toolInput: string | null;
     outcome: string | null;
@@ -310,7 +311,7 @@ function LogRow({
                     <span className="text-gray-400 text-xs mr-1">{formatDate(log.timestamp)}</span>
                     {formatTime(log.timestamp)}
                 </td>
-                <td className="px-3 py-2.5 text-gray-700 font-medium">{log.userId ?? '—'}</td>
+                <td className="px-3 py-2.5 text-gray-700 font-medium">{log.userName ?? log.userId ?? '—'}</td>
                 <td className="px-3 py-2.5">
                     <span className="inline-block px-1.5 py-0.5 text-xs font-mono bg-gray-100 text-gray-600 rounded">
                         {log.toolName ?? '—'}

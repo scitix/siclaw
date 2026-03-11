@@ -5,7 +5,7 @@
 import crypto from "node:crypto";
 import { eq, desc, and, lt, lte, gte, isNull, or, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { sessions, messages } from "../schema.js";
+import { sessions, messages, users } from "../schema.js";
 
 export class ChatRepository {
   constructor(private db: Database) {}
@@ -171,6 +171,7 @@ export class ChatRepository {
       .select({
         id: messages.id,
         userId: messages.userId,
+        userName: users.username,
         toolName: messages.toolName,
         toolInput: messages.toolInput,
         outcome: messages.outcome,
@@ -178,6 +179,7 @@ export class ChatRepository {
         timestamp: messages.timestamp,
       })
       .from(messages)
+      .leftJoin(users, eq(messages.userId, users.id))
       .where(and(...conditions))
       .orderBy(desc(messages.timestamp), desc(messages.id))
       .limit(opts.limit + 1);
