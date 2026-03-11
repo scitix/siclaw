@@ -2561,10 +2561,21 @@ export function createRpcMethods(
     const opts = (envId || workspaceId) ? { envId, workspaceId } : undefined;
     const rows = await configRepo.listCronJobs(userId, opts);
 
+    // Enrich with workspace names
+    const wsIds = [...new Set(rows.map((r) => r.workspaceId).filter(Boolean))] as string[];
+    const wsNameMap = new Map<string, string>();
+    if (wsIds.length > 0 && workspaceRepo) {
+      for (const wsId of wsIds) {
+        const ws = await workspaceRepo.getById(wsId);
+        if (ws) wsNameMap.set(wsId, ws.name);
+      }
+    }
+
     return {
       jobs: rows.map((r) => ({
         ...r,
         envName: null,
+        workspaceName: r.workspaceId ? (wsNameMap.get(r.workspaceId) ?? null) : null,
       })),
     };
   });
