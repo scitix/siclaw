@@ -18,11 +18,10 @@ if ! id agentbox &>/dev/null; then
   exit 1
 fi
 
-# ── Fix volume mount permissions (best-effort) ───────────────────
-# In K8s, the init-permissions container already handled this with full
-# capabilities. The main container has CAP_CHOWN/DAC_OVERRIDE dropped,
-# so these will silently fail — which is correct.
-# In standalone Docker (no init container, full caps), these succeed.
+# ── Fix volume mount permissions ──────────────────────────────────
+# The main container has CAP_CHOWN + CAP_FOWNER so these succeed in
+# both K8s and standalone Docker. Capabilities are dropped after
+# runuser switches to the agentbox user (no security impact).
 
 chown -R agentbox:kubecred /app/.siclaw/credentials 2>/dev/null || true
 chmod 0750 /app/.siclaw/credentials 2>/dev/null || true

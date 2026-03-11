@@ -18,9 +18,16 @@ export interface K8sSpawnerConfig {
   imagePullPolicy?: "Always" | "IfNotPresent" | "Never";
   /** Pod label prefix */
   labelPrefix?: string;
+  /** User data persistence (memory, sessions) */
+  persistence?: {
+    enabled: boolean;
+    storageClass: string;
+    accessMode: string;  // e.g. "ReadWriteMany"
+    size: string;        // e.g. "1Gi"
+  };
 }
 
-const DEFAULT_CONFIG: Required<K8sSpawnerConfig> = {
+const DEFAULT_CONFIG: Required<Omit<K8sSpawnerConfig, "persistence">> = {
   namespace: "default",
   image: "siclaw-agentbox:latest",
   imagePullPolicy: "Always",
@@ -32,7 +39,7 @@ export class K8sSpawner implements BoxSpawner {
 
   private kc: k8s.KubeConfig;
   private coreApi: k8s.CoreV1Api;
-  private config: Required<K8sSpawnerConfig>;
+  private config: Required<Omit<K8sSpawnerConfig, "persistence">> & Pick<K8sSpawnerConfig, "persistence">;
   private certManager: CertificateManager | null = null;
 
   constructor(config?: K8sSpawnerConfig) {
@@ -110,7 +117,13 @@ export class K8sSpawner implements BoxSpawner {
         body: {
           apiVersion: "v1",
           kind: "Secret",
-          metadata: { name: certSecretName },
+          metadata: {
+            name: certSecretName,
+            labels: {
+              [`${labelPrefix}/app`]: "agentbox",
+              [`${labelPrefix}/user`]: userId,
+            },
+          },
           type: "kubernetes.io/tls",
           data: {
             "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -129,7 +142,13 @@ export class K8sSpawner implements BoxSpawner {
           body: {
             apiVersion: "v1",
             kind: "Secret",
-            metadata: { name: certSecretName },
+            metadata: {
+              name: certSecretName,
+              labels: {
+                [`${labelPrefix}/app`]: "agentbox",
+                [`${labelPrefix}/user`]: userId,
+              },
+            },
             type: "kubernetes.io/tls",
             data: {
               "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -157,6 +176,11 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
+    // Ensure per-user PVC if persistence is enabled
+    if (this.config.persistence?.enabled) {
+      await this.ensureUserPvc(userId);
+    }
+
     // Pod definition
     const pod: k8s.V1Pod = {
       apiVersion: "v1",
@@ -178,42 +202,12 @@ export class K8sSpawner implements BoxSpawner {
         // ── Security: dual-user isolation (ADR-010) ─────────────────
         // Container starts as root (entrypoint fixes volume permissions,
         // then drops to agentbox via runuser). Child processes run as
-        // sandbox user via sudo. Capabilities restricted to SETUID/SETGID
-        // only — the minimum needed for user switching.
+        // sandbox user via sudo. CHOWN/FOWNER are needed for the
+        // entrypoint to fix volume permissions; SETUID/SETGID for user
+        // switching. All capabilities drop after runuser.
         securityContext: {
           seccompProfile: { type: "RuntimeDefault" },
         },
-        initContainers: [
-          {
-            name: "init-permissions",
-            image,
-            imagePullPolicy,
-            securityContext: {
-              runAsUser: 0,
-            },
-            command: ["sh", "-c", [
-              // Credentials dir: agentbox:kubecred 0750 (sandbox can't read)
-              "chown -R 1000:1002 /app/.siclaw/credentials",
-              "chmod 0750 /app/.siclaw/credentials",
-              "find /app/.siclaw/credentials -type f -exec chmod 0640 {} \\;",
-              // Config dir: agentbox:agentbox 0700 (settings.json written at runtime)
-              "chown -R 1000:1000 /app/.siclaw/config",
-              "chmod 0700 /app/.siclaw/config",
-              // Skills dir: agentbox:agentbox 0755 (sandbox can read)
-              "chown -R 1000:1000 /app/.siclaw/skills",
-              "chmod 0755 /app/.siclaw/skills",
-              // User data: world-writable (sandbox needs write access)
-              "chown -R 1000:1000 /app/.siclaw/user-data",
-              "chmod 0777 /app/.siclaw/user-data",
-            ].join(" && ")],
-            volumeMounts: [
-              { name: "credentials", mountPath: "/app/.siclaw/credentials" },
-              { name: "config", mountPath: "/app/.siclaw/config" },
-              { name: "skills-local", mountPath: "/app/.siclaw/skills" },
-              { name: "user-data", mountPath: "/app/.siclaw/user-data" },
-            ],
-          },
-        ],
         volumes: [
           {
             name: "credentials",
@@ -227,10 +221,15 @@ export class K8sSpawner implements BoxSpawner {
             name: "skills-local",
             emptyDir: {},
           },
-          {
-            name: "user-data",
-            emptyDir: {},
-          },
+          this.config.persistence?.enabled
+            ? {
+                name: "user-data",
+                persistentVolumeClaim: { claimName: this.userPvcName(userId) },
+              }
+            : {
+                name: "user-data",
+                emptyDir: {},
+              },
           {
             name: "client-cert",
             secret: { secretName: certSecretName },
@@ -248,7 +247,7 @@ export class K8sSpawner implements BoxSpawner {
             securityContext: {
               capabilities: {
                 drop: ["ALL"],
-                add: ["SETUID", "SETGID"],
+                add: ["SETUID", "SETGID", "CHOWN", "FOWNER"],
               },
               readOnlyRootFilesystem: true,
             },
@@ -273,7 +272,7 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                subPath: `user/${userId}/agent-data`,
+                subPath: this.config.persistence?.enabled ? workspaceId : `user/${userId}/agent-data`,
               },
               {
                 name: "client-cert",
@@ -310,47 +309,6 @@ export class K8sSpawner implements BoxSpawner {
       },
     };
 
-    // If a kubeconfig is provided, mount it via the init container
-    // into the credentials volume (agentbox:kubecred 0640).
-    if (boxConfig.kubeconfigBase64) {
-      const secretName = `${podName}-kubeconfig`;
-
-      // Create Secret
-      await this.coreApi.createNamespacedSecret({
-        namespace,
-        body: {
-          apiVersion: "v1",
-          kind: "Secret",
-          metadata: { name: secretName },
-          data: { config: boxConfig.kubeconfigBase64 },
-        },
-      });
-
-      // Mount the kubeconfig Secret into the init container at a temp path,
-      // and copy it to credentials dir with correct ownership/permissions
-      pod.spec!.volumes!.push({
-        name: "kubeconfig-secret",
-        secret: { secretName },
-      });
-      pod.spec!.initContainers![0].volumeMounts!.push({
-        name: "kubeconfig-secret",
-        mountPath: "/tmp/kubeconfig",
-        readOnly: true,
-      });
-      // Extend init command to copy kubeconfig with proper permissions
-      const initCmd = pod.spec!.initContainers![0].command![2] as string;
-      pod.spec!.initContainers![0].command![2] = initCmd +
-        " && cp /tmp/kubeconfig/config /app/.siclaw/credentials/kubeconfig" +
-        " && chown 1000:1002 /app/.siclaw/credentials/kubeconfig" +
-        " && chmod 0640 /app/.siclaw/credentials/kubeconfig";
-
-      // Add KUBECONFIG and SICLAW_CREDENTIALS_DIR env vars
-      env.push(
-        { name: "KUBECONFIG", value: "/app/.siclaw/credentials/kubeconfig" },
-        { name: "SICLAW_CREDENTIALS_DIR", value: "/app/.siclaw/credentials" },
-      );
-    }
-
     // Create Pod (handle 409 Conflict if another process created it concurrently)
     try {
       await this.coreApi.createNamespacedPod({ namespace, body: pod });
@@ -373,11 +331,18 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
+   * Generate PVC name for a user
+   */
+  private userPvcName(userId: string): string {
+    return `siclaw-user-${userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50)}`;
+  }
+
+  /**
    * Ensure per-user PVC exists (idempotent)
    */
   private async ensureUserPvc(userId: string): Promise<void> {
     const { namespace } = this.config;
-    const pvcName = `siclaw-user-${userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50)}`;
+    const pvcName = this.userPvcName(userId);
 
     try {
       await this.coreApi.readNamespacedPersistentVolumeClaim({ name: pvcName, namespace });
@@ -400,10 +365,10 @@ export class K8sSpawner implements BoxSpawner {
               },
             },
             spec: {
-              accessModes: ["ReadWriteOnce"],
-              storageClassName: process.env.SICLAW_STORAGE_CLASS || "nfs-siclaw",
+              accessModes: [this.config.persistence!.accessMode],
+              storageClassName: this.config.persistence!.storageClass,
               resources: {
-                requests: { storage: "1Gi" },
+                requests: { storage: this.config.persistence!.size },
               },
             },
           },
@@ -484,8 +449,8 @@ export class K8sSpawner implements BoxSpawner {
       // Delete Pod
       await this.coreApi.deleteNamespacedPod({ name: boxId, namespace });
 
-      // Attempt to delete the associated Secret
-      const secretName = `${boxId}-kubeconfig`;
+      // Attempt to delete the associated cert Secret
+      const secretName = `${boxId}-cert`;
       try {
         await this.coreApi.deleteNamespacedSecret({ name: secretName, namespace });
       } catch {
@@ -597,7 +562,7 @@ export class K8sSpawner implements BoxSpawner {
       labelSelector: `${labelPrefix}/app=agentbox`,
     });
 
-    // Delete all kubeconfig Secrets
+    // Delete all cert Secrets
     await this.coreApi.deleteCollectionNamespacedSecret({
       namespace,
       labelSelector: `${labelPrefix}/app=agentbox`,
