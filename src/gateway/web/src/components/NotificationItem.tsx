@@ -150,7 +150,7 @@ function extractSummary(message: string): string {
 
 // ─── Detail Modal ────────────────────────────────────
 
-function CronDetailModal({ notif, onClose }: { notif: Notification; onClose: () => void }) {
+export function CronDetailModal({ notif, onClose }: { notif: Notification; onClose: () => void }) {
     const cfg = getConfig(notif.type);
 
     return (
@@ -221,12 +221,12 @@ interface SingleItemProps {
     onMarkRead: (id: string) => void;
     onDelete: (id: string) => void;
     onClose?: () => void;
+    onShowDetail?: (notif: Notification) => void;
     nested?: boolean;
 }
 
-export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, nested }: SingleItemProps) {
+export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, onShowDetail, nested }: SingleItemProps) {
     const [collapsed, setCollapsed] = useState(true);
-    const [showDetail, setShowDetail] = useState(false);
     const navigate = useNavigate();
     const cfg = getConfig(notif.type);
     const Icon = cfg.icon;
@@ -242,9 +242,8 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
         } else if (SKILL_NAV_TYPES.has(notif.type) && notif.relatedId) {
             onClose?.();
             navigate(`/skills/${notif.relatedId}`);
-        } else if (isCron && notif.message) {
-            onClose?.();
-            setShowDetail(true);
+        } else if (isCron && notif.message && onShowDetail) {
+            onShowDetail(notif);
         }
     };
 
@@ -321,7 +320,7 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                                         {extractSummary(notif.message)}
                                     </p>
                                     <button
-                                        onClick={(e) => { e.stopPropagation(); if (!notif.isRead) onMarkRead(notif.id); onClose?.(); setShowDetail(true); }}
+                                        onClick={(e) => { e.stopPropagation(); if (!notif.isRead) onMarkRead(notif.id); onShowDetail?.(notif); }}
                                         className="flex items-center gap-0.5 text-[10px] text-primary-600 hover:text-primary-700 font-medium flex-shrink-0"
                                     >
                                         <FileText className="w-3 h-3" />
@@ -362,10 +361,6 @@ export function NotificationSingleItem({ notif, onMarkRead, onDelete, onClose, n
                 </div>
             </div>
 
-            {/* Detail modal for cron notifications */}
-            {showDetail && (
-                <CronDetailModal notif={notif} onClose={() => setShowDetail(false)} />
-            )}
         </>
     );
 }
@@ -377,9 +372,10 @@ interface GroupItemProps {
     onMarkRead: (id: string) => void;
     onDelete: (id: string) => void;
     onClose?: () => void;
+    onShowDetail?: (notif: Notification) => void;
 }
 
-export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose }: GroupItemProps) {
+export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose, onShowDetail }: GroupItemProps) {
     const [expanded, setExpanded] = useState(false);
 
     // Single item in group — render as regular item
@@ -390,6 +386,7 @@ export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose }: 
                 onMarkRead={onMarkRead}
                 onDelete={onDelete}
                 onClose={onClose}
+                onShowDetail={onShowDetail}
             />
         );
     }
@@ -462,6 +459,7 @@ export function NotificationGroupItem({ group, onMarkRead, onDelete, onClose }: 
                             onMarkRead={onMarkRead}
                             onDelete={onDelete}
                             onClose={onClose}
+                            onShowDetail={onShowDetail}
                             nested
                         />
                     ))}
