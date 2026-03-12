@@ -127,7 +127,7 @@ kubectl describe rs <new-rs> -n <ns>
 
 Check events for:
 - **Admission webhook denied** — a webhook is rejecting the new pod spec
-- **Exceeded quota** — resource quota in the namespace prevents creating more pods
+- **Exceeded quota / LimitRange violation** — Use `quota-debug` for native ResourceQuota/LimitRange diagnosis, or `volcano-queue-debug` for Volcano gang scheduling clusters
 - **FailedCreate** — other creation failures
 
 ---
