@@ -58,7 +58,7 @@ async function main() {
   console.log(`[agentbox] cwd: ${process.cwd()}`);
   console.log(`[agentbox] userDataDir=${userDataDir}`);
   console.log(`[agentbox] skillsDir=${skillsDir}`);
-  for (const tier of ["core"]) {
+  for (const tier of ["core", "extension"]) {
     const dir = path.join(skillsDir, tier);
     if (fs.existsSync(dir)) {
       const entries = fs.readdirSync(dir).filter(e => !e.startsWith("."));
