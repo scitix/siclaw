@@ -9,7 +9,7 @@ interface EmbeddingOpts {
 }
 
 const DEFAULT_BASE_URL = "";
-const DEFAULT_MODEL = "BAAI/bge-m3";
+const DEFAULT_MODEL = "";
 const DEFAULT_DIMENSIONS = 1024;
 const DEFAULT_MAX_INPUT_TOKENS = 8192;
 
@@ -102,6 +102,7 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
     dimensions,
     model,
     maxInputTokens,
+    available: !!baseUrl,
     async embed(texts: string[]): Promise<number[][]> {
       if (texts.length === 0 || !baseUrl) return [];
 

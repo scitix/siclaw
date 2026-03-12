@@ -130,3 +130,16 @@ export function tokenizeForFts(query: string): string[] {
 export function filterStopWords(tokens: string[]): string[] {
   return tokens.filter((t) => !isStopWord(t));
 }
+
+/**
+ * Extract meaningful keywords from a conversational query for FTS-only search.
+ * Strips stop words, vague references, and short fragments, returning only
+ * tokens likely to produce useful FTS matches.
+ *
+ * Examples:
+ * - "that thing we discussed about the API" → ["discussed", "api"]
+ * - "之前讨论的那个方案" → ["讨论", "方案"]  (via bigrams from tokenizeForFts)
+ */
+export function extractKeywords(query: string): string[] {
+  return tokenizeForFts(query);
+}

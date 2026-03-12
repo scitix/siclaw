@@ -19,6 +19,8 @@ export interface EmbeddingProvider {
   model: string;
   /** Max input tokens per text. Texts exceeding this are truncated before embedding. */
   maxInputTokens?: number;
+  /** Whether a real embedding endpoint is configured (baseUrl is non-empty). */
+  available: boolean;
 }
 
 /** Structured record extracted from a deep investigation conclusion. */

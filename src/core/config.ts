@@ -235,7 +235,7 @@ export function getEmbeddingConfig(): EmbeddingConfig | null {
   const config = loadConfig();
 
   const baseUrl = config.embedding?.baseUrl ?? "";
-  const model = config.embedding?.model ?? "BAAI/bge-m3";
+  const model = config.embedding?.model ?? "";
   const dimensions = config.embedding?.dimensions ?? 1024;
 
   // apiKey: explicit embedding key → default provider key → empty

@@ -6,7 +6,7 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { initMemoryDb } from "./schema.js";
 import { chunkMarkdown } from "./chunker.js";
 import { vectorToBlob, blobToVector } from "./embeddings.js";
-import { tokenizeForFts } from "./stop-words.js";
+import { tokenizeForFts, extractKeywords } from "./stop-words.js";
 import type { EmbeddingProvider, InvestigationRecord, MemoryChunk, MemorySearchResult } from "./types.js";
 import { applyTemporalDecay, type TemporalDecayConfig } from "./temporal-decay.js";
 import { mmrRerank, type MMRConfig } from "./mmr.js";
@@ -14,6 +14,11 @@ import { mmrRerank, type MMRConfig } from "./mmr.js";
 const DEFAULT_VECTOR_WEIGHT = 0.70;
 const DEFAULT_FTS_WEIGHT = 0.30;
 const DEFAULT_MIN_SCORE = 0.35;
+
+/** Internal extension of MemoryChunk that carries the DB row id through the pipeline. */
+interface ChunkWithId extends MemoryChunk {
+  _id: number;
+}
 
 export interface MemorySearchConfig {
   vectorWeight?: number;
@@ -212,6 +217,30 @@ export class MemoryIndexer {
       }
     }
 
+    // If embedding is now available, backfill chunks that were stored without vectors
+    // (e.g. embedding was configured after initial memory ingestion).
+    if (!modelChanged && this.embedding.available) {
+      const filesNeedingEmbedding = this.db
+        .prepare("SELECT DISTINCT file_path FROM chunks WHERE embedding IS NULL OR model = ''")
+        .all() as Array<{ file_path: string }>;
+      for (const row of filesNeedingEmbedding) {
+        if (!toUpdate.some((f) => f.relPath === row.file_path) && trackedPaths.has(row.file_path)) {
+          const absPath = path.join(this.memoryDir, row.file_path);
+          try {
+            const content = await fs.readFile(absPath, "utf-8");
+            const stat = await fs.stat(absPath);
+            const hash = crypto.createHash("sha256").update(content).digest("hex");
+            toUpdate.push({ relPath: row.file_path, absPath, content, hash, mtimeMs: Math.floor(stat.mtimeMs) });
+          } catch {
+            // File may have been deleted
+          }
+        }
+      }
+      if (filesNeedingEmbedding.length > 0) {
+        console.log(`[memory-indexer] Backfilling embeddings for ${filesNeedingEmbedding.length} files`);
+      }
+    }
+
     // Batch process changed files
     if (toUpdate.length > 0) {
       // Chunk all files
@@ -303,14 +332,30 @@ export class MemoryIndexer {
   /**
    * Hybrid search: vector similarity + FTS5 keyword.
    * Weights, temporal decay, and MMR re-ranking are configurable via searchConfig.
+   *
+   * When no embedding provider is available, falls back to FTS-only mode with
+   * query expansion (multi-keyword search + merge/dedup).
    */
   async search(query: string, topK = 10, minScore = DEFAULT_MIN_SCORE): Promise<MemorySearchResult> {
     const cleaned = query.trim();
     if (!cleaned) return { chunks: [], totalFiles: 0, totalChunks: 0 };
 
-    const vectorWeight = this.searchConfig.vectorWeight ?? DEFAULT_VECTOR_WEIGHT;
-    const ftsWeight = this.searchConfig.ftsWeight ?? DEFAULT_FTS_WEIGHT;
     const candidateK = Math.min(200, Math.max(1, topK * 4));
+
+    // ── FTS-only mode: no embedding provider configured ──
+    if (!this.embedding.available) {
+      const ftsChunks = this.ftsOnlySearch(cleaned, candidateK, minScore, topK);
+      return this.buildResult(ftsChunks);
+    }
+
+    // ── Hybrid mode: vector + FTS ──
+
+    // Normalize weights to sum to 1.0
+    const rawVW = this.searchConfig.vectorWeight ?? DEFAULT_VECTOR_WEIGHT;
+    const rawFW = this.searchConfig.ftsWeight ?? DEFAULT_FTS_WEIGHT;
+    const wSum = rawVW + rawFW;
+    const vectorWeight = wSum > 0 ? rawVW / wSum : DEFAULT_VECTOR_WEIGHT;
+    const ftsWeight = wSum > 0 ? rawFW / wSum : DEFAULT_FTS_WEIGHT;
 
     // 1. Vector search
     let vectorResults: Array<{ id: number; score: number }> = [];
@@ -331,13 +376,18 @@ export class MemoryIndexer {
       console.warn(`[memory-indexer] FTS search failed:`, err);
     }
 
+    // If vector search also returned nothing (e.g. API failed at runtime),
+    // fall back to FTS-only so results aren't lost behind the 0.30 weight.
+    if (vectorResults.length === 0 && ftsResults.length > 0) {
+      const ftsChunks = this.ftsOnlySearch(cleaned, candidateK, minScore, topK);
+      return this.buildResult(ftsChunks);
+    }
+
     // 3. Fuse results
     const scoreMap = new Map<number, { vectorScore: number; ftsScore: number }>();
-
     for (const r of vectorResults) {
       scoreMap.set(r.id, { vectorScore: r.score, ftsScore: 0 });
     }
-
     for (const r of ftsResults) {
       const entry = scoreMap.get(r.id) ?? { vectorScore: 0, ftsScore: 0 };
       entry.ftsScore = r.score;
@@ -349,41 +399,102 @@ export class MemoryIndexer {
         id,
         score: vectorWeight * vectorScore + ftsWeight * ftsScore,
       }))
-      .filter((r) => r.score >= minScore)
       .sort((a, b) => b.score - a.score)
       .slice(0, candidateK);
 
-    // Fetch chunk details
-    let chunks: MemoryChunk[] = [];
-    for (const { id, score } of fused) {
+    // 4. Fetch chunk details
+    let chunks = this.fetchChunks(fused);
+
+    // 5. Temporal decay + MMR (applied BEFORE minScore filter, matching openclaw)
+    chunks = applyTemporalDecay(chunks, this.searchConfig.temporalDecay);
+    chunks = mmrRerank(chunks, this.searchConfig.mmr);
+
+    // 6. Filter by minScore (strict)
+    const strict = chunks.filter((c) => (c.score ?? 0) >= minScore);
+    if (strict.length > 0 || ftsResults.length === 0) {
+      return this.buildResult(strict.sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, topK));
+    }
+
+    // 7. Relaxed minScore: keyword-only matches may score at most ftsWeight (e.g. 0.30).
+    //    If strict returned nothing but FTS had hits, relax the threshold for keyword-matched results.
+    const relaxedMinScore = Math.min(minScore, ftsWeight);
+    const ftsIds = new Set(ftsResults.map((r) => r.id));
+    const relaxed = chunks
+      .filter((c) => (c.score ?? 0) >= relaxedMinScore && ftsIds.has((c as ChunkWithId)._id))
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .slice(0, topK);
+    return this.buildResult(relaxed);
+  }
+
+  /**
+   * FTS-only search with query expansion.
+   * Extracts keywords from conversational queries and searches each independently,
+   * then merges results keeping the highest score per chunk.
+   */
+  private ftsOnlySearch(query: string, candidateK: number, minScore: number, topK: number): MemoryChunk[] {
+    const keywords = extractKeywords(query);
+    const searchTerms = keywords.length > 0 ? keywords : [query];
+
+    // Search each keyword and merge, keeping highest score per chunk
+    const best = new Map<number, { id: number; score: number }>();
+    for (const term of searchTerms) {
+      try {
+        const results = this.ftsSearch(term, candidateK);
+        for (const r of results) {
+          const existing = best.get(r.id);
+          if (!existing || r.score > existing.score) {
+            best.set(r.id, r);
+          }
+        }
+      } catch { /* skip failed term */ }
+    }
+
+    let chunks = this.fetchChunks(
+      [...best.values()].sort((a, b) => b.score - a.score).slice(0, candidateK),
+    );
+
+    // Apply temporal decay + MMR before filtering
+    chunks = applyTemporalDecay(chunks, this.searchConfig.temporalDecay);
+    chunks = mmrRerank(chunks, this.searchConfig.mmr);
+
+    return chunks
+      .filter((c) => (c.score ?? 0) >= minScore)
+      .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+      .slice(0, topK);
+  }
+
+  /** Fetch MemoryChunk rows by id+score pairs. */
+  private fetchChunks(entries: Array<{ id: number; score: number }>): MemoryChunk[] {
+    const chunks: MemoryChunk[] = [];
+    for (const { id, score } of entries) {
       const row = this.stmts.getChunkById.get(id) as
         | { file_path: string; heading: string; content: string; start_line: number; end_line: number }
         | undefined;
       if (row) {
-        chunks.push({
+        const chunk: ChunkWithId = {
           file: row.file_path,
           heading: row.heading,
           content: row.content,
           startLine: row.start_line,
           endLine: row.end_line,
           score,
-        });
+          _id: id,
+        };
+        chunks.push(chunk);
       }
     }
+    return chunks;
+  }
 
-    // 4. Temporal decay
-    chunks = applyTemporalDecay(chunks, this.searchConfig.temporalDecay);
-
-    // 5. MMR re-ranking
-    chunks = mmrRerank(chunks, this.searchConfig.mmr);
-
-    // Final sort and trim
-    chunks = chunks.sort((a, b) => (b.score ?? 0) - (a.score ?? 0)).slice(0, topK);
-
+  /** Build the final MemorySearchResult with counts. */
+  private buildResult(chunks: MemoryChunk[]): MemorySearchResult {
+    // Strip internal _id before returning
+    const cleaned = chunks.map(({ file, heading, content, startLine, endLine, score }) => ({
+      file, heading, content, startLine, endLine, score,
+    }));
     const totalFiles = (this.db.prepare("SELECT COUNT(*) AS c FROM files").get() as { c: number }).c;
     const totalChunks = (this.db.prepare("SELECT COUNT(*) AS c FROM chunks").get() as { c: number }).c;
-
-    return { chunks, totalFiles, totalChunks };
+    return { chunks: cleaned, totalFiles, totalChunks };
   }
 
   /**
@@ -640,10 +751,12 @@ export class MemoryIndexer {
         )
         .all(ftsQuery, limit) as Array<{ id: number; rank: number }>;
 
-      // BM25 rank is negative (lower is better), convert to bounded (0, 1] score
+      // BM25 rank is negative (lower = more relevant).
+      // Convert to (0, 1] score using saturation: relevance / (1 + relevance).
+      // e.g. rank=-4.2 → score=0.81, rank=-0.5 → score=0.33
       return rows.map((r) => ({
         id: r.id,
-        score: Number.isFinite(r.rank) ? 1 / (1 + Math.max(0, -r.rank)) : 0,
+        score: bm25RankToScore(r.rank),
       }));
     } catch {
       return [];
@@ -659,6 +772,16 @@ function safeJsonArray(raw: string | null | undefined): unknown[] {
   } catch {
     return [];
   }
+}
+
+/** Convert BM25 rank (negative = more relevant) to a (0, 1] score. */
+function bm25RankToScore(rank: number): number {
+  if (!Number.isFinite(rank)) return 0;
+  if (rank < 0) {
+    const relevance = -rank;
+    return relevance / (1 + relevance);
+  }
+  return 1 / (1 + rank);
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {

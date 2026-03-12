@@ -433,7 +433,7 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
   // Seed default embedding config if not present
   sdb.run(sql.raw(
     `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)
-     VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
+     VALUES ('default', '', '', 1024, ${Math.floor(Date.now() / 1000)})`
   ));
 
   // Persist schema changes to disk immediately (sql.js is in-memory)
