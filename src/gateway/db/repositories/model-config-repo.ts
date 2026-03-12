@@ -430,11 +430,11 @@ export class ModelConfigRepository {
 
     if (rows.length === 0) return null;
     const row = rows[0];
-    return {
-      provider: row.providerName ?? "",
-      model: row.model ?? "",
-      dimensions: row.dimensions,
-    };
+    const provider = row.providerName ?? "";
+    const model = row.model ?? "";
+    // Treat empty/placeholder values as unconfigured
+    if (!provider || !model) return null;
+    return { provider, model, dimensions: row.dimensions };
   }
 
   async getResolvedEmbeddingConfig(): Promise<{

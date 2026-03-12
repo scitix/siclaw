@@ -430,10 +430,15 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     END
   `));
 
-  // Seed default embedding config if not present
+  // Seed default embedding config if not present (empty = unconfigured)
   sdb.run(sql.raw(
     `INSERT OR IGNORE INTO embedding_config (id, provider_name, model, dimensions, updated_at)
-     VALUES ('default', 'default', 'BAAI/bge-m3', 1024, ${Math.floor(Date.now() / 1000)})`
+     VALUES ('default', '', '', 1024, ${Math.floor(Date.now() / 1000)})`
+  ));
+  // Clean up old seed that hardcoded BAAI/bge-m3 as default
+  sdb.run(sql.raw(
+    `UPDATE embedding_config SET provider_name = '', model = ''
+     WHERE id = 'default' AND provider_name = 'default' AND model = 'BAAI/bge-m3'`
   ));
 
   // Persist schema changes to disk immediately (sql.js is in-memory)

@@ -63,7 +63,6 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
           body: JSON.stringify({
             model,
             input: texts,
-            dimensions,
           }),
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
