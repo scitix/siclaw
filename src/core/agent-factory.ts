@@ -260,12 +260,17 @@ export async function createSiclawSession(
     createPodExecTool(kubeconfigRef),
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
-    createManageScheduleTool(kubeconfigRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createCredentialListTool(kubeconfigRef),
   ];
 
-  if (mode === "web" || mode === "cli") {
+  // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
+  if (mode !== "cli") {
+    customTools.push(createManageScheduleTool(kubeconfigRef));
+  }
+  // Skill management tools are web-only: they produce output designed for
+  // frontend preview card rendering that neither TUI nor channel mode supports.
+  if (mode === "web") {
     customTools.push(createCreateSkillTool());
     customTools.push(createUpdateSkillTool());
     customTools.push(createForkSkillTool());
