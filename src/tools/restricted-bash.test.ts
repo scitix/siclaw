@@ -443,8 +443,8 @@ describe("isSkillScript", () => {
   });
 
   afterAll(() => {
-    try { fs.unlinkSync(mockScript); } catch {}
-    try { fs.unlinkSync(mockPyScript); } catch {}
+    try { fs.rmSync(path.join(extSkillsDir, "roce-perftest-pod"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(extSkillsDir, "roce-check-node-config"), { recursive: true }); } catch {}
   });
 
   // bash/sh prefix
@@ -765,8 +765,8 @@ describe("createRestrictedBashTool — skill script whitelist", () => {
   });
 
   afterAll(() => {
-    try { fs.unlinkSync(mockScript); } catch {}
-    try { fs.unlinkSync(mockPyScript); } catch {}
+    try { fs.rmSync(path.join(extSkillsDir, "roce-perftest-pod"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(extSkillsDir, "roce-check-node-config"), { recursive: true }); } catch {}
   });
 
   it("allows bash skills/extension/ script", async () => {

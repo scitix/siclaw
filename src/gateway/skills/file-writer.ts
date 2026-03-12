@@ -31,7 +31,7 @@ export class SkillFileWriter {
 
   /** Initialize Skills PV (ensure dirs exist) */
   async init(): Promise<void> {
-    for (const sub of ["core", "team", "user", "platform"]) {
+    for (const sub of ["core", "extension", "team", "user", "platform"]) {
       const dir = path.join(this.skillsDir, sub);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -223,10 +223,12 @@ export class SkillFileWriter {
       const results: ScannedSkill[] = [];
       const seen = new Set<string>();
 
-      // Scan Docker-baked cwd/skills/core
-      const bakedCore = path.join(process.cwd(), "skills", "core");
-      for (const s of this.scanDir(bakedCore, "builtin")) {
-        if (!seen.has(s.dirName)) { seen.add(s.dirName); results.push(s); }
+      // Scan Docker-baked cwd/skills/core and cwd/skills/extension
+      for (const tier of ["core", "extension"]) {
+        const bakedDir = path.join(process.cwd(), "skills", tier);
+        for (const s of this.scanDir(bakedDir, "builtin")) {
+          if (!seen.has(s.dirName)) { seen.add(s.dirName); results.push(s); }
+        }
       }
 
       return results;
