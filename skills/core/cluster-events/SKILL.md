@@ -61,7 +61,7 @@ Match the Warning events against the patterns below. For each matched pattern, r
 
 The scheduler cannot place a pod on any node.
 
-**Next step:** Use the `pod-pending-debug` skill to diagnose the specific pod.
+**Next step:** Use the `pod-pending-debug` skill to diagnose the specific pod. If the pod has a `scheduling.volcano.sh/pod-group` annotation (managed by Volcano scheduler), use `volcano-diagnose-pod` skill instead for Volcano-specific issues (PodGroup, Queue, Gang scheduling).
 
 ---
 
