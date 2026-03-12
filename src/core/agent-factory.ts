@@ -260,12 +260,14 @@ export async function createSiclawSession(
     createPodExecTool(kubeconfigRef),
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
-    createManageScheduleTool(kubeconfigRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createCredentialListTool(kubeconfigRef),
   ];
 
-  if (mode === "web" || mode === "cli") {
+  // Web/channel-only tools: these require frontend UI for rendering, confirmation,
+  // or workspace binding that TUI (cli) mode does not have.
+  if (mode !== "cli") {
+    customTools.push(createManageScheduleTool(kubeconfigRef));
     customTools.push(createCreateSkillTool());
     customTools.push(createUpdateSkillTool());
     customTools.push(createForkSkillTool());
