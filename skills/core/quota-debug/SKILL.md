@@ -200,4 +200,4 @@ Look for `spec.scopes` or `spec.scopeSelector`. A scoped quota only applies to p
 - When a namespace has a ResourceQuota for compute resources (cpu/memory), **every container must specify requests/limits** for those resources, otherwise admission is rejected. This catches users who are used to running without resource specs.
 - LimitRange can automatically inject default requests/limits into containers that don't specify them. Check if defaults are configured before telling users to add explicit resource specs.
 - For cross-reference: if the pod IS created but stuck in Pending, use the `pod-pending-debug` skill instead — that covers scheduling failures (node resources, taints, affinity).
-- `kubectl top pods -n <ns>` shows actual resource usage, while quota tracks **requested** resources. A namespace can hit quota limits even if actual usage is low.
+- `kubectl top pods -n <ns>` shows actual resource usage, while quota tracks **requested** resources. A namespace can hit quota limits even if actual usage is low. Note: `kubectl top` requires metrics-server to be installed — if it returns an error, skip it and rely on quota `Used` values instead.

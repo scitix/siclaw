@@ -94,7 +94,7 @@ kubectl get queue -o custom-columns='NAME:.metadata.name,CAPABILITY:.spec.capabi
 For GPU-specific checks (GPU is often the bottleneck in Volcano clusters):
 
 ```bash
-kubectl get queue -o custom-columns='NAME:.metadata.name,GPU_CAP:.spec.capability.nvidia\.com/gpu,GPU_ALLOC:.status.allocated.nvidia\.com/gpu'
+kubectl get queue -o custom-columns="NAME:.metadata.name,GPU_CAP:.spec.capability['nvidia.com/gpu'],GPU_ALLOC:.status.allocated['nvidia.com/gpu']"
 ```
 
 Compare `Allocated` vs `Capability` for each resource dimension (cpu, memory, GPU). If any dimension is at or near the ceiling, the queue cannot allocate more resources.
@@ -102,7 +102,7 @@ Compare `Allocated` vs `Capability` for each resource dimension (cpu, memory, GP
 **Also verify queue capability against actual cluster capacity** — a common misconfiguration is setting queue capability higher than the cluster's physical resources:
 
 ```bash
-kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory'
+kubectl get nodes -o custom-columns="NAME:.metadata.name,GPU:.status.allocatable['nvidia.com/gpu'],CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory"
 ```
 
 If the sum of all nodes' allocatable GPUs is less than the queue's `spec.capability.nvidia.com/gpu`, the queue can never be fully utilized. When `Allocated` reaches the cluster's physical limit, the queue will appear to have remaining capacity but no more resources can actually be scheduled.
@@ -153,7 +153,7 @@ kubectl get vcjob <job-name> -n <ns> -o jsonpath='{.spec.tasks[*].template.spec.
 Then check if the matching nodes actually have available resources:
 
 ```bash
-kubectl get nodes -l <label-key>=<label-value> -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'
+kubectl get nodes -l <label-key>=<label-value> -o custom-columns="NAME:.metadata.name,GPU:.status.allocatable['nvidia.com/gpu']"
 kubectl top nodes -l <label-key>=<label-value>
 ```
 
