@@ -153,6 +153,7 @@ function reduceInvestigationProgress(
 }
 
 const SESSION_KEY_STORAGE = 'siclaw_current_session';
+const SESSION_WORKSPACE_STORAGE = 'siclaw_session_workspace';
 const SELECTED_BRAIN_STORAGE = 'siclaw_selected_brain';
 
 export type BrainType = "pi-agent" | "claude-sdk";
@@ -281,7 +282,12 @@ export function usePilot() {
     });
     const [sessions, setSessions] = useState<Session[]>([]);
     const [currentSessionKey, setCurrentSessionKey] = useState<string | null>(() => {
-        return sessionStorage.getItem(SESSION_KEY_STORAGE);
+        const storedKey = sessionStorage.getItem(SESSION_KEY_STORAGE);
+        if (!storedKey) return null;
+        // If workspace changed while Pilot was unmounted, discard stale session key
+        const storedWs = sessionStorage.getItem(SESSION_WORKSPACE_STORAGE);
+        if (storedWs !== (workspaceId ?? '')) return null;
+        return storedKey;
     });
     const [isLoading, setIsLoading] = useState(false);
     const [pendingMessages, setPendingMessages] = useState<string[]>([]);
@@ -346,14 +352,16 @@ export function usePilot() {
         setInvestigationProgress(null);
     };
 
-    // Persist currentSessionKey to sessionStorage (per-tab isolation)
+    // Persist currentSessionKey + workspace to sessionStorage (per-tab isolation)
     useEffect(() => {
         if (currentSessionKey) {
             sessionStorage.setItem(SESSION_KEY_STORAGE, currentSessionKey);
+            sessionStorage.setItem(SESSION_WORKSPACE_STORAGE, workspaceId ?? '');
         } else {
             sessionStorage.removeItem(SESSION_KEY_STORAGE);
+            sessionStorage.removeItem(SESSION_WORKSPACE_STORAGE);
         }
-    }, [currentSessionKey]);
+    }, [currentSessionKey, workspaceId]);
 
     // Persist dpActive to localStorage
     useEffect(() => {
@@ -1187,13 +1195,26 @@ export function usePilot() {
     // Load sessions, skills, and models on connect; reload history for persisted session
     useEffect(() => {
         if (isConnected) {
-            loadSessions();
+            // Load sessions and auto-select most recent if no persisted session key
+            (async () => {
+                try {
+                    const params: Record<string, unknown> = {};
+                    if (workspaceId) params.workspaceId = workspaceId;
+                    const result = await sendRpc<{ sessions: Session[] }>('session.list', params);
+                    const newSessions = result.sessions ?? [];
+                    setSessions(newSessions);
+                    if (currentSessionKey) {
+                        loadHistory(currentSessionKey);
+                    } else if (newSessions.length > 0) {
+                        loadHistory(newSessions[0].key);
+                    }
+                } catch (err) {
+                    console.error('Failed to load sessions:', err);
+                }
+            })();
             loadSkills();
             loadModels();
             loadSystemStatus();
-            if (currentSessionKey) {
-                loadHistory(currentSessionKey);
-            }
         }
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
