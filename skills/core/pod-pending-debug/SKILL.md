@@ -144,3 +144,4 @@ The scheduler is attempting to evict lower-priority pods to make room. This is n
 
 - If no `FailedScheduling` event exists, the pod may not have been processed by the scheduler yet — check if the scheduler pod itself is healthy: `kubectl get pods -n kube-system -l component=kube-scheduler`.
 - For pods created by controllers (Deployment, StatefulSet), the pending pod name may change as the controller recreates it — use label selectors to find the current pending pod.
+- If the pod has a `scheduling.volcano.sh/pod-group` annotation, it is managed by Volcano scheduler — use `volcano-diagnose-pod` skill instead for Volcano-specific issues (PodGroup, Queue, Gang scheduling).

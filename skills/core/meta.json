@@ -21,6 +21,13 @@
     "quota-debug":              ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "service-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "statefulset-debug":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
-    "volcano-queue-debug":      ["kubernetes", "general",  "diagnostic", "sre", "developer"]
+    "volcano-diagnose-pod":       ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-gang-scheduling":    ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-job-diagnose":       ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-node-resources":     ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-queue-diagnose":     ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-resource-insufficient": ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-scheduler-config":   ["volcano", "scheduling", "diagnostic", "sre", "developer"],
+    "volcano-scheduler-logs":     ["volcano", "scheduling", "diagnostic", "sre", "developer"]
   }
 }

@@ -3,7 +3,7 @@ name: quota-debug
 description: >-
   Diagnose Kubernetes native ResourceQuota and LimitRange admission rejections (exceeded quota, forbidden by LimitRange, FailedCreate).
   Checks namespace quotas, current usage, LimitRange constraints, and ReplicaSet events to identify why pods cannot be created.
-  Not applicable to Volcano Queue — use volcano-queue-debug for gang scheduling clusters.
+  Not applicable to Volcano Queue — use volcano-queue-diagnose for gang scheduling clusters.
 ---
 
 # ResourceQuota & LimitRange Admission Diagnosis
@@ -14,13 +14,13 @@ When pods fail to be created due to Kubernetes native namespace-level resource c
 
 **When to use:** Pods are not being created at all (not Pending, not CrashLoopBackOff — simply missing). Typical trigger: a ReplicaSet or Job shows `FailedCreate` events mentioning `exceeded quota` or `forbidden: ... LimitRange`.
 
-**Not applicable to Volcano Queue:** If the cluster uses Volcano for gang scheduling, resource quotas are managed by Volcano Queue, not Kubernetes native ResourceQuota. Use the `volcano-queue-debug` skill instead. To check:
+**Not applicable to Volcano Queue:** If the cluster uses Volcano for gang scheduling, resource quotas are managed by Volcano Queue, not Kubernetes native ResourceQuota. Use the `volcano-queue-diagnose` skill instead. To check:
 
 ```bash
 kubectl get queue 2>/dev/null
 ```
 
-If this command returns results (Queue resources listed), the cluster uses Volcano — use `volcano-queue-debug`. If it returns nothing or an error, Volcano is not installed — continue with this skill.
+If this command returns results (Queue resources listed), the cluster uses Volcano — use `volcano-queue-diagnose`. If it returns nothing or an error, Volcano is not installed — continue with this skill.
 
 ## Diagnostic Flow
 
