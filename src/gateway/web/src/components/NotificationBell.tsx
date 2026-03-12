@@ -1,8 +1,8 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Bell, Check, Trash2 } from 'lucide-react';
 import { useWebSocket } from '../hooks/useWebSocket';
-import { useNotifications, groupNotifications } from '../hooks/useNotifications';
-import { NotificationGroupItem } from './NotificationItem';
+import { useNotifications, groupNotifications, type Notification } from '../hooks/useNotifications';
+import { NotificationGroupItem, CronDetailModal } from './NotificationItem';
 
 export function NotificationBell() {
     const { sendRpc, isConnected } = useWebSocket({
@@ -20,7 +20,13 @@ export function NotificationBell() {
     } = useNotifications(sendRpc);
 
     const [isOpen, setIsOpen] = useState(false);
+    const [detailNotif, setDetailNotif] = useState<Notification | null>(null);
     const panelRef = useRef<HTMLDivElement>(null);
+
+    const handleShowDetail = useCallback((notif: Notification) => {
+        setIsOpen(false);
+        setDetailNotif(notif);
+    }, []);
 
     const groups = useMemo(() => groupNotifications(notifications), [notifications]);
 
@@ -96,11 +102,17 @@ export function NotificationBell() {
                                     onMarkRead={markRead}
                                     onDelete={dismissOne}
                                     onClose={() => setIsOpen(false)}
+                                    onShowDetail={handleShowDetail}
                                 />
                             ))
                         )}
                     </div>
                 </div>
+            )}
+
+            {/* Detail modal — rendered outside dropdown so it survives dropdown close */}
+            {detailNotif && (
+                <CronDetailModal notif={detailNotif} onClose={() => setDetailNotif(null)} />
             )}
         </div>
     );
