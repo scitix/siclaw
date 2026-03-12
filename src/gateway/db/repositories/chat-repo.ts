@@ -3,9 +3,9 @@
  */
 
 import crypto from "node:crypto";
-import { eq, desc, and, lt, lte, gte, isNull, or, like, sql } from "drizzle-orm";
+import { eq, desc, and, lt, lte, gte, isNull, isNotNull, or, like, inArray, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { sessions, messages, users } from "../schema.js";
+import { sessions, messages, users, sessionStats } from "../schema.js";
 
 export class ChatRepository {
   constructor(private db: Database) {}
@@ -188,6 +188,82 @@ export class ChatRepository {
       .where(and(...conditions))
       .orderBy(desc(messages.timestamp), desc(messages.id))
       .limit(opts.limit + 1);
+  }
+
+  // ── DB Cleanup Methods ──────────────────────────────
+
+  private static readonly BATCH_SIZE = 500;
+
+  /**
+   * Soft-delete inactive sessions (no activity for `inactiveDays`).
+   * Only targets sessions that haven't been deleted yet.
+   */
+  async softDeleteInactiveSessions(inactiveDays: number): Promise<number> {
+    const cutoff = new Date(Date.now() - inactiveDays * 86400_000);
+    const now = new Date();
+    let total = 0;
+    while (true) {
+      const ids = await this.db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(and(isNull(sessions.deletedAt), lt(sessions.lastActiveAt, cutoff)))
+        .limit(ChatRepository.BATCH_SIZE);
+      if (ids.length === 0) break;
+      await this.db
+        .update(sessions)
+        .set({ deletedAt: now })
+        .where(inArray(sessions.id, ids.map((r) => r.id)));
+      total += ids.length;
+      if (ids.length < ChatRepository.BATCH_SIZE) break;
+    }
+    return total;
+  }
+
+  /**
+   * Hard-delete sessions that were soft-deleted more than `deletedDays` ago.
+   * Messages are cleaned up automatically via FK CASCADE.
+   */
+  async purgeDeletedSessions(deletedDays: number): Promise<number> {
+    const cutoff = new Date(Date.now() - deletedDays * 86400_000);
+    let total = 0;
+    while (true) {
+      const ids = await this.db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(and(isNotNull(sessions.deletedAt), lt(sessions.deletedAt, cutoff)))
+        .limit(ChatRepository.BATCH_SIZE);
+      if (ids.length === 0) break;
+      await this.db
+        .delete(sessions)
+        .where(inArray(sessions.id, ids.map((r) => r.id)));
+      total += ids.length;
+      if (ids.length < ChatRepository.BATCH_SIZE) break;
+    }
+    return total;
+  }
+
+  /**
+   * Hard-delete session_stats older than `retentionDays`.
+   * Note: sessionStats.createdAt is a raw epoch number in milliseconds
+   * (no mode:"timestamp"), so we compare with numeric ms, not Date.
+   */
+  async purgeOldSessionStats(retentionDays: number): Promise<number> {
+    const cutoff = Date.now() - retentionDays * 86400_000;
+    let total = 0;
+    while (true) {
+      const ids = await this.db
+        .select({ id: sessionStats.id })
+        .from(sessionStats)
+        .where(lt(sessionStats.createdAt, cutoff))
+        .limit(ChatRepository.BATCH_SIZE);
+      if (ids.length === 0) break;
+      await this.db
+        .delete(sessionStats)
+        .where(inArray(sessionStats.id, ids.map((r) => r.id)));
+      total += ids.length;
+      if (ids.length < ChatRepository.BATCH_SIZE) break;
+    }
+    return total;
   }
 
   async updateMetadata(
