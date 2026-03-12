@@ -432,6 +432,7 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE workspaces ADD COLUMN env_type VARCHAR(10) NOT NULL DEFAULT 'prod' AFTER is_default`,
     `ALTER TABLE environments ADD COLUMN api_server VARCHAR(512) NOT NULL DEFAULT '' AFTER is_test`,
     `ALTER TABLE cron_jobs ADD COLUMN workspace_id VARCHAR(64)`,
+    `ALTER TABLE cron_jobs ADD CONSTRAINT fk_cron_jobs_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id)`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

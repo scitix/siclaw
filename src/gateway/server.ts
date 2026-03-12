@@ -929,7 +929,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           } catch (innerErr) {
             timeout.cancel();
             // On timeout, attempt to abort + close the orphaned agent session
-            if (client && sessionId && innerErr instanceof Error && innerErr.message.includes("timed out")) {
+            if (client && sessionId && innerErr instanceof ExecutionTimeoutError) {
               try { await client.abortSession(sessionId); } catch { /* best-effort */ }
               try { await client.closeSession(sessionId); } catch { /* best-effort */ }
               console.log(`[gateway] agent-prompt session=${sessionId} aborted after timeout`);
@@ -1447,11 +1447,18 @@ async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string)
   return resultText;
 }
 
+class ExecutionTimeoutError extends Error {
+  constructor(sessionId: string, ms: number) {
+    super(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`);
+    this.name = "ExecutionTimeoutError";
+  }
+}
+
 /** Returns a cancellable promise that rejects after the given timeout */
 function rejectAfterTimeout(ms: number, sessionId: string): { promise: Promise<never>; cancel: () => void } {
   let timer: NodeJS.Timeout | undefined;
   const promise = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`)), ms);
+    timer = setTimeout(() => reject(new ExecutionTimeoutError(sessionId, ms)), ms);
     timer.unref();
   });
   return {
