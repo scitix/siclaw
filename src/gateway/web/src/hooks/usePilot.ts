@@ -421,6 +421,17 @@ export function usePilot() {
                     // Initialize investigation progress for deep_search (preserve optimistic state if present)
                     if (toolName === 'deep_search') {
                         setInvestigationProgress(prev => prev ?? { hypotheses: [] });
+                        // Ensure dpChecklist exists so InvestigationCard is hidden in favor of DpChecklistCard.
+                        // Covers page refresh where restoreDpProgress returned empty (Phase 3 hadn't started yet).
+                        setDpChecklist(prev => {
+                            if (prev) return prev;
+                            const checklist = createDefaultDpChecklist();
+                            checklist[0].status = 'done';         // triage
+                            checklist[1].status = 'done';         // hypotheses
+                            checklist[2].status = 'in_progress';  // deep_search
+                            return checklist;
+                        });
+                        setDpFocus(prev => prev ?? 'deep_search');
                     }
                     // Handle manage_checklist status updates
                     if (toolName === 'manage_checklist') {
@@ -1119,17 +1130,19 @@ export function usePilot() {
             // If the prompt has already finished, restoring the old phase/checklist leaves
             // the UI stuck showing a stale "Present findings" card for completed sessions.
             if (!snap.promptActive) return;
-            if (!snap.events || snap.events.length === 0) return;
+
             // Replay events through the same reducer used for live progress
             let state: InvestigationProgress = { hypotheses: [] };
-            for (const ev of snap.events) {
-                state = reduceInvestigationProgress(state, ev);
+            if (snap.events && snap.events.length > 0) {
+                for (const ev of snap.events) {
+                    state = reduceInvestigationProgress(state, ev);
+                }
+                setInvestigationProgress(state);
             }
-            setInvestigationProgress(state);
 
-            // Derive dpChecklist from restored investigation state so the
-            // DpChecklistCard renders (it gates hypothesis tree visibility).
-            // Phase values from engine: "Phase 1/4" .. "Phase 4/4"
+            // Always create dpChecklist when prompt is active, even without events.
+            // Without this, a page refresh during deep_search shows the bare
+            // InvestigationCard (no progress bars) instead of DpChecklistCard.
             const phase = state.phase;
             const checklist = createDefaultDpChecklist();
             const phaseNum = phase ? parseInt(phase.match(/(\d+)/)?.[1] ?? '0') : 0;
@@ -1142,8 +1155,9 @@ export function usePilot() {
                         checklist[i].status = 'in_progress';
                     }
                 }
-            } else if (state.hypotheses.length > 0) {
-                // Have hypotheses but no phase info — at least in deep_search
+            } else {
+                // No phase info — default to deep_search in_progress so
+                // DpChecklistCard renders instead of bare InvestigationCard.
                 checklist[0].status = 'done';
                 checklist[1].status = 'done';
                 checklist[2].status = 'in_progress';

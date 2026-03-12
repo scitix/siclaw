@@ -225,9 +225,11 @@ export interface HypothesesCardProps {
     abortResponse?: () => void;
     onHypothesesConfirmed?: (hypotheses: ConfirmedHypothesis[]) => void;
     superseded?: boolean;
+    /** True when a deep_search exists after this card — survives page refresh */
+    alreadyConfirmed?: boolean;
 }
 
-export function HypothesesCard({ message, sendMessage, abortResponse, onHypothesesConfirmed, superseded }: HypothesesCardProps) {
+export function HypothesesCard({ message, sendMessage, abortResponse, onHypothesesConfirmed, superseded, alreadyConfirmed }: HypothesesCardProps) {
     const [feedbackMode, setFeedbackMode] = useState(false);
     const [feedbackText, setFeedbackText] = useState('');
     const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
@@ -239,6 +241,9 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
     // Parse hypotheses: prefer toolDetails.hypotheses (gateway mode), fallback to toolInput
     const hypothesesSource = (message.toolDetails?.hypotheses as string) || message.toolInput || '';
     const hypotheses = parseHypotheses(hypothesesSource);
+
+    // Effective confirmed: local state OR derived from history (deep_search exists after this card)
+    const effectiveConfirmed = confirmed || alreadyConfirmed;
 
     // Superseded: a newer propose_hypotheses exists — render collapsed
     if (superseded) {
@@ -258,7 +263,7 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
 
     // Check if auto-confirmed (TUI mode) or user-confirmed (web mode)
     const isAutoConfirmed = isDone && (message.toolDetails?.autoConfirmed === true);
-    const showActions = isDone && !isRunning && !feedbackMode && !isAutoConfirmed && !confirmed;
+    const showActions = isDone && !isRunning && !feedbackMode && !isAutoConfirmed && !effectiveConfirmed;
 
     const emitConfirmed = () => {
         if (onHypothesesConfirmed && hypotheses.length > 0) {
@@ -309,13 +314,13 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                     <Search className="w-4 h-4 text-indigo-500 shrink-0" />
                     <span className="text-sm font-semibold text-gray-800">Deep Investigation</span>
                     <span className="text-xs text-gray-500">Hypothesis Review</span>
-                    {isDone && (isAutoConfirmed || confirmed) && (
+                    {isDone && (isAutoConfirmed || effectiveConfirmed) && (
                         <span className="ml-auto text-xs font-medium px-1.5 py-0.5 rounded flex items-center gap-1 bg-indigo-100 text-indigo-700">
                             <CheckCircle2 className="w-3 h-3" />
                             Confirmed
                         </span>
                     )}
-                    {isDone && !isAutoConfirmed && !confirmed && !feedbackMode && (
+                    {isDone && !isAutoConfirmed && !effectiveConfirmed && !feedbackMode && (
                         <span className="ml-auto text-xs text-amber-600 font-medium px-1.5 py-0.5 rounded bg-amber-50">
                             Awaiting review
                         </span>
@@ -401,7 +406,7 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                             type="text"
                             value={feedbackText}
                             onChange={(e) => setFeedbackText(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && handleSendFeedback()}
+                            onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && handleSendFeedback()}
                             placeholder="Add/modify hypotheses..."
                             className="flex-1 text-sm border border-indigo-200 rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400"
                             autoFocus
