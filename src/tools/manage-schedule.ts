@@ -21,9 +21,18 @@ export function createManageScheduleTool(kubeconfigRef?: KubeconfigRef): ToolDef
     description: `Create, update, delete, pause, resume, rename, or list cron schedules for automated task execution.
 This tool outputs a structured schedule definition. ALL actions are AUTO-EXECUTED immediately — no user confirmation needed.
 
-IMPORTANT: An environment MUST be selected before using this tool. If no environment is selected, all actions will fail.
-If the user has not selected an environment, ask them to select one first before proceeding.
-All operations are scoped to the current environment — "list" only returns schedules in that environment, and mutations only affect schedules in that environment.
+NOTE: The "list" action returns schedules scoped to the current workspace.
+For mutation actions (create, update, delete, pause, resume, rename), the frontend handles workspace binding automatically.
+
+CRITICAL — LANGUAGE: The "name" and "description" fields MUST be written in the SAME language the user is speaking.
+If the user speaks Korean, write in Korean. If Japanese, write in Japanese. Match the user's language exactly. This directly controls the language of the scheduled task's output.
+
+CRITICAL — TARGET CONTEXT: When creating or updating a schedule, you MUST include the specific target in the description field.
+The description must be a self-contained instruction that clearly specifies WHAT to operate on:
+- For Kubernetes tasks: include the cluster/environment name and namespace (e.g. "Check abnormal pods in the default namespace of the roce-production cluster")
+- For host tasks: include the hostname or IP (e.g. "Check disk usage on host web-server-01")
+- For service tasks: include the service name (e.g. "Verify API health of payment-service")
+The scheduled task runs autonomously with no user interaction — if the target is ambiguous, the task WILL fail or produce wrong results.
 
 CRITICAL RESPONSE RULES:
 - After calling this tool, tell the user the operation is DONE. Use past tense: "Created/Updated/Paused/Resumed/Deleted/Renamed".
@@ -70,7 +79,7 @@ Common cron patterns:
         Type.Literal("list"),
       ], { description: "The action to perform" }),
       id: Type.Optional(
-        Type.String({ description: "Schedule ID. If unknown, pass name instead." }),
+        Type.String({ description: "Schedule ID (UUID). Only use if you obtained the exact ID from a previous list result. Otherwise omit and use name." }),
       ),
       name: Type.Optional(
         Type.String({ description: "Schedule name (for create/update, or to find schedule when id is unknown)" }),
@@ -79,7 +88,7 @@ Common cron patterns:
         Type.String({ description: "New name for rename action" }),
       ),
       description: Type.Optional(
-        Type.String({ description: "What the scheduled task should do" }),
+        Type.String({ description: "Self-contained instruction including the specific target (cluster name, hostname, service, etc.) and the action to perform. Must be unambiguous enough to run without user interaction." }),
       ),
       schedule: Type.Optional(
         Type.String({ description: "Cron expression (min hour dom month dow)" }),
@@ -98,10 +107,11 @@ Common cron patterns:
         const cfg = loadConfig();
         const gatewayUrl = cfg.server.gatewayUrl || "http://siclaw-gateway";
         const userId = cfg.userId;
+        const workspaceId = process.env.SICLAW_WORKSPACE_ID;
         try {
           // Use GatewayClient with mTLS authentication
           const gatewayClient = new GatewayClient({ gatewayUrl });
-          const jobs = await gatewayClient.listCronJobs(userId);
+          const jobs = await gatewayClient.listCronJobs(userId, workspaceId);
           if (jobs.length === 0) {
             return {
               content: [{ type: "text" as const, text: "No scheduled tasks currently." }],

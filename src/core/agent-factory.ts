@@ -396,11 +396,13 @@ export async function createSiclawSession(
   }
 
   // Filter custom tools by workspace allow-list
+  // Platform tools are exempt — they must always be available regardless of workspace config
+  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list"]);
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
   if (Array.isArray(allowedTools)) {
     const allowed = new Set(allowedTools);
     const before = customTools.length;
-    const filtered = customTools.filter(t => allowed.has(t.name));
+    const filtered = customTools.filter(t => PLATFORM_TOOLS.has(t.name) || allowed.has(t.name));
     customTools.length = 0;
     customTools.push(...filtered);
     if (before !== customTools.length) {

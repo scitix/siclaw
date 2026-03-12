@@ -34,25 +34,19 @@ export type ScheduleCardStatus = 'pending' | 'saved' | 'dismissed' | 'superseded
 
 async function resolveSchedule(
     sendRpc: RpcSendFn,
-    id: string | undefined,
     name: string | undefined,
 ): Promise<CronJob | null> {
+    if (!name) return null;
     try {
         const result = await sendRpc<{ jobs: CronJob[] }>('cron.list');
-        if (id) return result.jobs.find(j => j.id === id) ?? null;
-        if (name) {
-            const lower = name.toLowerCase();
-            const exact = result.jobs.find(j => j.name === name);
-            if (exact) return exact;
-            const ci = result.jobs.find(j => j.name.toLowerCase() === lower);
-            if (ci) return ci;
-            const partial = result.jobs.find(j =>
+        const lower = name.toLowerCase();
+        // Exact → case-insensitive → partial match
+        return result.jobs.find(j => j.name === name)
+            ?? result.jobs.find(j => j.name.toLowerCase() === lower)
+            ?? result.jobs.find(j =>
                 j.name.toLowerCase().includes(lower) || lower.includes(j.name.toLowerCase())
-            );
-            if (partial) return partial;
-        }
-        if (result.jobs.length === 1) return result.jobs[0];
-        return null;
+            )
+            ?? null;
     } catch {
         return null;
     }
@@ -77,18 +71,16 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
         // ignore
     }
 
-    // Auto-execute on mount — only for pause/resume (other actions require manual confirmation via View panel)
-    const isPauseResume = parsed?.action === 'pause' || parsed?.action === 'resume';
+    // Auto-execute on mount — all schedule actions execute immediately without user confirmation
     useEffect(() => {
         if (!parsed || parsed.error || !sendRpc || !updateMessageMeta) return;
         if (autoExecRef.current) return;
         if (status === 'saved' || status === 'dismissed' || status === 'superseded') return;
-        if (!isPauseResume) return;
 
         autoExecRef.current = true;
         autoExecute();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [status, isPauseResume]);
+    }, [status]);
 
     const autoExecute = async () => {
         if (!parsed || !sendRpc || !updateMessageMeta) return;
@@ -109,7 +101,8 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
                     workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (action === 'update' && parsed.schedule) {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name);
+                const jobName = parsed.name ?? parsed.schedule?.name ?? parsed.id;
+                const job = await resolveSchedule(sendRpc, jobName);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.save', {
                     id: job.id,
@@ -120,18 +113,18 @@ export function ScheduleCard({ message, status, onOpenPanel, sendRpc, updateMess
                     workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (action === 'delete') {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name);
+                const job = await resolveSchedule(sendRpc, parsed.name ?? parsed.id);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.delete', { id: job.id });
             } else if (action === 'pause' || action === 'resume') {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name);
+                const job = await resolveSchedule(sendRpc, parsed.name ?? parsed.id);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.setStatus', {
                     id: job.id,
                     status: action === 'pause' ? 'paused' : 'active',
                 });
             } else if (action === 'rename') {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name ?? parsed.schedule?.name);
+                const job = await resolveSchedule(sendRpc, parsed.name ?? parsed.id);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.rename', { id: job.id, newName: parsed.newName });
             }
