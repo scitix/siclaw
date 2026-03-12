@@ -1,10 +1,11 @@
-import { Plus, Timer, Play, Pause, Trash2, Search, Boxes } from 'lucide-react';
+import { Plus, Timer, Play, Pause, Trash2, Search, Boxes, History } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useState, useEffect, useRef } from 'react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useCronJobs } from '@/hooks/useCronJobs';
 import type { CronJob } from './cronData';
 import { CronDrawer } from './components/CronDrawer';
+import { CronRunHistory } from './components/CronRunHistory';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
@@ -16,6 +17,7 @@ export function CronPage() {
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [selectedJob, setSelectedJob] = useState<CronJob | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+    const [historyJob, setHistoryJob] = useState<CronJob | null>(null);
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
@@ -142,6 +144,13 @@ export function CronPage() {
 
                             <div className="flex items-center gap-2 shrink-0">
                                 <button
+                                    onClick={(e) => { e.stopPropagation(); setHistoryJob(job); }}
+                                    className="p-2 rounded-lg text-gray-400 hover:text-primary-600 hover:bg-primary-50 border border-transparent hover:border-primary-200 transition-all"
+                                    title="Execution History"
+                                >
+                                    <History className="w-4 h-4" />
+                                </button>
+                                <button
                                     onClick={(e) => handleToggleStatus(e, job)}
                                     className={cn(
                                         "p-2 rounded-lg transition-colors border",
@@ -188,6 +197,15 @@ export function CronPage() {
                 job={selectedJob}
                 onSave={handleSave}
             />
+
+            {historyJob && (
+                <CronRunHistory
+                    job={historyJob}
+                    isOpen={!!historyJob}
+                    onClose={() => setHistoryJob(null)}
+                    sendRpc={sendRpc}
+                />
+            )}
 
             <ConfirmDialog
                 isOpen={deleteTarget !== null}

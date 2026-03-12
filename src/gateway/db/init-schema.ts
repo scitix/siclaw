@@ -111,6 +111,17 @@ const DDL_STATEMENTS = [
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
 
+  `CREATE TABLE IF NOT EXISTS cron_job_runs (
+    id VARCHAR(64) PRIMARY KEY,
+    job_id VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    result_text TEXT,
+    error TEXT,
+    duration_ms INT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+  )`,
+
   `CREATE TABLE IF NOT EXISTS cron_instances (
     instance_id VARCHAR(64) PRIMARY KEY,
     endpoint VARCHAR(255) NOT NULL,
@@ -393,6 +404,7 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE session_stats ADD INDEX idx_session_stats_user (user_id, created_at)`,
   `ALTER TABLE messages ADD INDEX idx_messages_audit (role, user_id, timestamp, id)`,
   `ALTER TABLE messages ADD INDEX idx_messages_tool_name (tool_name)`,
+  `ALTER TABLE cron_job_runs ADD INDEX idx_cron_job_runs_job (job_id, created_at)`,
   `ALTER TABLE cron_jobs ADD INDEX idx_cron_jobs_status_assigned (status, assigned_to)`,
   `ALTER TABLE cron_instances ADD INDEX idx_cron_instances_heartbeat (heartbeat_at)`,
 ];

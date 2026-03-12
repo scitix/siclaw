@@ -104,6 +104,16 @@ const DDL_STATEMENTS = [
     workspace_id TEXT
   )`,
 
+  `CREATE TABLE IF NOT EXISTS cron_job_runs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    result_text TEXT,
+    error TEXT,
+    duration_ms INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
   `CREATE TABLE IF NOT EXISTS cron_instances (
     instance_id TEXT PRIMARY KEY,
     endpoint TEXT NOT NULL,
@@ -363,6 +373,7 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_session_stats_user ON session_stats(user_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_audit ON messages(role, user_id, timestamp, id)`,
   `CREATE INDEX IF NOT EXISTS idx_messages_tool_name ON messages(tool_name)`,
+  `CREATE INDEX IF NOT EXISTS idx_cron_job_runs_job ON cron_job_runs(job_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_cron_jobs_status_assigned ON cron_jobs(status, assigned_to)`,
   `CREATE INDEX IF NOT EXISTS idx_cron_instances_heartbeat ON cron_instances(heartbeat_at)`,
 ];

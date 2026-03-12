@@ -30,6 +30,7 @@ export const {
   skillVersions,
   channels,
   cronJobs,
+  cronJobRuns,
   cronInstances,
   skillVotes,
   notifications,
