@@ -912,6 +912,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             statsRetentionDays = 90,
             hardDeleteAfterDays = 30,
           } = body ? JSON.parse(body) : {};
+          if (softDeleteInactiveDays < 1 || statsRetentionDays < 1 || hardDeleteAfterDays < 1) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Retention days must be >= 1" }));
+            return;
+          }
           const chatRepo = new ChatRepository(db);
 
           // Step 1: soft-delete inactive sessions

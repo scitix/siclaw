@@ -109,6 +109,8 @@ sessionPurgeTimer.unref();
 // 8. Graceful shutdown — release jobs immediately so other instances can claim them
 async function shutdown() {
   console.log("\n[cron] Shutting down...");
+  clearInterval(purgeTimer);
+  clearInterval(sessionPurgeTimer);
   scheduler.stop();
   await coordinator.shutdown();
   apiServer.close();

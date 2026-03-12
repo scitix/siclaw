@@ -244,11 +244,11 @@ export class ChatRepository {
 
   /**
    * Hard-delete session_stats older than `retentionDays`.
-   * Note: sessionStats.createdAt is a raw epoch number (no mode:"timestamp"),
-   * so we compare with numeric epoch, not Date.
+   * Note: sessionStats.createdAt is a raw epoch number in milliseconds
+   * (no mode:"timestamp"), so we compare with numeric ms, not Date.
    */
   async purgeOldSessionStats(retentionDays: number): Promise<number> {
-    const cutoff = Math.floor(Date.now() / 1000) - retentionDays * 86400;
+    const cutoff = Date.now() - retentionDays * 86400_000;
     let total = 0;
     while (true) {
       const ids = await this.db
