@@ -113,10 +113,12 @@ export class SkillFileWriter {
   ): SkillFiles | null {
     let skillDir = this.resolveDir(scope, dirName, userId);
 
-    // Fallback to Docker-baked cwd/skills/core for builtin skills
+    // Fallback to Docker-baked cwd/skills/{core,extension} for builtin skills
     if (!fs.existsSync(skillDir) && scope === "builtin") {
-      const bakedCore = path.join(process.cwd(), "skills", "core", dirName);
-      if (fs.existsSync(bakedCore)) skillDir = bakedCore;
+      for (const tier of ["core", "extension"]) {
+        const bakedDir = path.join(process.cwd(), "skills", tier, dirName);
+        if (fs.existsSync(bakedDir)) { skillDir = bakedDir; break; }
+      }
     }
 
     if (!fs.existsSync(skillDir)) return null;
