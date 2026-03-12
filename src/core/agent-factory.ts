@@ -380,10 +380,12 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directories (two fixed sources):
-  // 1. Builtin: baked into Docker image at /app/skills/core/
-  // 2. Dynamic: team + personal written by bundle API to skillsBase (.siclaw/skills/)
+  // Skill directories (three fixed sources):
+  // 1. Builtin core: baked into Docker image at /app/skills/core/
+  // 2. Builtin extension: baked into Docker image at /app/skills/extension/
+  // 3. Dynamic: team + personal written by bundle API to skillsBase (.siclaw/skills/)
   const builtinPath = path.resolve(cwd, "skills", "core");
+  const extensionPath = path.resolve(cwd, "skills", "extension");
 
   // Read disabled builtins list (written by agentbox-main / local-spawner after bundle fetch)
   let disabledBuiltins: Set<string> | undefined;
@@ -402,17 +404,19 @@ export async function createSiclawSession(
   } catch { /* ignore malformed file */ }
 
   // If there are disabled builtins, enumerate individual skill dirs excluding disabled ones;
-  // otherwise pass the whole builtin directory
+  // otherwise pass the whole builtin directory.
+  // Both core/ and extension/ are scanned as builtin sources.
   let builtinPaths: string[] = [];
-  if (fs.existsSync(builtinPath)) {
+  for (const bDir of [builtinPath, extensionPath]) {
+    if (!fs.existsSync(bDir)) continue;
     if (disabledBuiltins) {
-      for (const entry of fs.readdirSync(builtinPath, { withFileTypes: true })) {
+      for (const entry of fs.readdirSync(bDir, { withFileTypes: true })) {
         if (entry.isDirectory() && !disabledBuiltins.has(entry.name)) {
-          builtinPaths.push(path.join(builtinPath, entry.name));
+          builtinPaths.push(path.join(bDir, entry.name));
         }
       }
     } else {
-      builtinPaths = [builtinPath];
+      builtinPaths.push(bDir);
     }
   }
 
