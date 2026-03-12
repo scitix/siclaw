@@ -157,6 +157,19 @@ export const cronJobs = sqliteTable("cron_jobs", {
   lockedBy: text("locked_by"),
   lockedAt: integer("locked_at", { mode: "timestamp" }),
   envId: text("env_id"),
+  workspaceId: text("workspace_id").references(() => workspaces.id),
+});
+
+// ─── Cron Job Runs (execution history) ──────────────
+
+export const cronJobRuns = sqliteTable("cron_job_runs", {
+  id: text("id").primaryKey(),
+  jobId: text("job_id").notNull().references(() => cronJobs.id, { onDelete: "cascade" }),
+  status: text("status").notNull(), // "success" | "failure"
+  resultText: text("result_text"),
+  error: text("error"),
+  durationMs: integer("duration_ms"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
 // ─── Cron Instances ─────────────────────────────────

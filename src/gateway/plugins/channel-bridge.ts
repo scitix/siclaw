@@ -1,5 +1,5 @@
 import type { AgentBoxManager } from "../agentbox/manager.js";
-import { AgentBoxClient } from "../agentbox/client.js";
+import { AgentBoxClient, type AgentBoxTlsOptions } from "../agentbox/client.js";
 import type { BroadcastFn } from "../ws-protocol.js";
 import type { ChannelPlugin, StreamingCard } from "./api.js";
 import type { UserStore } from "../auth/user-store.js";
@@ -85,6 +85,7 @@ export function createChannelBridge(
   configRepo?: ConfigRepository,
   buildCredentialPayload?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>,
   workspaceRepo?: WorkspaceRepository,
+  agentBoxTlsOptions?: AgentBoxTlsOptions,
 ): ChannelBridge {
   // channelId → outbound sender
   const outbounds = new Map<string, ChannelPlugin>();
@@ -152,7 +153,7 @@ export function createChannelBridge(
       // Channel and web share the same AgentBox — mode-driven skill loading
       // handles tool/skill differences per session.
       const handle = await agentBoxManager.getOrCreate(boundUser.id, defaultWs.id);
-      const client = new AgentBoxClient(handle.endpoint);
+      const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
       const plugin = outbounds.get(channelId);
 
@@ -396,7 +397,7 @@ export function createChannelBridge(
                   };
                   const action = parsed.action;
                   if (action && action !== "list") {
-                    await executeScheduleAction(parsed, boundUser.id, configRepo);
+                    await executeScheduleAction(parsed, boundUser.id, configRepo, defaultWs.id);
                     // Replace raw JSON with human-readable summary
                     if (parsed.summary) {
                       output = parsed.summary;
@@ -580,7 +581,7 @@ async function executeScheduleAction(
   },
   userId: string,
   configRepo: ConfigRepository,
-  envId?: string,
+  workspaceId?: string,
 ): Promise<void> {
   const action = parsed.action;
 
@@ -590,7 +591,8 @@ async function executeScheduleAction(
       description: parsed.schedule.description,
       schedule: parsed.schedule.schedule,
       status: (parsed.schedule.status as "active" | "paused") || "active",
-      envId: envId ?? null,
+
+      workspaceId: workspaceId ?? null,
     });
 
     let assignedTo: string | null = null;
@@ -611,16 +613,15 @@ async function executeScheduleAction(
         status: parsed.schedule.status || "active",
         skillId: null, assignedTo,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: envId ?? null,
+  
+        workspaceId: workspaceId ?? null,
       },
     }, configRepo);
     console.log(`[channel-bridge] Auto-created cron job: ${id}`);
   }
 
   if (action === "update" && parsed.schedule) {
-    const job = parsed.id
-      ? await configRepo.getCronJobById(parsed.id)
-      : await findJobByName(configRepo, userId, parsed.name, envId);
+    const job = await findJobByName(configRepo, userId, parsed.name || parsed.id, workspaceId);
     if (!job) {
       console.warn(`[channel-bridge] Schedule not found for update: id=${parsed.id} name=${parsed.name}`);
       return;
@@ -631,7 +632,8 @@ async function executeScheduleAction(
       description: parsed.schedule.description ?? job.description ?? undefined,
       schedule: parsed.schedule.schedule || job.schedule,
       status: (parsed.schedule.status as "active" | "paused") || (job.status as "active" | "paused"),
-      envId: envId ?? job.envId ?? null,
+
+      workspaceId: job.workspaceId ?? null,
     });
 
     notifyCronService({
@@ -643,16 +645,15 @@ async function executeScheduleAction(
         status: parsed.schedule.status || job.status,
         skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: envId ?? job.envId ?? null,
+  
+        workspaceId: job.workspaceId ?? null,
       },
     }, configRepo);
     console.log(`[channel-bridge] Auto-updated cron job: ${job.id}`);
   }
 
   if (action === "delete") {
-    const job = parsed.id
-      ? await configRepo.getCronJobById(parsed.id)
-      : await findJobByName(configRepo, userId, parsed.name, envId);
+    const job = await findJobByName(configRepo, userId, parsed.name || parsed.id, workspaceId);
     if (!job) {
       console.warn(`[channel-bridge] Schedule not found for delete: id=${parsed.id} name=${parsed.name}`);
       return;
@@ -663,9 +664,7 @@ async function executeScheduleAction(
   }
 
   if (action === "pause") {
-    const job = parsed.id
-      ? await configRepo.getCronJobById(parsed.id)
-      : await findJobByName(configRepo, userId, parsed.name, envId);
+    const job = await findJobByName(configRepo, userId, parsed.name || parsed.id, workspaceId);
     if (!job) {
       console.warn(`[channel-bridge] Schedule not found for pause: id=${parsed.id} name=${parsed.name}`);
       return;
@@ -676,16 +675,15 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: "paused",
-      envId: job.envId ?? null,
+
+      workspaceId: job.workspaceId ?? null,
     });
     notifyCronService({ action: "pause", jobId: job.id }, configRepo);
     console.log(`[channel-bridge] Auto-paused cron job: ${job.id}`);
   }
 
   if (action === "resume") {
-    const job = parsed.id
-      ? await configRepo.getCronJobById(parsed.id)
-      : await findJobByName(configRepo, userId, parsed.name, envId);
+    const job = await findJobByName(configRepo, userId, parsed.name || parsed.id, workspaceId);
     if (!job) {
       console.warn(`[channel-bridge] Schedule not found for resume: id=${parsed.id} name=${parsed.name}`);
       return;
@@ -696,7 +694,8 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: "active",
-      envId: job.envId ?? null,
+
+      workspaceId: job.workspaceId ?? null,
     });
     notifyCronService({
       action: "upsert",
@@ -706,16 +705,15 @@ async function executeScheduleAction(
         schedule: job.schedule, status: "active",
         skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: job.envId ?? null,
+  
+        workspaceId: job.workspaceId ?? null,
       },
     }, configRepo);
     console.log(`[channel-bridge] Auto-resumed cron job: ${job.id}`);
   }
 
   if (action === "rename") {
-    const job = parsed.id
-      ? await configRepo.getCronJobById(parsed.id)
-      : await findJobByName(configRepo, userId, parsed.name, envId);
+    const job = await findJobByName(configRepo, userId, parsed.name || parsed.id, workspaceId);
     if (!job) {
       console.warn(`[channel-bridge] Schedule not found for rename: id=${parsed.id} name=${parsed.name}`);
       return;
@@ -727,7 +725,8 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: job.status as "active" | "paused",
-      envId: job.envId ?? null,
+
+      workspaceId: job.workspaceId ?? null,
     });
     notifyCronService({
       action: "upsert",
@@ -737,21 +736,28 @@ async function executeScheduleAction(
         schedule: job.schedule, status: job.status,
         skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: job.envId ?? null,
+  
+        workspaceId: job.workspaceId ?? null,
       },
     }, configRepo);
     console.log(`[channel-bridge] Auto-renamed cron job: ${job.id} → ${newName}`);
   }
 }
 
-/** Find a cron job by name for a user, optionally scoped to an environment */
+/** Find a cron job by name for a user, optionally scoped to environment and workspace */
 async function findJobByName(
   configRepo: ConfigRepository,
   userId: string,
   name?: string,
-  envId?: string,
-): Promise<{ id: string; name: string; description?: string | null; schedule: string; status: string; skillId?: string | null; assignedTo?: string | null; envId?: string | null } | null> {
+  workspaceId?: string,
+): Promise<{ id: string; name: string; description?: string | null; schedule: string; status: string; skillId?: string | null; assignedTo?: string | null; workspaceId?: string | null } | null> {
   if (!name) return null;
-  const jobs = await configRepo.listCronJobs(userId, envId);
-  return jobs.find(j => j.name === name) as any ?? null;
+  const opts = workspaceId ? { workspaceId } : undefined;
+  const jobs = await configRepo.listCronJobs(userId, opts);
+  const lower = name.toLowerCase();
+  // Exact → case-insensitive → partial match
+  return (jobs.find(j => j.name === name)
+    ?? jobs.find(j => j.name.toLowerCase() === lower)
+    ?? jobs.find(j => j.name.toLowerCase().includes(lower) || lower.includes(j.name.toLowerCase()))
+  ) as any ?? null;
 }

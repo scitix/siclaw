@@ -3,9 +3,9 @@
  */
 
 import crypto from "node:crypto";
-import { eq, and, isNull, gt, asc, sql } from "drizzle-orm";
+import { eq, and, isNull, isNotNull, gt, lte, asc, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { channels, cronJobs, cronInstances, triggers } from "../schema.js";
+import { channels, cronJobs, cronJobRuns, cronInstances, triggers } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
 
 export class ConfigRepository {
@@ -56,10 +56,10 @@ export class ConfigRepository {
 
   // ─── Cron Jobs ────────────────────────────────
 
-  async listCronJobs(userId: string, envId?: string) {
+  async listCronJobs(userId: string, opts?: { workspaceId?: string }) {
     const conditions = [eq(cronJobs.userId, userId)];
-    if (envId !== undefined) {
-      conditions.push(eq(cronJobs.envId, envId));
+    if (opts?.workspaceId !== undefined) {
+      conditions.push(eq(cronJobs.workspaceId, opts.workspaceId));
     }
     return this.db
       .select()
@@ -76,7 +76,7 @@ export class ConfigRepository {
       schedule: string;
       skillId?: string;
       status?: "active" | "paused";
-      envId?: string | null;
+      workspaceId?: string | null;
     },
   ) {
     const id = job.id || crypto.randomUUID();
@@ -97,7 +97,7 @@ export class ConfigRepository {
           schedule: job.schedule,
           skillId: job.skillId ?? null,
           status: job.status ?? "active",
-          envId: job.envId ?? null,
+          workspaceId: job.workspaceId ?? null,
         })
         .where(eq(cronJobs.id, id));
     } else {
@@ -109,7 +109,7 @@ export class ConfigRepository {
         schedule: job.schedule,
         skillId: job.skillId ?? null,
         status: job.status ?? "active",
-        envId: job.envId ?? null,
+        workspaceId: job.workspaceId ?? null,
       });
     }
     return id;
@@ -149,6 +149,36 @@ export class ConfigRepository {
       .update(cronJobs)
       .set({ lastRunAt: new Date(), lastResult: result })
       .where(eq(cronJobs.id, id));
+  }
+
+  // ─── Cron Job Runs (execution history) ──────
+
+  async insertCronJobRun(params: {
+    jobId: string;
+    status: "success" | "failure";
+    resultText?: string;
+    error?: string;
+    durationMs?: number;
+  }): Promise<string> {
+    const id = crypto.randomUUID();
+    await this.db.insert(cronJobRuns).values({
+      id,
+      jobId: params.jobId,
+      status: params.status,
+      resultText: params.resultText ?? null,
+      error: params.error ?? null,
+      durationMs: params.durationMs ?? null,
+    });
+    return id;
+  }
+
+  async listCronJobRuns(jobId: string, limit = 20) {
+    return this.db
+      .select()
+      .from(cronJobRuns)
+      .where(eq(cronJobRuns.jobId, jobId))
+      .orderBy(sql`${cronJobRuns.createdAt} DESC`)
+      .limit(limit);
   }
 
   async assignCronJob(jobId: string, instanceId: string) {
@@ -264,6 +294,47 @@ export class ConfigRepository {
       .select()
       .from(cronJobs)
       .where(and(eq(cronJobs.status, "active"), isNull(cronJobs.assignedTo)));
+  }
+
+  /** Atomically lock a job for execution — returns true if locked by us */
+  async lockJobForExecution(jobId: string, executionId: string): Promise<boolean> {
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: executionId, lockedAt: new Date() })
+      .where(
+        and(eq(cronJobs.id, jobId), isNull(cronJobs.lockedBy)),
+      );
+    // Verify by reading back (same pattern as claimUnassignedJob)
+    const row = await this.db
+      .select({ lockedBy: cronJobs.lockedBy })
+      .from(cronJobs)
+      .where(eq(cronJobs.id, jobId))
+      .limit(1);
+    return row[0]?.lockedBy === executionId;
+  }
+
+  /** Unlock a job after execution (only if still locked by us) */
+  async unlockJob(jobId: string, executionId: string): Promise<void> {
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: null, lockedAt: null })
+      .where(
+        and(eq(cronJobs.id, jobId), eq(cronJobs.lockedBy, executionId)),
+      );
+  }
+
+  /** Clear locks older than thresholdMs (stale lock cleanup) */
+  async clearStaleLocks(thresholdMs: number): Promise<void> {
+    const cutoff = new Date(Date.now() - thresholdMs);
+    await this.db
+      .update(cronJobs)
+      .set({ lockedBy: null, lockedAt: null })
+      .where(
+        and(
+          isNotNull(cronJobs.lockedBy),
+          lte(cronJobs.lockedAt, cutoff),
+        ),
+      );
   }
 
   // ─── Triggers ─────────────────────────────────

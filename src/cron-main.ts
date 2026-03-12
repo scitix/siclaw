@@ -14,6 +14,7 @@ import { CronExecutor } from "./cron/cron-executor.js";
 import { CronCoordinator } from "./cron/cron-coordinator.js";
 import { createCronApi } from "./cron/cron-api.js";
 import { GatewayClient } from "./cron/gateway-client.js";
+import { withRetry } from "./shared/retry.js";
 
 const apiPort = parseInt(process.env.SICLAW_CRON_API_PORT || "3100", 10);
 
@@ -59,14 +60,16 @@ const RETENTION_DAYS = 30;
 
 async function purgeOldNotifications() {
   try {
-    const resp = await fetch(`${gatewayUrl}/api/internal/notifications/purge`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ retentionDays: RETENTION_DAYS }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const data = await resp.json() as { deleted?: number };
-    console.log(`[cron] Notification purge: deleted=${data.deleted ?? 0} (retention=${RETENTION_DAYS}d)`);
+    await withRetry(async () => {
+      const resp = await fetch(`${gatewayUrl}/api/internal/notifications/purge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ retentionDays: RETENTION_DAYS }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = await resp.json() as { deleted?: number };
+      console.log(`[cron] Notification purge: deleted=${data.deleted ?? 0} (retention=${RETENTION_DAYS}d)`);
+    }, { maxAttempts: 3, baseDelayMs: 2_000, maxDelayMs: 10_000, label: "notification-purge" });
   } catch (err) {
     console.warn("[cron] Notification purge failed:", err instanceof Error ? err.message : err);
   }

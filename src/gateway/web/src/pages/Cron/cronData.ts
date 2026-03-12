@@ -7,6 +7,6 @@ export interface CronJob {
     status: 'active' | 'paused';
     lastRun?: string;
     lastResult?: 'success' | 'failure';
-    envId?: string | null;
-    envName?: string | null;
+    workspaceId?: string | null;
+    workspaceName?: string | null;
 }

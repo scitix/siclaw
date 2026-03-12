@@ -169,6 +169,19 @@ export const cronJobs = mysqlTable("cron_jobs", {
   lockedBy: varchar("locked_by", { length: 64 }),
   lockedAt: timestamp("locked_at"),
   envId: varchar("env_id", { length: 64 }),
+  workspaceId: varchar("workspace_id", { length: 64 }).references(() => workspaces.id),
+});
+
+// ─── Cron Job Runs (execution history) ──────────────
+
+export const cronJobRuns = mysqlTable("cron_job_runs", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  jobId: varchar("job_id", { length: 64 }).notNull().references(() => cronJobs.id, { onDelete: "cascade" }),
+  status: varchar("status", { length: 20 }).notNull(), // "success" | "failure"
+  resultText: text("result_text"),
+  error: text("error"),
+  durationMs: int("duration_ms"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
 // ─── Cron Instances ─────────────────────────────────

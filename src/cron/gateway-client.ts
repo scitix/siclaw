@@ -7,6 +7,14 @@
  */
 
 import type { CronJobRow } from "./cron-scheduler.js";
+import { withRetry, shouldRetryHttp, HttpError } from "../shared/retry.js";
+
+const RETRY_OPTS = {
+  maxAttempts: 3,
+  baseDelayMs: 500,
+  maxDelayMs: 5_000,
+  shouldRetry: shouldRetryHttp,
+};
 
 export class GatewayClient {
   private baseUrl: string;
@@ -88,19 +96,54 @@ export class GatewayClient {
     await this.post("/api/internal/cron/reassign-jobs", { fromInstanceId, toInstanceId });
   }
 
+  // ─── Execution Lock (no retry — lock ops are not safely retriable) ───
+
+  async lockJobForExecution(jobId: string, executionId: string): Promise<boolean> {
+    const data = await this.postDirect("/api/internal/cron/lock-job", { jobId, executionId }) as {
+      locked: boolean;
+    };
+    return data.locked;
+  }
+
+  async unlockJob(jobId: string, executionId: string): Promise<void> {
+    await this.postDirect("/api/internal/cron/unlock-job", { jobId, executionId });
+  }
+
+  async clearStaleLocks(thresholdMs: number): Promise<void> {
+    await this.postDirect("/api/internal/cron/clear-stale-locks", { thresholdMs });
+  }
+
   // ─── HTTP helpers ────────────────────────────────
 
   private async get(path: string): Promise<unknown> {
-    const resp = await fetch(`${this.baseUrl}${path}`, {
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!resp.ok) {
-      throw new Error(`Gateway GET ${path} returned ${resp.status}: ${await resp.text()}`);
-    }
-    return resp.json();
+    return withRetry(async () => {
+      const resp = await fetch(`${this.baseUrl}${path}`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!resp.ok) {
+        throw new HttpError(resp.status, `Gateway GET ${path} returned ${resp.status}: ${await resp.text()}`);
+      }
+      return resp.json();
+    }, { ...RETRY_OPTS, label: `GET ${path}` });
   }
 
   private async post(path: string, body: unknown): Promise<unknown> {
+    return withRetry(async () => {
+      const resp = await fetch(`${this.baseUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!resp.ok) {
+        throw new HttpError(resp.status, `Gateway POST ${path} returned ${resp.status}: ${await resp.text()}`);
+      }
+      return resp.json();
+    }, { ...RETRY_OPTS, label: `POST ${path}` });
+  }
+
+  /** POST without retry — used for lock operations that are not safely retriable */
+  private async postDirect(path: string, body: unknown): Promise<unknown> {
     const resp = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -108,7 +151,7 @@ export class GatewayClient {
       signal: AbortSignal.timeout(10_000),
     });
     if (!resp.ok) {
-      throw new Error(`Gateway POST ${path} returned ${resp.status}: ${await resp.text()}`);
+      throw new HttpError(resp.status, `Gateway POST ${path} returned ${resp.status}: ${await resp.text()}`);
     }
     return resp.json();
   }

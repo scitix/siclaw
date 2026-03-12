@@ -4,6 +4,7 @@ import type { WsMessage } from './useWebSocket';
 
 export interface Notification {
     id: string;
+    /** e.g. "cron_success", "cron_failure", "skill_approved", ... */
     type: string;
     title: string;
     message?: string | null;
@@ -22,13 +23,16 @@ export interface NotificationGroup {
     unreadCount: number;
 }
 
-/** Group cron_result notifications by relatedId; other types stay individual */
+/** Cron notification types that should be grouped by relatedId (job ID) */
+const CRON_TYPES = new Set(['cron_success', 'cron_failure', 'cron_result']);
+
+/** Group cron notifications by relatedId; other types stay individual */
 export function groupNotifications(notifications: Notification[]): NotificationGroup[] {
     const cronGroups = new Map<string, Notification[]>();
     const groups: NotificationGroup[] = [];
 
     for (const n of notifications) {
-        if (n.type === 'cron_result' && n.relatedId) {
+        if (CRON_TYPES.has(n.type) && n.relatedId) {
             const existing = cronGroups.get(n.relatedId);
             if (existing) {
                 existing.push(n);
@@ -49,9 +53,11 @@ export function groupNotifications(notifications: Notification[]): NotificationG
     }
 
     for (const [relatedId, items] of cronGroups) {
+        // Use the most recent item's type for the group icon
+        const latestType = items[0].type;
         groups.push({
             key: `cron:${relatedId}`,
-            type: 'cron_result',
+            type: latestType,
             title: items[0].title,
             relatedId,
             notifications: items,

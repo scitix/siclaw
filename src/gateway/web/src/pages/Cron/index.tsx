@@ -1,19 +1,23 @@
-import { Plus, Timer, Play, Pause, Trash2, Search } from 'lucide-react';
+import { Plus, Timer, Play, Pause, Trash2, Search, Boxes, History } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useState, useEffect, useRef } from 'react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { useCronJobs } from '@/hooks/useCronJobs';
 import type { CronJob } from './cronData';
 import { CronDrawer } from './components/CronDrawer';
+import { CronRunHistory } from './components/CronRunHistory';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { useWorkspace } from '@/contexts/WorkspaceContext';
 
 export function CronPage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { jobs, loading, error, loadJobs, saveJob, deleteJob } = useCronJobs(sendRpc);
+    const { currentWorkspace } = useWorkspace();
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [selectedJob, setSelectedJob] = useState<CronJob | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+    const [historyJob, setHistoryJob] = useState<CronJob | null>(null);
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
@@ -35,7 +39,7 @@ export function CronPage() {
 
     const handleSave = async (updated: Partial<CronJob>) => {
         try {
-            await saveJob(updated);
+            await saveJob({ ...updated, workspaceId: updated.workspaceId ?? currentWorkspace?.id ?? null });
             setIsDrawerOpen(false);
         } catch (err) {
             console.error('[CronPage] Save failed:', err);
@@ -128,15 +132,24 @@ export function CronPage() {
                                         <Timer className="w-3 h-3 text-gray-400" />
                                         {job.schedule}
                                     </div>
-                                    <div className="flex items-center gap-1.5 text-gray-500 font-medium">
-                                        <Play className="w-3 h-3" />
-                                        <span>Bot Automated</span>
-                                    </div>
+                                    {job.workspaceName && (
+                                        <div className="flex items-center gap-1.5 text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded font-medium">
+                                            <Boxes className="w-3 h-3" />
+                                            {job.workspaceName}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
 
 
                             <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); setHistoryJob(job); }}
+                                    className="p-2 rounded-lg text-gray-400 hover:text-primary-600 hover:bg-primary-50 border border-transparent hover:border-primary-200 transition-all"
+                                    title="Execution History"
+                                >
+                                    <History className="w-4 h-4" />
+                                </button>
                                 <button
                                     onClick={(e) => handleToggleStatus(e, job)}
                                     className={cn(
@@ -184,6 +197,15 @@ export function CronPage() {
                 job={selectedJob}
                 onSave={handleSave}
             />
+
+            {historyJob && (
+                <CronRunHistory
+                    job={historyJob}
+                    isOpen={!!historyJob}
+                    onClose={() => setHistoryJob(null)}
+                    sendRpc={sendRpc}
+                />
+            )}
 
             <ConfirmDialog
                 isOpen={deleteTarget !== null}

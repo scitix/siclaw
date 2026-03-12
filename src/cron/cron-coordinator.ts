@@ -10,9 +10,10 @@
 import type { GatewayClient } from "./gateway-client.js";
 import type { CronScheduler } from "./cron-scheduler.js";
 
-const HEARTBEAT_INTERVAL_MS = 30_000; // 30s
-const RECONCILE_INTERVAL_MS = 60_000; // 60s
-const DEAD_THRESHOLD_MS = 90_000; // 90s
+const HEARTBEAT_INTERVAL_MS = 10_000; // 10s
+const RECONCILE_INTERVAL_MS = 15_000; // 15s
+const DEAD_THRESHOLD_MS = 30_000; // 30s (3x heartbeat)
+const STALE_LOCK_THRESHOLD_MS = 6 * 60 * 1000; // 6 min (slightly > 5min execution timeout)
 
 export class CronCoordinator {
   private heartbeatTimer: NodeJS.Timeout | null = null;
@@ -78,39 +79,59 @@ export class CronCoordinator {
     const unassigned = await this.configRepo.getUnassignedActiveJobs();
     if (unassigned.length === 0) return;
 
+    console.log(
+      `[coordinator] Found ${unassigned.length} unassigned job(s): ${unassigned.map(j => j.id).join(", ")}`,
+    );
+
     for (const job of unassigned) {
       // Re-check least-loaded each iteration (our count changes as we claim)
       const leastLoaded = await this.configRepo.getLeastLoadedInstance(
         DEAD_THRESHOLD_MS,
       );
-      if (leastLoaded && leastLoaded.instanceId === this.instanceId) {
-        // Atomic claim — only succeeds if job is still unassigned
-        const claimed = await this.configRepo.claimUnassignedJob(
-          job.id,
-          this.instanceId,
-        );
-        if (!claimed) continue; // Another instance claimed it first
-
-        await this.configRepo.updateHeartbeat(
-          this.instanceId,
-          this.scheduler.jobCount + 1,
-        );
-        // Schedule immediately
-        this.scheduler.addOrUpdate(
-          job as Parameters<typeof this.scheduler.addOrUpdate>[0],
-        );
-        console.log(
-          `[coordinator] Claimed unassigned job ${job.id} (${job.name})`,
-        );
-      } else {
-        // Another instance is less loaded, let them claim it
+      if (!leastLoaded) {
+        console.warn("[coordinator] No alive instances found, cannot claim jobs");
         break;
       }
+      if (leastLoaded.instanceId !== this.instanceId) {
+        console.log(
+          `[coordinator] Instance ${leastLoaded.instanceId} is least loaded (${leastLoaded.jobCount} jobs), deferring claim`,
+        );
+        break;
+      }
+
+      // Atomic claim — only succeeds if job is still unassigned
+      const claimed = await this.configRepo.claimUnassignedJob(
+        job.id,
+        this.instanceId,
+      );
+      if (!claimed) {
+        console.log(`[coordinator] Job ${job.id} already claimed by another instance`);
+        continue;
+      }
+
+      await this.configRepo.updateHeartbeat(
+        this.instanceId,
+        this.scheduler.jobCount + 1,
+      );
+      // Schedule immediately
+      this.scheduler.addOrUpdate(
+        job as Parameters<typeof this.scheduler.addOrUpdate>[0],
+      );
+      console.log(
+        `[coordinator] Claimed unassigned job ${job.id} (${job.name})`,
+      );
     }
   }
 
   /** Detect dead instances and claim their orphaned jobs */
   private async reconcile(): Promise<void> {
+    // 0. Clear stale execution locks (from crashed executors)
+    try {
+      await this.configRepo.clearStaleLocks(STALE_LOCK_THRESHOLD_MS);
+    } catch (err) {
+      console.warn("[coordinator] clearStaleLocks failed:", err);
+    }
+
     // 1. Find dead instances
     const deadInstances = await this.configRepo.getDeadInstances(
       DEAD_THRESHOLD_MS,
@@ -160,6 +181,36 @@ export class CronCoordinator {
 
     // 3. Claim any unassigned jobs (from new cron.save or graceful shutdown)
     await this.claimUnassignedJobs();
+
+    // 4. Sync: load DB-assigned jobs that are not yet in the local scheduler
+    //    (handles jobs reassigned to us by another instance's dead-detection)
+    await this.syncAssignedJobs();
+  }
+
+  /** Load jobs assigned to this instance in DB but missing from the local scheduler */
+  private async syncAssignedJobs(): Promise<void> {
+    const dbJobs = await this.configRepo.listCronJobsByInstance(this.instanceId);
+    const scheduledSet = new Set(this.scheduler.scheduledJobIds);
+    let synced = 0;
+
+    for (const job of dbJobs) {
+      if (!scheduledSet.has(job.id)) {
+        this.scheduler.addOrUpdate(
+          job as Parameters<typeof this.scheduler.addOrUpdate>[0],
+        );
+        synced++;
+        console.log(
+          `[coordinator] Synced assigned job ${job.id} (${job.name}) into scheduler`,
+        );
+      }
+    }
+
+    if (synced > 0) {
+      await this.configRepo.updateHeartbeat(
+        this.instanceId,
+        this.scheduler.jobCount,
+      );
+    }
   }
 
   /** Cancel scheduled jobs whose DB status is no longer active */

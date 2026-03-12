@@ -77,6 +77,10 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 
 **Open research**: R1 (Contextual vs Late Chunking), R3 (config merge strategy), T1 (KG storage: Kuzu vs SQLite)
 
+### 🔴 System Prompt Protection
+
+**`src/core/prompt.ts` (the SRE system prompt) must NEVER be modified without explicit human confirmation.** This file defines the agent's core behavioral rules, safety constraints, and credential handling — unauthorized changes can break security or alter agent behavior in subtle, hard-to-detect ways. Before making any change to this file, describe the intended modification and get approval first.
+
 ---
 
 ## PR & Code Review Standards

@@ -40,7 +40,7 @@ export interface SchedulePanelProps {
     onDismiss: (message: PilotMessage) => void;
     onClose: () => void;
     updateMessageMeta: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
-    selectedEnvId?: string | null;
+    selectedWorkspaceId?: string | null;
 }
 
 /** Look up a schedule by ID or name via cron.list (fuzzy name matching) */
@@ -48,37 +48,31 @@ async function resolveSchedule(
     sendRpc: RpcSendFn,
     id: string | undefined,
     name: string | undefined,
-    envId?: string | null,
 ): Promise<CronJob | null> {
     try {
         const result = await sendRpc<{ jobs: CronJob[] }>('cron.list');
-        const pool = envId ? result.jobs.filter(j => (j as any).envId === envId) : result.jobs;
         if (id) {
-            return pool.find(j => j.id === id) ?? null;
+            return result.jobs.find(j => j.id === id) ?? null;
         }
         if (name) {
             const lower = name.toLowerCase();
-            // Exact match first
-            const exact = pool.find(j => j.name === name);
+            const exact = result.jobs.find(j => j.name === name);
             if (exact) return exact;
-            // Case-insensitive match
-            const ci = pool.find(j => j.name.toLowerCase() === lower);
+            const ci = result.jobs.find(j => j.name.toLowerCase() === lower);
             if (ci) return ci;
-            // Partial match (name contains search or search contains name)
-            const partial = pool.find(j =>
+            const partial = result.jobs.find(j =>
                 j.name.toLowerCase().includes(lower) || lower.includes(j.name.toLowerCase())
             );
             if (partial) return partial;
         }
-        // If only one job exists, return it as fallback
-        if (pool.length === 1) return pool[0];
+        if (result.jobs.length === 1) return result.jobs[0];
         return null;
     } catch {
         return null;
     }
 }
 
-export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, updateMessageMeta, selectedEnvId }: SchedulePanelProps) {
+export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, updateMessageMeta, selectedWorkspaceId }: SchedulePanelProps) {
     const metaState = (message.metadata as Record<string, unknown> | undefined)?.scheduleCard as string | undefined;
     const initialState: SaveState = (metaState === 'saved' || metaState === 'dismissed') ? 'saved' : 'idle';
 
@@ -134,12 +128,12 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
     useEffect(() => {
         if (!isUpdate || !sendRpc) return;
         setLoadingOld(true);
-        resolveSchedule(sendRpc, parsed?.id, parsed?.name ?? scheduleInfo?.name, selectedEnvId)
+        resolveSchedule(sendRpc, parsed?.id, parsed?.name ?? scheduleInfo?.name)
             .then(job => setOldJob(job))
             .catch(() => setOldJob(null))
             .finally(() => setLoadingOld(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isUpdate, parsed?.id, parsed?.name, scheduleInfo?.name, sendRpc, selectedEnvId]);
+    }, [isUpdate, parsed?.id, parsed?.name, scheduleInfo?.name, sendRpc]);
 
     // Compute diffs for update
     const cronChanged = isUpdate && oldJob && scheduleInfo && oldJob.schedule !== scheduleInfo.schedule;
@@ -159,9 +153,9 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
 
     const handleSave = async () => {
         if (!parsed) return;
-        if (!selectedEnvId) {
+        if (!selectedWorkspaceId) {
             setSaveState('error');
-            setErrorMsg('Please select an environment first');
+            setErrorMsg('Please select a workspace first');
             return;
         }
         setSaveState('saving');
@@ -173,10 +167,10 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
                     description: scheduleInfo.description,
                     schedule: scheduleInfo.schedule,
                     status: scheduleInfo.status || 'active',
-                    envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (isUpdate && scheduleInfo) {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);
+                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.save', {
                     id: job.id,
@@ -184,21 +178,21 @@ export function SchedulePanel({ message, sendRpc, onSave, onDismiss, onClose, up
                     description: scheduleInfo.description,
                     schedule: scheduleInfo.schedule,
                     status: scheduleInfo.status || 'active',
-                    envId: selectedEnvId ?? null,
+                    workspaceId: selectedWorkspaceId ?? null,
                 });
             } else if (isDelete) {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);
+                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.delete', { id: job.id });
             } else if (isPause || isResume) {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);
+                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.setStatus', {
                     id: job.id,
                     status: isPause ? 'paused' : 'active',
                 });
             } else if (isRename) {
-                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name, selectedEnvId);
+                const job = await resolveSchedule(sendRpc, parsed.id, parsed.name);
                 if (!job) throw new Error('Schedule not found');
                 await sendRpc('cron.rename', {
                     id: job.id,

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import type { GatewayConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
-import { AgentBoxClient } from "./agentbox/client.js";
+import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import { createBroadcaster, buildEvent, parseFrame, dispatchRpc, MAX_BUFFERED_BYTES, type RpcHandler, type RpcContext } from "./ws-protocol.js";
 import { createRpcMethods } from "./rpc-methods.js";
 import type { SkillBundle } from "./skills/skill-bundle.js";
@@ -103,6 +103,8 @@ export interface GatewayServer {
   onCronNotify?: (data: { userId: string; jobName: string; result: string; resultText: string; error?: string }) => void;
   /** Build credential payload for a specific workspace (sent in prompt body) */
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
+  /** TLS options for AgentBox mTLS connections (K8s mode only) */
+  agentBoxTlsOptions?: import("./agentbox/client.js").AgentBoxTlsOptions;
   close(): Promise<void>;
 }
 
@@ -663,6 +665,42 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
               return;
             }
 
+            if (cronPath === "lock-job") {
+              if (!data.jobId || !data.executionId) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
+                return;
+              }
+              const locked = await configRepo.lockJobForExecution(data.jobId, data.executionId);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ locked }));
+              return;
+            }
+
+            if (cronPath === "unlock-job") {
+              if (!data.jobId || !data.executionId) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
+                return;
+              }
+              await configRepo.unlockJob(data.jobId, data.executionId);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "ok" }));
+              return;
+            }
+
+            if (cronPath === "clear-stale-locks") {
+              if (typeof data.thresholdMs !== "number" || data.thresholdMs <= 0) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "thresholdMs must be a positive number" }));
+                return;
+              }
+              await configRepo.clearStaleLocks(data.thresholdMs);
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "ok" }));
+              return;
+            }
+
             res.writeHead(404, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Unknown cron POST endpoint" }));
           } catch (err) {
@@ -745,27 +783,44 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           const data = JSON.parse(body) as {
             userId: string; jobId: string; jobName: string;
             result: "success" | "failure"; resultText: string; error?: string;
+            durationMs?: number;
           };
 
-          // 1. Write notification to DB
+          // 1. Write execution history + notification to DB
           if (db) {
+            // Persist run record
+            try {
+              const configRepo = new ConfigRepository(db);
+              await configRepo.insertCronJobRun({
+                jobId: data.jobId,
+                status: data.result,
+                resultText: data.resultText || undefined,
+                error: data.error,
+                durationMs: data.durationMs,
+              });
+            } catch (runErr) {
+              console.warn("[gateway] Failed to insert cron run:", runErr instanceof Error ? runErr.message : runErr);
+            }
             const notifRepo = new NotificationRepository(db);
+            const notifType = data.result === "success" ? "cron_success" : "cron_failure";
+            const notifMessage = data.result === "success" ? data.resultText : (data.error || "Unknown error");
             const notifId = await notifRepo.create({
               userId: data.userId,
-              type: "cron_result",
+              type: notifType,
               title: data.jobName,
-              message: data.result === "success" ? data.resultText : (data.error || "Unknown error"),
+              message: notifMessage,
               relatedId: data.jobId,
             });
 
-            // 2. Push via WebSocket
+            // 2. Push via WebSocket (include all fields so frontend renders correctly)
             sendToUser(data.userId, "notification", {
               id: notifId,
-              type: "cron_result",
+              type: notifType,
               title: data.jobName,
-              message: data.result === "success" ? data.resultText : (data.error || "Unknown error"),
-              result: data.result,
+              message: notifMessage,
               relatedId: data.jobId,
+              isRead: false,
+              createdAt: new Date().toISOString(),
             });
           }
 
@@ -794,10 +849,13 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       req.on("end", async () => {
         const startTime = Date.now();
         let userId = "";
+        let client: AgentBoxClient | null = null;
+        let sessionId: string | undefined;
         try {
           const data = JSON.parse(body) as {
             userId: string; sessionId: string; text: string;
             timeoutMs?: number; caller?: string; envId?: string;
+            workspaceId?: string;
           };
           userId = data.userId;
           const timeoutMs = data.timeoutMs || 300_000;
@@ -812,25 +870,72 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           console.log(`[gateway] agent-prompt from=${caller} user=${userId} session=${data.sessionId}`);
 
           // 1. Get or create user's AgentBox (resolve real workspace ID from DB)
-          if (!internalWorkspaceRepo) throw new Error("Database not available");
-          const wsId = (await internalWorkspaceRepo.getOrCreateDefault(userId)).id;
+          if (!data.workspaceId && !internalWorkspaceRepo) throw new Error("Database not available");
+          const workspace = data.workspaceId
+            ? await internalWorkspaceRepo?.getById(data.workspaceId) ?? null
+            : await internalWorkspaceRepo!.getOrCreateDefault(userId);
+          const wsId = workspace?.id || data.workspaceId!;
+          const isDefaultWs = workspace?.isDefault ?? true;
           const handle = await agentBoxManager.getOrCreate(userId, wsId);
-          const client = new AgentBoxClient(handle.endpoint);
+          client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
-          // 2. Send prompt
-          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text });
+          // 2. Build credential payload so AgentBox has kubeconfig etc.
+          const credentials = await buildCredentialPayload(userId, wsId, isDefaultWs).catch((err) => {
+            console.warn(`[gateway] agent-prompt credential build failed:`, err instanceof Error ? err.message : err);
+            return undefined;
+          });
 
-          // 3. Wait for completion with timeout
-          const resultText = await Promise.race([
-            waitForAgentCompletion(client, promptResult.sessionId),
-            rejectAfterTimeout(timeoutMs, data.sessionId),
-          ]);
+          // 3. Resolve model config (workspace default → global default)
+          let modelProvider: string | undefined;
+          let modelId: string | undefined;
+          let modelConfig: PromptOptions["modelConfig"];
+          if (db) {
+            const mcRepo = new ModelConfigRepository(db);
+            // Try workspace default model first, then global default
+            const wsDefault = workspace?.configJson?.defaultModel;
+            const defaultModel = wsDefault?.provider && wsDefault?.modelId
+              ? { provider: wsDefault.provider, modelId: wsDefault.modelId }
+              : await mcRepo.getDefault();
+            if (defaultModel) {
+              modelProvider = defaultModel.provider;
+              modelId = defaultModel.modelId;
+              try {
+                const providerConfig = await mcRepo.getProviderWithModels(modelProvider);
+                if (providerConfig) modelConfig = providerConfig;
+              } catch (err) {
+                console.warn(`[gateway] agent-prompt provider config resolve failed:`, err instanceof Error ? err.message : err);
+              }
+            }
+          }
 
-          const durationMs = Date.now() - startTime;
-          console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
+          // 4. Send prompt with credentials and model config
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig });
+          sessionId = promptResult.sessionId;
 
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "success", resultText, durationMs }));
+          // 4. Wait for completion with cancellable timeout
+          const timeout = rejectAfterTimeout(timeoutMs, data.sessionId);
+          try {
+            const resultText = await Promise.race([
+              waitForAgentCompletion(client, promptResult.sessionId),
+              timeout.promise,
+            ]);
+
+            timeout.cancel();
+            const durationMs = Date.now() - startTime;
+            console.log(`[gateway] agent-prompt completed user=${userId} duration=${durationMs}ms resultLen=${resultText.length}`);
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "success", resultText, durationMs }));
+          } catch (innerErr) {
+            timeout.cancel();
+            // On timeout, attempt to abort + close the orphaned agent session
+            if (client && sessionId && innerErr instanceof ExecutionTimeoutError) {
+              try { await client.abortSession(sessionId); } catch { /* best-effort */ }
+              try { await client.closeSession(sessionId); } catch { /* best-effort */ }
+              console.log(`[gateway] agent-prompt session=${sessionId} aborted after timeout`);
+            }
+            throw innerErr;
+          }
         } catch (err) {
           const durationMs = Date.now() - startTime;
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -1175,30 +1280,18 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                   return;
                 }
 
-                // Parse userId from query params
+                // Use userId from mTLS certificate identity (authoritative)
                 const urlObj = new URL(url, `https://${req.headers.host}`);
-                const requestedUserId = urlObj.searchParams.get("userId");
-                if (!requestedUserId) {
-                  res.writeHead(400, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "Missing userId parameter" }));
-                  return;
-                }
-
-                // Authorization: certificate userId must match requested userId
-                if (identity.userId !== requestedUserId) {
-                  console.warn(`[gateway] cron-list authorization failed: cert userId=${identity.userId} requested=${requestedUserId}`);
-                  res.writeHead(403, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "Forbidden: userId mismatch" }));
-                  return;
-                }
+                const userId = identity.userId;
 
                 // Query cron jobs using ConfigRepository
                 const configRepo = new ConfigRepository(db);
-                const jobs = await configRepo.listCronJobs(requestedUserId);
+                const workspaceId = urlObj.searchParams.get("workspaceId") || identity.workspaceId;
+                const jobs = await configRepo.listCronJobs(userId, workspaceId ? { workspaceId } : undefined);
 
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ jobs }));
-                console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${requestedUserId}`);
+                console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${userId}${workspaceId ? ` workspaceId=${workspaceId}` : ""}`);
               } catch (err) {
                 console.error("[gateway] cron-list error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });
@@ -1283,6 +1376,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     db,
     rpcMethods,
     buildCredentialPayload,
+    agentBoxTlsOptions,
     async close() {
       bindCodeStore.dispose();
       await agentBoxManager.cleanup();
@@ -1305,33 +1399,72 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 /** Consume SSE stream from AgentBox and extract final assistant text */
 async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string): Promise<string> {
   let resultText = "";
+  // Accumulate text deltas per message (claude-sdk brain emits text via
+  // message_update/text_delta and sends empty content in message_end)
+  let currentMsgText = "";
   for await (const event of client.streamEvents(sessionId)) {
     const evt = event as Record<string, unknown>;
+
+    // Accumulate streaming text deltas
+    if (evt.type === "message_update") {
+      const ame = evt.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (ame?.type === "text_delta" && typeof ame.delta === "string") {
+        currentMsgText += ame.delta;
+      }
+    }
+
+    if (evt.type === "message_start") {
+      // New message — reset accumulated text
+      currentMsgText = "";
+    }
+
     if (evt.type === "message_end" || evt.type === "turn_end") {
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "assistant") {
+        // Try to extract from message.content first (pi-agent brain)
+        let extracted = "";
         const content = message.content;
-        if (typeof content === "string") {
-          resultText = content;
+        if (typeof content === "string" && content) {
+          extracted = content;
         } else if (Array.isArray(content)) {
-          const text = (content as Array<{ type: string; text?: string }>)
+          extracted = (content as Array<{ type: string; text?: string }>)
             .filter((c) => c.type === "text")
             .map((c) => c.text ?? "")
             .join("");
-          if (text) resultText = text;
         }
+        // Use extracted content, or fall back to accumulated text deltas
+        // (claude-sdk brain sends empty content in message_end)
+        resultText = extracted || currentMsgText || resultText;
       }
+      currentMsgText = "";
     }
     if (evt.type === "agent_end") break;
+  }
+  // Final fallback: if no message_end was captured but we have accumulated text
+  if (!resultText && currentMsgText) {
+    resultText = currentMsgText;
   }
   return resultText;
 }
 
-/** Returns a promise that rejects after the given timeout */
-function rejectAfterTimeout(ms: number, sessionId: string): Promise<never> {
-  return new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`)), ms),
-  );
+class ExecutionTimeoutError extends Error {
+  constructor(sessionId: string, ms: number) {
+    super(`agent-prompt session=${sessionId} timed out after ${ms / 1000}s`);
+    this.name = "ExecutionTimeoutError";
+  }
+}
+
+/** Returns a cancellable promise that rejects after the given timeout */
+function rejectAfterTimeout(ms: number, sessionId: string): { promise: Promise<never>; cancel: () => void } {
+  let timer: NodeJS.Timeout | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ExecutionTimeoutError(sessionId, ms)), ms);
+    timer.unref();
+  });
+  return {
+    promise,
+    cancel: () => { if (timer) clearTimeout(timer); },
+  };
 }
 
 /**
