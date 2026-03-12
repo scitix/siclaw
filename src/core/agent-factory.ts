@@ -548,6 +548,15 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Skill diagnostics: ${JSON.stringify(skillDiagnostics)}`);
   }
 
+  // Ensure memoryDir and skeleton PROFILE.md exist (both brain paths need this)
+  if (!fs.existsSync(memoryDir)) {
+    fs.mkdirSync(memoryDir, { recursive: true });
+  }
+  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
+  if (!fs.existsSync(skeletonProfilePath)) {
+    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+  }
+
   // -- Claude SDK brain path --
   if (opts?.brainType === "claude-sdk") {
     console.log(`[agent-factory] Creating Claude SDK brain`);
@@ -639,15 +648,6 @@ Follow the structured workflow described in the deep-investigation skill guide.`
   // Initialize memory indexer for pi-agent (hybrid search over memory/*.md)
   let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
   try {
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
-    }
-    // Ensure a skeleton PROFILE.md exists so language defaults are always set.
-    // All fields start as TBD — the agent updates them during conversation.
-    const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
-    if (!fs.existsSync(skeletonProfilePath)) {
-      fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
-    }
     if (memoryIndexer) {
       // Shared indexer provided — reuse it, don't startWatching (caller manages lifecycle)
       memoryIndexerRef.current = memoryIndexer;
