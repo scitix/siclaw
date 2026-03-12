@@ -18,6 +18,9 @@
     "pod-ping-gateway":         ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "pod-show-gateway":         ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "pvc-debug":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
-    "service-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"]
+    "quota-debug":              ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "service-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"],
+    "statefulset-debug":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "volcano-queue-debug":      ["kubernetes", "general",  "diagnostic", "sre", "developer"]
   }
 }
