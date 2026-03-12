@@ -2556,9 +2556,8 @@ export function createRpcMethods(
 
     if (!configRepo) return { jobs: [] };
 
-    const envId = params.envId as string | undefined;
     const workspaceId = params.workspaceId as string | undefined;
-    const opts = (envId || workspaceId) ? { envId, workspaceId } : undefined;
+    const opts = workspaceId ? { workspaceId } : undefined;
     const rows = await configRepo.listCronJobs(userId, opts);
 
     // Enrich with workspace names
@@ -2574,7 +2573,6 @@ export function createRpcMethods(
     return {
       jobs: rows.map((r) => ({
         ...r,
-        envName: null,
         workspaceName: r.workspaceId ? (wsNameMap.get(r.workspaceId) ?? null) : null,
       })),
     };
@@ -2594,7 +2592,6 @@ export function createRpcMethods(
     const existingId = params.id as string | undefined;
     const existingJob = existingId ? await configRepo.getCronJobById(existingId) : null;
 
-    const envId = params.envId as string | null | undefined;
     const workspaceId = params.workspaceId as string | null | undefined;
 
     const id = await configRepo.saveCronJob(userId, {
@@ -2604,7 +2601,6 @@ export function createRpcMethods(
       schedule,
       skillId: params.skillId as string | undefined,
       status,
-      envId: envId ?? null,
       workspaceId: workspaceId ?? null,
     });
 
@@ -2636,7 +2632,7 @@ export function createRpcMethods(
           id, userId, name, description: description ?? null, schedule, status,
           skillId: params.skillId ?? null, assignedTo,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-          envId: envId ?? null,
+
           workspaceId: workspaceId ?? null,
         },
       });
@@ -2665,6 +2661,7 @@ export function createRpcMethods(
     if (notifRepo) {
       await notifRepo.dismissByTypeAndRelatedId("cron_success", id);
       await notifRepo.dismissByTypeAndRelatedId("cron_failure", id);
+      await notifRepo.dismissByTypeAndRelatedId("cron_result", id); // legacy type
     }
 
     return { status: "deleted" };
@@ -2695,7 +2692,6 @@ export function createRpcMethods(
       schedule: job.schedule,
       skillId: job.skillId ?? undefined,
       status,
-      envId: job.envId ?? null,
       workspaceId: job.workspaceId ?? null,
     });
 
@@ -2708,7 +2704,7 @@ export function createRpcMethods(
           schedule: job.schedule, status, skillId: job.skillId ?? null,
           assignedTo: job.assignedTo ?? null,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-          envId: job.envId ?? null,
+
           workspaceId: job.workspaceId ?? null,
         },
       }),
@@ -2740,7 +2736,6 @@ export function createRpcMethods(
       schedule: job.schedule,
       skillId: job.skillId ?? undefined,
       status: job.status as "active" | "paused",
-      envId: job.envId ?? null,
       workspaceId: job.workspaceId ?? null,
     });
 
@@ -2752,12 +2747,39 @@ export function createRpcMethods(
         schedule: job.schedule, status: job.status, skillId: job.skillId ?? null,
         assignedTo: job.assignedTo ?? null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: job.envId ?? null,
+        envId: null,
         workspaceId: job.workspaceId ?? null,
       },
     });
 
     return { id, name: newName.trim() };
+  });
+
+  methods.set("cron.runs", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!configRepo) throw new Error("Database not available");
+
+    const jobId = params.jobId as string;
+    if (!jobId) throw new Error("Missing required param: jobId");
+
+    // Verify ownership
+    const job = await configRepo.getCronJobById(jobId);
+    if (!job) throw new Error("Job not found");
+    if (job.userId !== userId) throw new Error("Forbidden");
+
+    const limit = Math.min(Number(params.limit) || 20, 100);
+    const runs = await configRepo.listCronJobRuns(jobId, limit);
+
+    return {
+      runs: runs.map((r) => ({
+        id: r.id,
+        status: r.status,
+        resultText: r.resultText,
+        error: r.error,
+        durationMs: r.durationMs,
+        createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt ? new Date(Number(r.createdAt) * 1000).toISOString() : null,
+      })),
+    };
   });
 
   // ─────────────────────────────────────────────────

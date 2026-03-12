@@ -21,7 +21,6 @@ export interface CronJobRow {
   assignedTo: string | null;
   lockedBy: string | null;
   lockedAt: Date | null;
-  envId: string | null;
   workspaceId: string | null;
 }
 

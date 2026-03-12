@@ -63,8 +63,12 @@ export class GatewayClient {
   /**
    * List cron jobs for a user
    */
-  async listCronJobs(userId: string): Promise<CronJob[]> {
-    const data = await this.request(`/api/internal/cron-list?userId=${encodeURIComponent(userId)}`, "GET");
+  async listCronJobs(userId: string, workspaceId?: string): Promise<CronJob[]> {
+    let url = `/api/internal/cron-list?userId=${encodeURIComponent(userId)}`;
+    if (workspaceId) {
+      url += `&workspaceId=${encodeURIComponent(workspaceId)}`;
+    }
+    const data = await this.request(url, "GET");
     return data.jobs || [];
   }
 

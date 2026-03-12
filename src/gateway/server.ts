@@ -783,10 +783,24 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           const data = JSON.parse(body) as {
             userId: string; jobId: string; jobName: string;
             result: "success" | "failure"; resultText: string; error?: string;
+            durationMs?: number;
           };
 
-          // 1. Write notification to DB
+          // 1. Write execution history + notification to DB
           if (db) {
+            // Persist run record
+            try {
+              const configRepo = new ConfigRepository(db);
+              await configRepo.insertCronJobRun({
+                jobId: data.jobId,
+                status: data.result,
+                resultText: data.resultText || undefined,
+                error: data.error,
+                durationMs: data.durationMs,
+              });
+            } catch (runErr) {
+              console.warn("[gateway] Failed to insert cron run:", runErr instanceof Error ? runErr.message : runErr);
+            }
             const notifRepo = new NotificationRepository(db);
             const notifType = data.result === "success" ? "cron_success" : "cron_failure";
             const notifMessage = data.result === "success" ? data.resultText : (data.error || "Unknown error");
@@ -1266,30 +1280,18 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                   return;
                 }
 
-                // Parse userId from query params
+                // Use userId from mTLS certificate identity (authoritative)
                 const urlObj = new URL(url, `https://${req.headers.host}`);
-                const requestedUserId = urlObj.searchParams.get("userId");
-                if (!requestedUserId) {
-                  res.writeHead(400, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "Missing userId parameter" }));
-                  return;
-                }
-
-                // Authorization: certificate userId must match requested userId
-                if (identity.userId !== requestedUserId) {
-                  console.warn(`[gateway] cron-list authorization failed: cert userId=${identity.userId} requested=${requestedUserId}`);
-                  res.writeHead(403, { "Content-Type": "application/json" });
-                  res.end(JSON.stringify({ error: "Forbidden: userId mismatch" }));
-                  return;
-                }
+                const userId = identity.userId;
 
                 // Query cron jobs using ConfigRepository
                 const configRepo = new ConfigRepository(db);
-                const jobs = await configRepo.listCronJobs(requestedUserId);
+                const workspaceId = urlObj.searchParams.get("workspaceId") || identity.workspaceId;
+                const jobs = await configRepo.listCronJobs(userId, workspaceId ? { workspaceId } : undefined);
 
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ jobs }));
-                console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${requestedUserId}`);
+                console.log(`[gateway] Listed ${jobs.length} cron jobs for userId=${userId}${workspaceId ? ` workspaceId=${workspaceId}` : ""}`);
               } catch (err) {
                 console.error("[gateway] cron-list error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });

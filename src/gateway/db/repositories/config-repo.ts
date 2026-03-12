@@ -5,7 +5,7 @@
 import crypto from "node:crypto";
 import { eq, and, isNull, isNotNull, gt, lte, asc, sql } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { channels, cronJobs, cronInstances, triggers } from "../schema.js";
+import { channels, cronJobs, cronJobRuns, cronInstances, triggers } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
 
 export class ConfigRepository {
@@ -56,11 +56,8 @@ export class ConfigRepository {
 
   // ─── Cron Jobs ────────────────────────────────
 
-  async listCronJobs(userId: string, opts?: { envId?: string; workspaceId?: string }) {
+  async listCronJobs(userId: string, opts?: { workspaceId?: string }) {
     const conditions = [eq(cronJobs.userId, userId)];
-    if (opts?.envId !== undefined) {
-      conditions.push(eq(cronJobs.envId, opts.envId));
-    }
     if (opts?.workspaceId !== undefined) {
       conditions.push(eq(cronJobs.workspaceId, opts.workspaceId));
     }
@@ -79,7 +76,6 @@ export class ConfigRepository {
       schedule: string;
       skillId?: string;
       status?: "active" | "paused";
-      envId?: string | null;
       workspaceId?: string | null;
     },
   ) {
@@ -101,7 +97,6 @@ export class ConfigRepository {
           schedule: job.schedule,
           skillId: job.skillId ?? null,
           status: job.status ?? "active",
-          envId: job.envId ?? null,
           workspaceId: job.workspaceId ?? null,
         })
         .where(eq(cronJobs.id, id));
@@ -114,7 +109,6 @@ export class ConfigRepository {
         schedule: job.schedule,
         skillId: job.skillId ?? null,
         status: job.status ?? "active",
-        envId: job.envId ?? null,
         workspaceId: job.workspaceId ?? null,
       });
     }
@@ -155,6 +149,36 @@ export class ConfigRepository {
       .update(cronJobs)
       .set({ lastRunAt: new Date(), lastResult: result })
       .where(eq(cronJobs.id, id));
+  }
+
+  // ─── Cron Job Runs (execution history) ──────
+
+  async insertCronJobRun(params: {
+    jobId: string;
+    status: "success" | "failure";
+    resultText?: string;
+    error?: string;
+    durationMs?: number;
+  }): Promise<string> {
+    const id = crypto.randomUUID();
+    await this.db.insert(cronJobRuns).values({
+      id,
+      jobId: params.jobId,
+      status: params.status,
+      resultText: params.resultText ?? null,
+      error: params.error ?? null,
+      durationMs: params.durationMs ?? null,
+    });
+    return id;
+  }
+
+  async listCronJobRuns(jobId: string, limit = 20) {
+    return this.db
+      .select()
+      .from(cronJobRuns)
+      .where(eq(cronJobRuns.jobId, jobId))
+      .orderBy(sql`${cronJobRuns.createdAt} DESC`)
+      .limit(limit);
   }
 
   async assignCronJob(jobId: string, instanceId: string) {
