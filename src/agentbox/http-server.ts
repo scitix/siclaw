@@ -328,24 +328,28 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
     }
 
-    // Programmatically update PROFILE.md Language field (code-level, not model-dependent)
-    try {
-      const cfg = loadConfig();
-      const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
-      const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
-      if (fs.existsSync(profilePath)) {
-        const content = fs.readFileSync(profilePath, "utf-8");
-        const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
-        const currentLang = currentLangMatch?.[1]?.trim();
-        if (currentLang !== detectedLang) {
-          const updated = content.replace(
-            /(\*\*Language\*\*:\s*).+/i,
-            `$1${detectedLang}`,
-          );
-          fs.writeFileSync(profilePath, updated);
+    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
+    // Only update on non-English detection to avoid flapping: English is the default,
+    // so we only persist when the user actively uses another language.
+    if (detectedLang !== "English") {
+      try {
+        const cfg = loadConfig();
+        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
+        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
+        if (fs.existsSync(profilePath)) {
+          const content = fs.readFileSync(profilePath, "utf-8");
+          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
+          const currentLang = currentLangMatch?.[1]?.trim();
+          if (currentLang !== detectedLang) {
+            const updated = content.replace(
+              /(\*\*Language\*\*:\s*).+/i,
+              `$1${detectedLang}`,
+            );
+            fs.writeFileSync(profilePath, updated);
+          }
         }
-      }
-    } catch { /* best-effort, don't block prompt */ }
+      } catch { /* best-effort, don't block prompt */ }
+    }
 
     // Execute prompt asynchronously; notify SSE to close on completion
     console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);

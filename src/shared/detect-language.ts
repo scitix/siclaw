@@ -46,14 +46,25 @@ export function detectLanguage(text: string): string {
     else if (DEVANAGARI.test(ch)) devanagari++;
   }
 
-  // Japanese: presence of kana is definitive (Chinese doesn't use kana)
-  if (ja > 0) return "Japanese";
-  if (ko > 0) return "Korean";
-  if (cjk > 0) return "Chinese";
-  if (cyrillic > 0) return "Russian";
-  if (arabic > 0) return "Arabic";
-  if (thai > 0) return "Thai";
-  if (devanagari > 0) return "Hindi";
+  // Total non-ASCII script characters
+  const total = ja + cjk + ko + cyrillic + arabic + thai + devanagari;
+  if (total === 0) return "English";
 
+  // Require at least 2 script characters to avoid false positives from
+  // stray technical terms embedded in English sentences. Single characters
+  // are too noisy for an SRE tool where mixed-language input is common.
+  const MIN_CHARS = 2;
+
+  // Japanese: presence of kana is definitive (Chinese doesn't use kana)
+  if (ja >= MIN_CHARS) return "Japanese";
+  if (ko >= MIN_CHARS) return "Korean";
+  // CJK alone needs slightly higher bar — could be a single term embedded in English
+  if (cjk >= MIN_CHARS) return "Chinese";
+  if (cyrillic >= MIN_CHARS) return "Russian";
+  if (arabic >= MIN_CHARS) return "Arabic";
+  if (thai >= MIN_CHARS) return "Thai";
+  if (devanagari >= MIN_CHARS) return "Hindi";
+
+  // Below threshold — treat as English with incidental non-Latin characters
   return "English";
 }
