@@ -230,20 +230,35 @@ describe("lookupInvestigationsByFiles", () => {
     const now = Date.now();
     insertRecord(db, { id: "1", question: "q1", createdAt: now });
 
-    const results = indexer.lookupInvestigationsByFiles(["investigations/1999-01-01-0000.md"]);
+    const results = indexer.lookupInvestigationsByFiles(["investigations/1999-01-01-00-00-00.md"]);
     expect(results.length).toBe(0);
   });
 
-  it("finds records matching file dates", () => {
-    // Create a record with a known date
+  it("finds records matching full datetime within ±60s window", () => {
+    // Create a record at a known time
     const targetDate = new Date("2026-03-08T12:00:00Z");
     insertRecord(db, { id: "match", question: "RDMA issue", createdAt: targetDate.getTime() });
 
-    // Create a record with a different date
+    // Create a record at a different time (same day, 2 hours later)
+    const sameDayOther = new Date("2026-03-08T14:00:00Z");
+    insertRecord(db, { id: "same-day-other", question: "other issue same day", createdAt: sameDayOther.getTime() });
+
+    // Filename format matches writeInvestigationToMemory: "2026-03-08-12-00-00.md"
+    const results = indexer.lookupInvestigationsByFiles(["investigations/2026-03-08-12-00-00.md"]);
+    expect(results.some(r => r.id === "match")).toBe(true);
+    // Same-day record 2 hours away should NOT match (outside ±60s window)
+    expect(results.some(r => r.id === "same-day-other")).toBe(false);
+  });
+
+  it("falls back to date-only match for filenames without full timestamp", () => {
+    const targetDate = new Date("2026-03-08T12:00:00Z");
+    insertRecord(db, { id: "match", question: "RDMA issue", createdAt: targetDate.getTime() });
+
     const otherDate = new Date("2026-03-07T12:00:00Z");
     insertRecord(db, { id: "other", question: "other issue", createdAt: otherDate.getTime() });
 
-    const results = indexer.lookupInvestigationsByFiles(["investigations/2026-03-08-1200.md"]);
+    // Date-only filename (no HH-MM-SS) — falls back to date matching
+    const results = indexer.lookupInvestigationsByFiles(["investigations/2026-03-08.md"]);
     expect(results.some(r => r.id === "match")).toBe(true);
     expect(results.some(r => r.id === "other")).toBe(false);
   });

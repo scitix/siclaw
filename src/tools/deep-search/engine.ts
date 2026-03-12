@@ -515,6 +515,14 @@ export async function investigate(
     }
 
     if (pk.patterns || pk.similarInvestigations || pk.validatedHypotheses) {
+      // Truncate to avoid token explosion — prior knowledge should inform, not dominate the prompt
+      const MAX_CHARS = 4000;
+      if (pk.similarInvestigations && pk.similarInvestigations.length > MAX_CHARS) {
+        pk.similarInvestigations = pk.similarInvestigations.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
+      if (pk.validatedHypotheses && pk.validatedHypotheses.length > MAX_CHARS) {
+        pk.validatedHypotheses = pk.validatedHypotheses.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
       priorKnowledge = pk;
     }
   }
@@ -798,19 +806,26 @@ function buildPastDiagnosticContext(records: InvestigationRecord[]): string {
   return contextLines.join("\n");
 }
 
-/** Extract validated hypotheses from investigation records, deduplicated and counted. */
+/**
+ * Extract validated hypotheses from investigation records, deduplicated and counted.
+ * Uses normalized text (lowercase, collapsed whitespace) for dedup to merge
+ * near-identical hypotheses like "MTU Mismatch" and "mtu mismatch".
+ * NOTE: Semantic dedup (embedding similarity) would catch more variants but
+ * requires async embedding calls — left as a future improvement.
+ */
 function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
-  // Count occurrences and track max confidence
-  const validated = new Map<string, { count: number; maxConfidence: number }>();
+  // Count occurrences and track max confidence, keyed by normalized text
+  const validated = new Map<string, { displayText: string; count: number; maxConfidence: number }>();
   for (const rec of records) {
     for (const h of rec.hypotheses) {
       if (h.status === "validated" && h.text) {
-        const existing = validated.get(h.text);
+        const key = normalizeHypothesisText(h.text);
+        const existing = validated.get(key);
         if (existing) {
           existing.count++;
           existing.maxConfidence = Math.max(existing.maxConfidence, h.confidence);
         } else {
-          validated.set(h.text, { count: 1, maxConfidence: h.confidence });
+          validated.set(key, { displayText: h.text, count: 1, maxConfidence: h.confidence });
         }
       }
     }
@@ -818,7 +833,12 @@ function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
 
   return [...validated.entries()]
     .sort((a, b) => b[1].count - a[1].count)
-    .map(([text, { count, maxConfidence }]) =>
-      `- "${text}" (validated ${count} time${count > 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
+    .map(([, { displayText, count, maxConfidence }]) =>
+      `- "${displayText}" (validated ${count} time${count > 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
     );
+}
+
+/** Normalize hypothesis text for dedup: lowercase, trim, collapse whitespace. */
+function normalizeHypothesisText(text: string): string {
+  return text.toLowerCase().trim().replace(/\s+/g, " ");
 }

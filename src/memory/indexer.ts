@@ -538,30 +538,73 @@ export class MemoryIndexer {
   }
 
   /**
-   * Look up investigation records whose dates match the given memory file paths.
+   * Look up investigation records whose timestamps match the given memory file paths.
    * Used to enrich semantic search results (chunks from investigations/*.md) with
    * structured metadata from the investigations table.
+   *
+   * Matching strategy:
+   * 1. Try full datetime from filename (e.g. "2026-03-08-12-39-00.md") → ±60s window
+   * 2. Fallback to date-only match for filenames without full timestamps
    */
   lookupInvestigationsByFiles(filePaths: string[]): InvestigationRecord[] {
     if (filePaths.length === 0) return [];
     try {
-      // Extract dates from file paths like "investigations/2026-03-08-1539.md"
-      const dates = new Set<string>();
+      const timeRanges: Array<{ start: number; end: number }> = [];
+      const fallbackDates = new Set<string>();
+
       for (const fp of filePaths) {
-        const match = fp.match(/(\d{4}-\d{2}-\d{2})/);
-        if (match) dates.add(match[1]);
+        // Try full datetime: "investigations/2026-03-08-12-39-00.md"
+        const fullMatch = fp.match(/(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})-(\d{2})/);
+        if (fullMatch) {
+          const dateStr = `${fullMatch[1]}T${fullMatch[2]}:${fullMatch[3]}:${fullMatch[4]}Z`;
+          const ts = new Date(dateStr).getTime();
+          if (!isNaN(ts)) {
+            timeRanges.push({ start: ts - 60_000, end: ts + 60_000 });
+            continue;
+          }
+        }
+        // Fallback: date only
+        const dateMatch = fp.match(/(\d{4}-\d{2}-\d{2})/);
+        if (dateMatch) fallbackDates.add(dateMatch[1]);
       }
-      if (dates.size === 0) return [];
 
-      // Query investigations created on those dates
-      const placeholders = [...dates].map(() => "?").join(",");
-      const rows = this.db
-        .prepare(
-          `SELECT * FROM investigations WHERE date(created_at / 1000, 'unixepoch') IN (${placeholders}) ORDER BY created_at DESC`,
-        )
-        .all(...dates) as Array<Record<string, unknown>>;
+      if (timeRanges.length === 0 && fallbackDates.size === 0) return [];
 
-      return rows.map((r) => rowToInvestigationRecord(r));
+      const results: InvestigationRecord[] = [];
+      const seenIds = new Set<string>();
+
+      // Precise ±60s window matching
+      for (const range of timeRanges) {
+        const rows = this.db
+          .prepare("SELECT * FROM investigations WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC")
+          .all(range.start, range.end) as Array<Record<string, unknown>>;
+        for (const r of rows) {
+          const rec = rowToInvestigationRecord(r);
+          if (!seenIds.has(rec.id)) {
+            results.push(rec);
+            seenIds.add(rec.id);
+          }
+        }
+      }
+
+      // Fallback: date-only matching for filenames without full timestamps
+      if (fallbackDates.size > 0) {
+        const placeholders = [...fallbackDates].map(() => "?").join(",");
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM investigations WHERE date(created_at / 1000, 'unixepoch') IN (${placeholders}) ORDER BY created_at DESC`,
+          )
+          .all(...fallbackDates) as Array<Record<string, unknown>>;
+        for (const r of rows) {
+          const rec = rowToInvestigationRecord(r);
+          if (!seenIds.has(rec.id)) {
+            results.push(rec);
+            seenIds.add(rec.id);
+          }
+        }
+      }
+
+      return results;
     } catch (err) {
       console.warn(`[memory-indexer] lookupInvestigationsByFiles failed:`, err);
       return [];
