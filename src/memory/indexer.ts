@@ -237,7 +237,7 @@ export class MemoryIndexer {
       }
 
       // Ensure vec table is ready (if sqlite-vec available)
-      const dims = embeddings.length > 0 && embeddings[0].length > 0 ? embeddings[0].length : this.embedding.dimensions;
+      const dims = embeddings.length > 0 && embeddings[0]?.length > 0 ? embeddings[0].length : this.embedding.dimensions;
       const vecReady = this.ensureVecTable(dims);
 
       // Write to DB in a transaction
@@ -701,7 +701,7 @@ export class MemoryIndexer {
       const newEmbeddings = await this.embedding.embed(missTexts);
 
       for (let j = 0; j < misses.length; j++) {
-        const vec = newEmbeddings[j];
+        const vec = newEmbeddings[j] ?? [];
         results[misses[j].index] = vec;
         // Write to cache
         if (vec && vec.length > 0) {
