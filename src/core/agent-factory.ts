@@ -135,108 +135,16 @@ function truncateWithBudget(content: string, maxChars: number): string {
 }
 
 /**
- * Build the append system prompt content (skills index + MEMORY.md).
+ * Build the append system prompt content (PROFILE.md + MEMORY.md).
  * Shared between pi-agent (via DefaultResourceLoader) and SDK brain.
+ *
+ * Skills are NOT listed here — pi-agent's DefaultResourceLoader provides a
+ * lazy index (name + description + path) and the model reads SKILL.md on demand.
  */
 function buildAppendSystemPrompt(
-  skillsBase: string,
-  getUserSkillDirName: () => string,
-  getPlatformSkillDirName: () => string,
   memoryDir: string,
 ): string[] {
   const parts: string[] = [];
-
-  const skillSearchDirs: string[] = [];
-  const activeDir = path.join(skillsBase, "user", getUserSkillDirName());
-  if (fs.existsSync(activeDir)) {
-    skillSearchDirs.push(activeDir);
-    // Platform skills (create-skill, update-skill, manage-skill) are excluded —
-    // they are internal agent guides, not user-facing skills.
-  } else {
-    const SKILL_SCOPES = ["user", "team", "core"];
-    for (const scope of SKILL_SCOPES) {
-      const scopeDir = path.join(skillsBase, scope);
-      if (fs.existsSync(scopeDir)) {
-        skillSearchDirs.push(scopeDir);
-      }
-    }
-  }
-
-  const withScripts: string[] = [];
-  const withoutScripts: string[] = [];
-  const seenSkills = new Set<string>();
-
-  for (const searchDir of skillSearchDirs) {
-    try {
-      const entries = fs.readdirSync(searchDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.name.startsWith("_")) continue;
-        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-        if (seenSkills.has(entry.name)) continue;
-        seenSkills.add(entry.name);
-        const skillName = entry.name;
-        const sDir = path.join(searchDir, skillName, "scripts");
-        let scripts: string[] = [];
-        try {
-          scripts = fs.readdirSync(sDir)
-            .filter((f) => f.endsWith(".sh") || f.endsWith(".py"));
-        } catch { /* no scripts dir */ }
-
-        if (scripts.length > 0) {
-          let execTool = "run_skill";
-          try {
-            const skillMd = fs.readFileSync(
-              path.join(searchDir, skillName, "SKILL.md"),
-              "utf-8",
-            );
-            // If the SKILL.md has an explicit "run_skill: ... skill=<this>" invocation,
-            // honour it and skip the heuristic — avoids misclassification when the
-            // SKILL.md cross-references other skills via node_script/pod_script.
-            const selfRunSkill = skillMd.split("\n").some((line) =>
-              /\brun_skill\s*:/.test(line) && new RegExp(`skill=["']?${skillName}["']?`).test(line),
-            );
-            if (!selfRunSkill) {
-              if (skillMd.includes("node_script")) execTool = "node_script";
-              else if (skillMd.includes("pod_script") || skillMd.includes("pod_netns_script")) execTool = "pod_script";
-            }
-          } catch { /* default to run_skill */ }
-          withScripts.push(
-            `- ${skillName} → ${scripts.map((s) => `\`${s}\``).join(", ")} (via **${execTool}**)`,
-          );
-        } else {
-          withoutScripts.push(skillName);
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  if (withScripts.length > 0 || withoutScripts.length > 0) {
-    const lines = [
-      "\n## Skill Scripts Reference",
-      "",
-      `**Skill directories**: ${skillSearchDirs.join(", ")}`,
-      `Example: \`read(path: "${skillSearchDirs[0]}/<skill-name>/SKILL.md")\``,
-      "IMPORTANT: Always use the FULL directory path above — do NOT shorten or guess paths.",
-      "",
-      "Each skill below shows its execution tool. **CRITICAL: use the EXACT tool indicated** — do NOT substitute one tool for another.",
-      "There are only three execution tools: `run_skill`, `node_script`, `pod_script` — do NOT use any other tool name (e.g. `node_exec` does not exist).",
-      "- `run_skill`: runs on agentbox (has kubectl), pass `skill=\"<skill-name>/<script>\"`",
-      "- `node_script`: runs ON a Kubernetes node (host namespaces), needs `node` parameter",
-      "- `pod_script`: runs inside a pod's namespace",
-      "",
-    ];
-    if (withScripts.length > 0) {
-      lines.push("**Skills with scripts:**");
-      lines.push(...withScripts);
-    }
-    if (withoutScripts.length > 0) {
-      lines.push("");
-      lines.push(
-        `**Skills without scripts** (follow SKILL.md instructions, do NOT invent script names): ${withoutScripts.join(", ")}`,
-      );
-    }
-    parts.push(lines.join("\n"));
-  }
 
   // Load PROFILE.md (user profile for personalized interactions)
   const profileFile = path.join(memoryDir, "PROFILE.md");
@@ -466,8 +374,6 @@ export async function createSiclawSession(
 
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
-  const getUserSkillDirName = opts?.userId ? () => opts.userId! : () => ".";
-  const getPlatformSkillDirName = () => mode === "channel" ? ".platform-channel" : ".platform-web";
 
   // Skill directories (two fixed sources):
   // 1. Builtin: baked into Docker image at /app/skills/core/
@@ -526,7 +432,7 @@ export async function createSiclawSession(
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(memoryDir, mode),
     appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
+      const parts = buildAppendSystemPrompt(memoryDir);
       if (workspaceSystemPromptAppend) {
         parts.push("\n\n" + workspaceSystemPromptAppend);
       }
@@ -575,7 +481,7 @@ export async function createSiclawSession(
     const systemPrompt = buildSreSystemPrompt(memoryDir, mode);
 
     // Build the same append content that pi-agent gets via appendSystemPromptOverride
-    const appendParts = buildAppendSystemPrompt(skillsBase, getUserSkillDirName, getPlatformSkillDirName, memoryDir);
+    const appendParts = buildAppendSystemPrompt(memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
 
     // Inject deep investigation judgment framework

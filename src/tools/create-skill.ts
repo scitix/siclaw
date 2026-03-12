@@ -61,7 +61,32 @@ Important:
 - If the user asks to "change", "modify", "update", or "replace" a skill (whether created earlier in this conversation or not), always use \`update_skill\`.
 - Only use \`create_skill\` when the user explicitly wants a brand-new, separate skill.
 
-**Approval required**: Skills with scripts require admin approval before they become active. After creating a skill, do NOT attempt to test or run it — it will not be available until an admin approves it. Inform the user that the skill is pending review.
+## Duplicate / Overlap Check — CRITICAL
+
+**Before calling \`create_skill\`, you MUST check whether an existing skill already covers the same functionality.** Check \`<available_skills>\` in your system prompt and compare the user's request against existing builtin, team, and personal skills.
+
+- **Exact name match**: The tool will reject creation if a skill with the same name exists. But functional overlap with a DIFFERENT name is equally problematic.
+- **Functional overlap found**: If an existing skill solves the same problem (even with a different name), DO NOT silently create a new one. Instead:
+  1. Tell the user which existing skill overlaps and what it does.
+  2. Ask if they want to: (a) use the existing skill as-is, (b) fork it with \`fork_skill\` to make a customized personal copy, or (c) still create a brand-new separate skill.
+  3. Only proceed with \`create_skill\` if the user explicitly chooses option (c).
+- **Why this matters**: Duplicate skills with similar functionality confuse the model — it cannot reliably choose between two skills that do the same thing. One well-maintained skill is always better than two overlapping ones.
+- To fork a builtin or team skill into a personal copy, use \`fork_skill\`.
+
+## Environments and Approval Workflow
+
+Skills go through a review workflow that behaves differently per environment:
+
+| Environment | Behavior |
+|-------------|----------|
+| **Dev / Test** | Newly created skills (draft status) are immediately visible and usable. You can test them right away. |
+| **Production** | Only **approved** skill versions are visible. Draft and pending skills do NOT appear in production. |
+
+- After creating a skill, it starts in **draft** status.
+- Skills with scripts must be **submitted for review** and **approved by an admin** before they become active in production.
+- Skills without scripts (pure guidance) also start as draft but can be submitted and approved more quickly.
+- **After creating a skill in production context**: inform the user that the skill is pending review and will not be available in production until approved. Suggest testing in the dev/test environment first.
+- **Do NOT attempt to test or run a newly created skill in production** — it will not be found.
 
 ## Script Execution Modes
 

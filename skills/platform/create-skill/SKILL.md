@@ -15,6 +15,32 @@ Use this skill when the user asks you to:
 - Create a new skill for a specific operational procedure
 - Save a diagnosis workflow as a skill
 
+## Duplicate / Overlap Check — Do This FIRST
+
+**Before creating any skill, check whether an existing skill already covers the same functionality.** Consult the `<available_skills>` index in your context.
+
+- **Functional overlap found**: If an existing builtin, team, or personal skill solves the same problem (even with a different name), DO NOT silently create a new one. Instead:
+  1. Tell the user which existing skill overlaps and what it does.
+  2. Ask if they want to: (a) use the existing skill as-is, (b) fork it with `fork_skill` to make a customized personal copy, or (c) still create a brand-new separate skill.
+  3. Only proceed with `create_skill` if the user explicitly chooses option (c).
+- **Why this matters**: Duplicate skills with similar functionality confuse the model — it cannot reliably choose between two skills that do the same thing. One well-maintained skill is always better than two overlapping ones.
+- To fork a builtin or team skill into a personal copy, use `fork_skill`.
+
+## Environments and Approval Workflow
+
+Skills go through a review workflow that behaves differently per environment:
+
+| Environment | Behavior |
+|-------------|----------|
+| **Dev / Test** | Newly created skills (draft status) are immediately visible and usable. You can test them right away. |
+| **Production** | Only **approved** skill versions are visible and usable. Draft and pending skills do NOT appear. |
+
+- After creating a skill, it starts in **draft** status.
+- Skills with scripts must be **submitted for review** and **approved by an admin** before they become active in production.
+- Skills without scripts (pure guidance) also start as draft but can be submitted and approved more quickly.
+- **After creating a skill in production context**: inform the user that it is pending review and will not be available in production until approved. Suggest testing in the dev/test environment first.
+- **Do NOT attempt to test or run a newly created skill in production** — it will not be found.
+
 ## Skill Structure
 
 A skill is a directory under `skills/` containing:
@@ -171,9 +197,12 @@ node_script: node="node-1", skill="node-logs", script="get-node-logs.sh", args="
 
 ## How to Create a Skill
 
-### Step 0: Check Completeness — Ask Before You Build
+### Step 0: Check for Duplicates and Completeness
 
-Before calling `create_skill`, review what you know and identify gaps. A good skill needs **all** of the following. If any are missing or vague, ask the user to clarify before proceeding:
+Before calling `create_skill`:
+
+1. **Check for existing skills** — consult the `<available_skills>` index. If an existing skill covers the same functionality, discuss with the user: reuse as-is, fork with `fork_skill`, or create new.
+2. **Verify completeness** — a good skill needs **all** of the following. If any are missing, ask the user:
 
 | Required Info | What to check | Example question to ask |
 |---|---|---|
@@ -205,7 +234,8 @@ create_skill({
   description: "Find OOMKilled pods and analyze memory usage",
   type: "Monitoring",
   specs: "---\nname: check-pod-oom\n...",
-  scripts: [{ name: "check-oom.sh", content: "#!/bin/bash\n..." }]
+  scripts: [{ name: "check-oom.sh", content: "#!/bin/bash\n..." }],
+  labels: ["monitoring", "memory"]
 })
 ```
 
@@ -283,6 +313,8 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
 - **`## Parameters` table**: list required and optional parameters with descriptions
 - **Actionable examples**: show multiple real tool invocations with realistic parameters
 - **Category selection**: choose from Monitoring, Network, Security, Database, Core, Utility, Automation, Custom
+- **Labels**: add relevant labels (e.g. `['gpu', 'network', 'monitoring']`) for discoverability
 - **Scripts are optional**: simple skills that just guide the bot's kubectl usage don't need scripts
 - **One concern per skill**: keep skills focused on a single task
+- **No duplicates**: always check for existing skills first; fork rather than recreate
 - **User scripts by name**: when referencing uploaded scripts, just pass `{name: "file.sh"}` without content
