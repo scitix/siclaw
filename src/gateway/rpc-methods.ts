@@ -4120,10 +4120,16 @@ export function createRpcMethods(
       sessionCount = sessions.length;
     }
 
-    // PROFILE.md exists?
+    // PROFILE.md exists with meaningful (non-skeleton) content?
+    // A skeleton PROFILE.md (all TBD) doesn't count — the user still needs onboarding.
     const userDataDir = process.env.SICLAW_USER_DATA_DIR || ".siclaw/user-data";
     const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
-    const hasProfile = fs.existsSync(profilePath);
+    let hasProfile = false;
+    if (fs.existsSync(profilePath)) {
+      const content = fs.readFileSync(profilePath, "utf-8");
+      // Profile is "real" if Name field has been filled (not TBD)
+      hasProfile = /\*\*Name\*\*:\s*(?!TBD).+/i.test(content);
+    }
 
     // Credentials by type count (SSH/API + kubeconfigs)
     const credentials: Record<string, number> = {};

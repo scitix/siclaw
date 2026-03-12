@@ -21,6 +21,7 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+import { detectLanguage } from "../shared/detect-language.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -213,10 +214,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType);
 
-    // Materialize credential files from payload (sent by gateway in prompt body)
-    if (body.credentials?.files?.length) {
+    // Materialize credential files from payload (sent by gateway in prompt body).
+    // Always call when credentials payload is present — even with empty files —
+    // so stale credential files from prior sessions are cleaned up.
+    if (body.credentials) {
       const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
-      console.log(`[agentbox-http] Materialized ${count} credential files`);
+      if (count > 0) {
+        console.log(`[agentbox-http] Materialized ${count} credential files`);
+      }
     }
 
     // Dynamically register provider config from gateway DB (before findModel)
@@ -317,8 +322,37 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     }
 
+    // --- Language detection: inject explicit instruction so model doesn't guess ---
+    const detectedLang = detectLanguage(body.text);
+    if (detectedLang !== "English") {
+      promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+    }
+
+    // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
+    // Only update on non-English detection to avoid flapping: English is the default,
+    // so we only persist when the user actively uses another language.
+    if (detectedLang !== "English") {
+      try {
+        const cfg = loadConfig();
+        const userDataDir = process.env.SICLAW_USER_DATA_DIR || cfg.paths.userDataDir;
+        const profilePath = path.resolve(userDataDir, "memory", "PROFILE.md");
+        if (fs.existsSync(profilePath)) {
+          const content = fs.readFileSync(profilePath, "utf-8");
+          const currentLangMatch = content.match(/\*\*Language\*\*:\s*(.+)/i);
+          const currentLang = currentLangMatch?.[1]?.trim();
+          if (currentLang !== detectedLang) {
+            const updated = content.replace(
+              /(\*\*Language\*\*:\s*).+/i,
+              `$1${detectedLang}`,
+            );
+            fs.writeFileSync(profilePath, updated);
+          }
+        }
+      } catch { /* best-effort, don't block prompt */ }
+    }
+
     // Execute prompt asynchronously; notify SSE to close on completion
-    console.log(`[agentbox-http] Starting prompt for session ${managed.id}`);
+    console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
 
     // Metrics: snapshot stats before prompt for delta calculation
     const prevStats = managed.brain.getSessionStats();
