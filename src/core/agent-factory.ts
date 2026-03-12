@@ -244,48 +244,44 @@ function buildAppendSystemPrompt(
     let profileContent = fs.readFileSync(profileFile, "utf-8").trim();
     if (profileContent) {
       profileContent = truncateWithBudget(profileContent, 5_000);
-      parts.push(`\n## User Profile\n\n${profileContent}`);
 
-      // Extract language preference and inject as behavioral instruction
-      const langMatch = profileContent.match(/\*\*Language\*\*:\s*(.+)/i);
-      if (langMatch) {
-        const lang = langMatch[1].trim();
-        if (lang && lang.toLowerCase() !== "tbd" && lang.toLowerCase() !== "english") {
-          parts.push(`\n## Language Preference\n\nThis user's preferred language is **${lang}**. Start conversations in ${lang} by default. If the user switches to a different language, follow their lead naturally.`);
-        }
-      }
-
-      // Detect TBD fields and prompt model to fill them during conversation
+      // Detect TBD fields
       const tbdFields: string[] = [];
       const fieldRegex = /\*\*(\w+)\*\*:\s*TBD/gi;
       let tbdMatch;
       while ((tbdMatch = fieldRegex.exec(profileContent)) !== null) {
         tbdFields.push(tbdMatch[1]);
       }
-      if (tbdFields.length > 0) {
-        parts.push(`\n## Profile Update Needed\n\nThe user's profile has incomplete fields: **${tbdFields.join(", ")}**.\nWhen the user mentions relevant info during conversation (e.g. their role, name, what infrastructure they manage), update \`${memoryDir}/PROFILE.md\` immediately using the write tool. Replace the "TBD" value with what you learned. Do not ask the user explicitly — just pick it up naturally from context.`);
-      }
-    }
-  } else {
-    // First-session: instruct agent to introduce itself and collect user context
-    parts.push(`\n## First Session — Getting to Know the User
 
-No PROFILE.md found. This is a new user.
+      // Check if this is a skeleton profile (Name still TBD = first-time user)
+      const isSkeleton = tbdFields.includes("Name");
+
+      if (isSkeleton) {
+        // First-session: instruct agent to greet and collect user context
+        parts.push(`\n## First Session — Getting to Know the User
+
+This is a new user (profile has only defaults).
 
 1. Greet warmly as Siclaw, briefly mention key capabilities (diagnostics, investigation, memory, automation).
 2. Through natural conversation, learn: name, role, infrastructure.
-3. After user's FIRST reply with any identifying info, IMMEDIATELY write \`${memoryDir}/PROFILE.md\`:
+3. After user's FIRST reply with any identifying info, IMMEDIATELY update \`${memoryDir}/PROFILE.md\` — replace TBD values with what you learned. Do NOT delay.`);
+      } else {
+        parts.push(`\n## User Profile\n\n${profileContent}`);
 
-\`\`\`markdown
-# User Profile
-- **Name**: ...
-- **Role**: ...
-- **Infrastructure**: ...
-- **Preferences**: ...
-- **Language**: ... (user's communication language)
-\`\`\`
+        // Extract language preference and inject as behavioral instruction
+        const langMatch = profileContent.match(/\*\*Language\*\*:\s*(.+)/i);
+        if (langMatch) {
+          const lang = langMatch[1].trim();
+          if (lang && lang.toLowerCase() !== "tbd" && lang.toLowerCase() !== "english") {
+            parts.push(`\n## Language Preference\n\nThis user's preferred language is **${lang}**. Start conversations in ${lang} by default. If the user switches to a different language, follow their lead naturally.`);
+          }
+        }
 
-Writing this file exits the onboarding flow. Fill what you know, use "TBD" for unknowns. Do NOT delay.`);
+        if (tbdFields.length > 0) {
+          parts.push(`\n## Profile Update Needed\n\nThe user's profile has incomplete fields: **${tbdFields.join(", ")}**.\nWhen the user mentions relevant info during conversation (e.g. their role, name, what infrastructure they manage), update \`${memoryDir}/PROFILE.md\` immediately using the write tool. Replace the "TBD" value with what you learned. Do not ask the user explicitly — just pick it up naturally from context.`);
+        }
+      }
+    }
   }
 
   const memoryFile = path.join(memoryDir, "MEMORY.md");
@@ -552,6 +548,15 @@ export async function createSiclawSession(
     console.log(`[agent-factory] Skill diagnostics: ${JSON.stringify(skillDiagnostics)}`);
   }
 
+  // Ensure memoryDir and skeleton PROFILE.md exist (both brain paths need this)
+  if (!fs.existsSync(memoryDir)) {
+    fs.mkdirSync(memoryDir, { recursive: true });
+  }
+  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
+  if (!fs.existsSync(skeletonProfilePath)) {
+    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+  }
+
   // -- Claude SDK brain path --
   if (opts?.brainType === "claude-sdk") {
     console.log(`[agent-factory] Creating Claude SDK brain`);
@@ -643,9 +648,6 @@ Follow the structured workflow described in the deep-investigation skill guide.`
   // Initialize memory indexer for pi-agent (hybrid search over memory/*.md)
   let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
   try {
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
-    }
     if (memoryIndexer) {
       // Shared indexer provided — reuse it, don't startWatching (caller manages lifecycle)
       memoryIndexerRef.current = memoryIndexer;
