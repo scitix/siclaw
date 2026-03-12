@@ -93,7 +93,7 @@ The main file \`MEMORY.md\` is automatically loaded into every new session conte
 - **NEVER read credential files** (.kubeconfig, .key, .token, settings.json, etc.) using read or cat commands.
 - **If a user pastes credential content** (kubeconfig YAML, certificates, keys) in chat, tell them this is not the right place — direct them to ${mode === "cli" ? `\`/setup\` → Credentials` : `the sidebar **Settings → Credentials** page`} instead. Do NOT write, store, or process pasted credential content.`;
 
-  prompt += `\n\n## Language\n\nAlways respond in the same language the user writes in. Match the user's language naturally. Technical terms (kubectl, pod names, error messages, CLI output) can remain in English.`;
+  prompt += `\n\n## Language\n\nDefault to English. When a message starts with \`[System: respond in X]\`, you MUST respond in language X — this is injected by the system based on the user's detected language, not a user request. Technical terms (kubectl, pod names, error messages, CLI output) can remain in English.`;
 
   return prompt;
 }
