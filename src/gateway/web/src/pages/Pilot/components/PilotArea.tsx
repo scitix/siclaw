@@ -209,6 +209,22 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         return null;
     }, [messages]);
 
+    // Check if latest hypotheses were already confirmed.
+    // Three signals (any one is sufficient):
+    // 1. deep_search tool message exists after hypotheses (works when complete or in live session)
+    // 2. User confirmation message exists ("confirmed hypotheses") — always persisted immediately
+    // 3. dpChecklist has deep_search in progress/done (works on refresh when deep_search isn't in history yet)
+    const latestHypothesesConfirmed = useMemo(() => {
+        if (!latestHypothesesId) return false;
+        const hypoIdx = messages.findIndex(m => m.id === latestHypothesesId);
+        if (hypoIdx < 0) return false;
+        const afterHypo = messages.slice(hypoIdx + 1);
+        if (afterHypo.some(m => m.toolName === 'deep_search')) return true;
+        if (afterHypo.some(m => m.role === 'user' && m.content.includes('confirmed hypotheses'))) return true;
+        if (dpChecklist?.some(i => i.id === 'deep_search' && (i.status === 'in_progress' || i.status === 'done'))) return true;
+        return false;
+    }, [messages, latestHypothesesId, dpChecklist]);
+
     // Handles three cases:
     // 1. Initial load / session switch (0 → N): force scroll to bottom
     // 2. Prepend (load more): restore scroll position so view doesn't jump
@@ -379,8 +395,10 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     sendMessage={sendMessage}
                                     abortResponse={abortResponse}
                                     dpFocus={dpFocus}
+                                    dpChecklistActive={dpChecklist != null && dpChecklist.length > 0}
                                     onHypothesesConfirmed={onHypothesesConfirmed}
                                     hypothesesSuperseded={latestHypothesesId != null && msg.toolName === 'propose_hypotheses' && msg.id !== latestHypothesesId}
+                                    hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                                     selectedWorkspaceId={selectedWorkspaceId}
                                 />
                             ))}
@@ -448,7 +466,7 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
     return { isDeepInvestigation: false, text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, onHypothesesConfirmed, hypothesesSuperseded, selectedWorkspaceId }: {
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -465,8 +483,12 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     sendMessage?: (text: string) => void;
     abortResponse?: () => void;
     dpFocus?: string | null;
+    /** True when DpChecklistCard is active — used to hide InvestigationCard even if dpFocus is transiently null */
+    dpChecklistActive?: boolean;
     onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void;
     hypothesesSuperseded?: boolean;
+    /** True when a deep_search exists after this propose_hypotheses — survives page refresh */
+    hypothesesAlreadyConfirmed?: boolean;
     selectedWorkspaceId?: string | null;
 }) {
     const isUser = message.role === 'user';
@@ -486,14 +508,16 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
             return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} selectedWorkspaceId={selectedWorkspaceId} />;
         }
         if (message.toolName === 'deep_search') {
-            // In DP mode, DpChecklistCard handles the running display — hide duplicate InvestigationCard
-            if (message.isStreaming && dpFocus) {
+            // In DP mode, DpChecklistCard handles the running display — hide duplicate InvestigationCard.
+            // Use dpChecklistActive (not just dpFocus) to avoid brief flash when dpFocus is transiently null
+            // during checklist phase transitions.
+            if (message.isStreaming && (dpFocus || dpChecklistActive)) {
                 return null;
             }
             return <InvestigationCard message={message} progress={message.isStreaming ? investigationProgress : undefined} />;
         }
         if (message.toolName === 'propose_hypotheses' && !message.isStreaming) {
-            return <HypothesesCard message={message} sendMessage={sendMessage} abortResponse={abortResponse} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} />;
+            return <HypothesesCard message={message} sendMessage={sendMessage} abortResponse={abortResponse} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
         }
         return <ToolItem message={message} skills={skills} onEditSkill={onEditSkill} />;
     }
