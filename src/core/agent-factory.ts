@@ -264,10 +264,13 @@ export async function createSiclawSession(
     createCredentialListTool(kubeconfigRef),
   ];
 
-  // Web/channel-only tools: these require frontend UI for rendering, confirmation,
-  // or workspace binding that TUI (cli) mode does not have.
+  // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
   if (mode !== "cli") {
     customTools.push(createManageScheduleTool(kubeconfigRef));
+  }
+  // Skill management tools are web-only: they produce output designed for
+  // frontend preview card rendering that neither TUI nor channel mode supports.
+  if (mode === "web") {
     customTools.push(createCreateSkillTool());
     customTools.push(createUpdateSkillTool());
     customTools.push(createForkSkillTool());
