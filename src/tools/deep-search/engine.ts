@@ -6,6 +6,7 @@ import {
   conclusionPrompt,
   forceVerdictPrompt,
   forceContextSummaryPrompt,
+  type PriorKnowledge,
 } from "./prompts.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
@@ -13,7 +14,7 @@ import { homedir } from "os";
 import crypto from "node:crypto";
 import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
-import type { InvestigationRecord } from "../../memory/types.js";
+import type { InvestigationPattern, InvestigationRecord } from "../../memory/types.js";
 import type {
   DeepSearchBudget,
   HypothesisNode,
@@ -197,9 +198,9 @@ async function generateHypotheses(
   maxHypotheses: number,
   options?: SubAgentOptions,
   onProgress?: ProgressCallback,
-  relatedInvestigations?: string,
+  priorKnowledge?: PriorKnowledge,
 ): Promise<RawHypothesis[]> {
-  const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses, relatedInvestigations);
+  const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses, priorKnowledge);
   const fallback: RawHypothesis[] = [{ text: "Failed to parse hypotheses", confidence: 0, suggestedTools: [] }];
 
   try {
@@ -430,25 +431,47 @@ export async function investigate(
     contextSummary = parseContextSummary(contextResult.textOutput);
   }
 
-  // --- Prior Investigation Retrieval (structured + semantic, for Phase 2) ---
-  let relatedInvestigations: string | undefined;
+  // --- Prior Investigation Retrieval (3-layer: patterns + similar + validated hypotheses) ---
+  let priorKnowledge: PriorKnowledge | undefined;
+  let similarInvestigationRecords: InvestigationRecord[] = [];
   if (options?.memoryIndexer && !(options?.hypotheses && options.hypotheses.length > 0)) {
-    const parts: string[] = [];
+    const pk: PriorKnowledge = {};
 
-    // 1. Structured query: precise match on categories/entities
+    // Layer 1: Pattern Table (aggregated from recent history)
+    try {
+      const patterns = options.memoryIndexer.getInvestigationPatterns(8);
+      if (patterns.length > 0) {
+        pk.patterns = formatPatternTable(patterns);
+        onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Loaded ${patterns.length} diagnostic pattern(s) from history` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Pattern aggregation failed:`, err);
+    }
+
+    // Layer 2: Similar Investigations (structured + semantic search)
+    const similarParts: string[] = [];
+
+    // 2a. Structured query (keyword-relevant)
     try {
       const structuredResults = options.memoryIndexer.searchInvestigations(question, { topK: 3 });
       if (structuredResults.length > 0) {
-        const seenQuestions = new Set<string>();
+        similarInvestigationRecords = structuredResults;
         for (const inv of structuredResults) {
-          seenQuestions.add(inv.question);
           const tags = [
             `root_cause: ${inv.rootCauseCategory}`,
             `confidence: ${inv.confidence}%`,
             inv.environmentTags.length > 0 ? `env: ${inv.environmentTags.join(", ")}` : "",
           ].filter(Boolean).join(", ");
           const chain = inv.causalChain.length > 0 ? `\nCausal chain: ${inv.causalChain.join(" → ")}` : "";
-          parts.push(`[Structured] [${tags}] ${inv.question}${chain}\nConclusion: ${inv.conclusion.slice(0, 300)}`);
+          const remediation = inv.remediationSteps?.length
+            ? `\nRemediation: ${inv.remediationSteps.join("; ")}`
+            : "";
+          const hypothesisVerdicts = inv.hypotheses
+            .filter(h => h.status !== "pending" && h.status !== "skipped")
+            .map(h => `  - ${h.text}: ${h.status.toUpperCase()} (${h.confidence}%)`)
+            .join("\n");
+          const hypothesisSection = hypothesisVerdicts ? `\nHypothesis verdicts:\n${hypothesisVerdicts}` : "";
+          similarParts.push(`[Structured] [${tags}] ${inv.question}${chain}${remediation}${hypothesisSection}\nConclusion: ${inv.conclusion.slice(0, 300)}`);
         }
         onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Found ${structuredResults.length} structured prior investigation(s)` });
       }
@@ -456,13 +479,24 @@ export async function investigate(
       console.warn(`[deep-search] Structured investigation retrieval failed:`, err);
     }
 
-    // 2. Semantic search: existing chunk-based search (catches cases not covered by structured fields)
+    // 2b. Semantic search (chunk-based) — also enrich similarInvestigationRecords
     try {
       const searchResult = await options.memoryIndexer.search(question, 3, 0.4);
       const investigationChunks = searchResult.chunks.filter(c => c.file.startsWith("investigations/"));
       if (investigationChunks.length > 0) {
         for (const c of investigationChunks) {
-          parts.push(`[Semantic] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`);
+          similarParts.push(`[Semantic] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`);
+        }
+        // Enrich: look up structured records for semantically matched investigations
+        // so Layer 3 and Phase 3 context can use them too
+        const existingIds = new Set(similarInvestigationRecords.map(r => r.id));
+        const semanticFiles = investigationChunks.map(c => c.file);
+        const semanticRecords = options.memoryIndexer.lookupInvestigationsByFiles(semanticFiles);
+        for (const rec of semanticRecords) {
+          if (!existingIds.has(rec.id)) {
+            similarInvestigationRecords.push(rec);
+            existingIds.add(rec.id);
+          }
         }
         onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Found ${investigationChunks.length} semantic match(es) from past investigations` });
       }
@@ -470,8 +504,26 @@ export async function investigate(
       console.warn(`[deep-search] Semantic investigation search failed:`, err);
     }
 
-    if (parts.length > 0) {
-      relatedInvestigations = parts.join("\n\n---\n\n");
+    if (similarParts.length > 0) {
+      pk.similarInvestigations = similarParts.join("\n\n---\n\n");
+    }
+
+    // Layer 3: Validated Hypothesis Templates (extracted from ALL similar investigations — structured + semantic)
+    const validatedList = extractValidatedHypotheses(similarInvestigationRecords);
+    if (validatedList.length > 0) {
+      pk.validatedHypotheses = validatedList.join("\n");
+    }
+
+    if (pk.patterns || pk.similarInvestigations || pk.validatedHypotheses) {
+      // Truncate to avoid token explosion — prior knowledge should inform, not dominate the prompt
+      const MAX_CHARS = 4000;
+      if (pk.similarInvestigations && pk.similarInvestigations.length > MAX_CHARS) {
+        pk.similarInvestigations = pk.similarInvestigations.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
+      if (pk.validatedHypotheses && pk.validatedHypotheses.length > MAX_CHARS) {
+        pk.validatedHypotheses = pk.validatedHypotheses.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
+      priorKnowledge = pk;
     }
   }
 
@@ -496,7 +548,7 @@ export async function investigate(
       budget.maxHypotheses,
       options,
       onProgress,
-      relatedInvestigations,
+      priorKnowledge,
     );
     hypotheses = rawHypotheses.map((h, i) => ({
       id: `H${i + 1}`,
@@ -517,6 +569,9 @@ export async function investigate(
   // --- Phase 3: Parallel Hypothesis Validation ---
   // Sort hypotheses by confidence DESC so most likely root cause is validated first
   hypotheses.sort((a, b) => b.confidence - a.confidence);
+
+  // Pre-compute past diagnostic context from similarInvestigationRecords (avoids N+1 queries)
+  const pastDiagnosticContext = buildPastDiagnosticContext(similarInvestigationRecords);
 
   // When phases are skipped, their budget is redistributed to validation
   const validationBudget = budget.maxTotalCalls - globalCallsUsed;
@@ -552,6 +607,7 @@ export async function investigate(
         hypothesisValidationPrompt(
           hypothesis.text, hypothesis.suggestedTools, contextSummary,
           perBudget, buildPriorFindings(), kubeconfigPath,
+          pastDiagnosticContext.length > 0 ? pastDiagnosticContext : undefined,
         ),
         `Validate hypothesis${isRetry ? " (retry)" : ""}: ${hypothesis.text}`,
         perBudget, options, taggedProgress, forceVerdictPrompt(),
@@ -707,4 +763,82 @@ export async function investigate(
     timedOut,
     debugTracePath,
   };
+}
+
+/** Format aggregated investigation patterns into a readable table for prompt injection. */
+function formatPatternTable(patterns: InvestigationPattern[]): string {
+  const total = patterns.reduce((sum, p) => sum + p.count, 0);
+  const lines: string[] = [`Based on ${total} past investigations:`];
+  lines.push("| Root Cause | Frequency | Avg Confidence | Common Fix |");
+  lines.push("|------------|-----------|----------------|------------|");
+  for (const p of patterns) {
+    const pct = total > 0 ? Math.round((p.count / total) * 100) : 0;
+    const fix = p.commonRemediations.length > 0
+      ? p.commonRemediations[0].slice(0, 60) + (p.commonRemediations[0].length > 60 ? "..." : "")
+      : "—";
+    lines.push(`| ${p.rootCauseCategory} | ${p.count} (${pct}%) | ${p.avgConfidence}% | ${fix} |`);
+  }
+  lines.push("\nUse these frequencies to calibrate your confidence scores.");
+  return lines.join("\n");
+}
+
+/**
+ * Pre-compute past diagnostic context from similar investigation records.
+ * Returns a single string shared by all Phase 3 sub-agents, avoiding N+1 queries.
+ */
+function buildPastDiagnosticContext(records: InvestigationRecord[]): string {
+  if (records.length === 0) return "";
+  const contextLines: string[] = [];
+  for (const rec of records) {
+    const validatedH = rec.hypotheses.filter(h => h.status === "validated");
+    if (validatedH.length === 0) continue;
+    for (const vh of validatedH) {
+      const parts = [`- "${vh.text}" (validated, ${vh.confidence}%)`];
+      if (rec.causalChain.length > 0) {
+        parts.push(`  Causal chain: ${rec.causalChain.join(" → ")}`);
+      }
+      if (rec.remediationSteps?.length) {
+        parts.push(`  Remediation: ${rec.remediationSteps.join("; ")}`);
+      }
+      contextLines.push(parts.join("\n"));
+    }
+  }
+  return contextLines.join("\n");
+}
+
+/**
+ * Extract validated hypotheses from investigation records, deduplicated and counted.
+ * Uses normalized text (lowercase, collapsed whitespace) for dedup to merge
+ * near-identical hypotheses like "MTU Mismatch" and "mtu mismatch".
+ * NOTE: Semantic dedup (embedding similarity) would catch more variants but
+ * requires async embedding calls — left as a future improvement.
+ */
+function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
+  // Count occurrences and track max confidence, keyed by normalized text
+  const validated = new Map<string, { displayText: string; count: number; maxConfidence: number }>();
+  for (const rec of records) {
+    for (const h of rec.hypotheses) {
+      if (h.status === "validated" && h.text) {
+        const key = normalizeHypothesisText(h.text);
+        const existing = validated.get(key);
+        if (existing) {
+          existing.count++;
+          existing.maxConfidence = Math.max(existing.maxConfidence, h.confidence);
+        } else {
+          validated.set(key, { displayText: h.text, count: 1, maxConfidence: h.confidence });
+        }
+      }
+    }
+  }
+
+  return [...validated.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .map(([, { displayText, count, maxConfidence }]) =>
+      `- "${displayText}" (validated ${count} time${count > 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
+    );
+}
+
+/** Normalize hypothesis text for dedup: lowercase, trim, collapse whitespace. */
+function normalizeHypothesisText(text: string): string {
+  return text.toLowerCase().trim().replace(/\s+/g, " ");
 }

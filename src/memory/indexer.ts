@@ -7,7 +7,7 @@ import { initMemoryDb } from "./schema.js";
 import { chunkMarkdown } from "./chunker.js";
 import { vectorToBlob, blobToVector } from "./embeddings.js";
 import { tokenizeForFts } from "./stop-words.js";
-import type { EmbeddingProvider, InvestigationRecord, MemoryChunk, MemorySearchResult } from "./types.js";
+import type { EmbeddingProvider, InvestigationRecord, InvestigationPattern, MemoryChunk, MemorySearchResult } from "./types.js";
 import { applyTemporalDecay, type TemporalDecayConfig } from "./temporal-decay.js";
 import { mmrRerank, type MMRConfig } from "./mmr.js";
 
@@ -237,7 +237,7 @@ export class MemoryIndexer {
       }
 
       // Ensure vec table is ready (if sqlite-vec available)
-      const dims = embeddings.length > 0 && embeddings[0].length > 0 ? embeddings[0].length : this.embedding.dimensions;
+      const dims = embeddings.length > 0 && embeddings[0]?.length > 0 ? embeddings[0].length : this.embedding.dimensions;
       const vecReady = this.ensureVecTable(dims);
 
       // Write to DB in a transaction
@@ -451,9 +451,169 @@ export class MemoryIndexer {
       );
   }
 
-  /** Search past investigations by structured fields. */
+  /**
+   * Aggregate investigation patterns from recent history.
+   * Groups by root_cause_category with time-weighted scoring — recent investigations
+   * count more than old ones (30-day half-life, matching temporal-decay.ts).
+   */
+  getInvestigationPatterns(topK = 8): InvestigationPattern[] {
+    try {
+      const rows = this.db
+        .prepare("SELECT * FROM investigations ORDER BY created_at DESC LIMIT 50")
+        .all() as Array<Record<string, unknown>>;
+
+      if (rows.length === 0) return [];
+
+      const now = Date.now();
+      const halfLifeMs = 30 * 24 * 60 * 60 * 1000; // 30 days
+      const lambda = Math.LN2 / halfLifeMs;
+
+      // Group by root_cause_category
+      const groups = new Map<string, {
+        weightedCount: number;
+        rawCount: number;
+        weightedConfidenceSum: number;
+        validatedTexts: Set<string>;
+        remediations: Set<string>;
+      }>();
+
+      for (const r of rows) {
+        const category = (r.root_cause_category as string) ?? "unknown";
+        if (!groups.has(category)) {
+          groups.set(category, { weightedCount: 0, rawCount: 0, weightedConfidenceSum: 0, validatedTexts: new Set(), remediations: new Set() });
+        }
+        const group = groups.get(category)!;
+
+        // Time-weighted: recent investigations contribute more
+        const createdAt = (r.created_at as number) ?? 0;
+        const ageMs = Math.max(0, now - createdAt);
+        const weight = Math.exp(-lambda * ageMs);
+
+        group.weightedCount += weight;
+        group.rawCount++;
+        group.weightedConfidenceSum += ((r.confidence as number) ?? 0) * weight;
+
+        // Extract validated hypotheses
+        const hypotheses = safeJsonArray(r.hypotheses_json as string) as Array<{
+          text: string; status: string; confidence: number;
+        }>;
+        for (const h of hypotheses) {
+          if (h.status === "validated" && h.text) {
+            group.validatedTexts.add(h.text);
+          }
+        }
+
+        // Extract remediation steps
+        const remediations = safeJsonArray(r.remediation_steps as string) as string[];
+        for (const step of remediations) {
+          if (step) group.remediations.add(step);
+        }
+      }
+
+      // Build sorted result using weighted counts
+      const patterns: InvestigationPattern[] = [];
+      for (const [category, group] of groups) {
+        const avgConfidence = group.weightedCount > 0
+          ? Math.round(group.weightedConfidenceSum / group.weightedCount)
+          : 0;
+        patterns.push({
+          rootCauseCategory: category,
+          count: group.rawCount,
+          avgConfidence,
+          validatedHypotheses: [...group.validatedTexts],
+          commonRemediations: [...group.remediations],
+        });
+      }
+
+      // Sort by weighted count (recent-biased frequency)
+      return patterns.sort((a, b) => {
+        const wA = groups.get(a.rootCauseCategory)!.weightedCount;
+        const wB = groups.get(b.rootCauseCategory)!.weightedCount;
+        return wB - wA;
+      }).slice(0, topK);
+    } catch (err) {
+      console.warn(`[memory-indexer] getInvestigationPatterns failed:`, err);
+      return [];
+    }
+  }
+
+  /**
+   * Look up investigation records whose timestamps match the given memory file paths.
+   * Used to enrich semantic search results (chunks from investigations/*.md) with
+   * structured metadata from the investigations table.
+   *
+   * Matching strategy:
+   * 1. Try full datetime from filename (e.g. "2026-03-08-12-39-00.md") → ±60s window
+   * 2. Fallback to date-only match for filenames without full timestamps
+   */
+  lookupInvestigationsByFiles(filePaths: string[]): InvestigationRecord[] {
+    if (filePaths.length === 0) return [];
+    try {
+      const timeRanges: Array<{ start: number; end: number }> = [];
+      const fallbackDates = new Set<string>();
+
+      for (const fp of filePaths) {
+        // Try full datetime: "investigations/2026-03-08-12-39-00.md"
+        const fullMatch = fp.match(/(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})-(\d{2})/);
+        if (fullMatch) {
+          const dateStr = `${fullMatch[1]}T${fullMatch[2]}:${fullMatch[3]}:${fullMatch[4]}Z`;
+          const ts = new Date(dateStr).getTime();
+          if (!isNaN(ts)) {
+            timeRanges.push({ start: ts - 60_000, end: ts + 60_000 });
+            continue;
+          }
+        }
+        // Fallback: date only
+        const dateMatch = fp.match(/(\d{4}-\d{2}-\d{2})/);
+        if (dateMatch) fallbackDates.add(dateMatch[1]);
+      }
+
+      if (timeRanges.length === 0 && fallbackDates.size === 0) return [];
+
+      const results: InvestigationRecord[] = [];
+      const seenIds = new Set<string>();
+
+      // Precise ±60s window matching
+      for (const range of timeRanges) {
+        const rows = this.db
+          .prepare("SELECT * FROM investigations WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC")
+          .all(range.start, range.end) as Array<Record<string, unknown>>;
+        for (const r of rows) {
+          const rec = rowToInvestigationRecord(r);
+          if (!seenIds.has(rec.id)) {
+            results.push(rec);
+            seenIds.add(rec.id);
+          }
+        }
+      }
+
+      // Fallback: date-only matching for filenames without full timestamps
+      if (fallbackDates.size > 0) {
+        const placeholders = [...fallbackDates].map(() => "?").join(",");
+        const rows = this.db
+          .prepare(
+            `SELECT * FROM investigations WHERE date(created_at / 1000, 'unixepoch') IN (${placeholders}) ORDER BY created_at DESC`,
+          )
+          .all(...fallbackDates) as Array<Record<string, unknown>>;
+        for (const r of rows) {
+          const rec = rowToInvestigationRecord(r);
+          if (!seenIds.has(rec.id)) {
+            results.push(rec);
+            seenIds.add(rec.id);
+          }
+        }
+      }
+
+      return results;
+    } catch (err) {
+      console.warn(`[memory-indexer] lookupInvestigationsByFiles failed:`, err);
+      return [];
+    }
+  }
+
+  /** Search past investigations by structured fields + question relevance. */
   searchInvestigations(
-    _question: string,
+    question: string,
     opts?: { rootCauseCategory?: string; environmentTag?: string; topK?: number },
   ): InvestigationRecord[] {
     const topK = opts?.topK ?? 5;
@@ -469,35 +629,40 @@ export class MemoryIndexer {
       params.push(`%${opts.environmentTag}%`);
     }
 
+    // Fetch more candidates than topK so we can re-rank by question relevance
+    const fetchLimit = Math.max(topK * 3, 15);
     const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
     const sql = `SELECT * FROM investigations ${where} ORDER BY created_at DESC LIMIT ?`;
-    params.push(topK);
+    params.push(fetchLimit);
 
     try {
       const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
-      return rows.map((r) => {
-        const remediation = safeJsonArray(r.remediation_steps as string) as string[];
-        return {
-          id: r.id as string,
-          question: r.question as string,
-          rootCauseCategory: (r.root_cause_category as string) ?? "unknown",
-          affectedEntities: safeJsonArray(r.affected_entities as string) as string[],
-          environmentTags: safeJsonArray(r.environment_tags as string) as string[],
-          causalChain: safeJsonArray(r.causal_chain as string) as string[],
-          confidence: (r.confidence as number) ?? 0,
-          conclusion: (r.conclusion as string) ?? "",
-          remediationSteps: remediation.length > 0 ? remediation : undefined,
-          durationMs: (r.duration_ms as number) ?? 0,
-          totalToolCalls: (r.total_tool_calls as number) ?? 0,
-          hypotheses: safeJsonArray(r.hypotheses_json as string) as Array<{
-            id: string;
-            text: string;
-            status: string;
-            confidence: number;
-          }>,
-          createdAt: (r.created_at as number) ?? 0,
-        };
+      const records = rows.map((r) => rowToInvestigationRecord(r));
+
+      // Extract keywords from question for relevance scoring
+      const keywords = extractKeywords(question);
+      if (keywords.length === 0) {
+        // No useful keywords — return by recency (original behavior)
+        return records.slice(0, topK);
+      }
+
+      // Score each record by keyword overlap with question + conclusion
+      const scored = records.map((rec) => {
+        const searchText = `${rec.question} ${rec.conclusion} ${rec.rootCauseCategory}`.toLowerCase();
+        let hits = 0;
+        for (const kw of keywords) {
+          if (searchText.includes(kw)) hits++;
+        }
+        return { rec, score: hits / keywords.length };
       });
+
+      // Sort by relevance score (desc), then by recency (desc)
+      scored.sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return b.rec.createdAt - a.rec.createdAt;
+      });
+
+      return scored.slice(0, topK).map((s) => s.rec);
     } catch (err) {
       console.warn(`[memory-indexer] searchInvestigations failed:`, err);
       return [];
@@ -536,7 +701,7 @@ export class MemoryIndexer {
       const newEmbeddings = await this.embedding.embed(missTexts);
 
       for (let j = 0; j < misses.length; j++) {
-        const vec = newEmbeddings[j];
+        const vec = newEmbeddings[j] ?? [];
         results[misses[j].index] = vec;
         // Write to cache
         if (vec && vec.length > 0) {
@@ -649,6 +814,36 @@ export class MemoryIndexer {
       return [];
     }
   }
+}
+
+function rowToInvestigationRecord(r: Record<string, unknown>): InvestigationRecord {
+  const remediation = safeJsonArray(r.remediation_steps as string) as string[];
+  return {
+    id: r.id as string,
+    question: r.question as string,
+    rootCauseCategory: (r.root_cause_category as string) ?? "unknown",
+    affectedEntities: safeJsonArray(r.affected_entities as string) as string[],
+    environmentTags: safeJsonArray(r.environment_tags as string) as string[],
+    causalChain: safeJsonArray(r.causal_chain as string) as string[],
+    confidence: (r.confidence as number) ?? 0,
+    conclusion: (r.conclusion as string) ?? "",
+    remediationSteps: remediation.length > 0 ? remediation : undefined,
+    durationMs: (r.duration_ms as number) ?? 0,
+    totalToolCalls: (r.total_tool_calls as number) ?? 0,
+    hypotheses: safeJsonArray(r.hypotheses_json as string) as Array<{
+      id: string;
+      text: string;
+      status: string;
+      confidence: number;
+    }>,
+    createdAt: (r.created_at as number) ?? 0,
+  };
+}
+
+/** Extract meaningful keywords from a question string for relevance scoring. */
+function extractKeywords(question: string): string[] {
+  // Reuse tokenizeForFts which already handles stop words, CJK, and normalization
+  return tokenizeForFts(question);
 }
 
 function safeJsonArray(raw: string | null | undefined): unknown[] {

@@ -21,6 +21,15 @@ export interface EmbeddingProvider {
   maxInputTokens?: number;
 }
 
+/** Aggregated pattern from multiple past investigations, grouped by root cause category. */
+export interface InvestigationPattern {
+  rootCauseCategory: string;
+  count: number;
+  avgConfidence: number;
+  validatedHypotheses: string[];
+  commonRemediations: string[];
+}
+
 /** Structured record extracted from a deep investigation conclusion. */
 export interface InvestigationRecord {
   id: string;

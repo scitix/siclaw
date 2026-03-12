@@ -13,6 +13,7 @@ import {
   conclusionPrompt,
   forceVerdictPrompt,
   forceContextSummaryPrompt,
+  type PriorKnowledge,
 } from "./prompts.js";
 import {
   toolSemantics,
@@ -136,6 +137,43 @@ describe("prompts", () => {
     expect(prompt).toContain("MUST use real skill script paths");
   });
 
+  it("hypothesisGenerationPrompt injects diagnostic_patterns when provided", () => {
+    const pk: PriorKnowledge = {
+      patterns: "| mtu_mismatch | 9 (45%) | 82% | Set MTU |",
+    };
+    const prompt = hypothesisGenerationPrompt("test", "ctx", 3, pk);
+    expect(prompt).toContain("<diagnostic_patterns>");
+    expect(prompt).toContain("mtu_mismatch");
+    expect(prompt).toContain("calibrate confidence");
+  });
+
+  it("hypothesisGenerationPrompt injects validated_hypotheses when provided", () => {
+    const pk: PriorKnowledge = {
+      validatedHypotheses: '- "MTU 1500 vs 9000" (validated 4 times, max conf 85%)',
+    };
+    const prompt = hypothesisGenerationPrompt("test", "ctx", 3, pk);
+    expect(prompt).toContain("<validated_hypotheses>");
+    expect(prompt).toContain("MTU 1500 vs 9000");
+    expect(prompt).toContain("Do NOT blindly copy");
+  });
+
+  it("hypothesisGenerationPrompt injects similar_investigations when provided", () => {
+    const pk: PriorKnowledge = {
+      similarInvestigations: "[Structured] [root_cause: mtu_mismatch] RDMA bandwidth low",
+    };
+    const prompt = hypothesisGenerationPrompt("test", "ctx", 3, pk);
+    expect(prompt).toContain("<similar_investigations>");
+    expect(prompt).toContain("mtu_mismatch");
+  });
+
+  it("hypothesisGenerationPrompt omits all prior knowledge sections when not provided", () => {
+    const prompt = hypothesisGenerationPrompt("test", "ctx", 3);
+    expect(prompt).not.toContain("<diagnostic_patterns>");
+    expect(prompt).not.toContain("<validated_hypotheses>");
+    expect(prompt).not.toContain("<similar_investigations>");
+    expect(prompt).not.toContain("calibrate confidence");
+  });
+
   it("hypothesisValidationPrompt includes hypothesis and suggested tools", () => {
     const prompt = hypothesisValidationPrompt(
       "OOM kill",
@@ -185,6 +223,20 @@ describe("prompts", () => {
     const prompt = hypothesisValidationPrompt("test", [], "ctx", 5);
     expect(prompt).not.toContain("<prior_findings>");
     expect(prompt).not.toContain("avoid redundant work");
+  });
+
+  it("hypothesisValidationPrompt injects past_diagnostic_context when provided", () => {
+    const pastCtx = '- "MTU mismatch" (validated, 90%)\n  Remediation: Set MTU to 9000';
+    const prompt = hypothesisValidationPrompt("test", [], "ctx", 5, undefined, undefined, pastCtx);
+    expect(prompt).toContain("<past_diagnostic_context>");
+    expect(prompt).toContain("MTU mismatch");
+    expect(prompt).toContain("validate more efficiently");
+  });
+
+  it("hypothesisValidationPrompt omits past_diagnostic_context when not provided", () => {
+    const prompt = hypothesisValidationPrompt("test", [], "ctx", 5);
+    expect(prompt).not.toContain("<past_diagnostic_context>");
+    expect(prompt).not.toContain("validate more efficiently");
   });
 
   it("conclusionPrompt includes question, hypotheses summary, and tool instruction", () => {

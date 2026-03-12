@@ -69,6 +69,15 @@ Do NOT make any more tool calls after outputting this summary.`;
 }
 
 /**
+ * Prior knowledge from past investigations, injected into Phase 2 hypothesis generation.
+ */
+export interface PriorKnowledge {
+  patterns?: string;
+  similarInvestigations?: string;
+  validatedHypotheses?: string;
+}
+
+/**
  * Phase 2: Hypothesis generation prompt (used with llmComplete, no tools).
  * Injects auto-formatted skills so LLM can reference real script paths in suggestedTools.
  */
@@ -76,16 +85,21 @@ export function hypothesisGenerationPrompt(
   question: string,
   contextSummary: string,
   maxHypotheses: number,
-  relatedInvestigations?: string,
+  priorKnowledge?: PriorKnowledge,
 ): string {
-  const historySection = relatedInvestigations
-    ? `\n<prior_investigations>
-The following are summaries from previous investigations on similar issues.
-Use them to generate better hypotheses — prioritize root causes that were validated before,
-and avoid re-proposing hypotheses that were conclusively invalidated in similar contexts.
-${relatedInvestigations}
-</prior_investigations>\n`
+  const patternSection = priorKnowledge?.patterns
+    ? `\n<diagnostic_patterns>\n${priorKnowledge.patterns}\n</diagnostic_patterns>\n`
     : "";
+
+  const validatedSection = priorKnowledge?.validatedHypotheses
+    ? `\n<validated_hypotheses>\nThe following hypotheses were VALIDATED in past similar investigations.\nReuse them (with adjusted confidence based on context similarity) if relevant:\n${priorKnowledge.validatedHypotheses}\n</validated_hypotheses>\n`
+    : "";
+
+  const similarSection = priorKnowledge?.similarInvestigations
+    ? `\n<similar_investigations>\n${priorKnowledge.similarInvestigations}\n</similar_investigations>\n`
+    : "";
+
+  const hasPriorKnowledge = patternSection || validatedSection || similarSection;
 
   return `You are a senior SRE investigator. Based on the question and context below, generate ${maxHypotheses} ranked hypotheses.
 
@@ -94,7 +108,7 @@ ${relatedInvestigations}
 <context>
 ${contextSummary}
 </context>
-${historySection}
+${patternSection}${validatedSection}${similarSection}
 ${getFormattedSkillsPrompt()}
 
 ${rdmaTroubleshootingPriority()}
@@ -109,7 +123,10 @@ Field semantics:
 RULES:
 - Exactly ${maxHypotheses} hypotheses, ranked by likelihood (highest confidence first).
 - Cover diverse failure modes — do not cluster hypotheses around a single root cause.
-- For RDMA/RoCE: follow the troubleshooting priority order above.${relatedInvestigations ? "\n- If prior investigations revealed validated root causes for similar issues, include them with HIGHER initial confidence." : ""}`;
+- For RDMA/RoCE: follow the troubleshooting priority order above.${hasPriorKnowledge ? `
+- Use diagnostic_patterns to calibrate confidence: if a root cause accounts for a high percentage of past cases, start its hypothesis at higher confidence.
+- If validated_hypotheses contains a relevant match, include it (possibly rephrased for this context) with boosted confidence.
+- Do NOT blindly copy past hypotheses — evaluate whether the context is similar enough.` : ""}`;
 }
 
 /**
@@ -123,6 +140,7 @@ export function hypothesisValidationPrompt(
   maxCalls: number,
   priorFindings?: string,
   kubeconfigPath?: string,
+  pastDiagnosticContext?: string,
 ): string {
   const toolList = suggestedTools.length > 0
     ? `\nSuggested commands to start with:\n${suggestedTools.map((t) => `- ${t}`).join("\n")}`
@@ -135,6 +153,13 @@ ${priorFindings}
 </prior_findings>\n`
     : "";
 
+  const pastDiagSection = pastDiagnosticContext
+    ? `\n<past_diagnostic_context>
+Similar hypotheses were investigated before. Use this to validate more efficiently:
+${pastDiagnosticContext}
+</past_diagnostic_context>\n`
+    : "";
+
   return `You are validating a specific hypothesis about a Kubernetes infrastructure issue.
 
 <hypothesis>${hypothesis}</hypothesis>
@@ -142,7 +167,7 @@ ${priorFindings}
 <context>
 ${contextSummary}
 </context>
-${priorSection}${toolList}
+${priorSection}${pastDiagSection}${toolList}
 ${environmentContext(kubeconfigPath)}
 
 ${toolSemantics()}
