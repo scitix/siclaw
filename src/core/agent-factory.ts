@@ -244,7 +244,12 @@ export async function createSiclawSession(
   const modelRegistry = new ModelRegistry(authStorage, modelsJson);
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
-  const llmConfigRef: LlmConfigRef = {};
+  // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
+  // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
+  // a model-change notification — so this initialization does not conflict with that path.
+  const llmConfigRef: LlmConfigRef = defaultLlm
+    ? { apiKey: defaultLlm.apiKey, baseUrl: defaultLlm.baseUrl, model: defaultLlm.model.id, api: defaultLlm.api }
+    : {};
   const sessionIdRef: { current: string } = { current: "" };
   const mode = opts?.mode ?? "web";
   // Mutable ref — populated after memoryIndexer is created (below), so deep_search
