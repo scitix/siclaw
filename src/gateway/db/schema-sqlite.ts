@@ -52,7 +52,6 @@ export const sessions = sqliteTable("sessions", {
   lastActiveAt: integer("last_active_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   messageCount: integer("message_count").notNull().default(0),
   deletedAt: integer("deleted_at", { mode: "timestamp" }),
-  s3Key: text("s3_key"),
 });
 
 // ─── Messages ────────────────────────────────────────
@@ -92,7 +91,6 @@ export const skills = sqliteTable("skills", {
   stagingVersion: integer("staging_version").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
-  s3Key: text("s3_key"),
   teamSourceSkillId: text("team_source_skill_id"),
   teamPinnedVersion: integer("team_pinned_version"),
   forkedFromId: text("forked_from_id"),
@@ -121,7 +119,6 @@ export const skillVersions = sqliteTable("skill_versions", {
   skillId: text("skill_id").notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
   version: integer("version").notNull(),
-  s3Key: text("s3_key"),
   specs: text("specs"),
   scriptsJson: text("scripts_json", { mode: "json" }).$type<Array<{ name: string; content: string }>>(),
   files: text("files", { mode: "json" }).$type<{ specs?: string; scripts?: string[] }>(),

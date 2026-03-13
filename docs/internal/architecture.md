@@ -508,7 +508,6 @@ Gateway starts with **zero environment variables and zero config files**. All de
 | Admin password | `"admin"` | Change via WebUI after first login |
 | LLM providers | None | Configure via **Settings > Models** in WebUI |
 | SSO | Disabled | Configure via **Settings > SSO** in WebUI |
-| S3 backup | Disabled | Set `SICLAW_S3_*` env vars |
 | Skills directory | `./skills` | Set `SICLAW_SKILLS_DIR` env var |
 
 ### 10.2 TUI / AgentBox Configuration
