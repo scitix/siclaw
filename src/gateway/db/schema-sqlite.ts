@@ -30,7 +30,7 @@ export const users = sqliteTable("users", {
 export const userProfiles = sqliteTable("user_profiles", {
   userId: text("user_id")
     .primaryKey()
-    .references(() => users.id),
+    .references(() => users.id, { onDelete: "cascade" }),
   name: text("name"),
   role: text("role"),
   email: text("email"),
@@ -83,7 +83,7 @@ export const skills = sqliteTable("skills", {
   type: text("type"),
   version: integer("version").notNull().default(1),
   scope: text("scope").notNull().default("personal"), // "builtin" | "team" | "personal"
-  authorId: text("author_id").references(() => users.id),
+  authorId: text("author_id").references(() => users.id, { onDelete: "set null" }),
   status: text("status").default("installed"),
   contributionStatus: text("contribution_status").default("none"), // "none" | "pending" | "approved"
   reviewStatus: text("review_status").notNull().default("draft"), // "draft" | "pending" | "approved"
@@ -96,6 +96,7 @@ export const skills = sqliteTable("skills", {
   teamSourceSkillId: text("team_source_skill_id"),
   teamPinnedVersion: integer("team_pinned_version"),
   forkedFromId: text("forked_from_id"),
+  labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
 });
 
 // ─── Skill Contents ─────────────────────────────────
