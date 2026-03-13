@@ -697,11 +697,19 @@ export class MemoryIndexer {
     }
 
     if (misses.length > 0) {
+      // Batch embedding calls to avoid API timeouts on large corpora
+      const EMBED_BATCH_SIZE = 100;
+      const allNewEmbeddings: number[][] = [];
       const missTexts = misses.map((m) => m.text);
-      const newEmbeddings = await this.embedding.embed(missTexts);
+
+      for (let batchStart = 0; batchStart < missTexts.length; batchStart += EMBED_BATCH_SIZE) {
+        const batch = missTexts.slice(batchStart, batchStart + EMBED_BATCH_SIZE);
+        const batchEmbeddings = await this.embedding.embed(batch);
+        allNewEmbeddings.push(...batchEmbeddings);
+      }
 
       for (let j = 0; j < misses.length; j++) {
-        const vec = newEmbeddings[j] ?? [];
+        const vec = allNewEmbeddings[j] ?? [];
         results[misses[j].index] = vec;
         // Write to cache
         if (vec && vec.length > 0) {
@@ -711,7 +719,7 @@ export class MemoryIndexer {
       }
 
       console.log(
-        `[memory-indexer] Embedding: ${texts.length - misses.length} cached, ${misses.length} computed`,
+        `[memory-indexer] Embedding: ${texts.length - misses.length} cached, ${misses.length} computed (${Math.ceil(misses.length / EMBED_BATCH_SIZE)} batches)`,
       );
     }
 
