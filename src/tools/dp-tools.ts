@@ -146,11 +146,14 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
       "Works both inside and outside Deep Investigation mode. " +
       "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.",
     parameters: Type.Object({
-      hypotheses: Type.String({
-        description:
-          "Formatted hypothesis list in markdown. Each hypothesis should include: " +
-          "description, validation method (skill script paths), and confidence percentage.",
-      }),
+      hypotheses: Type.Array(
+        Type.Object({
+          id: Type.String({ description: "Hypothesis identifier, e.g. H1, H2, H3" }),
+          text: Type.String({ description: "One-line hypothesis statement" }),
+          confidence: Type.Number({ description: "Prior confidence 0-100" }),
+        }),
+        { description: "Structured list of hypotheses to present to the user" }
+      ),
     }),
     async execute(_toolCallId, params) {
       const isDpMode = dpState.checklist !== null;
@@ -158,7 +161,7 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
         // Outside DP mode — don't create a checklist, just present hypotheses
       }
 
-      const { hypotheses: hypothesesText } = params as { hypotheses: string };
+      const { hypotheses } = params as { hypotheses: Array<{ id: string; text: string; confidence: number }> };
 
       const responseText = isDpMode
         ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."
@@ -166,7 +169,7 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
 
       return {
         content: [{ type: "text" as const, text: responseText }],
-        details: { hypotheses: hypothesesText },
+        details: { hypotheses },
       };
     },
   };

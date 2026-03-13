@@ -239,8 +239,23 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
     const isDone = message.toolStatus === 'success' || (!message.toolStatus && !message.isStreaming);
 
     // Parse hypotheses: prefer toolDetails.hypotheses (gateway mode), fallback to toolInput
-    const hypothesesSource = (message.toolDetails?.hypotheses as string) || message.toolInput || '';
-    const hypotheses = parseHypotheses(hypothesesSource);
+    const raw = message.toolDetails?.hypotheses;
+    let hypotheses: ParsedHypothesis[];
+    if (Array.isArray(raw)) {
+        // Structured path: new propose_hypotheses (array of {id, text, confidence}) or deep_search result
+        hypotheses = (raw as Array<{ id?: string; text?: string; confidence?: number; status?: string; reasoning?: string }>).map((h, i) => ({
+            index: i + 1,
+            title: h.text ?? `Hypothesis ${i + 1}`,
+            confidence: h.confidence,
+            description: h.reasoning,
+            detailLines: h.status ? [`Status: ${h.status}`] : [],
+        }));
+    } else {
+        // Text fallback for historical messages
+        const hypothesesSource = (raw as string | undefined) || message.toolInput || '';
+        hypotheses = parseHypotheses(hypothesesSource);
+    }
+    const hypothesesSource = Array.isArray(raw) ? '' : ((raw as string | undefined) || message.toolInput || '');
 
     // Effective confirmed: local state OR derived from history (deep_search exists after this card)
     const effectiveConfirmed = confirmed || alreadyConfirmed;
