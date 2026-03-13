@@ -162,3 +162,4 @@ If clients are getting `connection refused`, verify the individual pod IPs are c
 - For services using `sessionAffinity: ClientIP`, connections from the same source IP are routed to the same pod — if that pod becomes unhealthy, the session sticks to it until the timeout.
 - `EndpointSlices` (default in K8s 1.21+) replace Endpoints for large-scale services. You can check them with: `kubectl get endpointslices -n <ns> -l kubernetes.io/service-name=<service>`.
 - If the cluster uses a service mesh (Istio, Linkerd), traffic routing may be controlled by the mesh — check the mesh's VirtualService or ServiceProfile resources.
+- If endpoints exist and ports match but connections still time out, a NetworkPolicy may be blocking traffic — use `networkpolicy-debug` to check.
