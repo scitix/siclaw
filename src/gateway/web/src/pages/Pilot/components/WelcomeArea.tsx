@@ -69,72 +69,63 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
     return (
         <div className="flex flex-col items-center justify-center py-12 px-4 max-w-2xl mx-auto space-y-8">
 
-            {/* ── Onboarding block: only shown once (no PROFILE.md) ── */}
+            {/* ── Hero: only shown to first-time users ── */}
             {isFirstTime && (
-                <>
-                    {/* Hero */}
-                    <div className="text-center space-y-2">
-                        <h1 className="text-2xl font-semibold text-gray-800">Welcome to Siclaw</h1>
-                        <p className="text-gray-500 text-sm">
-                            Your personal SRE assistant that learns, remembers, and grows with you
-                        </p>
-                    </div>
-
-                    {/* Setup Checklist — replaces old model warning + env card */}
-                    {systemStatus && !allChecklistDone && (
-                        <div className="w-full bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-3">
-                            <h2 className="text-sm font-semibold text-gray-700">Getting Started</h2>
-                            <div className="space-y-2">
-                                {/* Step 1: Configure AI Model */}
-                                <ChecklistStep
-                                    step={1}
-                                    done={hasModels}
-                                    label="Configure AI Model"
-                                    subtitle="Add a model provider to start chatting"
-                                    onClick={onNavigateModels}
-                                />
-                                {/* Step 2: Add Credentials */}
-                                <ChecklistStep
-                                    step={2}
-                                    done={hasCredentials}
-                                    label="Add Credentials"
-                                    subtitle="Connect to your clusters and servers via SSH or Kubeconfig"
-                                    onClick={onNavigateCredentials}
-                                />
-                                {/* Step 3: Start a conversation */}
-                                <ChecklistStep
-                                    step={3}
-                                    done={sessionCount > 0}
-                                    label="Start your first conversation"
-                                    subtitle="Ask Siclaw to diagnose an issue or run a skill"
-                                />
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Capability Grid */}
-                    <div className="w-full grid grid-cols-2 gap-3">
-                        {CAPABILITIES.map((cap) => (
-                            <div
-                                key={cap.title}
-                                className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 space-y-1.5"
-                            >
-                                <cap.icon className="w-5 h-5 text-gray-400" />
-                                <p className="text-sm font-medium text-gray-700">{cap.title}</p>
-                                <p className="text-xs text-gray-500 leading-relaxed">{cap.description}</p>
-                            </div>
-                        ))}
-                    </div>
-
-                    {/* Credentials Summary — shown when checklist is all done */}
-                    {allChecklistDone && hasCredentials && (
-                        <CredentialsSummary credentials={credentials} />
-                    )}
-                </>
+                <div className="text-center space-y-2">
+                    <h1 className="text-2xl font-semibold text-gray-800">Welcome to Siclaw</h1>
+                    <p className="text-gray-500 text-sm">
+                        Your personal SRE assistant that learns, remembers, and grows with you
+                    </p>
+                </div>
             )}
 
-            {/* ── Returning user: Credentials summary (if any) ── */}
-            {!isFirstTime && hasCredentials && (
+            {/* ── Setup Checklist: shown whenever any step is incomplete ── */}
+            {systemStatus && !allChecklistDone && (
+                <div className="w-full bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-3">
+                    <h2 className="text-sm font-semibold text-gray-700">Getting Started</h2>
+                    <div className="space-y-2">
+                        <ChecklistStep
+                            step={1}
+                            done={hasModels}
+                            label="Configure AI Model"
+                            subtitle="Add a model provider to start chatting"
+                            onClick={onNavigateModels}
+                        />
+                        <ChecklistStep
+                            step={2}
+                            done={hasCredentials}
+                            label="Add Credentials"
+                            subtitle="Connect to your clusters and servers via SSH or Kubeconfig"
+                            onClick={onNavigateCredentials}
+                        />
+                        <ChecklistStep
+                            step={3}
+                            done={sessionCount > 0}
+                            label="Start your first conversation"
+                            subtitle="Ask Siclaw to diagnose an issue or run a skill"
+                        />
+                    </div>
+                </div>
+            )}
+
+            {/* ── Capability Grid: only shown to first-time users ── */}
+            {isFirstTime && (
+                <div className="w-full grid grid-cols-2 gap-3">
+                    {CAPABILITIES.map((cap) => (
+                        <div
+                            key={cap.title}
+                            className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4 space-y-1.5"
+                        >
+                            <cap.icon className="w-5 h-5 text-gray-400" />
+                            <p className="text-sm font-medium text-gray-700">{cap.title}</p>
+                            <p className="text-xs text-gray-500 leading-relaxed">{cap.description}</p>
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {/* ── Credentials Summary: shown when setup is complete ── */}
+            {allChecklistDone && hasCredentials && (
                 <CredentialsSummary credentials={credentials} />
             )}
 
