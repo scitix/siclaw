@@ -72,7 +72,9 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
   try {
     const a = new URL(kubeconfigServer);
     const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
-    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
+    // Require explicit port on the env side — environments without port are legacy and must be updated
+    if (!b.port) return false;
+    return a.hostname === b.hostname && (a.port || "443") === b.port;
   } catch {
     // If URL parsing fails, reject the match — don't fall back to loose comparison
     return false;
