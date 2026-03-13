@@ -148,11 +148,28 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
     parameters: Type.Object({
       hypotheses: Type.Array(
         Type.Object({
-          id: Type.String({ description: "Hypothesis identifier, e.g. H1, H2, H3" }),
-          text: Type.String({ description: "One-line hypothesis statement" }),
+          id: Type.String({ description: "Hypothesis identifier: H1, H2, H3, etc." }),
+          text: Type.String({
+            description:
+              "A specific, testable hypothesis statement (one sentence). " +
+              "NOT a title, category name, or group heading. " +
+              'Good: "Firewall rules blocking inter-node communication on port 6443". ' +
+              'Bad: "Check cluster demo".',
+          }),
           confidence: Type.Number({ description: "Prior confidence 0-100" }),
+          description: Type.Optional(
+            Type.String({
+              description:
+                "Brief explanation: why this hypothesis is plausible and how to validate it. " +
+                "Include relevant technical context, affected components, and key validation commands.",
+            })
+          ),
         }),
-        { description: "Structured list of hypotheses to present to the user" }
+        {
+          description:
+            "Each element is one distinct, independent hypothesis. " +
+            "Do NOT include overall titles or summary items — only concrete hypotheses.",
+        }
       ),
     }),
     async execute(_toolCallId, params) {
@@ -161,7 +178,19 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
         // Outside DP mode — don't create a checklist, just present hypotheses
       }
 
-      const { hypotheses } = params as { hypotheses: Array<{ id: string; text: string; confidence: number }> };
+      const { hypotheses: rawHypotheses } = params as {
+        hypotheses: Array<{ id: string; text: string; confidence: number; description?: string }>;
+      };
+
+      // Post-validation: filter out non-hypothesis items the model sometimes includes
+      const hypotheses = rawHypotheses.filter((h) => {
+        const text = h.text.trim();
+        // Markdown table rows / headers
+        if (text.startsWith("|")) return false;
+        // Meta-text about the hypotheses themselves (titles, proposal headings)
+        if (/假设提案|(?:revised|proposed|updated)\s*hypothes[ei]s/i.test(text)) return false;
+        return true;
+      });
 
       const responseText = isDpMode
         ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."

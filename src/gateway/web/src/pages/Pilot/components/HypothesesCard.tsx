@@ -242,13 +242,13 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
     const raw = message.toolDetails?.hypotheses;
     let hypotheses: ParsedHypothesis[];
     if (Array.isArray(raw)) {
-        // Structured path: new propose_hypotheses (array of {id, text, confidence}) or deep_search result
-        hypotheses = (raw as Array<{ id?: string; text?: string; confidence?: number; status?: string; reasoning?: string }>).map((h, i) => ({
+        // Structured path: use schema fields (id, text, confidence, description)
+        hypotheses = (raw as Array<{ text?: string; confidence?: number; description?: string }>).map((h, i) => ({
             index: i + 1,
             title: h.text ?? `Hypothesis ${i + 1}`,
             confidence: h.confidence,
-            description: h.reasoning,
-            detailLines: h.status ? [`Status: ${h.status}`] : [],
+            description: h.description,
+            detailLines: [],
         }));
     } else {
         // Text fallback for historical messages
