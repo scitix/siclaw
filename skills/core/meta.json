@@ -9,6 +9,7 @@
     "image-pull-debug":         ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "ingress-debug":            ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "job-debug":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
+    "networkpolicy-debug":      ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "node-health-check":        ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "node-logs":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "node-ping-gateway":        ["kubernetes", "network",  "diagnostic", "sre", "developer"],
