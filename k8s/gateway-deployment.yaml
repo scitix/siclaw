@@ -133,7 +133,7 @@ rules:
   verbs: ["get", "list", "create", "delete"]
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
-  verbs: ["get", "list", "create"]
+  verbs: ["get", "list"]
 
 ---
 # RoleBinding
