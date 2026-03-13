@@ -54,6 +54,13 @@ spec:
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
           value: "/app/.siclaw/skills"
+        # User data persistence — shared PVC for ensureUserDir()
+        - name: SICLAW_PERSISTENCE_ENABLED
+          value: "true"
+        - name: SICLAW_PERSISTENCE_CLAIM_NAME
+          value: "siclaw-data"
+        - name: SICLAW_PERSISTENCE_MOUNT_PATH
+          value: "/app/.siclaw/user-data"
         - name: SICLAW_DATABASE_URL
           valueFrom:
             secretKeyRef:
@@ -81,9 +88,14 @@ spec:
         volumeMounts:
         - name: skills-local
           mountPath: /app/.siclaw/skills
+        - name: user-data
+          mountPath: /app/.siclaw/user-data
       volumes:
       - name: skills-local
         emptyDir: {}
+      - name: user-data
+        persistentVolumeClaim:
+          claimName: siclaw-data
 
 ---
 apiVersion: v1
