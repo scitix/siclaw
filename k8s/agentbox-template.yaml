@@ -1,12 +1,13 @@
 # AgentBox Pod Template
-# This template is used by K8sSpawner to create per-user AgentBox pods
+# Reference document — shows what K8sSpawner creates programmatically.
+# Not consumed at runtime; kept in sync with k8s-spawner.ts for documentation.
 #
-# Variables to substitute:
+# Variables:
 #   ${USER_ID}      - User identifier
 #   ${IMAGE}        - Container image (e.g., siclaw-agentbox:latest)
 #   ${NAMESPACE}    - Kubernetes namespace
 #   ${WORKSPACE_ID} - Workspace identifier (e.g., "default")
-#
+
 apiVersion: v1
 kind: Pod
 metadata:
@@ -15,17 +16,25 @@ metadata:
   labels:
     app: agentbox
     siclaw.io/app: agentbox
-    user: ${USER_ID}
-    managed-by: siclaw-gateway
+    siclaw.io/user: ${USER_ID}
+    siclaw.io/workspace: ${WORKSPACE_ID}
 spec:
   automountServiceAccountToken: false
   restartPolicy: Never
   terminationGracePeriodSeconds: 30
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
 
   containers:
   - name: agentbox
     image: ${IMAGE}
     imagePullPolicy: Always
+    securityContext:
+      capabilities:
+        drop: ["ALL"]
+        add: ["SETUID", "SETGID", "CHOWN", "FOWNER"]
+      readOnlyRootFilesystem: true
 
     ports:
     - name: https
@@ -36,23 +45,13 @@ spec:
       protocol: TCP
 
     env:
-    - name: USER_ID
-      value: "${USER_ID}"
-    - name: NODE_ENV
-      value: "production"
-    - name: SICLAW_AGENTBOX_PORT
-      value: "3000"
     - name: PI_CODING_AGENT_DIR
       value: ".siclaw/user-data/agent"
-    - name: SICLAW_SKILLS_DIR
-      value: ".siclaw/skills"
-    - name: SICLAW_USER_DATA_DIR
-      value: ".siclaw/user-data"
     - name: SICLAW_GATEWAY_URL
       value: "https://siclaw-gateway.${NAMESPACE}.svc.cluster.local:3002"
-    - name: SICLAW_CREDENTIALS_DIR
-      value: "/home/agentbox/.credentials"
-    # LLM config is injected dynamically by gateway via envResolver
+    - name: SICLAW_WORKSPACE_ID
+      value: "${WORKSPACE_ID}"
+    # LLM config + settings.json are injected dynamically by gateway via RPC
 
     # Resource limits
     resources:
@@ -61,88 +60,64 @@ spec:
         cpu: "100m"
       limits:
         memory: "1Gi"
-        cpu: "500m"
+        cpu: "1000m"
 
     # Health probes
-    livenessProbe:
-      httpGet:
-        path: /health
-        port: 3000
-      initialDelaySeconds: 10
-      periodSeconds: 30
-      timeoutSeconds: 5
-      failureThreshold: 3
-
     readinessProbe:
       httpGet:
         path: /health
         port: 3000
-      initialDelaySeconds: 5
+        scheme: HTTPS
+      initialDelaySeconds: 2
+      periodSeconds: 2
+
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 3000
+        scheme: HTTPS
+      initialDelaySeconds: 10
       periodSeconds: 10
-      timeoutSeconds: 3
-      failureThreshold: 3
 
     # Volume mounts
     volumeMounts:
-    - name: kubeconfig
-      mountPath: /home/agentbox/.kube
-      readOnly: true
+    - name: credentials
+      mountPath: /app/.siclaw/credentials
     - name: config
       mountPath: /app/.siclaw/config
-    - name: tmp
-      mountPath: /tmp
-    - name: workspace
-      mountPath: /workspace
-    # Skills & MCP mounts (from shared PVC)
-    - name: skills-pv
-      mountPath: /app/.siclaw/skills/core
-      subPath: core
-      readOnly: true
-    - name: skills-pv
-      mountPath: /app/.siclaw/skills/team
-      subPath: team
-      readOnly: true
-    - name: skills-pv
-      mountPath: /app/.siclaw/skills/user
-      subPath: user/${USER_ID}/.ws-${WORKSPACE_ID}
-      readOnly: true
-    - name: skills-pv
+    - name: skills-local
+      mountPath: /app/.siclaw/skills
+    - name: user-data
       mountPath: /app/.siclaw/user-data
       subPath: users/${USER_ID}/${WORKSPACE_ID}
-    - name: skills-pv
-      mountPath: /home/agentbox/.credentials
-      subPath: user/${USER_ID}/.ws-${WORKSPACE_ID}/.credentials
+    - name: client-cert
+      mountPath: /etc/siclaw/certs
       readOnly: true
-    - name: skills-pv
-      mountPath: /home/agentbox/.kube/envs
-      subPath: user/${USER_ID}/.kube/envs
-      readOnly: true
-    - name: skills-pv
-      mountPath: /home/agentbox/.kube/defaults
-      subPath: _default_kubeconfigs
-      readOnly: true
+    - name: tmp
+      mountPath: /tmp
 
   volumes:
-  # User-specific kubeconfig (optional)
-  - name: kubeconfig
-    secret:
-      secretName: user-${USER_ID}-kubeconfig
-      optional: true
+  # Credentials (synced from gateway via RPC)
+  - name: credentials
+    emptyDir: {}
   # Config directory (settings.json written at runtime)
   - name: config
     emptyDir: {}
+  # Skills (synced from gateway via RPC buildSkillBundle)
+  - name: skills-local
+    emptyDir: {}
+  # User data (memory, investigations, sessions) — persistent on shared PVC
+  - name: user-data
+    persistentVolumeClaim:
+      claimName: siclaw-data
+  # mTLS client certificate
+  - name: client-cert
+    secret:
+      secretName: agentbox-${USER_ID}-cert
   # Temp directory
   - name: tmp
     emptyDir:
       sizeLimit: 500Mi
-  # Workspace for user files
-  - name: workspace
-    emptyDir:
-      sizeLimit: 1Gi
-  # Shared data PVC (skills + user data)
-  - name: skills-pv
-    persistentVolumeClaim:
-      claimName: siclaw-data
 
 ---
 # Service for accessing the AgentBox pod
@@ -153,15 +128,14 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: agentbox
-    user: ${USER_ID}
+    siclaw.io/user: ${USER_ID}
 spec:
   type: ClusterIP
   selector:
     app: agentbox
-    user: ${USER_ID}
+    siclaw.io/user: ${USER_ID}
   ports:
-  - name: http
+  - name: https
     port: 3000
     targetPort: 3000
     protocol: TCP
-
