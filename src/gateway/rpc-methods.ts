@@ -36,7 +36,7 @@ import { ScriptEvaluator } from "./skills/script-evaluator.js";
 import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js";
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
-import { notifyCronService as notifyCronServiceImpl } from "./cron/notify.js";
+import type { CronService } from "./cron/cron-service.js";
 import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
@@ -91,6 +91,7 @@ export function createRpcMethods(
   agentBoxTlsOptions?: AgentBoxTlsOptions,
   resourceNotifier?: ResourceNotifier,
   metricsAggregator?: MetricsAggregator,
+  cronService?: CronService | null,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
@@ -2548,10 +2549,6 @@ export function createRpcMethods(
   // Cron Job Methods
   // ─────────────────────────────────────────────────
 
-  /** Notify all cron instances of job changes (fire-and-forget) */
-  function notifyCronService(payload: object): void {
-    notifyCronServiceImpl(payload, configRepo);
-  }
 
   methods.set("cron.list", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
@@ -2590,10 +2587,7 @@ export function createRpcMethods(
     const schedule = params.schedule as string;
     const status = (params.status as "active" | "paused") ?? "active";
 
-    // For updates: fetch existing job to get current assignedTo
     const existingId = params.id as string | undefined;
-    const existingJob = existingId ? await configRepo.getCronJobById(existingId) : null;
-
     const workspaceId = params.workspaceId as string | null | undefined;
 
     const id = await configRepo.saveCronJob(userId, {
@@ -2606,38 +2600,17 @@ export function createRpcMethods(
       workspaceId: workspaceId ?? null,
     });
 
-    if (status === "paused") {
-      // Pausing — just cancel the timer, don't reassign
-      notifyCronService({ action: "pause", jobId: id });
-    } else {
-      // Active — keep existing assignment if possible, otherwise assign to least-loaded
-      let assignedTo: string | null = existingJob?.assignedTo ?? null;
-
-      if (!assignedTo) {
-        try {
-          const leastLoaded = await configRepo.getLeastLoadedInstance();
-          if (leastLoaded) {
-            assignedTo = leastLoaded.instanceId;
-          }
-        } catch {
-          // No instances available yet — coordinator will pick up unassigned jobs
-        }
-      }
-
-      if (assignedTo) {
-        await configRepo.assignCronJob(id, assignedTo);
-      }
-
-      notifyCronService({
-        action: "upsert",
-        job: {
+    if (cronService) {
+      if (status === "paused") {
+        cronService.cancel(id);
+      } else {
+        cronService.addOrUpdate({
           id, userId, name, description: description ?? null, schedule, status,
-          skillId: params.skillId ?? null, assignedTo,
+          skillId: (params.skillId as string) ?? null, assignedTo: null,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-
           workspaceId: workspaceId ?? null,
-        },
-      });
+        });
+      }
     }
 
     return { id, name, schedule, status };
@@ -2657,7 +2630,7 @@ export function createRpcMethods(
     if (job.userId !== userId) throw new Error("Forbidden");
 
     await configRepo.deleteCronJob(id);
-    notifyCronService({ action: "delete", jobId: id });
+    cronService?.cancel(id);
 
     // Auto-dismiss notifications for the deleted job
     if (notifRepo) {
@@ -2697,20 +2670,20 @@ export function createRpcMethods(
       workspaceId: job.workspaceId ?? null,
     });
 
-    // Notify cron service
-    notifyCronService({
-      action: status === "paused" ? "pause" : "upsert",
-      ...(status === "paused" ? { jobId: id } : {
-        job: {
+    // Update scheduler
+    if (cronService) {
+      if (status === "paused") {
+        cronService.cancel(id);
+      } else {
+        cronService.addOrUpdate({
           id, userId, name: job.name, description: job.description ?? null,
           schedule: job.schedule, status, skillId: job.skillId ?? null,
-          assignedTo: job.assignedTo ?? null,
-          lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-
+          assignedTo: null, lastRunAt: null, lastResult: null,
+          lockedBy: null, lockedAt: null,
           workspaceId: job.workspaceId ?? null,
-        },
-      }),
-    });
+        });
+      }
+    }
 
     return { id, status };
   });
@@ -2741,18 +2714,16 @@ export function createRpcMethods(
       workspaceId: job.workspaceId ?? null,
     });
 
-    // Notify cron service
-    notifyCronService({
-      action: "upsert",
-      job: {
+    // Update scheduler (name change — reschedule with updated job data)
+    if (cronService && job.status === "active") {
+      cronService.addOrUpdate({
         id, userId, name: newName.trim(), description: job.description ?? null,
-        schedule: job.schedule, status: job.status, skillId: job.skillId ?? null,
-        assignedTo: job.assignedTo ?? null,
+        schedule: job.schedule, status: job.status as "active" | "paused",
+        skillId: job.skillId ?? null, assignedTo: null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-        envId: null,
         workspaceId: job.workspaceId ?? null,
-      },
-    });
+      });
+    }
 
     return { id, name: newName.trim() };
   });

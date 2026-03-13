@@ -673,13 +673,12 @@ node siclaw-gateway.mjs
 
 ### 12.2 Kubernetes Production
 
-Three container images:
+Two container images:
 
 | Image | Entry Point | Role |
 |-------|-------------|------|
-| `siclaw-gateway` | `node dist/gateway-main.js --k8s` | Control plane |
+| `siclaw-gateway` | `node dist/gateway-main.js --k8s` | Control plane (includes cron scheduler) |
 | `siclaw-agentbox` | `node dist/agentbox-main.js` | Execution plane (dynamic pods) |
-| `siclaw-cron` | `node dist/cron-main.js` | Scheduled task worker |
 
 ```bash
 # Build
@@ -702,9 +701,8 @@ kubectl apply -f k8s/
 ```
 src/
 ├── cli-main.ts              # TUI entry point
-├── gateway-main.ts          # Gateway entry point
+├── gateway-main.ts          # Gateway entry point (includes cron scheduler)
 ├── agentbox-main.ts         # AgentBox entry point
-├── cron-main.ts             # Cron worker entry point
 ├── core/
 │   ├── config.ts            # Unified config loader (.siclaw/config/settings.json)
 │   ├── agent-factory.ts     # Session factory (tools + brain + skills)
