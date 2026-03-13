@@ -1272,6 +1272,7 @@ export function usePilot() {
         startEditSkill,
         clearEditSkill,
         loadSkills,
+        loadSystemStatus,
         updateMessageMeta,
         clearPendingMessages,
         removePendingMessage,
