@@ -7,9 +7,15 @@ function skillsBase(): string {
   return path.resolve(process.cwd(), config.paths.skillsDir);
 }
 
-/** Builtin skills directory (baked into Docker image at skills/core/) */
+/** Builtin skills directories (baked into Docker image at skills/core/ and skills/extension/) */
+const BUILTIN_TIERS = ["core", "extension"] as const;
+
 function builtinCoreDir(): string {
   return path.resolve(process.cwd(), "skills", "core");
+}
+
+function builtinDirs(): string[] {
+  return BUILTIN_TIERS.map(t => path.resolve(process.cwd(), "skills", t));
 }
 
 /** Load disabled builtins list (written by agentbox startup from bundle API) */
@@ -66,11 +72,13 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
   }
   if (dirs.length > 0) return dirs;
 
-  // 3. Builtin fallback (skills/core/) — for skills not in the bundle
+  // 3. Builtin fallback (skills/{core,extension}/) — for skills not in the bundle
   const disabled = loadDisabledBuiltins();
   if (!disabled.has(skill)) {
-    const builtinPath = path.join(builtinCoreDir(), skill, "scripts");
-    if (fs.existsSync(builtinPath)) return [{ dir: builtinPath, scope: "builtin" }];
+    for (const bDir of builtinDirs()) {
+      const builtinPath = path.join(bDir, skill, "scripts");
+      if (fs.existsSync(builtinPath)) return [{ dir: builtinPath, scope: "builtin" }];
+    }
   }
 
   return [];
@@ -92,8 +100,9 @@ function getSkillBaseDirs(): string[] {
   );
   if (hasDirectSkills) {
     const dirs = [base];
-    const coreDir = builtinCoreDir();
-    if (fs.existsSync(coreDir)) dirs.push(coreDir);
+    for (const bDir of builtinDirs()) {
+      if (fs.existsSync(bDir)) dirs.push(bDir);
+    }
     return dirs;
   }
 
@@ -102,9 +111,10 @@ function getSkillBaseDirs(): string[] {
     .map((scope) => path.join(base, scope))
     .filter((dir) => fs.existsSync(dir));
 
-  // 3. Builtin fallback (skills/core/ from Docker image)
-  const coreDir = builtinCoreDir();
-  if (fs.existsSync(coreDir) && !dirs.includes(coreDir)) dirs.push(coreDir);
+  // 3. Builtin fallback (skills/{core,extension}/ from Docker image)
+  for (const bDir of builtinDirs()) {
+    if (fs.existsSync(bDir) && !dirs.includes(bDir)) dirs.push(bDir);
+  }
 
   return dirs;
 }
@@ -123,12 +133,15 @@ export function skillExistsInBundle(skillName: string): boolean {
   return false;
 }
 
-/** Check if a skill exists as a non-disabled builtin (skills/core/) */
+/** Check if a skill exists as a non-disabled builtin (skills/{core,extension}/) */
 export function skillExistsAsBuiltin(skillName: string): boolean {
   const disabled = loadDisabledBuiltins();
   if (disabled.has(skillName)) return false;
-  const dir = path.join(builtinCoreDir(), skillName);
-  return fs.existsSync(dir) && fs.statSync(dir).isDirectory();
+  for (const bDir of builtinDirs()) {
+    const dir = path.join(bDir, skillName);
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
+  }
+  return false;
 }
 
 export type SkillScope = "builtin" | "team" | "personal";
@@ -189,10 +202,10 @@ export function listAllSkillsWithScripts(): Array<{
   const result: Array<{ skill: string; scripts: string[] }> = [];
   const seen = new Set<string>();
   const disabled = loadDisabledBuiltins();
-  const coreDir = builtinCoreDir();
+  const builtinSet = new Set(builtinDirs());
 
   for (const base of getSkillBaseDirs()) {
-    const isBuiltinDir = base === coreDir;
+    const isBuiltinDir = builtinSet.has(base);
     try {
       for (const d of fs.readdirSync(base, { withFileTypes: true })) {
         if (d.name.startsWith("_")) continue; // skip _lib etc.
