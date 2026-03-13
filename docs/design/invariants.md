@@ -35,7 +35,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 **Consequences**:
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
 - `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skillsDir` before writing. This is designed for K8s pods with isolated filesystems
-- Per-user skill sync in local mode must write only to scoped subdirectories (`skills/team/` and `skills/user/<userId>/`) without touching `skills/core/`
+- Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (team + personal skills from the bundle are both written into the user's directory)
 - The sql.js SQLite lockfile prevents multi-process access; local mode is single-process by design
 
 **Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:90-129`
@@ -244,7 +244,7 @@ postReload(context)  Notify active sessions to pick up changes
 | `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
 | `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes entire skillsDir first |
 
-For local mode skills sync, write directly to `skills/team/` and `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`.
+For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Team and personal skills from the bundle are both placed under the user's directory.
 
 ---
 
