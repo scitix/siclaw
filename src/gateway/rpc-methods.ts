@@ -72,10 +72,7 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
   try {
     const a = new URL(kubeconfigServer);
     const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
-    if (a.hostname !== b.hostname) return false;
-    // If envApiServer has no explicit port, match on hostname only (e.g. user omitted :6443)
-    if (!b.port) return true;
-    return (a.port || "443") === b.port;
+    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
   } catch {
     // If URL parsing fails, reject the match — don't fall back to loose comparison
     return false;
@@ -3369,6 +3366,15 @@ export function createRpcMethods(
     if (!name) throw new Error("Missing required param: name");
     if (!apiServer) throw new Error("Missing required param: apiServer");
 
+    // Require explicit port in apiServer (e.g. https://host:6443)
+    try {
+      const u = new URL(apiServer.includes("://") ? apiServer : `https://${apiServer}`);
+      if (!u.port) throw new Error("API Server must include an explicit port (e.g. https://host:6443)");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("API Server")) throw e;
+      throw new Error("API Server must be a valid URL with an explicit port (e.g. https://host:6443)");
+    }
+
     // defaultKubeconfig only accepted for test environments
     if (defaultKubeconfig && !isTest) {
       throw new Error("defaultKubeconfig can only be set for test environments");
@@ -3402,6 +3408,15 @@ export function createRpcMethods(
 
     if (!apiServer?.trim()) {
       throw new Error("apiServer must be a non-empty string");
+    }
+
+    // Require explicit port in apiServer (e.g. https://host:6443)
+    try {
+      const u = new URL(apiServer.includes("://") ? apiServer : `https://${apiServer}`);
+      if (!u.port) throw new Error("API Server must include an explicit port (e.g. https://host:6443)");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("API Server")) throw e;
+      throw new Error("API Server must be a valid URL with an explicit port (e.g. https://host:6443)");
     }
 
     // If promoting from test to prod, auto-clear defaultKubeconfig
