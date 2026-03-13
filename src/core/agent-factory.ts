@@ -120,16 +120,19 @@ function resolveEmbeddingConfig(): MemoryIndexerOpts | undefined {
 }
 
 /**
- * Truncate content to a character budget using 70% head + 20% tail strategy.
- * The remaining 10% is reserved for the truncation marker.
+ * Truncate content to a character budget using head + tail strategy.
+ * Subtracts the marker length from available budget before splitting.
  */
 function truncateWithBudget(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content;
-  const headSize = Math.floor(maxChars * 0.7);
-  const tailSize = Math.floor(maxChars * 0.2);
+  const marker = "\n\n[...truncated — use memory_search to find older entries...]\n\n";
+  const available = maxChars - marker.length;
+  if (available <= 0) return content.slice(0, maxChars);
+  const headSize = Math.floor(available * 0.78);
+  const tailSize = available - headSize;
   return (
     content.slice(0, headSize) +
-    "\n\n[...truncated — use memory_search to find older entries...]\n\n" +
+    marker +
     content.slice(-tailSize)
   );
 }
