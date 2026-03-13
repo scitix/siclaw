@@ -56,8 +56,6 @@ spec:
             {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
-            - name: SICLAW_CRON_SERVICE_URL
-              value: "http://{{ include "siclaw.fullname" . }}-cron.{{ .Values.namespace }}.svc.cluster.local"
             - name: SICLAW_GATEWAY_HOSTNAME
               value: "{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local"
             {{- if .Values.database.existingSecret.name }}
