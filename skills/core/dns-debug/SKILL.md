@@ -142,3 +142,4 @@ Check CoreDNS pod status and events for why they are not ready.
 - The `kube-dns` service name is used even when CoreDNS is the DNS provider — this is for backwards compatibility.
 - For pods using `hostNetwork: true`, DNS resolution uses the node's `/etc/resolv.conf` instead of the cluster DNS. These pods cannot resolve cluster-internal service names by default.
 - If testing DNS from outside the cluster, remember that `*.svc.cluster.local` names are only resolvable from within the cluster.
+- If DNS timeouts only affect specific pods (not cluster-wide), an egress NetworkPolicy may be blocking UDP/TCP port 53 — use `networkpolicy-debug` to check before investigating CoreDNS.
