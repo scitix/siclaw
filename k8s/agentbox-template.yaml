@@ -108,7 +108,7 @@ spec:
       readOnly: true
     - name: skills-pv
       mountPath: /app/.siclaw/user-data
-      subPath: user/${USER_ID}/agent-data
+      subPath: users/${USER_ID}/${WORKSPACE_ID}
     - name: skills-pv
       mountPath: /home/agentbox/.credentials
       subPath: user/${USER_ID}/.ws-${WORKSPACE_ID}/.credentials
@@ -139,10 +139,10 @@ spec:
   - name: workspace
     emptyDir:
       sizeLimit: 1Gi
-  # Shared skills PVC
+  # Shared data PVC (skills + user data)
   - name: skills-pv
     persistentVolumeClaim:
-      claimName: siclaw-skills
+      claimName: siclaw-data
 
 ---
 # Service for accessing the AgentBox pod
