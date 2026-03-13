@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Search, ChevronDown, ChevronRight, CheckCircle, XCircle, Ban, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
@@ -107,6 +107,10 @@ export function AuditTab() {
     const [detailCache, setDetailCache] = useState<Record<string, AuditDetail>>({});
     const [detailLoading, setDetailLoading] = useState(false);
 
+    // Ref to always read latest filterUser without triggering the effect
+    const filterUserRef = useRef(filterUser);
+    filterUserRef.current = filterUser;
+
     const doSearch = useCallback(async (cursor?: { ts: number; id: string }) => {
         setLoading(true);
         try {
@@ -120,7 +124,7 @@ export function AuditTab() {
                 endDate,
                 limit: 50,
             };
-            if (isAdmin && filterUser) params.userName = filterUser;
+            if (isAdmin && filterUserRef.current) params.userName = filterUserRef.current;
             if (filterTool !== 'All') params.toolName = filterTool;
             if (filterStatus !== 'All') params.outcome = filterStatus;
             if (cursor) {
@@ -141,12 +145,12 @@ export function AuditTab() {
         } finally {
             setLoading(false);
         }
-    }, [sendRpc, isAdmin, filterUser, filterTool, filterStatus, filterRange]);
+    }, [sendRpc, isAdmin, filterTool, filterStatus, filterRange]);
 
-    // Auto-load on mount and re-search when filters change
+    // Auto-search when dropdown filters change; also loads on mount
     useEffect(() => {
         if (isConnected) doSearch();
-    }, [isConnected, filterTool, filterStatus, filterRange]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [isConnected, doSearch]);
 
     const loadMore = useCallback(() => {
         if (logs.length === 0) return;
