@@ -4,7 +4,7 @@ import { SkillPanel } from './components/SkillPanel';
 import { SchedulePanel } from './components/SchedulePanel';
 import { History, X, Plus } from 'lucide-react';
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
@@ -14,12 +14,18 @@ export function PilotPage() {
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
     const [panelMessage, setPanelMessage] = useState<PilotMessage | null>(null);
     const navigate = useNavigate();
+    const location = useLocation();
     const pilot = usePilot();
     const { currentWorkspace } = useWorkspace();
 
     // Track which tool content we've already auto-opened the panel for
     // Uses content hash instead of message ID (IDs change when DB ID replaces temp ID)
     const autoOpenedRef = useRef<Set<string>>(new Set());
+
+    // Refresh system status on every navigation to this page (e.g. after adding credentials)
+    useEffect(() => {
+        pilot.loadSystemStatus();
+    }, [location]);
 
     const handleSkillSaved = useCallback(() => {
         pilot.clearEditSkill();
