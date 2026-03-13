@@ -151,9 +151,8 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   // ── Credential materialization helper (shared by prompt and reload-credentials) ──
-  // Writes to credDir atomically: clear existing files, write new ones.
-  // Uses a staging approach within the same directory to avoid permission issues
-  // in the container (parent dir /app/.siclaw/ has restricted permissions).
+  // Writes new files with .new suffix first, then atomically renames them into place.
+  // This prevents data loss if the process crashes between delete and write.
   function materializeCredentials(
     payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
     kubeconfigRef: { credentialsDir?: string },
@@ -161,19 +160,31 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
     fs.mkdirSync(credDir, { recursive: true });
 
-    // Clear existing files
+    // Phase 1: Write new files with .new suffix (staging)
+    const stagedFiles: string[] = [];
+    for (const file of payload.files) {
+      const resolved = resolveUnderDir(credDir, file.name);
+      const staged = resolved + ".new";
+      fs.writeFileSync(staged, file.content, file.mode ? { mode: file.mode } : undefined);
+      stagedFiles.push(file.name);
+    }
+    // Stage manifest
+    const manifestPath = path.join(credDir, "manifest.json");
+    fs.writeFileSync(manifestPath + ".new", JSON.stringify(payload.manifest, null, 2));
+
+    // Phase 2: Remove old files
     for (const entry of fs.readdirSync(credDir)) {
+      if (entry.endsWith(".new")) continue; // skip staged files
       fs.rmSync(path.join(credDir, entry), { recursive: true });
     }
 
-    // Write credential files with path traversal validation
+    // Phase 3: Rename staged files into place (atomic per-file on same filesystem)
     for (const file of payload.files) {
       const resolved = resolveUnderDir(credDir, file.name);
-      fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
+      fs.renameSync(resolved + ".new", resolved);
     }
+    fs.renameSync(manifestPath + ".new", manifestPath);
 
-    // Write manifest
-    fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
     kubeconfigRef.credentialsDir = credDir;
     return payload.files.length;
   }
