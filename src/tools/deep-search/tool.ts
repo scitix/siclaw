@@ -210,6 +210,7 @@ Do triage first before calling this tool — confirm the problem exists and gath
         return {
           content: [{ type: "text", text: summary }],
           details: {
+            investigationId: result.investigationId,
             totalToolCalls: result.totalToolCalls,
             durationMs: result.totalDurationMs,
             hypothesesValidated: result.hypotheses.filter((h) => h.status === "validated").length,
