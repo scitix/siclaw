@@ -34,6 +34,8 @@ export interface InvestigationResult {
   totalToolCalls: number;
   totalDurationMs: number;
   timedOut: boolean;
+  /** True when the circuit breaker tripped due to consecutive LLM API failures. */
+  circuitBroken?: boolean;
   debugTracePath?: string;
 }
 
@@ -84,6 +86,12 @@ export const EVIDENCE_HEAD_CHARS = 2000;
 export const EVIDENCE_TAIL_CHARS = 1500;
 
 // --- Engine constants ---
+
+/** Circuit breaker: consecutive sub-agent failures before tripping.
+ *  With maxParallel=3, this means the circuit trips after the first full
+ *  batch of parallel sub-agents all fail, preventing subsequent batches
+ *  from wasting time on a down LLM API. */
+export const CIRCUIT_BREAKER_THRESHOLD = 3;
 
 /** Early exit threshold: skip remaining hypotheses if one reaches this confidence.
  *  Set to 101 to effectively disable early exit (validate all hypotheses by default).

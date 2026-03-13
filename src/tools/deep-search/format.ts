@@ -100,8 +100,10 @@ export function formatSummary(
   const skipped = result.hypotheses.filter(
     (h) => h.status === "skipped",
   ).length;
-  const duration = `${(result.totalDurationMs / 1000).toFixed(1)}s` +
-    (result.timedOut ? " (timed out)" : "");
+  const durationSuffix = result.timedOut ? " (timed out)"
+    : result.circuitBroken ? " (circuit breaker tripped — LLM API unavailable)"
+    : "";
+  const duration = `${(result.totalDurationMs / 1000).toFixed(1)}s${durationSuffix}`;
   const hypoStat = `${validated}/${result.hypotheses.length} validated` +
     (skipped > 0 ? `, ${skipped} skipped` : "");
   sections.push(
@@ -171,7 +173,7 @@ export function formatResult(result: InvestigationResult): string {
     `## Statistics\n` +
     `- Tool calls: ${result.totalToolCalls}\n` +
     `- Duration: ${(result.totalDurationMs / 1000).toFixed(1)}s` +
-    (result.timedOut ? " (timed out)" : "") +
+    (result.timedOut ? " (timed out)" : result.circuitBroken ? " (circuit breaker — LLM API unavailable)" : "") +
     `\n` +
     `- Hypotheses: ${validated}/${result.hypotheses.length} validated` +
     (skipped > 0 ? `, ${skipped} skipped` : "");

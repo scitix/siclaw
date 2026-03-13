@@ -24,10 +24,12 @@ import type {
 import {
   NORMAL_BUDGET,
   EARLY_EXIT_CONFIDENCE,
+  CIRCUIT_BREAKER_THRESHOLD,
   TRACE_MAX_OUTPUT,
   TRACE_HEAD_CHARS,
   TRACE_TAIL_CHARS,
 } from "./types.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
 import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA } from "./schemas.js";
 
 interface RawHypothesis {
@@ -579,6 +581,7 @@ export async function investigate(
 
   let rootCauseFound = false;
   let timedOut = false;
+  const breaker = new CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD);
 
   // Build a summary of completed hypotheses for sub-agent context
   function buildPriorFindings(): string | undefined {
@@ -621,16 +624,23 @@ export async function investigate(
       hypothesis.toolCallsUsed = result.callsUsed;
       hypothesis.trace = result.trace;
       globalCallsUsed += result.callsUsed;
+      breaker.recordSuccess();
 
       onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence });
     } catch (err) {
+      breaker.recordFailure();
+      if (breaker.tripped) {
+        onProgress?.({ type: "phase", phase: "Phase 3/4", detail: "Circuit breaker tripped — LLM API appears unavailable, skipping remaining hypotheses" });
+      }
       if (!isRetry) {
-        // First failure → queue for retry
+        // First failure → queue for retry (unless circuit is broken)
         hypothesis.status = "inconclusive";
         hypothesis.confidence = 0;
         hypothesis.reasoning = `Sub-agent error: ${err instanceof Error ? err.message : String(err)}`;
         onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "inconclusive", confidence: 0 });
-        retryQueue.push(hypothesis);
+        if (!breaker.tripped) {
+          retryQueue.push(hypothesis);
+        }
       }
       // Second failure → leave as inconclusive (already marked)
     }
@@ -643,7 +653,7 @@ export async function investigate(
 
   await new Promise<void>((resolvePool) => {
     function tryStartNext() {
-      while (activeCount < budget.maxParallel && !rootCauseFound) {
+      while (activeCount < budget.maxParallel && !rootCauseFound && !breaker.tripped) {
         // Timeout check
         if (Date.now() - startTime > budget.maxDurationMs) {
           timedOut = true;
@@ -761,6 +771,7 @@ export async function investigate(
     totalToolCalls: globalCallsUsed,
     totalDurationMs,
     timedOut,
+    circuitBroken: breaker.tripped || undefined,
     debugTracePath,
   };
 }

@@ -2,10 +2,12 @@ import { describe, it, expect } from "vitest";
 import {
   NORMAL_BUDGET,
   QUICK_BUDGET,
+  CIRCUIT_BREAKER_THRESHOLD,
   type HypothesisNode,
   type InvestigationResult,
   type Evidence,
 } from "./types.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
 import {
   contextGatheringPrompt,
   hypothesisGenerationPrompt,
@@ -51,6 +53,55 @@ describe("types / budgets", () => {
 
   it("QUICK_BUDGET maxDurationMs is less than NORMAL_BUDGET", () => {
     expect(QUICK_BUDGET.maxDurationMs).toBeLessThan(NORMAL_BUDGET.maxDurationMs);
+  });
+});
+
+// ─── circuit-breaker.ts ───
+
+describe("CircuitBreaker", () => {
+  it("starts in closed state", () => {
+    const breaker = new CircuitBreaker(3);
+    expect(breaker.tripped).toBe(false);
+  });
+
+  it("trips after threshold consecutive failures", () => {
+    const breaker = new CircuitBreaker(3);
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(false);
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(false);
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(true);
+  });
+
+  it("resets consecutive count on success", () => {
+    const breaker = new CircuitBreaker(3);
+    breaker.recordFailure();
+    breaker.recordFailure();
+    breaker.recordSuccess(); // resets count
+    breaker.recordFailure();
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(false); // only 2 consecutive, not 3
+  });
+
+  it("stays tripped once opened", () => {
+    const breaker = new CircuitBreaker(2);
+    breaker.recordFailure();
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(true);
+    breaker.recordSuccess(); // doesn't un-trip
+    expect(breaker.tripped).toBe(true);
+  });
+
+  it("works with threshold of 1", () => {
+    const breaker = new CircuitBreaker(1);
+    expect(breaker.tripped).toBe(false);
+    breaker.recordFailure();
+    expect(breaker.tripped).toBe(true);
+  });
+
+  it("CIRCUIT_BREAKER_THRESHOLD matches maxParallel default", () => {
+    expect(CIRCUIT_BREAKER_THRESHOLD).toBe(NORMAL_BUDGET.maxParallel);
   });
 });
 
@@ -382,6 +433,19 @@ describe("formatResult", () => {
     const result = makeResult({ timedOut: false });
     const output = formatResult(result);
     expect(output).not.toContain("timed out");
+  });
+
+  it("shows circuit breaker marker when circuitBroken is true", () => {
+    const result = makeResult({ circuitBroken: true });
+    const output = formatResult(result);
+    expect(output).toContain("circuit breaker");
+    expect(output).toContain("LLM API unavailable");
+  });
+
+  it("does not show circuit breaker marker when circuitBroken is false", () => {
+    const result = makeResult({ circuitBroken: undefined });
+    const output = formatResult(result);
+    expect(output).not.toContain("circuit breaker");
   });
 
   it("does not show skipped count when no hypotheses are skipped", () => {
