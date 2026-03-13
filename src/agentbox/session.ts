@@ -516,6 +516,14 @@ export class AgentBoxSessionManager {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
       }
+      // Shutdown per-session MCP connections
+      if (managed.mcpManager) {
+        try {
+          await managed.mcpManager.shutdown();
+        } catch (err) {
+          console.warn(`[agentbox-session] MCP shutdown failed for ${sessionId}:`, err);
+        }
+      }
       // Sync shared memory index (don't close it — it's shared)
       if (this._sharedMemoryIndexer) {
         try {
@@ -553,6 +561,14 @@ export class AgentBoxSessionManager {
       if (managed._releaseTimer) {
         clearTimeout(managed._releaseTimer);
         managed._releaseTimer = null;
+      }
+      // Shutdown per-session MCP connections
+      if (managed.mcpManager) {
+        try {
+          await managed.mcpManager.shutdown();
+        } catch (err) {
+          console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
+        }
       }
       const stats = managed.brain.getSessionStats();
       const model = managed.brain.getModel();
