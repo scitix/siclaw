@@ -122,7 +122,7 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const isSubItem = trimmed.startsWith("-") || trimmed.startsWith("*") || /^\s{2,}/.test(line);
+    const isSubItem = /^- /.test(trimmed) || /^\* /.test(trimmed) || /^\s/.test(line);
     if (!isSubItem && trimmed.length > 5) {
       if (current !== null) results.push(extract(current));
       current = trimmed;
