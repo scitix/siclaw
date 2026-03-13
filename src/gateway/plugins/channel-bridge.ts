@@ -5,7 +5,7 @@ import type { ChannelPlugin, StreamingCard } from "./api.js";
 import type { UserStore } from "../auth/user-store.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
 import type { WorkspaceRepository } from "../db/repositories/workspace-repo.js";
-import { notifyCronService } from "../cron/notify.js";
+import type { CronService } from "../cron/cron-service.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "../output-redactor.js";
 
 export type OutboundSender = (sessionKey: string, text: string) => Promise<void>;
@@ -86,6 +86,7 @@ export function createChannelBridge(
   buildCredentialPayload?: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>,
   workspaceRepo?: WorkspaceRepository,
   agentBoxTlsOptions?: AgentBoxTlsOptions,
+  cronService?: CronService | null,
 ): ChannelBridge {
   // channelId → outbound sender
   const outbounds = new Map<string, ChannelPlugin>();
@@ -397,7 +398,7 @@ export function createChannelBridge(
                   };
                   const action = parsed.action;
                   if (action && action !== "list") {
-                    await executeScheduleAction(parsed, boundUser.id, configRepo, defaultWs.id);
+                    await executeScheduleAction(parsed, boundUser.id, configRepo, defaultWs.id, cronService);
                     // Replace raw JSON with human-readable summary
                     if (parsed.summary) {
                       output = parsed.summary;
@@ -582,41 +583,32 @@ async function executeScheduleAction(
   userId: string,
   configRepo: ConfigRepository,
   workspaceId?: string,
+  cronService?: CronService | null,
 ): Promise<void> {
   const action = parsed.action;
 
   if (action === "create" && parsed.schedule) {
+    const status = (parsed.schedule.status as "active" | "paused") || "active";
     const id = await configRepo.saveCronJob(userId, {
       name: parsed.schedule.name,
       description: parsed.schedule.description,
       schedule: parsed.schedule.schedule,
-      status: (parsed.schedule.status as "active" | "paused") || "active",
-
+      status,
       workspaceId: workspaceId ?? null,
     });
 
-    let assignedTo: string | null = null;
-    try {
-      const leastLoaded = await configRepo.getLeastLoadedInstance();
-      if (leastLoaded) {
-        assignedTo = leastLoaded.instanceId;
-        await configRepo.assignCronJob(id, assignedTo);
+    if (cronService) {
+      if (status === "active") {
+        cronService.addOrUpdate({
+          id, userId, name: parsed.schedule.name,
+          description: parsed.schedule.description ?? null,
+          schedule: parsed.schedule.schedule, status,
+          skillId: null, assignedTo: null,
+          lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
+          workspaceId: workspaceId ?? null,
+        });
       }
-    } catch { /* coordinator will pick up */ }
-
-    notifyCronService({
-      action: "upsert",
-      job: {
-        id, userId, name: parsed.schedule.name,
-        description: parsed.schedule.description ?? null,
-        schedule: parsed.schedule.schedule,
-        status: parsed.schedule.status || "active",
-        skillId: null, assignedTo,
-        lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-  
-        workspaceId: workspaceId ?? null,
-      },
-    }, configRepo);
+    }
     console.log(`[channel-bridge] Auto-created cron job: ${id}`);
   }
 
@@ -626,29 +618,32 @@ async function executeScheduleAction(
       console.warn(`[channel-bridge] Schedule not found for update: id=${parsed.id} name=${parsed.name}`);
       return;
     }
+    const updatedStatus = (parsed.schedule.status as "active" | "paused") || (job.status as "active" | "paused");
+    const updatedName = parsed.schedule.name || job.name;
+    const updatedSchedule = parsed.schedule.schedule || job.schedule;
     await configRepo.saveCronJob(userId, {
       id: job.id,
-      name: parsed.schedule.name || job.name,
+      name: updatedName,
       description: parsed.schedule.description ?? job.description ?? undefined,
-      schedule: parsed.schedule.schedule || job.schedule,
-      status: (parsed.schedule.status as "active" | "paused") || (job.status as "active" | "paused"),
-
+      schedule: updatedSchedule,
+      status: updatedStatus,
       workspaceId: job.workspaceId ?? null,
     });
 
-    notifyCronService({
-      action: "upsert",
-      job: {
-        id: job.id, userId, name: parsed.schedule.name || job.name,
-        description: parsed.schedule.description ?? job.description ?? null,
-        schedule: parsed.schedule.schedule || job.schedule,
-        status: parsed.schedule.status || job.status,
-        skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
-        lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-  
-        workspaceId: job.workspaceId ?? null,
-      },
-    }, configRepo);
+    if (cronService) {
+      if (updatedStatus === "paused") {
+        cronService.cancel(job.id);
+      } else {
+        cronService.addOrUpdate({
+          id: job.id, userId, name: updatedName,
+          description: parsed.schedule.description ?? job.description ?? null,
+          schedule: updatedSchedule, status: updatedStatus,
+          skillId: job.skillId ?? null, assignedTo: null,
+          lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
+          workspaceId: job.workspaceId ?? null,
+        });
+      }
+    }
     console.log(`[channel-bridge] Auto-updated cron job: ${job.id}`);
   }
 
@@ -659,7 +654,7 @@ async function executeScheduleAction(
       return;
     }
     await configRepo.deleteCronJob(job.id);
-    notifyCronService({ action: "delete", jobId: job.id }, configRepo);
+    cronService?.cancel(job.id);
     console.log(`[channel-bridge] Auto-deleted cron job: ${job.id}`);
   }
 
@@ -675,10 +670,9 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: "paused",
-
       workspaceId: job.workspaceId ?? null,
     });
-    notifyCronService({ action: "pause", jobId: job.id }, configRepo);
+    cronService?.cancel(job.id);
     console.log(`[channel-bridge] Auto-paused cron job: ${job.id}`);
   }
 
@@ -694,21 +688,16 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: "active",
-
       workspaceId: job.workspaceId ?? null,
     });
-    notifyCronService({
-      action: "upsert",
-      job: {
-        id: job.id, userId, name: job.name,
-        description: job.description ?? null,
-        schedule: job.schedule, status: "active",
-        skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
-        lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-  
-        workspaceId: job.workspaceId ?? null,
-      },
-    }, configRepo);
+    cronService?.addOrUpdate({
+      id: job.id, userId, name: job.name,
+      description: job.description ?? null,
+      schedule: job.schedule, status: "active",
+      skillId: job.skillId ?? null, assignedTo: null,
+      lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
+      workspaceId: job.workspaceId ?? null,
+    });
     console.log(`[channel-bridge] Auto-resumed cron job: ${job.id}`);
   }
 
@@ -725,21 +714,18 @@ async function executeScheduleAction(
       description: job.description ?? undefined,
       schedule: job.schedule,
       status: job.status as "active" | "paused",
-
       workspaceId: job.workspaceId ?? null,
     });
-    notifyCronService({
-      action: "upsert",
-      job: {
+    if (cronService && job.status === "active") {
+      cronService.addOrUpdate({
         id: job.id, userId, name: newName,
         description: job.description ?? null,
-        schedule: job.schedule, status: job.status,
-        skillId: job.skillId ?? null, assignedTo: job.assignedTo ?? null,
+        schedule: job.schedule, status: job.status as "active" | "paused",
+        skillId: job.skillId ?? null, assignedTo: null,
         lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
-  
         workspaceId: job.workspaceId ?? null,
-      },
-    }, configRepo);
+      });
+    }
     console.log(`[channel-bridge] Auto-renamed cron job: ${job.id} → ${newName}`);
   }
 }

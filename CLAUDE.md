@@ -109,9 +109,8 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 ```
 Entry Points
   src/cli-main.ts              TUI entry
-  src/gateway-main.ts          Gateway entry (--k8s flag for K8s mode)
+  src/gateway-main.ts          Gateway entry (--k8s flag for K8s mode, includes cron scheduler)
   src/agentbox-main.ts         AgentBox entry (K8s pod)
-  src/cron-main.ts             Cron worker entry
 
 Agent Core
   src/core/agent-factory.ts    Session factory — assembles tools + brain + skills

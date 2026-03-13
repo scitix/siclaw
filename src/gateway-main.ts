@@ -76,7 +76,7 @@ const configRepo = gateway.db ? new ConfigRepository(gateway.db) : undefined;
 const wsRepo = gateway.db ? new WorkspaceRepository(gateway.db) : undefined;
 
 // Create channel bridge (routes through AgentBox pods, not in-process sessions)
-const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.buildCredentialPayload, wsRepo, gateway.agentBoxTlsOptions);
+const channelBridge = createChannelBridge(agentBoxManager, gateway.broadcast, gateway.userStore, configRepo, gateway.buildCredentialPayload, wsRepo, gateway.agentBoxTlsOptions, gateway.cronService);
 
 // Auto-remember chatId from inbound messages for notifications
 channelBridge.onInbound = (channelId, chatId) => {
@@ -95,14 +95,21 @@ for (const [name, handler] of channelRpc) {
   gateway.rpcMethods.set(name, handler);
 }
 
-// --- Cron notification callback ---
-gateway.onCronNotify = (data) => {
-  const { userId, jobName, result, resultText, error } = data;
-  const text = result === "success"
-    ? `**Scheduled task "${jobName}" completed**\n\n${resultText || "(no output)"}`
-    : `**Scheduled task "${jobName}" failed**\n\n${error || "Unknown error"}`;
-  channelManager.sendUserNotification(userId, text);
-};
+// --- Start in-process cron service ---
+if (gateway.cronService) {
+  gateway.cronService.onNotify = (data) => {
+    const { userId, jobName, result, resultText, error } = data;
+    const text = result === "success"
+      ? `**Scheduled task "${jobName}" completed**\n\n${resultText || "(no output)"}`
+      : `**Scheduled task "${jobName}" failed**\n\n${error || "Unknown error"}`;
+    channelManager.sendUserNotification(userId, text);
+  };
+  gateway.cronService.start().then(() => {
+    console.log("[gateway] Cron service started");
+  }).catch((err) => {
+    console.error("[gateway] Cron service start error:", err);
+  });
+}
 
 // --- Trigger webhook subsystem ---
 // Triggers execute via the same internal agent-prompt API as cron

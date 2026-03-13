@@ -16,6 +16,7 @@ import { createDb, closeDb, type Database } from "./db/index.js";
 import { initSchema } from "./db/init-schema.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
 import { NotificationRepository } from "./db/repositories/notification-repo.js";
+import { CronService } from "./cron/cron-service.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
 import { PermissionRepository } from "./db/repositories/permission-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
@@ -100,8 +101,8 @@ export interface GatewayServer {
   rpcMethods: Map<string, RpcHandler>;
   /** Callback for webhook dispatch — set by gateway-main.ts */
   onWebhook?: (trigger: any, payload: unknown) => void;
-  /** Callback for cron job completion notifications — set by gateway-main.ts */
-  onCronNotify?: (data: { userId: string; jobName: string; result: string; resultText: string; error?: string }) => void;
+  /** In-process cron scheduler — started by gateway-main after HTTP is ready */
+  cronService: import("./cron/cron-service.js").CronService | null;
   /** Build credential payload for a specific workspace (sent in prompt body) */
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
   /** TLS options for AgentBox mTLS connections (K8s mode only) */
@@ -156,8 +157,14 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await initSchema(db);
   console.log("[gateway] Database initialized");
 
-  // Config repo for webhook route
+  // Config repo for webhook route + cron service
   const configRepo = db ? new ConfigRepository(db) : null;
+  const notifRepo = db ? new NotificationRepository(db) : null;
+
+  // In-process cron service (replaces standalone cron process)
+  const cronService = (configRepo && notifRepo)
+    ? new CronService({ configRepo, notifRepo, sendToUser, gatewayPort: config.port })
+    : null;
 
   // System config repo (used by JWT, SSO, cert-manager, metrics cache, etc.)
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
@@ -250,7 +257,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await refreshMetricsConfig();
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService);
 
   // Wrap system.saveSection to refresh caches when settings change
   const origSaveSection = rpcMethods.get("system.saveSection");
@@ -600,246 +607,6 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
     // NOTE: /api/internal/cron-list has been moved to HTTPS server (port 3002)
     // with mTLS authentication for AgentBox access only.
-
-    // ─── Internal cron coordination API (used by cron service) ────────
-    // These thin wrappers let cron-main talk to the DB through gateway,
-    // so cron never needs its own database connection.
-
-    if (url.startsWith("/api/internal/cron/") && configRepo) {
-      const cronPath = url.replace("/api/internal/cron/", "").split("?")[0];
-      const fullUrl = new URL(req.url!, `http://${req.headers.host}`);
-
-      // POST endpoints
-      if (method === "POST") {
-        let body = "";
-        req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-        req.on("end", async () => {
-          try {
-            const data = body ? JSON.parse(body) : {};
-
-            if (cronPath === "register") {
-              await configRepo.registerCronInstance(data.instanceId, data.endpoint);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "heartbeat") {
-              await configRepo.updateHeartbeat(data.instanceId, data.jobCount);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "delete-instance") {
-              await configRepo.deleteInstance(data.instanceId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "release-jobs") {
-              await configRepo.releaseInstanceJobs(data.instanceId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "claim-job") {
-              const claimed = await configRepo.claimUnassignedJob(data.jobId, data.instanceId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ claimed }));
-              return;
-            }
-
-            if (cronPath === "job-run") {
-              await configRepo.updateCronJobRun(data.jobId, data.result);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "reassign-jobs") {
-              await configRepo.reassignOrphanedJobs(data.fromInstanceId, data.toInstanceId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "lock-job") {
-              if (!data.jobId || !data.executionId) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
-                return;
-              }
-              const locked = await configRepo.lockJobForExecution(data.jobId, data.executionId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ locked }));
-              return;
-            }
-
-            if (cronPath === "unlock-job") {
-              if (!data.jobId || !data.executionId) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: "jobId and executionId are required" }));
-                return;
-              }
-              await configRepo.unlockJob(data.jobId, data.executionId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            if (cronPath === "clear-stale-locks") {
-              if (typeof data.thresholdMs !== "number" || data.thresholdMs <= 0) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: "thresholdMs must be a positive number" }));
-                return;
-              }
-              await configRepo.clearStaleLocks(data.thresholdMs);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "ok" }));
-              return;
-            }
-
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Unknown cron POST endpoint" }));
-          } catch (err) {
-            console.error(`[gateway] cron/${cronPath} error:`, err);
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        });
-        return;
-      }
-
-      // GET endpoints
-      if (method === "GET") {
-        (async () => {
-          try {
-            if (cronPath === "jobs") {
-              const instanceId = fullUrl.searchParams.get("instanceId");
-              const unassigned = fullUrl.searchParams.get("unassigned");
-
-              if (instanceId) {
-                const jobs = await configRepo.listCronJobsByInstance(instanceId);
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ jobs }));
-                return;
-              }
-              if (unassigned === "1") {
-                const jobs = await configRepo.getUnassignedActiveJobs();
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ jobs }));
-                return;
-              }
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "instanceId or unassigned=1 required" }));
-              return;
-            }
-
-            // GET /api/internal/cron/jobs/:id
-            if (cronPath.startsWith("jobs/")) {
-              const jobId = cronPath.slice("jobs/".length);
-              const job = await configRepo.getCronJobById(jobId);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ job }));
-              return;
-            }
-
-            if (cronPath === "dead-instances") {
-              const thresholdMs = parseInt(fullUrl.searchParams.get("thresholdMs") || "90000", 10);
-              const instances = await configRepo.getDeadInstances(thresholdMs);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ instances }));
-              return;
-            }
-
-            if (cronPath === "least-loaded") {
-              const thresholdMs = parseInt(fullUrl.searchParams.get("thresholdMs") || "90000", 10);
-              const instance = await configRepo.getLeastLoadedInstance(thresholdMs);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ instance }));
-              return;
-            }
-
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Unknown cron GET endpoint" }));
-          } catch (err) {
-            console.error(`[gateway] cron/${cronPath} error:`, err);
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Internal server error" }));
-          }
-        })();
-        return;
-      }
-    }
-
-    // Internal cron notification endpoint: POST /api/internal/cron-notify
-    if (url === "/api/internal/cron-notify" && method === "POST") {
-      let body = "";
-      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-      req.on("end", async () => {
-        try {
-          const data = JSON.parse(body) as {
-            userId: string; jobId: string; jobName: string;
-            result: "success" | "failure"; resultText: string; error?: string;
-            durationMs?: number;
-          };
-
-          // 1. Write execution history + notification to DB
-          if (db) {
-            // Persist run record
-            try {
-              const configRepo = new ConfigRepository(db);
-              await configRepo.insertCronJobRun({
-                jobId: data.jobId,
-                status: data.result,
-                resultText: data.resultText || undefined,
-                error: data.error,
-                durationMs: data.durationMs,
-              });
-            } catch (runErr) {
-              console.warn("[gateway] Failed to insert cron run:", runErr instanceof Error ? runErr.message : runErr);
-            }
-            const notifRepo = new NotificationRepository(db);
-            const notifType = data.result === "success" ? "cron_success" : "cron_failure";
-            const notifMessage = data.result === "success" ? data.resultText : (data.error || "Unknown error");
-            const notifId = await notifRepo.create({
-              userId: data.userId,
-              type: notifType,
-              title: data.jobName,
-              message: notifMessage,
-              relatedId: data.jobId,
-            });
-
-            // 2. Push via WebSocket (include all fields so frontend renders correctly)
-            sendToUser(data.userId, "notification", {
-              id: notifId,
-              type: notifType,
-              title: data.jobName,
-              message: notifMessage,
-              relatedId: data.jobId,
-              isRead: false,
-              createdAt: new Date().toISOString(),
-            });
-          }
-
-          // 3. Delegate to channel push via callback
-          if (gatewayServer.onCronNotify) {
-            gatewayServer.onCronNotify(data);
-          }
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok" }));
-        } catch (err) {
-          console.error("[gateway] cron-notify error:", err);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
-        }
-      });
-      return;
-    }
 
     // Internal agent-prompt endpoint: POST /api/internal/agent-prompt
     // Synchronous execution — waits for agent to finish and returns result text.
@@ -1424,9 +1191,11 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     bindCodeStore,
     db,
     rpcMethods,
+    cronService,
     buildCredentialPayload,
     agentBoxTlsOptions,
     async close() {
+      cronService?.stop();
       bindCodeStore.dispose();
       await agentBoxManager.cleanup();
       for (const ws of clients) {
