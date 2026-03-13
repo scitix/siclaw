@@ -45,8 +45,9 @@ COPY --from=builder /app/dist/ ./dist/
 # Copy web frontend from builder
 COPY --from=builder /app/src/gateway/web/dist/ ./dist/gateway/web/dist/
 
-# Copy core skills (baked-in, always available)
+# Copy builtin skills (baked-in, always available)
 COPY skills/core/ ./skills/core/
+COPY skills/extension/ ./skills/extension/
 
 # Create data directory
 RUN mkdir -p .siclaw
