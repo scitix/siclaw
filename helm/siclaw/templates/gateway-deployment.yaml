@@ -50,6 +50,10 @@ spec:
             - name: SICLAW_PERSISTENCE_SIZE
               value: {{ .Values.agentbox.persistence.size | quote }}
             {{- end }}
+            {{- if .Values.agentbox.debugImage }}
+            - name: SICLAW_DEBUG_IMAGE
+              value: {{ .Values.agentbox.debugImage | quote }}
+            {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
             - name: SICLAW_CRON_SERVICE_URL

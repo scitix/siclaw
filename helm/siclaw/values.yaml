@@ -32,6 +32,7 @@ agentbox:
     registry: ""        # defaults to image.registry
     repository: ""      # defaults to "siclaw-agentbox"
     tag: ""             # defaults to image.tag
+  debugImage: ""        # Debug pod image for node_exec/node_script (default: "busybox:latest")
   # User data persistence (memory, investigations, sessions)
   persistence:
     enabled: false          # set to true to persist user memory across pod restarts
