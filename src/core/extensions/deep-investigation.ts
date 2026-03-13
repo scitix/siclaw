@@ -597,6 +597,11 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // --- session_start: restore persisted state ---
 
   api.on("session_start", async (_event, ctx) => {
+    // Clean up stale feedback prompt from previous session
+    feedbackCleanup?.();
+    deepSearchRan = false;
+    pendingFeedbackId = null;
+
     // Reset state — each session starts clean (prevents bleed from previous session)
     checklist = null;
 
@@ -654,7 +659,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
   // --- tool_result: progress cleanup (no auto-mark) ---
 
-  api.on("tool_result", (event) => {
+  api.on("tool_result", (event, ctx) => {
     if (event.toolName === "deep_search") {
       // Progress rendering cleanup
       if (activeUI) {
@@ -668,6 +673,12 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       deepSearchRan = true;
       const details = event.details as Record<string, unknown> | undefined;
       pendingFeedbackId = (details?.investigationId as string) ?? null;
+
+      // Standalone deep_search (no DP mode): show feedback immediately since
+      // disableDpMode() won't fire. Guard with !checklist to avoid double-prompting.
+      if (!checklist) {
+        showFeedbackIfNeeded(ctx);
+      }
     }
   });
 
