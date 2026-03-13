@@ -27,7 +27,7 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 `LocalSpawner` runs ALL AgentBox instances **in-process with Gateway**, sharing the same filesystem. This means:
 
 - `skillsHandler.materialize()` **must NOT be called in local mode** — it wipes `skillsDir` entirely, destroying `skills/core/` and other users' data
-- Local skills sync must write only to `skills/team/` and `skills/user/{userId}/` scoped paths
+- Local skills sync must write only to `skills/user/{userId}/` scoped paths (team skills are included in the user bundle, not written to a separate `skills/team/` directory)
 - Any component designed for K8s pod isolation is **not directly reusable** in local mode
 
 ### 🔴 Skill Bundle Contract
