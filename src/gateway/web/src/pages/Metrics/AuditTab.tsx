@@ -143,10 +143,10 @@ export function AuditTab() {
         }
     }, [sendRpc, isAdmin, filterUser, filterTool, filterStatus, filterRange]);
 
-    // Auto-load on mount when connected
+    // Auto-load on mount and re-search when filters change
     useEffect(() => {
-        if (isConnected && !searched) doSearch();
-    }, [isConnected, searched, doSearch]);
+        if (isConnected) doSearch();
+    }, [isConnected, filterTool, filterStatus, filterRange]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const loadMore = useCallback(() => {
         if (logs.length === 0) return;
