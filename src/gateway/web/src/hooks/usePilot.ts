@@ -651,14 +651,14 @@ export function usePilot() {
                     // The backend agent_end handler sends dp-checklist-sync, but
                     // it's async and may not arrive before SSE closes (race condition).
                     // Mirror the backend logic here to ensure frontend consistency.
-                    // Skip if hypotheses phase isn't done yet — model is waiting
+                    // Only skip if hypotheses phase isn't done yet — model is waiting
                     // for user confirmation (gate blocked), not truly finished.
                     setDpChecklist(prev => {
                         if (!prev) return prev;
-                        const dsItem = prev.find(i => i.id === 'deep_search');
-                        // If deep_search hasn't been done, the investigation is still in progress
-                        // (either waiting for hypothesis confirmation or hasn't started deep_search yet)
-                        if (!dsItem || dsItem.status !== 'done') return prev;
+                        const hypoItem = prev.find(i => i.id === 'hypotheses');
+                        // If hypotheses phase isn't done, the agent is likely waiting
+                        // for user confirmation — don't auto-complete
+                        if (hypoItem && hypoItem.status !== 'done' && hypoItem.status !== 'skipped') return prev;
                         const hasIncomplete = prev.some(i => i.status === 'pending' || i.status === 'in_progress');
                         if (!hasIncomplete) return prev;
                         const completed = prev.map(i =>
