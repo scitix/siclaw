@@ -818,8 +818,8 @@ function buildPastDiagnosticContext(records: InvestigationRecord[]): string {
  */
 function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
   // Count occurrences and track max confidence, keyed by normalized text.
-  // Feedback signal weights the count: confirmed boosts, rejected suppresses.
-  const validated = new Map<string, { displayText: string; count: number; maxConfidence: number }>();
+  // Raw count is used for display; weightedScore (feedback-adjusted) is used for sorting.
+  const validated = new Map<string, { displayText: string; rawCount: number; weightedScore: number; maxConfidence: number }>();
   for (const rec of records) {
     const feedbackSignal = rec.feedbackSignal ?? 1.0;
     for (const h of rec.hypotheses) {
@@ -828,19 +828,20 @@ function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
         const adjustedConfidence = Math.round(h.confidence * feedbackSignal);
         const existing = validated.get(key);
         if (existing) {
-          existing.count += feedbackSignal;
+          existing.rawCount++;
+          existing.weightedScore += feedbackSignal;
           existing.maxConfidence = Math.max(existing.maxConfidence, adjustedConfidence);
         } else {
-          validated.set(key, { displayText: h.text, count: feedbackSignal, maxConfidence: adjustedConfidence });
+          validated.set(key, { displayText: h.text, rawCount: 1, weightedScore: feedbackSignal, maxConfidence: adjustedConfidence });
         }
       }
     }
   }
 
   return [...validated.entries()]
-    .sort((a, b) => b[1].count - a[1].count)
-    .map(([, { displayText, count, maxConfidence }]) =>
-      `- "${displayText}" (validated ${Math.round(count)} time${Math.round(count) !== 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
+    .sort((a, b) => b[1].weightedScore - a[1].weightedScore)
+    .map(([, { displayText, rawCount, maxConfidence }]) =>
+      `- "${displayText}" (validated ${rawCount} time${rawCount !== 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
     );
 }
 

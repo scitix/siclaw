@@ -251,6 +251,17 @@ export function InvestigationCard({ message, progress, sendMessage, updateMessag
     const [correctionText, setCorrectionText] = useState('');
     const investigationId = message.toolDetails?.investigationId as string | undefined;
 
+    const handleFeedbackSubmit = () => {
+        if (!feedbackStatus || !investigationId) return;
+        const text = correctionText.trim();
+        const msg = text
+            ? `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId} ${text}`
+            : `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId}`;
+        sendMessage?.(msg);
+        updateMessageMeta?.(message.id, { investigationFeedback: feedbackStatus });
+        setFeedbackState('submitted');
+    };
+
     // Parse structured data from completed result
     const parsed = !isRunning ? parseInvestigationResult(message.content) : null;
 
@@ -592,30 +603,12 @@ export function InvestigationCard({ message, progress, sendMessage, updateMessag
                                 placeholder={feedbackStatus === 'corrected' ? 'The actual root cause was...' : 'Optional note...'}
                                 value={correctionText}
                                 onChange={(e) => setCorrectionText(e.target.value)}
-                                onKeyDown={(e) => {
-                                    if (e.key === 'Enter') {
-                                        const text = correctionText.trim();
-                                        const msg = text
-                                            ? `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId} ${text}`
-                                            : `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId}`;
-                                        sendMessage?.(msg);
-                                        updateMessageMeta?.(message.id, { investigationFeedback: feedbackStatus });
-                                        setFeedbackState('submitted');
-                                    }
-                                }}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleFeedbackSubmit(); }}
                             />
                             <button
                                 type="button"
                                 className="text-xs px-3 py-1.5 rounded-md bg-blue-500 text-white hover:bg-blue-600 transition-colors cursor-pointer"
-                                onClick={() => {
-                                    const text = correctionText.trim();
-                                    const msg = text
-                                        ? `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId} ${text}`
-                                        : `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId}`;
-                                    sendMessage?.(msg);
-                                    updateMessageMeta?.(message.id, { investigationFeedback: feedbackStatus });
-                                    setFeedbackState('submitted');
-                                }}
+                                onClick={handleFeedbackSubmit}
                             >
                                 Submit
                             </button>
