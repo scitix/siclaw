@@ -72,7 +72,10 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
   try {
     const a = new URL(kubeconfigServer);
     const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
-    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
+    if (a.hostname !== b.hostname) return false;
+    // If envApiServer has no explicit port, match on hostname only (e.g. user omitted :6443)
+    if (!b.port) return true;
+    return (a.port || "443") === b.port;
   } catch {
     // If URL parsing fails, reject the match — don't fall back to loose comparison
     return false;
@@ -4139,10 +4142,18 @@ export function createRpcMethods(
         credentials[c.type] = (credentials[c.type] || 0) + 1;
       }
     }
-    if (userEnvConfigRepo) {
-      const envConfigs = await userEnvConfigRepo.listForUser(userId);
-      if (envConfigs.length > 0) {
-        credentials["kubeconfig"] = envConfigs.length;
+    if (envRepo && userEnvConfigRepo) {
+      const allEnvs = await envRepo.list();
+      let kubeconfigCount = 0;
+      for (const env of allEnvs) {
+        // Count if user has a personal kubeconfig, OR if it's a test env with a default kubeconfig
+        const userConfig = await userEnvConfigRepo.get(userId, env.id);
+        if (userConfig?.kubeconfig || (env.isTest && env.defaultKubeconfig)) {
+          kubeconfigCount++;
+        }
+      }
+      if (kubeconfigCount > 0) {
+        credentials["kubeconfig"] = kubeconfigCount;
       }
     }
 
