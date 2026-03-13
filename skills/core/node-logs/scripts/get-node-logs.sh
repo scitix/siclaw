@@ -54,18 +54,28 @@ if [[ -n "$UNIT" && -n "$FILE" ]]; then
   exit 1
 fi
 
-# Build and execute the command
-CMD=""
-if [[ -n "$UNIT" ]]; then
-  CMD="journalctl -u '$UNIT' --since '$SINCE' --no-pager"
-else
-  CMD="cat '$FILE'"
+# Validate --tail is a positive integer
+if ! [[ "$TAIL" =~ ^[0-9]+$ ]]; then
+  echo "Error: --tail must be a positive integer, got: $TAIL" >&2
+  exit 1
 fi
 
-[[ -n "$GREP" ]] && CMD="$CMD | grep -i '$GREP'"
-CMD="$CMD | tail -$TAIL"
+# Execute using native bash pipelines — no sh -c string interpolation.
+fetch_logs() {
+  if [[ -n "$UNIT" ]]; then
+    journalctl -u "$UNIT" --since "$SINCE" --no-pager 2>&1
+  else
+    cat -- "$FILE" 2>&1
+  fi
+}
 
-OUTPUT=$(sh -c "$CMD" 2>&1) || true
+OUTPUT=$(
+  if [[ -n "$GREP" ]]; then
+    fetch_logs | grep -i -- "$GREP" | tail -n "$TAIL"
+  else
+    fetch_logs | tail -n "$TAIL"
+  fi
+) || true
 
 if [[ -z "$OUTPUT" ]]; then
   if [[ -n "$UNIT" ]]; then
