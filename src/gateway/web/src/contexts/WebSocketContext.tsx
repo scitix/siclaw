@@ -27,7 +27,8 @@ export interface WebSocketContextValue {
 
 export const WebSocketContext = createContext<WebSocketContextValue | null>(null);
 
-const RECONNECT_DELAYS = [300, 600, 1200, 2500, 5000];
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
 
 export function WebSocketProvider({ children }: { children: ReactNode }) {
     const [status, setStatus] = useState<WsStatus>('disconnected');
@@ -49,9 +50,12 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
 
     const scheduleReconnect = useCallback(() => {
         if (intentionalCloseRef.current || !isAuthenticated()) return;
-        const delay = RECONNECT_DELAYS[Math.min(reconnectAttemptRef.current, RECONNECT_DELAYS.length - 1)];
+        // Exponential backoff with jitter: base * 2^attempt + random jitter, capped at max
+        const exponential = RECONNECT_BASE_MS * Math.pow(2, reconnectAttemptRef.current);
+        const jitter = Math.random() * RECONNECT_BASE_MS;
+        const delay = Math.min(exponential + jitter, RECONNECT_MAX_MS);
         reconnectAttemptRef.current++;
-        console.log(`[ws] Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
+        console.log(`[ws] Reconnecting in ${Math.round(delay)}ms (attempt ${reconnectAttemptRef.current})`);
         reconnectTimerRef.current = setTimeout(() => {
             connect();
         }, delay);
