@@ -22,6 +22,7 @@ import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -140,10 +141,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     // Write credential files with path traversal validation
     for (const file of payload.files) {
-      const resolved = path.resolve(credDir, file.name);
-      if (!resolved.startsWith(credDir + path.sep) && resolved !== credDir) {
-        throw new Error(`Invalid credential file name: ${file.name}`);
-      }
+      const resolved = resolveUnderDir(credDir, file.name);
       fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
     }
 

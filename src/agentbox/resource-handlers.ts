@@ -19,6 +19,7 @@ import type {
   ReloadContext,
 } from "../shared/resource-sync.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
 
@@ -98,7 +99,7 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     for (const skill of payload.skills) {
       // Write into scope subdirectory so getSkillScriptDirs() layer 2 matches naturally
       const scopeDir = skill.scope === "personal" ? "user" : "team";
-      const skillDir = path.join(skillsDir, scopeDir, skill.dirName);
+      const skillDir = resolveUnderDir(skillsDir, scopeDir, skill.dirName);
       fs.mkdirSync(skillDir, { recursive: true });
 
       if (skill.specs) {
@@ -109,7 +110,8 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
         const scriptsDir = path.join(skillDir, "scripts");
         fs.mkdirSync(scriptsDir, { recursive: true });
         for (const script of skill.scripts) {
-          fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
+          const scriptPath = resolveUnderDir(scriptsDir, script.name);
+          fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
         }
       }
     }
