@@ -38,6 +38,12 @@ Check which CNI is running:
 kubectl get pods -n kube-system -o custom-columns='NAME:.metadata.name' | grep -E 'calico|cilium|weave|antrea|flannel|canal|kube-router'
 ```
 
+If no results, the CNI may run in a different namespace (e.g., `cilium` in `cilium` namespace, `calico` in `calico-system`). Check other namespaces or inspect the node's CNI config:
+
+```bash
+kubectl get pods -A -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name' | grep -E 'calico|cilium|weave|antrea|flannel|canal|kube-router'
+```
+
 | CNI | NetworkPolicy support |
 |-----|----------------------|
 | Calico | Yes |
@@ -75,14 +81,17 @@ Get the pod's labels:
 kubectl get pod <pod> -n <ns> -o jsonpath='{.metadata.labels}'
 ```
 
-Get all NetworkPolicies with their pod selectors:
+Get all NetworkPolicies with their full pod selectors:
 
 ```bash
-kubectl get networkpolicy -n <ns> -o custom-columns='NAME:.metadata.name,POD-SELECTOR:.spec.podSelector.matchLabels'
+kubectl get networkpolicy -n <ns> -o custom-columns='NAME:.metadata.name,SELECTOR:.spec.podSelector'
 ```
 
+Note: `podSelector` can use both `matchLabels` (exact key-value pairs) and `matchExpressions` (operators like `In`, `NotIn`, `Exists`, `DoesNotExist`). The command above shows both forms. If the output is truncated, use `-o yaml` to see the full selector.
+
 A NetworkPolicy affects the pod if:
-- The policy's `podSelector` matches a **subset** of the pod's labels
+- The policy's `podSelector.matchLabels` matches a **subset** of the pod's labels
+- The policy's `podSelector.matchExpressions` conditions are satisfied by the pod's labels (e.g., `{key: tier, operator: Exists}` matches any pod with a `tier` label)
 - An **empty podSelector** (`{}`) matches ALL pods in the namespace
 
 List the matching policies — these are the ones controlling the pod's traffic.
@@ -126,7 +135,26 @@ spec:
 
 If a default-deny policy exists, ALL traffic to/from pods in the namespace is blocked unless another NetworkPolicy explicitly allows it.
 
-### 5. Diagnose blocked ingress (incoming traffic to the pod)
+### 5. Determine which directions a policy controls
+
+Before diagnosing ingress or egress, first confirm which direction(s) each matching policy actually controls. This depends on the `policyTypes` field:
+
+```bash
+kubectl get networkpolicy <policy-name> -n <ns> -o jsonpath='{.spec.policyTypes}'
+```
+
+| `policyTypes` value | Ingress controlled? | Egress controlled? |
+|---------------------|--------------------|--------------------|
+| `[Ingress]` | Yes | No — egress is unrestricted |
+| `[Egress]` | No — ingress is unrestricted | Yes |
+| `[Ingress, Egress]` | Yes | Yes |
+| *Omitted entirely* | Yes (always implied) | Only if `egress` rules exist |
+
+**The omitted case is a common trap:** If `policyTypes` is not specified but the policy has `ingress` rules and no `egress` rules, only ingress is controlled — egress remains fully open. If both `ingress` and `egress` rules are present (even empty), both directions are controlled.
+
+If the connectivity issue is incoming traffic, focus on policies that control ingress (step 6). If outgoing, focus on egress (step 7). Do not waste time analyzing a direction the policy does not control.
+
+### 6. Diagnose blocked ingress (incoming traffic to the pod)
 
 If external pods or services cannot reach the target pod, check the ingress rules of all matching policies.
 
@@ -179,7 +207,7 @@ ingress:
 
 If the source is connecting on a different port, it will be blocked even if the `from` selector matches.
 
-### 6. Diagnose blocked egress (outgoing traffic from the pod)
+### 7. Diagnose blocked egress (outgoing traffic from the pod)
 
 If the pod cannot reach other services or external endpoints, check the egress rules.
 
@@ -198,13 +226,17 @@ If any egress NetworkPolicy is applied to a pod, DNS traffic (UDP/TCP port 53) m
 ```yaml
 egress:
 - to:
-  - namespaceSelector: {}   # kube-system is in a different namespace
+  - namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
   ports:
   - protocol: UDP
     port: 53
   - protocol: TCP
     port: 53
 ```
+
+Note: The example above targets only `kube-system` where CoreDNS runs. A broader alternative is `namespaceSelector: {}` (matches all namespaces), which is simpler but allows port 53 traffic to any namespace. When diagnosing, check whether ANY rule allows UDP/TCP 53 — the specificity of the namespace selector is a security concern but not a functionality blocker.
 
 **Symptoms of blocked DNS egress:**
 - `nslookup` times out from the pod
@@ -213,7 +245,7 @@ egress:
 
 If the user reports DNS timeouts and the pod has an egress NetworkPolicy, check DNS port allowance FIRST before investigating CoreDNS with `dns-debug`.
 
-### 7. Cross-namespace communication
+### 8. Cross-namespace communication
 
 When pods in different namespaces need to communicate, NetworkPolicies on BOTH sides may need to allow the traffic:
 
@@ -242,8 +274,9 @@ If the namespace lacks the expected labels, the `namespaceSelector` will not mat
 
 - **No policy = allow all.** NetworkPolicy is not deny-by-default at the cluster level. Only pods explicitly selected by at least one NetworkPolicy have restrictions. This means adding the FIRST NetworkPolicy to a namespace can suddenly break existing communication.
 - **Policies are additive.** If policy A allows port 80 and policy B allows port 443 for the same pod, both ports are allowed. Policies never subtract permissions from each other.
-- **`policyTypes` matters.** If a NetworkPolicy has `policyTypes: [Ingress]` but no `ingress` rules, it denies all ingress. But if `policyTypes` is omitted, the policy only applies to directions that have rules defined.
+- **`policyTypes` matters.** See step 5 for the full behavior matrix. Misunderstanding which direction a policy controls is a common cause of wasted debugging effort.
 - **CIDR ranges and pod IPs.** Using `ipBlock` with pod CIDR ranges is fragile — pod IPs change. Prefer `podSelector` / `namespaceSelector` for in-cluster traffic. `ipBlock` is best for external IPs.
 - **Service mesh interaction.** If the cluster runs Istio, Linkerd, or similar service meshes, traffic may be additionally controlled by the mesh's own policies (AuthorizationPolicy, etc.). NetworkPolicy operates at L3/L4, while service mesh policies typically operate at L7.
 - **GPU clusters: multi-NIC / RDMA traffic is NOT affected by NetworkPolicy.** In GPU training clusters, pods typically have multiple network interfaces: a primary NIC (eth0) managed by the CNI, and secondary NICs (net1, etc.) for RDMA/InfiniBand/RoCE provisioned via Multus + SR-IOV or host-device plugin. NetworkPolicy only applies to the **primary CNI-managed interface**. RDMA/NCCL traffic on secondary interfaces bypasses CNI entirely and is invisible to NetworkPolicy. If a training job's GPU-to-GPU communication (NCCL) fails, NetworkPolicy is NOT the cause — investigate the RDMA network instead. If the same pod cannot reach the API server, download data, or resolve DNS, those go through the primary NIC and CAN be blocked by NetworkPolicy.
+- **Quick verification:** To confirm a NetworkPolicy is the cause, test connectivity from a pod in the same namespace that is NOT selected by any NetworkPolicy (or from a different namespace without policies). If the same connection works from the unaffected pod, the NetworkPolicy is confirmed as the blocker.
 - For cross-reference: if DNS is timing out, check egress rules here first, then use `dns-debug`. If Service endpoints exist but connections fail, check ingress rules here, then use `service-debug`.
