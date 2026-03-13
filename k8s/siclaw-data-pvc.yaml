@@ -1,5 +1,13 @@
-# Data PV — gateway SQLite database + JWT secret + local state
-# Only needed in SQLite mode (default). Not required when using MySQL.
+# Shared data PVC — user memory, investigations, sessions.
+# Also used for gateway SQLite database in non-MySQL deployments.
+#
+# This single PVC is shared by gateway and all AgentBox pods.
+# Gateway creates per-user subdirectories (users/{userId}/{workspaceId}/);
+# AgentBox pods mount via subPath for isolation.
+#
+# Requirements:
+#   - Must support ReadWriteMany (e.g. NFS, CephFS, EFS)
+#   - Must be created before deploying siclaw
 #
 # Deploy: kubectl apply -f k8s/siclaw-data-pvc.yaml -n siclaw
 
@@ -13,8 +21,8 @@ metadata:
     component: data
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   storageClassName: nfs
   resources:
     requests:
-      storage: 1Gi
+      storage: 10Gi

@@ -33,12 +33,13 @@ agentbox:
     repository: ""      # defaults to "siclaw-agentbox"
     tag: ""             # defaults to image.tag
   debugImage: ""        # Debug pod image for node_exec/node_script (default: "busybox:latest")
-  # User data persistence (memory, investigations, sessions)
+  # User data persistence (memory, investigations, sessions).
+  # Uses a single shared PVC; gateway creates per-user subdirectories,
+  # AgentBox pods mount via subPath. No dynamic provisioning required.
   persistence:
     enabled: false          # set to true to persist user memory across pod restarts
-    storageClass: ""        # required when enabled (e.g. "nfs-client", "efs-sc", "cephfs")
-    accessMode: ReadWriteMany
-    size: "1Gi"             # per-user PVC size
+    claimName: "siclaw-data"  # name of pre-existing shared PVC (must support ReadWriteMany)
+    mountPath: "/app/.siclaw/user-data"  # gateway mount path (env + volumeMount must match)
 
 # -- Database (MySQL — SQLite is not supported in K8s mode)
 database:

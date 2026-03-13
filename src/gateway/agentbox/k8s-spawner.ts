@@ -5,6 +5,8 @@
  */
 
 import * as k8s from "@kubernetes/client-node";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo, AgentBoxStatus } from "./types.js";
 import { CertificateManager } from "../security/cert-manager.js";
@@ -18,12 +20,14 @@ export interface K8sSpawnerConfig {
   imagePullPolicy?: "Always" | "IfNotPresent" | "Never";
   /** Pod label prefix */
   labelPrefix?: string;
-  /** User data persistence (memory, sessions) */
+  /** Shared PVC for user data persistence (memory, sessions).
+   *  Gateway creates per-user subdirectories; AgentBox pods mount via subPath. */
   persistence?: {
     enabled: boolean;
-    storageClass: string;
-    accessMode: string;  // e.g. "ReadWriteMany"
-    size: string;        // e.g. "1Gi"
+    /** Name of the pre-existing shared PVC (e.g. "siclaw-data") */
+    claimName: string;
+    /** Local mount path of the shared PVC on the gateway (default: "/app/.siclaw/user-data") */
+    mountPath?: string;
   };
 }
 
@@ -102,8 +106,6 @@ export class K8sSpawner implements BoxSpawner {
       // Pod doesn't exist, proceed to create
     }
 
-
-
     // Issue client certificate for mTLS authentication (env encoded in cert)
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
     const podEnv: "prod" | "dev" | "test" = boxConfig.podEnv ?? "prod";
@@ -177,12 +179,13 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
-    // Ensure per-user PVC if persistence is enabled
+    // Ensure per-user subdirectory on shared PVC
+    const safeUserId = this.sanitizePathSegment(userId);
+    const safeWorkspaceId = this.sanitizePathSegment(workspaceId);
     if (this.config.persistence?.enabled) {
-      if (!workspaceId || (workspaceId === "default" && !boxConfig.workspaceId)) {
-        console.warn(`[k8s-spawner] Persistence enabled but no explicit workspaceId — using "default"`);
-      }
-      await this.ensureUserPvc(userId);
+      const subDir = `users/${safeUserId}/${safeWorkspaceId}`;
+      console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
+      this.ensureUserDir(safeUserId, safeWorkspaceId);
     }
 
     // Pod definition
@@ -228,7 +231,7 @@ export class K8sSpawner implements BoxSpawner {
           this.config.persistence?.enabled
             ? {
                 name: "user-data",
-                persistentVolumeClaim: { claimName: this.userPvcName(userId) },
+                persistentVolumeClaim: { claimName: this.config.persistence.claimName },
               }
             : {
                 name: "user-data",
@@ -276,9 +279,9 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
-                subPath: this.config.persistence?.enabled
-                  ? workspaceId.replace(/[^a-zA-Z0-9-]/g, "_")
-                  : `user/${userId}/agent-data`,
+                ...(this.config.persistence?.enabled
+                  ? { subPath: `users/${safeUserId}/${safeWorkspaceId}` }
+                  : {}),
               },
               {
                 name: "client-cert",
@@ -336,53 +339,24 @@ export class K8sSpawner implements BoxSpawner {
     };
   }
 
-  /**
-   * Generate PVC name for a user
-   */
-  private userPvcName(userId: string): string {
-    return `siclaw-user-${userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50)}`;
+  /** Sanitize a path segment — keep only safe characters for directory names and K8s subPath. */
+  private sanitizePathSegment(segment: string): string {
+    return segment.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
   }
 
   /**
-   * Ensure per-user PVC exists (idempotent)
+   * Ensure per-user subdirectory exists on the shared PVC (synchronous, idempotent).
+   * Expects already-sanitized path segments.
+   * Directory layout: `{mountPath}/users/{safeUserId}/{safeWorkspaceId}/`
    */
-  private async ensureUserPvc(userId: string): Promise<void> {
-    const { namespace } = this.config;
-    const pvcName = this.userPvcName(userId);
-
-    try {
-      await this.coreApi.readNamespacedPersistentVolumeClaim({ name: pvcName, namespace });
-      // PVC already exists
-    } catch (err: any) {
-      if (err.code === 404 || err.statusCode === 404) {
-        console.log(`[k8s-spawner] Creating User PVC: ${pvcName}`);
-        await this.coreApi.createNamespacedPersistentVolumeClaim({
-          namespace,
-          body: {
-            apiVersion: "v1",
-            kind: "PersistentVolumeClaim",
-            metadata: {
-              name: pvcName,
-              namespace,
-              labels: {
-                [`${this.config.labelPrefix}/app`]: "agentbox",
-                [`${this.config.labelPrefix}/user`]: userId,
-                [`${this.config.labelPrefix}/type`]: "user-data",
-              },
-            },
-            spec: {
-              accessModes: [this.config.persistence!.accessMode],
-              storageClassName: this.config.persistence!.storageClass || undefined,
-              resources: {
-                requests: { storage: this.config.persistence!.size },
-              },
-            },
-          },
-        });
-      } else {
-        throw err;
-      }
+  private ensureUserDir(safeUserId: string, safeWorkspaceId: string): void {
+    const mountPath = this.config.persistence?.mountPath || "/app/.siclaw/user-data";
+    const base = path.resolve(mountPath);
+    const userDir = path.join(base, "users", safeUserId, safeWorkspaceId);
+    if (!userDir.startsWith(base)) {
+      throw new Error(`[k8s-spawner] Path traversal detected: ${userDir}`);
     }
+    fs.mkdirSync(userDir, { recursive: true });
   }
 
   /**

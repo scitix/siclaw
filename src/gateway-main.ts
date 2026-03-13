@@ -27,9 +27,8 @@ const spawner = useK8s
       persistence: process.env.SICLAW_PERSISTENCE_ENABLED === "true"
         ? {
             enabled: true,
-            storageClass: process.env.SICLAW_PERSISTENCE_STORAGE_CLASS || "",
-            accessMode: process.env.SICLAW_PERSISTENCE_ACCESS_MODE || "ReadWriteMany",
-            size: process.env.SICLAW_PERSISTENCE_SIZE || "1Gi",
+            claimName: process.env.SICLAW_PERSISTENCE_CLAIM_NAME || "siclaw-data",
+            mountPath: process.env.SICLAW_PERSISTENCE_MOUNT_PATH || "/app/.siclaw/user-data",
           }
         : undefined,
     })
