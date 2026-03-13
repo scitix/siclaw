@@ -8,6 +8,8 @@ import {
   createChecklist,
   buildActivationMessage,
 } from "../../tools/dp-tools.js";
+import type { MemoryRef } from "../../tools/deep-search/tool.js";
+import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
 
 
 /**
@@ -156,10 +158,13 @@ function formatHypothesesWidget(text: string, theme: any): string[] {
 
 // --- Extension ---
 
-export default function deepInvestigationExtension(api: ExtensionAPI): void {
+export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?: MemoryRef): void {
   // --- Mode state ---
   let checklist: DpChecklist | null = null;
   let pendingActivation = false;
+  let pendingFeedbackId: string | null = null;
+  let deepSearchRan = false;
+  let feedbackCleanup: (() => void) | null = null;
 
   // --- Progress rendering state ---
   let activeUI: ExtensionUIContext | null = null;
@@ -209,13 +214,53 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
     pendingActivation = true;
   }
 
+  /** Show feedback hint in status bar if deep_search ran. Can be called independently of DP mode exit. */
+  function showFeedbackIfNeeded(ctx: ExtensionContext): void {
+    if (!deepSearchRan || !ctx.hasUI) {
+      deepSearchRan = false;
+      pendingFeedbackId = null;
+      return;
+    }
+    deepSearchRan = false;
+    const id = pendingFeedbackId;
+    pendingFeedbackId = null;
+
+    const cleanup = () => {
+      ctx.ui.setStatus("dp-mode", undefined);
+      unsubInput();
+      clearTimeout(timer);
+      feedbackCleanup = null;
+    };
+
+    const timer = setTimeout(cleanup, 60_000);
+
+    const unsubInput = ctx.ui.onTerminalInput((data: string) => {
+      if (ctx.ui.getEditorText().length > 0) return undefined;
+      const keyMap: Record<string, FeedbackStatus> = { "1": "confirmed", "2": "corrected", "3": "rejected" };
+      const status = keyMap[data];
+      if (!status) return undefined;
+
+      if (id && memoryRef?.indexer) {
+        memoryRef.indexer.updateInvestigationFeedback(id, FEEDBACK_SIGNALS[status], status);
+      }
+      ctx.ui.notify(`Feedback recorded: ${status}`);
+      cleanup();
+      return { consume: true };
+    });
+
+    feedbackCleanup = cleanup;
+    const hint = "Thanks! Rate: 1-\uD83D\uDC4D 2-\uD83D\uDC4E 3-\u274C";
+    ctx.ui.setStatus("dp-mode", isThemeUsable(ctx) ? ctx.ui.theme.fg("muted", hint) : hint);
+  }
+
   function disableDpMode(ctx: ExtensionContext): void {
     if (!checklist) return;
     checklist = null;
-    updateStatus(ctx);
     persistState();
     if (ctx.hasUI) ctx.ui.notify("Deep Investigation OFF");
     pendingActivation = false;
+    showFeedbackIfNeeded(ctx);
+    if (!feedbackCleanup) updateStatus(ctx); // only clear status if no feedback hint active
   }
 
   function toggleDpMode(ctx: ExtensionContext): void {
@@ -618,7 +663,17 @@ export default function deepInvestigationExtension(api: ExtensionAPI): void {
       }
       activeUI = null;
       resetProgressState();
+
+      // Flag that deep_search ran; capture investigationId if available
+      deepSearchRan = true;
+      const details = event.details as Record<string, unknown> | undefined;
+      pendingFeedbackId = (details?.investigationId as string) ?? null;
     }
+  });
+
+  // Clean up feedback hint when agent starts processing next message
+  api.on("agent_start", () => {
+    feedbackCleanup?.();
   });
 
   // --- context: filter UI-only custom messages ---
