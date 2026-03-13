@@ -587,12 +587,31 @@ export function usePilot() {
                     break;
                 }
 
-                case 'message_end':
+                case 'message_end': {
+                    const endMsg = payload.message as { role?: string; toolName?: string; details?: Record<string, unknown> } | undefined;
+                    if (endMsg?.role === 'toolResult' && endMsg.details && Object.keys(endMsg.details).length > 0) {
+                        // Pi-agent brain: tool result details arrive via message_end (not tool_execution_end).
+                        // Backfill toolDetails onto the matching tool message.
+                        const tName = endMsg.toolName;
+                        setMessages(prev => {
+                            // Walk backwards to find the most recent tool message with this name
+                            for (let i = prev.length - 1; i >= 0; i--) {
+                                const m = prev[i];
+                                if (m.role === 'tool' && (!tName || m.toolName === tName) && !m.toolDetails) {
+                                    const updated = [...prev];
+                                    updated[i] = { ...m, toolDetails: endMsg.details };
+                                    return updated;
+                                }
+                            }
+                            return prev;
+                        });
+                    }
                     // Mark current streaming assistant message as complete
                     setMessages(prev => prev.map(m =>
                         m.isStreaming && m.role === 'assistant' ? { ...m, isStreaming: false } : m
                     ));
                     break;
+                }
 
                 case 'auto_compaction_start':
                     setIsCompacting(true);
