@@ -99,8 +99,8 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
   }
   if (results.length > 0) return results;
 
-  // Strategy 2: Numbered lists — 1. ... / 1) ... / (1) ...
-  const numberedPattern = /^(?:\d+[.)]\s*|\(\d+\)\s*)(.+)/gm;
+  // Strategy 2: Numbered lists — 1. ... / 1) ... / (1) ... (allows leading whitespace)
+  const numberedPattern = /^\s*(?:\d+[.)]\s*|\(\d+\)\s*)(.+)/gm;
   while ((m = numberedPattern.exec(text)) !== null) {
     const line = m[1]?.trim();
     if (line && line.length > 5) results.push(extract(line));
@@ -115,14 +115,21 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
   }
   if (results.length > 0) return results;
 
-  // Strategy 4: Raw fallback — non-empty lines, strip markdown markers
-  const rawLines = text.split("\n")
-    .map((l) => l.replace(/^[#*\->\s]+/, "").trim())
-    .filter((l) => l.length > 5);
-  for (const line of rawLines.slice(0, 8)) {
-    results.push(extract(line));
+  // Strategy 4: Grouped fallback — group bullet/indented lines under their parent
+  // Mirrors HypothesesCard.tsx parseNumberedList logic to avoid splitting sub-items
+  const lines = text.split("\n");
+  let current: string | null = null;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const isSubItem = trimmed.startsWith("-") || trimmed.startsWith("*") || /^\s{2,}/.test(line);
+    if (!isSubItem && trimmed.length > 5) {
+      if (current !== null) results.push(extract(current));
+      current = trimmed;
+    }
   }
-  return results;
+  if (current !== null) results.push(extract(current));
+  return results.slice(0, 8);
 }
 
 /**
