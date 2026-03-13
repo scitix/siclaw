@@ -707,6 +707,7 @@ export async function investigate(
   const totalDurationMs = Date.now() - startTime;
 
   // Write structured investigation record to SQLite (best-effort)
+  let investigationId: string | undefined;
   if (conclusionResult.structured && options?.memoryIndexer) {
     try {
       const record: InvestigationRecord = {
@@ -730,6 +731,7 @@ export async function investigate(
         createdAt: Date.now(),
       };
       options.memoryIndexer.insertInvestigation(record);
+      investigationId = record.id;
       console.log(`[deep-search] Structured investigation record saved: ${record.rootCauseCategory} (${record.confidence}%)`);
     } catch (err) {
       console.warn(`[deep-search] Failed to save structured investigation record:`, err);
@@ -762,6 +764,7 @@ export async function investigate(
     totalDurationMs,
     timedOut,
     debugTracePath,
+    investigationId,
   };
 }
 
@@ -814,18 +817,21 @@ function buildPastDiagnosticContext(records: InvestigationRecord[]): string {
  * requires async embedding calls — left as a future improvement.
  */
 function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
-  // Count occurrences and track max confidence, keyed by normalized text
+  // Count occurrences and track max confidence, keyed by normalized text.
+  // Feedback signal weights the count: confirmed boosts, rejected suppresses.
   const validated = new Map<string, { displayText: string; count: number; maxConfidence: number }>();
   for (const rec of records) {
+    const feedbackSignal = rec.feedbackSignal ?? 1.0;
     for (const h of rec.hypotheses) {
       if (h.status === "validated" && h.text) {
         const key = normalizeHypothesisText(h.text);
+        const adjustedConfidence = Math.round(h.confidence * feedbackSignal);
         const existing = validated.get(key);
         if (existing) {
-          existing.count++;
-          existing.maxConfidence = Math.max(existing.maxConfidence, h.confidence);
+          existing.count += feedbackSignal;
+          existing.maxConfidence = Math.max(existing.maxConfidence, adjustedConfidence);
         } else {
-          validated.set(key, { displayText: h.text, count: 1, maxConfidence: h.confidence });
+          validated.set(key, { displayText: h.text, count: feedbackSignal, maxConfidence: adjustedConfidence });
         }
       }
     }
@@ -834,7 +840,7 @@ function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
   return [...validated.entries()]
     .sort((a, b) => b[1].count - a[1].count)
     .map(([, { displayText, count, maxConfidence }]) =>
-      `- "${displayText}" (validated ${count} time${count > 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
+      `- "${displayText}" (validated ${Math.round(count)} time${Math.round(count) !== 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
     );
 }
 
