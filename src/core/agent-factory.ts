@@ -457,7 +457,7 @@ export async function createSiclawSession(
       }
       return parts;
     },
-    extensionFactories: [contextPruningExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), deepInvestigationExtension, (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [contextPruningExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();
