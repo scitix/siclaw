@@ -46,10 +46,10 @@ async function main() {
     try {
       const { failed } = await syncAllResources(gatewayClient.toClientLike());
       if (failed.length > 0) {
-        console.warn(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
+        console.error(`[agentbox] Resource sync partial failure: [${failed.join(", ")}]`);
       }
     } catch (err) {
-      console.warn(`[agentbox] Resource sync failed:`, err);
+      console.error(`[agentbox] Resource sync failed:`, err);
     }
   }
 

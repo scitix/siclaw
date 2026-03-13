@@ -40,18 +40,45 @@ interface Route {
 /**
  * Parse JSON body
  */
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const BODY_TIMEOUT_MS = 30_000; // 30s
+
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    let size = 0;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      req.destroy();
+      reject(new Error("Body read timeout"));
+    }, BODY_TIMEOUT_MS);
+
+    req.on("data", (chunk: Buffer | string) => {
+      if (timedOut) return;
+      size += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        clearTimeout(timer);
+        req.destroy();
+        reject(new Error(`Body exceeds ${MAX_BODY_SIZE} byte limit`));
+        return;
+      }
+      body += chunk;
+    });
     req.on("end", () => {
+      clearTimeout(timer);
+      if (timedOut) return;
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (e) {
         reject(new Error("Invalid JSON"));
       }
     });
-    req.on("error", reject);
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -216,9 +243,15 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     // Always call when credentials payload is present — even with empty files —
     // so stale credential files from prior sessions are cleaned up.
     if (body.credentials) {
-      const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
-      if (count > 0) {
-        console.log(`[agentbox-http] Materialized ${count} credential files`);
+      try {
+        const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
+        if (count > 0) {
+          console.log(`[agentbox-http] Materialized ${count} credential files`);
+        }
+      } catch (err) {
+        console.error(`[agentbox-http] Failed to materialize credentials for session ${managed.id}:`, err);
+        sendJson(res, 500, { error: "Failed to materialize credentials" });
+        return;
       }
     }
 
@@ -722,12 +755,18 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     const payload = { manifest: body.manifest, files: body.files ?? [] };
 
-    // Use atomic materializeCredentials for both populate and clear paths
-    const count = materializeCredentials(payload, kubeconfigRef);
-    if (count > 0) {
-      console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
-    } else {
-      console.log("[agentbox-http] Credentials cleared (empty payload)");
+    try {
+      // Use atomic materializeCredentials for both populate and clear paths
+      const count = materializeCredentials(payload, kubeconfigRef);
+      if (count > 0) {
+        console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
+      } else {
+        console.log("[agentbox-http] Credentials cleared (empty payload)");
+      }
+    } catch (err) {
+      console.error("[agentbox-http] Failed to reload credentials:", err);
+      sendJson(res, 500, { error: "Failed to materialize credentials" });
+      return;
     }
 
     // Update kubeconfigRef on all active sessions
