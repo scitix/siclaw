@@ -8,9 +8,8 @@ description: "Build and publish Siclaw container images for Kubernetes deploymen
 
 Siclaw currently ships Dockerfiles for **building runtime images**:
 
-- `gateway` — Web UI + API server
+- `gateway` — Web UI + API server (includes cron scheduler)
 - `agentbox` — per-user execution runtime
-- `cron` — scheduled job runner
 
 For a single-machine setup, use [CLI & Local Server](/install/cli). The repository does **not** include a supported `docker compose` deployment.
 
@@ -26,14 +25,12 @@ That builds:
 
 - `registry.example.com/myteam/siclaw-gateway:latest`
 - `registry.example.com/myteam/siclaw-agentbox:latest`
-- `registry.example.com/myteam/siclaw-cron:latest`
 
 To build one image only:
 
 ```bash
 make docker-gateway REGISTRY=registry.example.com/myteam TAG=latest
 make docker-agentbox REGISTRY=registry.example.com/myteam TAG=latest
-make docker-cron REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
 ## Push Images
@@ -47,7 +44,6 @@ Or push individually:
 ```bash
 make push-gateway REGISTRY=registry.example.com/myteam TAG=latest
 make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
-make push-cron REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
 ## Runtime Notes
