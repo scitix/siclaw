@@ -58,7 +58,6 @@
     "zod": "^3.24.0"
   },
   "optionalDependencies": {
-    "@aws-sdk/client-s3": "^3.984.0",
     "@larksuiteoapi/node-sdk": "^1.56.1",
     "@slack/bolt": "^4.6.0",
     "@slack/web-api": "^7.14.1",

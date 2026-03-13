@@ -55,7 +55,6 @@ export const sessions = mysqlTable("sessions", {
   lastActiveAt: timestamp("last_active_at").notNull().defaultNow(),
   messageCount: int("message_count").notNull().default(0),
   deletedAt: timestamp("deleted_at"),
-  s3Key: varchar("s3_key", { length: 500 }),
 });
 
 // ─── Messages ────────────────────────────────────────
@@ -103,7 +102,6 @@ export const skills = mysqlTable("skills", {
   stagingVersion: int("staging_version").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
-  s3Key: varchar("s3_key", { length: 500 }),
   teamSourceSkillId: varchar("team_source_skill_id", { length: 64 }),
   teamPinnedVersion: int("team_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
@@ -132,7 +130,6 @@ export const skillVersions = mysqlTable("skill_versions", {
   skillId: varchar("skill_id", { length: 64 }).notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
   version: int("version").notNull(),
-  s3Key: varchar("s3_key", { length: 500 }),
   specs: text("specs"),
   scriptsJson: json("scripts_json").$type<Array<{ name: string; content: string }>>(),
   files: json("files").$type<{ specs?: string; scripts?: string[] }>(),

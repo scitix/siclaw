@@ -28,7 +28,6 @@ export class SkillVersionRepository {
       id,
       skillId: input.skillId,
       version: input.version,
-      s3Key: null,
       files: input.files ?? null,
       specs: input.specs ?? null,
       scriptsJson: input.scriptsJson ?? null,
