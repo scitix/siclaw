@@ -697,7 +697,6 @@ export class MemoryIndexer {
     }
 
     if (misses.length > 0) {
-      // embed() already handles token-bounded batching internally (BATCH_MAX_TOKENS in embeddings.ts)
       const missTexts = misses.map((m) => m.text);
       const newEmbeddings = await this.embedding.embed(missTexts);
 
