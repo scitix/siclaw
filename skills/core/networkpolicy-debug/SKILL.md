@@ -25,6 +25,7 @@ When pod-to-pod or pod-to-external communication is unexpectedly blocked, and Se
 - **NetworkPolicy is deny-by-default once applied.** If any NetworkPolicy selects a pod for a given direction (ingress or egress), all traffic in that direction is denied EXCEPT what is explicitly allowed by the rules. Pods with NO NetworkPolicy selecting them allow all traffic.
 - Multiple NetworkPolicies selecting the same pod are **additive (union)** — a connection is allowed if ANY matching policy permits it.
 - NetworkPolicy requires **CNI support**. If the CNI plugin does not support NetworkPolicy (e.g., Flannel without additional plugins), policies are silently ignored — they can be created but have no effect.
+- **`hostNetwork: true` pods are exempt.** Pods using the host network namespace are not selected by any NetworkPolicy — neither as targets nor as sources. A default-deny policy does not protect or restrict hostNetwork pods.
 
 ## Diagnostic Flow
 
@@ -67,9 +68,23 @@ If the CNI does support NetworkPolicy, continue to step 2.
 kubectl get networkpolicy -n <ns>
 ```
 
-If no NetworkPolicies exist in the namespace, NetworkPolicy is not the cause — all traffic is allowed by default. Look elsewhere (firewall rules, service mesh, node-level iptables).
+If no NetworkPolicies exist in the namespace, standard Kubernetes NetworkPolicy is not the cause — all traffic is allowed by default. However, if the CNI is Calico or Cilium, also check for CNI-specific extended policies that operate independently of standard NetworkPolicy:
 
-If NetworkPolicies exist, continue to step 3.
+```bash
+# Cilium extended policies
+kubectl get ciliumnetworkpolicy -n <ns> 2>/dev/null
+kubectl get ciliumclusterwidenetworkpolicy 2>/dev/null
+
+# Calico extended policies
+kubectl get networkpolicy.crd.projectcalico.org -n <ns> 2>/dev/null
+kubectl get globalnetworkpolicy.crd.projectcalico.org 2>/dev/null
+```
+
+These CNI-specific policies can block traffic even when no standard NetworkPolicy exists, and they take effect at a higher priority. If extended policies exist, examine their rules using `-o yaml`.
+
+If neither standard nor extended policies exist, look elsewhere (firewall rules, service mesh, node-level iptables).
+
+If policies exist (standard or extended), continue to step 3.
 
 ### 3. Identify which policies affect the target pod
 
@@ -205,7 +220,24 @@ ingress:
     port: 8080
 ```
 
+The `port` field can be a number or a **named port** (e.g., `port: http`). If a named port is used, it must match a `containerPort` name defined in the target pod's spec. If the pod does not define that port name, the rule will not match.
+
 If the source is connecting on a different port, it will be blocked even if the `from` selector matches.
+
+**NodePort / LoadBalancer SNAT issue:**
+
+When external traffic enters through a NodePort or LoadBalancer Service, kube-proxy may SNAT the source IP to the node's IP. This means `podSelector` and `namespaceSelector` rules in ingress will NOT match the original client or source pod — they will see the node IP instead.
+
+Check the Service's `externalTrafficPolicy`:
+
+```bash
+kubectl get svc <service-name> -n <ns> -o jsonpath='{.spec.externalTrafficPolicy}'
+```
+
+- **Cluster** (default) — source IP is SNATed to node IP. Ingress `podSelector`/`namespaceSelector` rules cannot match the original source. Use `ipBlock` with the node CIDR range instead.
+- **Local** — original source IP is preserved, but traffic is only routed to pods on the node that received the request.
+
+If the target pod has ingress NetworkPolicy and receives traffic via NodePort/LoadBalancer with `externalTrafficPolicy: Cluster`, `from: podSelector` rules will fail silently — the traffic appears to come from a node IP, not a pod IP.
 
 ### 7. Diagnose blocked egress (outgoing traffic from the pod)
 
@@ -245,6 +277,24 @@ Note: The example above targets only `kube-system` where CoreDNS runs. A broader
 
 If the user reports DNS timeouts and the pod has an egress NetworkPolicy, check DNS port allowance FIRST before investigating CoreDNS with `dns-debug`.
 
+**API Server egress**
+
+The second most common egress issue after DNS. Pods that need to call the Kubernetes API (operators, controllers, pods using service account tokens) must be able to reach the API server. The API server endpoint is typically outside the pod network, so `podSelector`/`namespaceSelector` rules will not match it — use `ipBlock` instead.
+
+Find the API server endpoint:
+
+```bash
+kubectl get endpoints kubernetes -n default
+```
+
+Symptoms of blocked API server egress:
+- `kubectl` commands from within the pod time out (but DNS works — service names resolve)
+- Operators or controllers cannot watch or list resources
+- Service account token authentication fails
+- Pod logs show "connection refused" or "i/o timeout" when calling the API
+
+The key difference from DNS blocking: with DNS blocked, name resolution itself fails. With API server blocked, names resolve but the TCP connection to the API server times out.
+
 ### 8. Cross-namespace communication
 
 When pods in different namespaces need to communicate, NetworkPolicies on BOTH sides may need to allow the traffic:
@@ -275,7 +325,7 @@ If the namespace lacks the expected labels, the `namespaceSelector` will not mat
 - **No policy = allow all.** NetworkPolicy is not deny-by-default at the cluster level. Only pods explicitly selected by at least one NetworkPolicy have restrictions. This means adding the FIRST NetworkPolicy to a namespace can suddenly break existing communication.
 - **Policies are additive.** If policy A allows port 80 and policy B allows port 443 for the same pod, both ports are allowed. Policies never subtract permissions from each other.
 - **`policyTypes` matters.** See step 5 for the full behavior matrix. Misunderstanding which direction a policy controls is a common cause of wasted debugging effort.
-- **CIDR ranges and pod IPs.** Using `ipBlock` with pod CIDR ranges is fragile — pod IPs change. Prefer `podSelector` / `namespaceSelector` for in-cluster traffic. `ipBlock` is best for external IPs.
+- **CIDR ranges and pod IPs.** Using `ipBlock` with pod CIDR ranges is fragile — pod IPs change. Prefer `podSelector` / `namespaceSelector` for in-cluster traffic. `ipBlock` is best for external IPs. Also check for `except` subnets within `ipBlock` — a rule may allow a broad CIDR (e.g., `10.0.0.0/8`) but exclude a specific subnet (e.g., `except: [10.244.0.0/16]`), causing unexpected blocks for IPs in the excluded range.
 - **Service mesh interaction.** If the cluster runs Istio, Linkerd, or similar service meshes, traffic may be additionally controlled by the mesh's own policies (AuthorizationPolicy, etc.). NetworkPolicy operates at L3/L4, while service mesh policies typically operate at L7.
 - **GPU clusters: multi-NIC / RDMA traffic is NOT affected by NetworkPolicy.** In GPU training clusters, pods typically have multiple network interfaces: a primary NIC (eth0) managed by the CNI, and secondary NICs (net1, etc.) for RDMA/InfiniBand/RoCE provisioned via Multus + SR-IOV or host-device plugin. NetworkPolicy only applies to the **primary CNI-managed interface**. RDMA/NCCL traffic on secondary interfaces bypasses CNI entirely and is invisible to NetworkPolicy. If a training job's GPU-to-GPU communication (NCCL) fails, NetworkPolicy is NOT the cause — investigate the RDMA network instead. If the same pod cannot reach the API server, download data, or resolve DNS, those go through the primary NIC and CAN be blocked by NetworkPolicy.
 - **Quick verification:** To confirm a NetworkPolicy is the cause, test connectivity from a pod in the same namespace that is NOT selected by any NetworkPolicy (or from a different namespace without policies). If the same connection works from the unaffected pod, the NetworkPolicy is confirmed as the blocker.
