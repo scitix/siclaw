@@ -1284,6 +1284,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
               try {
                 const modelConfigRepo = new ModelConfigRepository(db);
                 const settings: Record<string, unknown> = await modelConfigRepo.exportSettingsConfig();
+                // Append debugImage if configured via env
+                if (process.env.SICLAW_DEBUG_IMAGE) {
+                  settings.debugImage = process.env.SICLAW_DEBUG_IMAGE;
+                }
                 // Append metrics config from system_config table
                 if (sysConfigRepo) {
                   const metricsPort = await sysConfigRepo.get("metrics.port");
