@@ -52,7 +52,7 @@ spec:
       value: "https://siclaw-gateway.${NAMESPACE}.svc.cluster.local:3002"
     - name: SICLAW_CREDENTIALS_DIR
       value: "/home/agentbox/.credentials"
-    # LLM/S3 config is injected dynamically by gateway via envResolver
+    # LLM config is injected dynamically by gateway via envResolver
 
     # Resource limits
     resources:

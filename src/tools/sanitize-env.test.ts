@@ -8,14 +8,10 @@ describe("sanitizeEnv", () => {
     expect(result).toHaveProperty("PATH", "/usr/bin");
   });
 
-  it("blocks SICLAW_S3_SECRET_KEY and SICLAW_EMBEDDING_API_KEY", () => {
+  it("blocks SICLAW_EMBEDDING_API_KEY", () => {
     const result = sanitizeEnv({
-      SICLAW_S3_SECRET_KEY: "s3secret",
-      SICLAW_S3_ACCESS_KEY: "s3access",
       SICLAW_EMBEDDING_API_KEY: "embkey",
     });
-    expect(result).not.toHaveProperty("SICLAW_S3_SECRET_KEY");
-    expect(result).not.toHaveProperty("SICLAW_S3_ACCESS_KEY");
     expect(result).not.toHaveProperty("SICLAW_EMBEDDING_API_KEY");
   });
 
