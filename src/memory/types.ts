@@ -30,6 +30,15 @@ export interface InvestigationPattern {
   commonRemediations: string[];
 }
 
+export type FeedbackStatus = 'confirmed' | 'corrected' | 'rejected';
+
+/** Retrieval weight multiplier for each feedback status. */
+export const FEEDBACK_SIGNALS: Record<FeedbackStatus, number> = {
+  confirmed: 1.5,   // boost
+  corrected: 0.5,   // partial suppress (data still useful, conclusion wrong)
+  rejected: 0.1,    // heavy suppress
+};
+
 /** Structured record extracted from a deep investigation conclusion. */
 export interface InvestigationRecord {
   id: string;
@@ -45,4 +54,10 @@ export interface InvestigationRecord {
   totalToolCalls: number;
   hypotheses: Array<{ id: string; text: string; status: string; confidence: number }>;
   createdAt: number;
+  /** Retrieval weight multiplier (default 1.0). Set by investigation_feedback tool. */
+  feedbackSignal?: number;
+  /** Feedback note: status label + optional user text (e.g. "corrected: actual root cause was X"). */
+  feedbackNote?: string;
+  /** Timestamp when feedback was submitted. */
+  feedbackAt?: number;
 }

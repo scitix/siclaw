@@ -77,6 +77,15 @@ export function initMemoryDb(dbPath: string): DatabaseSync {
   if (!invCols.some((c) => c.name === "remediation_steps")) {
     db.exec("ALTER TABLE investigations ADD COLUMN remediation_steps TEXT");
   }
+  if (!invCols.some((c) => c.name === "feedback_signal")) {
+    db.exec("ALTER TABLE investigations ADD COLUMN feedback_signal REAL DEFAULT 1.0");
+  }
+  if (!invCols.some((c) => c.name === "feedback_note")) {
+    db.exec("ALTER TABLE investigations ADD COLUMN feedback_note TEXT");
+  }
+  if (!invCols.some((c) => c.name === "feedback_at")) {
+    db.exec("ALTER TABLE investigations ADD COLUMN feedback_at INTEGER");
+  }
 
   // Migrations — chunks table
   const cols = db.prepare("PRAGMA table_info(chunks)").all() as Array<{ name: string }>;
