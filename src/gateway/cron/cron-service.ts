@@ -128,14 +128,18 @@ export class CronService {
       const resultText = data.resultText || "";
 
       // Record success
-      await this.configRepo.updateCronJobRun(job.id, "success");
+      try { await this.configRepo.updateCronJobRun(job.id, "success"); } catch (e) {
+        console.warn(`[cron-service] updateCronJobRun failed for ${job.id}:`, e instanceof Error ? e.message : e);
+      }
       console.log(`[cron-service] Job ${job.id} completed in ${data.durationMs}ms, resultText length=${resultText.length}`);
 
       // Write run record + notification
       await this.recordResult(job, "success", resultText, undefined, data.durationMs);
     } catch (err) {
       console.error(`[cron-service] Job ${job.id} failed:`, err);
-      await this.configRepo.updateCronJobRun(job.id, "failure");
+      try { await this.configRepo.updateCronJobRun(job.id, "failure"); } catch (e) {
+        console.warn(`[cron-service] updateCronJobRun failed for ${job.id}:`, e instanceof Error ? e.message : e);
+      }
       await this.recordResult(job, "failure", "", err instanceof Error ? err.message : String(err));
     } finally {
       try {
