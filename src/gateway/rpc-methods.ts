@@ -3875,12 +3875,6 @@ export function createRpcMethods(
     workspaceId: string,
     isDefault: boolean,
   ): Promise<CredentialPayload> {
-    // Ensure user agent-data directory exists (used as subPath mount for user data)
-    const agentDataDir = path.join(skillsDir, "user", userId, "agent-data");
-    if (!fs.existsSync(agentDataDir)) {
-      fs.mkdirSync(agentDataDir, { recursive: true });
-    }
-
     const manifest: CredentialManifestEntry[] = [];
     const files: CredentialFile[] = [];
 
