@@ -22,7 +22,6 @@ TAG       ?= $(if $(GIT_TAG),$(GIT_TAG),$(VERSION)-$(GIT_COMMIT)$(GIT_DIRTY))
 # ── Image names ──
 GATEWAY_IMAGE  = $(REGISTRY)/siclaw-gateway:$(TAG)
 AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
-CRON_IMAGE     = $(REGISTRY)/siclaw-cron:$(TAG)
 
 # ── OCI labels injected into every image ──
 DOCKER_LABELS = \
@@ -65,7 +64,6 @@ build-web: ## Compile Web frontend (Vite)
 docker: build ## Build all Docker images
 	docker build -f Dockerfile.gateway  $(DOCKER_LABELS) -t $(GATEWAY_IMAGE)  .
 	docker build -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
-	docker build -f Dockerfile.cron     $(DOCKER_LABELS) -t $(CRON_IMAGE)     .
 
 docker-gateway: build ## Build gateway image
 	docker build -f Dockerfile.gateway $(DOCKER_LABELS) -t $(GATEWAY_IMAGE) .
@@ -73,19 +71,13 @@ docker-gateway: build ## Build gateway image
 docker-agentbox: build-ts ## Build agentbox image
 	docker build -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
 
-docker-cron: build-ts ## Build cron image
-	docker build -f Dockerfile.cron $(DOCKER_LABELS) -t $(CRON_IMAGE) .
-
-push: push-gateway push-agentbox push-cron ## Push all images to registry
+push: push-gateway push-agentbox ## Push all images to registry
 
 push-gateway: ## Push gateway image
 	docker push $(GATEWAY_IMAGE)
 
 push-agentbox: ## Push agentbox image
 	docker push $(AGENTBOX_IMAGE)
-
-push-cron: ## Push cron image
-	docker push $(CRON_IMAGE)
 
 # ==================== Test ====================
 ##@ Test
@@ -109,13 +101,10 @@ info: ## Print build variables
 	@echo "REGISTRY:    $(REGISTRY)"
 	@echo "GATEWAY:     $(GATEWAY_IMAGE)"
 	@echo "AGENTBOX:    $(AGENTBOX_IMAGE)"
-	@echo "CRON:        $(CRON_IMAGE)"
 
 logs: ## View recent logs (all components)
 	@echo "=== Gateway ===" && \
 	kubectl -n $(NAMESPACE) logs --tail=50 -l app=siclaw-gateway 2>/dev/null; \
-	echo "\n=== Cron ===" && \
-	kubectl -n $(NAMESPACE) logs --tail=30 -l app=siclaw-cron 2>/dev/null; \
 	echo "\n=== AgentBox ===" && \
 	for pod in $$(kubectl -n $(NAMESPACE) get pods -l siclaw.io/app=agentbox --no-headers -o name 2>/dev/null); do \
 		echo "--- $$pod ---"; \
@@ -128,15 +117,11 @@ logs-gateway: ## Follow gateway logs
 logs-agentbox: ## Follow latest agentbox logs
 	kubectl -n $(NAMESPACE) logs -f $$(kubectl -n $(NAMESPACE) get pods -l siclaw.io/app=agentbox --sort-by=.metadata.creationTimestamp --no-headers -o name | tail -1)
 
-logs-cron: ## Follow cron logs
-	kubectl -n $(NAMESPACE) logs -f deployment/siclaw-cron
-
 status: ## Show K8s deployment status
 	@echo "=== Pods ==="
 	@kubectl -n $(NAMESPACE) get pods -o wide
 	@echo "\n=== Images ==="
 	@kubectl -n $(NAMESPACE) get deployment siclaw-gateway -o jsonpath='gateway:  {.spec.template.spec.containers[0].image}{"\n"}' 2>/dev/null || true
-	@kubectl -n $(NAMESPACE) get deployment siclaw-cron -o jsonpath='cron:     {.spec.template.spec.containers[0].image}{"\n"}' 2>/dev/null || true
 
 # ==================== Clean ====================
 ##@ Clean
@@ -146,7 +131,7 @@ clean: ## Remove build artifacts
 
 # ── All targets are phony (no file outputs) ──
 .PHONY: help tui gateway dev build build-ts build-web \
-	docker docker-gateway docker-agentbox docker-cron \
-	push push-gateway push-agentbox push-cron \
+	docker docker-gateway docker-agentbox \
+	push push-gateway push-agentbox \
 	test typecheck unit \
-	info logs logs-gateway logs-agentbox logs-cron status clean
+	info logs logs-gateway logs-agentbox status clean

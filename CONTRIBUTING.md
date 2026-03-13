@@ -50,14 +50,13 @@ New architectural decisions should get an ADR entry in `docs/design/decisions.md
 
 ## Project Architecture
 
-Siclaw has four entry points, each serving a different deployment role:
+Siclaw has three entry points, each serving a different deployment role:
 
 | Entry Point | File | Role |
 |-------------|------|------|
 | `siclaw` | `src/cli-main.ts` | Interactive TUI for local diagnostics |
-| `siclaw-gateway` | `src/gateway-main.ts` | HTTP + WebSocket control plane |
+| `siclaw-gateway` | `src/gateway-main.ts` | HTTP + WebSocket control plane (includes cron scheduler) |
 | `siclaw-agentbox` | `src/agentbox-main.ts` | Isolated worker (one per user) |
-| `siclaw-cron` | `src/cron-main.ts` | Scheduled task runner |
 
 Key directories:
 

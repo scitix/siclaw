@@ -54,8 +54,6 @@ spec:
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
           value: "/app/.siclaw/skills"
-        - name: SICLAW_CRON_SERVICE_URL
-          value: "http://siclaw-cron.siclaw.svc.cluster.local"
         - name: SICLAW_DATABASE_URL
           valueFrom:
             secretKeyRef:
