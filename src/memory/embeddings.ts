@@ -18,6 +18,8 @@ const TIMEOUT_MS = 30_000;
 const MAX_RETRY_DELAY_MS = 8000;
 /** Max estimated tokens per embedding API batch */
 const BATCH_MAX_TOKENS = 8000;
+/** Max number of texts per embedding API batch (guards against many short texts) */
+const BATCH_MAX_ITEMS = 100;
 
 export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider {
   const baseUrl = (opts?.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -114,8 +116,8 @@ export function createEmbeddingProvider(opts?: EmbeddingOpts): EmbeddingProvider
 
       for (const text of truncated) {
         const tokens = estimateTokens(text);
-        // If adding this text would exceed budget and batch is non-empty, flush
-        if (currentBatch.length > 0 && currentTokens + tokens > BATCH_MAX_TOKENS) {
+        // If adding this text would exceed token budget or item count, flush
+        if (currentBatch.length > 0 && (currentTokens + tokens > BATCH_MAX_TOKENS || currentBatch.length >= BATCH_MAX_ITEMS)) {
           batches.push(currentBatch);
           currentBatch = [];
           currentTokens = 0;
