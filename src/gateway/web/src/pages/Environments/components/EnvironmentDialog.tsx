@@ -167,6 +167,7 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
                             placeholder="https://10.0.1.100:6443"
                             className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                         />
+                        <p className="text-xs text-gray-400 mt-1">Must include explicit port, e.g. <span className="font-mono">:6443</span></p>
                     </div>
 
                     {/* Allowed Servers */}
