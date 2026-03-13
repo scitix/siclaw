@@ -98,6 +98,9 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
 
     for (const skill of payload.skills) {
       // Write into scope subdirectory so getSkillScriptDirs() layer 2 matches naturally
+      if (skill.scope !== "personal" && skill.scope !== "team") {
+        console.warn(`[resource-handlers] Unexpected skill scope "${skill.scope}" for "${skill.dirName}", defaulting to "team"`);
+      }
       const scopeDir = skill.scope === "personal" ? "user" : "team";
       const skillDir = resolveUnderDir(skillsDir, scopeDir, skill.dirName);
       fs.mkdirSync(skillDir, { recursive: true });
