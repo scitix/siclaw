@@ -31,6 +31,7 @@ import { createUpdateSkillTool } from "../tools/update-skill.js";
 import { createForkSkillTool } from "../tools/fork-skill.js";
 import { createManageScheduleTool } from "../tools/manage-schedule.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
+import { createInvestigationFeedbackTool } from "../tools/investigation-feedback.js";
 import {
   type DpState,
   createManageChecklistTool,
@@ -269,6 +270,7 @@ export async function createSiclawSession(
     createPodNsenterExecTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
+    createInvestigationFeedbackTool(memoryRef),
     createCredentialListTool(kubeconfigRef),
   ];
 

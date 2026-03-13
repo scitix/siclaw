@@ -209,9 +209,14 @@ const STATUS_COLOR: Record<HypothesisStatus, string> = {
 
 // --- Component ---
 
+type FeedbackState = 'idle' | 'input' | 'submitted';
+type FeedbackStatus = 'confirmed' | 'corrected' | 'rejected';
+
 export interface InvestigationCardProps {
     message: PilotMessage;
     progress?: InvestigationProgress | null;
+    sendMessage?: (text: string) => void;
+    updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
 }
 
 function ElapsedTimer() {
@@ -234,10 +239,28 @@ function ElapsedTimer() {
     );
 }
 
-export function InvestigationCard({ message, progress }: InvestigationCardProps) {
+export function InvestigationCard({ message, progress, sendMessage, updateMessageMeta }: InvestigationCardProps) {
     const [expanded, setExpanded] = useState(false);
     const isRunning = message.toolStatus === 'running';
     const isError = message.toolStatus === 'error';
+
+    // Feedback state
+    const savedFeedback = (message.metadata as Record<string, unknown> | undefined)?.investigationFeedback as FeedbackStatus | undefined;
+    const [feedbackState, setFeedbackState] = useState<FeedbackState>(savedFeedback ? 'submitted' : 'idle');
+    const [feedbackStatus, setFeedbackStatus] = useState<FeedbackStatus | null>(savedFeedback ?? null);
+    const [correctionText, setCorrectionText] = useState('');
+    const investigationId = message.toolDetails?.investigationId as string | undefined;
+
+    const handleFeedbackSubmit = () => {
+        if (!feedbackStatus || !investigationId) return;
+        const text = correctionText.trim();
+        const msg = text
+            ? `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId} ${text}`
+            : `[investigation feedback: ${feedbackStatus}] investigationId=${investigationId}`;
+        sendMessage?.(msg);
+        updateMessageMeta?.(message.id, { investigationFeedback: feedbackStatus });
+        setFeedbackState('submitted');
+    };
 
     // Parse structured data from completed result
     const parsed = !isRunning ? parseInvestigationResult(message.content) : null;
@@ -506,6 +529,101 @@ export function InvestigationCard({ message, progress }: InvestigationCardProps)
                     <div className="mt-2 pt-2 border-t border-green-200">
                         <span className="text-xs text-gray-400">Full report: </span>
                         <code className="text-xs text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">{reportPath}</code>
+                    </div>
+                )}
+
+                {/* Feedback strip — only for investigations with an ID */}
+                {investigationId && feedbackState === 'submitted' && feedbackStatus && (
+                    <div className="mt-3 pt-2 border-t border-green-200 flex items-center gap-2">
+                        <span className="text-xs text-gray-400">Feedback:</span>
+                        <span className={cn(
+                            "text-xs font-medium px-2 py-0.5 rounded-full",
+                            feedbackStatus === 'confirmed' ? "bg-green-100 text-green-700" :
+                            feedbackStatus === 'corrected' ? "bg-amber-100 text-amber-700" :
+                            "bg-red-100 text-red-600"
+                        )}>
+                            {feedbackStatus === 'confirmed' ? '✅ Correct' :
+                             feedbackStatus === 'corrected' ? '🔧 Corrected' :
+                             '❌ Rejected'}
+                        </span>
+                    </div>
+                )}
+                {investigationId && feedbackState === 'idle' && (
+                    <div className="mt-3 pt-2 border-t border-green-200">
+                        <div className="flex items-center gap-2">
+                            <span className="text-xs text-gray-400">Was this diagnosis accurate?</span>
+                            <div className="flex gap-1.5 ml-auto">
+                                <button
+                                    type="button"
+                                    className="text-xs px-2.5 py-1 rounded-md bg-green-50 text-green-700 hover:bg-green-100 border border-green-200 transition-colors cursor-pointer"
+                                    onClick={() => {
+                                        setFeedbackStatus('confirmed');
+                                        setFeedbackState('submitted');
+                                        sendMessage?.(`[investigation feedback: confirmed] investigationId=${investigationId}`);
+                                        updateMessageMeta?.(message.id, { investigationFeedback: 'confirmed' });
+                                    }}
+                                >
+                                    ✅ Correct
+                                </button>
+                                <button
+                                    type="button"
+                                    className="text-xs px-2.5 py-1 rounded-md bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200 transition-colors cursor-pointer"
+                                    onClick={() => {
+                                        setFeedbackStatus('corrected');
+                                        setFeedbackState('input');
+                                    }}
+                                >
+                                    🔧 Partial
+                                </button>
+                                <button
+                                    type="button"
+                                    className="text-xs px-2.5 py-1 rounded-md bg-red-50 text-red-600 hover:bg-red-100 border border-red-200 transition-colors cursor-pointer"
+                                    onClick={() => {
+                                        setFeedbackStatus('rejected');
+                                        setFeedbackState('input');
+                                    }}
+                                >
+                                    ❌ Wrong
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                {investigationId && feedbackState === 'input' && feedbackStatus && (
+                    <div className="mt-3 pt-2 border-t border-green-200 space-y-2">
+                        <span className="text-xs text-gray-500">
+                            {feedbackStatus === 'corrected'
+                                ? 'What was the actual root cause?'
+                                : 'What was wrong with the diagnosis? (optional)'}
+                        </span>
+                        <div className="flex gap-2">
+                            <input
+                                type="text"
+                                className="flex-1 text-xs px-2.5 py-1.5 border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-300"
+                                placeholder={feedbackStatus === 'corrected' ? 'The actual root cause was...' : 'Optional note...'}
+                                value={correctionText}
+                                onChange={(e) => setCorrectionText(e.target.value)}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleFeedbackSubmit(); }}
+                            />
+                            <button
+                                type="button"
+                                className="text-xs px-3 py-1.5 rounded-md bg-blue-500 text-white hover:bg-blue-600 transition-colors cursor-pointer"
+                                onClick={handleFeedbackSubmit}
+                            >
+                                Submit
+                            </button>
+                            <button
+                                type="button"
+                                className="text-xs px-2 py-1.5 rounded-md text-gray-400 hover:text-gray-600 transition-colors cursor-pointer"
+                                onClick={() => {
+                                    setFeedbackState('idle');
+                                    setFeedbackStatus(null);
+                                    setCorrectionText('');
+                                }}
+                            >
+                                Cancel
+                            </button>
+                        </div>
                     </div>
                 )}
             </div>

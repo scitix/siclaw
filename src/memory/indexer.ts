@@ -451,6 +451,33 @@ export class MemoryIndexer {
       );
   }
 
+  /** Look up a single investigation record by ID. */
+  getInvestigationById(id: string): InvestigationRecord | null {
+    try {
+      const row = this.db
+        .prepare("SELECT * FROM investigations WHERE id = ?")
+        .get(id) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return rowToInvestigationRecord(row);
+    } catch (err) {
+      console.warn(`[memory-indexer] getInvestigationById failed:`, err);
+      return null;
+    }
+  }
+
+  /** Update feedback fields on an investigation record. Returns true if the row was updated. */
+  updateInvestigationFeedback(id: string, signal: number, note: string): boolean {
+    try {
+      const result = this.db
+        .prepare("UPDATE investigations SET feedback_signal = ?, feedback_note = ?, feedback_at = ? WHERE id = ?")
+        .run(signal, note, Date.now(), id);
+      return (result.changes as number) > 0;
+    } catch (err) {
+      console.warn(`[memory-indexer] updateInvestigationFeedback failed:`, err);
+      return false;
+    }
+  }
+
   /**
    * Aggregate investigation patterns from recent history.
    * Groups by root_cause_category with time-weighted scoring — recent investigations
@@ -489,9 +516,12 @@ export class MemoryIndexer {
         const ageMs = Math.max(0, now - createdAt);
         const weight = Math.exp(-lambda * ageMs);
 
-        group.weightedCount += weight;
+        // Feedback-weighted: confirmed boosts, rejected suppresses
+        const feedbackSignal = (r.feedback_signal as number) ?? 1.0;
+
+        group.weightedCount += weight * feedbackSignal;
         group.rawCount++;
-        group.weightedConfidenceSum += ((r.confidence as number) ?? 0) * weight;
+        group.weightedConfidenceSum += ((r.confidence as number) ?? 0) * weight * feedbackSignal;
 
         // Extract validated hypotheses
         const hypotheses = safeJsonArray(r.hypotheses_json as string) as Array<{
@@ -646,14 +676,14 @@ export class MemoryIndexer {
         return records.slice(0, topK);
       }
 
-      // Score each record by keyword overlap with question + conclusion
+      // Score each record by keyword overlap with question + conclusion, weighted by feedback
       const scored = records.map((rec) => {
         const searchText = `${rec.question} ${rec.conclusion} ${rec.rootCauseCategory}`.toLowerCase();
         let hits = 0;
         for (const kw of keywords) {
           if (searchText.includes(kw)) hits++;
         }
-        return { rec, score: hits / keywords.length };
+        return { rec, score: (hits / keywords.length) * (rec.feedbackSignal ?? 1.0) };
       });
 
       // Sort by relevance score (desc), then by recency (desc)
@@ -818,6 +848,9 @@ export class MemoryIndexer {
 
 function rowToInvestigationRecord(r: Record<string, unknown>): InvestigationRecord {
   const remediation = safeJsonArray(r.remediation_steps as string) as string[];
+  const feedbackSignal = r.feedback_signal as number | null | undefined;
+  const feedbackNote = r.feedback_note as string | null | undefined;
+  const feedbackAt = r.feedback_at as number | null | undefined;
   return {
     id: r.id as string,
     question: r.question as string,
@@ -837,6 +870,9 @@ function rowToInvestigationRecord(r: Record<string, unknown>): InvestigationReco
       confidence: number;
     }>,
     createdAt: (r.created_at as number) ?? 0,
+    feedbackSignal: feedbackSignal != null ? feedbackSignal : undefined,
+    feedbackNote: feedbackNote ?? undefined,
+    feedbackAt: feedbackAt != null ? feedbackAt : undefined,
   };
 }
 

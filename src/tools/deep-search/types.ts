@@ -35,6 +35,8 @@ export interface InvestigationResult {
   totalDurationMs: number;
   timedOut: boolean;
   debugTracePath?: string;
+  /** ID of the investigation record stored in SQLite (for feedback). */
+  investigationId?: string;
 }
 
 export interface DeepSearchBudget {

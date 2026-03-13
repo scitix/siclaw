@@ -65,6 +65,16 @@ Synthesize the deep_search results into a conclusion.
 2. Write a clear conclusion with root cause analysis and recommendations.
 3. Call `manage_checklist` to mark `conclusion` as `done`.
 
+### Phase 5: Feedback (optional)
+
+After presenting findings, briefly ask if the diagnosis looks accurate.
+Do NOT be pushy — a single sentence like "Let me know if this diagnosis
+matches what you're seeing" is sufficient.
+
+If the user confirms, corrects, or rejects the diagnosis:
+1. Call `investigation_feedback` with the investigationId from deep_search results.
+2. This improves future investigations by boosting/suppressing this diagnosis.
+
 ## Available Tools
 
 | Tool | Purpose |
@@ -73,6 +83,7 @@ Synthesize the deep_search results into a conclusion.
 | `propose_hypotheses` | Present hypotheses to the user — a communication tool for aligning investigation direction |
 | `deep_search` | Launch parallel sub-agent validation of hypotheses |
 | `end_investigation` | End early — auto-skips remaining phases |
+| `investigation_feedback` | Submit user feedback on diagnosis accuracy (confirmed/corrected/rejected) |
 
 ## Guidelines
 
