@@ -71,6 +71,7 @@ COPY --from=builder /app/dist/ ./dist/
 
 # Builtin skills baked into image (always available, no Gateway dependency)
 COPY skills/core/ ./skills/core/
+COPY skills/extension/ ./skills/extension/
 
 # ── Directory structure & permissions ────────────────────────────
 # Credentials: agentbox:kubecred 0750 (sandbox: no access, kubectl: read via setgid)
