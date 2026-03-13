@@ -697,19 +697,12 @@ export class MemoryIndexer {
     }
 
     if (misses.length > 0) {
-      // Batch embedding calls to avoid API timeouts on large corpora
-      const EMBED_BATCH_SIZE = 100;
-      const allNewEmbeddings: number[][] = [];
+      // embed() already handles token-bounded batching internally (BATCH_MAX_TOKENS in embeddings.ts)
       const missTexts = misses.map((m) => m.text);
-
-      for (let batchStart = 0; batchStart < missTexts.length; batchStart += EMBED_BATCH_SIZE) {
-        const batch = missTexts.slice(batchStart, batchStart + EMBED_BATCH_SIZE);
-        const batchEmbeddings = await this.embedding.embed(batch);
-        allNewEmbeddings.push(...batchEmbeddings);
-      }
+      const newEmbeddings = await this.embedding.embed(missTexts);
 
       for (let j = 0; j < misses.length; j++) {
-        const vec = allNewEmbeddings[j] ?? [];
+        const vec = newEmbeddings[j] ?? [];
         results[misses[j].index] = vec;
         // Write to cache
         if (vec && vec.length > 0) {
@@ -719,7 +712,7 @@ export class MemoryIndexer {
       }
 
       console.log(
-        `[memory-indexer] Embedding: ${texts.length - misses.length} cached, ${misses.length} computed (${Math.ceil(misses.length / EMBED_BATCH_SIZE)} batches)`,
+        `[memory-indexer] Embedding: ${texts.length - misses.length} cached, ${misses.length} computed`,
       );
     }
 
