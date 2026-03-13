@@ -22,6 +22,7 @@ import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -39,18 +40,45 @@ interface Route {
 /**
  * Parse JSON body
  */
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const BODY_TIMEOUT_MS = 30_000; // 30s
+
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    let size = 0;
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      req.destroy();
+      reject(new Error("Body read timeout"));
+    }, BODY_TIMEOUT_MS);
+
+    req.on("data", (chunk: Buffer | string) => {
+      if (timedOut) return;
+      size += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        clearTimeout(timer);
+        req.destroy();
+        reject(new Error(`Body exceeds ${MAX_BODY_SIZE} byte limit`));
+        return;
+      }
+      body += chunk;
+    });
     req.on("end", () => {
+      clearTimeout(timer);
+      if (timedOut) return;
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (e) {
         reject(new Error("Invalid JSON"));
       }
     });
-    req.on("error", reject);
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -123,9 +151,8 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   // ── Credential materialization helper (shared by prompt and reload-credentials) ──
-  // Writes to credDir atomically: clear existing files, write new ones.
-  // Uses a staging approach within the same directory to avoid permission issues
-  // in the container (parent dir /app/.siclaw/ has restricted permissions).
+  // Writes new files with .new suffix first, then atomically renames them into place.
+  // This prevents data loss if the process crashes between delete and write.
   function materializeCredentials(
     payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
     kubeconfigRef: { credentialsDir?: string },
@@ -133,22 +160,31 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
     fs.mkdirSync(credDir, { recursive: true });
 
-    // Clear existing files
+    // Phase 1: Write new files with .new suffix (staging)
+    const stagedFiles: string[] = [];
+    for (const file of payload.files) {
+      const resolved = resolveUnderDir(credDir, file.name);
+      const staged = resolved + ".new";
+      fs.writeFileSync(staged, file.content, file.mode ? { mode: file.mode } : undefined);
+      stagedFiles.push(file.name);
+    }
+    // Stage manifest
+    const manifestPath = path.join(credDir, "manifest.json");
+    fs.writeFileSync(manifestPath + ".new", JSON.stringify(payload.manifest, null, 2));
+
+    // Phase 2: Remove old files
     for (const entry of fs.readdirSync(credDir)) {
+      if (entry.endsWith(".new")) continue; // skip staged files
       fs.rmSync(path.join(credDir, entry), { recursive: true });
     }
 
-    // Write credential files with path traversal validation
+    // Phase 3: Rename staged files into place (atomic per-file on same filesystem)
     for (const file of payload.files) {
-      const resolved = path.resolve(credDir, file.name);
-      if (!resolved.startsWith(credDir + path.sep) && resolved !== credDir) {
-        throw new Error(`Invalid credential file name: ${file.name}`);
-      }
-      fs.writeFileSync(resolved, file.content, file.mode ? { mode: file.mode } : undefined);
+      const resolved = resolveUnderDir(credDir, file.name);
+      fs.renameSync(resolved + ".new", resolved);
     }
+    fs.renameSync(manifestPath + ".new", manifestPath);
 
-    // Write manifest
-    fs.writeFileSync(path.join(credDir, "manifest.json"), JSON.stringify(payload.manifest, null, 2));
     kubeconfigRef.credentialsDir = credDir;
     return payload.files.length;
   }
@@ -218,9 +254,15 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     // Always call when credentials payload is present — even with empty files —
     // so stale credential files from prior sessions are cleaned up.
     if (body.credentials) {
-      const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
-      if (count > 0) {
-        console.log(`[agentbox-http] Materialized ${count} credential files`);
+      try {
+        const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
+        if (count > 0) {
+          console.log(`[agentbox-http] Materialized ${count} credential files`);
+        }
+      } catch (err) {
+        console.error(`[agentbox-http] Failed to materialize credentials for session ${managed.id}:`, err);
+        sendJson(res, 500, { error: "Failed to materialize credentials" });
+        return;
       }
     }
 
@@ -724,12 +766,18 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
 
     const payload = { manifest: body.manifest, files: body.files ?? [] };
 
-    // Use atomic materializeCredentials for both populate and clear paths
-    const count = materializeCredentials(payload, kubeconfigRef);
-    if (count > 0) {
-      console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
-    } else {
-      console.log("[agentbox-http] Credentials cleared (empty payload)");
+    try {
+      // Use atomic materializeCredentials for both populate and clear paths
+      const count = materializeCredentials(payload, kubeconfigRef);
+      if (count > 0) {
+        console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
+      } else {
+        console.log("[agentbox-http] Credentials cleared (empty payload)");
+      }
+    } catch (err) {
+      console.error("[agentbox-http] Failed to reload credentials:", err);
+      sendJson(res, 500, { error: "Failed to materialize credentials" });
+      return;
     }
 
     // Update kubeconfigRef on all active sessions

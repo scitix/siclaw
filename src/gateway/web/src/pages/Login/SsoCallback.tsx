@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 
@@ -12,11 +12,19 @@ import { Loader2 } from 'lucide-react';
 export function SsoCallback() {
     const navigate = useNavigate();
     const [params] = useSearchParams();
+    const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
         const token = params.get('token');
         const userId = params.get('userId');
         const username = params.get('username');
+        const errorParam = params.get('error');
+
+        if (errorParam) {
+            setError(errorParam);
+            setTimeout(() => navigate('/login?error=' + encodeURIComponent(errorParam), { replace: true }), 3000);
+            return;
+        }
 
         if (token && userId && username) {
             // Save auth state (same format as regular login)
@@ -28,10 +36,20 @@ export function SsoCallback() {
             localStorage.setItem('siclaw_auth', JSON.stringify(authState));
             navigate('/', { replace: true });
         } else {
-            // Missing params — back to login
-            navigate('/login?error=sso_callback_failed', { replace: true });
+            // Missing params — show error briefly, then redirect
+            setError('SSO callback missing required parameters');
+            setTimeout(() => navigate('/login?error=sso_callback_failed', { replace: true }), 3000);
         }
     }, [params, navigate]);
+
+    if (error) {
+        return (
+            <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center">
+                <p className="text-sm text-red-500 mb-2">{error}</p>
+                <p className="text-xs text-gray-400">Redirecting to login...</p>
+            </div>
+        );
+    }
 
     return (
         <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center">

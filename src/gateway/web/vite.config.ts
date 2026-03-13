@@ -10,6 +10,9 @@ export default defineConfig({
             '@': path.resolve(__dirname, './src'),
         },
     },
+    build: {
+        sourcemap: 'hidden',
+    },
     server: {
         host: '0.0.0.0',
     },

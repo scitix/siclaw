@@ -393,9 +393,16 @@ export async function runSubAgent(
     }
   });
 
+  const SUB_AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
   try {
-    // Run the investigation
-    await session.prompt(userMessage);
+    // Run the investigation with a timeout to prevent indefinite hangs
+    await Promise.race([
+      session.prompt(userMessage),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Sub-agent timed out after 5 minutes")), SUB_AGENT_TIMEOUT_MS),
+      ),
+    ]);
   } finally {
     // Mark finished first — guards against events from abort/dispose
     sessionFinished = true;

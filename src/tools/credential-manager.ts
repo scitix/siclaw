@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import yaml from "js-yaml";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -107,16 +108,6 @@ function ensureDir(dir: string): void {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
-}
-
-/** Resolve a path and assert it stays under the credentials directory. */
-function resolveUnderDir(credentialsDir: string, filename: string): string {
-  const resolved = path.resolve(credentialsDir, filename);
-  const resolvedDir = path.resolve(credentialsDir);
-  if (resolved !== resolvedDir && !resolved.startsWith(resolvedDir + path.sep)) {
-    throw new Error(`Path traversal blocked: "${filename}" escapes credentials directory`);
-  }
-  return resolved;
 }
 
 function readManifest(credentialsDir: string): CredentialManifestEntry[] {
@@ -476,4 +467,4 @@ export async function listCredentials(
 // ---------------------------------------------------------------------------
 
 /** @internal Exposed for unit testing only. */
-export const _testing = { safeName, sanitizeSshField, resolveUnderDir, readManifest };
+export const _testing = { safeName, sanitizeSshField, readManifest };

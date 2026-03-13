@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { _testing } from "./credential-manager.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
-const { safeName, sanitizeSshField, resolveUnderDir, readManifest } = _testing;
+const { safeName, sanitizeSshField, readManifest } = _testing;
 
 // ---------------------------------------------------------------------------
 // safeName
@@ -78,12 +79,12 @@ describe("resolveUnderDir", () => {
 
   it("blocks ../ traversal", () => {
     expect(() => resolveUnderDir(credDir, "../../../etc/passwd"))
-      .toThrow("Path traversal blocked");
+      .toThrow("Path escapes base directory");
   });
 
   it("blocks absolute path escape", () => {
     expect(() => resolveUnderDir(credDir, "/etc/passwd"))
-      .toThrow("Path traversal blocked");
+      .toThrow("Path escapes base directory");
   });
 });
 
