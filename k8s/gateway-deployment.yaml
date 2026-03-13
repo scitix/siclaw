@@ -60,7 +60,7 @@ spec:
         - name: SICLAW_PERSISTENCE_CLAIM_NAME
           value: "siclaw-data"
         - name: SICLAW_PERSISTENCE_MOUNT_PATH
-          value: "/app/.siclaw/user-data"
+          value: "/app/.siclaw/agentbox-user-data"
         - name: SICLAW_DATABASE_URL
           valueFrom:
             secretKeyRef:
@@ -86,13 +86,9 @@ spec:
           initialDelaySeconds: 2
           periodSeconds: 2
         volumeMounts:
-        - name: skills-local
-          mountPath: /app/.siclaw/skills
         - name: user-data
-          mountPath: /app/.siclaw/user-data
+          mountPath: /app/.siclaw/agentbox-user-data
       volumes:
-      - name: skills-local
-        emptyDir: {}
       - name: user-data
         persistentVolumeClaim:
           claimName: siclaw-data

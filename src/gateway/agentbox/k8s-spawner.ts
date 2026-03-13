@@ -26,7 +26,7 @@ export interface K8sSpawnerConfig {
     enabled: boolean;
     /** Name of the pre-existing shared PVC (e.g. "siclaw-data") */
     claimName: string;
-    /** Local mount path of the shared PVC on the gateway (default: "/app/.siclaw/user-data") */
+    /** Local mount path of the shared PVC on the gateway (default: "/app/.siclaw/agentbox-user-data") */
     mountPath?: string;
   };
 }
@@ -278,7 +278,7 @@ export class K8sSpawner implements BoxSpawner {
               },
               {
                 name: "user-data",
-                mountPath: "/app/.siclaw/user-data",
+                mountPath: "/app/.siclaw/agentbox-user-data",
                 ...(this.config.persistence?.enabled
                   ? { subPath: `users/${safeUserId}/${safeWorkspaceId}` }
                   : {}),
@@ -350,7 +350,7 @@ export class K8sSpawner implements BoxSpawner {
    * Directory layout: `{mountPath}/users/{safeUserId}/{safeWorkspaceId}/`
    */
   private ensureUserDir(safeUserId: string, safeWorkspaceId: string): void {
-    const mountPath = this.config.persistence?.mountPath || "/app/.siclaw/user-data";
+    const mountPath = this.config.persistence?.mountPath || "/app/.siclaw/agentbox-user-data";
     const base = path.resolve(mountPath);
     const userDir = path.join(base, "users", safeUserId, safeWorkspaceId);
     if (!userDir.startsWith(base)) {

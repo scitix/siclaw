@@ -28,7 +28,7 @@ const spawner = useK8s
         ? {
             enabled: true,
             claimName: process.env.SICLAW_PERSISTENCE_CLAIM_NAME || "siclaw-data",
-            mountPath: process.env.SICLAW_PERSISTENCE_MOUNT_PATH || "/app/.siclaw/user-data",
+            mountPath: process.env.SICLAW_PERSISTENCE_MOUNT_PATH || "/app/.siclaw/agentbox-user-data",
           }
         : undefined,
     })

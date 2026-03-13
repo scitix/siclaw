@@ -76,10 +76,8 @@ spec:
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
           volumeMounts:
-            - name: skills
-              mountPath: /app/.siclaw/skills
             {{- if .Values.agentbox.persistence.enabled }}
-            - name: user-data
+            - name: agentbox-user-data
               mountPath: {{ .Values.agentbox.persistence.mountPath }}
             {{- end }}
           livenessProbe:
@@ -95,10 +93,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
       volumes:
-        - name: skills
-          emptyDir: {}
         {{- if .Values.agentbox.persistence.enabled }}
-        - name: user-data
+        - name: agentbox-user-data
           persistentVolumeClaim:
             claimName: {{ .Values.agentbox.persistence.claimName }}
         {{- end }}
