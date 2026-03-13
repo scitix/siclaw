@@ -178,8 +178,7 @@ export function DpChecklistCard({ items, investigationProgress, onDismiss }: DpC
                     </span>
                     {onDismiss && !allDone && (
                         confirmingExit ? (
-                            <div className="ml-auto flex items-center gap-1.5 text-xs">
-                                <span className="text-gray-500">Exit investigation?</span>
+                            <div className="flex items-center gap-1 text-xs ml-1">
                                 <button
                                     onClick={() => { setConfirmingExit(false); onDismiss(); }}
                                     className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 hover:bg-red-200 font-medium"
