@@ -72,7 +72,9 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
   try {
     const a = new URL(kubeconfigServer);
     const b = new URL(envApiServer.includes("://") ? envApiServer : `https://${envApiServer}`);
-    return a.hostname === b.hostname && (a.port || "443") === (b.port || "443");
+    // Require explicit port on the env side — environments without port are legacy and must be updated
+    if (!b.port) return false;
+    return a.hostname === b.hostname && (a.port || "443") === b.port;
   } catch {
     // If URL parsing fails, reject the match — don't fall back to loose comparison
     return false;
@@ -3366,6 +3368,15 @@ export function createRpcMethods(
     if (!name) throw new Error("Missing required param: name");
     if (!apiServer) throw new Error("Missing required param: apiServer");
 
+    // Require explicit port in apiServer (e.g. https://host:6443)
+    try {
+      const u = new URL(apiServer.includes("://") ? apiServer : `https://${apiServer}`);
+      if (!u.port) throw new Error("API Server must include an explicit port (e.g. https://host:6443)");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("API Server")) throw e;
+      throw new Error("API Server must be a valid URL with an explicit port (e.g. https://host:6443)");
+    }
+
     // defaultKubeconfig only accepted for test environments
     if (defaultKubeconfig && !isTest) {
       throw new Error("defaultKubeconfig can only be set for test environments");
@@ -3399,6 +3410,15 @@ export function createRpcMethods(
 
     if (!apiServer?.trim()) {
       throw new Error("apiServer must be a non-empty string");
+    }
+
+    // Require explicit port in apiServer (e.g. https://host:6443)
+    try {
+      const u = new URL(apiServer.includes("://") ? apiServer : `https://${apiServer}`);
+      if (!u.port) throw new Error("API Server must include an explicit port (e.g. https://host:6443)");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("API Server")) throw e;
+      throw new Error("API Server must be a valid URL with an explicit port (e.g. https://host:6443)");
     }
 
     // If promoting from test to prod, auto-clear defaultKubeconfig
@@ -4139,10 +4159,18 @@ export function createRpcMethods(
         credentials[c.type] = (credentials[c.type] || 0) + 1;
       }
     }
-    if (userEnvConfigRepo) {
-      const envConfigs = await userEnvConfigRepo.listForUser(userId);
-      if (envConfigs.length > 0) {
-        credentials["kubeconfig"] = envConfigs.length;
+    if (envRepo && userEnvConfigRepo) {
+      const allEnvs = await envRepo.list();
+      let kubeconfigCount = 0;
+      for (const env of allEnvs) {
+        // Count if user has a personal kubeconfig, OR if it's a test env with a default kubeconfig
+        const userConfig = await userEnvConfigRepo.get(userId, env.id);
+        if (userConfig?.kubeconfig || (env.isTest && env.defaultKubeconfig)) {
+          kubeconfigCount++;
+        }
+      }
+      if (kubeconfigCount > 0) {
+        credentials["kubeconfig"] = kubeconfigCount;
       }
     }
 

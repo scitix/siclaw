@@ -1,4 +1,5 @@
 import { Circle, Loader2, CheckCircle2, SearchCode, SkipForward, XCircle, AlertTriangle, Clock, X } from 'lucide-react';
+import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import type { InvestigationProgress, InvestigationHypothesisProgress } from '@/hooks/usePilot';
 
@@ -129,6 +130,7 @@ function HypothesisRow({ h }: { h: InvestigationHypothesisProgress }) {
 }
 
 export function DpChecklistCard({ items, investigationProgress, onDismiss }: DpChecklistCardProps) {
+    const [confirmingExit, setConfirmingExit] = useState(false);
     const done = items.filter(i => i.status === 'done' || i.status === 'skipped').length;
     const total = items.length;
     const allDone = done === total;
@@ -175,16 +177,30 @@ export function DpChecklistCard({ items, investigationProgress, onDismiss }: DpC
                         {done}/{total}
                     </span>
                     {onDismiss && !allDone && (
-                        <button
-                            onClick={() => {
-                                if (!window.confirm('Exit investigation? Current progress will be summarized.')) return;
-                                onDismiss();
-                            }}
-                            className="ml-1 p-0.5 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
-                            title="Exit investigation"
-                        >
-                            <X className="w-3.5 h-3.5" />
-                        </button>
+                        confirmingExit ? (
+                            <div className="flex items-center gap-1 text-xs ml-1">
+                                <button
+                                    onClick={() => { setConfirmingExit(false); onDismiss(); }}
+                                    className="px-1.5 py-0.5 rounded bg-red-100 text-red-700 hover:bg-red-200 font-medium"
+                                >
+                                    Exit
+                                </button>
+                                <button
+                                    onClick={() => setConfirmingExit(false)}
+                                    className="px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 hover:bg-gray-200 font-medium"
+                                >
+                                    Cancel
+                                </button>
+                            </div>
+                        ) : (
+                            <button
+                                onClick={() => setConfirmingExit(true)}
+                                className="ml-1 p-0.5 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+                                title="Exit investigation"
+                            >
+                                <X className="w-3.5 h-3.5" />
+                            </button>
+                        )
                     )}
                 </div>
 
