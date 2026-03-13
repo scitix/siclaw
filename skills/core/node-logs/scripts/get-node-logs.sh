@@ -55,8 +55,8 @@ if [[ -n "$UNIT" && -n "$FILE" ]]; then
 fi
 
 # Validate --tail is a positive integer
-if ! [[ "$TAIL" =~ ^[0-9]+$ ]]; then
-  echo "Error: --tail must be a positive integer, got: $TAIL" >&2
+if ! [[ "$TAIL" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: --tail must be a positive integer (>0), got: $TAIL" >&2
   exit 1
 fi
 
