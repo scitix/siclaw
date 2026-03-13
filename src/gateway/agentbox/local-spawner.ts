@@ -19,6 +19,7 @@ import { buildMergedMcpConfig } from "../mcp-config-builder.js";
 import { loadConfig } from "../../core/config.js";
 import type { McpServerRepository } from "../db/repositories/mcp-server-repo.js";
 import type { ResourceType } from "../../shared/resource-sync.js";
+import { resolveUnderDir } from "../../shared/path-utils.js";
 
 interface LocalBox {
   userId: string;
@@ -218,7 +219,7 @@ export class LocalSpawner implements BoxSpawner {
 
       // Write skills into per-user directory
       for (const skill of bundle.skills) {
-        const skillDir = path.join(userSkillsDir, skill.dirName);
+        const skillDir = resolveUnderDir(userSkillsDir, skill.dirName);
         fs.mkdirSync(skillDir, { recursive: true });
         if (skill.specs) {
           fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
@@ -227,7 +228,8 @@ export class LocalSpawner implements BoxSpawner {
           const scriptsDir = path.join(skillDir, "scripts");
           fs.mkdirSync(scriptsDir, { recursive: true });
           for (const script of skill.scripts) {
-            fs.writeFileSync(path.join(scriptsDir, script.name), script.content, { mode: 0o755 });
+            const scriptPath = resolveUnderDir(scriptsDir, script.name);
+            fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
           }
         }
       }

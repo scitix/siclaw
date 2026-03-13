@@ -109,6 +109,7 @@ export const getCurrentUser = (): User | undefined => {
 function isTokenExpired(token: string): boolean {
     try {
         const payload = JSON.parse(atob(token.split('.')[1]));
+        if (!payload.exp) return true; // treat missing exp as expired (fail-safe)
         return payload.exp * 1000 < Date.now() - 60_000;
     } catch {
         return true;

@@ -761,6 +761,9 @@ function validateCurl(args: string[]): string | null {
       const inlineValue = hasValue ? arg.slice(flag.length + 1) : undefined;
 
       if (CURL_REQUEST_FLAGS.has(flag)) {
+        if (!hasValue && i + 1 >= args.length) {
+          return JSON.stringify({ error: `curl "${flag}" requires a value` }, null, 2);
+        }
         const method = hasValue ? inlineValue : args[i + 1];
         const err = checkCurlMethod(method);
         if (err) return err;
@@ -769,6 +772,9 @@ function validateCurl(args: string[]): string | null {
       }
 
       if (CURL_DATA_FLAGS.has(flag)) {
+        if (!hasValue && i + 1 >= args.length) {
+          return JSON.stringify({ error: `curl "${flag}" requires a value` }, null, 2);
+        }
         const value = hasValue ? inlineValue : args[i + 1];
         const err = checkCurlDataValue(flag, value);
         if (err) return err;

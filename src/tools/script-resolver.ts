@@ -209,8 +209,15 @@ export function listAllSkillsWithScripts(): Array<{
     try {
       for (const d of fs.readdirSync(base, { withFileTypes: true })) {
         if (d.name.startsWith("_")) continue; // skip _lib etc.
-        if ((!d.isDirectory() && !d.isSymbolicLink()) || seen.has(d.name))
-          continue;
+        if (seen.has(d.name)) continue;
+        // Check if entry is a directory (for symlinks, stat the target)
+        let isDir = d.isDirectory();
+        if (!isDir && d.isSymbolicLink()) {
+          try {
+            isDir = fs.statSync(path.join(base, d.name)).isDirectory();
+          } catch { /* broken symlink */ }
+        }
+        if (!isDir) continue;
         // Skip disabled builtins so they don't shadow bundle overrides
         if (isBuiltinDir && disabled.has(d.name)) continue;
         const scriptsDir = path.join(base, d.name, "scripts");

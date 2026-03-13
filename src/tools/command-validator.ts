@@ -45,8 +45,13 @@ export function extractCommands(input: string): string[] {
 
     if (inQuote) {
       current += ch;
-      if (ch === inQuote && input[i - 1] !== "\\") {
-        inQuote = null;
+      if (ch === inQuote) {
+        // Count consecutive preceding backslashes — char is escaped only if count is odd
+        let backslashes = 0;
+        for (let j = i - 1; j >= 0 && input[j] === "\\"; j--) backslashes++;
+        if (backslashes % 2 === 0) {
+          inQuote = null;
+        }
       }
       continue;
     }
@@ -125,8 +130,13 @@ export function extractPipeline(input: string): PipelineSegment[] {
 
     if (inQuote) {
       current += ch;
-      if (ch === inQuote && input[i - 1] !== "\\") {
-        inQuote = null;
+      if (ch === inQuote) {
+        // Count consecutive preceding backslashes — char is escaped only if count is odd
+        let backslashes = 0;
+        for (let j = i - 1; j >= 0 && input[j] === "\\"; j--) backslashes++;
+        if (backslashes % 2 === 0) {
+          inQuote = null;
+        }
       }
       continue;
     }
