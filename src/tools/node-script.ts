@@ -14,8 +14,6 @@ import {
   formatExecOutput,
 } from "./exec-utils.js";
 
-const DEFAULT_IMAGE = loadConfig().debugImage;
-
 interface NodeScriptParams {
   node: string;
   skill?: string;
@@ -72,7 +70,7 @@ Examples:
       ),
       image: Type.Optional(
         Type.String({
-          description: `Debug container image (default: ${DEFAULT_IMAGE})`,
+          description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -117,7 +115,7 @@ Examples:
         };
       }
 
-      const image = params.image || DEFAULT_IMAGE;
+      const image = params.image || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
       // Security: shell-escape each argument to prevent injection via args parameter
