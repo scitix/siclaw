@@ -27,12 +27,7 @@ gateway:
 
 # -- AgentBox (spawned at runtime by gateway)
 agentbox:
-  image:
-    # Override registry/tag if agentbox image differs from gateway
-    registry: ""        # defaults to image.registry
-    repository: ""      # defaults to "siclaw-agentbox"
-    tag: ""             # defaults to image.tag
-  debugImage: ""        # Debug pod image for node_exec/node_script (default: "busybox:latest")
+  debugImage: ""        # Debug pod image for node_exec/node_script (default: "busybox:1.36")
   # User data persistence (memory, investigations, sessions).
   # Uses a single shared PVC; gateway creates per-user subdirectories,
   # AgentBox pods mount via subPath. No dynamic provisioning required.
