@@ -39,7 +39,6 @@ agentbox:
   persistence:
     enabled: false          # set to true to persist user memory across pod restarts
     claimName: "siclaw-data"  # name of pre-existing shared PVC (must support ReadWriteMany)
-    mountPath: "/app/.siclaw/user-data"  # gateway mount path (env + volumeMount must match)
 
 # -- Database (MySQL — SQLite is not supported in K8s mode)
 database:
