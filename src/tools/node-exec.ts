@@ -14,8 +14,6 @@ import {
   formatExecOutput,
 } from "./exec-utils.js";
 
-const DEFAULT_IMAGE = loadConfig().debugImage;
-
 // Re-export for backward compatibility (tests + downstream imports)
 export { ALLOWED_COMMANDS } from "./command-sets.js";
 export { validateNodeName, validatePodName } from "./exec-utils.js";
@@ -89,7 +87,7 @@ Examples:
       }),
       image: Type.Optional(
         Type.String({
-          description: `Debug container image (default: ${DEFAULT_IMAGE})`,
+          description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
         })
       ),
       timeout_seconds: Type.Optional(
@@ -143,7 +141,7 @@ Examples:
         };
       }
 
-      const image = params.image || DEFAULT_IMAGE;
+      const image = params.image || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const commands = extractCommands(params.command);
       const needsShell = commands.length > 1;

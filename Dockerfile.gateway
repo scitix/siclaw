@@ -64,10 +64,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Expose port
 EXPOSE 3000
 
-# Run as non-root user for security
-RUN useradd -m -s /bin/bash gateway
-RUN chown -R gateway:gateway /app
-USER gateway
-
 # Start gateway with K8s spawner
 CMD ["node", "dist/gateway-main.js", "--k8s"]
