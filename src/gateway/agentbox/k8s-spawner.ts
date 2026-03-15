@@ -26,8 +26,6 @@ export interface K8sSpawnerConfig {
     enabled: boolean;
     /** Name of the pre-existing shared PVC (e.g. "siclaw-data") */
     claimName: string;
-    /** Local mount path of the shared PVC on the gateway (default: "/app/.siclaw/user-data") */
-    mountPath?: string;
   };
 }
 
@@ -347,11 +345,10 @@ export class K8sSpawner implements BoxSpawner {
   /**
    * Ensure per-user subdirectory exists on the shared PVC (synchronous, idempotent).
    * Expects already-sanitized path segments.
-   * Directory layout: `{mountPath}/users/{safeUserId}/{safeWorkspaceId}/`
+   * Directory layout: `/app/.siclaw/user-data/users/{safeUserId}/{safeWorkspaceId}/`
    */
   private ensureUserDir(safeUserId: string, safeWorkspaceId: string): void {
-    const mountPath = this.config.persistence?.mountPath || "/app/.siclaw/user-data";
-    const base = path.resolve(mountPath);
+    const base = path.resolve("/app/.siclaw/user-data");
     const userDir = path.join(base, "users", safeUserId, safeWorkspaceId);
     if (!userDir.startsWith(base)) {
       throw new Error(`[k8s-spawner] Path traversal detected: ${userDir}`);
