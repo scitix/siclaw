@@ -59,8 +59,6 @@ spec:
           value: "true"
         - name: SICLAW_PERSISTENCE_CLAIM_NAME
           value: "siclaw-data"
-        - name: SICLAW_PERSISTENCE_MOUNT_PATH
-          value: "/app/.siclaw/user-data"
         - name: SICLAW_DATABASE_URL
           valueFrom:
             secretKeyRef:

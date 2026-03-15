@@ -45,8 +45,6 @@ spec:
               value: "true"
             - name: SICLAW_PERSISTENCE_CLAIM_NAME
               value: {{ .Values.agentbox.persistence.claimName | quote }}
-            - name: SICLAW_PERSISTENCE_MOUNT_PATH
-              value: {{ .Values.agentbox.persistence.mountPath | quote }}
             {{- end }}
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
@@ -80,7 +78,7 @@ spec:
               mountPath: /app/.siclaw/skills
             {{- if .Values.agentbox.persistence.enabled }}
             - name: user-data
-              mountPath: {{ .Values.agentbox.persistence.mountPath }}
+              mountPath: /app/.siclaw/user-data
             {{- end }}
           livenessProbe:
             httpGet:
