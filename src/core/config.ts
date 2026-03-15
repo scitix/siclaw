@@ -74,7 +74,7 @@ const DEFAULTS: SiclawConfig = {
     credentialsDir: ".siclaw/credentials",
   },
   server: { port: 3000, gatewayUrl: "" },
-  debugImage: "busybox:latest",
+  debugImage: "busybox:1.36",
   allowedTools: null,
   mcpServers: {},
   debug: false,
