@@ -198,7 +198,10 @@ This is a new user (profile has only defaults).
   }
 
   // Knowledge Overview (between PROFILE and MEMORY)
-  const overview = buildKnowledgeOverview(memoryDir);
+  const config_ = loadConfig();
+  const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
+  const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
+  const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_ });
   if (overview) {
     parts.push(overview);
   }
@@ -342,10 +345,12 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
 
   // -- Path-restricted file I/O tools --
-  // Whitelist: only skills directories + user-data + reports (no credentials, no config)
+  // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
   const builtinSkillsRoot = path.resolve(cwd, "skills");
   const reportsDir = path.join(homedir(), ".siclaw", "reports");
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir];
+  const reposDir = path.resolve(cwd, config.paths.reposDir);
+  const docsDir = path.resolve(cwd, config.paths.docsDir);
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, reposDir, docsDir];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
