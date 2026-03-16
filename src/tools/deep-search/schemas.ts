@@ -85,3 +85,23 @@ export const CONCLUSION_SCHEMA = {
   },
   required: ["conclusion_text", "root_cause_category", "confidence"],
 };
+
+/** Quality gate: conclusion validation — validate_conclusion tool schema. */
+export const VALIDATION_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    pass: {
+      type: "boolean" as const,
+      description: "Whether conclusion passes quality checks",
+    },
+    critique: {
+      type: "string" as const,
+      description: "Specific issues found (empty string if pass is true)",
+    },
+    adjusted_confidence: {
+      type: "number" as const,
+      description: "Adjusted confidence score if the original was miscalibrated (0-100)",
+    },
+  },
+  required: ["pass"] as const,
+};

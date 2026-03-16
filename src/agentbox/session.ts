@@ -19,7 +19,7 @@ import { createSiclawSession, type KubeconfigRef, type LlmConfigRef, type Sessio
 import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
-import { saveSessionMemory } from "../memory/session-summarizer.js";
+import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
@@ -414,10 +414,16 @@ export class AgentBoxSessionManager {
       const currentMessageCount = this.countJsonlMessages(sessionDir);
 
       if (currentMessageCount > managed._lastSavedMessageCount) {
-        const saved = await saveSessionMemory({ sessionDir, memoryDir });
+        const saved = await saveSessionKnowledge({
+          sessionDir,
+          memoryDir,
+          llmConfig: managed.llmConfigRef.apiKey && managed.llmConfigRef.baseUrl
+            ? { apiKey: managed.llmConfigRef.apiKey, baseUrl: managed.llmConfigRef.baseUrl, model: managed.llmConfigRef.model }
+            : undefined,
+        });
         if (saved) {
           managed._lastSavedMessageCount = currentMessageCount;
-          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved}`);
+          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : saved}`);
         }
       } else {
         console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
