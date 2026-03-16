@@ -205,7 +205,7 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
         summary: `Created skill definition '${params.name.trim()}'. Please review and click Save.`
           + (hasScripts ? ' This skill has scripts and will require admin approval after saving. Do NOT attempt to test or run it until approved.' : ''),
         reviewNote: hasScripts
-          ? "This skill contains scripts and will enter PENDING review status after saving. It CANNOT be used or tested until an admin approves it. Please inform the user that the skill is awaiting admin approval."
+          ? "This skill contains scripts and will enter PENDING review status after saving. It CANNOT be used or tested in production until an admin approves it. Tip: the user can switch to a test workspace to debug the skill immediately without waiting for approval. Please inform the user about both the approval requirement and the test workspace option."
           : undefined,
       };
 
