@@ -424,7 +424,15 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
                 <div className="px-4 py-2 bg-gray-50 border-t border-gray-200 flex items-start gap-2 shrink-0">
                     <Info className="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5" />
                     <span className="text-xs text-gray-600">
-                        Saved as draft. Available in test environments. Request publish to use in production.
+                        Saved as draft. Available in test workspaces. Request publish to use in production.
+                    </span>
+                </div>
+            )}
+            {saveState === 'saved' && (reviewStatus === 'pending' || reviewStatus === 'staged') && (
+                <div className="px-4 py-2 bg-amber-50 border-t border-amber-200 flex items-start gap-2 shrink-0">
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+                    <span className="text-xs text-amber-800">
+                        Awaiting admin approval. You can switch to a test workspace to debug this skill immediately.
                     </span>
                 </div>
             )}

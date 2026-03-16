@@ -198,7 +198,7 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
         summary: `Updated skill definition '${params.name.trim()}'. Please review and click Update.`
           + (hasScripts ? ' Script changes will be staged for admin review. The old version remains active until approved. Do NOT attempt to test the new version until approved.' : ''),
         reviewNote: hasScripts
-          ? "This update contains scripts and will enter STAGED review status. The OLD version of the skill remains active and usable, but the new version will NOT take effect until an admin approves it. Please inform the user that the update is awaiting admin approval."
+          ? "This update contains scripts and will enter STAGED review status. The OLD version of the skill remains active and usable, but the new version will NOT take effect in production until an admin approves it. Tip: the user can switch to a test workspace to debug the updated skill immediately without waiting for approval. Please inform the user about both the approval requirement and the test workspace option."
           : undefined,
       };
 
