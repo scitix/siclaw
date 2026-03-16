@@ -54,6 +54,7 @@ export interface PilotAreaProps {
     sessionKey?: string | null;
     /** Current workspace ID for cron job operations */
     selectedWorkspaceId?: string | null;
+    isAdmin?: boolean;
 }
 
 /** Compute superseded status for skill messages */
@@ -153,7 +154,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -361,6 +362,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                             onSendPrompt={sendMessage}
                             onNavigateModels={onNavigateModels ?? (() => {})}
                             onNavigateCredentials={onNavigateCredentials ?? (() => {})}
+                            isAdmin={isAdmin}
                         />
                     ) : (
                         <>
