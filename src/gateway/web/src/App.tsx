@@ -73,7 +73,7 @@ const router = createBrowserRouter([
                     { path: 'environments', element: <Navigate to="/credentials" replace /> },
                     // { path: 'brains', element: <BrainsPage /> },  // hidden until claude-sdk brain is polished
                     { path: 'models', element: <ModelsPage /> },
-                    { path: 'metrics', element: <MetricsPage /> },
+                    { path: 'monitoring', element: <MetricsPage /> },
                 ],
             },
         ],
