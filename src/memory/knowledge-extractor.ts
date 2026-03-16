@@ -62,7 +62,7 @@ const EXTRACTION_SCHEMA: Record<string, unknown> = {
       description: "Extracted knowledge entries grouped by topic",
     },
   },
-  required: ["should_extract"],
+  required: ["should_extract", "entries"],
 };
 
 /**
@@ -111,6 +111,7 @@ Call the extract_knowledge tool with your result.`;
   );
 
   if (!toolArgs?.should_extract || !Array.isArray(toolArgs.entries)) {
+    console.log(`[knowledge-extractor] No extraction: toolArgs=${JSON.stringify(toolArgs)?.slice(0, 300)}`);
     return [];
   }
 
