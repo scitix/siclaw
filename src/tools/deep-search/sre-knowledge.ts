@@ -1,9 +1,9 @@
 /**
- * SRE Knowledge Base for Deep Search Sub-Agent.
+ * Tool usage knowledge for Deep Search Sub-Agent.
  *
- * Skills are now auto-loaded by pi-agent from skills/core/ — no manual catalogs needed.
- * This file provides tool semantics, common mistakes, and domain-specific
- * troubleshooting priorities that complement the auto-loaded skills.
+ * Domain-agnostic: contains only tool semantics and generic usage mistakes.
+ * Domain-specific knowledge (RDMA, networking, etc.) lives in skill SKILL.md files
+ * and is loaded by the agent on demand via progressive discovery.
  */
 
 /**
@@ -32,26 +32,21 @@ export function toolSemantics(): string {
 - ALWAYS read a skill's SKILL.md before using complex scripts
 
 ### Critical Differences
-- net1/net2 interfaces exist ONLY in pod network namespace, NOT on host
-  node_exec: ip link show net1 → NOT FOUND (wrong tool!)
-  bash: kubectl exec <pod> -n <ns> -- ip link show net1 → CORRECT
+- Pod-specific interfaces/files exist ONLY in the pod's network namespace, NOT on the host
+  node_exec: ip link show <pod-interface> → NOT FOUND (wrong tool!)
+  bash: kubectl exec <pod> -n <ns> -- ip link show <pod-interface> → CORRECT
 - node_exec does NOT support pipes:
-  node_exec: lsmod | grep mlx → ERROR (pipe not supported!)
+  node_exec: lsmod | grep <module> → ERROR (pipe not supported!)
   node_exec: lsmod → OK (filter output in your reasoning, not in the command)
 - Shell globs do NOT expand in node_exec:
-  node_exec: cat /sys/class/infiniband/*/ports/*/counters/port_rcv_errors → ERROR
+  node_exec: cat /sys/class/.../*/.../file → ERROR
   Use skill scripts instead, which handle glob expansion internally
 - Prefer skill scripts over raw commands — they encode domain knowledge and handle edge cases
 
 ### Command Chaining — Maximize Efficiency
-Simple chains (2 commands, no parsing needed):
-  bash: skills/extension/roce-mtu-compare/scripts/mtu-compare.sh --pod-a X --ns-a Y && skills/extension/roce-pcie-link/scripts/pcie-link.sh --node N
+PREFER chaining independent commands with && in a single bash call:
+  bash: <command-1> && <command-2>
   → 1 tool call instead of 2, both outputs returned together
-
-PREFER chaining when:
-- Commands are independent (order doesn't matter, no conditional logic)
-- You need to run 2+ skill scripts for the same hypothesis
-- Gathering multiple data points to compare (e.g. MTU on both pods)
 
 DO NOT chain when:
 - Next command depends on the previous result and requires LLM reasoning to decide
@@ -59,56 +54,29 @@ DO NOT chain when:
 }
 
 /**
- * Common mistakes the LLM makes — injected into Phase 3.
+ * Common tool usage mistakes the LLM makes — injected into Phase 3.
+ * Domain-agnostic: only covers tool misuse, not domain-specific errors.
  */
 export function commonMistakes(): string {
   return `## Common Mistakes — AVOID these
 
 1. Using node_exec for pod-level diagnostics:
-   WRONG: node_exec: cat /sys/class/net/net1/mtu  (net1 doesn't exist on host)
-   RIGHT: bash: kubectl exec <pod> -n <ns> -- cat /sys/class/net/net1/mtu
+   WRONG: node_exec: cat /sys/class/net/<iface>/mtu  (pod interfaces don't exist on host)
+   RIGHT: bash: kubectl exec <pod> -n <ns> -- cat /sys/class/net/<iface>/mtu
 
 2. Using pipes in node_exec:
-   WRONG: node_exec: lsmod | grep mlx5
+   WRONG: node_exec: lsmod | grep <module>
    RIGHT: node_exec: lsmod  (then parse the output yourself)
 
 3. Using shell globs in node_exec:
-   WRONG: node_exec: cat /sys/class/infiniband/*/ports/*/counters/port_rcv_errors
-   RIGHT: Use the roce-port-counters skill script via bash tool
+   WRONG: node_exec: cat /sys/class/.../*/file
+   RIGHT: Use a skill script via bash tool (scripts handle glob expansion internally)
 
 4. Hand-crafting commands when a skill script exists:
-   WRONG: bash: kubectl exec pod -n ns -- cat /sys/class/infiniband/mlx5_0/ports/1/counters/port_rcv_errors
-   RIGHT: bash skills/extension/roce-port-counters/scripts/port-counters.sh --pod pod --ns ns
+   Before running raw kubectl/bash commands, check if a relevant skill exists.
+   Skill scripts encode domain knowledge, handle edge cases, and produce structured output.
 
-5. Running node-level perftest in switchdev mode:
-   WRONG: roce-perftest-node in switchdev (PF is a switch, not an endpoint)
-   RIGHT: roce-perftest-pod (always works regardless of mode)
-
-6. Assuming switchdev mode is an error:
-   Switchdev is normal production configuration for SR-IOV + OVS offload.
-   Do NOT report it as a misconfiguration.
-
-7. NOT reading SKILL.md before invoking a skill:
+5. NOT reading SKILL.md before invoking a skill:
    Always use the read tool to read skills/{core,extension}/<name>/SKILL.md first.
    It tells you required parameters, edge cases, and output format.`;
-}
-
-/**
- * RDMA bandwidth troubleshooting priority.
- * Injected into Phase 2 for hypothesis ordering.
- */
-export function rdmaTroubleshootingPriority(): string {
-  return `## RDMA Bandwidth Troubleshooting Priority (most common → least common)
-1. roce-show-node-mode → Determine mode (switchdev/legacy) — affects which tools to use
-2. roce-mtu-compare → MTU mismatch (most common cause of low bandwidth)
-3. roce-pcie-link → PCIe link degradation (Gen4→Gen3, x16→x8)
-4. roce-port-counters → Port error/retransmission counters
-5. roce-ethtool-errors → NIC hardware errors (CRC, PFC storm)
-6. roce-perftest-pod → Actual bandwidth test to confirm the problem
-
-## Switchdev Mode Considerations
-- Switchdev is NORMAL production config, NOT an error
-- PF acts as switch (not endpoint) — node-level testing does not apply
-- SKIP in switchdev: roce-perftest-node, roce-perftest-cross, node-ping-gateway
-- USE in switchdev: roce-perftest-pod, pod-ping-gateway, all pod-level skills`;
 }

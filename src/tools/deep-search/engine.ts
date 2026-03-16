@@ -16,6 +16,7 @@ import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
 import type { InvestigationPattern, InvestigationRecord } from "../../memory/types.js";
 import type {
+  ConclusionResult,
   DeepSearchBudget,
   HypothesisNode,
   InvestigationResult,
@@ -29,23 +30,12 @@ import {
   TRACE_TAIL_CHARS,
 } from "./types.js";
 import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA } from "./schemas.js";
+import { validateConclusion } from "./quality-gate.js";
 
 interface RawHypothesis {
   text: string;
   confidence: number;
   suggestedTools: string[];
-}
-
-interface ConclusionResult {
-  text: string;
-  structured?: {
-    root_cause_category: string;
-    affected_entities: string[];
-    environment_tags: string[];
-    causal_chain: string[];
-    confidence: number;
-    remediation_steps?: string[];
-  };
 }
 
 /**
@@ -292,6 +282,7 @@ async function generateConclusion(
   question: string,
   hypotheses: HypothesisNode[],
   options?: SubAgentOptions,
+  critique?: string,
 ): Promise<ConclusionResult> {
   const hypothesesSummary = hypotheses
     .map((h) => {
@@ -302,7 +293,7 @@ async function generateConclusion(
     })
     .join("\n\n");
 
-  const prompt = conclusionPrompt(question, hypothesesSummary);
+  const prompt = conclusionPrompt(question, hypothesesSummary, critique);
   // No onProgress here — Phase 4 conclusion text should NOT leak into spinner
   try {
     const { toolArgs, textContent } = await llmCompleteWithTool<ConclusionToolArgs>(
@@ -702,7 +693,22 @@ export async function investigate(
 
   // --- Phase 4: Conclusion ---
   onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Generating conclusion..." });
-  const conclusionResult = await generateConclusion(question, hypotheses, options);
+  let conclusionResult = await generateConclusion(question, hypotheses, options);
+
+  // Quality gate: validate conclusion before storing (skip for text-only fallback conclusions)
+  if (conclusionResult.structured) {
+    const validation = await validateConclusion({
+      question, hypotheses, conclusion: conclusionResult, options,
+    });
+    if (!validation.pass) {
+      onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Re-generating (quality feedback)..." });
+      conclusionResult = await generateConclusion(question, hypotheses, options, validation.critique);
+    } else if (validation.adjustedConfidence !== undefined && conclusionResult.structured) {
+      // Only apply adjustedConfidence when the gate passed — after retry the new conclusion
+      // has its own confidence from the critique-informed generation
+      conclusionResult.structured.confidence = validation.adjustedConfidence;
+    }
+  }
 
   const totalDurationMs = Date.now() - startTime;
 

@@ -18,7 +18,6 @@ import {
 import {
   toolSemantics,
   commonMistakes,
-  rdmaTroubleshootingPriority,
 } from "./sre-knowledge.js";
 import { formatResult, formatSummary } from "./format.js";
 import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA, ROOT_CAUSE_CATEGORIES } from "./schemas.js";
@@ -28,10 +27,10 @@ import { extractJSON } from "./sub-agent.js";
 
 describe("types / budgets", () => {
   it("NORMAL_BUDGET has expected defaults", () => {
-    expect(NORMAL_BUDGET.maxContextCalls).toBe(8);
+    expect(NORMAL_BUDGET.maxContextCalls).toBe(15);
     expect(NORMAL_BUDGET.maxHypotheses).toBe(5);
     expect(NORMAL_BUDGET.maxCallsPerHypothesis).toBe(10);
-    expect(NORMAL_BUDGET.maxTotalCalls).toBe(60);
+    expect(NORMAL_BUDGET.maxTotalCalls).toBe(75);
     expect(NORMAL_BUDGET.maxParallel).toBe(3);
   });
 
@@ -56,11 +55,10 @@ describe("types / budgets", () => {
 
 // ─── sre-knowledge.ts ───
 
-describe("sre-knowledge", () => {
+describe("sre-knowledge (domain-agnostic tool usage)", () => {
   it("toolSemantics explains bash vs node_exec differences", () => {
     const semantics = toolSemantics();
-    expect(semantics).toContain("net1/net2");
-    expect(semantics).toContain("NOT on host");
+    expect(semantics).toContain("NOT on the host");
     expect(semantics).toContain("NO pipes");
     expect(semantics).toContain("kubectl exec");
     expect(semantics).toContain("skills/");
@@ -69,33 +67,36 @@ describe("sre-knowledge", () => {
   it("toolSemantics includes command chaining guidance", () => {
     const semantics = toolSemantics();
     expect(semantics).toContain("Command Chaining");
-    expect(semantics).toContain("PREFER chaining when");
+    expect(semantics).toContain("PREFER chaining");
     expect(semantics).toContain("DO NOT chain when");
   });
 
-  it("commonMistakes includes all major anti-patterns", () => {
+  it("toolSemantics does not contain domain-specific knowledge", () => {
+    const semantics = toolSemantics();
+    expect(semantics).not.toContain("roce-");
+    expect(semantics).not.toContain("switchdev");
+    expect(semantics).not.toContain("RDMA");
+  });
+
+  it("commonMistakes includes generic tool anti-patterns", () => {
     const mistakes = commonMistakes();
     // node_exec for pod interfaces
-    expect(mistakes).toContain("net1 doesn't exist on host");
+    expect(mistakes).toContain("don't exist on host");
     // pipes in node_exec
     expect(mistakes).toContain("lsmod | grep");
     // shell globs in node_exec
-    expect(mistakes).toContain("/sys/class/infiniband/*/ports/");
-    // hand-crafting when skill exists
+    expect(mistakes).toContain("glob expansion");
+    // prefer skill scripts
     expect(mistakes).toContain("skill script exists");
-    // switchdev misconception
-    expect(mistakes).toContain("switchdev");
-    expect(mistakes).toContain("normal production configuration");
+    // read SKILL.md
+    expect(mistakes).toContain("SKILL.md");
   });
 
-  it("rdmaTroubleshootingPriority lists correct order", () => {
-    const priority = rdmaTroubleshootingPriority();
-    const mtuIndex = priority.indexOf("roce-mtu-compare");
-    const pcieIndex = priority.indexOf("roce-pcie-link");
-    const portCountersIndex = priority.indexOf("roce-port-counters");
-    // MTU should come before PCIe, which should come before port counters
-    expect(mtuIndex).toBeLessThan(pcieIndex);
-    expect(pcieIndex).toBeLessThan(portCountersIndex);
+  it("commonMistakes does not contain domain-specific knowledge", () => {
+    const mistakes = commonMistakes();
+    expect(mistakes).not.toContain("roce-");
+    expect(mistakes).not.toContain("switchdev");
+    expect(mistakes).not.toContain("RDMA");
   });
 });
 
@@ -110,17 +111,20 @@ describe("prompts", () => {
     expect(prompt).toContain("CONTEXT_SUMMARY_END");
   });
 
-  it("contextGatheringPrompt injects tool semantics", () => {
-    const prompt = contextGatheringPrompt("RDMA bandwidth low", 8);
+  it("contextGatheringPrompt uses progressive discovery approach", () => {
+    const prompt = contextGatheringPrompt("RDMA bandwidth low", 12);
     expect(prompt).toContain("Tool Semantics");
-    expect(prompt).toContain("roce-show-node-mode");
-    expect(prompt).toContain("ALWAYS run roce-show-node-mode FIRST");
+    expect(prompt).toContain("Progressive Discovery");
+    expect(prompt).toContain("Confirm the symptom");
+    expect(prompt).toContain("Follow the thread");
   });
 
-  it("contextGatheringPrompt includes chaining guidance", () => {
+  it("contextGatheringPrompt includes chaining guidance and allows early impressions", () => {
     const prompt = contextGatheringPrompt("test question", 5);
-    expect(prompt).toContain("Chain environment checks");
+    expect(prompt).toContain("Chain independent commands");
     expect(prompt).toContain("&&");
+    expect(prompt).toContain("Initial leads");
+    expect(prompt).toContain("early impressions");
   });
 
   it("hypothesisGenerationPrompt includes context and maxHypotheses", () => {
@@ -131,10 +135,13 @@ describe("prompts", () => {
     expect(prompt).toContain("submit_hypotheses");
   });
 
-  it("hypothesisGenerationPrompt injects skills and troubleshooting priority", () => {
+  it("hypothesisGenerationPrompt injects skills and is domain-agnostic", () => {
     const prompt = hypothesisGenerationPrompt("RDMA bandwidth low", "context", 5);
-    expect(prompt).toContain("Troubleshooting Priority");
     expect(prompt).toContain("MUST use real skill script paths");
+    expect(prompt).toContain("initial leads");
+    // Should NOT contain hardcoded domain knowledge
+    expect(prompt).not.toContain("Troubleshooting Priority");
+    expect(prompt).not.toContain("roce-mtu-compare");
   });
 
   it("hypothesisGenerationPrompt injects diagnostic_patterns when provided", () => {

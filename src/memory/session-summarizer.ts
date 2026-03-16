@@ -2,11 +2,15 @@
  * Session Summarizer — extracts conversation from JSONL and saves as memory markdown.
  *
  * Called during session release to persist conversation context for future memory search.
+ * Supports two modes:
+ * - saveSessionMemory(): raw conversation dump (legacy fallback)
+ * - saveSessionKnowledge(): LLM-driven knowledge extraction into topic files
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { extractConversationKnowledge, mergeTopicFiles } from "./knowledge-extractor.js";
 
 const DEFAULT_MAX_MESSAGES = 15;
 const MIN_MESSAGES_TO_SAVE = 3;
@@ -20,6 +24,10 @@ export interface SaveSessionMemoryOpts {
   maxMessages?: number;
 }
 
+export interface SaveSessionKnowledgeOpts extends SaveSessionMemoryOpts {
+  llmConfig?: { apiKey: string; baseUrl: string; model?: string };
+}
+
 interface ExtractedMessage {
   role: "user" | "assistant";
   text: string;
@@ -28,7 +36,7 @@ interface ExtractedMessage {
 /**
  * Find the most recent .jsonl file in the session directory.
  */
-function findLatestJsonl(sessionDir: string): string | null {
+export function findLatestJsonl(sessionDir: string): string | null {
   let files: string[];
   try {
     files = fs.readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"));
@@ -65,7 +73,7 @@ function extractText(content: unknown): string {
 /**
  * Extract user and assistant messages from a JSONL session file.
  */
-async function extractMessages(jsonlPath: string): Promise<ExtractedMessage[]> {
+export async function extractMessages(jsonlPath: string): Promise<ExtractedMessage[]> {
   const messages: ExtractedMessage[] = [];
 
   const stream = fs.createReadStream(jsonlPath, { encoding: "utf-8" });
@@ -162,4 +170,39 @@ export async function saveSessionMemory(opts: SaveSessionMemoryOpts): Promise<st
   fs.writeFileSync(finalPath, lines.join("\n"), "utf-8");
   console.log(`[session-summarizer] Saved session memory to ${finalPath} (${messages.length} messages)`);
   return finalPath;
+}
+
+/**
+ * Save session knowledge using LLM-driven extraction.
+ * Falls back to raw saveSessionMemory() when LLM config is unavailable or extraction fails.
+ *
+ * @returns Array of modified topic file paths, or null if nothing was saved.
+ */
+export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Promise<string[] | null> {
+  const { sessionDir, memoryDir, llmConfig } = opts;
+
+  const jsonlPath = findLatestJsonl(sessionDir);
+  if (!jsonlPath) return null;
+
+  const messages = await extractMessages(jsonlPath);
+  if (messages.length < MIN_MESSAGES_TO_SAVE) return null;
+
+  // No LLM config → fall back to raw save
+  if (!llmConfig?.apiKey) {
+    const raw = await saveSessionMemory(opts);
+    return raw ? [raw] : null;
+  }
+
+  try {
+    const entries = await extractConversationKnowledge({ messages, llmConfig });
+    if (!entries.length) {
+      // LLM judged no extractable knowledge (small talk, too short) — trust the judgment
+      return null;
+    }
+    return mergeTopicFiles(memoryDir, entries);
+  } catch (err) {
+    console.warn("[session-summarizer] Knowledge extraction failed, falling back to raw save:", err);
+    const raw = await saveSessionMemory(opts);
+    return raw ? [raw] : null;
+  }
 }

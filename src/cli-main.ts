@@ -9,7 +9,7 @@ import { createSiclawSession } from "./core/agent-factory.js";
 import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
-import { saveSessionMemory } from "./memory/session-summarizer.js";
+import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 import type { BrainType } from "./core/brain-session.js";
 
 // Parse arguments
@@ -204,9 +204,15 @@ if (session.sessionFile) {
   const sessionDir = path.dirname(session.sessionFile);
   const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {
-    const saved = await saveSessionMemory({ sessionDir, memoryDir });
+    const llm = getDefaultLlm();
+    const saved = await saveSessionKnowledge({
+      sessionDir,
+      memoryDir,
+      llmConfig: llm ? { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id } : undefined,
+    });
     if (saved) {
-      console.log(`[siclaw] Session memory saved to ${path.basename(saved)}`);
+      const label = Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : path.basename(saved);
+      console.log(`[siclaw] Session knowledge saved: ${label}`);
     }
   } catch (err) {
     console.warn(`[siclaw] Memory auto-save failed:`, err);
