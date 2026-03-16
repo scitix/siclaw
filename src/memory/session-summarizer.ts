@@ -194,12 +194,16 @@ export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Prom
   }
 
   try {
+    console.log(`[session-summarizer] Starting knowledge extraction (${messages.length} messages, model=${llmConfig.model})`);
     const entries = await extractConversationKnowledge({ messages, llmConfig });
+    console.log(`[session-summarizer] Extraction returned ${entries.length} entries`);
     if (!entries.length) {
       // LLM judged no extractable knowledge (small talk, too short) — trust the judgment
       return null;
     }
-    return mergeTopicFiles(memoryDir, entries);
+    const saved = await mergeTopicFiles(memoryDir, entries);
+    console.log(`[session-summarizer] Merged ${saved.length} topic files: ${saved.map(f => path.basename(f)).join(", ")}`);
+    return saved;
   } catch (err) {
     console.warn("[session-summarizer] Knowledge extraction failed, falling back to raw save:", err);
     const raw = await saveSessionMemory(opts);
