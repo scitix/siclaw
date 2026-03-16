@@ -148,6 +148,19 @@ interface InvestigationInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Check if a Dirent is a directory, following symlinks. */
+function isDir(parentDir: string, entry: fs.Dirent): boolean {
+  if (entry.isDirectory()) return true;
+  if (entry.isSymbolicLink()) {
+    try { return fs.statSync(path.join(parentDir, entry.name)).isDirectory(); } catch { return false; }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Scanners
 // ---------------------------------------------------------------------------
 
@@ -166,7 +179,7 @@ function scanRepos(reposDir: string): RepoInfo[] {
 
   const repos: RepoInfo[] = [];
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    if (!isDir(reposDir, entry)) continue;
     const repoPath = path.join(reposDir, entry.name);
     const { fileCount, extensionCounts } = countFilesRecursive(repoPath);
     const topExtensions = getTopExtensions(extensionCounts, 3);
@@ -235,11 +248,11 @@ function scanDocs(docsDir: string): DocEntry[] {
   let rootFileCount = 0;
 
   for (const item of items) {
-    if (item.isDirectory()) {
+    if (isDir(docsDir, item)) {
       const subPath = path.join(docsDir, item.name);
       const { fileCount } = countFilesRecursive(subPath);
       entries.push({ category: item.name, fileCount });
-    } else if (item.isFile()) {
+    } else if (item.isFile() || item.isSymbolicLink()) {
       rootFileCount++;
     }
   }

@@ -250,6 +250,32 @@ describe("buildKnowledgeOverview", () => {
     expect(result).toContain("| 1 |"); // only src.ts counted
   });
 
+  it("follows symlinked repo directories", () => {
+    fs.mkdirSync(reposDir);
+    // Create actual repo outside repos/
+    const realRepo = path.join(tmpDir, "real-repo");
+    fs.mkdirSync(realRepo);
+    fs.writeFileSync(path.join(realRepo, "index.ts"), "");
+    fs.writeFileSync(path.join(realRepo, "lib.ts"), "");
+    // Symlink into repos/
+    fs.symlinkSync(realRepo, path.join(reposDir, "linked-repo"));
+
+    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    expect(result).toContain("linked-repo");
+    expect(result).toContain("2"); // file count
+  });
+
+  it("follows symlinked doc directories", () => {
+    fs.mkdirSync(docsDir);
+    const realDocs = path.join(tmpDir, "real-runbooks");
+    fs.mkdirSync(realDocs);
+    fs.writeFileSync(path.join(realDocs, "deploy.md"), "");
+    fs.symlinkSync(realDocs, path.join(docsDir, "runbooks"));
+
+    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    expect(result).toContain("runbooks");
+  });
+
   // --- Documentation ---
 
   it("returns empty when docs/ doesn't exist", () => {
