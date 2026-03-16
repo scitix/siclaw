@@ -1,12 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
+import { ShieldX } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
+import { usePermissions } from '@/hooks/usePermissions';
 import { useChannels } from '@/hooks/useChannels';
 import { mergeChannels, type Channel } from './channelsData';
 import { ChannelDrawer } from './components/ChannelDrawer';
 
 export function ChannelsPage() {
     const { sendRpc, isConnected } = useWebSocket();
+    const { isAdmin, loaded } = usePermissions(sendRpc, isConnected);
     const { channels: views, loading, loadChannels, saveChannel } = useChannels(sendRpc);
     const [selectedChannel, setSelectedChannel] = useState<Channel | null>(null);
     const [isDrawerOpen, setIsDrawerOpen] = useState(false);
@@ -32,6 +35,18 @@ export function ChannelsPage() {
         await saveChannel(id, enabled, config);
         setIsDrawerOpen(false);
     };
+
+    if (loaded && !isAdmin) {
+        return (
+            <div className="h-full flex items-center justify-center">
+                <div className="text-center">
+                    <ShieldX className="w-12 h-12 text-gray-300 mx-auto mb-4" />
+                    <h2 className="text-lg font-semibold text-gray-900 mb-1">Admin access required</h2>
+                    <p className="text-sm text-gray-500">Only administrators can manage channels.</p>
+                </div>
+            </div>
+        );
+    }
 
     return (
         <div className="h-full bg-white flex flex-col">

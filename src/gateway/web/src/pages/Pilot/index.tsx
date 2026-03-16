@@ -7,6 +7,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
+import { usePermissions } from '@/hooks/usePermissions';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 
 
@@ -16,6 +17,7 @@ export function PilotPage() {
     const navigate = useNavigate();
     const location = useLocation();
     const pilot = usePilot();
+    const { isAdmin } = usePermissions(pilot.sendRpc, pilot.isConnected);
     const { currentWorkspace } = useWorkspace();
 
     // Track which tool content we've already auto-opened the panel for
@@ -216,6 +218,7 @@ export function PilotPage() {
                         onNavigateModels={() => navigate('/models')}
                         onNavigateCredentials={() => navigate('/credentials')}
                         sessionKey={pilot.currentSessionKey}
+                        isAdmin={isAdmin}
                     />
                 </div>
             </div>
