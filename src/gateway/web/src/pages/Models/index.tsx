@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Settings, Layers, Globe, Key, Save, Trash2, Plus } from 'lucide-react';
+import { Settings, Layers, Globe, Key, Save, Trash2, Plus, ShieldX } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
 import { ModelsDialog } from './ModelsDialog';
@@ -34,7 +34,7 @@ interface EmbeddingConfig {
 
 export function ModelsPage() {
     const { sendRpc, isConnected } = useWebSocket();
-    const { isAdmin } = usePermissions(sendRpc, isConnected);
+    const { isAdmin, loaded } = usePermissions(sendRpc, isConnected);
 
     const [providers, setProviders] = useState<ProviderInfo[]>([]);
     const [allModels, setAllModels] = useState<ModelEntry[]>([]);
@@ -193,6 +193,18 @@ export function ModelsPage() {
 
     const llmGroups = groupByProvider(llmModels);
     const embeddingGroups = groupByProvider(embeddingModels);
+
+    if (loaded && !isAdmin) {
+        return (
+            <div className="h-full flex items-center justify-center">
+                <div className="text-center">
+                    <ShieldX className="w-12 h-12 text-gray-300 mx-auto mb-4" />
+                    <h2 className="text-lg font-semibold text-gray-900 mb-1">Admin access required</h2>
+                    <p className="text-sm text-gray-500">Only administrators can manage models.</p>
+                </div>
+            </div>
+        );
+    }
 
     const defaultChanged = defaultValue !== savedDefault;
     const embeddingChanged = savedEmbedding

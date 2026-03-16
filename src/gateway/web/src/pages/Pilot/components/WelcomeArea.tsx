@@ -6,6 +6,7 @@ export interface WelcomeAreaProps {
     onSendPrompt: (text: string) => void;
     onNavigateModels: () => void;
     onNavigateCredentials: () => void;
+    isAdmin?: boolean;
 }
 
 const CAPABILITIES = [
@@ -49,22 +50,56 @@ const CREDENTIAL_LABELS: Record<string, string> = {
     api_basic_auth: 'API Auth',
 };
 
-export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNavigateCredentials }: WelcomeAreaProps) {
-    const isFirstTime = systemStatus?.hasProfile === false;
+export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNavigateCredentials, isAdmin }: WelcomeAreaProps) {
+    const isFirstTime = systemStatus ? (systemStatus.sessionCount ?? 0) === 0 : false;
     const hasModels = systemStatus?.hasModels ?? false;
     const credentials = systemStatus?.credentials ?? {};
     const hasCredentials = Object.keys(credentials).length > 0;
     const sessionCount = systemStatus?.sessionCount ?? 0;
 
-    const allChecklistDone = hasModels && hasCredentials && sessionCount > 0;
+    const allChecklistDone = isAdmin
+        ? hasModels && hasCredentials && sessionCount > 0
+        : hasCredentials && sessionCount > 0;
 
     const handlePromptClick = (text: string) => {
         if (!hasModels) {
-            onNavigateModels();
+            if (isAdmin) {
+                onNavigateModels();
+            }
             return;
         }
         onSendPrompt(text);
     };
+
+    // Build checklist steps dynamically based on role
+    const checklistSteps: Array<{
+        done: boolean;
+        label: string;
+        subtitle: string;
+        onClick?: () => void;
+    }> = [];
+
+    if (isAdmin) {
+        checklistSteps.push({
+            done: hasModels,
+            label: 'Configure AI Model',
+            subtitle: 'Add a model provider to start chatting',
+            onClick: onNavigateModels,
+        });
+    }
+
+    checklistSteps.push({
+        done: hasCredentials,
+        label: 'Add Credentials',
+        subtitle: 'Connect to your clusters and servers via SSH or Kubeconfig',
+        onClick: onNavigateCredentials,
+    });
+
+    checklistSteps.push({
+        done: sessionCount > 0,
+        label: 'Start your first conversation',
+        subtitle: 'Ask Siclaw to diagnose an issue or run a skill',
+    });
 
     return (
         <div className="flex flex-col items-center justify-center py-12 px-4 max-w-2xl mx-auto space-y-8">
@@ -84,26 +119,16 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
                 <div className="w-full bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-3">
                     <h2 className="text-sm font-semibold text-gray-700">Getting Started</h2>
                     <div className="space-y-2">
-                        <ChecklistStep
-                            step={1}
-                            done={hasModels}
-                            label="Configure AI Model"
-                            subtitle="Add a model provider to start chatting"
-                            onClick={onNavigateModels}
-                        />
-                        <ChecklistStep
-                            step={2}
-                            done={hasCredentials}
-                            label="Add Credentials"
-                            subtitle="Connect to your clusters and servers via SSH or Kubeconfig"
-                            onClick={onNavigateCredentials}
-                        />
-                        <ChecklistStep
-                            step={3}
-                            done={sessionCount > 0}
-                            label="Start your first conversation"
-                            subtitle="Ask Siclaw to diagnose an issue or run a skill"
-                        />
+                        {checklistSteps.map((step, idx) => (
+                            <ChecklistStep
+                                key={step.label}
+                                step={idx + 1}
+                                done={step.done}
+                                label={step.label}
+                                subtitle={step.subtitle}
+                                onClick={step.onClick}
+                            />
+                        ))}
                     </div>
                 </div>
             )}
@@ -155,7 +180,9 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
                     </div>
                     {!hasModels && (
                         <p className="text-xs text-center text-amber-600">
-                            Configure a model first to start chatting
+                            {isAdmin
+                                ? 'Configure a model first to start chatting'
+                                : 'Waiting for an admin to configure a model'}
                         </p>
                     )}
                 </div>
