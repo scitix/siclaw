@@ -52,7 +52,7 @@ export interface SiclawConfig {
   providers: Record<string, ProviderConfig>;
   default?: { provider: string; modelId: string };
   embedding?: EmbeddingConfig;
-  paths: { userDataDir: string; skillsDir: string; credentialsDir: string };
+  paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string };
   server: { port: number; gatewayUrl: string };
   debugImage: string;
   allowedTools: string[] | null;
@@ -72,6 +72,8 @@ const DEFAULTS: SiclawConfig = {
     userDataDir: ".siclaw/user-data",
     skillsDir: ".siclaw/skills",
     credentialsDir: ".siclaw/credentials",
+    reposDir: ".siclaw/repos",
+    docsDir: ".siclaw/docs",
   },
   server: { port: 3000, gatewayUrl: "" },
   debugImage: "busybox:1.36",
@@ -156,6 +158,12 @@ export function loadConfig(): SiclawConfig {
   }
   if (process.env.SICLAW_CREDENTIALS_DIR) {
     cached.paths.credentialsDir = process.env.SICLAW_CREDENTIALS_DIR;
+  }
+  if (process.env.SICLAW_REPOS_DIR) {
+    cached.paths.reposDir = process.env.SICLAW_REPOS_DIR;
+  }
+  if (process.env.SICLAW_DOCS_DIR) {
+    cached.paths.docsDir = process.env.SICLAW_DOCS_DIR;
   }
   if (process.env.SICLAW_GATEWAY_URL) {
     cached.server.gatewayUrl = process.env.SICLAW_GATEWAY_URL;

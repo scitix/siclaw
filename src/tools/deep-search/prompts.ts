@@ -58,6 +58,7 @@ Start from the problem, not from a checklist. Each finding should guide your nex
 - Read a skill's SKILL.md before invoking complex scripts.
 - Use skill scripts instead of hand-crafting commands — they encode domain knowledge.
 - **Chain independent commands** with && in a single bash call to save budget.
+- If the workspace contains code repos (repos/) or documentation (docs/), use \`read\` or \`grep\` to explore relevant files.
 - You MAY form early impressions about what's wrong — note them in your summary. This helps hypothesis generation.
 
 IMPORTANT: When you have finished (or used all tool calls), you MUST output your final summary. Your LAST message must be plain text (no more tool calls) in this exact format:
