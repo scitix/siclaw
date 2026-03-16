@@ -26,7 +26,7 @@ export function TokenChart({ buckets }: TokenChartProps) {
     }));
 
     return (
-        <div className="rounded-2xl border border-gray-200 bg-white p-5">
+        <div className="rounded-2xl border border-gray-200 bg-white p-5 min-w-0">
             <div className="text-sm font-semibold text-gray-900 mb-4">Token Usage</div>
             <div className="h-[200px]">
                 <ResponsiveContainer width="100%" height="100%">
