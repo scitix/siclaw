@@ -6,6 +6,7 @@ export interface WelcomeAreaProps {
     onSendPrompt: (text: string) => void;
     onNavigateModels: () => void;
     onNavigateCredentials: () => void;
+    isAdmin?: boolean;
 }
 
 const CAPABILITIES = [
@@ -49,18 +50,22 @@ const CREDENTIAL_LABELS: Record<string, string> = {
     api_basic_auth: 'API Auth',
 };
 
-export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNavigateCredentials }: WelcomeAreaProps) {
-    const isFirstTime = systemStatus?.hasProfile === false;
+export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNavigateCredentials, isAdmin }: WelcomeAreaProps) {
     const hasModels = systemStatus?.hasModels ?? false;
     const credentials = systemStatus?.credentials ?? {};
     const hasCredentials = Object.keys(credentials).length > 0;
     const sessionCount = systemStatus?.sessionCount ?? 0;
+    const isFirstTime = sessionCount === 0;
 
-    const allChecklistDone = hasModels && hasCredentials && sessionCount > 0;
+    const allChecklistDone = isAdmin
+        ? hasModels && hasCredentials && sessionCount > 0
+        : hasCredentials && sessionCount > 0;
 
     const handlePromptClick = (text: string) => {
         if (!hasModels) {
-            onNavigateModels();
+            if (isAdmin) {
+                onNavigateModels();
+            }
             return;
         }
         onSendPrompt(text);
@@ -85,25 +90,27 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
                         <div className="w-full bg-white border border-gray-200 rounded-2xl shadow-sm p-5 space-y-3">
                             <h2 className="text-sm font-semibold text-gray-700">Getting Started</h2>
                             <div className="space-y-2">
-                                {/* Step 1: Configure AI Model */}
+                                {/* Step: Configure AI Model (admin only) */}
+                                {isAdmin && (
+                                    <ChecklistStep
+                                        step={1}
+                                        done={hasModels}
+                                        label="Configure AI Model"
+                                        subtitle="Add a model provider to start chatting"
+                                        onClick={onNavigateModels}
+                                    />
+                                )}
+                                {/* Step: Add Credentials */}
                                 <ChecklistStep
-                                    step={1}
-                                    done={hasModels}
-                                    label="Configure AI Model"
-                                    subtitle="Add a model provider to start chatting"
-                                    onClick={onNavigateModels}
-                                />
-                                {/* Step 2: Add Credentials */}
-                                <ChecklistStep
-                                    step={2}
+                                    step={isAdmin ? 2 : 1}
                                     done={hasCredentials}
                                     label="Add Credentials"
                                     subtitle="Connect to your clusters and servers via SSH or Kubeconfig"
                                     onClick={onNavigateCredentials}
                                 />
-                                {/* Step 3: Start a conversation */}
+                                {/* Step: Start a conversation */}
                                 <ChecklistStep
-                                    step={3}
+                                    step={isAdmin ? 3 : 2}
                                     done={sessionCount > 0}
                                     label="Start your first conversation"
                                     subtitle="Ask Siclaw to diagnose an issue or run a skill"
@@ -164,7 +171,7 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
                     </div>
                     {!hasModels && (
                         <p className="text-xs text-center text-amber-600">
-                            Configure a model first to start chatting
+                            {isAdmin ? 'Configure a model first to start chatting' : 'Waiting for an admin to configure a model'}
                         </p>
                     )}
                 </div>

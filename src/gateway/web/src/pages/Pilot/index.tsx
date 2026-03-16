@@ -7,6 +7,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
+import { usePermissions } from '@/hooks/usePermissions';
 
 
 export function PilotPage() {
@@ -14,6 +15,7 @@ export function PilotPage() {
     const [panelMessage, setPanelMessage] = useState<PilotMessage | null>(null);
     const navigate = useNavigate();
     const pilot = usePilot();
+    const { isAdmin } = usePermissions(pilot.sendRpc, pilot.isConnected);
 
     // Track which tool content we've already auto-opened the panel for
     // Uses content hash instead of message ID (IDs change when DB ID replaces temp ID)
@@ -206,6 +208,7 @@ export function PilotPage() {
                         systemStatus={pilot.systemStatus}
                         onNavigateModels={() => navigate('/models')}
                         onNavigateCredentials={() => navigate('/credentials')}
+                        isAdmin={isAdmin}
                     />
                 </div>
             </div>
