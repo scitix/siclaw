@@ -135,12 +135,8 @@ function scanInvestigations(investigationsDir: string): InvestigationInfo[] {
   for (const file of files.slice(0, 5)) {
     try {
       // Read only first 300 bytes to extract the title
-      const fd = fs.openSync(path.join(investigationsDir, file), "r");
-      const buf = Buffer.alloc(300);
-      const bytesRead = fs.readSync(fd, buf, 0, 300, 0);
-      fs.closeSync(fd);
-
-      const head = buf.toString("utf-8", 0, bytesRead);
+      const content = fs.readFileSync(path.join(investigationsDir, file), "utf-8");
+      const head = content.slice(0, 300);
       const titleMatch = head.match(/^# Investigation:\s*(.+)/m);
       const question = titleMatch ? titleMatch[1].trim() : file.replace(/\.md$/, "");
 

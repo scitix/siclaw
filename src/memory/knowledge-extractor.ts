@@ -157,8 +157,9 @@ Call the extract_knowledge tool with your result.`;
     return [];
   }
 
-  // Filter out entries with empty facts
-  return args.entries.filter(e => e.topic && Array.isArray(e.facts) && e.facts.length > 0);
+  // Validate topic values against allowed set (defense against LLM returning path-traversal values)
+  const ALLOWED_TOPICS = new Set(["environment", "preferences", "troubleshooting", "commands", "architecture"]);
+  return args.entries.filter(e => ALLOWED_TOPICS.has(e.topic) && Array.isArray(e.facts) && e.facts.length > 0);
 }
 
 /**
