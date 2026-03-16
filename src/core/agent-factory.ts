@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { buildKnowledgeOverview } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
   createAgentSession,
@@ -194,6 +195,12 @@ This is a new user (profile has only defaults).
         }
       }
     }
+  }
+
+  // Knowledge Overview (between PROFILE and MEMORY)
+  const overview = buildKnowledgeOverview(memoryDir);
+  if (overview) {
+    parts.push(overview);
   }
 
   const memoryFile = path.join(memoryDir, "MEMORY.md");
