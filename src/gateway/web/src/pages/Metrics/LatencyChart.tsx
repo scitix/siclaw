@@ -37,7 +37,7 @@ export function LatencyChart({ buckets }: LatencyChartProps) {
     return (
         <div className="rounded-2xl border border-gray-200 bg-white p-5 min-w-0">
             <div className="text-sm font-semibold text-gray-900 mb-4">Prompt Latency</div>
-            <div className="h-[200px]">
+            <div className="h-[200px] w-full min-w-0">
                 <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={data}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
