@@ -27,10 +27,10 @@ import { extractJSON } from "./sub-agent.js";
 
 describe("types / budgets", () => {
   it("NORMAL_BUDGET has expected defaults", () => {
-    expect(NORMAL_BUDGET.maxContextCalls).toBe(12);
+    expect(NORMAL_BUDGET.maxContextCalls).toBe(15);
     expect(NORMAL_BUDGET.maxHypotheses).toBe(5);
     expect(NORMAL_BUDGET.maxCallsPerHypothesis).toBe(10);
-    expect(NORMAL_BUDGET.maxTotalCalls).toBe(60);
+    expect(NORMAL_BUDGET.maxTotalCalls).toBe(75);
     expect(NORMAL_BUDGET.maxParallel).toBe(3);
   });
 
