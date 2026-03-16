@@ -117,6 +117,25 @@ describe("extractConversationKnowledge", () => {
     expect(result[0].topic).toBe("environment");
   });
 
+  it("rejects topics outside the allowed set (path traversal defense)", async () => {
+    mockFetch.mockResolvedValue(makeFetchResponse({
+      should_extract: true,
+      entries: [
+        { topic: "../../.env", facts: ["secret=leaked"] },
+        { topic: "environment", facts: ["Cluster is prod-us-west"] },
+        { topic: "invented_category", facts: ["something"] },
+      ],
+    }));
+
+    const result = await extractConversationKnowledge({
+      messages: [{ role: "user", text: "test" }],
+      llmConfig,
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].topic).toBe("environment");
+  });
+
   it("truncates long messages in prompt", async () => {
     mockFetch.mockResolvedValue(makeFetchResponse({
       should_extract: false,
