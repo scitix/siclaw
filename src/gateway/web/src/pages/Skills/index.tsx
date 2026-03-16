@@ -886,6 +886,7 @@ function ScriptReviewApprovalCard({
         onConfirm: () => void;
     }>({ isOpen: false, title: '', description: '', variant: 'primary', confirmText: '', onConfirm: () => {} });
     const [errorDialog, setErrorDialog] = useState<{ isOpen: boolean; message: string }>({ isOpen: false, message: '' });
+    const [deleted, setDeleted] = useState(false);
 
     const handleExpand = async () => {
         if (expanded) {
@@ -906,8 +907,14 @@ function ScriptReviewApprovalCard({
             if (results[1]) {
                 setReviews(results[1].reviews);
             }
-        } catch (err) {
-            console.error('[Approvals] Failed to load review data:', err);
+        } catch (err: any) {
+            const msg = err?.message || String(err);
+            if (msg.includes('Skill not found')) {
+                setDeleted(true);
+                setExpanded(false);
+            } else {
+                console.error('[Approvals] Failed to load review data:', err);
+            }
         } finally {
             setLoading(false);
         }
@@ -1014,6 +1021,15 @@ function ScriptReviewApprovalCard({
         team: { label: 'Team Skills', cls: 'bg-blue-50 text-blue-700 border-blue-100', icon: Users },
         personal: { label: 'Personal', cls: 'bg-purple-50 text-purple-700 border-purple-100', icon: User },
     }[skill.scope] || { label: skill.scope, cls: 'bg-gray-100 text-gray-600', icon: User };
+
+    if (deleted) {
+        return (
+            <div className="bg-gray-50 rounded-xl border border-gray-200 opacity-60 p-4 flex items-center gap-3 text-gray-400 text-sm">
+                <Trash2 className="w-4 h-4" />
+                <span><strong>{skill.name}</strong> — This skill has been deleted or withdrawn.</span>
+            </div>
+        );
+    }
 
     return (
         <div className="bg-white rounded-xl border border-gray-200 hover:shadow-sm transition-shadow">

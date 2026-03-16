@@ -1979,6 +1979,12 @@ export function createRpcMethods(
     // Clean up version records
     if (skillVersionRepo) await skillVersionRepo.deleteForSkill(skillId);
 
+    // Clean up orphaned notifications (approval/contribution requests)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
+
     // Delete from DB (CASCADE deletes skill_contents)
     await skillRepo.deleteById(skillId);
 
@@ -2904,6 +2910,12 @@ export function createRpcMethods(
     // Clean up votes
     if (voteRepo) await voteRepo.deleteForSkill(skillId);
 
+    // Clean up orphaned notifications (approval/contribution requests for deleted team skill)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
+
     // Notify author
     const authorId = sourceSkill?.authorId ?? meta.authorId;
     if (notifRepo && authorId) {
@@ -3021,6 +3033,12 @@ export function createRpcMethods(
       contributionStatus: "none",
       stagingVersion: 0,
     });
+
+    // Clean up orphaned notifications (approval/contribution requests)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
 
     notifySkillReload(userId);
     return { status: "withdrawn", wasNew: false };
