@@ -11,7 +11,7 @@ import { createBroadcaster, buildEvent, parseFrame, dispatchRpc, MAX_BUFFERED_BY
 import { createRpcMethods } from "./rpc-methods.js";
 import type { SkillBundle } from "./skills/skill-bundle.js";
 import { UserStore, createLoginHandler, createAuthMiddleware, BindCodeStore, signJwt, type AuthContext } from "./auth/index.js";
-import { loadOAuth2Config, generateState, consumeState, buildAuthorizeUrl, exchangeCode, fetchUserInfo } from "./auth/oauth2.js";
+import { loadOAuth2Config, generateState, consumeState, buildAuthorizeUrl, exchangeCode, fetchUserInfo, type OAuth2Config } from "./auth/oauth2.js";
 import { createDb, closeDb, type Database } from "./db/index.js";
 import { initSchema } from "./db/init-schema.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
@@ -267,6 +267,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       const section = (params as { section?: string }).section;
       if (section === "system") await refreshCspCache();
       if (section === "metrics") await refreshMetricsConfig();
+      if (section === "sso") await refreshSsoCache();
       return result;
     });
   }
@@ -284,14 +285,27 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   const { handleLogin } = createLoginHandler(userStore, jwtSecret);
   const authMiddleware = createAuthMiddleware(jwtSecret);
 
-  // OAuth2 / SSO config — DB values take priority over env vars
-  let ssoDbConfig: Record<string, string> | undefined;
-  if (sysConfigRepo) {
-    try { ssoDbConfig = await sysConfigRepo.getAll("sso."); } catch { /* ignore */ }
+  // OAuth2 / SSO config — loaded into memory at startup and refreshed only
+  // when admin saves settings via system.saveSection RPC. Zero DB queries on
+  // the unauthenticated /api/sso/config endpoint.
+  let cachedOAuth2Config: OAuth2Config | null = null;
+  let cachedSsoEnabled = false;
+
+  async function refreshSsoCache() {
+    let dbOverrides: Record<string, string> | undefined;
+    if (sysConfigRepo) {
+      try { dbOverrides = await sysConfigRepo.getAll("sso."); } catch { /* ignore */ }
+    }
+    cachedOAuth2Config = loadOAuth2Config(dbOverrides);
+    cachedSsoEnabled = cachedOAuth2Config !== null
+      && dbOverrides?.["sso.enabled"] === "true";
   }
-  const oauth2Config = loadOAuth2Config(ssoDbConfig);
-  if (oauth2Config) {
-    console.log(`[gateway] SSO enabled: issuer=${oauth2Config.issuer} clientId=${oauth2Config.clientId}`);
+
+  await refreshSsoCache();
+  if (cachedOAuth2Config) {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- TS can't narrow let vars captured by closures
+    const cfg = cachedOAuth2Config as OAuth2Config;
+    console.log(`[gateway] SSO configured: issuer=${cfg.issuer} clientId=${cfg.clientId}`);
   }
 
   // Permission management RPCs (admin only)
@@ -487,58 +501,31 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
-    // SSO config check (frontend uses this to decide whether to show SSO button)
+    // SSO config check (frontend uses this to decide whether to show SSO button).
+    // Pure memory read — no DB query. Cache is refreshed via system.saveSection RPC.
     if (url === "/api/sso/config") {
-      (async () => {
-        let enabled = false;
-        if (oauth2Config && sysConfigRepo) {
-          try {
-            const val = await sysConfigRepo.get("sso.enabled");
-            enabled = val === "true";
-          } catch { /* ignore */ }
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ enabled }));
-      })();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ enabled: cachedSsoEnabled }));
       return;
     }
 
     // SSO: redirect to IdP authorize URL
     if (url === "/auth/sso" && method === "GET") {
-      if (!oauth2Config) {
+      if (!cachedSsoEnabled || !cachedOAuth2Config) {
         res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "SSO not configured" }));
+        res.end(JSON.stringify({ error: cachedOAuth2Config ? "SSO is disabled" : "SSO not configured" }));
         return;
       }
-      (async () => {
-        // Check explicit SSO toggle
-        if (sysConfigRepo) {
-          try {
-            const val = await sysConfigRepo.get("sso.enabled");
-            if (val !== "true") {
-              res.writeHead(404, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "SSO is disabled" }));
-              return;
-            }
-          } catch { /* ignore — allow if DB read fails */ }
-        }
-        const state = generateState();
-        const authorizeUrl = buildAuthorizeUrl(oauth2Config, state);
-        console.log(`[gateway] SSO redirect → ${authorizeUrl}`);
-        res.writeHead(302, { Location: authorizeUrl });
-        res.end();
-      })();
+      const state = generateState();
+      const authorizeUrl = buildAuthorizeUrl(cachedOAuth2Config, state);
+      console.log(`[gateway] SSO redirect → ${authorizeUrl}`);
+      res.writeHead(302, { Location: authorizeUrl });
+      res.end();
       return;
     }
 
     // SSO: callback from IdP
     if (url.startsWith("/auth/callback") && method === "GET") {
-      if (!oauth2Config) {
-        res.writeHead(404, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "SSO not configured" }));
-        return;
-      }
-
       const fullUrl = new URL(req.url!, `http://${req.headers.host}`);
       const code = fullUrl.searchParams.get("code");
       const state = fullUrl.searchParams.get("state");
@@ -568,12 +555,18 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
       (async () => {
         try {
+          if (!cachedOAuth2Config) {
+            res.writeHead(302, { Location: "/login?error=SSO+not+configured" });
+            res.end();
+            return;
+          }
+
           // Exchange code for tokens
-          const tokenResp = await exchangeCode(oauth2Config, code);
+          const tokenResp = await exchangeCode(cachedOAuth2Config, code);
           console.log("[gateway] SSO token exchange OK");
 
           // Fetch user info
-          const userInfo = await fetchUserInfo(oauth2Config, tokenResp.access_token);
+          const userInfo = await fetchUserInfo(cachedOAuth2Config, tokenResp.access_token);
           console.log(`[gateway] SSO userInfo: sub=${userInfo.sub} email=${userInfo.email} name=${userInfo.name}`);
 
           // Find or create local user
