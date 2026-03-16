@@ -26,6 +26,18 @@ export interface TraceStep {
   command?: string;
 }
 
+export interface ConclusionResult {
+  text: string;
+  structured?: {
+    root_cause_category: string;
+    affected_entities: string[];
+    environment_tags: string[];
+    causal_chain: string[];
+    confidence: number;
+    remediation_steps?: string[];
+  };
+}
+
 export interface InvestigationResult {
   question: string;
   contextSummary: string;
