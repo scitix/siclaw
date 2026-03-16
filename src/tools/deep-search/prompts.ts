@@ -8,7 +8,6 @@
 import {
   toolSemantics,
   commonMistakes,
-  rdmaTroubleshootingPriority,
 } from "./sre-knowledge.js";
 import { getFormattedSkillsPrompt } from "./sub-agent.js";
 
@@ -35,34 +34,40 @@ Use \`node_exec\` for host-level diagnostics (it handles kubeconfig internally).
 /**
  * Phase 1: Context gathering system prompt (used as pi-agent session prompt).
  * Skills are auto-loaded by pi-agent — only tool semantics needed here.
+ *
+ * Uses progressive discovery: the agent follows leads from the problem
+ * rather than filling a fixed checklist. Each finding guides the next query.
  */
 export function contextGatheringPrompt(question: string, maxCalls: number, kubeconfigPath?: string): string {
-  return `You are a Kubernetes SRE assistant. Gather the MINIMUM necessary context about the environment related to this question:
+  return `You are a Kubernetes SRE investigator. Your job is to UNDERSTAND the problem and gather the context needed to form hypotheses.
 
 <question>${question}</question>
 ${environmentContext(kubeconfigPath)}
 ${toolSemantics()}
 
-RULES:
+## Approach: Progressive Discovery
+
+Start from the problem, not from a checklist. Each finding should guide your next query.
+
+1. **Confirm the symptom** — Verify the reported problem actually exists right now.
+2. **Follow the thread** — If you find something unexpected, investigate it. If a pod is crashing, check its logs. If a node is NotReady, check its conditions. Let the evidence lead you.
+3. **Broaden only if needed** — Only gather environment-level info (cluster version, node count, etc.) if it's relevant to the problem you're seeing.
+
+## Rules
 - You have at most ${maxCalls} tool calls (read calls are free). Use them wisely.
-- For RDMA/RoCE questions, ALWAYS run roce-show-node-mode FIRST to determine the mode.
 - Read a skill's SKILL.md before invoking complex scripts.
 - Use skill scripts instead of hand-crafting commands — they encode domain knowledge.
-- Focus on: what resources exist, what namespace, what's running, what mode/versions.
-- **Chain environment checks**: Combine independent info-gathering commands with && in a single bash call.
-  Example: bash: kubectl get nodes -o wide && kubectl get pods -n <ns> -o wide
-  This saves tool calls for more important checks.
-- Do NOT diagnose or fix anything yet. Just gather context.
+- **Chain independent commands** with && in a single bash call to save budget.
+- You MAY form early impressions about what's wrong — note them in your summary. This helps hypothesis generation.
 
-IMPORTANT: When you have finished gathering context (or used all tool calls), you MUST output your final summary. Your LAST message must be plain text (no more tool calls) in this exact format:
+IMPORTANT: When you have finished (or used all tool calls), you MUST output your final summary. Your LAST message must be plain text (no more tool calls) in this exact format:
 
 CONTEXT_SUMMARY_START
-- Cluster: <cluster info>
-- Namespaces: <relevant namespaces>
-- Key resources: <pods, services, devices found>
-- Mode: <switchdev/legacy/shared/exclusive if applicable>
-- Versions: <firmware, driver, software versions found>
-- Anomalies: <anything unusual noticed>
+<Write a free-form summary organized by relevance to the problem. Include:>
+- Problem confirmation: <what you verified — is the symptom real? what exactly is happening?>
+- Key findings: <significant observations, error messages, anomalies discovered>
+- Environment: <only the environment details relevant to this specific problem>
+- Initial leads: <your early impressions about possible causes, if any>
 CONTEXT_SUMMARY_END
 
 Do NOT make any more tool calls after outputting this summary.`;
@@ -111,19 +116,17 @@ ${contextSummary}
 ${patternSection}${validatedSection}${similarSection}
 ${getFormattedSkillsPrompt()}
 
-${rdmaTroubleshootingPriority()}
-
 Call the submit_hypotheses tool with your analysis.
 
 Field semantics:
 - text: specific hypothesis description ("Pod OOMKilled due to 256Mi limit" not "Pod has memory issues")
 - confidence: 0-100 prior belief, highest first
-- suggestedTools: MUST use real skill script paths from the skills listed above (e.g. "bash: skills/core/roce-mtu-compare/scripts/mtu-compare.sh --pod-a X --ns-a Y --pod-b Z --ns-b W"). Only fall back to raw kubectl/node_exec when no skill covers the check.
+- suggestedTools: MUST use real skill script paths from the skills listed above. Only fall back to raw kubectl/node_exec when no skill covers the check.
 
 RULES:
 - Exactly ${maxHypotheses} hypotheses, ranked by likelihood (highest confidence first).
 - Cover diverse failure modes — do not cluster hypotheses around a single root cause.
-- For RDMA/RoCE: follow the troubleshooting priority order above.${hasPriorKnowledge ? `
+- If the context includes initial leads or early impressions from Phase 1, use them to boost confidence of related hypotheses — but still generate diverse alternatives.${hasPriorKnowledge ? `
 - Use diagnostic_patterns to calibrate confidence: if a root cause accounts for a high percentage of past cases, start its hypothesis at higher confidence.
 - If validated_hypotheses contains a relevant match, include it (possibly rephrased for this context) with boosted confidence.
 - Do NOT blindly copy past hypotheses — evaluate whether the context is similar enough.` : ""}`;
@@ -238,27 +241,26 @@ REASONING: <2-3 sentences based on evidence gathered so far>`;
  */
 export function forceContextSummaryPrompt(): string {
   return `You have used all your tool call budget.
-Summarize the context you gathered as PLAIN TEXT.
+Summarize what you found as PLAIN TEXT.
 Do NOT output any tool calls or XML tags.
 Do NOT output <tool_call> or <function=...> or any function call syntax.
 
 Output in this exact format:
 
 CONTEXT_SUMMARY_START
-- Cluster: <info>
-- Namespaces: <relevant namespaces>
-- Key resources: <pods, services, devices>
-- Mode: <switchdev/legacy/shared/exclusive if applicable>
-- Versions: <firmware, driver, software>
-- Anomalies: <anything unusual>
+- Problem confirmation: <what you verified — is the symptom real? what exactly is happening?>
+- Key findings: <significant observations, error messages, anomalies discovered>
+- Environment: <relevant environment details>
+- Initial leads: <your early impressions about possible causes, if any>
 CONTEXT_SUMMARY_END`;
 }
 
 export function conclusionPrompt(
   question: string,
   hypothesesSummary: string,
+  critique?: string,
 ): string {
-  return `You are a senior SRE writing the final conclusion for an investigation.
+  let result = `You are a senior SRE writing the final conclusion for an investigation.
 
 <question>${question}</question>
 
@@ -277,5 +279,18 @@ Field semantics:
 - confidence: overall confidence in the root cause diagnosis (0-100)
 - remediation_steps: specific steps to fix the issue
 
+Before submitting, self-check:
+1. Does conclusion_text directly answer the original question?
+2. Is root_cause_category supported by at least one validated/inconclusive hypothesis?
+3. Is confidence calibrated — high confidence (>70) requires validated hypotheses with clear evidence?
+4. Are affected_entities actually observed during investigation, not inferred?
+If any check fails, revise before calling the tool.
+
 Do NOT repeat all the evidence — summarize the key findings.`;
+
+  if (critique) {
+    result += `\n\nIMPORTANT: Your previous conclusion was rejected by the quality gate. Address this feedback:\n${critique}`;
+  }
+
+  return result;
 }
