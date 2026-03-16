@@ -271,7 +271,7 @@ export function Sidebar() {
             {/* Metrics — fixed above user footer, does not scroll */}
             <div className="px-3 pb-2">
                 <NavLink
-                    to="/metrics"
+                    to="/monitoring"
                     className={({ isActive }) =>
                         cn(
                             "flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-normal transition-all",
