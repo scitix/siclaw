@@ -16,6 +16,7 @@ import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
 import type { InvestigationPattern, InvestigationRecord } from "../../memory/types.js";
 import type {
+  ConclusionResult,
   DeepSearchBudget,
   HypothesisNode,
   InvestigationResult,
@@ -35,18 +36,6 @@ interface RawHypothesis {
   text: string;
   confidence: number;
   suggestedTools: string[];
-}
-
-interface ConclusionResult {
-  text: string;
-  structured?: {
-    root_cause_category: string;
-    affected_entities: string[];
-    environment_tags: string[];
-    causal_chain: string[];
-    confidence: number;
-    remediation_steps?: string[];
-  };
 }
 
 /**
@@ -706,16 +695,19 @@ export async function investigate(
   onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Generating conclusion..." });
   let conclusionResult = await generateConclusion(question, hypotheses, options);
 
-  // Quality gate: validate conclusion before storing
-  const validation = await validateConclusion({
-    question, hypotheses, conclusion: conclusionResult, options,
-  });
-  if (!validation.pass) {
-    onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Re-generating (quality feedback)..." });
-    conclusionResult = await generateConclusion(question, hypotheses, options, validation.critique);
-  }
-  if (validation.adjustedConfidence !== undefined && conclusionResult.structured) {
-    conclusionResult.structured.confidence = validation.adjustedConfidence;
+  // Quality gate: validate conclusion before storing (skip for text-only fallback conclusions)
+  if (conclusionResult.structured) {
+    const validation = await validateConclusion({
+      question, hypotheses, conclusion: conclusionResult, options,
+    });
+    if (!validation.pass) {
+      onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Re-generating (quality feedback)..." });
+      conclusionResult = await generateConclusion(question, hypotheses, options, validation.critique);
+    } else if (validation.adjustedConfidence !== undefined && conclusionResult.structured) {
+      // Only apply adjustedConfidence when the gate passed — after retry the new conclusion
+      // has its own confidence from the critique-informed generation
+      conclusionResult.structured.confidence = validation.adjustedConfidence;
+    }
   }
 
   const totalDurationMs = Date.now() - startTime;

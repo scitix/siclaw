@@ -13,19 +13,7 @@
 
 import { llmCompleteWithTool, type SubAgentOptions } from "./sub-agent.js";
 import { VALIDATION_SCHEMA } from "./schemas.js";
-import type { HypothesisNode } from "./types.js";
-
-interface ConclusionResult {
-  text: string;
-  structured?: {
-    root_cause_category: string;
-    affected_entities: string[];
-    environment_tags: string[];
-    causal_chain: string[];
-    confidence: number;
-    remediation_steps?: string[];
-  };
-}
+import type { ConclusionResult, HypothesisNode } from "./types.js";
 
 export interface ValidationResult {
   pass: boolean;

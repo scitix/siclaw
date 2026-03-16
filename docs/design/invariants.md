@@ -281,7 +281,7 @@ Memory search (`memory_search` tool) is only available when an embedding provide
 
 | Metric | Normal | Quick |
 |--------|--------|-------|
-| maxContextCalls | 8 | 5 |
+| maxContextCalls | 12 | 8 |
 | maxHypotheses | 5 | 3 |
 | maxCallsPerHypothesis | 10 | 8 |
 | maxTotalCalls | 60 | 30 |
