@@ -35,10 +35,10 @@ export function LatencyChart({ buckets }: LatencyChartProps) {
     const p95 = sorted.length > 0 ? sorted[Math.floor(sorted.length * 0.95)] : 0;
 
     return (
-        <div className="rounded-2xl border border-gray-200 bg-white p-5">
+        <div className="rounded-2xl border border-gray-200 bg-white p-5 min-w-0">
             <div className="text-sm font-semibold text-gray-900 mb-4">Prompt Latency</div>
-            <div className="h-[200px]">
-                <ResponsiveContainer width="100%" height="100%">
+            <div className="min-w-0">
+                <ResponsiveContainer width="100%" height={200}>
                     <AreaChart data={data}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
                         <XAxis
