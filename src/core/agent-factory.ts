@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { homedir } from "node:os";
+
 import path from "node:path";
 import { buildKnowledgeOverview } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
@@ -347,7 +347,7 @@ export async function createSiclawSession(
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
   const builtinSkillsRoot = path.resolve(cwd, "skills");
-  const reportsDir = path.join(homedir(), ".siclaw", "reports");
+  const reportsDir = path.resolve(cwd, ".siclaw", "reports");
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, reposDir, docsDir];

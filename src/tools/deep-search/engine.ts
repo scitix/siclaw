@@ -10,7 +10,6 @@ import {
 } from "./prompts.js";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
-import { homedir } from "os";
 import crypto from "node:crypto";
 import { resolveKubeconfigPath } from "../kubeconfig-resolver.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
@@ -39,11 +38,12 @@ interface RawHypothesis {
 }
 
 /**
- * Write the full investigation report to ~/.siclaw/reports/deep-search-{timestamp}.md
+ * Write the full investigation report to .siclaw/reports/deep-search-{timestamp}.md
+ * Uses cwd-relative path (not homedir) so it works in K8s pods where homedir may not exist.
  * Returns the file path for inclusion in the summary.
  */
 export async function writeReport(report: string): Promise<string> {
-  const reportDir = join(homedir(), ".siclaw", "reports");
+  const reportDir = join(process.cwd(), ".siclaw", "reports");
   await mkdir(reportDir, { recursive: true });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -64,7 +64,7 @@ async function writeDebugTrace(
   totalCalls: number,
   durationMs: number,
 ): Promise<string> {
-  const traceDir = join(homedir(), ".siclaw", "traces");
+  const traceDir = join(process.cwd(), ".siclaw", "traces");
   await mkdir(traceDir, { recursive: true });
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
