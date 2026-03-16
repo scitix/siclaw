@@ -281,10 +281,10 @@ Memory search (`memory_search` tool) is only available when an embedding provide
 
 | Metric | Normal | Quick |
 |--------|--------|-------|
-| maxContextCalls | 12 | 8 |
+| maxContextCalls | 15 | 10 |
 | maxHypotheses | 5 | 3 |
 | maxCallsPerHypothesis | 10 | 8 |
-| maxTotalCalls | 60 | 30 |
+| maxTotalCalls | 75 | 40 |
 | maxParallel | 3 | 3 |
 | maxDurationMs | 300,000 (5 min) | 180,000 (3 min) |
 
