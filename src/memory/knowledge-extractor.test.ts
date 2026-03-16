@@ -96,7 +96,7 @@ describe("extractConversationKnowledge", () => {
     await expect(extractConversationKnowledge({
       messages: [{ role: "user", text: "test" }],
       llmConfig,
-    })).rejects.toThrow("Knowledge extraction LLM error 500");
+    })).rejects.toThrow("LLM API error 500");
   });
 
   it("filters out entries with empty facts", async () => {

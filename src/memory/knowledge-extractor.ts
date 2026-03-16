@@ -15,6 +15,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { llmCompleteWithTool } from "../tools/deep-search/sub-agent.js";
 
 export interface TopicEntry {
   topic: string;
@@ -31,41 +32,43 @@ interface ExtractionToolArgs {
   entries?: Array<{ topic: string; facts: string[] }>;
 }
 
-const EXTRACTION_SCHEMA = {
-  type: "object" as const,
+const ALLOWED_TOPICS = new Set(["environment", "preferences", "troubleshooting", "commands", "architecture"]);
+
+const EXTRACTION_SCHEMA: Record<string, unknown> = {
+  type: "object",
   properties: {
     should_extract: {
-      type: "boolean" as const,
+      type: "boolean",
       description: "Whether the conversation contains extractable knowledge (false for greetings, small talk, or very short exchanges)",
     },
     entries: {
-      type: "array" as const,
+      type: "array",
       items: {
-        type: "object" as const,
+        type: "object",
         properties: {
           topic: {
-            type: "string" as const,
-            enum: ["environment", "preferences", "troubleshooting", "commands", "architecture"],
+            type: "string",
+            enum: [...ALLOWED_TOPICS],
             description: "Knowledge category",
           },
           facts: {
-            type: "array" as const,
-            items: { type: "string" as const },
+            type: "array",
+            items: { type: "string" },
             description: "Concise factual statements extracted from the conversation",
           },
         },
-        required: ["topic", "facts"] as const,
+        required: ["topic", "facts"],
       },
       description: "Extracted knowledge entries grouped by topic",
     },
   },
-  required: ["should_extract"] as const,
+  required: ["should_extract"],
 };
-
-const LLM_MAX_TOKENS = 2048;
 
 /**
  * Extract structured knowledge from conversation messages using LLM.
+ * Uses llmCompleteWithTool which handles providers that don't support tool_use
+ * (falls back to extractJSON from plain text).
  * Returns empty array if conversation has no extractable knowledge.
  */
 export async function extractConversationKnowledge(opts: ExtractionOpts): Promise<TopicEntry[]> {
@@ -98,68 +101,21 @@ Rules:
 
 Call the extract_knowledge tool with your result.`;
 
-  const url = `${llmConfig.baseUrl.replace(/\/+$/, "")}/chat/completions`;
-  const model = llmConfig.model ?? "";
+  const { toolArgs } = await llmCompleteWithTool<ExtractionToolArgs>(
+    undefined,
+    prompt,
+    "extract_knowledge",
+    "Submit extracted knowledge from conversation",
+    EXTRACTION_SCHEMA,
+    { apiKey: llmConfig.apiKey, baseUrl: llmConfig.baseUrl, model: llmConfig.model },
+  );
 
-  const body = {
-    model,
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: LLM_MAX_TOKENS,
-    tools: [{
-      type: "function",
-      function: {
-        name: "extract_knowledge",
-        description: "Submit extracted knowledge from conversation",
-        parameters: EXTRACTION_SCHEMA,
-      },
-    }],
-    tool_choice: { type: "function", function: { name: "extract_knowledge" } },
-  };
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${llmConfig.apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "");
-    throw new Error(`Knowledge extraction LLM error ${response.status}: ${errText.slice(0, 300)}`);
-  }
-
-  const data = await response.json() as {
-    choices: Array<{
-      message: {
-        content?: string | null;
-        tool_calls?: Array<{
-          function: { arguments: string };
-        }>;
-      };
-    }>;
-  };
-
-  const toolCall = data.choices[0]?.message?.tool_calls?.[0];
-  if (!toolCall?.function?.arguments) {
-    return [];
-  }
-
-  let args: ExtractionToolArgs;
-  try {
-    args = JSON.parse(toolCall.function.arguments);
-  } catch {
-    return [];
-  }
-
-  if (!args.should_extract || !Array.isArray(args.entries)) {
+  if (!toolArgs?.should_extract || !Array.isArray(toolArgs.entries)) {
     return [];
   }
 
   // Validate topic values against allowed set (defense against LLM returning path-traversal values)
-  const ALLOWED_TOPICS = new Set(["environment", "preferences", "troubleshooting", "commands", "architecture"]);
-  return args.entries.filter(e => ALLOWED_TOPICS.has(e.topic) && Array.isArray(e.facts) && e.facts.length > 0);
+  return toolArgs.entries.filter(e => ALLOWED_TOPICS.has(e.topic) && Array.isArray(e.facts) && e.facts.length > 0);
 }
 
 /**
