@@ -2029,9 +2029,11 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Personal skills: only author can view diffs
+    // Personal skills: only author or reviewer can view diffs
     if (meta.scope === "personal" && meta.authorId !== userId) {
-      throw new Error("Skill not found");
+      const isReviewer = context.auth?.username === "admin" ||
+        (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+      if (!isReviewer) throw new Error("Skill not found");
     }
 
     /** Build a unified diff string for specs + all scripts between two SkillFiles */
@@ -2974,11 +2976,13 @@ export function createRpcMethods(
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillReviewRepo) return { reviews: [] };
 
-    // Personal skills: only author can view reviews
+    // Personal skills: only author or reviewer can view reviews
     if (skillRepo) {
       const meta = await skillRepo.getById(skillId);
       if (meta && meta.scope === "personal" && meta.authorId !== userId) {
-        throw new Error("Skill not found");
+        const isReviewer = context.auth?.username === "admin" ||
+          (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+        if (!isReviewer) throw new Error("Skill not found");
       }
     }
 
