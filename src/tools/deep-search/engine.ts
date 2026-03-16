@@ -29,6 +29,7 @@ import {
   TRACE_TAIL_CHARS,
 } from "./types.js";
 import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA } from "./schemas.js";
+import { validateConclusion } from "./quality-gate.js";
 
 interface RawHypothesis {
   text: string;
@@ -292,6 +293,7 @@ async function generateConclusion(
   question: string,
   hypotheses: HypothesisNode[],
   options?: SubAgentOptions,
+  critique?: string,
 ): Promise<ConclusionResult> {
   const hypothesesSummary = hypotheses
     .map((h) => {
@@ -302,7 +304,7 @@ async function generateConclusion(
     })
     .join("\n\n");
 
-  const prompt = conclusionPrompt(question, hypothesesSummary);
+  const prompt = conclusionPrompt(question, hypothesesSummary, critique);
   // No onProgress here — Phase 4 conclusion text should NOT leak into spinner
   try {
     const { toolArgs, textContent } = await llmCompleteWithTool<ConclusionToolArgs>(
@@ -702,7 +704,19 @@ export async function investigate(
 
   // --- Phase 4: Conclusion ---
   onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Generating conclusion..." });
-  const conclusionResult = await generateConclusion(question, hypotheses, options);
+  let conclusionResult = await generateConclusion(question, hypotheses, options);
+
+  // Quality gate: validate conclusion before storing
+  const validation = await validateConclusion({
+    question, hypotheses, conclusion: conclusionResult, options,
+  });
+  if (!validation.pass) {
+    onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Re-generating (quality feedback)..." });
+    conclusionResult = await generateConclusion(question, hypotheses, options, validation.critique);
+  }
+  if (validation.adjustedConfidence !== undefined && conclusionResult.structured) {
+    conclusionResult.structured.confidence = validation.adjustedConfidence;
+  }
 
   const totalDurationMs = Date.now() - startTime;
 

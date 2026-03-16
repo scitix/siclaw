@@ -50,7 +50,7 @@ export interface DeepSearchBudget {
 }
 
 export const NORMAL_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 8,
+  maxContextCalls: 12,
   maxHypotheses: 5,
   maxCallsPerHypothesis: 10,
   maxTotalCalls: 60,
@@ -59,7 +59,7 @@ export const NORMAL_BUDGET: DeepSearchBudget = {
 };
 
 export const QUICK_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 5,
+  maxContextCalls: 8,
   maxHypotheses: 3,
   maxCallsPerHypothesis: 8,
   maxTotalCalls: 30,
