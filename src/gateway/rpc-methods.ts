@@ -1979,6 +1979,12 @@ export function createRpcMethods(
     // Clean up version records
     if (skillVersionRepo) await skillVersionRepo.deleteForSkill(skillId);
 
+    // Clean up orphaned notifications (approval/contribution requests)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
+
     // Delete from DB (CASCADE deletes skill_contents)
     await skillRepo.deleteById(skillId);
 
@@ -2029,9 +2035,11 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Personal skills: only author can view diffs
+    // Personal skills: only author or reviewer can view diffs
     if (meta.scope === "personal" && meta.authorId !== userId) {
-      throw new Error("Skill not found");
+      const isReviewer = context.auth?.username === "admin" ||
+        (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+      if (!isReviewer) throw new Error("Skill not found");
     }
 
     /** Build a unified diff string for specs + all scripts between two SkillFiles */
@@ -2902,6 +2910,12 @@ export function createRpcMethods(
     // Clean up votes
     if (voteRepo) await voteRepo.deleteForSkill(skillId);
 
+    // Clean up orphaned notifications (approval/contribution requests for deleted team skill)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
+
     // Notify author
     const authorId = sourceSkill?.authorId ?? meta.authorId;
     if (notifRepo && authorId) {
@@ -2974,11 +2988,13 @@ export function createRpcMethods(
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillReviewRepo) return { reviews: [] };
 
-    // Personal skills: only author can view reviews
+    // Personal skills: only author or reviewer can view reviews
     if (skillRepo) {
       const meta = await skillRepo.getById(skillId);
       if (meta && meta.scope === "personal" && meta.authorId !== userId) {
-        throw new Error("Skill not found");
+        const isReviewer = context.auth?.username === "admin" ||
+          (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+        if (!isReviewer) throw new Error("Skill not found");
       }
     }
 
@@ -3017,6 +3033,12 @@ export function createRpcMethods(
       contributionStatus: "none",
       stagingVersion: 0,
     });
+
+    // Clean up orphaned notifications (approval/contribution requests)
+    if (notifRepo) {
+      await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
+      await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
+    }
 
     notifySkillReload(userId);
     return { status: "withdrawn", wasNew: false };
