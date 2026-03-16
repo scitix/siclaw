@@ -196,9 +196,8 @@ export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Prom
   try {
     const entries = await extractConversationKnowledge({ messages, llmConfig });
     if (!entries.length) {
-      // LLM found nothing worth extracting (small talk, too short) — fall back to raw save
-      const raw = await saveSessionMemory(opts);
-      return raw ? [raw] : null;
+      // LLM judged no extractable knowledge (small talk, too short) — trust the judgment
+      return null;
     }
     return mergeTopicFiles(memoryDir, entries);
   } catch (err) {
