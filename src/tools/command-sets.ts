@@ -609,12 +609,20 @@ function validateByRule(
     const flag = extractFlag(arg);
     if (rule.allowedFlags.includes(flag)) continue;
 
-    // short flag with attached value: -k2,3 → check "-k"
-    // Only when 3rd char is NOT a letter — prevents combined flags like -ro
-    // from bypassing the check (where -r is safe but -o is not)
+    // Handle multi-char short flags: either combined flags (-rn) or
+    // flag with attached value (-k2,3).
     if (!arg.startsWith("--") && arg.length > 2) {
-      const thirdChar = arg[2];
-      if (thirdChar && !/[a-zA-Z]/.test(thirdChar)) {
+      const chars = arg.slice(1);
+      if (/^[a-zA-Z]+$/.test(chars)) {
+        // Combined short flags: -rn → accept only if every char is allowed
+        if ([...chars].every(ch => rule.allowedFlags!.includes(`-${ch}`))) continue;
+        // Report the first disallowed char for better agent self-correction
+        const bad = [...chars].find(ch => !rule.allowedFlags!.includes(`-${ch}`));
+        return JSON.stringify({
+          error: `${cmd} "-${bad}" (in "${arg}") is not allowed.`,
+        }, null, 2);
+      } else {
+        // Short flag with attached value: -k2,3 → check "-k"
         const shortFlag = arg.slice(0, 2);
         if (rule.allowedFlags.includes(shortFlag)) continue;
       }
