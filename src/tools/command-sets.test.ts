@@ -134,7 +134,15 @@ describe("validateCommandRestrictions", () => {
     it("blocks combined short flags that hide unsafe flags (sort -ro)", () => {
       const err = validateCommandRestrictions("sort -ro /tmp/out file.txt");
       expect(err).not.toBeNull();
+      expect(err).toContain("-o");
       expect(err).toContain("-ro");
+    });
+
+    it("blocks combined short flags with unknown chars (sort -rz)", () => {
+      const err = validateCommandRestrictions("sort -rz file.txt");
+      expect(err).not.toBeNull();
+      expect(err).toContain("-z");
+      expect(err).toContain("-rz");
     });
 
     it("allows short flag with attached non-letter value (sort -k2,3)", () => {
