@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { watch, type FSWatcher } from "node:fs";
+import { readdirSync, watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
@@ -486,7 +486,7 @@ export class MemoryIndexer {
    *
    * Returns the number of purged records.
    */
-  async purgeStaleInvestigations(memoryDir: string): Promise<number> {
+  async purgeStaleInvestigations(memoryDir: string, opts?: { skipSync?: boolean }): Promise<number> {
     try {
       const now = Date.now();
       const ninetyDaysCutoff = now - 90 * 24 * 60 * 60 * 1000;
@@ -503,26 +503,31 @@ export class MemoryIndexer {
 
       if (rows.length === 0) return 0;
 
-      const investigationsDir = path.join(memoryDir, "investigations");
+      // Delete DB records first — orphaned files are more benign than orphaned DB records
+      const ids = rows.map(r => r.id);
+      for (const id of ids) {
+        this.db.prepare("DELETE FROM investigations WHERE id = ?").run(id);
+      }
 
+      // Delete .md files — match by date prefix (±1s) to handle epoch/filename drift
+      const investigationsDir = path.join(memoryDir, "investigations");
       for (const row of rows) {
-        // Delete .md file (defensive: ignore if missing)
-        const filename = epochToInvestigationFilename(row.created_at);
-        const filePath = path.join(investigationsDir, filename);
         try {
-          await fs.unlink(filePath);
+          const candidates = findInvestigationFiles(investigationsDir, row.created_at);
+          for (const filePath of candidates) {
+            await fs.unlink(filePath);
+          }
         } catch {
           // File may already be deleted — that's fine
         }
-
-        // Delete DB record
-        this.db.prepare("DELETE FROM investigations WHERE id = ?").run(row.id);
       }
 
       console.log(`[memory-indexer] Purged ${rows.length} stale investigation(s)`);
 
       // Sync to clean up orphaned chunks from deleted .md files
-      await this.sync();
+      if (!opts?.skipSync) {
+        await this.sync();
+      }
 
       return rows.length;
     } catch (err) {
@@ -949,6 +954,29 @@ function epochToInvestigationFilename(epochMs: number): string {
   const d = new Date(epochMs);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())}-${pad(d.getUTCSeconds())}.md`;
+}
+
+/**
+ * Find investigation .md files matching an epoch timestamp within ±1 second,
+ * to handle potential drift between DB created_at and filesystem filename.
+ */
+function findInvestigationFiles(dir: string, epochMs: number): string[] {
+  const exact = epochToInvestigationFilename(epochMs);
+  const minus1 = epochToInvestigationFilename(epochMs - 1000);
+  const plus1 = epochToInvestigationFilename(epochMs + 1000);
+  const candidates = new Set([exact, minus1, plus1]);
+
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return [path.join(dir, exact)]; // fallback to exact match
+  }
+
+  const matched = files.filter(f => candidates.has(f));
+  return matched.length > 0
+    ? matched.map(f => path.join(dir, f))
+    : [path.join(dir, exact)]; // fallback to exact match
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {

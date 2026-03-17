@@ -47,56 +47,59 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   // --- Code Repositories (~400 chars budget) ---
   if (repoEntries.length > 0) {
     const header = "\n\n### Code Repositories\n| Repo | Files | Top languages |\n|------|-------|--------------|";
-    currentLen += header.length;
 
     const rows: string[] = [];
+    let sectionLen = header.length;
     for (const entry of repoEntries) {
       const langs = entry.topExtensions.length > 0 ? entry.topExtensions.join(", ") : "-";
       const row = `\n| ${entry.name} | ${entry.fileCount} | ${langs} |`;
-      if (currentLen + row.length > TOTAL_BUDGET - 1200) break; // reserve for docs + topics + investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 1200) break; // reserve for docs + topics + investigations + footer
       rows.push(row);
-      currentLen += row.length;
+      sectionLen += row.length;
     }
 
     if (rows.length > 0) {
       parts.push(header + rows.join(""));
+      currentLen += sectionLen;
     }
   }
 
   // --- Documentation (~300 chars budget) ---
   if (docEntries.length > 0) {
     const header = "\n\n### Documentation\n| Category | Files |\n|----------|-------|";
-    currentLen += header.length;
 
     const rows: string[] = [];
+    let sectionLen = header.length;
     for (const entry of docEntries) {
       const row = `\n| ${entry.category} | ${entry.fileCount} |`;
-      if (currentLen + row.length > TOTAL_BUDGET - 900) break; // reserve for topics + investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 900) break; // reserve for topics + investigations + footer
       rows.push(row);
-      currentLen += row.length;
+      sectionLen += row.length;
     }
 
     if (rows.length > 0) {
       parts.push(header + rows.join(""));
+      currentLen += sectionLen;
     }
   }
 
   // --- Accumulated Knowledge (~500 chars budget) ---
   if (topicEntries.length > 0) {
     const header = "\n\n### Accumulated Knowledge";
-    currentLen += header.length;
 
     const lines: string[] = [];
+    let sectionLen = header.length;
     for (const entry of topicEntries) {
       const summaryPart = entry.summary ? `: ${entry.summary}` : "";
       const line = `\n- **${entry.topic}** (${entry.factCount} facts, updated ${entry.lastUpdated})${summaryPart}`;
-      if (currentLen + line.length > TOTAL_BUDGET - 300) break; // reserve space for investigations + footer
+      if (currentLen + sectionLen + line.length > TOTAL_BUDGET - 300) break; // reserve space for investigations + footer
       lines.push(line);
-      currentLen += line.length;
+      sectionLen += line.length;
     }
 
     if (lines.length > 0) {
       parts.push(header + lines.join(""));
+      currentLen += sectionLen;
     }
   }
 
