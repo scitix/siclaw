@@ -223,18 +223,7 @@ describe("triggerConsolidationIfNeeded", () => {
     expect(mockLlmComplete).not.toHaveBeenCalled();
   });
 
-  it("mergeTopicFiles can append to consolidated file", () => {
-    // After consolidation, the file has no date sections.
-    // mergeTopicFiles should still be able to append new facts.
-    const file = path.join(memoryDir, "topics", "env.md");
-    const today = new Date().toISOString().slice(0, 10);
-    fs.writeFileSync(file, `Last consolidated: ${today}\n# Environment\n\n- existing fact\n`);
-
-    // Read the file to verify structure
-    const content = fs.readFileSync(file, "utf-8");
-    expect(content).toContain("Last consolidated:");
-    expect(content).toContain("- existing fact");
-    // No date section headers
-    expect(content).not.toMatch(/^## \d{4}-\d{2}-\d{2}/m);
-  });
+  // Removed: "mergeTopicFiles can append to consolidated file" was a hollow test
+  // that only wrote a file and read it back, without exercising any module behavior.
+  // Actual mergeTopicFiles coverage belongs in knowledge-extractor.test.ts.
 });
