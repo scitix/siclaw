@@ -257,7 +257,11 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            // Auto-resolve KUBECONFIG when single cluster; /dev/null when ambiguous (agent must use --kubeconfig=<name>)
+            // Auto-resolve KUBECONFIG when single cluster; /dev/null when ambiguous.
+            // Unlike other tools, restricted-bash has no `kubeconfig` param — the agent
+            // uses inline `--kubeconfig=<name>` which is resolved by the regex below.
+            // When ambiguous, kubectl fails with a connection error, prompting the agent
+            // to use credential_list and add --kubeconfig=<name>.
             KUBECONFIG: (() => {
               const r = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, undefined);
               return ("path" in r && r.path) ? r.path : "/dev/null";

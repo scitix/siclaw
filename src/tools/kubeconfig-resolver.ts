@@ -5,6 +5,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { resolveUnderDir } from "../shared/path-utils.js";
 
 interface CredentialEntry {
   name: string;
@@ -30,7 +31,7 @@ export function resolveKubeconfigPath(credentialsDir?: string): string | null {
     const kubeconfigFile = kubeEntry.files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntry.files[0];
     if (!kubeconfigFile) return null;
 
-    return join(credentialsDir, kubeconfigFile);
+    return resolveUnderDir(credentialsDir, kubeconfigFile);
   } catch {
     return null;
   }
@@ -49,7 +50,7 @@ export function resolveKubeconfigByName(credentialsDir: string, name: string): s
     const match = entries.find((e) => e.type === "kubeconfig" && e.name === name);
     if (!match) return null;
     const kubeconfigFile = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
-    return kubeconfigFile ? join(credentialsDir, kubeconfigFile) : null;
+    return kubeconfigFile ? resolveUnderDir(credentialsDir, kubeconfigFile) : null;
   } catch {
     return null;
   }
@@ -84,10 +85,19 @@ export function resolveRequiredKubeconfig(
 
   if (kubeEntries.length === 0) return { path: null };
 
+  /** Safely resolve file under credentialsDir; returns error on path traversal. */
+  const safeResolve = (file: string): { path: string } | { error: string } => {
+    try {
+      return { path: resolveUnderDir(credentialsDir, file) };
+    } catch {
+      return { error: `Kubeconfig file path escapes credentials directory: ${file}` };
+    }
+  };
+
   // Single kubeconfig — auto-select (name is optional)
   if (kubeEntries.length === 1 && !name) {
     const file = kubeEntries[0].files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntries[0].files[0];
-    return file ? { path: join(credentialsDir, file) } : { path: null };
+    return file ? safeResolve(file) : { path: null };
   }
 
   // Name required from here
@@ -110,5 +120,5 @@ export function resolveRequiredKubeconfig(
   }
 
   const file = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
-  return file ? { path: join(credentialsDir, file) } : { error: `Kubeconfig "${name}" has no files` };
+  return file ? safeResolve(file) : { error: `Kubeconfig "${name}" has no files` };
 }

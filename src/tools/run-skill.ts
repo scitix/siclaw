@@ -125,7 +125,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: kubeResult.error }) }],
+          content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
           details: { error: true },
         };
       }

@@ -56,7 +56,9 @@ export interface ExecEnv {
  *
  * @param kubeconfigRef — credential directory reference
  * @param resolvedKubeconfigPath — pre-resolved kubeconfig path (from resolveRequiredKubeconfig).
- *   When provided, skips internal resolution. Pass `undefined` to auto-resolve (single-cluster fallback).
+ *   `undefined` = auto-resolve via resolveKubeconfigPath (legacy single-cluster fallback).
+ *   `null` = explicitly no kubeconfig (KUBECONFIG will be /dev/null).
+ *   `string` = use this exact path.
  */
 export function prepareExecEnv(kubeconfigRef?: KubeconfigRef, resolvedKubeconfigPath?: string | null): ExecEnv {
   const kubeconfigPath = resolvedKubeconfigPath !== undefined
