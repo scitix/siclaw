@@ -10,6 +10,8 @@ export const CRON_LIMITS = {
   MAX_ACTIVE_JOBS_PER_USER: 20,
   /** Maximum concurrently executing jobs (soft limit) */
   MAX_CONCURRENT_EXECUTIONS: 5,
-  /** How many consecutive fires to sample when computing minimum interval */
+  /** Absolute minimum gap between any two consecutive fires (anti-burst) */
+  ABSOLUTE_MIN_GAP_MS: 10 * 60 * 1000,
+  /** How many consecutive fires to sample when computing average interval */
   INTERVAL_SAMPLE_COUNT: 10,
 } as const;

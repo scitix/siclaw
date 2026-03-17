@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import { CronScheduler, type CronJobRow } from "../../cron/cron-scheduler.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
 import type { NotificationRepository } from "../db/repositories/notification-repo.js";
-import { CRON_LIMITS } from "./cron-limits.js";
+import { CRON_LIMITS } from "../../cron/cron-limits.js";
 
 const EXECUTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const STALE_LOCK_CLEANUP_MS = 6 * 60 * 1000; // 6 min
