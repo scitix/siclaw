@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
 import { Loader2 } from 'lucide-react';
 
 /**
@@ -8,9 +8,12 @@ import { Loader2 } from 'lucide-react';
  * The backend redirects here after a successful OAuth2 flow with
  * ?token=xxx&userId=xxx&username=xxx in the URL.
  * We save the auth state to localStorage and redirect to /.
+ *
+ * Uses window.location.href instead of React Router navigate() to ensure
+ * a full page reload — this avoids stale React state from the previous
+ * session interfering with the newly authenticated state.
  */
 export function SsoCallback() {
-    const navigate = useNavigate();
     const [params] = useSearchParams();
     const [error, setError] = useState<string | null>(null);
 
@@ -22,7 +25,7 @@ export function SsoCallback() {
 
         if (errorParam) {
             setError(errorParam);
-            setTimeout(() => navigate('/login?error=' + encodeURIComponent(errorParam), { replace: true }), 3000);
+            setTimeout(() => { window.location.href = '/login?error=' + encodeURIComponent(errorParam); }, 3000);
             return;
         }
 
@@ -34,13 +37,14 @@ export function SsoCallback() {
                 user: { id: userId, username },
             };
             localStorage.setItem('siclaw_auth', JSON.stringify(authState));
-            navigate('/', { replace: true });
+            // Full page reload to ensure clean React state
+            window.location.href = '/';
         } else {
             // Missing params — show error briefly, then redirect
             setError('SSO callback missing required parameters');
-            setTimeout(() => navigate('/login?error=sso_callback_failed', { replace: true }), 3000);
+            setTimeout(() => { window.location.href = '/login?error=sso_callback_failed'; }, 3000);
         }
-    }, [params, navigate]);
+    }, [params]);
 
     if (error) {
         return (
