@@ -140,6 +140,8 @@ export function EnvironmentsPage() {
         }
     };
 
+    const uploadEnv = useMemo(() => environments.find(e => e.id === uploadEnvId), [environments, uploadEnvId]);
+
     const showAdmin = isAdmin || isAdminFromServer;
 
     /* Status badge for kubeconfig */
@@ -381,21 +383,17 @@ export function EnvironmentsPage() {
             )}
 
             {/* All users: Kubeconfig upload dialog */}
-            {uploadDialogOpen && uploadEnvId && (() => {
-                const env = environments.find(e => e.id === uploadEnvId);
-                if (!env) return null;
-                return (
-                    <KubeconfigUploadDialog
-                        envId={env.id}
-                        envName={env.name}
-                        apiServer={env.apiServer}
-                        replacing={env.hasUserKubeconfig}
-                        onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
-                        onUploaded={handleUploadComplete}
-                        sendRpc={sendRpc}
-                    />
-                );
-            })()}
+            {uploadDialogOpen && uploadEnv && (
+                <KubeconfigUploadDialog
+                    envId={uploadEnv.id}
+                    envName={uploadEnv.name}
+                    apiServer={uploadEnv.apiServer}
+                    replacing={uploadEnv.hasUserKubeconfig}
+                    onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
+                    onUploaded={handleUploadComplete}
+                    sendRpc={sendRpc}
+                />
+            )}
         </div>
     );
 }
