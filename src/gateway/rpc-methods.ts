@@ -37,6 +37,8 @@ import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js"
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
 import type { CronService } from "./cron/cron-service.js";
+import { CRON_LIMITS } from "./cron/cron-limits.js";
+import { parseCronExpression, getMinimumIntervalMs } from "../cron/cron-matcher.js";
 import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
@@ -2594,16 +2596,63 @@ export function createRpcMethods(
     const description = params.description as string | undefined;
     const schedule = params.schedule as string;
     const status = (params.status as "active" | "paused") ?? "active";
+    const skillId = params.skillId as string | undefined;
 
     const existingId = params.id as string | undefined;
     const workspaceId = params.workspaceId as string | null | undefined;
+
+    // ── Validation chain ──────────────────────────
+
+    // 1. Syntax validation
+    parseCronExpression(schedule);
+
+    // 2. Ownership check on update
+    let existingJob: Awaited<ReturnType<ConfigRepository["getCronJobById"]>> | null = null;
+    if (existingId) {
+      existingJob = await configRepo.getCronJobById(existingId);
+      if (!existingJob) throw new Error("Job not found");
+      if (existingJob.userId !== userId) throw new Error("Forbidden");
+    }
+
+    // 3. Minimum interval check (skip if updating without changing schedule)
+    const scheduleChanged = !existingJob || existingJob.schedule !== schedule;
+    if (scheduleChanged) {
+      const minInterval = getMinimumIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      const limit = isAdminUser(context) ? CRON_LIMITS.ADMIN_MIN_INTERVAL_MS : CRON_LIMITS.MIN_INTERVAL_MS;
+      if (minInterval < limit) {
+        const limitMin = Math.round(limit / 60_000);
+        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+      }
+    }
+
+    // 4. Active job quota
+    if (status === "active") {
+      const activeCount = await configRepo.countActiveJobsByUser(userId);
+      // If updating an already-active job, it's already counted
+      const alreadyCounted = existingJob?.status === "active" ? 1 : 0;
+      if (activeCount - alreadyCounted >= CRON_LIMITS.MAX_ACTIVE_JOBS_PER_USER) {
+        throw new Error(`Active job limit reached (max ${CRON_LIMITS.MAX_ACTIVE_JOBS_PER_USER})`);
+      }
+    }
+
+    // 5. Skill ownership validation
+    if (skillId && skillRepo) {
+      const skill = await skillRepo.getById(skillId);
+      if (!skill) throw new Error(`Skill not found: ${skillId}`);
+      // Allow builtin + team skills for everyone; personal skills only for the author
+      if (skill.scope === "personal" && skill.authorId !== userId) {
+        throw new Error("Forbidden: cannot use another user's personal skill");
+      }
+    }
+
+    // ── Persist ───────────────────────────────────
 
     const id = await configRepo.saveCronJob(userId, {
       id: existingId,
       name,
       description,
       schedule,
-      skillId: params.skillId as string | undefined,
+      skillId,
       status,
       workspaceId: workspaceId ?? null,
     });
@@ -2614,7 +2663,7 @@ export function createRpcMethods(
       } else {
         cronService.addOrUpdate({
           id, userId, name, description: description ?? null, schedule, status,
-          skillId: (params.skillId as string) ?? null, assignedTo: null,
+          skillId: skillId ?? null, assignedTo: null,
           lastRunAt: null, lastResult: null, lockedBy: null, lockedAt: null,
           workspaceId: workspaceId ?? null,
         });
@@ -2666,6 +2715,23 @@ export function createRpcMethods(
     const job = await configRepo.getCronJobById(id);
     if (!job) throw new Error("Job not found");
     if (job.userId !== userId) throw new Error("Forbidden");
+
+    // ── Rate-limit checks when activating ──────────
+    if (status === "active" && job.status !== "active") {
+      // Interval check (prevents re-activating a high-frequency job)
+      const minInterval = getMinimumIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      const limit = isAdminUser(context) ? CRON_LIMITS.ADMIN_MIN_INTERVAL_MS : CRON_LIMITS.MIN_INTERVAL_MS;
+      if (minInterval < limit) {
+        const limitMin = Math.round(limit / 60_000);
+        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+      }
+
+      // Active job quota
+      const activeCount = await configRepo.countActiveJobsByUser(userId);
+      if (activeCount >= CRON_LIMITS.MAX_ACTIVE_JOBS_PER_USER) {
+        throw new Error(`Active job limit reached (max ${CRON_LIMITS.MAX_ACTIVE_JOBS_PER_USER})`);
+      }
+    }
 
     // Update status
     await configRepo.saveCronJob(userId, {
