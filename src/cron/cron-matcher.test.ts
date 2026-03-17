@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseCronExpression, getMinimumIntervalMs } from "./cron-matcher.js";
+import { parseCronExpression, getAverageIntervalMs } from "./cron-matcher.js";
 
 const HOUR = 60 * 60 * 1000;
 const MIN = 60 * 1000;
@@ -36,44 +36,62 @@ describe("parseCronExpression", () => {
   });
 });
 
-describe("getMinimumIntervalMs", () => {
-  it("every hour → 60 min interval", () => {
-    expect(getMinimumIntervalMs("0 * * * *")).toBe(HOUR);
+describe("getAverageIntervalMs", () => {
+  it("throws when sampleCount < 2", () => {
+    expect(() => getAverageIntervalMs("0 * * * *", 1)).toThrow("sampleCount must be >= 2");
+    expect(() => getAverageIntervalMs("0 * * * *", 0)).toThrow("sampleCount must be >= 2");
   });
 
-  it("every 5 minutes → 5 min interval", () => {
-    expect(getMinimumIntervalMs("*/5 * * * *")).toBe(5 * MIN);
+  it("every hour → avg 60 min, min 60 min", () => {
+    const { avg, min } = getAverageIntervalMs("0 * * * *");
+    expect(avg).toBe(HOUR);
+    expect(min).toBe(HOUR);
   });
 
-  it("every minute → 1 min interval", () => {
-    expect(getMinimumIntervalMs("* * * * *")).toBe(MIN);
+  it("every 5 minutes → avg 5 min", () => {
+    const { avg } = getAverageIntervalMs("*/5 * * * *");
+    expect(avg).toBe(5 * MIN);
   });
 
-  it("daily at 9am → 24h interval", () => {
-    expect(getMinimumIntervalMs("0 9 * * *")).toBe(24 * HOUR);
+  it("every minute → avg 1 min", () => {
+    const { avg } = getAverageIntervalMs("* * * * *");
+    expect(avg).toBe(MIN);
   });
 
-  it("every 15 minutes → 15 min interval", () => {
-    expect(getMinimumIntervalMs("*/15 * * * *")).toBe(15 * MIN);
+  it("daily at 9am → avg 24h", () => {
+    const { avg } = getAverageIntervalMs("0 9 * * *");
+    expect(avg).toBe(24 * HOUR);
   });
 
-  it("variable-interval: 9am and 5pm weekdays → well above 8h", () => {
-    // Gaps: 8h (9→17), 16h (17→9 next day), plus weekend spans.
-    // Average over 10 samples includes weekend gaps, so >> 12h.
-    const interval = getMinimumIntervalMs("0 9,17 * * 1-5");
-    expect(interval).toBeGreaterThan(8 * HOUR);
+  it("every 15 minutes → avg 15 min", () => {
+    const { avg } = getAverageIntervalMs("*/15 * * * *");
+    expect(avg).toBe(15 * MIN);
   });
 
-  it("*/16 every 16 min → average ~15 min (not min 12 min)", () => {
-    // 0,16,32,48 — gaps: 16,16,16,12 — average ≈ 15 min
-    const interval = getMinimumIntervalMs("*/16 * * * *");
-    expect(interval).toBeGreaterThanOrEqual(15 * MIN);
-    expect(interval).toBeLessThan(16 * MIN);
+  it("weekday 9am+5pm → avg > 12h (includes weekend gaps)", () => {
+    const { avg, min } = getAverageIntervalMs("0 9,17 * * 1-5");
+    expect(avg).toBeGreaterThan(12 * HOUR);
+    expect(min).toBe(8 * HOUR); // 9→17 same day
+  });
+
+  it("*/16 → avg ~15 min, min 12 min", () => {
+    // 0,16,32,48 — cycle: 16,16,16,12. Use sampleCount=5 (one full cycle)
+    // to make the test deterministic.
+    const { avg, min } = getAverageIntervalMs("*/16 * * * *", 5);
+    expect(avg).toBe(15 * MIN);
+    expect(min).toBe(12 * MIN);
+  });
+
+  it("burst pattern: min gap catches what avg misses", () => {
+    // 0,1,2,3 0 * * * — 4 fires in 3 min at midnight, then 24h idle
+    const { avg, min } = getAverageIntervalMs("0,1,2,3 0 * * *", 10);
+    expect(avg).toBeGreaterThan(HOUR); // avg is huge (diluted by idle)
+    expect(min).toBe(MIN);             // but min gap is only 1 min
   });
 
   it("monthly 1st at midnight → ~28-31 days", () => {
-    const interval = getMinimumIntervalMs("0 0 1 * *");
-    expect(interval).toBeGreaterThanOrEqual(28 * 24 * HOUR);
-    expect(interval).toBeLessThanOrEqual(31 * 24 * HOUR);
+    const { avg } = getAverageIntervalMs("0 0 1 * *");
+    expect(avg).toBeGreaterThanOrEqual(28 * 24 * HOUR);
+    expect(avg).toBeLessThanOrEqual(31 * 24 * HOUR);
   });
 });

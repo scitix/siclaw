@@ -3,8 +3,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { loadConfig } from "../core/config.js";
 import { GatewayClient } from "../agentbox/gateway-client.js";
-import { parseCronExpression, getMinimumIntervalMs } from "../cron/cron-matcher.js";
-import { CRON_LIMITS } from "../gateway/cron/cron-limits.js";
+import { parseCronExpression, getAverageIntervalMs } from "../cron/cron-matcher.js";
+import { CRON_LIMITS } from "../cron/cron-limits.js";
 
 interface ManageScheduleParams {
   action: "create" | "update" | "delete" | "pause" | "resume" | "rename" | "list";
@@ -219,8 +219,15 @@ Common cron patterns:
         };
       }
 
-      const avgInterval = getMinimumIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+      const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
+        const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes.` }) }],
+          details: { error: true },
+        };
+      }
+      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
         const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         return {
           content: [{ type: "text", text: JSON.stringify({ error: `Schedule interval too short: minimum ${limitMin} minutes between executions. Try a less frequent schedule.` }) }],
