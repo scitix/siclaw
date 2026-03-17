@@ -616,6 +616,11 @@ function validateByRule(
       if (/^[a-zA-Z]+$/.test(chars)) {
         // Combined short flags: -rn → accept only if every char is allowed
         if ([...chars].every(ch => rule.allowedFlags!.includes(`-${ch}`))) continue;
+        // Report the first disallowed char for better agent self-correction
+        const bad = [...chars].find(ch => !rule.allowedFlags!.includes(`-${ch}`));
+        return JSON.stringify({
+          error: `${cmd} "-${bad}" (in "${arg}") is not allowed.`,
+        }, null, 2);
       } else {
         // Short flag with attached value: -k2,3 → check "-k"
         const shortFlag = arg.slice(0, 2);
