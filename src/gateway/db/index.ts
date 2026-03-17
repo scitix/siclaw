@@ -84,8 +84,8 @@ export async function createDb(): Promise<Database> {
     // Force MySQL session timezone to UTC so timestamp comparisons match
     // the client-side serialization (timezone: '+00:00' above).
     pool.on("connection", (conn) => {
-      conn.query("SET time_zone = '+00:00'").catch((err) => {
-        console.error("[db] Failed to set session timezone:", err);
+      conn.query("SET time_zone = '+00:00'", (err: unknown) => {
+        if (err) console.error("[db] Failed to set session timezone:", err);
       });
     });
     _db = drizzle(pool, { schema, mode: "default" });
