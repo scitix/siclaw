@@ -4,10 +4,8 @@
  */
 
 export const CRON_LIMITS = {
-  /** Minimum interval between fires — regular users (1 hour) */
+  /** Minimum average interval between fires — all users (1 hour) */
   MIN_INTERVAL_MS: 60 * 60 * 1000,
-  /** Minimum interval between fires — admin users (15 min) */
-  ADMIN_MIN_INTERVAL_MS: 15 * 60 * 1000,
   /** Maximum active (non-paused) jobs per user */
   MAX_ACTIVE_JOBS_PER_USER: 20,
   /** Maximum concurrently executing jobs (soft limit) */
