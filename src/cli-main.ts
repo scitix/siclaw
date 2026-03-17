@@ -10,6 +10,7 @@ import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
+import { consolidateAllPending } from "./memory/topic-consolidator.js";
 import type { BrainType } from "./core/brain-session.js";
 
 // Parse arguments
@@ -99,6 +100,19 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
     console.log("│  SSH keys, or API tokens for diagnostics.       │");
     console.log("└─────────────────────────────────────────────────┘");
   }
+}
+
+// Startup maintenance: purge stale investigations, then consolidate topics (chained to avoid race)
+if (memoryIndexer) {
+  const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
+  memoryIndexer.purgeStaleInvestigations(cliMemoryDir)
+    .then(() => {
+      const llm = getDefaultLlm();
+      if (llm?.apiKey && llm?.baseUrl) {
+        return consolidateAllPending(cliMemoryDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id });
+      }
+    })
+    .catch(err => console.warn("[siclaw] Startup maintenance failed:", err));
 }
 
 // Debug: subscribe to all session events and write to log file

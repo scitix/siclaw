@@ -43,14 +43,16 @@ describe("buildKnowledgeOverview", () => {
 
     const result = buildKnowledgeOverview({ memoryDir });
     expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("| env | 1 | 2026-03-16 |");
+    expect(result).toContain("**env**");
+    expect(result).toContain("1 facts");
+    expect(result).toContain("2026-03-16");
     expect(result).not.toContain("### Code Repositories");
     expect(result).not.toContain("### Documentation");
   });
 
   // --- Topics ---
 
-  it("shows only topics table when only topics/ exists", () => {
+  it("shows topics list with summaries when only topics/ exists", () => {
     const topicsDir = path.join(memoryDir, "topics");
     fs.mkdirSync(topicsDir);
     fs.writeFileSync(
@@ -61,7 +63,8 @@ describe("buildKnowledgeOverview", () => {
     const result = buildKnowledgeOverview({ memoryDir });
     expect(result).toContain("## Knowledge Overview");
     expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("| environment | 3 | 2026-03-16 |");
+    expect(result).toContain("**environment** (3 facts, updated 2026-03-16)");
+    expect(result).toContain("fact one");
     expect(result).not.toContain("### Recent Investigations");
     expect(result).toContain("memory_get");
   });
@@ -93,7 +96,7 @@ describe("buildKnowledgeOverview", () => {
     );
 
     const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("| multi | 2 | 2026-03-16 |");
+    expect(result).toContain("**multi** (2 facts, updated 2026-03-16)");
   });
 
   it("handles empty topic files gracefully", () => {
@@ -102,7 +105,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(topicsDir, "empty.md"), "");
 
     const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("| empty | 0 | unknown |");
+    expect(result).toContain("**empty** (0 facts, updated unknown)");
   });
 
   // --- Investigations ---
@@ -139,7 +142,7 @@ describe("buildKnowledgeOverview", () => {
 
     const result = buildKnowledgeOverview({ memoryDir });
     expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("| networking | 2 | 2026-03-15 |");
+    expect(result).toContain("**networking** (2 facts, updated 2026-03-15)");
     expect(result).toContain("### Recent Investigations");
     expect(result).toContain("2026-03-08: RoCE network latency spike");
   });
@@ -354,7 +357,7 @@ describe("buildKnowledgeOverview", () => {
     expect(result).toContain("### Documentation");
     expect(result).toContain("runbooks");
     expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("| environment | 2 | 2026-03-16 |");
+    expect(result).toContain("**environment** (2 facts, updated 2026-03-16)");
     expect(result).toContain("### Recent Investigations");
     expect(result).toContain("Pod CrashLoopBackOff");
   });
@@ -439,5 +442,74 @@ describe("buildKnowledgeOverview", () => {
 
     const result = buildKnowledgeOverview({ memoryDir, reposDir, docsDir });
     expect(result.length).toBeLessThanOrEqual(1800 + 150);
+  });
+
+  // --- Topic summaries ---
+
+  it("includes topic summary from first 3 facts", () => {
+    const topicsDir = path.join(memoryDir, "topics");
+    fs.mkdirSync(topicsDir);
+    fs.writeFileSync(
+      path.join(topicsDir, "environment.md"),
+      `# Environment\n\n## 2026-03-17\n- Cluster gpu-east-1 has 64 A100 nodes\n- K8s version 1.29.2\n- Network uses RoCE v2\n- Storage is Lustre\n`,
+    );
+
+    const result = buildKnowledgeOverview({ memoryDir });
+    expect(result).toContain("Cluster gpu-east-1");
+    expect(result).toContain("K8s version 1.29.2");
+    // Summary is truncated to ~60 chars, so not all facts appear
+    expect(result).toContain("**environment** (4 facts, updated 2026-03-17):");
+  });
+
+  it("handles consolidated files with Last consolidated header", () => {
+    const topicsDir = path.join(memoryDir, "topics");
+    fs.mkdirSync(topicsDir);
+    fs.writeFileSync(
+      path.join(topicsDir, "environment.md"),
+      `Last consolidated: 2026-03-17\n# Environment\n\n- Cluster gpu-east-1 has 64 A100 nodes\n- K8s version 1.29.2\n`,
+    );
+
+    const result = buildKnowledgeOverview({ memoryDir });
+    expect(result).toContain("**environment** (2 facts, updated 2026-03-17)");
+    expect(result).toContain("Cluster gpu-east-1");
+  });
+
+  // --- Investigation patterns ---
+
+  it("renders investigation patterns when provided", () => {
+    const invDir = path.join(memoryDir, "investigations");
+    fs.mkdirSync(invDir);
+    fs.writeFileSync(
+      path.join(invDir, "2026-03-16-14-30-00.md"),
+      `# Investigation: Pod CrashLoopBackOff\n`,
+    );
+
+    const patterns = [
+      { category: "networking", count: 3 },
+      { category: "resource_exhaustion", count: 2 },
+    ];
+    const result = buildKnowledgeOverview({ memoryDir, investigationPatterns: patterns });
+    expect(result).toContain("Patterns: networking (3x), resource_exhaustion (2x)");
+  });
+
+  it("renders patterns even without investigation files", () => {
+    // No investigations/ dir, but patterns provided (from DB)
+    const patterns = [{ category: "mtu_mismatch", count: 5 }];
+    const result = buildKnowledgeOverview({ memoryDir, investigationPatterns: patterns });
+    expect(result).toContain("### Recent Investigations");
+    expect(result).toContain("Patterns: mtu_mismatch (5x)");
+  });
+
+  it("backward compatible when no patterns provided", () => {
+    const invDir = path.join(memoryDir, "investigations");
+    fs.mkdirSync(invDir);
+    fs.writeFileSync(
+      path.join(invDir, "2026-03-16-14-30-00.md"),
+      `# Investigation: Pod CrashLoopBackOff\n`,
+    );
+
+    const result = buildKnowledgeOverview({ memoryDir });
+    expect(result).toContain("### Recent Investigations");
+    expect(result).not.toContain("Patterns:");
   });
 });

@@ -23,6 +23,7 @@ import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summa
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { consolidateAllPending } from "../memory/topic-consolidator.js";
 
 export interface ManagedSession {
   id: string;
@@ -207,11 +208,23 @@ export class AgentBoxSessionManager {
     // Populate sessionIdRef so skill_call events can associate with this session
     result.sessionIdRef.current = id;
 
-    // New session: re-sync memory index to pick up files from previous sessions
+    // New session: sync memory index, then purge stale investigations (chained to avoid race)
     if (isNewSession && this._sharedMemoryIndexer) {
-      this._sharedMemoryIndexer.sync().catch((err) => {
-        console.warn(`[agentbox-session] Memory sync on new session failed:`, err);
-      });
+      const memDir = this.getMemoryDir();
+      this._sharedMemoryIndexer.sync()
+        .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
+        .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
+    }
+
+    // Catch-up topic consolidation on new session — use llmConfigRef (dynamic, works in K8s mode)
+    if (isNewSession) {
+      const memDir = this.getMemoryDir();
+      const llmRef = result.llmConfigRef;
+      if (llmRef.apiKey && llmRef.baseUrl) {
+        consolidateAllPending(memDir, { apiKey: llmRef.apiKey, baseUrl: llmRef.baseUrl, model: llmRef.model }).catch(err =>
+          console.warn("[agentbox-session] Topic consolidation failed:", err),
+        );
+      }
     }
 
     managed = {
