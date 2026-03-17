@@ -39,6 +39,8 @@ export const HYPOTHESES_SCHEMA = {
           },
           estimatedCalls: {
             type: "number" as const,
+            minimum: 1,
+            maximum: 10,
             description: "Estimated tool calls needed to validate: 1-3 for quick checks, 4-6 for standard, 7-10 for deep multi-step validation",
           },
         },
