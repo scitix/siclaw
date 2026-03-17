@@ -3,6 +3,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { loadConfig } from "../core/config.js";
 import { GatewayClient } from "../agentbox/gateway-client.js";
+import { parseCronExpression, getMinimumIntervalMs } from "../cron/cron-matcher.js";
+import { CRON_LIMITS } from "../gateway/cron/cron-limits.js";
 
 interface ManageScheduleParams {
   action: "create" | "update" | "delete" | "pause" | "resume" | "rename" | "list";
@@ -203,6 +205,25 @@ Common cron patterns:
       if (!params.schedule?.trim()) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: "Cron schedule expression is required." }) }],
+          details: { error: true },
+        };
+      }
+
+      // Pre-validate cron expression so the model sees errors before the frontend RPC call
+      try {
+        parseCronExpression(params.schedule.trim());
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `Invalid cron expression: ${err instanceof Error ? err.message : String(err)}` }) }],
+          details: { error: true },
+        };
+      }
+
+      const avgInterval = getMinimumIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `Schedule interval too short: minimum ${limitMin} minutes between executions. Try a less frequent schedule.` }) }],
           details: { error: true },
         };
       }

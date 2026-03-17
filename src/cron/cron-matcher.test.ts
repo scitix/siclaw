@@ -57,15 +57,22 @@ describe("getMinimumIntervalMs", () => {
     expect(getMinimumIntervalMs("*/15 * * * *")).toBe(15 * MIN);
   });
 
-  it("variable-interval: 9am and 5pm → minimum 8h", () => {
-    // Weekdays 9am and 5pm: gaps are 8h (9→17) and 16h (17→next 9)
+  it("variable-interval: 9am and 5pm weekdays → well above 8h", () => {
+    // Gaps: 8h (9→17), 16h (17→9 next day), plus weekend spans.
+    // Average over 10 samples includes weekend gaps, so >> 12h.
     const interval = getMinimumIntervalMs("0 9,17 * * 1-5");
-    expect(interval).toBe(8 * HOUR);
+    expect(interval).toBeGreaterThan(8 * HOUR);
+  });
+
+  it("*/16 every 16 min → average ~15 min (not min 12 min)", () => {
+    // 0,16,32,48 — gaps: 16,16,16,12 — average ≈ 15 min
+    const interval = getMinimumIntervalMs("*/16 * * * *");
+    expect(interval).toBeGreaterThanOrEqual(15 * MIN);
+    expect(interval).toBeLessThan(16 * MIN);
   });
 
   it("monthly 1st at midnight → ~28-31 days", () => {
     const interval = getMinimumIntervalMs("0 0 1 * *");
-    // Minimum is 28 days (Feb → Mar in non-leap year)
     expect(interval).toBeGreaterThanOrEqual(28 * 24 * HOUR);
     expect(interval).toBeLessThanOrEqual(31 * 24 * HOUR);
   });
