@@ -82,7 +82,7 @@ Bundles contain **only team + personal skills**. Core skills are baked into the 
 - ✅ Bundle requests are small and fast (no large static skill content)
 - ✅ Core skills are versioned with the code, not the database
 - ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
-- ⚠️ In local mode, `materialize()` would wipe core skills from disk — see ADR-002 for why local mode cannot safely call `materialize()`
+- ⚠️ In local mode, `materialize()` wipes `skills/team/` and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
 - ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
 
 ---
