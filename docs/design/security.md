@@ -342,7 +342,7 @@ spec:
     securityContext:
       capabilities:
         drop: ["ALL"]
-        add: ["SETUID", "SETGID", "CHOWN", "FOWNER"]  # SETUID/SETGID for sudo; CHOWN/FOWNER for entrypoint volume permissions
+        add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"]  # SETUID/SETGID for sudo; CHOWN/FOWNER for entrypoint volume permissions; AUDIT_WRITE for sudo audit
       readOnlyRootFilesystem: true
     volumeMounts:
     - name: tmp
@@ -377,11 +377,12 @@ does not need timestamp caching, so no additional writable paths are needed for 
 | `SETGID` | `sudo` also switches GID; kubectl's setgid bit requires kernel enforcement | Low — setgid only grants kubecred group |
 | `CHOWN` | Entrypoint fixes volume mount ownership (runs as root before `runuser`) | Low — kernel clears effective/permitted caps on UID transition via `runuser` |
 | `FOWNER` | Entrypoint fixes volume mount permissions regardless of ownership | Low — same as CHOWN, cleared after `runuser` |
+| `AUDIT_WRITE` | Required by `sudo` to write kernel audit records; without it every command emits stderr noise (`unable to send audit message`) | Low — only grants write to kernel audit log, no privilege escalation path; included in Docker default cap set |
 | All others | Dropped | N/A |
 
 ### 5.3 What Is Blocked
 
-With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER (CHOWN/FOWNER used only during root entrypoint, cleared after `runuser`):
+With `drop: ALL` + only SETUID/SETGID/CHOWN/FOWNER/AUDIT_WRITE (CHOWN/FOWNER used only during root entrypoint, cleared after `runuser`):
 
 - `CAP_NET_RAW` dropped — no raw sockets, no packet sniffing
 - `CAP_SYS_PTRACE` dropped — no debugging/attaching to other processes
@@ -558,7 +559,7 @@ spec:
 
 ### 10.2 K8s Manifests
 
-- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID", "CHOWN", "FOWNER"] }`
+- [x] Add `capabilities: { drop: ["ALL"], add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"] }`
 - [x] Add `seccompProfile: { type: RuntimeDefault }`
 - [x] Entrypoint handles volume permission fixing (no init container needed; CHOWN/FOWNER cleared after `runuser`)
 - [x] Keep `automountServiceAccountToken: false`
