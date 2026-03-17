@@ -143,15 +143,33 @@ export function getNextCronDelay(expr: string, after?: Date): number {
  * Estimate the average interval (in ms) between consecutive fires
  * by sampling `sampleCount` successive trigger times.
  *
- * Uses average (not minimum) to avoid penalising cron boundary artifacts.
- * e.g. *​/16 * * * * has gaps of 16-16-16-12 — average 15 min, not min 12 min.
+ * Uses average to avoid penalising cron boundary artifacts
+ * (e.g. *​/16 has gaps 16-16-16-12, average 15 min not min 12 min).
+ *
+ * Also tracks the minimum gap to catch burst patterns
+ * (e.g. 0,1,2,3 0 * * * fires 4 times in 3 min then idles 24h).
  */
-export function getMinimumIntervalMs(expr: string, sampleCount = 10): number {
+export function getAverageIntervalMs(
+  expr: string,
+  sampleCount = 10,
+): { avg: number; min: number } {
+  if (sampleCount < 2) {
+    throw new Error("sampleCount must be >= 2");
+  }
+
   const first = getNextCronTime(expr, new Date());
   let prev = first;
+  let minGap = Infinity;
+
   for (let i = 1; i < sampleCount; i++) {
-    prev = getNextCronTime(expr, prev);
+    const next = getNextCronTime(expr, prev);
+    const gap = next.getTime() - prev.getTime();
+    if (gap < minGap) minGap = gap;
+    prev = next;
   }
-  // Total span divided by number of intervals
-  return (prev.getTime() - first.getTime()) / (sampleCount - 1);
+
+  return {
+    avg: (prev.getTime() - first.getTime()) / (sampleCount - 1),
+    min: minGap,
+  };
 }

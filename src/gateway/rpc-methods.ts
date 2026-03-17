@@ -37,8 +37,8 @@ import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js"
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
 import type { CronService } from "./cron/cron-service.js";
-import { CRON_LIMITS } from "./cron/cron-limits.js";
-import { parseCronExpression, getMinimumIntervalMs } from "../cron/cron-matcher.js";
+import { CRON_LIMITS } from "../cron/cron-limits.js";
+import { parseCronExpression, getAverageIntervalMs } from "../cron/cron-matcher.js";
 import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
@@ -2614,11 +2614,15 @@ export function createRpcMethods(
       if (existingJob.userId !== userId) throw new Error("Forbidden");
     }
 
-    // 3. Minimum interval check (skip if updating without changing schedule)
+    // 3. Interval check (skip if updating without changing schedule)
     const scheduleChanged = !existingJob || existingJob.schedule !== schedule;
     if (scheduleChanged) {
-      const avgInterval = getMinimumIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+      const { avg, min } = getAverageIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
+        const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
+        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
+      }
+      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
         const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
       }
@@ -2718,8 +2722,12 @@ export function createRpcMethods(
     // ── Rate-limit checks when activating ──────────
     if (status === "active" && job.status !== "active") {
       // Interval check (prevents re-activating a high-frequency job)
-      const avgInterval = getMinimumIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+      const { avg, min } = getAverageIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
+        const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
+        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
+      }
+      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
         const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
       }
