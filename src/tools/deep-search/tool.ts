@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { investigate, writeReport } from "./engine.js";
-import { formatResult, formatSummary } from "./format.js";
+import { investigate } from "./engine.js";
+import { formatSummary } from "./format.js";
 import { NORMAL_BUDGET, QUICK_BUDGET } from "./types.js";
 import { Text } from "@mariozechner/pi-tui";
 import { deepSearchEvents } from "./events.js";
@@ -204,9 +204,7 @@ Do triage first before calling this tool — confirm the problem exists and gath
           memoryIndexer: memoryRef?.indexer,
           memoryDir: memoryRef?.dir,
         });
-        const report = formatResult(result);
-        const reportPath = await writeReport(report);
-        const summary = formatSummary(result, reportPath);
+        const summary = formatSummary(result);
         return {
           content: [{ type: "text", text: summary }],
           details: {
@@ -215,7 +213,6 @@ Do triage first before calling this tool — confirm the problem exists and gath
             durationMs: result.totalDurationMs,
             hypothesesValidated: result.hypotheses.filter((h) => h.status === "validated").length,
             hypothesesTotal: result.hypotheses.length,
-            reportPath,
             hypotheses: result.hypotheses.map((h) => ({
               id: h.id,
               text: h.text,
