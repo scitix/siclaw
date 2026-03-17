@@ -19,7 +19,9 @@ import { llmCompleteWithTool } from "../tools/deep-search/sub-agent.js";
 const MIN_DATE_SECTIONS = 5;
 const MIN_FACT_LINES = 20;
 
-// Guard against concurrent consolidation of the same file (LocalSpawner shared filesystem)
+// Guard against concurrent consolidation of the same file in LocalSpawner mode
+// (single process, shared filesystem). In K8s mode, topics are pod-scoped so
+// cross-pod races don't occur; the mtime optimistic lock is the safety net there.
 const consolidationInProgress = new Set<string>();
 
 // ---------------------------------------------------------------------------

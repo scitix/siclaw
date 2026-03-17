@@ -503,10 +503,17 @@ export class MemoryIndexer {
 
       if (rows.length === 0) return 0;
 
-      // Delete DB records first — orphaned files are more benign than orphaned DB records
-      const deleteStmt = this.db.prepare("DELETE FROM investigations WHERE id = ?");
-      for (const row of rows) {
-        deleteStmt.run(row.id);
+      // Delete DB records first (atomic) — orphaned files are more benign than orphaned DB records
+      this.db.exec("BEGIN");
+      try {
+        const deleteStmt = this.db.prepare("DELETE FROM investigations WHERE id = ?");
+        for (const row of rows) {
+          deleteStmt.run(row.id);
+        }
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
       }
 
       // Delete .md files — match by date prefix (±1s) to handle epoch/filename drift
