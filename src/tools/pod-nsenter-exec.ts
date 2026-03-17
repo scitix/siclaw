@@ -13,12 +13,14 @@ import {
   runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 interface PodNsenterExecParams {
   pod: string;
   namespace?: string;
   container?: string;
   command: string;
+  kubeconfig?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -71,6 +73,11 @@ Examples:
         description:
           'Diagnostic command to run in the pod\'s network namespace (e.g. "ip addr show", "ss -tlnp")',
       }),
+      kubeconfig: Type.Optional(
+        Type.String({
+          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+        }),
+      ),
       image: Type.Optional(
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
@@ -97,7 +104,15 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as PodNsenterExecParams;
-      const env = prepareExecEnv(kubeconfigRef);
+
+      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      if ("error" in kubeResult) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: kubeResult.error }, null, 2) }],
+          details: { error: true },
+        };
+      }
+      const env = prepareExecEnv(kubeconfigRef, kubeResult.path);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 

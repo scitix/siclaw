@@ -53,9 +53,15 @@ export interface ExecEnv {
  * Build a sanitised child-process environment with kubeconfig resolution.
  * Sets KUBECONFIG=/dev/null to block default ~/.kube/config; passes
  * explicit --kubeconfig= via kubeconfigArgs when credentials are available.
+ *
+ * @param kubeconfigRef — credential directory reference
+ * @param resolvedKubeconfigPath — pre-resolved kubeconfig path (from resolveRequiredKubeconfig).
+ *   When provided, skips internal resolution. Pass `undefined` to auto-resolve (single-cluster fallback).
  */
-export function prepareExecEnv(kubeconfigRef?: KubeconfigRef): ExecEnv {
-  const kubeconfigPath = resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
+export function prepareExecEnv(kubeconfigRef?: KubeconfigRef, resolvedKubeconfigPath?: string | null): ExecEnv {
+  const kubeconfigPath = resolvedKubeconfigPath !== undefined
+    ? resolvedKubeconfigPath
+    : resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
   return {
     childEnv: {
       ...sanitizeEnv(process.env as Record<string, string>),

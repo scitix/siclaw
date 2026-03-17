@@ -5,7 +5,7 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { loadConfig } from "../core/config.js";
-import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
 import { parseArgs } from "./command-sets.js";
 import {
@@ -19,6 +19,7 @@ interface RunSkillParams {
   skill: string;
   script: string;
   args?: string;
+  kubeconfig?: string;
   timeout_seconds?: number;
 }
 
@@ -47,6 +48,7 @@ Parameters:
 - skill: Skill name (e.g. "find-node", "roce-perftest-pod")
 - script: Script filename (e.g. "find-node.sh", "run-perftest.py")
 - args: Optional command-line arguments
+- kubeconfig: Credential name of the target cluster (use credential_list to discover). Omit to use the default kubeconfig.
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
@@ -66,6 +68,11 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       args: Type.Optional(
         Type.String({
           description: "Command-line arguments to pass to the script",
+        })
+      ),
+      kubeconfig: Type.Optional(
+        Type.String({
+          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
         })
       ),
       timeout_seconds: Type.Optional(
@@ -114,6 +121,15 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         };
       }
 
+      // Resolve kubeconfig — requires explicit selection when multiple clusters exist
+      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      if ("error" in kubeResult) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: kubeResult.error }) }],
+          details: { error: true },
+        };
+      }
+
       const args = params.args?.trim() || "";
       // Security: parse args into array and pass via spawn() — never interpolate
       // into a shell command string (prevents shell injection via args parameter)
@@ -130,7 +146,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
             ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            KUBECONFIG: resolveKubeconfigPath(kubeconfigRef?.credentialsDir) || "/dev/null",
+            KUBECONFIG: kubeResult.path || "/dev/null",
           },
         });
 

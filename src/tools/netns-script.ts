@@ -13,6 +13,7 @@ import {
   runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 interface NetnsScriptParams {
   pod: string;
@@ -21,6 +22,7 @@ interface NetnsScriptParams {
   skill?: string;
   script: string;
   args?: string;
+  kubeconfig?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -89,6 +91,11 @@ Examples:
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
+      kubeconfig: Type.Optional(
+        Type.String({
+          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+        }),
+      ),
       image: Type.Optional(
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
@@ -102,7 +109,15 @@ Examples:
     }),
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NetnsScriptParams;
-      const env = prepareExecEnv(kubeconfigRef);
+
+      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      if ("error" in kubeResult) {
+        return {
+          content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
+          details: { error: true },
+        };
+      }
+      const env = prepareExecEnv(kubeconfigRef, kubeResult.path);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 
