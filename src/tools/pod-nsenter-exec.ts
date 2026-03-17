@@ -108,7 +108,7 @@ Examples:
       const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: kubeResult.error }, null, 2) }],
+          content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
           details: { error: true },
         };
       }

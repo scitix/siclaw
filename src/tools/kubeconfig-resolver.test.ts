@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
@@ -88,6 +89,35 @@ describe("resolveRequiredKubeconfig", () => {
       expect(result.error).toContain("not found");
       expect(result.error).toContain("dev");
       expect(result.availableNames).toEqual(["prod", "staging"]);
+    }
+  });
+
+  it("errors when single kubeconfig + explicit name does not match", () => {
+    writeManifest([{ name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] }]);
+    const result = resolveRequiredKubeconfig(credDir, "staging");
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error).toContain("not found");
+      expect(result.error).toContain("staging");
+    }
+  });
+
+  it("returns null path when kubeconfig entry has empty files array", () => {
+    writeManifest([{ name: "empty", type: "kubeconfig", files: [] }]);
+    const result = resolveRequiredKubeconfig(credDir, undefined);
+    expect(result).toEqual({ path: null });
+  });
+
+  it("rejects path traversal in manifest file entries", () => {
+    // Write manifest directly — writeManifest helper would try to create the traversal file
+    writeFileSync(
+      join(credDir, "manifest.json"),
+      JSON.stringify([{ name: "evil", type: "kubeconfig", files: ["../../etc/passwd"] }]),
+    );
+    const result = resolveRequiredKubeconfig(credDir, undefined);
+    expect("error" in result).toBe(true);
+    if ("error" in result) {
+      expect(result.error).toContain("escapes credentials directory");
     }
   });
 
