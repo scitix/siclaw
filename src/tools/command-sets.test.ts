@@ -126,6 +126,11 @@ describe("validateCommandRestrictions", () => {
       expect(err).toContain("--output");
     });
 
+    it("allows combined short flags when all are whitelisted (sort -rn)", () => {
+      expect(validateCommandRestrictions("sort -rn file.txt")).toBeNull();
+      expect(validateCommandRestrictions("sort -nru file.txt")).toBeNull();
+    });
+
     it("blocks combined short flags that hide unsafe flags (sort -ro)", () => {
       const err = validateCommandRestrictions("sort -ro /tmp/out file.txt");
       expect(err).not.toBeNull();
