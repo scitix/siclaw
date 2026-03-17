@@ -75,7 +75,6 @@ function formatHypothesis(h: HypothesisNode): string {
  */
 export function formatSummary(
   result: InvestigationResult,
-  reportPath: string,
 ): string {
   const sections: string[] = [];
 
@@ -108,8 +107,6 @@ export function formatSummary(
     `### Statistics\n` +
     `- Tool calls: ${result.totalToolCalls} | Duration: ${duration} | Hypotheses: ${hypoStat}`,
   );
-
-  sections.push(`Full report: \`${reportPath}\``);
 
   return sections.join("\n\n");
 }
