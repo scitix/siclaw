@@ -26,7 +26,7 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 
 `LocalSpawner` runs ALL AgentBox instances **in-process with Gateway**, sharing the same filesystem. This means:
 
-- `skillsHandler.materialize()` **must NOT be called in local mode** — it wipes `skillsDir` entirely, destroying `skills/core/` and other users' data
+- `skillsHandler.materialize()` **must NOT be called in local mode** — it wipes `skills/team/` and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem
 - Local skills sync must write only to `skills/user/{userId}/` scoped paths (team skills are included in the user bundle, not written to a separate `skills/team/` directory)
 - Any component designed for K8s pod isolation is **not directly reusable** in local mode
 
@@ -130,8 +130,13 @@ Resource Sync (read before touching)
   src/shared/resource-sync.ts  Types, contracts, RESOURCE_DESCRIPTORS
   src/agentbox/resource-handlers.ts  mcpHandler + skillsHandler
   src/agentbox/resource-sync.ts      syncAllResources() for K8s startup
-  src/gateway/agentbox/local-spawner.ts  Local mode (in-process)
   src/gateway/resource-notifier.ts   Gateway → AgentBox reload notifications
+
+Spawner Implementations
+  src/gateway/agentbox/spawner.ts          BoxSpawner interface
+  src/gateway/agentbox/local-spawner.ts    In-process, dev mode (shared filesystem)
+  src/gateway/agentbox/k8s-spawner.ts      K8s pod spawner (production)
+  src/gateway/agentbox/process-spawner.ts  Child process spawner (--process flag)
 
 Database
   src/gateway/db/index.ts          createDb() — SQLite vs MySQL selection
@@ -150,6 +155,14 @@ Investigation
   src/tools/deep-search/types.ts    Budget constants (Normal/Quick)
   src/tools/deep-search/engine.ts   4-phase workflow engine
   src/tools/deep-search/sub-agent.ts Sub-agent factory (minimal tool set)
+  src/tools/investigation-feedback.ts  User feedback on diagnoses (IM Phase 2, pi-agent only)
+
+Platform Tools
+  src/tools/manage-schedule.ts     Cron job management (language-aware)
+  src/tools/credential-list.ts     Credential discovery for AgentBox
+
+Cron (merged into Gateway)
+  src/gateway/cron/cron-service.ts In-process scheduler, DB-based coordination (ADR-008)
 ```
 
 ---
