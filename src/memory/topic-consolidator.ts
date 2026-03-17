@@ -16,8 +16,11 @@ import { llmCompleteWithTool } from "../tools/deep-search/sub-agent.js";
 // Thresholds
 // ---------------------------------------------------------------------------
 
-const MIN_DATE_SECTIONS = 3;
+const MIN_DATE_SECTIONS = 5;
 const MIN_FACT_LINES = 20;
+
+// Guard against concurrent consolidation of the same file (LocalSpawner shared filesystem)
+const consolidationInProgress = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -82,6 +85,22 @@ const CONSOLIDATION_SCHEMA: Record<string, unknown> = {
  * then rewrites the file in clean format.
  */
 export async function consolidateTopicFile(
+  filePath: string,
+  llmConfig: { apiKey: string; baseUrl: string; model?: string },
+): Promise<void> {
+  if (consolidationInProgress.has(filePath)) {
+    console.log(`[topic-consolidator] Skipping ${path.basename(filePath)}: consolidation already in progress`);
+    return;
+  }
+  consolidationInProgress.add(filePath);
+  try {
+    await doConsolidateTopicFile(filePath, llmConfig);
+  } finally {
+    consolidationInProgress.delete(filePath);
+  }
+}
+
+async function doConsolidateTopicFile(
   filePath: string,
   llmConfig: { apiKey: string; baseUrl: string; model?: string },
 ): Promise<void> {

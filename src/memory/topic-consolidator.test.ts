@@ -34,7 +34,30 @@ describe("shouldConsolidate", () => {
     expect(shouldConsolidate(file)).toBe(false);
   });
 
-  it("returns true when date sections >= 3", () => {
+  it("returns true when date sections >= 5", () => {
+    const file = path.join(tmpDir, "env.md");
+    fs.writeFileSync(file, [
+      "# Env",
+      "",
+      "## 2026-03-17",
+      "- fact a",
+      "",
+      "## 2026-03-16",
+      "- fact b",
+      "",
+      "## 2026-03-15",
+      "- fact c",
+      "",
+      "## 2026-03-14",
+      "- fact d",
+      "",
+      "## 2026-03-13",
+      "- fact e",
+    ].join("\n"));
+    expect(shouldConsolidate(file)).toBe(true);
+  });
+
+  it("returns false when date sections < 5", () => {
     const file = path.join(tmpDir, "env.md");
     fs.writeFileSync(file, [
       "# Env",
@@ -48,7 +71,7 @@ describe("shouldConsolidate", () => {
       "## 2026-03-15",
       "- fact c",
     ].join("\n"));
-    expect(shouldConsolidate(file)).toBe(true);
+    expect(shouldConsolidate(file)).toBe(false);
   });
 
   it("returns true when fact lines >= 20", () => {
