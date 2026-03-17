@@ -2617,10 +2617,9 @@ export function createRpcMethods(
     // 3. Minimum interval check (skip if updating without changing schedule)
     const scheduleChanged = !existingJob || existingJob.schedule !== schedule;
     if (scheduleChanged) {
-      const minInterval = getMinimumIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      const limit = isAdminUser(context) ? CRON_LIMITS.ADMIN_MIN_INTERVAL_MS : CRON_LIMITS.MIN_INTERVAL_MS;
-      if (minInterval < limit) {
-        const limitMin = Math.round(limit / 60_000);
+      const avgInterval = getMinimumIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
       }
     }
@@ -2719,10 +2718,9 @@ export function createRpcMethods(
     // ── Rate-limit checks when activating ──────────
     if (status === "active" && job.status !== "active") {
       // Interval check (prevents re-activating a high-frequency job)
-      const minInterval = getMinimumIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      const limit = isAdminUser(context) ? CRON_LIMITS.ADMIN_MIN_INTERVAL_MS : CRON_LIMITS.MIN_INTERVAL_MS;
-      if (minInterval < limit) {
-        const limitMin = Math.round(limit / 60_000);
+      const avgInterval = getMinimumIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      if (avgInterval < CRON_LIMITS.MIN_INTERVAL_MS) {
+        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
       }
 
