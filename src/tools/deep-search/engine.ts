@@ -38,23 +38,6 @@ interface RawHypothesis {
 }
 
 /**
- * Write the full investigation report to .siclaw/reports/deep-search-{timestamp}.md
- * Uses cwd-relative path (not homedir) so it works in K8s pods where homedir may not exist.
- * Returns the file path for inclusion in the summary.
- */
-export async function writeReport(report: string): Promise<string> {
-  const reportDir = join(process.cwd(), ".siclaw", "reports");
-  await mkdir(reportDir, { recursive: true });
-
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filename = `deep-search-${timestamp}.md`;
-  const filepath = join(reportDir, filename);
-
-  await writeFile(filepath, report, "utf-8");
-  return filepath;
-}
-
-/**
  * Write a human-readable Markdown trace file for debugging sub-agent behavior.
  * File is written to ~/.siclaw/traces/deep-search-{timestamp}.md
  */
