@@ -34,19 +34,19 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 
 **Consequences**:
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
-- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skillsDir` before writing. This is designed for K8s pods with isolated filesystems
+- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/team/` and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
 - Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (team + personal skills from the bundle are both written into the user's directory)
 - The sql.js SQLite lockfile prevents multi-process access; local mode is single-process by design
 
-**Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:90-129`
+**Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:82-97`
 
 ### 1.3 K8s Pod Isolation
 
 **Invariant**: Each K8s AgentBox pod is fully isolated: its own emptyDir volume for skills, its own mTLS client certificate, its own process. Skills sync via `skillsHandler.materialize()` is safe here because there is no shared filesystem.
 
 **Consequences**:
-- The skills directory in a pod is fully managed by resource sync — it is wiped and rebuilt on every sync
-- Core skills are NOT in the pod's initial image; they arrive via the skill bundle
+- The `team/` and `user/` skill subdirectories in a pod are managed by resource sync — wiped and rebuilt on every sync. `core/` and `extension/` are baked into the image.
+- Core skills ARE baked into the Docker image (`COPY skills/core/ ./skills/core/` in Dockerfile.agentbox). They are NOT delivered via the skill bundle — see §2.1.
 - Pod self-destructs after 5 minutes of idle (no SSE connections, no sessions)
 
 **Source**: `src/gateway/agentbox/k8s-spawner.ts`, `src/agentbox/http-server.ts` (IDLE_TIMEOUT_MS)
@@ -86,7 +86,7 @@ Scripts in a skill follow this workflow before execution is permitted:
 draft → (request review) → pending → (AI + static analysis) → approved/rejected
 ```
 
-- **Static analysis**: 27 `DANGER_PATTERNS` (Critical/High/Medium severity) in `ScriptEvaluator`
+- **Static analysis**: 23 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 7) in `ScriptEvaluator`
 - **AI analysis**: LLM semantic review with mandatory rule — "Skills MUST be strictly read-only"
 - **Human gate**: `skill_reviewer` role must approve before `published` status
 - Skills with unapproved scripts **cannot** be executed via `run_skill`
@@ -234,7 +234,7 @@ postReload(context)  Notify active sessions to pick up changes
 ```
 
 - `fetch` is network I/O with retry (3 attempts, exponential backoff: 1s, 2s, 4s)
-- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes then rebuilds)
+- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `team/` + `user/` subdirs then rebuilds)
 - `postReload` calls `brain.reload()` on active sessions
 
 ### 6.2 When to Use Each Handler
@@ -242,7 +242,7 @@ postReload(context)  Notify active sessions to pick up changes
 | Handler | Safe in LocalSpawner? | Safe in K8s pod? | Notes |
 |---------|----------------------|------------------|-------|
 | `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
-| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes entire skillsDir first |
+| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `team/` + `user/` subdirs (not `core/`) |
 
 For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Team and personal skills from the bundle are both placed under the user's directory.
 
@@ -256,7 +256,7 @@ For local mode skills sync, write directly to `skills/user/<userId>/` without de
 finalScore = (vectorWeight × cosineSimilarity) + (ftsWeight × bm25Score)
 ```
 
-Default weights: `vectorWeight = 0.85`, `ftsWeight = 0.15` (architecture.md reference; code default may differ — check `src/memory/indexer.ts`)
+Default weights: `vectorWeight = 0.70`, `ftsWeight = 0.30` (see `src/memory/indexer.ts:14-15`; configurable via `searchConfig`)
 
 - Minimum score threshold: `0.35` (results below this are filtered)
 - Default top-K: `10` results
@@ -348,43 +348,14 @@ Memory-dependent features (investigations, `memory_search`) only work with pi-ag
 
 ## 12. Production/Test Environment Isolation (ADR-011)
 
-**Invariant**: Environment isolation is enforced at the **workspace level via credential scoping**, not at the tool level or via LLM prompts.
+> **Status: Data model only — enforcement not yet implemented.**
 
-### 12.1 Workspace envType
+The data model supports workspace-level environment isolation:
+- `workspaces.envType` (`"prod"` | `"test"`) — exists in schema, default `"prod"`
+- `environments.apiServer` — exists in schema, required field
 
-Every workspace has an `envType` (`"prod"` or `"test"`) set at creation time. This determines the credential visibility boundary for the workspace's AgentBox.
+**Not yet implemented**: credential scoping enforcement, environment binding constraints,
+kubeconfig upload validation, investigation memory isolation.
+Until enforcement lands, treat all workspaces as having full credential visibility.
 
-### 12.2 Credential Visibility Rules
-
-```
-Prod workspace  → sees all kubeconfigs (prod + test envs) + all non-kubeconfig credentials
-Test workspace  → sees only test kubeconfigs; no SSH keys, API tokens, or prod kubeconfigs
-```
-
-Production can see test credentials (for comparison/debugging). Test cannot see production credentials.
-
-### 12.3 Environment Governance
-
-- **Admin-only**: Only admins can create/modify/delete environments. Users cannot.
-- **apiServer required**: Every environment must have an `apiServer` address. Kubeconfig uploads are validated against this anchor — the kubeconfig's `clusters[].cluster.server` must match.
-- **isTest immutable by users**: The `isTest` flag is set by admin and determines credential routing.
-
-### 12.4 Binding Constraints
-
-```
-workspace.envType === "test" → can only bind environments where isTest=true
-workspace.envType === "prod" → can bind any environment
-user.testOnly === true       → can only create workspaces with envType="test"
-```
-
-### 12.5 Investigation Memory Isolation
-
-**Planned (not yet implemented):** Each workspace will have its own memory database (`<userDataDir>/<workspaceId>/.memory.db`). Investigations will not cross workspace boundaries.
-
-### 12.6 What NOT to Do
-
-- Do NOT add per-tool environment guards in `restricted-bash.ts` or other tools — credential scoping is the isolation mechanism
-- Do NOT inject environment info into LLM system prompts as a security measure — models forget
-- Do NOT allow users to create environments or change `isTest`/`apiServer`
-
-**Source**: `docs/design/decisions.md` ADR-011
+→ Full target design: `docs/design/decisions.md` ADR-011
