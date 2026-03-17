@@ -381,20 +381,21 @@ export function EnvironmentsPage() {
             )}
 
             {/* All users: Kubeconfig upload dialog */}
-            {uploadDialogOpen && (
-                <KubeconfigUploadDialog
-                    environments={environments.map(e => ({
-                        id: e.id,
-                        name: e.name,
-                        apiServer: e.apiServer,
-                        hasUserKubeconfig: e.hasUserKubeconfig,
-                    }))}
-                    initialEnvId={uploadEnvId}
-                    onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
-                    onUploaded={handleUploadComplete}
-                    sendRpc={sendRpc}
-                />
-            )}
+            {uploadDialogOpen && uploadEnvId && (() => {
+                const env = environments.find(e => e.id === uploadEnvId);
+                if (!env) return null;
+                return (
+                    <KubeconfigUploadDialog
+                        envId={env.id}
+                        envName={env.name}
+                        apiServer={env.apiServer}
+                        replacing={env.hasUserKubeconfig}
+                        onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
+                        onUploaded={handleUploadComplete}
+                        sendRpc={sendRpc}
+                    />
+                );
+            })()}
         </div>
     );
 }
