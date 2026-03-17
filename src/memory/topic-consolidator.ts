@@ -31,31 +31,38 @@ const consolidationInProgress = new Set<string>();
  * Returns false if already consolidated today.
  */
 export function shouldConsolidate(filePath: string): boolean {
+  return analyzeTopicFile(filePath) !== null;
+}
+
+/**
+ * Analyze a topic file for consolidation eligibility.
+ * Returns { factCount } if consolidation is needed, null otherwise.
+ */
+export function analyzeTopicFile(filePath: string): { factCount: number } | null {
   let content: string;
   try {
     content = fs.readFileSync(filePath, "utf-8");
   } catch {
-    return false;
+    return null;
   }
 
   // Skip if already consolidated today
   const consolidatedMatch = content.match(/^Last consolidated:\s*(\d{4}-\d{2}-\d{2})/m);
   if (consolidatedMatch) {
     const today = new Date().toISOString().slice(0, 10);
-    if (consolidatedMatch[1] === today) return false;
+    if (consolidatedMatch[1] === today) return null;
   }
 
   const lines = content.split("\n");
+  const factCount = lines.filter(l => l.startsWith("- ")).length;
 
   // Count date sections (## YYYY-MM-DD)
   const dateSections = lines.filter(l => /^## \d{4}-\d{2}-\d{2}/.test(l)).length;
-  if (dateSections >= MIN_DATE_SECTIONS) return true;
+  if (dateSections >= MIN_DATE_SECTIONS) return { factCount };
 
-  // Count fact lines (- ...)
-  const factLines = lines.filter(l => l.startsWith("- ")).length;
-  if (factLines >= MIN_FACT_LINES) return true;
+  if (factCount >= MIN_FACT_LINES) return { factCount };
 
-  return false;
+  return null;
 }
 
 interface ConsolidationResult {
@@ -141,6 +148,13 @@ Call the consolidate_knowledge tool with the merged result.`;
     return;
   }
 
+  // Sanity check: reject overly aggressive consolidation (possible prompt injection or LLM error)
+  const originalFactCount = content.split("\n").filter(l => l.startsWith("- ")).length;
+  if (originalFactCount > 0 && toolArgs.consolidated_facts.length < originalFactCount * 0.3) {
+    console.warn(`[topic-consolidator] Consolidation too aggressive for ${path.basename(filePath)} (${originalFactCount} → ${toolArgs.consolidated_facts.length}), skipping`);
+    return;
+  }
+
   // Optimistic lock: check mtime hasn't changed since we read the file
   const mtimeAfter = fs.statSync(filePath).mtimeMs;
   if (mtimeAfter !== mtimeBefore) {
@@ -203,14 +217,9 @@ export async function consolidateAllPending(
   const candidates = files
     .map(file => {
       const filePath = path.join(topicsDir, file);
-      if (!shouldConsolidate(filePath)) return null;
-      try {
-        const content = fs.readFileSync(filePath, "utf-8");
-        const factCount = content.split("\n").filter(l => l.startsWith("- ")).length;
-        return { file, filePath, factCount };
-      } catch {
-        return null;
-      }
+      const analysis = analyzeTopicFile(filePath);
+      if (!analysis) return null;
+      return { file, filePath, factCount: analysis.factCount };
     })
     .filter((c): c is NonNullable<typeof c> => c !== null)
     .sort((a, b) => b.factCount - a.factCount)
