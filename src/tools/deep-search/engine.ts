@@ -532,7 +532,7 @@ export async function investigate(
       evidence: [],
       reasoning: "",
       suggestedTools: h.suggestedTools,
-      estimatedCalls: DEFAULT_ESTIMATED_CALLS,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, DEFAULT_ESTIMATED_CALLS)),
       toolCallsUsed: 0,
     }));
   } else {
@@ -586,6 +586,7 @@ export async function investigate(
         ? h.reasoning.slice(0, 100) + "..."
         : (h.reasoning || "(no details)");
       const keyCommands = h.evidence.slice(0, 2)
+        .filter(e => e.command.trim().length > 0)
         .map(e => `  already ran: ${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}`)
         .join("\n");
       return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}${keyCommands ? "\n" + keyCommands : ""}`;
@@ -639,6 +640,7 @@ export async function investigate(
   // Concurrency pool: keep maxParallel slots busy, fill freed slots immediately
   const queue = [...hypotheses];
   let activeCount = 0;
+  let allocatedNotConsumed = 0; // budget allocated to in-flight sub-agents but not yet counted in globalCallsUsed
   const retryQueue: HypothesisNode[] = [];
 
   await new Promise<void>((resolvePool) => {
@@ -651,8 +653,8 @@ export async function investigate(
           break;
         }
 
-        // Budget check
-        const remaining = budget.maxTotalCalls - globalCallsUsed;
+        // Budget check — account for budget already allocated to in-flight sub-agents
+        const remaining = budget.maxTotalCalls - globalCallsUsed - allocatedNotConsumed;
         if (remaining <= 0) break;
 
         // Pick from retry queue first, then main queue
@@ -673,6 +675,7 @@ export async function investigate(
         if (perBudget > remaining) break; // not enough remaining budget for minimum allocation
 
         activeCount++;
+        allocatedNotConsumed += perBudget;
 
         runOneHypothesis(hypothesis, perBudget, isRetry)
           .then(() => {
@@ -686,6 +689,9 @@ export async function investigate(
           })
           .finally(() => {
             activeCount--;
+            // Release the pre-allocated budget reservation; actual usage is
+            // already tracked in globalCallsUsed by runOneHypothesis.
+            allocatedNotConsumed = Math.max(0, allocatedNotConsumed - perBudget);
             tryStartNext();
             if (activeCount === 0) resolvePool();
           });

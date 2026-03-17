@@ -293,6 +293,7 @@ describe("formatResult", () => {
     evidence: [makeEvidence()],
     reasoning: "Found OOMKilled in pod events",
     suggestedTools: [],
+    estimatedCalls: 3,
     toolCallsUsed: 3,
     ...overrides,
   });
@@ -422,6 +423,7 @@ describe("formatSummary", () => {
     evidence: [makeEvidence()],
     reasoning: "Found OOMKilled in pod events",
     suggestedTools: [],
+    estimatedCalls: 3,
     toolCallsUsed: 3,
     ...overrides,
   });

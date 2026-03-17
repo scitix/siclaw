@@ -19,6 +19,7 @@ function makeHypothesis(overrides: Partial<HypothesisNode> = {}): HypothesisNode
     evidence: [{ tool: "bash", command: "mtu-compare.sh", output: "MTU mismatch found", interpretation: "MTU mismatch" }],
     reasoning: "Clear MTU mismatch found across pods",
     suggestedTools: [],
+    estimatedCalls: 3,
     toolCallsUsed: 2,
     ...overrides,
   };
