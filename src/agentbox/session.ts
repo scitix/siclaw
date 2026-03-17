@@ -21,8 +21,9 @@ import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
-import { loadConfig, getEmbeddingConfig } from "../core/config.js";
+import { loadConfig, getEmbeddingConfig, getDefaultLlm } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { consolidateAllPending } from "../memory/topic-consolidator.js";
 
 export interface ManagedSession {
   id: string;
@@ -212,6 +213,25 @@ export class AgentBoxSessionManager {
       this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on new session failed:`, err);
       });
+    }
+
+    // Purge stale investigations on new session creation
+    if (isNewSession && this._sharedMemoryIndexer) {
+      const memDir = this.getMemoryDir();
+      this._sharedMemoryIndexer.purgeStaleInvestigations(memDir).catch(err =>
+        console.warn("[agentbox-session] Investigation purge failed:", err)
+      );
+    }
+
+    // Catch-up topic consolidation on new session
+    if (isNewSession) {
+      const memDir = this.getMemoryDir();
+      const llm = getDefaultLlm();
+      if (llm?.apiKey && llm?.baseUrl) {
+        consolidateAllPending(memDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id }).catch(err =>
+          console.warn("[agentbox-session] Topic consolidation failed:", err),
+        );
+      }
     }
 
     managed = {

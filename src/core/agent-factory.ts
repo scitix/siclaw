@@ -148,6 +148,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string,
+  memoryIndexerRef?: { current?: MemoryIndexer },
 ): string[] {
   const parts: string[] = [];
 
@@ -201,7 +202,14 @@ This is a new user (profile has only defaults).
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_ });
+  let investigationPatterns: Array<{ category: string; count: number }> | undefined;
+  if (memoryIndexerRef?.current) {
+    try {
+      investigationPatterns = memoryIndexerRef.current.getInvestigationPatterns(3)
+        .map(p => ({ category: p.rootCauseCategory, count: p.count }));
+    } catch { /* ignore — patterns are a nice-to-have */ }
+  }
+  const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_, investigationPatterns });
   if (overview) {
     parts.push(overview);
   }
@@ -350,7 +358,8 @@ export async function createSiclawSession(
   const reportsDir = path.resolve(cwd, ".siclaw", "reports");
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, reposDir, docsDir];
+  const tracesDir = path.resolve(cwd, ".siclaw", "traces");
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
@@ -463,7 +472,7 @@ export async function createSiclawSession(
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(memoryDir, mode),
     appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(memoryDir);
+      const parts = buildAppendSystemPrompt(memoryDir, memoryIndexerRef);
       if (workspaceSystemPromptAppend) {
         parts.push("\n\n" + workspaceSystemPromptAppend);
       }
