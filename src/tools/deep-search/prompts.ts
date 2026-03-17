@@ -123,6 +123,10 @@ Field semantics:
 - text: specific hypothesis description ("Pod OOMKilled due to 256Mi limit" not "Pod has memory issues")
 - confidence: 0-100 prior belief, highest first
 - suggestedTools: MUST use real skill script paths from the skills listed above. Only fall back to raw kubectl/node_exec when no skill covers the check.
+- estimatedCalls: how many tool calls are needed to validate this hypothesis:
+  * 1-3 (quick): simple config checks, single command verification (e.g. "check if MTU is 9000")
+  * 4-6 (standard): multi-step validation, cross-checking multiple sources (e.g. "compare driver versions across nodes")
+  * 7-10 (deep): complex multi-node/multi-layer investigation (e.g. "trace PCIe link errors across the topology")
 
 RULES:
 - Exactly ${maxHypotheses} hypotheses, ranked by likelihood (highest confidence first).

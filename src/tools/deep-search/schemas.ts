@@ -37,8 +37,12 @@ export const HYPOTHESES_SCHEMA = {
             items: { type: "string" as const },
             description: "Real skill script paths to validate this hypothesis",
           },
+          estimatedCalls: {
+            type: "number" as const,
+            description: "Estimated tool calls needed to validate: 1-3 for quick checks, 4-6 for standard, 7-10 for deep multi-step validation",
+          },
         },
-        required: ["text", "confidence", "suggestedTools"],
+        required: ["text", "confidence", "suggestedTools", "estimatedCalls"],
       },
     },
   },
