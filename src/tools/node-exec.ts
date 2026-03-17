@@ -13,6 +13,7 @@ import {
   runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
 export { ALLOWED_COMMANDS } from "./command-sets.js";
@@ -22,6 +23,7 @@ export { validateCommand } from "./command-validator.js";
 interface NodeExecParams {
   node: string;
   command: string;
+  kubeconfig?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -85,6 +87,11 @@ Examples:
         description:
           'Diagnostic command to run on the node (e.g. "ip addr show", "nvidia-smi")',
       }),
+      kubeconfig: Type.Optional(
+        Type.String({
+          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+        })
+      ),
       image: Type.Optional(
         Type.String({
           description: "Debug container image (default: SICLAW_DEBUG_IMAGE)",
@@ -110,7 +117,15 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
-      const env = prepareExecEnv(kubeconfigRef);
+
+      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      if ("error" in kubeResult) {
+        return {
+          content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
+          details: { error: true },
+        };
+      }
+      const env = prepareExecEnv(kubeconfigRef, kubeResult.path);
 
       // Validate node name
       const nodeErr = validateNodeName(params.node);
