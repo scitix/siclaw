@@ -670,7 +670,7 @@ export async function investigate(
           ? Math.floor(remaining * (hypothesis.estimatedCalls / totalEstimated))
           : Math.floor(remaining / Math.max(1, pendingHypotheses.length));
         const perBudget = Math.max(2, Math.min(budget.maxCallsPerHypothesis, proportionalShare));
-        if (perBudget <= 0) break;
+        if (perBudget > remaining) break; // not enough remaining budget for minimum allocation
 
         activeCount++;
 
