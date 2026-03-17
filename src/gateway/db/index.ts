@@ -83,13 +83,11 @@ export async function createDb(): Promise<Database> {
     const pool = mysql.createPool({ uri: dbUrl, timezone: "+00:00" });
     // Force MySQL session timezone to UTC so timestamp comparisons match
     // the client-side serialization (timezone: '+00:00' above).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rawPool = (pool as any).pool;
-    if (rawPool?.on) {
-      rawPool.on("connection", (conn: any) => {
-        conn.query("SET time_zone = '+00:00'");
+    pool.on("connection", (conn) => {
+      conn.query("SET time_zone = '+00:00'").catch((err) => {
+        console.error("[db] Failed to set session timezone:", err);
       });
-    }
+    });
     _db = drizzle(pool, { schema, mode: "default" });
     _closeHook = async () => { await pool.end(); };
     console.log("[db] Connected to MySQL");
