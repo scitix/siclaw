@@ -15,6 +15,8 @@ export interface HypothesisNode {
   evidence: Evidence[];
   reasoning: string;
   suggestedTools: string[];
+  /** LLM-estimated tool calls needed for validation (from Phase 2). Used for proportional budget allocation. */
+  estimatedCalls: number;
   toolCallsUsed: number;
   trace?: TraceStep[];
 }

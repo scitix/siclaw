@@ -35,6 +35,7 @@ interface RawHypothesis {
   text: string;
   confidence: number;
   suggestedTools: string[];
+  estimatedCalls?: number;
 }
 
 /**
@@ -518,6 +519,8 @@ export async function investigate(
     }
   }
 
+  const DEFAULT_ESTIMATED_CALLS = 5;
+
   let hypotheses: HypothesisNode[];
   if (options?.hypotheses && options.hypotheses.length > 0) {
     onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Using ${options.hypotheses.length} pre-confirmed hypotheses (skipped)` });
@@ -529,6 +532,7 @@ export async function investigate(
       evidence: [],
       reasoning: "",
       suggestedTools: h.suggestedTools,
+      estimatedCalls: DEFAULT_ESTIMATED_CALLS,
       toolCallsUsed: 0,
     }));
   } else {
@@ -549,6 +553,7 @@ export async function investigate(
       evidence: [],
       reasoning: "",
       suggestedTools: h.suggestedTools,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, h.estimatedCalls ?? DEFAULT_ESTIMATED_CALLS)),
       toolCallsUsed: 0,
     }));
   }
@@ -571,7 +576,8 @@ export async function investigate(
   let rootCauseFound = false;
   let timedOut = false;
 
-  // Build a summary of completed hypotheses for sub-agent context
+  // Build a summary of completed hypotheses for sub-agent context.
+  // Includes key evidence commands so the next sub-agent can avoid redundant checks.
   function buildPriorFindings(): string | undefined {
     const completed = hypotheses.filter(h => h.status !== "pending" && h.status !== "skipped");
     if (completed.length === 0) return undefined;
@@ -579,7 +585,10 @@ export async function investigate(
       const reasoning = h.reasoning.length > 100
         ? h.reasoning.slice(0, 100) + "..."
         : (h.reasoning || "(no details)");
-      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}`;
+      const keyCommands = h.evidence.slice(0, 2)
+        .map(e => `  already ran: ${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}`)
+        .join("\n");
+      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}${keyCommands ? "\n" + keyCommands : ""}`;
     }).join("\n");
   }
 
@@ -651,10 +660,16 @@ export async function investigate(
         if (!hypothesis) break;
 
         const isRetry = hypothesis.status === "inconclusive";
-        const perBudget = Math.min(
-          budget.maxCallsPerHypothesis,
-          Math.floor(remaining / Math.max(1, activeCount + queue.length + retryQueue.length)),
-        );
+
+        // Proportional budget: allocate based on each hypothesis's estimatedCalls
+        // rather than splitting evenly. This lets simple checks finish fast and
+        // complex validations get the budget they need.
+        const pendingHypotheses = [hypothesis, ...queue, ...retryQueue];
+        const totalEstimated = pendingHypotheses.reduce((sum, h) => sum + h.estimatedCalls, 0);
+        const proportionalShare = totalEstimated > 0
+          ? Math.floor(remaining * (hypothesis.estimatedCalls / totalEstimated))
+          : Math.floor(remaining / Math.max(1, pendingHypotheses.length));
+        const perBudget = Math.max(2, Math.min(budget.maxCallsPerHypothesis, proportionalShare));
         if (perBudget <= 0) break;
 
         activeCount++;
