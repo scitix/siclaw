@@ -140,6 +140,8 @@ export function EnvironmentsPage() {
         }
     };
 
+    const uploadEnv = useMemo(() => environments.find(e => e.id === uploadEnvId), [environments, uploadEnvId]);
+
     const showAdmin = isAdmin || isAdminFromServer;
 
     /* Status badge for kubeconfig */
@@ -381,15 +383,12 @@ export function EnvironmentsPage() {
             )}
 
             {/* All users: Kubeconfig upload dialog */}
-            {uploadDialogOpen && (
+            {uploadDialogOpen && uploadEnv && (
                 <KubeconfigUploadDialog
-                    environments={environments.map(e => ({
-                        id: e.id,
-                        name: e.name,
-                        apiServer: e.apiServer,
-                        hasUserKubeconfig: e.hasUserKubeconfig,
-                    }))}
-                    initialEnvId={uploadEnvId}
+                    envId={uploadEnv.id}
+                    envName={uploadEnv.name}
+                    apiServer={uploadEnv.apiServer}
+                    replacing={uploadEnv.hasUserKubeconfig}
                     onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
                     onUploaded={handleUploadComplete}
                     sendRpc={sendRpc}
