@@ -209,28 +209,22 @@ Common cron patterns:
         };
       }
 
-      // Pre-validate cron expression so the model sees errors before the frontend RPC call
+      // Pre-validate cron expression + interval so the model sees errors
+      // before the frontend RPC call (which the model never observes)
       try {
         parseCronExpression(params.schedule.trim());
+        const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+        if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
+          const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
+          throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
+        }
+        if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
+          const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+          throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+        }
       } catch (err) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Invalid cron expression: ${err instanceof Error ? err.message : String(err)}` }) }],
-          details: { error: true },
-        };
-      }
-
-      const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
-      if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
-        const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes.` }) }],
-          details: { error: true },
-        };
-      }
-      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
-        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Schedule interval too short: minimum ${limitMin} minutes between executions. Try a less frequent schedule.` }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) }],
           details: { error: true },
         };
       }
