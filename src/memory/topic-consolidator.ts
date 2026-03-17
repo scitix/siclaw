@@ -85,8 +85,8 @@ export async function consolidateTopicFile(
   filePath: string,
   llmConfig: { apiKey: string; baseUrl: string; model?: string },
 ): Promise<void> {
-  const content = fs.readFileSync(filePath, "utf-8");
   const mtimeBefore = fs.statSync(filePath).mtimeMs;
+  const content = fs.readFileSync(filePath, "utf-8");
 
   // Extract the topic title from the first heading
   const titleMatch = content.match(/^# (.+)/m);
@@ -149,7 +149,7 @@ export async function triggerConsolidationIfNeeded(
   for (const filePath of modifiedFiles) {
     // Only process files in topics/
     const topicsDir = path.join(memoryDir, "topics");
-    if (!filePath.startsWith(topicsDir)) continue;
+    if (!filePath.startsWith(topicsDir + path.sep)) continue;
 
     if (shouldConsolidate(filePath)) {
       try {
@@ -168,6 +168,7 @@ export async function triggerConsolidationIfNeeded(
 export async function consolidateAllPending(
   memoryDir: string,
   llmConfig: { apiKey: string; baseUrl: string; model?: string },
+  maxFilesPerRun = 5,
 ): Promise<void> {
   const topicsDir = path.join(memoryDir, "topics");
   if (!fs.existsSync(topicsDir)) return;
@@ -179,14 +180,28 @@ export async function consolidateAllPending(
     return;
   }
 
-  for (const file of files) {
-    const filePath = path.join(topicsDir, file);
-    if (shouldConsolidate(filePath)) {
+  // Prioritize files with the most fact lines (highest consolidation value)
+  const candidates = files
+    .map(file => {
+      const filePath = path.join(topicsDir, file);
+      if (!shouldConsolidate(filePath)) return null;
       try {
-        await consolidateTopicFile(filePath, llmConfig);
-      } catch (err) {
-        console.warn(`[topic-consolidator] Catch-up consolidation failed for ${file}:`, err);
+        const content = fs.readFileSync(filePath, "utf-8");
+        const factCount = content.split("\n").filter(l => l.startsWith("- ")).length;
+        return { file, filePath, factCount };
+      } catch {
+        return null;
       }
+    })
+    .filter((c): c is NonNullable<typeof c> => c !== null)
+    .sort((a, b) => b.factCount - a.factCount)
+    .slice(0, maxFilesPerRun);
+
+  for (const { file, filePath } of candidates) {
+    try {
+      await consolidateTopicFile(filePath, llmConfig);
+    } catch (err) {
+      console.warn(`[topic-consolidator] Catch-up consolidation failed for ${file}:`, err);
     }
   }
 }

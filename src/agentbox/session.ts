@@ -21,7 +21,7 @@ import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
-import { loadConfig, getEmbeddingConfig, getDefaultLlm } from "../core/config.js";
+import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { consolidateAllPending } from "../memory/topic-consolidator.js";
 
@@ -215,20 +215,20 @@ export class AgentBoxSessionManager {
       });
     }
 
-    // Purge stale investigations on new session creation
+    // Purge stale investigations on new session creation (skipSync: sync already triggered above)
     if (isNewSession && this._sharedMemoryIndexer) {
       const memDir = this.getMemoryDir();
-      this._sharedMemoryIndexer.purgeStaleInvestigations(memDir).catch(err =>
+      this._sharedMemoryIndexer.purgeStaleInvestigations(memDir, { skipSync: true }).catch(err =>
         console.warn("[agentbox-session] Investigation purge failed:", err)
       );
     }
 
-    // Catch-up topic consolidation on new session
+    // Catch-up topic consolidation on new session — use llmConfigRef (dynamic, works in K8s mode)
     if (isNewSession) {
       const memDir = this.getMemoryDir();
-      const llm = getDefaultLlm();
-      if (llm?.apiKey && llm?.baseUrl) {
-        consolidateAllPending(memDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id }).catch(err =>
+      const llmRef = result.llmConfigRef;
+      if (llmRef.apiKey && llmRef.baseUrl) {
+        consolidateAllPending(memDir, { apiKey: llmRef.apiKey, baseUrl: llmRef.baseUrl, model: llmRef.model }).catch(err =>
           console.warn("[agentbox-session] Topic consolidation failed:", err),
         );
       }
