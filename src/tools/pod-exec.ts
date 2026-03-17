@@ -9,6 +9,7 @@ import { checkPodRunning } from "./k8s-checks.js";
 import { parseArgs } from "./command-sets.js";
 import { validateCommand } from "./command-validator.js";
 import { validatePodName, prepareExecEnv } from "./exec-utils.js";
+import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,6 +21,7 @@ interface PodExecParams {
   namespace?: string;
   container?: string;
   command: string;
+  kubeconfig?: string;
   timeout_seconds?: number;
 }
 
@@ -73,6 +75,11 @@ Examples:
         description:
           'Diagnostic command to run in the pod (e.g. "ip addr show", "ps aux")',
       }),
+      kubeconfig: Type.Optional(
+        Type.String({
+          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+        }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 30, max: 120)",
@@ -94,7 +101,15 @@ Examples:
     renderResult: renderTextResult,
     async execute(_toolCallId, rawParams) {
       const params = rawParams as PodExecParams;
-      const env = prepareExecEnv(kubeconfigRef);
+
+      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      if ("error" in kubeResult) {
+        return {
+          content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
+          details: { error: true },
+        };
+      }
+      const env = prepareExecEnv(kubeconfigRef, kubeResult.path);
       const pod = params.pod?.trim();
       const namespace = params.namespace?.trim() || "default";
 
