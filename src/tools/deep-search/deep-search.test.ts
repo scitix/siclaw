@@ -437,9 +437,9 @@ describe("formatSummary", () => {
     ...overrides,
   });
 
-  it("includes conclusion, verdicts, statistics, and report path", () => {
+  it("includes conclusion, verdicts, and statistics", () => {
     const result = makeResult();
-    const output = formatSummary(result, "/home/user/.siclaw/reports/deep-search-test.md");
+    const output = formatSummary(result);
     expect(output).toContain("## Deep Search Summary");
     expect(output).toContain("### Conclusion");
     expect(output).toContain("The pod is crashing due to OOM.");
@@ -447,7 +447,6 @@ describe("formatSummary", () => {
     expect(output).toContain("VALIDATED **H1**: OOM Kill — 85%");
     expect(output).toContain("### Statistics");
     expect(output).toContain("Tool calls: 15");
-    expect(output).toContain("Full report: `/home/user/.siclaw/reports/deep-search-test.md`");
   });
 
   it("shows one-line verdict per hypothesis with truncated reasoning", () => {
@@ -459,7 +458,7 @@ describe("formatSummary", () => {
         makeHypothesis({ id: "H3", status: "skipped", text: "Disk full", confidence: 40, reasoning: "" }),
       ],
     });
-    const output = formatSummary(result, "/tmp/report.md");
+    const output = formatSummary(result);
     // Long reasoning is truncated with ...
     expect(output).toContain("...");
     // Short reasoning is kept intact
@@ -471,7 +470,7 @@ describe("formatSummary", () => {
 
   it("does not include evidence details", () => {
     const result = makeResult();
-    const output = formatSummary(result, "/tmp/report.md");
+    const output = formatSummary(result);
     expect(output).not.toContain("**Evidence**");
     expect(output).not.toContain("kubectl get pods");
   });
@@ -485,7 +484,7 @@ describe("formatSummary", () => {
       ],
     });
     const full = formatResult(result);
-    const summary = formatSummary(result, "/tmp/report.md");
+    const summary = formatSummary(result);
     expect(summary.length).toBeLessThan(full.length);
   });
 });
