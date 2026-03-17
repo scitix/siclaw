@@ -625,6 +625,10 @@ export async function investigate(
 
       onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence });
     } catch (err) {
+      // Charge minimum 1 call so failed attempts aren't zero-cost —
+      // the sub-agent may have made calls before throwing, but we
+      // can't know the exact count without a partial result.
+      globalCallsUsed += 1;
       if (!isRetry) {
         // First failure → queue for retry
         hypothesis.status = "inconclusive";
