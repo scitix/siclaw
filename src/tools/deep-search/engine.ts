@@ -35,6 +35,7 @@ interface RawHypothesis {
   text: string;
   confidence: number;
   suggestedTools: string[];
+  estimatedCalls?: number;
 }
 
 /**
@@ -501,6 +502,8 @@ export async function investigate(
     }
   }
 
+  const DEFAULT_ESTIMATED_CALLS = 5;
+
   let hypotheses: HypothesisNode[];
   if (options?.hypotheses && options.hypotheses.length > 0) {
     onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Using ${options.hypotheses.length} pre-confirmed hypotheses (skipped)` });
@@ -512,6 +515,7 @@ export async function investigate(
       evidence: [],
       reasoning: "",
       suggestedTools: h.suggestedTools,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, DEFAULT_ESTIMATED_CALLS)),
       toolCallsUsed: 0,
     }));
   } else {
@@ -532,6 +536,7 @@ export async function investigate(
       evidence: [],
       reasoning: "",
       suggestedTools: h.suggestedTools,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, h.estimatedCalls ?? DEFAULT_ESTIMATED_CALLS)),
       toolCallsUsed: 0,
     }));
   }
@@ -554,7 +559,8 @@ export async function investigate(
   let rootCauseFound = false;
   let timedOut = false;
 
-  // Build a summary of completed hypotheses for sub-agent context
+  // Build a summary of completed hypotheses for sub-agent context.
+  // Includes key evidence commands so the next sub-agent can avoid redundant checks.
   function buildPriorFindings(): string | undefined {
     const completed = hypotheses.filter(h => h.status !== "pending" && h.status !== "skipped");
     if (completed.length === 0) return undefined;
@@ -562,7 +568,11 @@ export async function investigate(
       const reasoning = h.reasoning.length > 100
         ? h.reasoning.slice(0, 100) + "..."
         : (h.reasoning || "(no details)");
-      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}`;
+      const keyCommands = h.evidence.slice(0, 2)
+        .filter(e => e.command.trim().length > 0)
+        .map(e => `  already ran: ${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}`)
+        .join("\n");
+      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}${keyCommands ? "\n" + keyCommands : ""}`;
     }).join("\n");
   }
 
@@ -598,6 +608,10 @@ export async function investigate(
 
       onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence });
     } catch (err) {
+      // Charge minimum 1 call so failed attempts aren't zero-cost —
+      // the sub-agent may have made calls before throwing, but we
+      // can't know the exact count without a partial result.
+      globalCallsUsed += 1;
       if (!isRetry) {
         // First failure → queue for retry
         hypothesis.status = "inconclusive";
@@ -613,6 +627,7 @@ export async function investigate(
   // Concurrency pool: keep maxParallel slots busy, fill freed slots immediately
   const queue = [...hypotheses];
   let activeCount = 0;
+  let allocatedNotConsumed = 0; // budget allocated to in-flight sub-agents but not yet counted in globalCallsUsed
   const retryQueue: HypothesisNode[] = [];
 
   await new Promise<void>((resolvePool) => {
@@ -625,8 +640,8 @@ export async function investigate(
           break;
         }
 
-        // Budget check
-        const remaining = budget.maxTotalCalls - globalCallsUsed;
+        // Budget check — account for budget already allocated to in-flight sub-agents
+        const remaining = budget.maxTotalCalls - globalCallsUsed - allocatedNotConsumed;
         if (remaining <= 0) break;
 
         // Pick from retry queue first, then main queue
@@ -634,13 +649,20 @@ export async function investigate(
         if (!hypothesis) break;
 
         const isRetry = hypothesis.status === "inconclusive";
-        const perBudget = Math.min(
-          budget.maxCallsPerHypothesis,
-          Math.floor(remaining / Math.max(1, activeCount + queue.length + retryQueue.length)),
-        );
-        if (perBudget <= 0) break;
+
+        // Proportional budget: allocate based on each hypothesis's estimatedCalls
+        // rather than splitting evenly. This lets simple checks finish fast and
+        // complex validations get the budget they need.
+        const pendingHypotheses = [hypothesis, ...queue, ...retryQueue];
+        const totalEstimated = pendingHypotheses.reduce((sum, h) => sum + h.estimatedCalls, 0);
+        const proportionalShare = totalEstimated > 0
+          ? Math.floor(remaining * (hypothesis.estimatedCalls / totalEstimated))
+          : Math.floor(remaining / Math.max(1, pendingHypotheses.length));
+        const perBudget = Math.max(2, Math.min(budget.maxCallsPerHypothesis, proportionalShare));
+        if (perBudget > remaining) break; // not enough remaining budget for minimum allocation
 
         activeCount++;
+        allocatedNotConsumed += perBudget;
 
         runOneHypothesis(hypothesis, perBudget, isRetry)
           .then(() => {
@@ -654,6 +676,9 @@ export async function investigate(
           })
           .finally(() => {
             activeCount--;
+            // Release the pre-allocated budget reservation; actual usage is
+            // already tracked in globalCallsUsed by runOneHypothesis.
+            allocatedNotConsumed = Math.max(0, allocatedNotConsumed - perBudget);
             tryStartNext();
             if (activeCount === 0) resolvePool();
           });
