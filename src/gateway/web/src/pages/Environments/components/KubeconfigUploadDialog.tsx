@@ -1,16 +1,11 @@
 import { useState, useMemo } from 'react';
 import { CheckCircle2, FileText } from 'lucide-react';
 
-interface EnvOption {
-    id: string;
-    name: string;
-    apiServer: string;
-    hasUserKubeconfig: boolean;
-}
-
 interface KubeconfigUploadDialogProps {
-    environments: EnvOption[];
-    initialEnvId?: string;
+    envId: string;
+    envName: string;
+    apiServer: string;
+    replacing: boolean;
     onClose: () => void;
     onUploaded: () => void;
     sendRpc: <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
@@ -65,18 +60,16 @@ function parseKubeconfigSummary(content: string): KubeconfigSummary | null {
     }
 }
 
-export function KubeconfigUploadDialog({ environments, initialEnvId, onClose, onUploaded, sendRpc }: KubeconfigUploadDialogProps) {
-    const [envId, setEnvId] = useState(initialEnvId ?? '');
+export function KubeconfigUploadDialog({ envId, envName, apiServer, replacing, onClose, onUploaded, sendRpc }: KubeconfigUploadDialogProps) {
     const [kubeContent, setKubeContent] = useState('');
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
 
-    const selectedEnv = environments.find(e => e.id === envId);
     const summary = useMemo(() => kubeContent.trim() ? parseKubeconfigSummary(kubeContent) : null, [kubeContent]);
     const hasParsed = summary !== null;
 
     const handleUpload = async () => {
-        if (!envId || !kubeContent.trim()) return;
+        if (!kubeContent.trim()) return;
         setSaving(true);
         setError('');
         try {
@@ -94,26 +87,12 @@ export function KubeconfigUploadDialog({ environments, initialEnvId, onClose, on
             <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6" onClick={e => e.stopPropagation()}>
                 <h3 className="text-lg font-semibold text-gray-900 mb-4">Upload Kubeconfig</h3>
 
-                {/* Environment selector */}
-                <div className="mb-4">
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Environment</label>
-                    <select
-                        value={envId}
-                        onChange={e => setEnvId(e.target.value)}
-                        className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-white"
-                    >
-                        <option value="">Select an environment...</option>
-                        {environments.map(env => (
-                            <option key={env.id} value={env.id}>
-                                {env.name} ({env.apiServer}) {env.hasUserKubeconfig ? '— replace' : ''}
-                            </option>
-                        ))}
-                    </select>
-                    {selectedEnv && (
-                        <p className="text-xs text-gray-400 mt-1.5">
-                            API Server: <span className="font-mono">{selectedEnv.apiServer}</span>
-                            {selectedEnv.hasUserKubeconfig && ' — existing kubeconfig will be replaced'}
-                        </p>
+                {/* Environment info */}
+                <div className="mb-4 px-3 py-2.5 bg-gray-50 rounded-lg">
+                    <p className="text-sm font-medium text-gray-900">{envName}</p>
+                    <p className="text-xs text-gray-500 font-mono mt-0.5">{apiServer}</p>
+                    {replacing && (
+                        <p className="text-xs text-amber-600 mt-1">Existing kubeconfig will be replaced</p>
                     )}
                 </div>
 
@@ -163,7 +142,7 @@ export function KubeconfigUploadDialog({ environments, initialEnvId, onClose, on
                     <button onClick={onClose} className="px-4 py-2 text-sm font-medium text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg">Cancel</button>
                     <button
                         onClick={handleUpload}
-                        disabled={!envId || !kubeContent.trim() || saving}
+                        disabled={!kubeContent.trim() || saving}
                         className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg disabled:opacity-50"
                     >
                         {saving ? 'Uploading...' : 'Upload'}
