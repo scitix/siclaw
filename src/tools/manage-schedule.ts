@@ -3,6 +3,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { loadConfig } from "../core/config.js";
 import { GatewayClient } from "../agentbox/gateway-client.js";
+import { parseCronExpression, getAverageIntervalMs } from "../cron/cron-matcher.js";
+import { CRON_LIMITS } from "../cron/cron-limits.js";
 
 interface ManageScheduleParams {
   action: "create" | "update" | "delete" | "pause" | "resume" | "rename" | "list";
@@ -203,6 +205,26 @@ Common cron patterns:
       if (!params.schedule?.trim()) {
         return {
           content: [{ type: "text", text: JSON.stringify({ error: "Cron schedule expression is required." }) }],
+          details: { error: true },
+        };
+      }
+
+      // Pre-validate cron expression + interval so the model sees errors
+      // before the frontend RPC call (which the model never observes)
+      try {
+        parseCronExpression(params.schedule.trim());
+        const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+        if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
+          const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
+          throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
+        }
+        if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
+          const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+          throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+        }
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) }],
           details: { error: true },
         };
       }
