@@ -11,6 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { extractConversationKnowledge, mergeTopicFiles } from "./knowledge-extractor.js";
+import { triggerConsolidationIfNeeded } from "./topic-consolidator.js";
 
 const DEFAULT_MAX_MESSAGES = 15;
 const MIN_MESSAGES_TO_SAVE = 3;
@@ -203,6 +204,12 @@ export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Prom
     }
     const saved = await mergeTopicFiles(memoryDir, entries);
     console.log(`[session-summarizer] Merged ${saved.length} topic files: ${saved.map(f => path.basename(f)).join(", ")}`);
+    // Fire-and-forget: consolidate topic files that exceed thresholds
+    if (saved.length > 0) {
+      triggerConsolidationIfNeeded(memoryDir, saved, llmConfig).catch(err =>
+        console.warn("[session-summarizer] Background consolidation failed:", err),
+      );
+    }
     return saved;
   } catch (err) {
     console.warn("[session-summarizer] Knowledge extraction failed, falling back to raw save:", err);

@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { watch, type FSWatcher } from "node:fs";
+import { readdirSync, watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
@@ -479,6 +479,71 @@ export class MemoryIndexer {
   }
 
   /**
+   * Purge stale investigation records and their .md files based on retention policy:
+   * - Explicitly confirmed (feedback_at IS NOT NULL AND feedback_signal >= 1.0): permanent
+   * - Negated/corrected (feedback_signal < 1.0): 90 days
+   * - No feedback (feedback_at IS NULL, default signal=1.0): 365 days
+   *
+   * Returns the number of purged records.
+   */
+  async purgeStaleInvestigations(memoryDir: string, opts?: { skipSync?: boolean }): Promise<number> {
+    try {
+      const now = Date.now();
+      const ninetyDaysCutoff = now - 90 * 24 * 60 * 60 * 1000;
+      const yearCutoff = now - 365 * 24 * 60 * 60 * 1000;
+
+      const rows = this.db
+        .prepare(
+          `SELECT id, created_at FROM investigations WHERE
+            (feedback_at IS NOT NULL AND feedback_signal < 1.0 AND created_at < ?)
+            OR
+            (feedback_at IS NULL AND created_at < ?)`,
+        )
+        .all(ninetyDaysCutoff, yearCutoff) as Array<{ id: string; created_at: number }>;
+
+      if (rows.length === 0) return 0;
+
+      // Delete DB records first (atomic) — orphaned files are more benign than orphaned DB records
+      this.db.exec("BEGIN");
+      try {
+        const deleteStmt = this.db.prepare("DELETE FROM investigations WHERE id = ?");
+        for (const row of rows) {
+          deleteStmt.run(row.id);
+        }
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+
+      // Delete .md files — match by date prefix (±1s) to handle epoch/filename drift
+      const investigationsDir = path.join(memoryDir, "investigations");
+      for (const row of rows) {
+        try {
+          const candidates = findInvestigationFiles(investigationsDir, row.created_at);
+          for (const filePath of candidates) {
+            await fs.unlink(filePath);
+          }
+        } catch {
+          // File may already be deleted — that's fine
+        }
+      }
+
+      console.log(`[memory-indexer] Purged ${rows.length} stale investigation(s)`);
+
+      // Sync to clean up orphaned chunks from deleted .md files
+      if (!opts?.skipSync) {
+        await this.sync();
+      }
+
+      return rows.length;
+    } catch (err) {
+      console.warn(`[memory-indexer] purgeStaleInvestigations failed:`, err);
+      return 0;
+    }
+  }
+
+  /**
    * Aggregate investigation patterns from recent history.
    * Groups by root_cause_category with time-weighted scoring — recent investigations
    * count more than old ones (30-day half-life, matching temporal-decay.ts).
@@ -890,6 +955,35 @@ function safeJsonArray(raw: string | null | undefined): unknown[] {
   } catch {
     return [];
   }
+}
+
+function epochToInvestigationFilename(epochMs: number): string {
+  const d = new Date(epochMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}-${pad(d.getUTCHours())}-${pad(d.getUTCMinutes())}-${pad(d.getUTCSeconds())}.md`;
+}
+
+/**
+ * Find investigation .md files matching an epoch timestamp within ±1 second,
+ * to handle potential drift between DB created_at and filesystem filename.
+ */
+function findInvestigationFiles(dir: string, epochMs: number): string[] {
+  const exact = epochToInvestigationFilename(epochMs);
+  const minus1 = epochToInvestigationFilename(epochMs - 1000);
+  const plus1 = epochToInvestigationFilename(epochMs + 1000);
+  const candidates = new Set([exact, minus1, plus1]);
+
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return []; // directory does not exist — nothing to delete
+  }
+
+  const matched = files.filter(f => candidates.has(f));
+  return matched.length > 0
+    ? matched.map(f => path.join(dir, f))
+    : [path.join(dir, exact)]; // exact match not in listing but try anyway
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {
