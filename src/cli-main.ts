@@ -102,23 +102,17 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
   }
 }
 
-// Purge stale investigations at startup
+// Startup maintenance: purge stale investigations, then consolidate topics (chained to avoid race)
 if (memoryIndexer) {
   const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
-  memoryIndexer.purgeStaleInvestigations(cliMemoryDir).catch(err =>
-    console.warn("[siclaw] Investigation purge failed:", err)
-  );
-}
-
-// Catch-up topic consolidation at startup
-{
-  const llm = getDefaultLlm();
-  const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
-  if (llm?.apiKey && llm?.baseUrl) {
-    consolidateAllPending(cliMemoryDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id }).catch(err =>
-      console.warn("[siclaw] Topic consolidation failed:", err)
-    );
-  }
+  memoryIndexer.purgeStaleInvestigations(cliMemoryDir)
+    .then(() => {
+      const llm = getDefaultLlm();
+      if (llm?.apiKey && llm?.baseUrl) {
+        return consolidateAllPending(cliMemoryDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id });
+      }
+    })
+    .catch(err => console.warn("[siclaw] Startup maintenance failed:", err));
 }
 
 // Debug: subscribe to all session events and write to log file

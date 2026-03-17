@@ -504,9 +504,9 @@ export class MemoryIndexer {
       if (rows.length === 0) return 0;
 
       // Delete DB records first — orphaned files are more benign than orphaned DB records
-      const ids = rows.map(r => r.id);
-      for (const id of ids) {
-        this.db.prepare("DELETE FROM investigations WHERE id = ?").run(id);
+      const deleteStmt = this.db.prepare("DELETE FROM investigations WHERE id = ?");
+      for (const row of rows) {
+        deleteStmt.run(row.id);
       }
 
       // Delete .md files — match by date prefix (±1s) to handle epoch/filename drift
@@ -970,13 +970,13 @@ function findInvestigationFiles(dir: string, epochMs: number): string[] {
   try {
     files = readdirSync(dir);
   } catch {
-    return [path.join(dir, exact)]; // fallback to exact match
+    return []; // directory does not exist — nothing to delete
   }
 
   const matched = files.filter(f => candidates.has(f));
   return matched.length > 0
     ? matched.map(f => path.join(dir, f))
-    : [path.join(dir, exact)]; // fallback to exact match
+    : [path.join(dir, exact)]; // exact match not in listing but try anyway
 }
 
 function cosineSimilarity(a: number[], b: number[]): number {

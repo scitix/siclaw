@@ -208,19 +208,12 @@ export class AgentBoxSessionManager {
     // Populate sessionIdRef so skill_call events can associate with this session
     result.sessionIdRef.current = id;
 
-    // New session: re-sync memory index to pick up files from previous sessions
-    if (isNewSession && this._sharedMemoryIndexer) {
-      this._sharedMemoryIndexer.sync().catch((err) => {
-        console.warn(`[agentbox-session] Memory sync on new session failed:`, err);
-      });
-    }
-
-    // Purge stale investigations on new session creation (skipSync: sync already triggered above)
+    // New session: sync memory index, then purge stale investigations (chained to avoid race)
     if (isNewSession && this._sharedMemoryIndexer) {
       const memDir = this.getMemoryDir();
-      this._sharedMemoryIndexer.purgeStaleInvestigations(memDir, { skipSync: true }).catch(err =>
-        console.warn("[agentbox-session] Investigation purge failed:", err)
-      );
+      this._sharedMemoryIndexer.sync()
+        .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
+        .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
     }
 
     // Catch-up topic consolidation on new session — use llmConfigRef (dynamic, works in K8s mode)
