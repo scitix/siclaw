@@ -252,7 +252,7 @@ export class K8sSpawner implements BoxSpawner {
             securityContext: {
               capabilities: {
                 drop: ["ALL"],
-                add: ["SETUID", "SETGID", "CHOWN", "FOWNER"],
+                add: ["SETUID", "SETGID", "CHOWN", "FOWNER", "AUDIT_WRITE"],
               },
               readOnlyRootFilesystem: true,
             },
