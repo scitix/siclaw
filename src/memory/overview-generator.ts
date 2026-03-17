@@ -9,6 +9,7 @@ export interface OverviewOpts {
   memoryDir: string;
   reposDir?: string;
   docsDir?: string;
+  investigationPatterns?: Array<{ category: string; count: number }>;
 }
 
 /**
@@ -18,7 +19,7 @@ export interface OverviewOpts {
  * Returns empty string if no knowledge files exist.
  */
 export function buildKnowledgeOverview(opts: OverviewOpts): string {
-  const { memoryDir, reposDir, docsDir } = opts;
+  const { memoryDir, reposDir, docsDir, investigationPatterns } = opts;
   const TOTAL_BUDGET = 1800;
 
   const topicsDir = path.join(memoryDir, "topics");
@@ -29,11 +30,13 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   const topicEntries = scanTopics(topicsDir);
   const investigationEntries = scanInvestigations(investigationsDir);
 
+  const hasPatterns = investigationPatterns && investigationPatterns.length > 0;
   if (
     repoEntries.length === 0 &&
     docEntries.length === 0 &&
     topicEntries.length === 0 &&
-    investigationEntries.length === 0
+    investigationEntries.length === 0 &&
+    !hasPatterns
   ) {
     return "";
   }
@@ -80,29 +83,37 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 
   // --- Accumulated Knowledge (~500 chars budget) ---
   if (topicEntries.length > 0) {
-    const header = "\n\n### Accumulated Knowledge\n| Topic | Facts | Last updated |\n|-------|-------|-------------|";
+    const header = "\n\n### Accumulated Knowledge";
     currentLen += header.length;
 
-    const rows: string[] = [];
+    const lines: string[] = [];
     for (const entry of topicEntries) {
-      const row = `\n| ${entry.topic} | ${entry.factCount} | ${entry.lastUpdated} |`;
-      if (currentLen + row.length > TOTAL_BUDGET - 300) break; // reserve space for investigations + footer
-      rows.push(row);
-      currentLen += row.length;
+      const summaryPart = entry.summary ? `: ${entry.summary}` : "";
+      const line = `\n- **${entry.topic}** (${entry.factCount} facts, updated ${entry.lastUpdated})${summaryPart}`;
+      if (currentLen + line.length > TOTAL_BUDGET - 300) break; // reserve space for investigations + footer
+      lines.push(line);
+      currentLen += line.length;
     }
 
-    if (rows.length > 0) {
-      parts.push(header + rows.join(""));
+    if (lines.length > 0) {
+      parts.push(header + lines.join(""));
     }
   }
 
   // --- Recent Investigations (~300 chars budget) ---
-  if (investigationEntries.length > 0) {
+  if (investigationEntries.length > 0 || (investigationPatterns && investigationPatterns.length > 0)) {
     const maxInvestigations = currentLen > TOTAL_BUDGET - 600 ? 3 : 5;
     const entries = investigationEntries.slice(0, maxInvestigations);
 
     const header = "\n\n### Recent Investigations";
     const lines = entries.map(e => `\n- ${e.date}: ${e.question}`);
+
+    // Append pattern summary if available
+    if (investigationPatterns && investigationPatterns.length > 0) {
+      const patternStr = investigationPatterns.map(p => `${p.category} (${p.count}x)`).join(", ");
+      lines.push(`\n- Patterns: ${patternStr}`);
+    }
+
     const section = header + lines.join("");
 
     if (currentLen + section.length <= TOTAL_BUDGET - 100) {
@@ -140,6 +151,7 @@ interface TopicInfo {
   topic: string;
   factCount: number;
   lastUpdated: string;
+  summary: string;
 }
 
 interface InvestigationInfo {
@@ -280,12 +292,36 @@ function scanTopics(topicsDir: string): TopicInfo[] {
   for (const file of files) {
     try {
       const content = fs.readFileSync(path.join(topicsDir, file), "utf-8");
-      const factCount = content.split("\n").filter(line => line.startsWith("- ")).length;
-      const lastUpdated = findLatestDateSection(content);
+      const facts = content.split("\n").filter(line => line.startsWith("- "));
+      const factCount = facts.length;
+
+      // For consolidated files, check Last consolidated header for date
+      let lastUpdated = findLatestDateSection(content);
+      if (lastUpdated === "unknown") {
+        const consolidatedMatch = content.match(/^Last consolidated:\s*(\d{4}-\d{2}-\d{2})/m);
+        if (consolidatedMatch) {
+          lastUpdated = consolidatedMatch[1];
+        }
+      }
+
+      // Build summary from first 3 facts (~60 chars max)
+      const MAX_SUMMARY_CHARS = 60;
+      const summaryParts: string[] = [];
+      let summaryLen = 0;
+      for (const fact of facts.slice(0, 3)) {
+        const text = fact.slice(2).trim(); // remove "- " prefix
+        const short = text.length > 30 ? text.slice(0, 27) + "..." : text;
+        if (summaryLen + short.length + 2 > MAX_SUMMARY_CHARS && summaryParts.length > 0) break;
+        summaryParts.push(short);
+        summaryLen += short.length + 2; // +2 for ", "
+      }
+      const summary = summaryParts.join(", ");
+
       entries.push({
         topic: file.replace(/\.md$/, ""),
         factCount,
         lastUpdated,
+        summary,
       });
     } catch {
       // Skip malformed files

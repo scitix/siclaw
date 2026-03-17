@@ -10,6 +10,7 @@ import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
+import { consolidateAllPending } from "./memory/topic-consolidator.js";
 import type { BrainType } from "./core/brain-session.js";
 
 // Parse arguments
@@ -98,6 +99,25 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
     console.log("│  Use /setup → Credentials to add kubeconfig,    │");
     console.log("│  SSH keys, or API tokens for diagnostics.       │");
     console.log("└─────────────────────────────────────────────────┘");
+  }
+}
+
+// Purge stale investigations at startup
+if (memoryIndexer) {
+  const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
+  memoryIndexer.purgeStaleInvestigations(cliMemoryDir).catch(err =>
+    console.warn("[siclaw] Investigation purge failed:", err)
+  );
+}
+
+// Catch-up topic consolidation at startup
+{
+  const llm = getDefaultLlm();
+  const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
+  if (llm?.apiKey && llm?.baseUrl) {
+    consolidateAllPending(cliMemoryDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id }).catch(err =>
+      console.warn("[siclaw] Topic consolidation failed:", err)
+    );
   }
 }
 
