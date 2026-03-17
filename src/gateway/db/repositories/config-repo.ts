@@ -337,6 +337,26 @@ export class ConfigRepository {
       );
   }
 
+  // ─── Cron Limits Queries ─────────────────────────
+
+  /** Count active (non-paused) jobs owned by a user */
+  async countActiveJobsByUser(userId: string): Promise<number> {
+    const rows = await this.db
+      .select({ cnt: sql<number>`count(*)` })
+      .from(cronJobs)
+      .where(and(eq(cronJobs.userId, userId), eq(cronJobs.status, "active")));
+    return Number(rows[0]?.cnt ?? 0);
+  }
+
+  /** Count jobs currently locked for execution (lockedBy IS NOT NULL) */
+  async countCurrentlyExecutingJobs(): Promise<number> {
+    const rows = await this.db
+      .select({ cnt: sql<number>`count(*)` })
+      .from(cronJobs)
+      .where(isNotNull(cronJobs.lockedBy));
+    return Number(rows[0]?.cnt ?? 0);
+  }
+
   // ─── Triggers ─────────────────────────────────
 
   async listTriggers(userId: string) {

@@ -138,3 +138,24 @@ export function getNextCronDelay(expr: string, after?: Date): number {
   const next = getNextCronTime(expr, now);
   return next.getTime() - now.getTime();
 }
+
+/**
+ * Estimate the minimum interval (in ms) between consecutive fires
+ * by sampling `sampleCount` successive trigger times.
+ *
+ * Handles variable-interval expressions like `0 9,17 * * 1-5`
+ * where intervals alternate (e.g. 8h / 16h).
+ */
+export function getMinimumIntervalMs(expr: string, sampleCount = 10): number {
+  let minGap = Infinity;
+
+  let prev = getNextCronTime(expr, new Date());
+  for (let i = 1; i < sampleCount; i++) {
+    const next = getNextCronTime(expr, prev);
+    const gap = next.getTime() - prev.getTime();
+    if (gap < minGap) minGap = gap;
+    prev = next;
+  }
+
+  return minGap;
+}

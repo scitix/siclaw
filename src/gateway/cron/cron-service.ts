@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 import { CronScheduler, type CronJobRow } from "../../cron/cron-scheduler.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
 import type { NotificationRepository } from "../db/repositories/notification-repo.js";
+import { CRON_LIMITS } from "./cron-limits.js";
 
 const EXECUTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const STALE_LOCK_CLEANUP_MS = 6 * 60 * 1000; // 6 min
@@ -85,6 +86,15 @@ export class CronService {
     const current = await this.configRepo.getCronJobById(job.id);
     if (!current || current.status !== "active") {
       console.log(`[cron-service] Job ${job.id} no longer active, skipping`);
+      return;
+    }
+
+    // Soft concurrent-execution limit — skip this run, retry next cycle
+    const executing = await this.configRepo.countCurrentlyExecutingJobs();
+    if (executing >= CRON_LIMITS.MAX_CONCURRENT_EXECUTIONS) {
+      console.warn(
+        `[cron-service] Job ${job.id} skipped: concurrent limit reached (${executing}/${CRON_LIMITS.MAX_CONCURRENT_EXECUTIONS})`,
+      );
       return;
     }
 
