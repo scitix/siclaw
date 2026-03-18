@@ -14,7 +14,7 @@ import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/deep-search/events.js";
-import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
+import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -315,6 +315,17 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (!managed._promptDone) {
         managed._eventBuffer.push(event);
       }
+      // Null dpState.checklist when deep_search completes — this is the exit signal
+      // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
+      const ev = event as Record<string, unknown>;
+      if (ev.type === "tool_execution_end" && managed.dpState?.checklist) {
+        // Find the matching tool_execution_start to get toolName
+        // (tool_execution_end doesn't carry toolName directly in all brain types)
+        const toolName = (ev.toolName as string) ?? "";
+        if (toolName === "deep_search") {
+          managed.dpState.checklist = null;
+        }
+      }
     });
 
     // Also buffer deep_search progress events (same stream as session events)
@@ -331,18 +342,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (managed.dpState?.checklist) {
         const ev = event as Record<string, unknown>;
         if (ev.type === "phase") {
-          const phaseStr = ev.phase as string;
-          const m = phaseStr.match(/(\d+)/);
-          const phaseNum = m ? parseInt(m[1], 10) : 0;
+          const phaseNum = parsePhaseNum(ev.phase as string);
           if (phaseNum >= 1) {
-            const items = managed.dpState.checklist.items;
-            for (let i = 0; i < items.length; i++) {
-              if (i < phaseNum - 1 && items[i].status !== "done" && items[i].status !== "skipped") {
-                items[i].status = "done";
-              } else if (i === phaseNum - 1 && items[i].status !== "done" && items[i].status !== "skipped") {
-                items[i].status = "in_progress";
-              }
-            }
+            applyPhaseToChecklist(managed.dpState.checklist.items, phaseNum);
           }
         }
       }

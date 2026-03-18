@@ -470,15 +470,14 @@ export function usePilot() {
                             if (last.toolName === 'deep_search') {
                                 setDpChecklist(prev => {
                                     if (!prev) return prev;
-                                    const items = prev.map(i =>
+                                    return prev.map(i =>
                                         i.status === 'pending' || i.status === 'in_progress'
                                             ? { ...i, status: 'done' as const }
                                             : i
                                     );
-                                    dpTimeout(() => resetDpState(), 3000);
-                                    return items;
                                 });
                                 setDpFocus(null);
+                                dpTimeout(() => resetDpState(), 3000);
                                 dpTimeout(() => {
                                     setInvestigationProgress(prev => {
                                         if (prev && prev.hypotheses.every(h =>
@@ -514,7 +513,9 @@ export function usePilot() {
                             const state = prev ?? { hypotheses: [] };
                             return reduceInvestigationProgress(state, progress);
                         });
-                        // Map engine phase events to dpChecklist (system-driven, not LLM-driven)
+                        // Map engine phase events to dpChecklist (system-driven, not LLM-driven).
+                        // Phase mapping logic mirrors applyPhaseToChecklist() in dp-tools.ts
+                        // and restoreDpProgress below. Keep all three in sync.
                         if (progress.type === 'phase') {
                             const phaseStr = progress.phase as string;
                             const m = phaseStr.match(/(\d+)/);
@@ -1171,6 +1172,8 @@ export function usePilot() {
             // Always create dpChecklist when prompt is active, even without events.
             // Without this, a page refresh during deep_search shows the bare
             // InvestigationCard (no progress bars) instead of DpChecklistCard.
+            // Phase mapping mirrors applyPhaseToChecklist() in dp-tools.ts
+            // and the tool_progress handler above. Keep all three in sync.
             const phase = state.phase;
             const checklist = createDefaultDpChecklist();
             const phaseNum = phase ? parseInt(phase.match(/(\d+)/)?.[1] ?? '0') : 0;

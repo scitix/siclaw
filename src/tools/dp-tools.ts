@@ -51,6 +51,32 @@ export function createChecklist(question: string): DpChecklist {
   };
 }
 
+/**
+ * Apply a phase number (1-4) to checklist items.
+ * Forward-only: items already done/skipped are not regressed.
+ * Phase mapping: 1→triage, 2→hypotheses, 3→deep_search, 4→conclusion
+ * (coupled to createChecklist() item order at indices 0-3).
+ */
+export function applyPhaseToChecklist(items: ChecklistItem[], phaseNum: number): void {
+  for (let i = 0; i < items.length; i++) {
+    if (i < phaseNum - 1) {
+      if (items[i].status !== "done" && items[i].status !== "skipped") {
+        items[i].status = "done";
+      }
+    } else if (i === phaseNum - 1) {
+      if (items[i].status !== "done" && items[i].status !== "skipped") {
+        items[i].status = "in_progress";
+      }
+    }
+  }
+}
+
+/** Parse phase number from engine phase string (e.g. "Phase 3/4" → 3). Returns 0 if unparseable. */
+export function parsePhaseNum(phaseStr: string): number {
+  const m = phaseStr.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
 // --- Load SKILL.md workflow (one-time, at module init) ---
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
