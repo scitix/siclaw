@@ -483,13 +483,15 @@ export function createRpcMethods(
         content: message,
       });
       await chatRepo.incrementMessageCount(sessionId);
-      // Update session metadata (title/preview)
-      const title =
-        message.length > 40 ? message.slice(0, 40) + "..." : message;
-      await chatRepo.updateSessionMeta(sessionId, {
-        title,
-        preview: message.slice(0, 100),
-      });
+      // Update session metadata (title/preview) — skip for feedback sentinel
+      if (!message.startsWith("[Feedback]")) {
+        const title =
+          message.length > 40 ? message.slice(0, 40) + "..." : message;
+        await chatRepo.updateSessionMeta(sessionId, {
+          title,
+          preview: message.slice(0, 100),
+        });
+      }
     }
 
     if (!sessionId) throw new Error("Failed to create session");
