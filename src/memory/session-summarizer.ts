@@ -23,6 +23,8 @@ export interface SaveSessionMemoryOpts {
   maxMessages?: number;
 }
 
+// Kept as a forward-compatibility seam: callers use this interface so future
+// re-enabling of LLM extraction only requires changing this function body.
 export interface SaveSessionKnowledgeOpts extends SaveSessionMemoryOpts {}
 
 interface ExtractedMessage {

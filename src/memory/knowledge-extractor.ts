@@ -1,5 +1,6 @@
 /**
- * DISABLED — no production callsites. Kept for potential future config-gated reuse.
+ * DISABLED — no production callsites. Reactivate when a config flag for selective
+ * topic extraction is implemented (e.g. settings.json memory.topicExtraction: true).
  *
  * Knowledge Extractor — extracts structured knowledge from conversations.
  *
