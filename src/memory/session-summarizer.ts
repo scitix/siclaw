@@ -180,6 +180,7 @@ export async function saveSessionMemory(opts: SaveSessionMemoryOpts): Promise<st
  * searchable via memory_search.
  *
  * @returns Array of saved file paths, or null if nothing was saved.
+ *          Return type must remain `string[] | null` — callers depend on it.
  */
 export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Promise<string[] | null> {
   const raw = await saveSessionMemory(opts);

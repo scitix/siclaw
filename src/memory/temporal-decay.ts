@@ -41,7 +41,7 @@ function parseDate(filePath: string): Date | null {
 function isEvergreen(filePath: string): boolean {
   const normalized = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
   if (normalized === "MEMORY.md" || normalized === "memory.md") return true;
-  // Non-dated files under memory/ are topic files (evergreen)
+  // Non-dated files under memory/ (PROFILE.md, legacy topics, user-written) are evergreen
   if (normalized.startsWith("memory/") && !DATED_MEMORY_RE.test(normalized)) return true;
   return false;
 }
