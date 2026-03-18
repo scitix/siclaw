@@ -395,32 +395,47 @@ export async function runSubAgent(
 
   const SUB_AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
+  let raceTimer: ReturnType<typeof setTimeout> | undefined;
+  let timedOutByRace = false;
+  let finalText = "";
+  let trace: TraceStep[] = [];
+
   try {
     // Run the investigation with a timeout to prevent indefinite hangs
     await Promise.race([
       session.prompt(userMessage),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Sub-agent timed out after 5 minutes")), SUB_AGENT_TIMEOUT_MS),
-      ),
+      new Promise<never>((_, reject) => {
+        raceTimer = setTimeout(() => {
+          timedOutByRace = true;
+          reject(new Error("Sub-agent timed out after 5 minutes"));
+        }, SUB_AGENT_TIMEOUT_MS);
+      }),
     ]);
   } finally {
     // Mark finished first — guards against events from abort/dispose
     sessionFinished = true;
 
-    // Clear abort timer if it hasn't fired
+    // Clear timers to prevent leaked rejections after successful completion
+    if (raceTimer) clearTimeout(raceTimer);
     if (abortTimer) clearTimeout(abortTimer);
 
     // Unsubscribe from events before dispose to prevent orphan events
     unsubscribe();
+
+    // If timed out, abort the still-running session.prompt() to stop
+    // burning CPU/resources on a result nobody will read
+    if (timedOutByRace) {
+      session.abort().catch(() => {});
+    }
+
+    // Extract output before dispose — session state is cleared on dispose
+    finalText = extractTextFromMessages(session.state.messages);
+    trace = extractTrace(session.state.messages);
+
+    // Dispose session (removes internal listeners, frees resources)
+    // Now guaranteed to run on both success and error/timeout paths
+    session.dispose();
   }
-
-  // Extract final text and full trace from session messages
-  const sessionMessages = session.state.messages;
-  const finalText = extractTextFromMessages(sessionMessages);
-  const trace = extractTrace(sessionMessages);
-
-  // Dispose session (removes internal listeners, frees resources)
-  session.dispose();
 
   return { textOutput: finalText, evidence, callsUsed, trace };
 }
