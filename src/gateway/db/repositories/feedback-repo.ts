@@ -10,6 +10,7 @@ import { feedbackReports } from "../schema.js";
 export interface FeedbackReportInput {
   sessionId: string;
   userId: string;
+  workspaceId?: string;
   overallRating?: number;
   summary: string;
   decisionPoints?: Array<{
@@ -34,6 +35,7 @@ export class FeedbackRepository {
       id,
       sessionId: report.sessionId,
       userId: report.userId,
+      workspaceId: report.workspaceId ?? null,
       overallRating: report.overallRating ?? null,
       summary: report.summary,
       decisionPoints: report.decisionPoints ?? null,
