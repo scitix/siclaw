@@ -1,6 +1,6 @@
 import { ArrowUp, Square, X, Loader2, BookOpen, SearchCode, MessageSquareHeart, Plus, Check } from 'lucide-react';
 import type { ContextUsage } from '@/hooks/usePilot';
-import { useState, useCallback, useRef, KeyboardEvent } from 'react';
+import { useState, useCallback, useRef, useEffect, KeyboardEvent } from 'react';
 import { cn } from '@/lib/utils';
 
 /** Format token count: 0 → "0", 1234 → "1.2k", 12345 → "12.3k", 123456 → "123k" */
@@ -31,12 +31,32 @@ interface InputAreaProps {
     dpFocus?: string | null;
     dpActive?: boolean;
     onSetDpActive?: (active: boolean) => void;
+    /** External draft text — when changed, populates the input and focuses it */
+    draft?: string | null;
+    /** Sequence counter — ensures useEffect fires even for repeated same-value drafts */
+    draftSeq?: number;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, draft, draftSeq }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const isComposingRef = useRef(false);
+    const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+    // When external draft changes, populate input and focus
+    useEffect(() => {
+        if (draft) {
+            setValue(draft);
+            setTimeout(() => {
+                const el = textareaRef.current;
+                if (el) {
+                    el.focus();
+                    el.setSelectionRange(draft.length, draft.length);
+                }
+            }, 0);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [draft, draftSeq]);
 
     // Deep investigation toggle — controlled by parent (usePilot manages state)
     const deepInvestigation = dpActive ?? false;
@@ -206,20 +226,29 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                             </div>
                         )}
 
-                        <textarea
-                            value={value}
-                            onFocus={() => setIsFocused(true)}
-                            onBlur={() => setIsFocused(false)}
-                            onChange={(e) => setValue(e.target.value)}
-                            onKeyDown={handleKeyDown}
-                            onCompositionStart={() => { isComposingRef.current = true; }}
-                            onCompositionEnd={() => { isComposingRef.current = false; }}
-                            placeholder={disabled ? "Connecting..." : "Reply..."}
-                            disabled={disabled}
-                            className="w-full bg-transparent border-none outline-none px-6 py-3 pr-14 text-[15px] text-gray-900 placeholder:text-gray-400 focus:ring-0 focus:outline-none resize-none min-h-[48px] max-h-[200px] disabled:cursor-not-allowed"
-                            rows={1}
-                            style={{ height: 'auto' }}
-                        />
+                        <div className="relative w-full">
+                            <textarea
+                                ref={textareaRef}
+                                value={value}
+                                onFocus={() => setIsFocused(true)}
+                                onBlur={() => setIsFocused(false)}
+                                onChange={(e) => setValue(e.target.value)}
+                                onKeyDown={handleKeyDown}
+                                onCompositionStart={() => { isComposingRef.current = true; }}
+                                onCompositionEnd={() => { isComposingRef.current = false; }}
+                                placeholder={disabled ? "Connecting..." : "Reply..."}
+                                disabled={disabled}
+                                className="w-full bg-transparent border-none outline-none px-6 py-3 pr-14 text-[15px] text-gray-900 placeholder:text-gray-400 focus:ring-0 focus:outline-none resize-none min-h-[48px] max-h-[200px] disabled:cursor-not-allowed"
+                                rows={1}
+                                style={{ height: 'auto' }}
+                            />
+                            {draft && value.trim() === draft.trim() && (
+                                <span className="absolute left-6 top-3 pointer-events-none text-[15px]">
+                                    <span className="invisible">{value}</span>
+                                    <span className="text-gray-400">add details or press Enter ↵</span>
+                                </span>
+                            )}
+                        </div>
 
                         {isLoading && value.trim() ? (
                             <button

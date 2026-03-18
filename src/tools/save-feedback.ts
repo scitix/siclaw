@@ -57,7 +57,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
       const params = rawParams as SaveFeedbackParams;
 
       const cfg = loadConfig();
-      const gatewayUrl = cfg.server.gatewayUrl || "http://siclaw-gateway";
+      const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
       const userId = cfg.userId;
       const sessionId = sessionIdRef.current;
       const workspaceId = process.env.SICLAW_WORKSPACE_ID;
