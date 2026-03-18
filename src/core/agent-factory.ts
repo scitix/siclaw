@@ -45,6 +45,7 @@ import { createCredentialListTool } from "../tools/credential-list.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
+import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
@@ -477,7 +478,7 @@ export async function createSiclawSession(
       }
       return parts;
     },
-    extensionFactories: [contextPruningExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();
