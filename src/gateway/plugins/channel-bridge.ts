@@ -730,7 +730,7 @@ async function executeScheduleAction(
   }
 }
 
-/** Find a cron job by name for a user, optionally scoped to environment and workspace */
+/** Find a cron job by name for a user, optionally scoped to a workspace */
 async function findJobByName(
   configRepo: ConfigRepository,
   userId: string,

@@ -2,48 +2,52 @@ import { useState } from 'react';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
-interface Environment {
+interface Cluster {
     id: string;
     name: string;
+    infraContext: string | null;
     isTest: boolean;
     apiServer: string;
     allowedServers: string[];
     hasDefaultKubeconfig: boolean;
 }
 
-interface EnvironmentFormData {
+interface ClusterFormData {
     name: string;
+    infraContext: string;
     isTest: boolean;
     apiServer: string;
     allowedServers: string;
     defaultKubeconfig: string;
 }
 
-const EMPTY_FORM: EnvironmentFormData = {
+const EMPTY_FORM: ClusterFormData = {
     name: '',
+    infraContext: '',
     isTest: false,
     apiServer: '',
     allowedServers: '',
     defaultKubeconfig: '',
 };
 
-interface EnvironmentDialogProps {
-    environment: Environment | null;
+interface ClusterDialogProps {
+    cluster: Cluster | null;
     onClose: () => void;
     onSaved: () => void;
     sendRpc: <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
 }
 
-export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: EnvironmentDialogProps) {
-    const isNew = !environment;
+export function ClusterDialog({ cluster, onClose, onSaved, sendRpc }: ClusterDialogProps) {
+    const isNew = !cluster;
 
-    const [form, setForm] = useState<EnvironmentFormData>(() => {
-        if (environment) {
+    const [form, setForm] = useState<ClusterFormData>(() => {
+        if (cluster) {
             return {
-                name: environment.name,
-                isTest: environment.isTest,
-                apiServer: environment.apiServer,
-                allowedServers: environment.allowedServers.join(', '),
+                name: cluster.name,
+                infraContext: cluster.infraContext ?? '',
+                isTest: cluster.isTest,
+                apiServer: cluster.apiServer,
+                allowedServers: cluster.allowedServers.join(', '),
                 defaultKubeconfig: '',
             };
         }
@@ -51,7 +55,7 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
     });
     const [saving, setSaving] = useState(false);
 
-    const updateField = <K extends keyof EnvironmentFormData>(key: K, value: EnvironmentFormData[K]) => {
+    const updateField = <K extends keyof ClusterFormData>(key: K, value: ClusterFormData[K]) => {
         setForm(prev => ({ ...prev, [key]: value }));
     };
 
@@ -66,18 +70,22 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
                 ? form.defaultKubeconfig.trim()
                 : undefined;
 
+            const infraContext = form.infraContext.trim() || null;
+
             if (isNew) {
-                await sendRpc('environment.create', {
+                await sendRpc('cluster.create', {
                     name: form.name.trim(),
+                    infraContext,
                     isTest: form.isTest,
                     apiServer: form.apiServer.trim(),
                     allowedServers,
                     defaultKubeconfig,
                 });
             } else {
-                await sendRpc('environment.update', {
-                    id: environment.id,
+                await sendRpc('cluster.update', {
+                    id: cluster.id,
                     name: form.name.trim(),
+                    infraContext,
                     isTest: form.isTest,
                     apiServer: form.apiServer.trim(),
                     allowedServers,
@@ -86,7 +94,7 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
             }
             onSaved();
         } catch (err) {
-            console.error('[Environments] Save failed:', err);
+            console.error('[Clusters] Save failed:', err);
         } finally {
             setSaving(false);
         }
@@ -101,7 +109,7 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
                 {/* Header */}
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
                     <h2 className="text-lg font-semibold text-gray-900">
-                        {isNew ? 'Create Environment' : `Edit: ${environment.name}`}
+                        {isNew ? 'Create Cluster' : `Edit: ${cluster.name}`}
                     </h2>
                     <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-600 rounded-md">
                         <X className="w-5 h-5" />
@@ -122,6 +130,21 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
                             placeholder="production-us-east"
                             className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                         />
+                    </div>
+
+                    {/* Infrastructure Context */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Infrastructure Context
+                        </label>
+                        <textarea
+                            value={form.infraContext}
+                            onChange={e => updateField('infraContext', e.target.value)}
+                            placeholder={"Describe cluster infrastructure details, e.g.:\n- RDMA network: SR-IOV (switchdev) / macvlan / ipvlan\n- GPU scheduler: volcano / kueue / default\n- CNI: calico / cilium / flannel"}
+                            rows={4}
+                            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 resize-none"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">Filling this helps the SRE agent diagnose issues faster and more accurately — it provides infrastructure context not discoverable via kubectl</p>
                     </div>
 
                     {/* Type toggle */}
@@ -194,7 +217,7 @@ export function EnvironmentDialog({ environment, onClose, onSaved, sendRpc }: En
                                 rows={6}
                                 className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 resize-none"
                             />
-                            {!isNew && environment.hasDefaultKubeconfig && !form.defaultKubeconfig.trim() && (
+                            {!isNew && cluster.hasDefaultKubeconfig && !form.defaultKubeconfig.trim() && (
                                 <p className="text-xs text-gray-400 mt-1">
                                     A kubeconfig is already configured. Leave empty to keep the existing one.
                                 </p>
