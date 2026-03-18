@@ -1,6 +1,5 @@
-import { ArrowUp, Square, X, Loader2, BookOpen, Search, SearchCode, MessageSquareHeart } from 'lucide-react';
+import { ArrowUp, Square, X, Loader2, BookOpen, SearchCode, MessageSquareHeart, Plus, Check } from 'lucide-react';
 import type { ContextUsage } from '@/hooks/usePilot';
-import type { Skill } from '@/pages/Skills/skillsData';
 import { useState, useCallback, useRef, KeyboardEvent } from 'react';
 import { cn } from '@/lib/utils';
 
@@ -27,17 +26,14 @@ interface InputAreaProps {
     isCompacting?: boolean;
     editingSkill?: { id: string; name: string } | null;
     onClearEditSkill?: () => void;
-    skills?: Skill[];
-    onEditSkill?: (id: string, name: string) => void;
     pendingMessages?: string[];
     onRemovePending?: (index: number) => void;
     dpFocus?: string | null;
     dpActive?: boolean;
     onSetDpActive?: (active: boolean) => void;
-    hasMessages?: boolean;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, skills, onEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const isComposingRef = useRef(false);
@@ -46,10 +42,8 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
     const deepInvestigation = dpActive ?? false;
     const setDeepInvestigation = onSetDpActive ?? (() => {});
 
-    // Skill picker state
-    const [showSkillPicker, setShowSkillPicker] = useState(false);
-    const [skillSearch, setSkillSearch] = useState('');
-    const skillSearchRef = useRef<HTMLInputElement>(null);
+    // Action menu state
+    const [showActionMenu, setShowActionMenu] = useState(false);
 
     const handleSend = useCallback(async () => {
         const text = value.trim();
@@ -98,147 +92,55 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                     >
                         {/* Toolbar */}
                         <div className="flex items-center gap-1 px-4 pt-3 pb-1 min-w-0">
-                            {/* Skill Picker */}
-                            {skills && skills.length > 0 && onEditSkill && (
-                                <div className="relative">
-                                    <button
-                                        type="button"
-                                        onClick={() => { setShowSkillPicker(!showSkillPicker); setSkillSearch(''); }}
-                                        disabled={disabled}
-                                        className={cn(
-                                            "p-1.5 rounded-lg transition-colors disabled:opacity-50",
-                                            showSkillPicker
-                                                ? "text-indigo-600 bg-indigo-50"
-                                                : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
-                                        )}
-                                        title="Select skill to edit"
-                                    >
-                                        <BookOpen className="w-4 h-4" />
-                                    </button>
-
-                                    {showSkillPicker && (
-                                        <>
-                                            <div className="fixed inset-0 z-10" onClick={() => setShowSkillPicker(false)} />
-                                            <div className="absolute bottom-full left-0 mb-1 bg-white rounded-xl shadow-xl border border-gray-200 z-20 w-[280px] max-h-[360px] flex flex-col">
-                                                {/* Search */}
-                                                <div className="px-3 pt-3 pb-2">
-                                                    <div className="relative">
-                                                        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
-                                                        <input
-                                                            ref={skillSearchRef}
-                                                            type="text"
-                                                            value={skillSearch}
-                                                            onChange={(e) => setSkillSearch(e.target.value)}
-                                                            placeholder="Search skills..."
-                                                            className="w-full pl-8 pr-3 py-1.5 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-indigo-300 focus:border-indigo-300"
-                                                            autoFocus
-                                                        />
-                                                    </div>
-                                                </div>
-
-                                                {/* Skill list */}
-                                                <div className="overflow-y-auto flex-1 pb-2">
-                                                    {(() => {
-                                                        const query = skillSearch.toLowerCase();
-                                                        const filtered = skills.filter(s =>
-                                                            s.name.toLowerCase().includes(query) ||
-                                                            s.description.toLowerCase().includes(query)
-                                                        );
-                                                        const groups: { label: string; scope: Skill['scope'] }[] = [
-                                                            { label: 'Personal', scope: 'personal' },
-                                                            { label: 'Team Skills', scope: 'team' },
-                                                            { label: 'System Skills', scope: 'builtin' },
-                                                        ];
-                                                        const hasResults = filtered.length > 0;
-
-                                                        if (!hasResults) {
-                                                            return (
-                                                                <div className="px-3 py-4 text-center text-sm text-gray-400">
-                                                                    No skills found
-                                                                </div>
-                                                            );
-                                                        }
-
-                                                        return groups.map(({ label, scope }) => {
-                                                            const items = filtered.filter(s => s.scope === scope);
-                                                            if (items.length === 0) return null;
-                                                            return (
-                                                                <div key={scope}>
-                                                                    <div className="px-3 pt-2 pb-1">
-                                                                        <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">{label}</span>
-                                                                    </div>
-                                                                    {items.map(skill => {
-                                                                        const isSelected = editingSkill?.id === String(skill.id);
-                                                                        return (
-                                                                            <button
-                                                                                key={skill.id}
-                                                                                type="button"
-                                                                                className={cn(
-                                                                                    "flex flex-col w-full px-3 py-1.5 text-left transition-colors",
-                                                                                    isSelected
-                                                                                        ? "bg-indigo-50 border-l-2 border-indigo-500"
-                                                                                        : "hover:bg-gray-50 border-l-2 border-transparent"
-                                                                                )}
-                                                                                onClick={() => {
-                                                                                    onEditSkill(String(skill.id), skill.name);
-                                                                                    setShowSkillPicker(false);
-                                                                                }}
-                                                                            >
-                                                                                <span className={cn(
-                                                                                    "text-sm font-medium truncate",
-                                                                                    isSelected ? "text-indigo-700" : "text-gray-700"
-                                                                                )}>
-                                                                                    {skill.name}
-                                                                                </span>
-                                                                                {skill.description && (
-                                                                                    <span className="text-xs text-gray-400 truncate">{skill.description}</span>
-                                                                                )}
-                                                                            </button>
-                                                                        );
-                                                                    })}
-                                                                </div>
-                                                            );
-                                                        });
-                                                    })()}
-                                                </div>
-                                            </div>
-                                        </>
-                                    )}
-                                </div>
-                            )}
-
-                            {/* Deep Investigation Toggle */}
-                            {(
+                            <div className="relative">
                                 <button
                                     type="button"
-                                    onClick={() => setDeepInvestigation(!deepInvestigation)}
+                                    onClick={() => setShowActionMenu(!showActionMenu)}
                                     disabled={disabled}
                                     className={cn(
                                         "p-1.5 rounded-lg transition-colors disabled:opacity-50",
-                                        deepInvestigation
-                                            ? "text-blue-600 bg-blue-50"
+                                        showActionMenu
+                                            ? "text-gray-600 bg-gray-100"
                                             : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
                                     )}
-                                    title={deepInvestigation ? "Deep Investigation enabled — click to disable" : "Enable Deep Investigation"}
+                                    title="Actions"
                                 >
-                                    <SearchCode className="w-4 h-4" />
+                                    <Plus className="w-4 h-4" />
                                 </button>
-                            )}
 
-                            {/* Session Feedback */}
-                            {!isLoading && !disabled && hasMessages && (
-                                <button
-                                    type="button"
-                                    onClick={() => onSend("[Feedback]")}
-                                    className="p-1.5 rounded-lg transition-colors text-gray-400 hover:text-emerald-600 hover:bg-emerald-50"
-                                    title="Session Feedback"
-                                >
-                                    <MessageSquareHeart className="w-4 h-4" />
-                                </button>
-                            )}
+                                {showActionMenu && (
+                                    <>
+                                        <div className="fixed inset-0 z-10" onClick={() => setShowActionMenu(false)} />
+                                        <div className="absolute bottom-full left-0 mb-1 bg-white rounded-xl shadow-xl border border-gray-200 z-20 w-[220px]">
+                                            <div className="py-1">
+                                                {/* Deep Investigation */}
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setDeepInvestigation(!deepInvestigation)}
+                                                    className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-gray-50 transition-colors"
+                                                >
+                                                    <SearchCode className="w-4 h-4 text-blue-500 shrink-0" />
+                                                    <span className="flex-1 text-sm text-gray-700">Deep Investigation</span>
+                                                    {deepInvestigation && <Check className="w-4 h-4 text-blue-500 shrink-0" />}
+                                                </button>
 
-                            <div className="ml-auto flex items-center gap-3 shrink-0">
+                                                {/* Session Feedback */}
+                                                {!isLoading && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => { onSend("[Feedback]"); setShowActionMenu(false); }}
+                                                        className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-gray-50 transition-colors"
+                                                    >
+                                                        <MessageSquareHeart className="w-4 h-4 text-emerald-500 shrink-0" />
+                                                        <span className="flex-1 text-sm text-gray-700">Session Feedback</span>
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </>
+                                )}
                             </div>
+                            <div className="ml-auto flex items-center gap-3 shrink-0" />
                         </div>
 
                         {/* Mode chips */}
