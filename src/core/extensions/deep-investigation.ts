@@ -92,8 +92,10 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
     return { title, confidence: confMatch ? parseInt(confMatch[1], 10) : undefined };
   }
 
-  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 (supports CJK)
-  const headerPattern = /^#{2,3}\s*(?:Hypothesis|假设|假說|H)\s*\d[^:：\n]*[:：\s]*(.*)/gim;
+  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 / ### #1 (supports CJK)
+  // Requires a number after the keyword to distinguish individual hypotheses
+  // from summary headings like "## 假设列表（按可能性排序）".
+  const headerPattern = /^#{2,3}\s*(?:Hypothesis|假设|假說|H|#)\s*\d[^:：\n]*[:：\s]*(.*)/gim;
   let m: RegExpExecArray | null;
   while ((m = headerPattern.exec(text)) !== null) {
     const titleLine = m[1]?.trim();
@@ -405,13 +407,22 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       const hasTUI = ctx.hasUI && isThemeUsable(ctx);
 
       if (hasTUI) {
-        // Render hypotheses widget above editor
-        const widgetLines = formatHypothesesWidget(hypothesesText, ctx.ui.theme);
-        ctx.ui.setWidget("dp-hypotheses", widgetLines);
+        // Build a compact text summary of hypotheses for the select title.
+        // We do NOT use setWidget here — the pi-tui framework's spinner
+        // (80ms animation) triggers requestRender() continuously, and having
+        // both a widget and a select dialog active causes duplicated rendering
+        // because they share the sequential container hierarchy.
+        const parsed = parseHypotheses(hypothesesText);
+        const hypoLines = parsed.slice(0, 5).map((h, i) => {
+          const title = h.title.length > 60 ? h.title.slice(0, 57) + "..." : h.title;
+          const conf = h.confidence ? ` (${h.confidence}%)` : "";
+          return `  ${i + 1}. ${title}${conf}`;
+        }).join("\n");
+        const selectTitle = `Review Hypotheses\n\n${hypoLines}\n`;
 
         // Block until user reviews and decides
         const choice = await ctx.ui.select(
-          "Review Hypotheses",
+          selectTitle,
           [
             "Proceed to deep search",
             "Adjust hypotheses",
@@ -420,12 +431,19 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
           { signal },
         );
 
+        // Show hypotheses as widget after dialog closes — will be cleared by
+        // tool_call handler when the model proceeds to the next tool.
+        const widgetLines = formatHypothesesWidget(hypothesesText, ctx.ui.theme);
+        ctx.ui.setWidget("dp-hypotheses", widgetLines);
+
         if (choice === "Adjust hypotheses") {
+          ctx.ui.setWidget("dp-hypotheses", undefined);
           const feedback = await ctx.ui.input(
             "What should be adjusted?",
             "e.g., focus on #1 and #3, add a new hypothesis...",
             { signal },
           );
+          ctx.ui.setWidget("dp-hypotheses", widgetLines);
           return {
             content: [{ type: "text" as const, text: `User wants adjustments: ${feedback ?? "(no details)"}. Revise hypotheses and call propose_hypotheses again.` }],
             details: { hypotheses: hypothesesText, userChoice: "adjust", feedback },
