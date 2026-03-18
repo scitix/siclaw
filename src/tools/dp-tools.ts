@@ -51,6 +51,32 @@ export function createChecklist(question: string): DpChecklist {
   };
 }
 
+/**
+ * Apply a phase number (1-4) to checklist items.
+ * Forward-only: items already done/skipped are not regressed.
+ * Phase mapping: 1→triage, 2→hypotheses, 3→deep_search, 4→conclusion
+ * (coupled to createChecklist() item order at indices 0-3).
+ */
+export function applyPhaseToChecklist(items: ChecklistItem[], phaseNum: number): void {
+  for (let i = 0; i < items.length; i++) {
+    if (i < phaseNum - 1) {
+      if (items[i].status !== "done" && items[i].status !== "skipped") {
+        items[i].status = "done";
+      }
+    } else if (i === phaseNum - 1) {
+      if (items[i].status !== "done" && items[i].status !== "skipped") {
+        items[i].status = "in_progress";
+      }
+    }
+  }
+}
+
+/** Parse phase number from engine phase string (e.g. "Phase 3/4" → 3). Returns 0 if unparseable. */
+export function parsePhaseNum(phaseStr: string): number {
+  const m = phaseStr.match(/(\d+)/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
 // --- Load SKILL.md workflow (one-time, at module init) ---
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -74,63 +100,6 @@ export function buildActivationMessage(question: string): string {
 }
 
 // --- Tool factories (for SDK brain) ---
-
-/**
- * Create the manage_checklist tool.
- * Updates checklist item statuses. When conclusion is marked done,
- * automatically disables DP mode.
- */
-export function createManageChecklistTool(dpState: DpState): ToolDefinition {
-  return {
-    name: "manage_checklist",
-    label: "Manage Investigation Checklist",
-    description:
-      "Update checklist item status during deep investigation. " +
-      "Supports batch updates in one call. Items: triage, hypotheses, deep_search, conclusion.",
-    parameters: Type.Object({
-      updates: Type.Array(Type.Object({
-        id: Type.String({ description: "Checklist item id: triage | hypotheses | deep_search | conclusion" }),
-        status: Type.Optional(Type.Union([
-          Type.Literal("pending"),
-          Type.Literal("in_progress"),
-          Type.Literal("done"),
-          Type.Literal("skipped"),
-        ], { description: "New status" })),
-        summary: Type.Optional(Type.String({ description: "Brief summary (1-2 sentences)" })),
-      })),
-    }),
-    async execute(_toolCallId, params) {
-      if (!dpState.checklist) {
-        dpState.checklist = createChecklist("");
-      }
-
-      const { updates } = params as { updates: Array<{ id: string; status?: string; summary?: string }> };
-      const results: string[] = [];
-
-      for (const upd of updates) {
-        const found = dpState.checklist.items.find((i) => i.id === upd.id);
-        if (!found) {
-          results.push(`update ${upd.id}: not found`);
-          continue;
-        }
-        if (upd.status) found.status = upd.status as ChecklistItemStatus;
-        if (upd.summary) found.summary = upd.summary;
-        results.push(`update ${upd.id}: ${upd.status ?? "ok"}`);
-      }
-
-      // Auto-cleanup when conclusion is marked done
-      const conclusionItem = dpState.checklist.items.find((i) => i.id === "conclusion");
-      if (conclusionItem?.status === "done") {
-        dpState.checklist = null;
-      }
-
-      return {
-        content: [{ type: "text" as const, text: results.length > 0 ? results.join("; ") : "No operations specified." }],
-        details: {},
-      };
-    },
-  };
-}
 
 /**
  * Create the propose_hypotheses tool.
@@ -214,8 +183,7 @@ export function createEndInvestigationTool(dpState: DpState): ToolDefinition {
     label: "End Investigation",
     description:
       "End the current deep investigation early with a single call. " +
-      "Automatically marks ALL remaining pending phases as skipped and exits DP mode. " +
-      "Do NOT manually skip phases via manage_checklist — use this tool instead.\n" +
+      "Automatically marks ALL remaining pending phases as skipped and exits DP mode.\n" +
       "Use when: 1) User confirms triage is sufficient (MUST ask first) " +
       "2) User explicitly requests to stop/terminate.",
     parameters: Type.Object({
