@@ -13,11 +13,11 @@ import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
 
 
 /**
- * Deep Investigation extension — externalized checklist mode.
+ * Deep Investigation extension — system-event-driven checklist.
  *
- * Replaces the former Phase A→B→C→D state machine with an Azure-style
- * externalized checklist. The model manages its own progress via the
- * `manage_checklist` tool; there are no phase gates or structural signals.
+ * Phase progress is driven by deterministic engine events (Phase 1/4 ~ 4/4)
+ * from the deep_search tool, not by LLM tool calls. The frontend maps these
+ * phase events to checklist item statuses.
  *
  * Entry points:
  * - `/dp [question]` command
@@ -165,6 +165,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   let pendingFeedbackId: string | null = null;
   let deepSearchRan = false;
   let feedbackCleanup: (() => void) | null = null;
+  let pendingDpExit = false; // deferred exit: set on deep_search completion, consumed on agent_end
 
   // --- Progress rendering state ---
   let activeUI: ExtensionUIContext | null = null;
@@ -342,72 +343,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     },
   });
 
-  // --- manage_checklist tool: model manages its own progress (batch add/update/remove) ---
-
-  function executeManageChecklist(
-    params: {
-      updates?: Array<{ id: string; status?: string; summary?: string }>;
-    },
-    ctx: ExtensionContext,
-  ): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
-    if (!checklist) {
-      checklist = createChecklist("");
-    }
-
-    const results: string[] = [];
-
-    if (params.updates && params.updates.length > 0) {
-      for (const upd of params.updates) {
-        const found = checklist.items.find((i) => i.id === upd.id);
-        if (!found) {
-          results.push(`update ${upd.id}: not found`);
-          continue;
-        }
-        if (upd.status) found.status = upd.status as ChecklistItemStatus;
-        if (upd.summary) found.summary = upd.summary;
-        results.push(`update ${upd.id}: ${upd.status ?? "ok"}`);
-      }
-    }
-
-    persistState();
-    if (ctx.hasUI) updateStatus(ctx);
-
-    // Auto-exit DP mode when conclusion is marked done (workflow complete)
-    const conclusionItem = checklist.items.find((i) => i.id === "conclusion");
-    if (conclusionItem?.status === "done") {
-      disableDpMode(ctx);
-    }
-
-    return {
-      content: [{ type: "text" as const, text: results.length > 0 ? results.join("; ") : "No operations specified." }],
-      details: {},
-    };
-  }
-
-  api.registerTool({
-    name: "manage_checklist",
-    label: "Manage Investigation Checklist",
-    description:
-      "Update checklist item status during deep investigation. " +
-      "Supports batch updates in one call. Items: triage, hypotheses, deep_search, conclusion.",
-    parameters: Type.Object({
-      updates: Type.Array(Type.Object({
-        id: Type.String({ description: "Checklist item id: triage | hypotheses | deep_search | conclusion" }),
-        status: Type.Optional(Type.Union([
-          Type.Literal("pending"),
-          Type.Literal("in_progress"),
-          Type.Literal("done"),
-          Type.Literal("skipped"),
-        ], { description: "New status" })),
-        summary: Type.Optional(Type.String({ description: "Brief summary (1-2 sentences)" })),
-      })),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      return executeManageChecklist(params as any, ctx);
-    },
-  });
-
-
   // --- end_investigation tool: early termination ---
 
   api.registerTool({
@@ -415,8 +350,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     label: "End Investigation",
     description:
       "End the current deep investigation early with a single call. " +
-      "Automatically marks ALL remaining pending phases as skipped and exits DP mode. " +
-      "Do NOT manually skip phases via manage_checklist — use this tool instead.\n" +
+      "Automatically marks ALL remaining pending phases as skipped and exits DP mode.\n" +
       "Use when: 1) User confirms triage is sufficient (MUST ask first) " +
       "2) User explicitly requests to stop/terminate.",
     parameters: Type.Object({
@@ -638,10 +572,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     updateStatus(ctx);
   });
 
-  // --- agent_end: no backend safety-net ---
-  // The model owns checklist state via manage_checklist. If it forgets to mark
-  // items done, that's accurately reflected. Tool guards (gate, dpActive) protect
-  // against harmful actions. Frontend handles visual cleanup on prompt_done.
+  // --- agent_end: consume deferred DP exit ---
+  // deep_search sets pendingDpExit; we wait until agent_end so the model can
+  // present its conclusion before disableDpMode triggers the feedback prompt.
+  api.on("agent_end", (_event, ctx) => {
+    if (pendingDpExit) {
+      pendingDpExit = false;
+      disableDpMode(ctx);
+    }
+  });
 
   // --- tool_call: progress rendering setup (no auto-mark) ---
 
@@ -674,9 +613,14 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       const details = event.details as Record<string, unknown> | undefined;
       pendingFeedbackId = (details?.investigationId as string) ?? null;
 
-      // Standalone deep_search (no DP mode): show feedback immediately since
-      // disableDpMode() won't fire. Guard with !checklist to avoid double-prompting.
-      if (!checklist) {
+      // Defer DP exit to agent_end so the agent can present its conclusion first.
+      // disableDpMode triggers showFeedbackIfNeeded — firing it here would flash
+      // the feedback prompt before the conclusion message appears.
+      if (checklist) {
+        pendingDpExit = true;
+      } else {
+        // Standalone deep_search (no DP mode): show feedback immediately since
+        // disableDpMode() won't fire.
         showFeedbackIfNeeded(ctx);
       }
     }

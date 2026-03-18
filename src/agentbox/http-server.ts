@@ -14,7 +14,7 @@ import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/deep-search/events.js";
-import { createChecklist, buildActivationMessage } from "../tools/dp-tools.js";
+import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -315,6 +315,17 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (!managed._promptDone) {
         managed._eventBuffer.push(event);
       }
+      // Null dpState.checklist when deep_search completes — this is the exit signal
+      // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
+      const ev = event as Record<string, unknown>;
+      if (ev.type === "tool_execution_end" && managed.dpState?.checklist) {
+        // Find the matching tool_execution_start to get toolName
+        // (tool_execution_end doesn't carry toolName directly in all brain types)
+        const toolName = (ev.toolName as string) ?? "";
+        if (toolName === "deep_search") {
+          managed.dpState.checklist = null;
+        }
+      }
     });
 
     // Also buffer deep_search progress events (same stream as session events)
@@ -325,6 +336,19 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           toolName: "deep_search",
           progress: event,
         });
+      }
+      // Sync phase events to SDK brain's dpState so the auto-continue loop
+      // sees correct phase progression without relying on LLM tool calls.
+      // Guard with _promptDone to avoid stale events mutating state after completion.
+      if (!managed._promptDone && managed.dpState?.checklist) {
+        const ev = event as Record<string, unknown>;
+        if (ev.type === "phase") {
+          const phaseStr = typeof ev.phase === "string" ? ev.phase : "";
+          const phaseNum = parsePhaseNum(phaseStr);
+          if (phaseNum >= 1) {
+            applyPhaseToChecklist(managed.dpState.checklist.items, phaseNum);
+          }
+        }
       }
     };
     deepSearchEvents.on("progress", deepProgressBufHandler);
