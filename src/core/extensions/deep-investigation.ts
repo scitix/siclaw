@@ -165,6 +165,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   let pendingFeedbackId: string | null = null;
   let deepSearchRan = false;
   let feedbackCleanup: (() => void) | null = null;
+  let pendingDpExit = false; // deferred exit: set on deep_search completion, consumed on agent_end
 
   // --- Progress rendering state ---
   let activeUI: ExtensionUIContext | null = null;
@@ -571,9 +572,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     updateStatus(ctx);
   });
 
-  // --- agent_end: no backend safety-net ---
-  // Checklist state is driven by system events (phase progress from deep_search engine).
-  // Frontend handles visual cleanup on prompt_done.
+  // --- agent_end: consume deferred DP exit ---
+  // deep_search sets pendingDpExit; we wait until agent_end so the model can
+  // present its conclusion before disableDpMode triggers the feedback prompt.
+  api.on("agent_end", (_event, ctx) => {
+    if (pendingDpExit) {
+      pendingDpExit = false;
+      disableDpMode(ctx);
+    }
+  });
 
   // --- tool_call: progress rendering setup (no auto-mark) ---
 
@@ -606,10 +613,11 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       const details = event.details as Record<string, unknown> | undefined;
       pendingFeedbackId = (details?.investigationId as string) ?? null;
 
-      // Auto-exit DP mode when deep_search completes (replaces old manage_checklist conclusion trigger).
-      // The agent will present findings as its next assistant message; DP mode is no longer needed.
+      // Defer DP exit to agent_end so the agent can present its conclusion first.
+      // disableDpMode triggers showFeedbackIfNeeded — firing it here would flash
+      // the feedback prompt before the conclusion message appears.
       if (checklist) {
-        disableDpMode(ctx);
+        pendingDpExit = true;
       } else {
         // Standalone deep_search (no DP mode): show feedback immediately since
         // disableDpMode() won't fire.
