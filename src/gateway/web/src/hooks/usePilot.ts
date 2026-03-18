@@ -461,34 +461,37 @@ export function usePilot() {
                     const isError = payload.isError as boolean | undefined;
                     // Use real DB message ID if available (enables metadata persistence)
                     const dbMessageId = payload.dbMessageId as string | undefined;
+                    // Check toolName before entering setMessages to avoid side effects
+                    // inside the state updater (React StrictMode calls updaters twice).
+                    const endedToolName = payload.toolName as string | undefined;
+                    // When deep_search completes, mark all remaining checklist items
+                    // as done and auto-clear after 3s. This replaces the old
+                    // manage_checklist(conclusion=done) trigger.
+                    if (endedToolName === 'deep_search') {
+                        setDpChecklist(prev => {
+                            if (!prev) return prev;
+                            return prev.map(i =>
+                                i.status === 'pending' || i.status === 'in_progress'
+                                    ? { ...i, status: 'done' as const }
+                                    : i
+                            );
+                        });
+                        setDpFocus(null);
+                        dpTimeout(() => resetDpState(), 3000);
+                        dpTimeout(() => {
+                            setInvestigationProgress(prev => {
+                                if (prev && prev.hypotheses.every(h =>
+                                    h.status !== 'validating' && h.status !== 'pending'
+                                )) {
+                                    return null;
+                                }
+                                return prev;
+                            });
+                        }, 5000);
+                    }
                     setMessages(prev => {
                         const last = prev[prev.length - 1];
                         if (last?.role === 'tool' && last.isStreaming) {
-                            // When deep_search completes, mark all remaining checklist items
-                            // as done and auto-clear after 3s. This replaces the old
-                            // manage_checklist(conclusion=done) trigger.
-                            if (last.toolName === 'deep_search') {
-                                setDpChecklist(prev => {
-                                    if (!prev) return prev;
-                                    return prev.map(i =>
-                                        i.status === 'pending' || i.status === 'in_progress'
-                                            ? { ...i, status: 'done' as const }
-                                            : i
-                                    );
-                                });
-                                setDpFocus(null);
-                                dpTimeout(() => resetDpState(), 3000);
-                                dpTimeout(() => {
-                                    setInvestigationProgress(prev => {
-                                        if (prev && prev.hypotheses.every(h =>
-                                            h.status !== 'validating' && h.status !== 'pending'
-                                        )) {
-                                            return null;
-                                        }
-                                        return prev;
-                                    });
-                                }, 5000);
-                            }
                             return [
                                 ...prev.slice(0, -1),
                                 {
@@ -517,14 +520,15 @@ export function usePilot() {
                         // Phase mapping logic mirrors applyPhaseToChecklist() in dp-tools.ts
                         // and restoreDpProgress below. Keep all three in sync.
                         if (progress.type === 'phase') {
-                            const phaseStr = progress.phase as string;
+                            const phaseStr = typeof progress.phase === 'string' ? progress.phase : '';
                             const m = phaseStr.match(/(\d+)/);
                             const phaseNum = m ? parseInt(m[1], 10) : 0;
                             if (phaseNum >= 1) {
                                 setDpChecklist(prev => {
-                                    const items: DpChecklistItem[] = prev
-                                        ? prev.map(i => ({ ...i }))
-                                        : createDefaultDpChecklist();
+                                    // Only update existing checklist — don't create one for
+                                    // standalone deep_search (no DP mode active).
+                                    if (!prev) return prev;
+                                    const items: DpChecklistItem[] = prev.map(i => ({ ...i }));
                                     for (let i = 0; i < items.length; i++) {
                                         if (i < phaseNum - 1) {
                                             // Forward-only: don't regress already-done items
