@@ -24,6 +24,7 @@ import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
+import { FeedbackRepository } from "./db/repositories/feedback-repo.js";
 import { loadConfig } from "../core/config.js";
 import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
@@ -805,6 +806,46 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
+    // Internal feedback endpoint: POST /api/internal/feedback
+    if (url === "/api/internal/feedback" && method === "POST") {
+      if (!db) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Database not available" }));
+        return;
+      }
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", async () => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.sessionId || !data.userId || !data.summary) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "sessionId, userId, and summary are required" }));
+            return;
+          }
+          const feedbackRepo = new FeedbackRepository(db);
+          const id = await feedbackRepo.saveFeedbackReport({
+            sessionId: data.sessionId,
+            userId: data.userId,
+            overallRating: data.overallRating,
+            summary: data.summary,
+            decisionPoints: data.decisionPoints,
+            strengths: data.strengths,
+            improvements: data.improvements,
+            tags: data.tags,
+            feedbackConversation: data.feedbackConversation,
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, id }));
+        } catch (err) {
+          console.error("[gateway] feedback save error:", err);
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+      });
+      return;
+    }
+
     // Webhook endpoint: POST /hooks/v1/:triggerId
     if (url.startsWith("/hooks/v1/") && method === "POST") {
       const triggerId = url.split("/hooks/v1/")[1]?.split("?")[0];
@@ -1156,6 +1197,49 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 res.end(JSON.stringify({ error: "Internal server error" }));
               }
             })();
+            return;
+          }
+
+          // Internal feedback endpoint: POST /api/internal/feedback
+          if (url === "/api/internal/feedback" && method === "POST") {
+            if (!db) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Database not available" }));
+              return;
+            }
+            let body = "";
+            req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+            req.on("end", async () => {
+              try {
+                const identity = (req as any).certIdentity;
+                const data = JSON.parse(body);
+                // Use userId from mTLS identity when available (authoritative)
+                const userId = identity?.userId || data.userId;
+                if (!data.sessionId || !userId || !data.summary) {
+                  res.writeHead(400, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "sessionId, userId, and summary are required" }));
+                  return;
+                }
+                const feedbackRepo = new FeedbackRepository(db);
+                const id = await feedbackRepo.saveFeedbackReport({
+                  sessionId: data.sessionId,
+                  userId,
+                  overallRating: data.overallRating,
+                  summary: data.summary,
+                  decisionPoints: data.decisionPoints,
+                  strengths: data.strengths,
+                  improvements: data.improvements,
+                  tags: data.tags,
+                  feedbackConversation: data.feedbackConversation,
+                });
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, id }));
+              } catch (err) {
+                console.error("[gateway] feedback save error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            });
             return;
           }
 

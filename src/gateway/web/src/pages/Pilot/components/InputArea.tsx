@@ -1,4 +1,4 @@
-import { ArrowUp, Square, X, Loader2, BookOpen, Search, SearchCode } from 'lucide-react';
+import { ArrowUp, Square, X, Loader2, BookOpen, Search, SearchCode, MessageSquareHeart } from 'lucide-react';
 import type { ContextUsage } from '@/hooks/usePilot';
 import type { Skill } from '@/pages/Skills/skillsData';
 import { useState, useCallback, useRef, KeyboardEvent } from 'react';
@@ -34,9 +34,10 @@ interface InputAreaProps {
     dpFocus?: string | null;
     dpActive?: boolean;
     onSetDpActive?: (active: boolean) => void;
+    hasMessages?: boolean;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, skills, onEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, skills, onEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const isComposingRef = useRef(false);
@@ -221,6 +222,18 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                                     title={deepInvestigation ? "Deep Investigation enabled — click to disable" : "Enable Deep Investigation"}
                                 >
                                     <SearchCode className="w-4 h-4" />
+                                </button>
+                            )}
+
+                            {/* Session Feedback */}
+                            {!isLoading && !disabled && hasMessages && (
+                                <button
+                                    type="button"
+                                    onClick={() => onSend("[Feedback]")}
+                                    className="p-1.5 rounded-lg transition-colors text-gray-400 hover:text-emerald-600 hover:bg-emerald-50"
+                                    title="Session Feedback"
+                                >
+                                    <MessageSquareHeart className="w-4 h-4" />
                                 </button>
                             )}
 

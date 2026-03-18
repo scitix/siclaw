@@ -452,6 +452,28 @@ export const systemConfig = mysqlTable("system_config", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
+// ─── Feedback Reports ─────────────────────────────
+
+export const feedbackReports = mysqlTable("feedback_reports", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  sessionId: varchar("session_id", { length: 64 }).notNull(),
+  userId: varchar("user_id", { length: 32 }).notNull(),
+  overallRating: int("overall_rating"),
+  summary: text("summary").notNull(),
+  decisionPoints: json("decision_points").$type<Array<{
+    step: number;
+    description: string;
+    wasCorrect: boolean;
+    comment?: string;
+    idealAction?: string;
+  }>>(),
+  strengths: json("strengths").$type<string[]>(),
+  improvements: json("improvements").$type<string[]>(),
+  tags: json("tags").$type<string[]>(),
+  feedbackConversation: json("feedback_conversation").$type<unknown>(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
 export const skillReviews = mysqlTable("skill_reviews", {
   id: varchar("id", { length: 64 }).primaryKey(),
   skillId: varchar("skill_id", { length: 64 })
