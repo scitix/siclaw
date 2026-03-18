@@ -10,8 +10,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
-import { extractConversationKnowledge, mergeTopicFiles } from "./knowledge-extractor.js";
-import { triggerConsolidationIfNeeded } from "./topic-consolidator.js";
+// NOTE: knowledge-extractor and topic-consolidator imports removed.
+// Topic extraction + consolidation disabled — see memory simplification design doc.
 
 const DEFAULT_MAX_MESSAGES = 15;
 const MIN_MESSAGES_TO_SAVE = 3;
@@ -174,46 +174,16 @@ export async function saveSessionMemory(opts: SaveSessionMemoryOpts): Promise<st
 }
 
 /**
- * Save session knowledge using LLM-driven extraction.
- * Falls back to raw saveSessionMemory() when LLM config is unavailable or extraction fails.
+ * Save session knowledge.
  *
- * @returns Array of modified topic file paths, or null if nothing was saved.
+ * LLM-driven topic extraction is disabled — topic files produced more noise than signal
+ * in SRE scenarios (stale state, duplicate facts, 20KB injection drowning skill instructions).
+ * Now delegates to saveSessionMemory() which writes a raw conversation dump that is still
+ * searchable via memory_search.
+ *
+ * @returns Array of saved file paths, or null if nothing was saved.
  */
 export async function saveSessionKnowledge(opts: SaveSessionKnowledgeOpts): Promise<string[] | null> {
-  const { sessionDir, memoryDir, llmConfig } = opts;
-
-  const jsonlPath = findLatestJsonl(sessionDir);
-  if (!jsonlPath) return null;
-
-  const messages = await extractMessages(jsonlPath);
-  if (messages.length < MIN_MESSAGES_TO_SAVE) return null;
-
-  // No LLM config → fall back to raw save
-  if (!llmConfig?.apiKey) {
-    const raw = await saveSessionMemory(opts);
-    return raw ? [raw] : null;
-  }
-
-  try {
-    console.log(`[session-summarizer] Starting knowledge extraction (${messages.length} messages, model=${llmConfig.model})`);
-    const entries = await extractConversationKnowledge({ messages, llmConfig });
-    console.log(`[session-summarizer] Extraction returned ${entries.length} entries`);
-    if (!entries.length) {
-      // LLM judged no extractable knowledge (small talk, too short) — trust the judgment
-      return null;
-    }
-    const saved = await mergeTopicFiles(memoryDir, entries);
-    console.log(`[session-summarizer] Merged ${saved.length} topic files: ${saved.map(f => path.basename(f)).join(", ")}`);
-    // Fire-and-forget: consolidate topic files that exceed thresholds
-    if (saved.length > 0) {
-      triggerConsolidationIfNeeded(memoryDir, saved, llmConfig).catch(err =>
-        console.warn("[session-summarizer] Background consolidation failed:", err),
-      );
-    }
-    return saved;
-  } catch (err) {
-    console.warn("[session-summarizer] Knowledge extraction failed, falling back to raw save:", err);
-    const raw = await saveSessionMemory(opts);
-    return raw ? [raw] : null;
-  }
+  const raw = await saveSessionMemory(opts);
+  return raw ? [raw] : null;
 }
