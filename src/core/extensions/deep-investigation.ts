@@ -92,8 +92,10 @@ function parseHypotheses(text: string): Array<{ title: string; confidence?: numb
     return { title, confidence: confMatch ? parseInt(confMatch[1], 10) : undefined };
   }
 
-  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 (supports CJK)
-  const headerPattern = /^#{2,3}\s*(?:Hypothesis|假设|假說|H)\s*\d[^:：\n]*[:：\s]*(.*)/gim;
+  // Strategy 1: Structured headers — ## Hypothesis N / ### H1 / ### #1 (supports CJK)
+  // Requires a number after the keyword to distinguish individual hypotheses
+  // from summary headings like "## 假设列表（按可能性排序）".
+  const headerPattern = /^#{2,3}\s*(?:Hypothesis|假设|假說|H|#)\s*\d[^:：\n]*[:：\s]*(.*)/gim;
   let m: RegExpExecArray | null;
   while ((m = headerPattern.exec(text)) !== null) {
     const titleLine = m[1]?.trim();
