@@ -161,16 +161,29 @@ function translateRequest(body: any, config: ProxyConfig): any {
             .join("\n");
         }
 
-        // Tool use → tool_calls
+        // Tool use → tool_calls (skip malformed blocks with missing/empty id or name)
         if (toolUseBlocks.length > 0) {
-          assistantMsg.tool_calls = toolUseBlocks.map((b: any) => ({
-            id: b.id,
-            type: "function",
-            function: {
-              name: b.name,
-              arguments: typeof b.input === "string" ? b.input : JSON.stringify(b.input),
-            },
-          }));
+          const validToolCalls = toolUseBlocks
+            .filter((b: any) => {
+              const hasId = typeof b.id === "string" && b.id.trim().length > 0;
+              const hasName = typeof b.name === "string" && b.name.trim().length > 0;
+              if (!hasId || !hasName) {
+                console.warn(`[llm-proxy] Dropping malformed tool_use block: id=${b.id ?? "(missing)"} name=${b.name ?? "(missing)"}`);
+                return false;
+              }
+              return true;
+            })
+            .map((b: any) => ({
+              id: b.id,
+              type: "function",
+              function: {
+                name: b.name,
+                arguments: typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {}),
+              },
+            }));
+          if (validToolCalls.length > 0) {
+            assistantMsg.tool_calls = validToolCalls;
+          }
         }
 
         if (!assistantMsg.content) assistantMsg.content = null;
@@ -399,8 +412,11 @@ async function handleStreamResponse(
           // finish_reason without delta
           if (choice.finish_reason) {
             closeCurrentBlock();
+            // Determine stop_reason from actual content, not finish_reason.
+            // Some models (e.g. Kimi-K2.5) return finish_reason "stop" even
+            // when tool_calls are present — derive from emitted content instead.
             let stopReason = "end_turn";
-            if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
+            if (hasToolCalls) stopReason = "tool_use";
             else if (choice.finish_reason === "length") stopReason = "max_tokens";
 
             writeEvent("message_delta", {
@@ -481,9 +497,12 @@ async function handleStreamResponse(
           finishReason = choice.finish_reason;
           closeCurrentBlock();
 
+          // Determine stop_reason from actual content, not finish_reason.
+          // Some models (e.g. Kimi-K2.5) return finish_reason "stop" even
+          // when tool_calls are present — derive from emitted content instead.
           let stopReason = "end_turn";
-          if (choice.finish_reason === "tool_calls") stopReason = "tool_use";
-          else if (choice.finish_reason === "length") stopReason = "max_tokens";
+          if (hasToolCalls) stopReason = "tool_use";
+          else if (finishReason === "length") stopReason = "max_tokens";
 
           writeEvent("message_delta", {
             type: "message_delta",
