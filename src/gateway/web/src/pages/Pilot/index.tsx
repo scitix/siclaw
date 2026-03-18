@@ -9,6 +9,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
+import { isSkillTool } from './constants';
 
 
 export function PilotPage() {
@@ -35,7 +36,7 @@ export function PilotPage() {
     }, [pilot]);
 
     const handlePanelSave = useCallback(async (msg: PilotMessage) => {
-        if (msg.toolName === 'create_skill' || msg.toolName === 'update_skill' || msg.toolName === 'fork_skill') {
+        if (isSkillTool(msg.toolName)) {
             await pilot.loadSkills();
         }
         setPanelMessage(null);
@@ -80,7 +81,7 @@ export function PilotPage() {
             // Skip messages loaded from history (they have isoTimestamp set by mapMessages)
             if (msg.isoTimestamp) continue;
 
-            if (msg.toolName !== 'create_skill' && msg.toolName !== 'update_skill' && msg.toolName !== 'fork_skill') continue;
+            if (!isSkillTool(msg.toolName)) continue;
 
             // Use content as dedup key (stable across ID changes)
             const contentKey = `${msg.toolName}:${msg.content.slice(0, 200)}`;
@@ -225,7 +226,7 @@ export function PilotPage() {
 
             {/* 3. Panel (Right Side) — Skill or Schedule */}
             {panelMessage && (() => {
-                if (panelMessage.toolName === 'create_skill' || panelMessage.toolName === 'update_skill' || panelMessage.toolName === 'fork_skill') {
+                if (isSkillTool(panelMessage.toolName)) {
                     return (
                         <SkillPanel
                             message={panelMessage}
