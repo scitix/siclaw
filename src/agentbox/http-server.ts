@@ -339,10 +339,12 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
       // Sync phase events to SDK brain's dpState so the auto-continue loop
       // sees correct phase progression without relying on LLM tool calls.
-      if (managed.dpState?.checklist) {
+      // Guard with _promptDone to avoid stale events mutating state after completion.
+      if (!managed._promptDone && managed.dpState?.checklist) {
         const ev = event as Record<string, unknown>;
         if (ev.type === "phase") {
-          const phaseNum = parsePhaseNum(ev.phase as string);
+          const phaseStr = typeof ev.phase === "string" ? ev.phase : "";
+          const phaseNum = parsePhaseNum(phaseStr);
           if (phaseNum >= 1) {
             applyPhaseToChecklist(managed.dpState.checklist.items, phaseNum);
           }
