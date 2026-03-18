@@ -23,7 +23,7 @@ import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summa
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import { consolidateAllPending } from "../memory/topic-consolidator.js";
+// topic-consolidator import removed — consolidation disabled
 
 export interface ManagedSession {
   id: string;
@@ -214,17 +214,6 @@ export class AgentBoxSessionManager {
       this._sharedMemoryIndexer.sync()
         .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
         .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
-    }
-
-    // Catch-up topic consolidation on new session — use llmConfigRef (dynamic, works in K8s mode)
-    if (isNewSession) {
-      const memDir = this.getMemoryDir();
-      const llmRef = result.llmConfigRef;
-      if (llmRef.apiKey && llmRef.baseUrl) {
-        consolidateAllPending(memDir, { apiKey: llmRef.apiKey, baseUrl: llmRef.baseUrl, model: llmRef.model }).catch(err =>
-          console.warn("[agentbox-session] Topic consolidation failed:", err),
-        );
-      }
     }
 
     managed = {
