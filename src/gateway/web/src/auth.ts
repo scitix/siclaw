@@ -86,6 +86,7 @@ export const login = async (credentials: LoginCredentials): Promise<LoginResult>
  */
 export const logout = (): void => {
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem('siclaw_user_profile');
     window.location.href = '/login';
 };
 
@@ -126,6 +127,7 @@ export const isAuthenticated = (): boolean => {
 
     if (isTokenExpired(auth.token)) {
         localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem('siclaw_user_profile');
         window.location.href = '/login';
         return false;
     }
