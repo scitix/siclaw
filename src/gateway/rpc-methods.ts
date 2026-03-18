@@ -93,12 +93,16 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
 const _feedbackModDir = path.dirname(fileURLToPath(import.meta.url));
 const _feedbackPkgRoot = path.resolve(_feedbackModDir, "..", "..");
 
+let _feedbackSkillCache: string | null = null;
+
 async function readFeedbackSkillContent(): Promise<string> {
+  if (_feedbackSkillCache) return _feedbackSkillCache;
   const skillPath = path.join(_feedbackPkgRoot, "skills", "core", "session-feedback", "SKILL.md");
   const raw = await fs.promises.readFile(skillPath, "utf-8");
   // Strip YAML frontmatter (between --- delimiters)
-  const stripped = raw.replace(/^---[\s\S]*?---\s*/, "");
-  return stripped.trim();
+  const stripped = raw.replace(/^---[\s\S]*?---\s*/, "").trim();
+  _feedbackSkillCache = stripped;
+  return stripped;
 }
 
 /**
@@ -115,6 +119,8 @@ async function buildSessionTimeline(
   let stepNum = 0;
   for (const msg of msgs) {
     if (msg.role === "user") {
+      // Skip feedback sentinel messages from timeline
+      if (msg.content.startsWith("[Feedback]")) continue;
       stepNum++;
       const preview = msg.content.length > 100 ? msg.content.slice(0, 100) + "..." : msg.content;
       lines.push(`${stepNum}. **User**: ${preview}`);
@@ -550,7 +556,8 @@ export function createRpcMethods(
           "\n---\nThe user has requested a feedback session. Begin the interactive review now.",
         ].join("\n");
       } catch (err) {
-        console.warn("[rpc] feedback enrichment failed, sending raw message:", err);
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(`Feedback system unavailable: ${reason}`);
       }
     }
 
