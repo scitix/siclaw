@@ -1,5 +1,6 @@
 /**
- * DISABLED — no production callsites. Kept for potential future config-gated reuse.
+ * DISABLED — no production callsites. Reactivate when a config flag for topic
+ * consolidation is implemented (paired with knowledge-extractor.ts reactivation).
  *
  * Topic Consolidator — LLM-driven deduplication and merging of topic files.
  *

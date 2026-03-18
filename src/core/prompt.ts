@@ -72,8 +72,8 @@ Memory is NOT pre-loaded into context — use the tools below to retrieve it on 
 - **\`memory_get\`**: Read a specific memory file by relative path (e.g. "PROFILE.md", "2025-01-15.md"). Use after memory_search to read full content.
 
 ### Writing Memory
-- After completing a significant investigation or troubleshooting task, **proactively save** key findings, root causes, outcomes, and important context to \`${memoryDir}/YYYY-MM-DD.md\` (use today's date). Append if the file already exists. Keep entries concise — bullet points with essential facts, not verbose narratives.
-- When the user explicitly asks to remember/save something: write to the appropriate date file in \`${memoryDir}/\`.`;
+- Key findings are automatically saved at session end. Only write to \`${memoryDir}/\` mid-session when the user explicitly asks you to remember something.
+- When writing, use \`${memoryDir}/YYYY-MM-DD.md\` (today's date). Append if the file already exists. Keep entries concise — bullet points with essential facts, not verbose narratives.`;
   }
 
   // P1-2: Credential guidance — always include usage instructions regardless of

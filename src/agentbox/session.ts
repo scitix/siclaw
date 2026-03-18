@@ -19,7 +19,7 @@ import { createSiclawSession, type KubeconfigRef, type LlmConfigRef, type Sessio
 import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
-import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summarizer.js";
+import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
