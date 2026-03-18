@@ -2,9 +2,7 @@
  * Session Summarizer — extracts conversation from JSONL and saves as memory markdown.
  *
  * Called during session release to persist conversation context for future memory search.
- * Supports two modes:
- * - saveSessionMemory(): raw conversation dump (legacy fallback)
- * - saveSessionKnowledge(): LLM-driven knowledge extraction into topic files
+ * saveSessionKnowledge() delegates to saveSessionMemory() (LLM topic extraction disabled).
  */
 
 import fs from "node:fs";
@@ -25,9 +23,7 @@ export interface SaveSessionMemoryOpts {
   maxMessages?: number;
 }
 
-export interface SaveSessionKnowledgeOpts extends SaveSessionMemoryOpts {
-  llmConfig?: { apiKey: string; baseUrl: string; model?: string };
-}
+export interface SaveSessionKnowledgeOpts extends SaveSessionMemoryOpts {}
 
 interface ExtractedMessage {
   role: "user" | "assistant";
