@@ -66,7 +66,7 @@ function computeSkillStatuses(messages: PilotMessage[]): Map<string, SkillRefSta
 
     for (const msg of messages) {
         if (msg.role !== 'tool') continue;
-        if (msg.toolName !== 'create_skill' && msg.toolName !== 'update_skill') continue;
+        if (msg.toolName !== 'create_skill' && msg.toolName !== 'update_skill' && msg.toolName !== 'fork_skill') continue;
 
         let parsed: { skill?: { name: string }; skillId?: string } | null = null;
         try { parsed = JSON.parse(msg.content); } catch { continue; }
@@ -497,7 +497,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     const isTool = message.role === 'tool';
 
     if (isTool) {
-        if ((message.toolName === 'create_skill' || message.toolName === 'update_skill') && !message.isStreaming) {
+        if ((message.toolName === 'create_skill' || message.toolName === 'update_skill' || message.toolName === 'fork_skill') && !message.isStreaming) {
             return (
                 <SkillCard
                     message={message}

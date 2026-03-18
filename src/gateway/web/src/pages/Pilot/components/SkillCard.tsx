@@ -29,6 +29,7 @@ export function SkillCard({ message, status, onOpenPanel }: {
 
     const { skill } = parsed;
     const isUpdate = message.toolName === 'update_skill';
+    const isFork = message.toolName === 'fork_skill';
     return (
         <div className="pl-12">
             <div className={cn(
@@ -56,7 +57,7 @@ export function SkillCard({ message, status, onOpenPanel }: {
                 {status === 'saved' && (
                     <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-700">
                         <Check className="w-2.5 h-2.5" />
-                        {isUpdate ? 'Updated' : 'Saved'}
+                        {isUpdate ? 'Updated' : isFork ? 'Forked' : 'Saved'}
                     </span>
                 )}
                 {status === 'dismissed' && (
