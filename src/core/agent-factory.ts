@@ -478,6 +478,9 @@ export async function createSiclawSession(
       }
       return parts;
     },
+    // compactionSafeguard must precede memoryFlush: it handles session_before_compact
+    // to generate a structured summary directly, preventing the OOM-causing infinite
+    // loop that occurred when memoryFlush injected flush messages during compaction.
     extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });

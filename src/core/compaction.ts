@@ -42,6 +42,9 @@ const MERGE_SUMMARIES_INSTRUCTIONS = [
   "what it was doing, not just what was discussed.",
 ].join("\n");
 
+/** Sentinel heading used to detect structured compaction instructions. */
+export const EXACT_IDENTIFIERS_HEADING = "## Exact identifiers";
+
 export const IDENTIFIER_PRESERVATION_INSTRUCTIONS =
   "Preserve all opaque identifiers exactly as written (no shortening or reconstruction), " +
   "including UUIDs, hashes, IDs, tokens, API keys, hostnames, IPs, ports, URLs, and file names.";
@@ -73,9 +76,9 @@ export function stripToolResultDetails(messages: AgentMessage[]): AgentMessage[]
   return touched ? out : messages;
 }
 
-type ToolCallLike = { id: string; name?: string };
+export type ToolCallLike = { id: string; name?: string };
 
-function extractToolCallsFromAssistant(
+export function extractToolCallsFromAssistant(
   msg: Extract<AgentMessage, { role: "assistant" }>,
 ): ToolCallLike[] {
   const content = msg.content;
@@ -93,7 +96,7 @@ function extractToolCallsFromAssistant(
   return toolCalls;
 }
 
-function extractToolResultId(msg: Extract<AgentMessage, { role: "toolResult" }>): string | null {
+export function extractToolResultId(msg: Extract<AgentMessage, { role: "toolResult" }>): string | null {
   const toolCallId = (msg as { toolCallId?: unknown }).toolCallId;
   if (typeof toolCallId === "string" && toolCallId) return toolCallId;
   const toolUseId = (msg as { toolUseId?: unknown }).toolUseId;
@@ -396,7 +399,11 @@ async function summarizeChunks(params: {
         }
       }
     }
-    if (lastError) throw lastError;
+    if (lastError) {
+      // Return best-effort partial summary if earlier chunks succeeded
+      if (summary) return summary;
+      throw lastError;
+    }
   }
 
   return summary ?? DEFAULT_SUMMARY_FALLBACK;
@@ -408,7 +415,7 @@ function buildSummarizationInstructions(customInstructions?: string): string | u
   // When custom instructions already contain structured section headings
   // (from buildCompactionStructureInstructions), pass them through directly
   // to avoid double-wrapping with identifier preservation instructions.
-  if (custom.includes("## Exact identifiers")) return custom;
+  if (custom.includes(EXACT_IDENTIFIERS_HEADING)) return custom;
   return `${IDENTIFIER_PRESERVATION_INSTRUCTIONS}\n\nAdditional focus:\n${custom}`;
 }
 
@@ -562,8 +569,10 @@ export function pruneHistoryForContextShare(params: {
   let droppedTokens = 0;
 
   const parts = normalizeParts(params.parts ?? DEFAULT_PARTS, keptMessages.length);
+  let iterations = 0;
 
   while (keptMessages.length > 0 && estimateMessagesTokens(keptMessages) > budgetTokens) {
+    if (++iterations > 50) break; // defensive cap against infinite loops
     const chunks = splitMessagesByTokenShare(keptMessages, parts);
     if (chunks.length <= 1) break;
 
