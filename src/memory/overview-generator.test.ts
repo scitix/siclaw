@@ -34,78 +34,19 @@ describe("buildKnowledgeOverview", () => {
   });
 
   it("works with only memoryDir (backward compat, repos/docs optional)", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
+    // Topics no longer scanned — only investigations produce output for memoryDir-only
+    const invDir = path.join(memoryDir, "investigations");
+    fs.mkdirSync(invDir);
     fs.writeFileSync(
-      path.join(topicsDir, "env.md"),
-      `# Env\n\n## 2026-03-16\n- fact\n`,
+      path.join(invDir, "2026-03-16-14-30-00.md"),
+      `# Investigation: OOM in prod\n`,
     );
 
     const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("**env**");
-    expect(result).toContain("1 facts");
-    expect(result).toContain("2026-03-16");
+    expect(result).toContain("### Recent Investigations");
     expect(result).not.toContain("### Code Repositories");
     expect(result).not.toContain("### Documentation");
-  });
-
-  // --- Topics ---
-
-  it("shows topics list with summaries when only topics/ exists", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "environment.md"),
-      `# Environment\n\n## 2026-03-16\n- fact one\n- fact two\n- fact three\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("## Knowledge Overview");
-    expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("**environment** (3 facts, updated 2026-03-16)");
-    expect(result).toContain("fact one");
-    expect(result).not.toContain("### Recent Investigations");
-    expect(result).toContain("memory_get");
-  });
-
-  it("sorts topics by last updated descending", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "old-topic.md"),
-      `# Old\n\n## 2026-01-01\n- old fact\n`,
-    );
-    fs.writeFileSync(
-      path.join(topicsDir, "new-topic.md"),
-      `# New\n\n## 2026-03-16\n- new fact\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    const newIdx = result.indexOf("new-topic");
-    const oldIdx = result.indexOf("old-topic");
-    expect(newIdx).toBeLessThan(oldIdx);
-  });
-
-  it("picks the latest date section across multiple sections", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "multi.md"),
-      `# Multi\n\n## 2026-03-16\n- recent\n\n## 2026-01-01\n- old\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("**multi** (2 facts, updated 2026-03-16)");
-  });
-
-  it("handles empty topic files gracefully", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(path.join(topicsDir, "empty.md"), "");
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("**empty** (0 facts, updated unknown)");
+    expect(result).not.toContain("### Accumulated Knowledge");
   });
 
   // --- Investigations ---
@@ -125,7 +66,8 @@ describe("buildKnowledgeOverview", () => {
     expect(result).not.toContain("### Accumulated Knowledge");
   });
 
-  it("shows both sections when both exist", () => {
+  it("shows investigations (topics no longer scanned)", () => {
+    // Topics dir exists but is ignored — only investigations shown
     const topicsDir = path.join(memoryDir, "topics");
     fs.mkdirSync(topicsDir);
     fs.writeFileSync(
@@ -141,8 +83,7 @@ describe("buildKnowledgeOverview", () => {
     );
 
     const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("**networking** (2 facts, updated 2026-03-15)");
+    expect(result).not.toContain("### Accumulated Knowledge");
     expect(result).toContain("### Recent Investigations");
     expect(result).toContain("2026-03-08: RoCE network latency spike");
   });
@@ -322,7 +263,7 @@ describe("buildKnowledgeOverview", () => {
 
   // --- Mixed scenarios ---
 
-  it("shows all sections when repos + docs + topics + investigations exist", () => {
+  it("shows repos + docs + investigations (topics no longer scanned)", () => {
     // repos
     fs.mkdirSync(reposDir);
     const repo = path.join(reposDir, "api-svc");
@@ -334,14 +275,6 @@ describe("buildKnowledgeOverview", () => {
     const runbooks = path.join(docsDir, "runbooks");
     fs.mkdirSync(runbooks);
     fs.writeFileSync(path.join(runbooks, "deploy.md"), "# Deploy");
-
-    // topics
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "environment.md"),
-      `# Env\n\n## 2026-03-16\n- fact 1\n- fact 2\n`,
-    );
 
     // investigations
     const invDir = path.join(memoryDir, "investigations");
@@ -356,8 +289,7 @@ describe("buildKnowledgeOverview", () => {
     expect(result).toContain("api-svc");
     expect(result).toContain("### Documentation");
     expect(result).toContain("runbooks");
-    expect(result).toContain("### Accumulated Knowledge");
-    expect(result).toContain("**environment** (2 facts, updated 2026-03-16)");
+    expect(result).not.toContain("### Accumulated Knowledge");
     expect(result).toContain("### Recent Investigations");
     expect(result).toContain("Pod CrashLoopBackOff");
   });
@@ -375,20 +307,10 @@ describe("buildKnowledgeOverview", () => {
 
   // --- Budget ---
 
-  it("stays within budget with many topics", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    for (let i = 0; i < 50; i++) {
-      const name = `topic-with-a-long-name-number-${String(i).padStart(3, "0")}`;
-      fs.writeFileSync(
-        path.join(topicsDir, `${name}.md`),
-        `# T\n\n## 2026-03-16\n${Array(20).fill("- fact").join("\n")}\n`,
-      );
-    }
-
+  it("stays within budget with many investigations", () => {
     const invDir = path.join(memoryDir, "investigations");
     fs.mkdirSync(invDir);
-    for (let i = 1; i <= 5; i++) {
+    for (let i = 1; i <= 10; i++) {
       fs.writeFileSync(
         path.join(invDir, `2026-03-${String(i).padStart(2, "0")}-12-00-00.md`),
         `# Investigation: A fairly long investigation question number ${i}\n`,
@@ -396,10 +318,10 @@ describe("buildKnowledgeOverview", () => {
     }
 
     const result = buildKnowledgeOverview({ memoryDir });
-    expect(result.length).toBeLessThanOrEqual(1800 + 150); // small slack for footer
+    expect(result.length).toBeLessThanOrEqual(1200 + 150); // small slack for footer
   });
 
-  it("stays within budget with large repos + many docs + topics + investigations", () => {
+  it("stays within budget with large repos + many docs + investigations", () => {
     // Large repos
     fs.mkdirSync(reposDir);
     for (let r = 0; r < 10; r++) {
@@ -420,16 +342,6 @@ describe("buildKnowledgeOverview", () => {
       }
     }
 
-    // Topics
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    for (let i = 0; i < 20; i++) {
-      fs.writeFileSync(
-        path.join(topicsDir, `topic-${i}.md`),
-        `# T\n\n## 2026-03-16\n- fact\n`,
-      );
-    }
-
     // Investigations
     const invDir = path.join(memoryDir, "investigations");
     fs.mkdirSync(invDir);
@@ -441,37 +353,7 @@ describe("buildKnowledgeOverview", () => {
     }
 
     const result = buildKnowledgeOverview({ memoryDir, reposDir, docsDir });
-    expect(result.length).toBeLessThanOrEqual(1800 + 150);
-  });
-
-  // --- Topic summaries ---
-
-  it("includes topic summary from first 3 facts", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "environment.md"),
-      `# Environment\n\n## 2026-03-17\n- Cluster gpu-east-1 has 64 A100 nodes\n- K8s version 1.29.2\n- Network uses RoCE v2\n- Storage is Lustre\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("Cluster gpu-east-1");
-    expect(result).toContain("K8s version 1.29.2");
-    // Summary is truncated to ~60 chars, so not all facts appear
-    expect(result).toContain("**environment** (4 facts, updated 2026-03-17):");
-  });
-
-  it("handles consolidated files with Last consolidated header", () => {
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "environment.md"),
-      `Last consolidated: 2026-03-17\n# Environment\n\n- Cluster gpu-east-1 has 64 A100 nodes\n- K8s version 1.29.2\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("**environment** (2 facts, updated 2026-03-17)");
-    expect(result).toContain("Cluster gpu-east-1");
+    expect(result.length).toBeLessThanOrEqual(1200 + 150);
   });
 
   // --- Investigation patterns ---

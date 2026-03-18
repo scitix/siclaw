@@ -140,7 +140,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
 }
 
 /**
- * Build the append system prompt content (PROFILE.md + MEMORY.md).
+ * Build the append system prompt content (PROFILE.md + knowledge overview).
  * Shared between pi-agent (via DefaultResourceLoader) and SDK brain.
  *
  * Skills are NOT listed here — pi-agent's DefaultResourceLoader provides a
@@ -212,15 +212,6 @@ This is a new user (profile has only defaults).
   const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_, investigationPatterns });
   if (overview) {
     parts.push(overview);
-  }
-
-  const memoryFile = path.join(memoryDir, "MEMORY.md");
-  if (fs.existsSync(memoryFile)) {
-    let content = fs.readFileSync(memoryFile, "utf-8").trim();
-    if (content) {
-      content = truncateWithBudget(content, 20_000);
-      parts.push(`\n## MEMORY.md\n\n${content}`);
-    }
   }
 
   return parts;
@@ -478,9 +469,7 @@ export async function createSiclawSession(
       }
       return parts;
     },
-    // compactionSafeguard must precede memoryFlush: it handles session_before_compact
-    // to generate a structured summary directly, preventing the OOM-causing infinite
-    // loop that occurred when memoryFlush injected flush messages during compaction.
+    // Extension registration order: compactionSafeguard handles session_before_compact.
     extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
