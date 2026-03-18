@@ -357,6 +357,7 @@ const DDL_STATEMENTS = [
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
+    workspace_id TEXT,
     overall_rating INTEGER CHECK(overall_rating BETWEEN 1 AND 5),
     summary TEXT NOT NULL,
     decision_points TEXT,

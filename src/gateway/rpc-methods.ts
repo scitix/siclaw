@@ -88,9 +88,13 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
 
 /**
  * Read the session-feedback SKILL.md content, stripping YAML frontmatter.
+ * Uses import.meta.url to resolve the package root (works in both dev and K8s).
  */
+const _feedbackModDir = path.dirname(fileURLToPath(import.meta.url));
+const _feedbackPkgRoot = path.resolve(_feedbackModDir, "..", "..");
+
 async function readFeedbackSkillContent(): Promise<string> {
-  const skillPath = path.join(process.cwd(), "skills", "core", "session-feedback", "SKILL.md");
+  const skillPath = path.join(_feedbackPkgRoot, "skills", "core", "session-feedback", "SKILL.md");
   const raw = await fs.promises.readFile(skillPath, "utf-8");
   // Strip YAML frontmatter (between --- delimiters)
   const stripped = raw.replace(/^---[\s\S]*?---\s*/, "");

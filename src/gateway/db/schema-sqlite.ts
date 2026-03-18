@@ -445,6 +445,7 @@ export const feedbackReports = sqliteTable("feedback_reports", {
   id: text("id").primaryKey(),
   sessionId: text("session_id").notNull(),
   userId: text("user_id").notNull(),
+  workspaceId: text("workspace_id"),
   overallRating: integer("overall_rating"),
   summary: text("summary").notNull(),
   decisionPoints: text("decision_points", { mode: "json" }).$type<Array<{

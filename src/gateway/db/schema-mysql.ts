@@ -458,6 +458,7 @@ export const feedbackReports = mysqlTable("feedback_reports", {
   id: varchar("id", { length: 64 }).primaryKey(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   userId: varchar("user_id", { length: 32 }).notNull(),
+  workspaceId: varchar("workspace_id", { length: 64 }),
   overallRating: int("overall_rating"),
   summary: text("summary").notNull(),
   decisionPoints: json("decision_points").$type<Array<{

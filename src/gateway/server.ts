@@ -827,6 +827,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           const id = await feedbackRepo.saveFeedbackReport({
             sessionId: data.sessionId,
             userId: data.userId,
+            workspaceId: data.workspaceId,
             overallRating: data.overallRating,
             summary: data.summary,
             decisionPoints: data.decisionPoints,
@@ -1224,6 +1225,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 const id = await feedbackRepo.saveFeedbackReport({
                   sessionId: data.sessionId,
                   userId,
+                  workspaceId: identity?.workspaceId || data.workspaceId,
                   overallRating: data.overallRating,
                   summary: data.summary,
                   decisionPoints: data.decisionPoints,
