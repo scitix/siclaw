@@ -60,6 +60,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
       const gatewayUrl = cfg.server.gatewayUrl || "http://siclaw-gateway";
       const userId = cfg.userId;
       const sessionId = sessionIdRef.current;
+      const workspaceId = process.env.SICLAW_WORKSPACE_ID;
 
       if (!userId) {
         return {
@@ -87,11 +88,10 @@ The report includes overall rating, decision point evaluations, strengths, impro
         if (params.improvements) improvements = JSON.parse(params.improvements);
         if (params.tags) tags = JSON.parse(params.tags);
         if (params.feedbackConversation) {
-          let conv = params.feedbackConversation;
-          if (conv.length > MAX_CONVERSATION_BYTES) {
-            conv = conv.slice(0, MAX_CONVERSATION_BYTES);
-          }
-          feedbackConversation = JSON.parse(conv);
+          const parsed = JSON.parse(params.feedbackConversation);
+          const serialized = JSON.stringify(parsed);
+          // Drop entirely if serialized size exceeds limit (truncating JSON is unsafe)
+          feedbackConversation = serialized.length <= MAX_CONVERSATION_BYTES ? parsed : undefined;
         }
       } catch (err) {
         return {
@@ -108,6 +108,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
           {
             sessionId,
             userId,
+            workspaceId,
             overallRating: params.overallRating,
             summary: params.summary,
             decisionPoints,
