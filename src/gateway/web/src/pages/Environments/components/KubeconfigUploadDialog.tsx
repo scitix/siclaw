@@ -2,8 +2,8 @@ import { useState, useMemo } from 'react';
 import { CheckCircle2, FileText } from 'lucide-react';
 
 interface KubeconfigUploadDialogProps {
-    envId: string;
-    envName: string;
+    clusterId: string;
+    clusterName: string;
     apiServer: string;
     replacing: boolean;
     onClose: () => void;
@@ -60,7 +60,7 @@ function parseKubeconfigSummary(content: string): KubeconfigSummary | null {
     }
 }
 
-export function KubeconfigUploadDialog({ envId, envName, apiServer, replacing, onClose, onUploaded, sendRpc }: KubeconfigUploadDialogProps) {
+export function KubeconfigUploadDialog({ clusterId, clusterName, apiServer, replacing, onClose, onUploaded, sendRpc }: KubeconfigUploadDialogProps) {
     const [kubeContent, setKubeContent] = useState('');
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
@@ -73,7 +73,7 @@ export function KubeconfigUploadDialog({ envId, envName, apiServer, replacing, o
         setSaving(true);
         setError('');
         try {
-            await sendRpc('userEnvConfig.set', { envId, kubeconfig: kubeContent });
+            await sendRpc('userClusterConfig.set', { clusterId, kubeconfig: kubeContent });
             onUploaded();
         } catch (err: any) {
             setError(err?.message || 'Failed to upload kubeconfig');
@@ -87,9 +87,9 @@ export function KubeconfigUploadDialog({ envId, envName, apiServer, replacing, o
             <div className="bg-white rounded-2xl shadow-xl w-full max-w-lg p-6" onClick={e => e.stopPropagation()}>
                 <h3 className="text-lg font-semibold text-gray-900 mb-4">Upload Kubeconfig</h3>
 
-                {/* Environment info */}
+                {/* Cluster info */}
                 <div className="mb-4 px-3 py-2.5 bg-gray-50 rounded-lg">
-                    <p className="text-sm font-medium text-gray-900">{envName}</p>
+                    <p className="text-sm font-medium text-gray-900">{clusterName}</p>
                     <p className="text-xs text-gray-500 font-mono mt-0.5">{apiServer}</p>
                     {replacing && (
                         <p className="text-xs text-amber-600 mt-1">Existing kubeconfig will be replaced</p>

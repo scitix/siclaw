@@ -28,7 +28,7 @@ export function WorkspacesPage() {
     const [isCreating, setIsCreating] = useState(false);
     const [skillCounts, setSkillCounts] = useState<Record<string, number>>({});
     const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
-    const [envCounts, setEnvCounts] = useState<Record<string, number>>({});
+    const [clusterCounts, setClusterCounts] = useState<Record<string, number>>({});
     const hasLoadedRef = useRef(false);
 
     const loadWorkspaces = useCallback(async () => {
@@ -41,12 +41,12 @@ export function WorkspacesPage() {
             // Load config counts for each non-default workspace
             for (const ws of list) {
                 if (ws.isDefault) continue;
-                sendRpc<{ skills: string[]; tools: string[]; environments: string[] }>(
+                sendRpc<{ skills: string[]; tools: string[]; clusters: string[] }>(
                     'workspace.getConfig', { id: ws.id }
                 ).then(cfg => {
                     setSkillCounts(prev => ({ ...prev, [ws.id]: cfg.skills?.length ?? 0 }));
                     setToolCounts(prev => ({ ...prev, [ws.id]: cfg.tools?.length ?? 0 }));
-                    setEnvCounts(prev => ({ ...prev, [ws.id]: cfg.environments?.length ?? 0 }));
+                    setClusterCounts(prev => ({ ...prev, [ws.id]: cfg.clusters?.length ?? 0 }));
                 }).catch(() => {});
             }
         } catch (err) {
@@ -87,7 +87,7 @@ export function WorkspacesPage() {
                     <div>
                         <h1 className="text-lg font-semibold text-gray-900">Workspaces</h1>
                         <p className="text-sm text-gray-500 mt-1">
-                            Isolated contexts with scoped skills, tools, and environments.
+                            Isolated contexts with scoped skills, tools, and clusters.
                         </p>
                     </div>
                     <button
@@ -128,7 +128,7 @@ export function WorkspacesPage() {
                                     {ws.isDefault ? (
                                         <div className="flex items-center gap-2">
                                             <Boxes className="w-3.5 h-3.5 text-gray-400" />
-                                            <span>All skills, tools & environments</span>
+                                            <span>All skills, tools & clusters</span>
                                         </div>
                                     ) : (
                                         <>
@@ -142,7 +142,7 @@ export function WorkspacesPage() {
                                             </div>
                                             <div className="flex items-center gap-2">
                                                 <span className="w-3.5 text-center text-xs font-mono text-gray-400">E</span>
-                                                <span>{envCounts[ws.id] ?? 0} environments</span>
+                                                <span>{clusterCounts[ws.id] ?? 0} clusters</span>
                                             </div>
                                         </>
                                     )}

@@ -165,7 +165,6 @@ export const cronJobs = mysqlTable("cron_jobs", {
   assignedTo: varchar("assigned_to", { length: 64 }),
   lockedBy: varchar("locked_by", { length: 64 }),
   lockedAt: timestamp("locked_at"),
-  envId: varchar("env_id", { length: 64 }),
   workspaceId: varchar("workspace_id", { length: 64 }).references(() => workspaces.id),
 });
 
@@ -302,11 +301,11 @@ export const workspaceTools = mysqlTable("workspace_tools", {
   pk: primaryKey({ columns: [table.workspaceId, table.toolName] }),
 }));
 
-export const workspaceEnvironments = mysqlTable("workspace_environments", {
+export const workspaceClusters = mysqlTable("workspace_clusters", {
   workspaceId: varchar("workspace_id", { length: 64 }).notNull().references(() => workspaces.id, { onDelete: "cascade" }),
-  envId: varchar("env_id", { length: 64 }).notNull().references(() => environments.id, { onDelete: "cascade" }),
+  clusterId: varchar("cluster_id", { length: 64 }).notNull().references(() => clusters.id, { onDelete: "cascade" }),
 }, (table) => ({
-  pk: primaryKey({ columns: [table.workspaceId, table.envId] }),
+  pk: primaryKey({ columns: [table.workspaceId, table.clusterId] }),
 }));
 
 export const workspaceCredentials = mysqlTable("workspace_credentials", {
@@ -327,11 +326,12 @@ export const userDisabledSkills = mysqlTable("user_disabled_skills", {
   pk: primaryKey({ columns: [table.userId, table.skillName] }),
 }));
 
-// ─── Environments ────────────────────────────────────
+// ─── Clusters ────────────────────────────────────────
 
-export const environments = mysqlTable("environments", {
+export const clusters = mysqlTable("clusters", {
   id: varchar("id", { length: 64 }).primaryKey(),
   name: varchar("name", { length: 255 }).notNull(),
+  infraContext: text("infra_context"),
   isTest: boolean("is_test").notNull().default(false),
   apiServer: varchar("api_server", { length: 512 }).notNull(),
   allowedServers: text("allowed_servers"),  // JSON array: ["10.0.0.1","k8s.example.com"]
@@ -341,12 +341,12 @@ export const environments = mysqlTable("environments", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
-// ─── User Environment Configs ────────────────────────
+// ─── User Cluster Configs ────────────────────────────
 
-export const userEnvConfigs = mysqlTable("user_env_configs", {
+export const userClusterConfigs = mysqlTable("user_cluster_configs", {
   id: varchar("id", { length: 64 }).primaryKey(),
   userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id),
-  envId: varchar("env_id", { length: 64 }).notNull().references(() => environments.id),
+  clusterId: varchar("cluster_id", { length: 64 }).notNull().references(() => clusters.id),
   kubeconfig: text("kubeconfig").notNull(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

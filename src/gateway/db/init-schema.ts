@@ -106,7 +106,6 @@ const DDL_STATEMENTS = [
     assigned_to VARCHAR(64),
     locked_by VARCHAR(64),
     locked_at TIMESTAMP NULL,
-    env_id VARCHAR(64),
     workspace_id VARCHAR(64),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
@@ -152,9 +151,10 @@ const DDL_STATEMENTS = [
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
 
-  `CREATE TABLE IF NOT EXISTS environments (
+  `CREATE TABLE IF NOT EXISTS clusters (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
+    infra_context TEXT,
     is_test BOOLEAN NOT NULL DEFAULT FALSE,
     api_server VARCHAR(512) NOT NULL DEFAULT '',
     created_by VARCHAR(32),
@@ -164,16 +164,16 @@ const DDL_STATEMENTS = [
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
   )`,
 
-  `CREATE TABLE IF NOT EXISTS user_env_configs (
+  `CREATE TABLE IF NOT EXISTS user_cluster_configs (
     id VARCHAR(64) PRIMARY KEY,
     user_id VARCHAR(32) NOT NULL,
-    env_id VARCHAR(64) NOT NULL,
+    cluster_id VARCHAR(64) NOT NULL,
     kubeconfig TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE,
-    UNIQUE KEY uk_user_env (user_id, env_id)
+    FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_user_cluster (user_id, cluster_id)
   )`,
 
   `CREATE TABLE IF NOT EXISTS user_disabled_skills (
@@ -306,12 +306,12 @@ const DDL_STATEMENTS = [
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
   )`,
 
-  `CREATE TABLE IF NOT EXISTS workspace_environments (
+  `CREATE TABLE IF NOT EXISTS workspace_clusters (
     workspace_id VARCHAR(64) NOT NULL,
-    env_id VARCHAR(64) NOT NULL,
-    PRIMARY KEY (workspace_id, env_id),
+    cluster_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (workspace_id, cluster_id),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
-    FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+    FOREIGN KEY (cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
   )`,
 
   `CREATE TABLE IF NOT EXISTS workspace_credentials (
@@ -395,8 +395,8 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE notifications ADD INDEX idx_notifications_user (user_id, is_read, created_at)`,
   `ALTER TABLE skill_reviews ADD INDEX idx_skill_reviews_skill (skill_id, created_at)`,
   `ALTER TABLE user_permissions ADD INDEX idx_user_permissions_perm (permission)`,
-  `ALTER TABLE user_env_configs ADD INDEX idx_user_env_configs_user (user_id)`,
-  `ALTER TABLE user_env_configs ADD INDEX idx_user_env_configs_env (env_id)`,
+  `ALTER TABLE user_cluster_configs ADD INDEX idx_user_cluster_configs_user (user_id)`,
+  `ALTER TABLE user_cluster_configs ADD INDEX idx_user_cluster_configs_cluster (cluster_id)`,
   `ALTER TABLE skill_versions ADD INDEX idx_skill_versions_skill (skill_id, version)`,
   `ALTER TABLE skill_contents ADD INDEX idx_skill_contents_skill (skill_id)`,
   `ALTER TABLE credentials ADD INDEX idx_credentials_user (user_id, type)`,
@@ -414,11 +414,11 @@ export async function initSchema(db: Database): Promise<void> {
 
   console.log("[db] Initialising schema...");
 
-  for (const ddl of DDL_STATEMENTS) {
-    await db.execute(sql.raw(ddl));
-  }
-
-  // Schema migrations — run after DDL to handle existing databases
+  // Schema migrations run FIRST — existing databases need column adds and table
+  // renames BEFORE DDL_STATEMENTS, because DDL uses new table names (clusters,
+  // user_cluster_configs, workspace_clusters). If DDL ran first, CREATE TABLE
+  // IF NOT EXISTS would create empty tables with new names, blocking the RENAME
+  // and leaving data stranded in old tables.
   const MIGRATIONS = [
     // skill_versions: s3_key NOT NULL → NULL, add specs + scripts_json columns
     `ALTER TABLE skill_versions MODIFY COLUMN s3_key VARCHAR(500) NULL`,
@@ -431,6 +431,15 @@ export async function initSchema(db: Database): Promise<void> {
     // ADR-011: environment isolation
     `ALTER TABLE workspaces ADD COLUMN env_type VARCHAR(10) NOT NULL DEFAULT 'prod' AFTER is_default`,
     `ALTER TABLE environments ADD COLUMN api_server VARCHAR(512) NOT NULL DEFAULT '' AFTER is_test`,
+    `ALTER TABLE environments ADD COLUMN description TEXT AFTER name`,
+    // Rename environments → clusters
+    `RENAME TABLE environments TO clusters`,
+    `RENAME TABLE user_env_configs TO user_cluster_configs`,
+    `RENAME TABLE workspace_environments TO workspace_clusters`,
+    `ALTER TABLE user_cluster_configs CHANGE COLUMN env_id cluster_id VARCHAR(64) NOT NULL`,
+    `ALTER TABLE workspace_clusters CHANGE COLUMN env_id cluster_id VARCHAR(64) NOT NULL`,
+    // Rename description → infra_context
+    `ALTER TABLE clusters CHANGE COLUMN description infra_context TEXT`,
     `ALTER TABLE cron_jobs ADD COLUMN workspace_id VARCHAR(64)`,
     `ALTER TABLE cron_jobs ADD CONSTRAINT fk_cron_jobs_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id)`,
   ];
@@ -443,9 +452,15 @@ export async function initSchema(db: Database): Promise<void> {
       if (code === "ER_DUP_FIELDNAME" || code === "ER_BAD_FIELD_ERROR") continue;
       // Ignore if column type already matches
       if (String(err).includes("ER_DUP_FIELDNAME")) continue;
+      // Ignore "table doesn't exist" (fresh install) and "already renamed"
+      if (code === "ER_NO_SUCH_TABLE" || code === "ER_TABLE_EXISTS_ERROR") continue;
       // Log but don't fail
       console.warn("[db] Migration warning:", String(err).slice(0, 200));
     }
+  }
+
+  for (const ddl of DDL_STATEMENTS) {
+    await db.execute(sql.raw(ddl));
   }
 
   // Create indexes (ignore ER_DUP_KEYNAME if already exist)

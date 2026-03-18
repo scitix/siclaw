@@ -9,7 +9,7 @@ import {
   workspaces,
   workspaceSkills,
   workspaceTools,
-  workspaceEnvironments,
+  workspaceClusters,
   workspaceCredentials,
 } from "../schema.js";
 
@@ -143,26 +143,26 @@ export class WorkspaceRepository {
     }
   }
 
-  // ─── Allow-list: Environments ─────────────────────
+  // ─── Allow-list: Clusters ────────────────────────
 
-  async getEnvironments(workspaceId: string): Promise<string[]> {
+  async getClusters(workspaceId: string): Promise<string[]> {
     const rows = await this.db
-      .select({ envId: workspaceEnvironments.envId })
-      .from(workspaceEnvironments)
-      .where(eq(workspaceEnvironments.workspaceId, workspaceId));
-    return rows.map((r) => r.envId);
+      .select({ clusterId: workspaceClusters.clusterId })
+      .from(workspaceClusters)
+      .where(eq(workspaceClusters.workspaceId, workspaceId));
+    return rows.map((r) => r.clusterId);
   }
 
-  async setEnvironments(
+  async setClusters(
     workspaceId: string,
-    envIds: string[],
+    clusterIds: string[],
   ): Promise<void> {
     await this.db
-      .delete(workspaceEnvironments)
-      .where(eq(workspaceEnvironments.workspaceId, workspaceId));
-    if (envIds.length > 0) {
-      await this.db.insert(workspaceEnvironments).values(
-        envIds.map((envId) => ({ workspaceId, envId })),
+      .delete(workspaceClusters)
+      .where(eq(workspaceClusters.workspaceId, workspaceId));
+    if (clusterIds.length > 0) {
+      await this.db.insert(workspaceClusters).values(
+        clusterIds.map((clusterId) => ({ workspaceId, clusterId })),
       );
     }
   }
