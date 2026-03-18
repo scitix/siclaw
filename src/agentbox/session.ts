@@ -416,16 +416,10 @@ export class AgentBoxSessionManager {
       const currentMessageCount = this.countJsonlMessages(sessionDir);
 
       if (currentMessageCount > managed._lastSavedMessageCount) {
-        const saved = await saveSessionKnowledge({
-          sessionDir,
-          memoryDir,
-          llmConfig: managed.llmConfigRef.apiKey && managed.llmConfigRef.baseUrl
-            ? { apiKey: managed.llmConfigRef.apiKey, baseUrl: managed.llmConfigRef.baseUrl, model: managed.llmConfigRef.model }
-            : undefined,
-        });
+        const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
         if (saved) {
           managed._lastSavedMessageCount = currentMessageCount;
-          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : saved}`);
+          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
         }
       } else {
         console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);

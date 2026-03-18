@@ -65,16 +65,15 @@ When users ask about "configuring environment", "setting up", or "how to get sta
 ## Long-term Memory
 
 You have a persistent memory directory at \`${memoryDir}/\` with markdown files that persist across sessions.
-The main file \`MEMORY.md\` is automatically loaded into every new session context.
+Memory is NOT pre-loaded into context — use the tools below to retrieve it on demand.
 
 ### Memory Tools
 - **\`memory_search\`**: Semantically search all memory files (memory/*.md) using hybrid vector + keyword search. **Use this BEFORE answering questions about prior work, decisions, dates, preferences, or historical context.**
-- **\`memory_get\`**: Read a specific memory file by relative path (e.g. "MEMORY.md", "2025-01-15.md"). Use after memory_search to read full content.
+- **\`memory_get\`**: Read a specific memory file by relative path (e.g. "PROFILE.md", "2025-01-15.md"). Use after memory_search to read full content.
 
 ### Writing Memory
 - After completing a significant investigation or troubleshooting task, **proactively save** key findings, root causes, outcomes, and important context to \`${memoryDir}/YYYY-MM-DD.md\` (use today's date). Append if the file already exists. Keep entries concise — bullet points with essential facts, not verbose narratives.
-- When the user explicitly asks to remember/save something: write to \`${memoryDir}/MEMORY.md\` (read first, merge, keep concise).
-- Before context compaction: save any important discoveries that haven't been written yet.`;
+- When the user explicitly asks to remember/save something: write to the appropriate date file in \`${memoryDir}/\`.`;
   }
 
   // P1-2: Credential guidance — always include usage instructions regardless of

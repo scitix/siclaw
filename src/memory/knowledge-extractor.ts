@@ -1,4 +1,6 @@
 /**
+ * DISABLED — no production callsites. Kept for potential future config-gated reuse.
+ *
  * Knowledge Extractor — extracts structured knowledge from conversations.
  *
  * Replaces raw conversation dumps with LLM-driven topic extraction.
