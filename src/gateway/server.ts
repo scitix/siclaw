@@ -77,10 +77,17 @@ function handleFeedbackPost(
     if (bodySize > MAX_FEEDBACK_BODY) return; // already responded
     try {
       const data = JSON.parse(body);
+      // In local mode (HTTP, no certIdentity), userId comes from the request body.
+      // This is a local-trust assumption — loopback only, no external access.
       const userId = certIdentity?.userId || data.userId;
       if (!data.sessionId || !userId || !data.summary) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "sessionId, userId, and summary are required" }));
+        return;
+      }
+      if (data.overallRating != null && (data.overallRating < 1 || data.overallRating > 5)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "overallRating must be between 1 and 5" }));
         return;
       }
       const feedbackRepo = new FeedbackRepository(db);
