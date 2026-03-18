@@ -112,7 +112,7 @@ Examples:
           scripts: params.scripts?.map((s) => ({
             name: s.name,
             content: s.content,
-          })) || [],
+          })),
           labels: labels && labels.length > 0 ? labels : undefined,
         },
         summary: hasModifications

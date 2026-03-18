@@ -12,6 +12,7 @@ import { WelcomeArea } from './WelcomeArea';
 import type { PilotMessage, ContextUsage, InvestigationProgress, SystemStatus } from '@/hooks/usePilot';
 import type { WsStatus } from '@/hooks/useWebSocket';
 import type { Skill } from '@/pages/Skills/skillsData';
+import { isSkillTool } from '../constants';
 
 type RpcSendFn = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -66,7 +67,7 @@ function computeSkillStatuses(messages: PilotMessage[]): Map<string, SkillRefSta
 
     for (const msg of messages) {
         if (msg.role !== 'tool') continue;
-        if (msg.toolName !== 'create_skill' && msg.toolName !== 'update_skill') continue;
+        if (!isSkillTool(msg.toolName)) continue;
 
         let parsed: { skill?: { name: string }; skillId?: string } | null = null;
         try { parsed = JSON.parse(msg.content); } catch { continue; }
@@ -497,7 +498,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     const isTool = message.role === 'tool';
 
     if (isTool) {
-        if ((message.toolName === 'create_skill' || message.toolName === 'update_skill') && !message.isStreaming) {
+        if (isSkillTool(message.toolName) && !message.isStreaming) {
             return (
                 <SkillCard
                     message={message}
