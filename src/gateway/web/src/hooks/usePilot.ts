@@ -417,7 +417,7 @@ export function usePilot() {
                     const toolName = payload.toolName as string | undefined;
                     const args = payload.args as Record<string, unknown> | undefined;
                     const toolInput = formatToolInput(toolName ?? '', args);
-                    const hidden = toolName === 'update_plan' || toolName === 'manage_checklist' || toolName === 'end_investigation';
+                    const hidden = toolName === 'update_plan' || toolName === 'end_investigation';
                     // Initialize investigation progress for deep_search (preserve optimistic state if present)
                     if (toolName === 'deep_search') {
                         setInvestigationProgress(prev => prev ?? { hypotheses: [] });
@@ -432,37 +432,6 @@ export function usePilot() {
                             return checklist;
                         });
                         setDpFocus(prev => prev ?? 'deep_search');
-                    }
-                    // Handle manage_checklist status updates
-                    if (toolName === 'manage_checklist') {
-                        const updates: Array<{ id: string; status?: string; summary?: string }> =
-                            (args?.updates as any[]) || [];
-
-                        setDpChecklist(prev => {
-                            const items: DpChecklistItem[] = prev
-                                ? prev.map(i => ({ ...i }))
-                                : createDefaultDpChecklist();
-
-                            for (const upd of updates) {
-                                const item = items.find(i => i.id === upd.id);
-                                if (!item) continue;
-                                if (upd.status && (upd.status === 'done' || upd.status === 'skipped' || upd.status === 'in_progress' || upd.status === 'pending')) {
-                                    item.status = upd.status;
-                                }
-                                if (upd.summary) item.summary = upd.summary;
-                            }
-
-                            // Derive dpFocus: first in_progress item
-                            const focus = items.find(i => i.status === 'in_progress');
-                            setDpFocus(focus ? focus.id : null);
-
-                            // Auto-clear checklist when all steps are done
-                            const allDone = items.every(i => i.status === 'done' || i.status === 'skipped');
-                            if (allDone) {
-                                dpTimeout(() => resetDpState(), 3000);
-                            }
-                            return items;
-                        });
                     }
                     // Handle end_investigation: immediately reset all DP state
                     if (toolName === 'end_investigation') {
@@ -495,9 +464,21 @@ export function usePilot() {
                     setMessages(prev => {
                         const last = prev[prev.length - 1];
                         if (last?.role === 'tool' && last.isStreaming) {
-                            // Delayed clear of investigation progress — let DpChecklistCard show final state.
-                            // Definitive clear happens on manage_checklist(deep_search, done).
+                            // When deep_search completes, mark all remaining checklist items
+                            // as done and auto-clear after 3s. This replaces the old
+                            // manage_checklist(conclusion=done) trigger.
                             if (last.toolName === 'deep_search') {
+                                setDpChecklist(prev => {
+                                    if (!prev) return prev;
+                                    const items = prev.map(i =>
+                                        i.status === 'pending' || i.status === 'in_progress'
+                                            ? { ...i, status: 'done' as const }
+                                            : i
+                                    );
+                                    dpTimeout(() => resetDpState(), 3000);
+                                    return items;
+                                });
+                                setDpFocus(null);
                                 dpTimeout(() => {
                                     setInvestigationProgress(prev => {
                                         if (prev && prev.hypotheses.every(h =>
@@ -533,6 +514,34 @@ export function usePilot() {
                             const state = prev ?? { hypotheses: [] };
                             return reduceInvestigationProgress(state, progress);
                         });
+                        // Map engine phase events to dpChecklist (system-driven, not LLM-driven)
+                        if (progress.type === 'phase') {
+                            const phaseStr = progress.phase as string;
+                            const m = phaseStr.match(/(\d+)/);
+                            const phaseNum = m ? parseInt(m[1], 10) : 0;
+                            if (phaseNum >= 1) {
+                                setDpChecklist(prev => {
+                                    const items: DpChecklistItem[] = prev
+                                        ? prev.map(i => ({ ...i }))
+                                        : createDefaultDpChecklist();
+                                    for (let i = 0; i < items.length; i++) {
+                                        if (i < phaseNum - 1) {
+                                            // Forward-only: don't regress already-done items
+                                            if (items[i].status !== 'done' && items[i].status !== 'skipped') {
+                                                items[i].status = 'done';
+                                            }
+                                        } else if (i === phaseNum - 1) {
+                                            if (items[i].status !== 'done' && items[i].status !== 'skipped') {
+                                                items[i].status = 'in_progress';
+                                            }
+                                        }
+                                    }
+                                    const focus = items.find(i => i.status === 'in_progress');
+                                    setDpFocus(focus ? focus.id : null);
+                                    return items;
+                                });
+                            }
+                        }
                     }
                     break;
                 }

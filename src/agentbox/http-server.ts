@@ -326,6 +326,26 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           progress: event,
         });
       }
+      // Sync phase events to SDK brain's dpState so the auto-continue loop
+      // sees correct phase progression without relying on LLM tool calls.
+      if (managed.dpState?.checklist) {
+        const ev = event as Record<string, unknown>;
+        if (ev.type === "phase") {
+          const phaseStr = ev.phase as string;
+          const m = phaseStr.match(/(\d+)/);
+          const phaseNum = m ? parseInt(m[1], 10) : 0;
+          if (phaseNum >= 1) {
+            const items = managed.dpState.checklist.items;
+            for (let i = 0; i < items.length; i++) {
+              if (i < phaseNum - 1 && items[i].status !== "done" && items[i].status !== "skipped") {
+                items[i].status = "done";
+              } else if (i === phaseNum - 1 && items[i].status !== "done" && items[i].status !== "skipped") {
+                items[i].status = "in_progress";
+              }
+            }
+          }
+        }
+      }
     };
     deepSearchEvents.on("progress", deepProgressBufHandler);
 

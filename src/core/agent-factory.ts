@@ -35,7 +35,6 @@ import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.
 import { createInvestigationFeedbackTool } from "../tools/investigation-feedback.js";
 import {
   type DpState,
-  createManageChecklistTool,
   createProposeHypothesesTool,
   createEndInvestigationTool,
   getDpWorkflow,
@@ -513,7 +512,6 @@ export async function createSiclawSession(
     // DP tools for SDK brain — mutable state shared with http-server via dpState ref
     const dpState: DpState = { checklist: null };
     sdkTools.push(
-      createManageChecklistTool(dpState),
       createProposeHypothesesTool(dpState),
       createEndInvestigationTool(dpState),
     );
