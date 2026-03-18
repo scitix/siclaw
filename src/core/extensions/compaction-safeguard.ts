@@ -12,10 +12,13 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, FileOperations } from "@mariozechner/pi-coding-agent";
 import {
+  EXACT_IDENTIFIERS_HEADING,
   SUMMARIZATION_OVERHEAD_TOKENS,
   SAFETY_MARGIN,
   computeAdaptiveChunkRatio,
   estimateMessagesTokens,
+  extractToolCallsFromAssistant,
+  extractToolResultId,
   pruneHistoryForContextShare,
   repairToolUseResultPairing,
   resolveContextWindowTokens,
@@ -37,7 +40,7 @@ const REQUIRED_SUMMARY_SECTIONS = [
   "## Open TODOs",
   "## Constraints/Rules",
   "## Pending user asks",
-  "## Exact identifiers",
+  EXACT_IDENTIFIERS_HEADING,
 ] as const;
 
 const STRICT_EXACT_IDENTIFIERS_INSTRUCTION =
@@ -215,32 +218,6 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 }
 
 // ── Recent turns preservation ────────────────────────────────────────────
-
-function extractToolCallsFromAssistant(
-  msg: Extract<AgentMessage, { role: "assistant" }>,
-): Array<{ id: string }> {
-  const content = msg.content;
-  if (!Array.isArray(content)) return [];
-  const TOOL_CALL_TYPES = new Set(["toolCall", "toolUse", "functionCall"]);
-  const calls: Array<{ id: string }> = [];
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    const rec = block as { type?: unknown; id?: unknown };
-    if (typeof rec.id !== "string" || !rec.id) continue;
-    if (typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type)) {
-      calls.push({ id: rec.id });
-    }
-  }
-  return calls;
-}
-
-function extractToolResultId(msg: Extract<AgentMessage, { role: "toolResult" }>): string | null {
-  const toolCallId = (msg as { toolCallId?: unknown }).toolCallId;
-  if (typeof toolCallId === "string" && toolCallId) return toolCallId;
-  const toolUseId = (msg as { toolUseId?: unknown }).toolUseId;
-  if (typeof toolUseId === "string" && toolUseId) return toolUseId;
-  return null;
-}
 
 function splitPreservedRecentTurns(params: {
   messages: AgentMessage[];
@@ -512,6 +489,14 @@ function tokenizeOverlapText(text: string): string[] {
     .filter((token) => token.length > 0);
 }
 
+/** Check if a token is a CJK character (single-char tokens from CJK splitting). */
+function isCjkChar(ch: string): boolean {
+  if (ch.length !== 1) return false;
+  const code = ch.codePointAt(0)!;
+  // CJK Unified Ideographs + Extension A
+  return (code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF);
+}
+
 function hasAskOverlap(summary: string, latestAsk: string | null): boolean {
   if (!latestAsk) return true;
   const askTokens = Array.from(new Set(tokenizeOverlapText(latestAsk))).slice(0, 12);
@@ -522,10 +507,18 @@ function hasAskOverlap(summary: string, latestAsk: string | null): boolean {
   );
   const tokensToCheck = meaningfulTokens.length > 0 ? meaningfulTokens : askTokens;
   if (tokensToCheck.length === 0) return true;
+  const summaryLower = summary.toLocaleLowerCase().normalize("NFKC");
   const summaryTokens = new Set(tokenizeOverlapText(summary));
   let overlapCount = 0;
   for (const token of tokensToCheck) {
-    if (summaryTokens.has(token)) overlapCount += 1;
+    // For single CJK characters, use substring matching instead of exact token match
+    // since Unicode word-boundary splitting yields individual characters that rarely
+    // match as standalone tokens in the summary.
+    if (isCjkChar(token)) {
+      if (summaryLower.includes(token)) overlapCount += 1;
+    } else {
+      if (summaryTokens.has(token)) overlapCount += 1;
+    }
   }
   const requiredMatches = tokensToCheck.length >= 3 ? 2 : 1;
   return overlapCount >= requiredMatches;
@@ -615,10 +608,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       const contextWindowTokens = resolveContextWindowTokens(model);
       const turnPrefixMessages = preparation.turnPrefixMessages ?? [];
       let messagesToSummarize = preparation.messagesToSummarize;
-      const recentTurnsPreserve = Math.min(
-        MAX_RECENT_TURNS_PRESERVE,
-        clampNonNegativeInt(DEFAULT_RECENT_TURNS_PRESERVE, 0),
-      );
+      const recentTurnsPreserve = DEFAULT_RECENT_TURNS_PRESERVE;
       const qualityGuardMaxRetries = DEFAULT_QUALITY_GUARD_MAX_RETRIES;
       const structuredInstructions = buildCompactionStructureInstructions(customInstructions);
 
@@ -689,6 +679,9 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       }
 
       // ── Recent turns preservation ──
+      // Extract latestUserAsk BEFORE splitting so it reflects the actual most recent ask,
+      // not an older one left after preserved turns are removed.
+      const latestUserAsk = extractLatestUserAsk([...messagesToSummarize, ...turnPrefixMessages]);
       const {
         summarizableMessages: summaryTargetMessages,
         preservedMessages: preservedRecentMessages,
@@ -698,7 +691,6 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       });
       messagesToSummarize = summaryTargetMessages;
       const preservedTurnsSection = formatPreservedTurnsSection(preservedRecentMessages);
-      const latestUserAsk = extractLatestUserAsk([...messagesToSummarize, ...turnPrefixMessages]);
       const identifierSeedText = [...messagesToSummarize, ...turnPrefixMessages]
         .slice(-10)
         .map((message) => extractMessageText(message))
