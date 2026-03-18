@@ -297,8 +297,8 @@ export class K8sSpawner implements BoxSpawner {
                 memory: boxConfig.resources?.memory || "256Mi",
               },
               limits: {
-                cpu: boxConfig.resources?.cpu || "1000m",
-                memory: boxConfig.resources?.memory || "1Gi",
+                cpu: boxConfig.resources?.cpu || "2000m",
+                memory: boxConfig.resources?.memory || "4Gi",
               },
             },
             readinessProbe: {
