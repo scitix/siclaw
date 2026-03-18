@@ -103,22 +103,6 @@ export default function memoryFlushExtension(api: ExtensionAPI, memoryIndexer?: 
     });
   }
 
-  // Before compaction: inject a flush prompt as last chance
-  api.on("session_before_compact", () => {
-    const dateStamp = new Date().toISOString().slice(0, 10);
-
-    api.sendUserMessage(
-      `[System] Pre-compaction memory flush. ` +
-      `Context is about to be compacted. Save any important discoveries, findings, or context ` +
-      `from this session to \`memory/${dateStamp}.md\` now. ` +
-      `If the file already exists, APPEND new content — do not overwrite existing entries. ` +
-      `If there is nothing important to save, reply with exactly: ${SILENT_REPLY_TOKEN}`,
-      { deliverAs: "followUp" },
-    );
-
-    return undefined;
-  });
-
   // Track compaction events for flush gating
   api.on("session_compact", () => {
     compactionCount++;
