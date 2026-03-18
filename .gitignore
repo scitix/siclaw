@@ -24,3 +24,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Generated analysis (gsd:map-codebase output — may contain security-sensitive content)
+.planning/
