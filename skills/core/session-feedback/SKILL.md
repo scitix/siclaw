@@ -8,20 +8,34 @@ tags: [feedback, meta, improvement]
 
 You are conducting an interactive feedback review of the current diagnostic session. Follow these phases. Be concise — don't over-ask.
 
-## Phase 1 — Review
+## Phase 1 — Compressed Timeline with Self-Reflection
 
-Summarize the diagnostic process based on the Session Diagnostic Timeline:
+Analyze the Session Diagnostic Timeline and present a **compressed timeline**:
 
-1. List key decision points in chronological order (not every tool call — focus on decisions)
-2. For each, note: what was decided, what tool/skill was used, the outcome
-3. Present as a numbered list in the user's language
+**Compression rules:**
+- Group consecutive same-purpose tool calls into one line, marked with `(N steps)`
+- Routine successful steps get `✓` and stay as one-liners
+- Decision points or anomalies get `⚠️` with a brief self-reflection on what might be questionable
+- Target: **5-8 lines max**, regardless of how many raw steps exist
+
+**Example format:**
+```
+1. Cluster connection — credential_list → connected to roce-test ✓
+2. Component scan (6 steps) — pods/nodes/daemonsets → found 3 nodes NotReady ✓
+3. ⚠️ NIC identification — inferred Broadcom from ConfigMap tag, did not verify on node
+4. Node diagnostics (4 steps) — node_exec attempts → debug image pull failed
+5. ⚠️ Log analysis pivot — exporter shows no devices vs rdma-qos shows 60+ VFs, contradictory
+6. Report generation ✓
+```
+
+After presenting, tell the user: **"If you want details on any compressed step, just mention its number."**
 
 ## Phase 2 — Interactive Evaluation
 
 Present options using **letters** (to avoid confusion with numeric ratings):
 
 > **A.** Overall direction — right track?
-> **B.** A specific step — wrong or suboptimal?
+> **B.** A specific step — pick a number from the timeline above, or describe it
 > **C.** Missing checks — important diagnostics skipped?
 > **D.** Conclusion accuracy — was the diagnosis correct?
 > **E.** All good — satisfied, nothing to change
@@ -29,6 +43,7 @@ Present options using **letters** (to avoid confusion with numeric ratings):
 
 **Rules:**
 - User selects a letter → ask ONE follow-up to get the details (what was wrong + what should have been done). Do NOT ask multiple questions one by one — let the user explain in their own words.
+- If user references a timeline number (e.g. "B 3"), expand that step's details from the raw timeline and discuss it.
 - After each feedback item, show a brief **running tally** (e.g. "Noted: 2 items so far") and ask: **"Continue (letter) or generate report (R)?"**
 - If user selects **E**, skip directly to Phase 3.
 - After **3 feedback items**, proactively suggest generating the report. Don't keep looping.
