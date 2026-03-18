@@ -394,16 +394,25 @@ export async function investigate(
   } else {
     onProgress?.({ type: "phase", phase: "Phase 1/4", detail: "Gathering context..." });
     const contextPrompt = contextGatheringPrompt(question, budget.maxContextCalls, kubeconfigPath);
-    const contextResult = await runSubAgent(
-      contextPrompt,
-      question,
-      budget.maxContextCalls,
-      options,
-      onProgress,
-      forceContextSummaryPrompt(),
-    );
-    globalCallsUsed += contextResult.callsUsed;
-    contextSummary = parseContextSummary(contextResult.textOutput);
+    try {
+      const contextResult = await runSubAgent(
+        contextPrompt,
+        question,
+        budget.maxContextCalls,
+        options,
+        onProgress,
+        forceContextSummaryPrompt(),
+      );
+      globalCallsUsed += contextResult.callsUsed;
+      contextSummary = parseContextSummary(contextResult.textOutput);
+    } catch (err) {
+      // Phase 1 sub-agent timed out or crashed — fall back to question as context
+      // so Phases 2-4 can still proceed with degraded quality.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[deep-search] Phase 1 context gathering failed: ${msg}`);
+      onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Context gathering failed (${msg}), proceeding with question only` });
+      contextSummary = `Context gathering failed. Original question: ${question}`;
+    }
   }
 
   // --- Prior Investigation Retrieval (3-layer: patterns + similar + validated hypotheses) ---
