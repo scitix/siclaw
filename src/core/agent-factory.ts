@@ -469,7 +469,7 @@ export async function createSiclawSession(
       }
       return parts;
     },
-    // compactionSafeguard must precede memoryFlush so it handles session_before_compact first.
+    // Extension registration order: compactionSafeguard handles session_before_compact.
     extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
