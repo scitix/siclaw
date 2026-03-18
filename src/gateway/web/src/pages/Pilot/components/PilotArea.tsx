@@ -240,6 +240,16 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         return null;
     }, [messages]);
 
+    // Find last assistant message id — used to show suggested reply chips only on the latest reply
+    const lastAssistantMsgId = useMemo(() => {
+        const visible = messages.filter(m => !m.hidden);
+        for (let i = visible.length - 1; i >= 0; i--) {
+            if (visible[i].role === 'assistant') return visible[i].id;
+            if (visible[i].role === 'user') return null;
+        }
+        return null;
+    }, [messages]);
+
     // Check if latest hypotheses were already confirmed.
     // Three signals (any one is sufficient):
     // 1. deep_search tool message exists after hypotheses (works when complete or in live session)
@@ -432,6 +442,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     hypothesesSuperseded={latestHypothesesId != null && msg.toolName === 'propose_hypotheses' && msg.id !== latestHypothesesId}
                                     hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                                     selectedWorkspaceId={selectedWorkspaceId}
+                                    showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
                                 />
                             ))}
 
@@ -530,7 +541,48 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
     return { isDeepInvestigation: false, text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId }: {
+/** Parse <!-- suggested-replies: A|Label A, B|Label B --> from assistant messages */
+interface SuggestedReply { key: string; label: string; }
+
+/** Auto-detect `- **X.** Label — description` option patterns from agent output */
+function detectOptionReplies(content: string): SuggestedReply[] {
+    const replies: SuggestedReply[] = [];
+    const regex = /[-*]\s+\*\*([A-Za-z\d]+)\.\*\*\s+(.+?)(?:\s+[—\-–]\s+.*)?$/gm;
+    for (const match of content.matchAll(regex)) {
+        replies.push({ key: match[1], label: match[2].trim() });
+    }
+    return replies.length >= 2 && replies.length <= 8 ? replies : [];
+}
+
+function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; text: string } {
+    // Priority 1: Explicit HTML comment (escape hatch for custom cases)
+    const commentMatch = content.match(/<!--\s*suggested-replies:\s*(.*?)\s*-->/);
+    if (commentMatch) {
+        const replies: SuggestedReply[] = [];
+        for (const part of commentMatch[1].split(',')) {
+            const trimmed = part.trim();
+            if (!trimmed) continue;
+            const pipeIdx = trimmed.indexOf('|');
+            if (pipeIdx > 0) {
+                replies.push({ key: trimmed.slice(0, pipeIdx).trim(), label: trimmed.slice(pipeIdx + 1).trim() });
+            } else {
+                replies.push({ key: trimmed, label: trimmed });
+            }
+        }
+        const text = content.replace(/<!--\s*suggested-replies:\s*.*?\s*-->/, '').trimEnd();
+        return { replies, text };
+    }
+
+    // Priority 2: Auto-detect **X.** option patterns — zero agent burden
+    const detected = detectOptionReplies(content);
+    if (detected.length > 0) {
+        return { replies: detected, text: content };
+    }
+
+    return { replies: [], text: content };
+}
+
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -554,6 +606,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     /** True when a deep_search exists after this propose_hypotheses — survives page refresh */
     hypothesesAlreadyConfirmed?: boolean;
     selectedWorkspaceId?: string | null;
+    showSuggestedReplies?: boolean;
 }) {
     const isUser = message.role === 'user';
     const isTool = message.role === 'tool';
@@ -593,9 +646,14 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     const { scripts, text: afterScripts } = isUser
         ? parseScriptRefs(afterDeepInv)
         : { scripts: [] as ScriptRef[], text: afterDeepInv };
-    const { skillName, text: textContent } = isUser
+    const { skillName, text: afterSkillRef } = isUser
         ? parseSkillRef(afterScripts)
         : { skillName: null, text: afterScripts };
+
+    // Parse suggested replies from the last non-streaming assistant message
+    const { replies: suggestedReplies, text: textContent } = !isUser && !isTool && showSuggestedReplies && !message.isStreaming
+        ? parseSuggestedReplies(afterSkillRef)
+        : { replies: [] as SuggestedReply[], text: afterSkillRef };
 
     return (
         <div className={cn(
@@ -672,6 +730,21 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
                             : "bg-white border border-gray-200 text-gray-800 rounded-tl-sm"
                     )}>
                         <Markdown>{textContent}</Markdown>
+                    </div>
+                )}
+
+                {suggestedReplies.length > 0 && sendMessage && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                        {suggestedReplies.map((reply) => (
+                            <button
+                                key={reply.key}
+                                type="button"
+                                onClick={() => sendMessage(reply.key)}
+                                className="rounded-full px-3 py-1.5 text-sm border border-gray-200 bg-white hover:bg-gray-50 text-gray-700 transition-colors cursor-pointer"
+                            >
+                                {reply.label}
+                            </button>
+                        ))}
                     </div>
                 )}
             </div>
