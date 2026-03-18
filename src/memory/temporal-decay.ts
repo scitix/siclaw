@@ -17,7 +17,7 @@ export const DEFAULT_TEMPORAL_DECAY: TemporalDecayConfig = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const DATED_MEMORY_RE = /(?:^|\/)(\d{4})-(\d{2})-(\d{2})\.md$/;
+const DATED_MEMORY_RE = /(?:^|\/)(\d{4})-(\d{2})-(\d{2})(?:-\d{4}(?:-\d+)?)?\.md$/;
 
 function toDecayLambda(halfLifeDays: number): number {
   if (!Number.isFinite(halfLifeDays) || halfLifeDays <= 0) return 0;
@@ -41,7 +41,7 @@ function parseDate(filePath: string): Date | null {
 function isEvergreen(filePath: string): boolean {
   const normalized = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
   if (normalized === "MEMORY.md" || normalized === "memory.md") return true;
-  // Non-dated files under memory/ are topic files (evergreen)
+  // Non-dated files under memory/ (PROFILE.md, legacy topics, user-written) are evergreen
   if (normalized.startsWith("memory/") && !DATED_MEMORY_RE.test(normalized)) return true;
   return false;
 }

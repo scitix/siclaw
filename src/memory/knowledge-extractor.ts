@@ -1,4 +1,7 @@
 /**
+ * DISABLED — no production callsites. Reactivate when a config flag for selective
+ * topic extraction is implemented (e.g. settings.json memory.topicExtraction: true).
+ *
  * Knowledge Extractor — extracts structured knowledge from conversations.
  *
  * Replaces raw conversation dumps with LLM-driven topic extraction.

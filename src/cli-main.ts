@@ -10,7 +10,7 @@ import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
-import { consolidateAllPending } from "./memory/topic-consolidator.js";
+// topic-consolidator import removed — consolidation disabled
 import type { BrainType } from "./core/brain-session.js";
 
 // Parse arguments
@@ -102,16 +102,10 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
   }
 }
 
-// Startup maintenance: purge stale investigations, then consolidate topics (chained to avoid race)
+// Startup maintenance: purge stale investigations
 if (memoryIndexer) {
   const cliMemoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   memoryIndexer.purgeStaleInvestigations(cliMemoryDir)
-    .then(() => {
-      const llm = getDefaultLlm();
-      if (llm?.apiKey && llm?.baseUrl) {
-        return consolidateAllPending(cliMemoryDir, { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id });
-      }
-    })
     .catch(err => console.warn("[siclaw] Startup maintenance failed:", err));
 }
 
@@ -218,15 +212,9 @@ if (session.sessionFile) {
   const sessionDir = path.dirname(session.sessionFile);
   const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {
-    const llm = getDefaultLlm();
-    const saved = await saveSessionKnowledge({
-      sessionDir,
-      memoryDir,
-      llmConfig: llm ? { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id } : undefined,
-    });
+    const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
     if (saved) {
-      const label = Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : path.basename(saved);
-      console.log(`[siclaw] Session knowledge saved: ${label}`);
+      console.log(`[siclaw] Session knowledge saved: ${saved.map(f => path.basename(f)).join(", ")}`);
     }
   } catch (err) {
     console.warn(`[siclaw] Memory auto-save failed:`, err);
