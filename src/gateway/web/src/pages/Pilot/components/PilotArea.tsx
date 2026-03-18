@@ -7,6 +7,17 @@ import { SkillCard, type SkillRefStatus } from './SkillCard';
 import { ScheduleCard, type ScheduleCardStatus } from './ScheduleCard';
 import { InvestigationCard } from './InvestigationCard';
 import { HypothesesCard } from './HypothesesCard';
+
+const THINKING_TIPS = [
+    'Thinking...',
+    'Tip: Use + to provide session feedback and help the AI improve',
+    'Tip: Enable Deep Investigation for hypothesis-driven root cause analysis',
+    'Tip: Siclaw remembers findings across sessions \u2014 ask about past investigations',
+    'Analyzing the situation...',
+    'Tip: Use Skills to run reusable diagnostic scripts',
+    'Tip: You can steer the AI mid-response by typing in the input box',
+    'Working on it...',
+];
 import { DpChecklistCard, type DpChecklistItem } from './DpChecklistCard';
 import { WelcomeArea } from './WelcomeArea';
 import type { PilotMessage, ContextUsage, InvestigationProgress, SystemStatus } from '@/hooks/usePilot';
@@ -175,6 +186,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             userScrolledAwayRef.current = false;
             prevMsgCountRef.current = 0;
             needsScrollOnLoadRef.current = true;
+            hasShownFeedbackHintRef.current = false;
             pendingRestoreScrollRef.current = true;
             if (restoreScrollTimerRef.current) {
                 clearTimeout(restoreScrollTimerRef.current);
@@ -182,6 +194,23 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             }
         }
     }, [sessionKey]);
+
+    // Feedback hint: show once per session after agent finishes first response
+    const hasShownFeedbackHintRef = useRef(false);
+    const prevIsLoadingRef = useRef(isLoading);
+    const [showFeedbackHint, setShowFeedbackHint] = useState(false);
+
+    useEffect(() => {
+        const wasLoading = prevIsLoadingRef.current;
+        prevIsLoadingRef.current = isLoading;
+
+        if (wasLoading && !isLoading && !hasShownFeedbackHintRef.current && messages.length > 0) {
+            hasShownFeedbackHintRef.current = true;
+            setShowFeedbackHint(true);
+            const timer = setTimeout(() => setShowFeedbackHint(false), 7000);
+            return () => clearTimeout(timer);
+        }
+    }, [isLoading, messages.length]);
 
     useEffect(() => {
         return () => {
@@ -411,15 +440,14 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                 <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
                             )}
 
-                            {isLoading && (
-                                <div className="flex gap-4">
-                                    <div className="w-8 h-8 rounded-full bg-white border border-gray-200 flex items-center justify-center text-primary-600 shadow-sm">
-                                        <Cpu className="w-5 h-5" />
-                                    </div>
-                                    <div className="flex items-center gap-2 text-gray-400">
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                        <span className="text-sm">Thinking...</span>
-                                    </div>
+                            {isLoading && <ThinkingIndicator />}
+
+                            {showFeedbackHint && (
+                                <div className={cn(
+                                    "text-center text-xs text-gray-400 py-2 transition-opacity duration-500",
+                                    showFeedbackHint ? "opacity-100" : "opacity-0"
+                                )}>
+                                    Was this helpful? Tap <span className="font-medium text-gray-500">+</span> below to share feedback
                                 </div>
                             )}
                         </>
@@ -427,7 +455,40 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} skills={skills} onEditSkill={onEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} />
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} />
+        </div>
+    );
+}
+
+function ThinkingIndicator() {
+    const [tipIndex, setTipIndex] = useState(0);
+    const [visible, setVisible] = useState(true);
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            setVisible(false);
+            setTimeout(() => {
+                setTipIndex(i => (i + 1) % THINKING_TIPS.length);
+                setVisible(true);
+            }, 300);
+        }, 8000);
+        return () => clearInterval(interval);
+    }, []);
+
+    return (
+        <div className="flex gap-4">
+            <div className="w-8 h-8 rounded-full bg-white border border-gray-200 flex items-center justify-center text-primary-600 shadow-sm">
+                <Cpu className="w-5 h-5" />
+            </div>
+            <div className="flex items-center gap-2 text-gray-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span className={cn(
+                    "text-sm transition-opacity duration-300",
+                    visible ? "opacity-100" : "opacity-0"
+                )}>
+                    {THINKING_TIPS[tipIndex]}
+                </span>
+            </div>
         </div>
     );
 }
