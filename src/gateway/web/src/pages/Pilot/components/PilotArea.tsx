@@ -195,6 +195,10 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         }
     }, [sessionKey]);
 
+    // Suggested reply draft — chip click populates input instead of sending immediately
+    const chipSeq = useRef(0);
+    const [chipDraft, setChipDraft] = useState<string | null>(null);
+
     // Feedback hint: show once per session after agent finishes first response
     const hasShownFeedbackHintRef = useRef(false);
     const prevIsLoadingRef = useRef(isLoading);
@@ -443,6 +447,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                                     selectedWorkspaceId={selectedWorkspaceId}
                                     showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                                    onChipClick={(key) => { chipSeq.current++; setChipDraft(key + ' '); }}
                                 />
                             ))}
 
@@ -466,7 +471,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} />
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} draft={chipDraft} draftSeq={chipSeq.current} />
         </div>
     );
 }
@@ -544,14 +549,25 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
 /** Parse <!-- suggested-replies: A|Label A, B|Label B --> from assistant messages */
 interface SuggestedReply { key: string; label: string; }
 
-/** Auto-detect `- **X.** Label — description` option patterns from agent output */
+/** Auto-detect option patterns from agent output.
+ *  Primary:  `- **X.** Label` (bullet + bold)
+ *  Fallback: `X. Label` (plain, letter-only keys — catches agent format drift) */
 function detectOptionReplies(content: string): SuggestedReply[] {
-    const replies: SuggestedReply[] = [];
+    // Primary: - **X.** label (bullet + bold)
+    const primary: SuggestedReply[] = [];
     const regex = /[-*]\s+\*\*([A-Za-z\d]+)\.\*\*\s+(.+?)(?:\s+[—\-–]\s+.*)?$/gm;
     for (const match of content.matchAll(regex)) {
-        replies.push({ key: match[1], label: match[2].trim() });
+        primary.push({ key: match[1], label: match[2].trim() });
     }
-    return replies.length >= 2 && replies.length <= 8 ? replies : [];
+    if (primary.length >= 2 && primary.length <= 8) return primary;
+
+    // Fallback: X. label (uppercase letter keys only, avoids matching numbered lists)
+    const fallback: SuggestedReply[] = [];
+    const fallbackRegex = /^([A-Z])\.\s+(.+?)(?:\s+[—\-–]\s+.*)?$/gm;
+    for (const match of content.matchAll(fallbackRegex)) {
+        fallback.push({ key: match[1], label: match[2].trim() });
+    }
+    return fallback.length >= 2 && fallback.length <= 8 ? fallback : [];
 }
 
 function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; text: string } {
@@ -582,7 +598,7 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies }: {
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -607,6 +623,8 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     hypothesesAlreadyConfirmed?: boolean;
     selectedWorkspaceId?: string | null;
     showSuggestedReplies?: boolean;
+    /** Chip click populates input instead of sending immediately */
+    onChipClick?: (key: string) => void;
 }) {
     const isUser = message.role === 'user';
     const isTool = message.role === 'tool';
@@ -650,10 +668,14 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
         ? parseSkillRef(afterScripts)
         : { skillName: null, text: afterScripts };
 
-    // Parse suggested replies from the last non-streaming assistant message
+    // Always strip <!-- suggested-replies --> comments from assistant messages (they should never be visible)
+    // Only parse replies into chips for the last non-streaming assistant message
+    const strippedContent = !isUser && !isTool
+        ? afterSkillRef.replace(/<!--\s*suggested-replies:\s*.*?\s*-->/g, '').trimEnd()
+        : afterSkillRef;
     const { replies: suggestedReplies, text: textContent } = !isUser && !isTool && showSuggestedReplies && !message.isStreaming
         ? parseSuggestedReplies(afterSkillRef)
-        : { replies: [] as SuggestedReply[], text: afterSkillRef };
+        : { replies: [] as SuggestedReply[], text: strippedContent };
 
     return (
         <div className={cn(
@@ -733,16 +755,16 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
                     </div>
                 )}
 
-                {suggestedReplies.length > 0 && sendMessage && (
+                {suggestedReplies.length > 0 && onChipClick && (
                     <div className="flex flex-wrap gap-2 mt-2">
                         {suggestedReplies.map((reply) => (
                             <button
                                 key={reply.key}
                                 type="button"
-                                onClick={() => sendMessage(reply.key)}
+                                onClick={() => onChipClick(reply.key)}
                                 className="rounded-full px-3 py-1.5 text-sm border border-gray-200 bg-white hover:bg-gray-50 text-gray-700 transition-colors cursor-pointer"
                             >
-                                {reply.label}
+                                <span className="font-medium text-gray-500">{reply.key}.</span> {reply.label}
                             </button>
                         ))}
                     </div>

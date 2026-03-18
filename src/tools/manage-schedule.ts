@@ -107,7 +107,7 @@ Common cron patterns:
       // List action: query Gateway for current schedules
       if (params.action === "list") {
         const cfg = loadConfig();
-        const gatewayUrl = cfg.server.gatewayUrl || "http://siclaw-gateway";
+        const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
         const userId = cfg.userId;
         const workspaceId = process.env.SICLAW_WORKSPACE_ID;
         try {
