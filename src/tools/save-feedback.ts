@@ -81,6 +81,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
       let improvements: unknown;
       let tags: unknown;
       let feedbackConversation: unknown;
+      let conversationOmitted = false;
 
       try {
         if (params.decisionPoints) decisionPoints = JSON.parse(params.decisionPoints);
@@ -91,7 +92,11 @@ The report includes overall rating, decision point evaluations, strengths, impro
           const parsed = JSON.parse(params.feedbackConversation);
           const serialized = JSON.stringify(parsed);
           // Drop entirely if serialized size exceeds limit (truncating JSON is unsafe)
-          feedbackConversation = serialized.length <= MAX_CONVERSATION_BYTES ? parsed : undefined;
+          if (serialized.length <= MAX_CONVERSATION_BYTES) {
+            feedbackConversation = parsed;
+          } else {
+            conversationOmitted = true;
+          }
         }
       } catch (err) {
         return {
@@ -120,7 +125,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
         ) as { ok: boolean; id: string };
 
         return {
-          content: [{ type: "text", text: `Feedback saved successfully (id: ${result.id}).` }],
+          content: [{ type: "text", text: `Feedback saved successfully (id: ${result.id}).${conversationOmitted ? " Note: conversation transcript omitted (exceeded size limit)." : ""}` }],
           details: { id: result.id, sessionId },
         };
       } catch (err) {

@@ -31,13 +31,15 @@ interface InputAreaProps {
     dpFocus?: string | null;
     dpActive?: boolean;
     onSetDpActive?: (active: boolean) => void;
+    /** Whether the session has messages — gates feedback button visibility */
+    hasMessages?: boolean;
     /** External draft text — when changed, populates the input and focuses it */
     draft?: string | null;
     /** Sequence counter — ensures useEffect fires even for repeated same-value drafts */
     draftSeq?: number;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, draft, draftSeq }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const isComposingRef = useRef(false);
@@ -144,8 +146,8 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                                                     {deepInvestigation && <Check className="w-4 h-4 text-blue-500 shrink-0" />}
                                                 </button>
 
-                                                {/* Session Feedback */}
-                                                {!isLoading && (
+                                                {/* Session Feedback — only visible when session has messages */}
+                                                {!isLoading && hasMessages && (
                                                     <button
                                                         type="button"
                                                         onClick={() => { onSend("[Feedback]"); setShowActionMenu(false); }}
