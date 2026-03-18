@@ -1,4 +1,6 @@
 /**
+ * DISABLED — no production callsites. Kept for potential future config-gated reuse.
+ *
  * Topic Consolidator — LLM-driven deduplication and merging of topic files.
  *
  * When topic files accumulate many date sections and facts over time, this module

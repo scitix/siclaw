@@ -212,15 +212,9 @@ if (session.sessionFile) {
   const sessionDir = path.dirname(session.sessionFile);
   const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {
-    const llm = getDefaultLlm();
-    const saved = await saveSessionKnowledge({
-      sessionDir,
-      memoryDir,
-      llmConfig: llm ? { apiKey: llm.apiKey, baseUrl: llm.baseUrl, model: llm.model?.id } : undefined,
-    });
+    const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
     if (saved) {
-      const label = Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : path.basename(saved);
-      console.log(`[siclaw] Session knowledge saved: ${label}`);
+      console.log(`[siclaw] Session knowledge saved: ${saved.map(f => path.basename(f)).join(", ")}`);
     }
   } catch (err) {
     console.warn(`[siclaw] Memory auto-save failed:`, err);
