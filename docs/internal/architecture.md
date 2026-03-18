@@ -195,7 +195,7 @@ For claude-sdk brain: raw server config is passed to the SDK's native MCP suppor
 4. Loads MCP tools from external servers
 5. Initializes the chosen brain (pi-agent or claude-sdk) with the assembled tools and system prompt
 6. For pi-agent: initializes memory indexer, loads extensions (context pruning, memory flush, deep investigation)
-7. For claude-sdk: adds deep investigation tools (manage_checklist, propose_hypotheses, end_investigation), starts LLM proxy if needed
+7. For claude-sdk: adds deep investigation tools (propose_hypotheses, end_investigation), starts LLM proxy if needed
 
 ## 4. Tool System
 
@@ -233,7 +233,6 @@ All tools are TypeBox `ToolDefinition` objects with structured input schemas and
 | Tool | File | Description |
 |------|------|-------------|
 | `deep_search` | `deep-search/tool.ts` | Structured hypothesis-driven investigation (see Section 5) |
-| `manage_checklist` | `dp-tools.ts` | Update deep investigation phase statuses (claude-sdk only) |
 | `propose_hypotheses` | `dp-tools.ts` | Present hypotheses to user for confirmation (claude-sdk only) |
 | `end_investigation` | `dp-tools.ts` | Early termination of investigation (claude-sdk only) |
 | `manage_schedule` | `manage-schedule.ts` | CRUD for cron schedules. Queries Gateway's internal API |
