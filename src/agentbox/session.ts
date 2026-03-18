@@ -19,11 +19,11 @@ import { createSiclawSession, type KubeconfigRef, type LlmConfigRef, type Sessio
 import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
-import { saveSessionMemory, saveSessionKnowledge } from "../memory/session-summarizer.js";
+import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import { consolidateAllPending } from "../memory/topic-consolidator.js";
+// topic-consolidator import removed — consolidation disabled
 
 export interface ManagedSession {
   id: string;
@@ -214,17 +214,6 @@ export class AgentBoxSessionManager {
       this._sharedMemoryIndexer.sync()
         .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
         .catch(err => console.warn("[agentbox-session] Memory sync/purge failed:", err));
-    }
-
-    // Catch-up topic consolidation on new session — use llmConfigRef (dynamic, works in K8s mode)
-    if (isNewSession) {
-      const memDir = this.getMemoryDir();
-      const llmRef = result.llmConfigRef;
-      if (llmRef.apiKey && llmRef.baseUrl) {
-        consolidateAllPending(memDir, { apiKey: llmRef.apiKey, baseUrl: llmRef.baseUrl, model: llmRef.model }).catch(err =>
-          console.warn("[agentbox-session] Topic consolidation failed:", err),
-        );
-      }
     }
 
     managed = {
@@ -427,16 +416,10 @@ export class AgentBoxSessionManager {
       const currentMessageCount = this.countJsonlMessages(sessionDir);
 
       if (currentMessageCount > managed._lastSavedMessageCount) {
-        const saved = await saveSessionKnowledge({
-          sessionDir,
-          memoryDir,
-          llmConfig: managed.llmConfigRef.apiKey && managed.llmConfigRef.baseUrl
-            ? { apiKey: managed.llmConfigRef.apiKey, baseUrl: managed.llmConfigRef.baseUrl, model: managed.llmConfigRef.model }
-            : undefined,
-        });
+        const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
         if (saved) {
           managed._lastSavedMessageCount = currentMessageCount;
-          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${Array.isArray(saved) ? saved.map(f => path.basename(f)).join(", ") : saved}`);
+          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
         }
       } else {
         console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);

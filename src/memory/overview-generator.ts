@@ -14,27 +14,24 @@ export interface OverviewOpts {
 
 /**
  * Build a concise knowledge overview from workspace directories.
- * Scans repos/, docs/, topics/, and investigations/.
+ * Scans repos/, docs/, and investigations/ (topic files no longer injected).
  * Pure sync filesystem scan — no DB dependency.
  * Returns empty string if no knowledge files exist.
  */
 export function buildKnowledgeOverview(opts: OverviewOpts): string {
   const { memoryDir, reposDir, docsDir, investigationPatterns } = opts;
-  const TOTAL_BUDGET = 1800;
+  const TOTAL_BUDGET = 1200;
 
-  const topicsDir = path.join(memoryDir, "topics");
   const investigationsDir = path.join(memoryDir, "investigations");
 
   const repoEntries = reposDir ? scanRepos(reposDir) : [];
   const docEntries = docsDir ? scanDocs(docsDir) : [];
-  const topicEntries = scanTopics(topicsDir);
   const investigationEntries = scanInvestigations(investigationsDir);
 
   const hasPatterns = investigationPatterns && investigationPatterns.length > 0;
   if (
     repoEntries.length === 0 &&
     docEntries.length === 0 &&
-    topicEntries.length === 0 &&
     investigationEntries.length === 0 &&
     !hasPatterns
   ) {
@@ -53,7 +50,7 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     for (const entry of repoEntries) {
       const langs = entry.topExtensions.length > 0 ? entry.topExtensions.join(", ") : "-";
       const row = `\n| ${entry.name} | ${entry.fileCount} | ${langs} |`;
-      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 1200) break; // reserve for docs + topics + investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 800) break; // reserve for docs + investigations + footer
       rows.push(row);
       sectionLen += row.length;
     }
@@ -72,33 +69,13 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     let sectionLen = header.length;
     for (const entry of docEntries) {
       const row = `\n| ${entry.category} | ${entry.fileCount} |`;
-      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 900) break; // reserve for topics + investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 400) break; // reserve for investigations + footer
       rows.push(row);
       sectionLen += row.length;
     }
 
     if (rows.length > 0) {
       parts.push(header + rows.join(""));
-      currentLen += sectionLen;
-    }
-  }
-
-  // --- Accumulated Knowledge (~500 chars budget) ---
-  if (topicEntries.length > 0) {
-    const header = "\n\n### Accumulated Knowledge";
-
-    const lines: string[] = [];
-    let sectionLen = header.length;
-    for (const entry of topicEntries) {
-      const summaryPart = entry.summary ? `: ${entry.summary}` : "";
-      const line = `\n- **${entry.topic}** (${entry.factCount} facts, updated ${entry.lastUpdated})${summaryPart}`;
-      if (currentLen + sectionLen + line.length > TOTAL_BUDGET - 300) break; // reserve space for investigations + footer
-      lines.push(line);
-      sectionLen += line.length;
-    }
-
-    if (lines.length > 0) {
-      parts.push(header + lines.join(""));
       currentLen += sectionLen;
     }
   }
@@ -128,8 +105,8 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   // --- Footer ---
   const hasWorkspace = repoEntries.length > 0 || docEntries.length > 0;
   const footer = hasWorkspace
-    ? '\n\nUse `read` to view files in repos/ or docs/, `memory_get` for memory details, or `memory_search` to search.'
-    : '\n\nUse `memory_get` with path like "topics/<name>.md" to read details, or `memory_search` to find specific facts.';
+    ? '\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.'
+    : '\n\nUse `memory_search` to find specific facts from past sessions or investigations.';
   parts.push(footer);
 
   return parts.join("");
@@ -148,13 +125,6 @@ interface RepoInfo {
 interface DocEntry {
   category: string;
   fileCount: number;
-}
-
-interface TopicInfo {
-  topic: string;
-  factCount: number;
-  lastUpdated: string;
-  summary: string;
 }
 
 interface InvestigationInfo {
@@ -279,76 +249,6 @@ function scanDocs(docsDir: string): DocEntry[] {
   // Sort by file count descending, (root) last if tied
   entries.sort((a, b) => b.fileCount - a.fileCount || (a.category === "(root)" ? 1 : -1));
   return entries;
-}
-
-function scanTopics(topicsDir: string): TopicInfo[] {
-  if (!fs.existsSync(topicsDir)) return [];
-
-  let files: string[];
-  try {
-    files = fs.readdirSync(topicsDir).filter(f => f.endsWith(".md"));
-  } catch {
-    return [];
-  }
-
-  const entries: TopicInfo[] = [];
-  for (const file of files) {
-    try {
-      const content = fs.readFileSync(path.join(topicsDir, file), "utf-8");
-      const facts = content.split("\n").filter(line => line.startsWith("- "));
-      const factCount = facts.length;
-
-      // For consolidated files, check Last consolidated header for date
-      let lastUpdated = findLatestDateSection(content);
-      if (lastUpdated === "unknown") {
-        const consolidatedMatch = content.match(/^Last consolidated:\s*(\d{4}-\d{2}-\d{2})/m);
-        if (consolidatedMatch) {
-          lastUpdated = consolidatedMatch[1];
-        }
-      }
-
-      // Build summary from first 3 facts (~60 chars max)
-      const MAX_SUMMARY_CHARS = 60;
-      const summaryParts: string[] = [];
-      let summaryLen = 0;
-      for (const fact of facts.slice(0, 3)) {
-        const text = fact.slice(2).trim(); // remove "- " prefix
-        const short = text.length > 30 ? text.slice(0, 27) + "..." : text;
-        if (summaryLen + short.length + 2 > MAX_SUMMARY_CHARS && summaryParts.length > 0) break;
-        summaryParts.push(short);
-        summaryLen += short.length + 2; // +2 for ", "
-      }
-      const summary = summaryParts.join(", ");
-
-      entries.push({
-        topic: file.replace(/\.md$/, ""),
-        factCount,
-        lastUpdated,
-        summary,
-      });
-    } catch {
-      // Skip malformed files
-    }
-  }
-
-  // Sort by lastUpdated descending
-  entries.sort((a, b) => b.lastUpdated.localeCompare(a.lastUpdated));
-  return entries;
-}
-
-/**
- * Find the most recent `## YYYY-MM-DD` section header in a topic file.
- */
-function findLatestDateSection(content: string): string {
-  const dateRegex = /^## (\d{4}-\d{2}-\d{2})/gm;
-  let latest = "";
-  let match;
-  while ((match = dateRegex.exec(content)) !== null) {
-    if (match[1] > latest) {
-      latest = match[1];
-    }
-  }
-  return latest || "unknown";
 }
 
 function scanInvestigations(investigationsDir: string): InvestigationInfo[] {
