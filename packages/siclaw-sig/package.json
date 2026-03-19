@@ -1,6 +1,9 @@
 {
   "name": "siclaw-sig",
   "version": "0.1.0",
+  "bin": {
+    "siclaw-sig": "./dist/cli/main.js"
+  },
   "private": true,
   "type": "module",
   "exports": {
@@ -15,20 +18,27 @@
     "./extraction": {
       "types": "./dist/extraction/index.d.ts",
       "default": "./dist/extraction/index.js"
+    },
+    "./pipeline": {
+      "types": "./dist/pipeline/index.d.ts",
+      "default": "./dist/pipeline/index.js"
     }
   },
-  "files": ["dist/"],
+  "files": [
+    "dist/"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run"
   },
   "dependencies": {
+    "commander": "^13.1.0",
+    "js-yaml": "^4.1.1",
     "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
-    "js-yaml": "^4.1.1",
-    "vitest": "^3.0.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "vitest": "^3.0.0"
   }
 }
