@@ -75,34 +75,38 @@ The report includes overall rating, decision point evaluations, strengths, impro
         };
       }
 
-      // Parse JSON string fields
+      // Parse JSON string fields independently — valid fields are saved even if one fails
       let decisionPoints: unknown;
       let strengths: unknown;
       let improvements: unknown;
       let tags: unknown;
       let feedbackConversation: unknown;
       let conversationOmitted = false;
+      const parseErrors: string[] = [];
 
-      try {
-        if (params.decisionPoints) decisionPoints = JSON.parse(params.decisionPoints);
-        if (params.strengths) strengths = JSON.parse(params.strengths);
-        if (params.improvements) improvements = JSON.parse(params.improvements);
-        if (params.tags) tags = JSON.parse(params.tags);
-        if (params.feedbackConversation) {
+      const tryParse = (name: string, value: string | undefined): unknown => {
+        if (!value) return undefined;
+        try { return JSON.parse(value); }
+        catch { parseErrors.push(name); return undefined; }
+      };
+
+      decisionPoints = tryParse("decisionPoints", params.decisionPoints);
+      strengths = tryParse("strengths", params.strengths);
+      improvements = tryParse("improvements", params.improvements);
+      tags = tryParse("tags", params.tags);
+
+      if (params.feedbackConversation) {
+        try {
           const parsed = JSON.parse(params.feedbackConversation);
           const serialized = JSON.stringify(parsed);
-          // Drop entirely if serialized size exceeds limit (truncating JSON is unsafe)
           if (serialized.length <= MAX_CONVERSATION_BYTES) {
             feedbackConversation = parsed;
           } else {
             conversationOmitted = true;
           }
+        } catch {
+          parseErrors.push("feedbackConversation");
         }
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Invalid JSON in feedback fields: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true },
-        };
       }
 
       try {
@@ -125,7 +129,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
         ) as { ok: boolean; id: string };
 
         return {
-          content: [{ type: "text", text: `Feedback saved successfully (id: ${result.id}).${conversationOmitted ? " Note: conversation transcript omitted (exceeded size limit)." : ""}` }],
+          content: [{ type: "text", text: `Feedback saved successfully (id: ${result.id}).${conversationOmitted ? " Note: conversation transcript omitted (exceeded size limit)." : ""}${parseErrors.length > 0 ? ` Warning: failed to parse ${parseErrors.join(", ")} (saved without these fields).` : ""}` }],
           details: { id: result.id, sessionId },
         };
       } catch (err) {

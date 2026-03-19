@@ -546,6 +546,9 @@ export function createRpcMethods(
 
     // === Feedback enrichment (system-level) ===
     let promptText = message;
+    if (message.startsWith("[Feedback]") && !chatRepo) {
+      throw new Error("Feedback requires a database connection (not available in TUI mode).");
+    }
     if (message.startsWith("[Feedback]") && chatRepo) {
       try {
         const skillContent = await readFeedbackSkillContent();
