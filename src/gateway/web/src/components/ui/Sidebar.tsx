@@ -18,6 +18,7 @@ import {
     KeyRound,
     Wrench,
     BarChart3,
+    BookOpen,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -67,6 +68,7 @@ const groups: NavGroup[] = [
             // { icon: BrainCircuit, label: 'Brains', to: '/brains' },  // hidden until claude-sdk brain is polished
             { icon: Cpu, label: 'Models', to: '/models', adminOnly: true },
             { icon: KeyRound, label: 'Credentials', to: '/credentials' },
+            { icon: BookOpen, label: 'Knowledge', to: '/knowledge', adminOnly: true },
             { icon: Shield, label: 'Permissions', to: '/permissions', adminOnly: true },
             { icon: Wrench, label: 'System', to: '/settings/system', adminOnly: true },
         ],

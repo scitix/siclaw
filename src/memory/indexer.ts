@@ -764,6 +764,12 @@ export class MemoryIndexer {
     }
   }
 
+  /** Count indexed chunks for a specific file path (exact match). */
+  countChunksByFile(filePath: string): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS c FROM chunks WHERE file_path = ?").get(filePath) as { c: number } | undefined;
+    return row?.c ?? 0;
+  }
+
   close(): void {
     this._closed = true;
     this.stopWatching();
