@@ -15,7 +15,14 @@ import { getCurrentUser } from '../../auth';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 
-const DEFAULT_SPEC_TEMPLATE = `inputs:
+const DEFAULT_SPEC_TEMPLATE = `---
+name: new-skill
+description: Describe what this skill does
+---
+
+# New Skill
+
+inputs:
   - name: target
     description: The target resource to analyze
     required: true
@@ -59,7 +66,6 @@ const DRAFT_KEY_PREFIX = 'siclaw_skill_draft:';
 
 interface SkillDraft {
     name: string;
-    description: string;
     type: string;
     version: string;
     specs: string;
@@ -70,7 +76,6 @@ interface SkillDraft {
 function saveDraft(id: string, formData: Skill) {
     const draft: SkillDraft = {
         name: formData.name,
-        description: formData.description,
         type: formData.type,
         version: formData.version,
         specs: formData.specs || '',
@@ -94,7 +99,6 @@ function clearDraft(id: string) {
 function hasUnsavedChanges(formData: Skill | null, serverData: Skill | null): boolean {
     if (!formData || !serverData) return false;
     return formData.name !== serverData.name
-        || formData.description !== serverData.description
         || formData.specs !== serverData.specs
         || formData.type !== serverData.type
         || formData.version !== serverData.version
@@ -202,7 +206,7 @@ export function SkillEditor() {
             const draft = loadDraft(id);
             if (draft && draft.savedAt > 0) {
                 // Apply draft data to formData and show restore banner
-                setFormData({ ...skill, name: draft.name, description: draft.description, type: draft.type, version: draft.version, specs: draft.specs, scripts: draft.scripts });
+                setFormData({ ...skill, name: draft.name, type: draft.type, version: draft.version, specs: draft.specs, scripts: draft.scripts });
                 setDraftRestored({ savedAt: draft.savedAt });
             } else {
                 setFormData(skill);
@@ -592,21 +596,6 @@ export function SkillEditor() {
                     isExpanded ? "w-[70%] max-w-[70%]" : "w-full"
                 )}>
                     <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
-                        <div>
-                            <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 block">Description</label>
-                            <textarea
-                                value={formData.description}
-                                onChange={(e) => !isReadOnly && setFormData({ ...formData, description: e.target.value })}
-                                readOnly={isReadOnly}
-                                className={cn(
-                                    "w-full px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 outline-none resize-none transition-all placeholder:text-gray-400",
-                                    isReadOnly ? "bg-gray-50 cursor-default" : "bg-gray-50/50 focus:ring-1 focus:ring-primary-500/50 focus:bg-white focus:border-primary-500"
-                                )}
-                                rows={2}
-                                placeholder="Enter a description..."
-                            />
-                        </div>
-
                         <div className="grid grid-cols-2 gap-4">
                             <div>
                                 <label className="text-[11px] font-bold text-gray-400 uppercase tracking-wider mb-2 block">Category</label>
