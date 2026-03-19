@@ -352,6 +352,21 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
+
+  `CREATE TABLE IF NOT EXISTS feedback_reports (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    workspace_id TEXT,
+    overall_rating INTEGER CHECK(overall_rating BETWEEN 1 AND 5),
+    summary TEXT NOT NULL,
+    decision_points TEXT,
+    strengths TEXT,
+    improvements TEXT,
+    tags TEXT,
+    feedback_conversation TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
 ];
 
 const INDEX_STATEMENTS = [
@@ -376,6 +391,8 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_cron_job_runs_job ON cron_job_runs(job_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_cron_jobs_status_assigned ON cron_jobs(status, assigned_to)`,
   `CREATE INDEX IF NOT EXISTS idx_cron_instances_heartbeat ON cron_instances(heartbeat_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_feedback_reports_user ON feedback_reports(user_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_feedback_reports_session ON feedback_reports(session_id)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {

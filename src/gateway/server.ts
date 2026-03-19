@@ -24,6 +24,7 @@ import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
+import { FeedbackRepository } from "./db/repositories/feedback-repo.js";
 import { loadConfig } from "../core/config.js";
 import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
@@ -50,6 +51,67 @@ const MIME_TYPES: Record<string, string> = {
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
 };
+
+const MAX_FEEDBACK_BODY = 512 * 1024; // 512KB
+
+/** Shared handler for POST /api/internal/feedback — used by both HTTP and HTTPS servers */
+function handleFeedbackPost(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  db: Database,
+  certIdentity?: { userId?: string; workspaceId?: string },
+): void {
+  let body = "";
+  let bodySize = 0;
+  req.on("data", (chunk: Buffer) => {
+    bodySize += chunk.length;
+    if (bodySize > MAX_FEEDBACK_BODY) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request body too large" }));
+      req.destroy();
+      return;
+    }
+    body += chunk.toString();
+  });
+  req.on("end", async () => {
+    if (bodySize > MAX_FEEDBACK_BODY) return; // already responded
+    try {
+      const data = JSON.parse(body);
+      // In local mode (HTTP, no certIdentity), userId comes from the request body.
+      // This is a local-trust assumption — loopback only, no external access.
+      const userId = certIdentity?.userId || data.userId;
+      if (!data.sessionId || !userId || !data.summary) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "sessionId, userId, and summary are required" }));
+        return;
+      }
+      if (data.overallRating != null && (data.overallRating < 1 || data.overallRating > 5)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "overallRating must be between 1 and 5" }));
+        return;
+      }
+      const feedbackRepo = new FeedbackRepository(db);
+      const id = await feedbackRepo.saveFeedbackReport({
+        sessionId: data.sessionId,
+        userId,
+        workspaceId: certIdentity?.workspaceId || data.workspaceId,
+        overallRating: data.overallRating,
+        summary: data.summary,
+        decisionPoints: data.decisionPoints,
+        strengths: data.strengths,
+        improvements: data.improvements,
+        tags: data.tags,
+        feedbackConversation: data.feedbackConversation,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, id }));
+    } catch (err) {
+      console.error("[gateway] feedback save error:", err);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
+  });
+}
 
 function serveStatic(res: http.ServerResponse, urlPath: string, frameSrc?: string | null): void {
   const withoutQuery = urlPath.split("?")[0];
@@ -805,6 +867,17 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
+    // Internal feedback endpoint: POST /api/internal/feedback
+    if (url === "/api/internal/feedback" && method === "POST") {
+      if (!db) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Database not available" }));
+        return;
+      }
+      handleFeedbackPost(req, res, db);
+      return;
+    }
+
     // Webhook endpoint: POST /hooks/v1/:triggerId
     if (url.startsWith("/hooks/v1/") && method === "POST") {
       const triggerId = url.split("/hooks/v1/")[1]?.split("?")[0];
@@ -1156,6 +1229,18 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 res.end(JSON.stringify({ error: "Internal server error" }));
               }
             })();
+            return;
+          }
+
+          // Internal feedback endpoint: POST /api/internal/feedback
+          if (url === "/api/internal/feedback" && method === "POST") {
+            if (!db) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Database not available" }));
+              return;
+            }
+            const identity = (req as any).certIdentity;
+            handleFeedbackPost(req, res, db, identity);
             return;
           }
 

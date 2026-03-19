@@ -439,6 +439,29 @@ export const systemConfig = sqliteTable("system_config", {
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
+// ─── Feedback Reports ─────────────────────────────
+
+export const feedbackReports = sqliteTable("feedback_reports", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id").notNull(),
+  userId: text("user_id").notNull(),
+  workspaceId: text("workspace_id"),
+  overallRating: integer("overall_rating"),
+  summary: text("summary").notNull(),
+  decisionPoints: text("decision_points", { mode: "json" }).$type<Array<{
+    step: number;
+    description: string;
+    wasCorrect: boolean;
+    comment?: string;
+    idealAction?: string;
+  }>>(),
+  strengths: text("strengths", { mode: "json" }).$type<string[]>(),
+  improvements: text("improvements", { mode: "json" }).$type<string[]>(),
+  tags: text("tags", { mode: "json" }).$type<string[]>(),
+  feedbackConversation: text("feedback_conversation", { mode: "json" }).$type<unknown>(),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
 export const skillReviews = sqliteTable("skill_reviews", {
   id: text("id").primaryKey(),
   skillId: text("skill_id")

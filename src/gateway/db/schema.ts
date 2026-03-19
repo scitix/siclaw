@@ -51,6 +51,7 @@ export const {
   sessionStats,
   systemConfig,
   mcpServers,
+  feedbackReports,
   skillReviews,
 } = _mod;
 

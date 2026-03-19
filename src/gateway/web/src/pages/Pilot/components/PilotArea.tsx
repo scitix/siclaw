@@ -7,6 +7,17 @@ import { SkillCard, type SkillRefStatus } from './SkillCard';
 import { ScheduleCard, type ScheduleCardStatus } from './ScheduleCard';
 import { InvestigationCard } from './InvestigationCard';
 import { HypothesesCard } from './HypothesesCard';
+
+const THINKING_TIPS = [
+    'Thinking...',
+    'Tip: Use + to provide session feedback and help the AI improve',
+    'Tip: Enable Deep Investigation for hypothesis-driven root cause analysis',
+    'Tip: Siclaw remembers findings across sessions \u2014 ask about past investigations',
+    'Analyzing the situation...',
+    'Tip: Use Skills to run reusable diagnostic scripts',
+    'Tip: You can queue your next message while the AI is responding',
+    'Working on it...',
+];
 import { DpChecklistCard, type DpChecklistItem } from './DpChecklistCard';
 import { WelcomeArea } from './WelcomeArea';
 import type { PilotMessage, ContextUsage, InvestigationProgress, SystemStatus } from '@/hooks/usePilot';
@@ -175,6 +186,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             userScrolledAwayRef.current = false;
             prevMsgCountRef.current = 0;
             needsScrollOnLoadRef.current = true;
+            hasShownFeedbackHintRef.current = false;
             pendingRestoreScrollRef.current = true;
             if (restoreScrollTimerRef.current) {
                 clearTimeout(restoreScrollTimerRef.current);
@@ -182,6 +194,27 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             }
         }
     }, [sessionKey]);
+
+    // Suggested reply draft — chip click populates input instead of sending immediately
+    const [chipSeq, setChipSeq] = useState(0);
+    const [chipDraft, setChipDraft] = useState<string | null>(null);
+
+    // Feedback hint: show once per session after agent finishes first response
+    const hasShownFeedbackHintRef = useRef(false);
+    const prevIsLoadingRef = useRef(isLoading);
+    const [showFeedbackHint, setShowFeedbackHint] = useState(false);
+
+    useEffect(() => {
+        const wasLoading = prevIsLoadingRef.current;
+        prevIsLoadingRef.current = isLoading;
+
+        if (wasLoading && !isLoading && !hasShownFeedbackHintRef.current && messages.length > 0) {
+            hasShownFeedbackHintRef.current = true;
+            setShowFeedbackHint(true);
+            const timer = setTimeout(() => setShowFeedbackHint(false), 7000);
+            return () => clearTimeout(timer);
+        }
+    }, [isLoading, messages.length]);
 
     useEffect(() => {
         return () => {
@@ -207,6 +240,16 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             if (messages[i].toolName === 'propose_hypotheses' && !messages[i].isStreaming) {
                 return messages[i].id;
             }
+        }
+        return null;
+    }, [messages]);
+
+    // Find last assistant message id — used to show suggested reply chips only on the latest reply
+    const lastAssistantMsgId = useMemo(() => {
+        const visible = messages.filter(m => !m.hidden);
+        for (let i = visible.length - 1; i >= 0; i--) {
+            if (visible[i].role === 'assistant') return visible[i].id;
+            if (visible[i].role === 'user') return null;
         }
         return null;
     }, [messages]);
@@ -403,6 +446,8 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     hypothesesSuperseded={latestHypothesesId != null && msg.toolName === 'propose_hypotheses' && msg.id !== latestHypothesesId}
                                     hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                                     selectedWorkspaceId={selectedWorkspaceId}
+                                    showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                                    onChipClick={(key) => { setChipSeq(s => s + 1); setChipDraft(key + ' '); }}
                                 />
                             ))}
 
@@ -411,15 +456,14 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                 <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
                             )}
 
-                            {isLoading && (
-                                <div className="flex gap-4">
-                                    <div className="w-8 h-8 rounded-full bg-white border border-gray-200 flex items-center justify-center text-primary-600 shadow-sm">
-                                        <Cpu className="w-5 h-5" />
-                                    </div>
-                                    <div className="flex items-center gap-2 text-gray-400">
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                        <span className="text-sm">Thinking...</span>
-                                    </div>
+                            {isLoading && <ThinkingIndicator />}
+
+                            {showFeedbackHint && (
+                                <div className={cn(
+                                    "text-center text-xs text-gray-400 py-2 transition-opacity duration-500",
+                                    showFeedbackHint ? "opacity-100" : "opacity-0"
+                                )}>
+                                    Was this helpful? Tap <span className="font-medium text-gray-500">+</span> below to share feedback
                                 </div>
                             )}
                         </>
@@ -427,7 +471,40 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} skills={skills} onEditSkill={onEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} />
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
+        </div>
+    );
+}
+
+function ThinkingIndicator() {
+    const [tipIndex, setTipIndex] = useState(0);
+    const [visible, setVisible] = useState(true);
+
+    useEffect(() => {
+        const interval = setInterval(() => {
+            setVisible(false);
+            setTimeout(() => {
+                setTipIndex(i => (i + 1) % THINKING_TIPS.length);
+                setVisible(true);
+            }, 300);
+        }, 8000);
+        return () => clearInterval(interval);
+    }, []);
+
+    return (
+        <div className="flex gap-4">
+            <div className="w-8 h-8 rounded-full bg-white border border-gray-200 flex items-center justify-center text-primary-600 shadow-sm">
+                <Cpu className="w-5 h-5" />
+            </div>
+            <div className="flex items-center gap-2 text-gray-400">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span className={cn(
+                    "text-sm transition-opacity duration-300",
+                    visible ? "opacity-100" : "opacity-0"
+                )}>
+                    {THINKING_TIPS[tipIndex]}
+                </span>
+            </div>
         </div>
     );
 }
@@ -469,7 +546,59 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
     return { isDeepInvestigation: false, text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId }: {
+/** Parse <!-- suggested-replies: A|Label A, B|Label B --> from assistant messages */
+interface SuggestedReply { key: string; label: string; }
+
+/** Auto-detect option patterns from agent output.
+ *  Primary:  `- **X.** Label` (bullet + bold)
+ *  Fallback: `X. Label` (plain, letter-only keys — catches agent format drift) */
+function detectOptionReplies(content: string): SuggestedReply[] {
+    // Primary: - **X.** label (bullet + bold)
+    const primary: SuggestedReply[] = [];
+    const regex = /[-*]\s+\*\*([A-Za-z\d]+)\.\*\*\s+(.+?)(?:\s+[—\-–]\s+.*)?$/gm;
+    for (const match of content.matchAll(regex)) {
+        primary.push({ key: match[1], label: match[2].trim() });
+    }
+    if (primary.length >= 2 && primary.length <= 8) return primary;
+
+    // Fallback: X. label (uppercase letter keys only, avoids matching numbered lists)
+    const fallback: SuggestedReply[] = [];
+    const fallbackRegex = /^([A-Z])\.\s+(.+?)(?:\s+[—\-–]\s+.*)?$/gm;
+    for (const match of content.matchAll(fallbackRegex)) {
+        fallback.push({ key: match[1], label: match[2].trim() });
+    }
+    return fallback.length >= 2 && fallback.length <= 8 ? fallback : [];
+}
+
+function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; text: string } {
+    // Priority 1: Explicit HTML comment (escape hatch for custom cases)
+    const commentMatch = content.match(/<!--\s*suggested-replies:\s*(.*?)\s*-->/);
+    if (commentMatch) {
+        const replies: SuggestedReply[] = [];
+        for (const part of commentMatch[1].split(',')) {
+            const trimmed = part.trim();
+            if (!trimmed) continue;
+            const pipeIdx = trimmed.indexOf('|');
+            if (pipeIdx > 0) {
+                replies.push({ key: trimmed.slice(0, pipeIdx).trim(), label: trimmed.slice(pipeIdx + 1).trim() });
+            } else {
+                replies.push({ key: trimmed, label: trimmed });
+            }
+        }
+        const text = content.replace(/<!--\s*suggested-replies:\s*.*?\s*-->/, '').trimEnd();
+        return { replies, text };
+    }
+
+    // Priority 2: Auto-detect **X.** option patterns — zero agent burden
+    const detected = detectOptionReplies(content);
+    if (detected.length > 0) {
+        return { replies: detected, text: content };
+    }
+
+    return { replies: [], text: content };
+}
+
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -493,6 +622,9 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     /** True when a deep_search exists after this propose_hypotheses — survives page refresh */
     hypothesesAlreadyConfirmed?: boolean;
     selectedWorkspaceId?: string | null;
+    showSuggestedReplies?: boolean;
+    /** Chip click populates input instead of sending immediately */
+    onChipClick?: (key: string) => void;
 }) {
     const isUser = message.role === 'user';
     const isTool = message.role === 'tool';
@@ -532,9 +664,18 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     const { scripts, text: afterScripts } = isUser
         ? parseScriptRefs(afterDeepInv)
         : { scripts: [] as ScriptRef[], text: afterDeepInv };
-    const { skillName, text: textContent } = isUser
+    const { skillName, text: afterSkillRef } = isUser
         ? parseSkillRef(afterScripts)
         : { skillName: null, text: afterScripts };
+
+    // Always strip <!-- suggested-replies --> comments from assistant messages (they should never be visible)
+    // Only parse replies into chips for the last non-streaming assistant message
+    const strippedContent = !isUser && !isTool
+        ? afterSkillRef.replace(/<!--\s*suggested-replies:\s*.*?\s*-->/g, '').trimEnd()
+        : afterSkillRef;
+    const { replies: suggestedReplies, text: textContent } = !isUser && !isTool && showSuggestedReplies && !message.isStreaming
+        ? parseSuggestedReplies(afterSkillRef)
+        : { replies: [] as SuggestedReply[], text: strippedContent };
 
     return (
         <div className={cn(
@@ -611,6 +752,21 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
                             : "bg-white border border-gray-200 text-gray-800 rounded-tl-sm"
                     )}>
                         <Markdown>{textContent}</Markdown>
+                    </div>
+                )}
+
+                {suggestedReplies.length > 0 && onChipClick && (
+                    <div className="flex flex-wrap gap-2 mt-2">
+                        {suggestedReplies.map((reply) => (
+                            <button
+                                key={reply.key}
+                                type="button"
+                                onClick={() => onChipClick(reply.key)}
+                                className="rounded-full px-3 py-1.5 text-sm border border-gray-200 bg-white hover:bg-gray-50 text-gray-700 transition-colors cursor-pointer"
+                            >
+                                <span className="font-medium text-gray-500">{reply.key}.</span> {reply.label}
+                            </button>
+                        ))}
                     </div>
                 )}
             </div>

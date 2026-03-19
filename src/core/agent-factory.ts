@@ -33,6 +33,7 @@ import { createForkSkillTool } from "../tools/fork-skill.js";
 import { createManageScheduleTool } from "../tools/manage-schedule.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
 import { createInvestigationFeedbackTool } from "../tools/investigation-feedback.js";
+import { createSaveFeedbackTool } from "../tools/save-feedback.js";
 import {
   type DpState,
   createProposeHypothesesTool,
@@ -287,6 +288,7 @@ export async function createSiclawSession(
     createRunSkillTool(kubeconfigRef, sessionIdRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createInvestigationFeedbackTool(memoryRef),
+    createSaveFeedbackTool(sessionIdRef),
     createCredentialListTool(kubeconfigRef),
     createClusterInfoTool(kubeconfigRef),
   ];
@@ -333,7 +335,7 @@ export async function createSiclawSession(
 
   // Filter custom tools by workspace allow-list
   // Platform tools are exempt — they must always be available regardless of workspace config
-  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info"]);
+  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback"]);
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
   if (Array.isArray(allowedTools)) {
     const allowed = new Set(allowedTools);
