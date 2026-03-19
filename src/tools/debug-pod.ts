@@ -330,6 +330,13 @@ export class DebugPodCache {
   /**
    * Evict a cache entry by key: delete the pod, remove from cache.
    * Called by the idle timer. Errors are logged but not thrown.
+   *
+   * Note: the cache entry is removed BEFORE deleteDebugPod completes.
+   * During the deletion window (up to 6s), a concurrent getOrCreate may
+   * create a second pod on the same node. This is harmless — the old pod
+   * is being deleted and has activeDeadlineSeconds as a hard safety net.
+   * Moving pods.delete after deleteDebugPod would risk returning a stale
+   * (being-deleted) entry to concurrent get() callers, which is worse.
    */
   private async evict(key: string): Promise<void> {
     const entry = this.pods.get(key);
@@ -391,6 +398,11 @@ const GC_LIST_TIMEOUT_MS = 15_000;
  *   (2) Running/Unknown pods whose creationTimestamp age > config.debugPodTTL seconds
  *
  * GC does NOT consult DebugPodCache — it operates purely on kubectl label queries.
+ * This means GC may delete a pod that is still in the cache. When this happens,
+ * the next kubectl exec against that pod will fail; the stale-pod detection in
+ * runInDebugPod evicts the cache entry, and the following call creates a fresh pod.
+ * One request fails before auto-recovery — an acceptable trade-off to keep GC
+ * decoupled from in-process cache state.
  * activeDeadlineSeconds is the ultimate safety net; GC is best-effort acceleration.
  *
  * Process lifecycle:
