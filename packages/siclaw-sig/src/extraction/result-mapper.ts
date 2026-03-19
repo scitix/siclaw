@@ -20,28 +20,111 @@ export function stripGoQuotes(raw: string): string {
   return raw;
 }
 
-/** Maps Go log function names to normalized log levels. */
+/**
+ * Strips surrounding Python string literal quotes.
+ * Handles f-string/r-string/b-string/u-string prefixes, triple quotes, and single/double quotes.
+ */
+export function stripPythonQuotes(raw: string): string {
+  let s = raw;
+  if (/^[fFrRbBuU]{0,2}["']/.test(s)) {
+    s = s.replace(/^[fFrRbBuU]+/, "");
+  }
+  // Triple quotes
+  if ((s.startsWith('"""') && s.endsWith('"""')) || (s.startsWith("'''") && s.endsWith("'''"))) {
+    return s.slice(3, -3);
+  }
+  // Single/double quotes
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1).replace(/\\(['"])/g, "$1");
+  }
+  return s;
+}
+
+/**
+ * Strips surrounding Java string literal quotes (double quotes only).
+ */
+export function stripJavaQuotes(raw: string): string {
+  if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+    return raw.slice(1, -1).replace(/\\"/g, '"');
+  }
+  return raw;
+}
+
+/**
+ * Strips surrounding Rust string literal quotes.
+ * Handles raw strings r#"..."#, r##"..."##, etc. and normal double quotes.
+ */
+export function stripRustQuotes(raw: string): string {
+  // Raw strings: r#"..."#, r##"..."##, etc.
+  const rawMatch = raw.match(/^r(#+)"(.*)"\1$/s);
+  if (rawMatch) return rawMatch[2];
+  // Normal double quotes
+  if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+    return raw.slice(1, -1).replace(/\\"/g, '"');
+  }
+  return raw;
+}
+
+/**
+ * Strips surrounding Bash string literal quotes.
+ * Double quotes: removes outer quotes (interpolation preserved).
+ * Single quotes: removes outer quotes (no escaping in bash single quotes).
+ */
+export function stripBashQuotes(raw: string): string {
+  if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+    return raw.slice(1, -1);
+  }
+  // Single quotes: no escaping in bash
+  if (raw.startsWith("'") && raw.endsWith("'") && raw.length >= 2) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+}
+
+/**
+ * Language-aware quote stripping dispatch.
+ */
+export function stripQuotes(raw: string, language: string): string {
+  switch (language) {
+    case "go": return stripGoQuotes(raw);
+    case "python": return stripPythonQuotes(raw);
+    case "java": return stripJavaQuotes(raw);
+    case "rust": return stripRustQuotes(raw);
+    case "bash": return stripBashQuotes(raw);
+    default: return raw;
+  }
+}
+
+/** Maps log function names to normalized log levels (all languages). */
 const FUNCTION_LEVEL_MAP: Record<string, LogLevel> = {
-  // klog printf
+  // Go — klog printf
   Infof: "info",
   Warningf: "warning",
   Errorf: "error",
   Fatalf: "fatal",
-  // klog structured
+  // Go — klog structured
   InfoS: "info",
   ErrorS: "error",
-  // logr
+  // Go — logr
   Info: "info",
   Warn: "warning",
   Error: "error",
   Debug: "debug",
   Fatal: "fatal",
-  // zap sugar printf
+  // Go — zap sugar printf
   Warnf: "warning",
-  // zap sugar structured
+  // Go — zap sugar structured
   Infow: "info",
   Warnw: "warning",
   Errorw: "error",
+  // Python logging
+  error: "error",
+  warning: "warning",
+  info: "info",
+  debug: "debug",
+  critical: "fatal",
+  // Java SLF4J/Log4j2 (error, info, debug already covered above)
+  warn: "warning",
 };
 
 /**
@@ -58,13 +141,37 @@ export function detectLevel(
     return metadata["level"] as LogLevel;
   }
 
-  // Scan matched code for function name
+  // Scan matched code for function name — Go, Python, Java
   const funcPattern =
-    /\.(Infof|Warningf|Errorf|Fatalf|InfoS|ErrorS|Info|Warn|Error|Debug|Fatal|Warnf|Infow|Warnw|Errorw)\(/;
+    /\.(Infof|Warningf|Errorf|Fatalf|InfoS|ErrorS|Info|Warn|Error|Debug|Fatal|Warnf|Infow|Warnw|Errorw|error|warning|info|debug|critical|warn)\(/;
   const match = funcPattern.exec(matchedCode);
   if (match) {
     const funcName = match[1]!;
     const level = FUNCTION_LEVEL_MAP[funcName];
+    if (level) return level;
+  }
+
+  // Rust macros: error!(...), warn!(...), info!(...), debug!(...), trace!(...)
+  const rustMacroPattern = /\b(error|warn|info|debug|trace)!\(/;
+  const rustMatch = rustMacroPattern.exec(matchedCode);
+  if (rustMatch) {
+    const macroName = rustMatch[1]!;
+    const rustLevels: Record<string, LogLevel> = {
+      error: "error", warn: "warning", info: "info", debug: "debug", trace: "debug",
+    };
+    const level = rustLevels[macroName];
+    if (level) return level;
+  }
+
+  // Bash logger: logger -p user.err "..."
+  const bashLoggerPattern = /logger.*-p\s+\w+\.(err|warning|info|debug)/;
+  const bashMatch = bashLoggerPattern.exec(matchedCode);
+  if (bashMatch) {
+    const bashPriority = bashMatch[1]!;
+    const bashLevels: Record<string, LogLevel> = {
+      err: "error", warning: "warning", info: "info", debug: "debug",
+    };
+    const level = bashLevels[bashPriority];
     if (level) return level;
   }
 
@@ -76,7 +183,7 @@ export function detectLevel(
  *
  * Fails fast if required metadata (framework, style) is missing.
  */
-export function mapSemgrepMatch(match: SemgrepMatch): ExtractionResult {
+export function mapSemgrepMatch(match: SemgrepMatch, language?: string): ExtractionResult {
   const metadata = match.extra.metadata ?? {};
 
   const framework = metadata["framework"];
@@ -104,9 +211,9 @@ export function mapSemgrepMatch(match: SemgrepMatch): ExtractionResult {
   // Extract template from $FMT or $MSG metavar
   let template: string;
   if (metavars["$FMT"]) {
-    template = stripGoQuotes(metavars["$FMT"].abstract_content);
+    template = stripQuotes(metavars["$FMT"].abstract_content, language ?? "go");
   } else if (metavars["$MSG"]) {
-    template = stripGoQuotes(metavars["$MSG"].abstract_content);
+    template = stripQuotes(metavars["$MSG"].abstract_content, language ?? "go");
   } else {
     throw new Error(
       `No $FMT or $MSG metavar in rule ${match.check_id} at ${match.path}:${match.start.line}`,
@@ -136,7 +243,7 @@ export function mapSemgrepMatch(match: SemgrepMatch): ExtractionResult {
  * Individual match mapping errors are collected in `errors` rather than
  * aborting the entire run.
  */
-export function mapSemgrepOutput(output: SemgrepOutput): ExtractionOutput {
+export function mapSemgrepOutput(output: SemgrepOutput, language?: string): ExtractionOutput {
   const results: ExtractionResult[] = [];
   const errors: string[] = [];
 
@@ -150,7 +257,7 @@ export function mapSemgrepOutput(output: SemgrepOutput): ExtractionOutput {
   // Map each match
   for (const match of output.results) {
     try {
-      results.push(mapSemgrepMatch(match));
+      results.push(mapSemgrepMatch(match, language));
     } catch (err) {
       errors.push(err instanceof Error ? err.message : String(err));
     }

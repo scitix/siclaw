@@ -1,0 +1,19 @@
+rules:
+  - id: siclaw.rust.log-crate-printf
+    languages: [rust]
+    severity: INFO
+    message: "Rust log crate macro log call"
+    metadata:
+      framework: log
+      style: printf
+    pattern-either:
+      - pattern: log::error!($FMT, ...)
+      - pattern: log::error!($FMT)
+      - pattern: log::warn!($FMT, ...)
+      - pattern: log::warn!($FMT)
+      - pattern: log::info!($FMT, ...)
+      - pattern: log::info!($FMT)
+      - pattern: log::debug!($FMT, ...)
+      - pattern: log::debug!($FMT)
+      - pattern: log::trace!($FMT, ...)
+      - pattern: log::trace!($FMT)

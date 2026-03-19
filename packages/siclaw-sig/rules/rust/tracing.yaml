@@ -1,0 +1,29 @@
+rules:
+  - id: siclaw.rust.tracing-printf
+    languages: [rust]
+    severity: INFO
+    message: "Rust tracing macro log call"
+    metadata:
+      framework: tracing
+      style: printf
+    pattern-either:
+      - pattern: tracing::error!($FMT, ...)
+      - pattern: tracing::error!($FMT)
+      - pattern: tracing::warn!($FMT, ...)
+      - pattern: tracing::warn!($FMT)
+      - pattern: tracing::info!($FMT, ...)
+      - pattern: tracing::info!($FMT)
+      - pattern: tracing::debug!($FMT, ...)
+      - pattern: tracing::debug!($FMT)
+      - pattern: tracing::trace!($FMT, ...)
+      - pattern: tracing::trace!($FMT)
+      - pattern: error!($FMT, ...)
+      - pattern: error!($FMT)
+      - pattern: warn!($FMT, ...)
+      - pattern: warn!($FMT)
+      - pattern: info!($FMT, ...)
+      - pattern: info!($FMT)
+      - pattern: debug!($FMT, ...)
+      - pattern: debug!($FMT)
+      - pattern: trace!($FMT, ...)
+      - pattern: trace!($FMT)

@@ -19,6 +19,8 @@ export interface RunSemgrepOptions {
   srcPath: string;
   /** Timeout in milliseconds. Default: 300_000 (5 minutes). */
   timeoutMs?: number;
+  /** Target language for language-aware result mapping. */
+  language?: string;
 }
 
 /** Wraps execFile in a promise returning {stdout, stderr}. */
@@ -101,7 +103,7 @@ export async function checkSemgrepVersion(): Promise<string> {
 export async function runSemgrep(
   options: RunSemgrepOptions,
 ): Promise<ExtractionOutput> {
-  const { rulePaths, srcPath, timeoutMs = 300_000 } = options;
+  const { rulePaths, srcPath, timeoutMs = 300_000, language } = options;
 
   await checkSemgrepVersion();
 
@@ -131,5 +133,5 @@ export async function runSemgrep(
 
   const json: unknown = JSON.parse(stdout);
   const parsed = SemgrepOutputSchema.parse(json);
-  return mapSemgrepOutput(parsed);
+  return mapSemgrepOutput(parsed, language);
 }

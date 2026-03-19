@@ -1,0 +1,17 @@
+rules:
+  - id: siclaw.bash.logger-printf
+    languages: [bash]
+    severity: INFO
+    message: "Bash logger syslog call"
+    metadata:
+      framework: logger
+      style: printf
+    pattern-either:
+      - pattern: logger $FMT
+      - pattern: logger "$FMT"
+      - pattern: logger -p $PRIORITY $FMT
+      - pattern: logger -p $PRIORITY "$FMT"
+      - pattern: logger -t $TAG $FMT
+      - pattern: logger -t $TAG "$FMT"
+      - pattern: logger -p $PRIORITY -t $TAG $FMT
+      - pattern: logger -p $PRIORITY -t $TAG "$FMT"

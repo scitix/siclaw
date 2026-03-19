@@ -8,15 +8,35 @@
 
 import { ContextBuilder } from "./context-builder.js";
 import { parseGoFormat } from "../parser/go-format.js";
+import { parsePythonFormat } from "../parser/python-format.js";
+import { parseJavaFormat } from "../parser/java-format.js";
+import { parseRustFormat } from "../parser/rust-format.js";
+import { parseBashFormat } from "../parser/bash-format.js";
 import { extractKeywords } from "../parser/keywords.js";
 import { computeSigId } from "../schema/id.js";
 import { SigRecordSchema, type SigRecord } from "../schema/record.js";
+import type { FormatParseResult } from "../parser/types.js";
 import type { ExtractionResult } from "../extraction/types.js";
 
 export interface EmitterOptions {
   component: string;
   version: string;
   srcPath: string;
+  language: string;
+}
+
+/**
+ * Dispatches format string parsing to the correct language parser.
+ */
+function parseFormat(template: string, language: string, style?: string): FormatParseResult {
+  switch (language) {
+    case "go": return parseGoFormat(template);
+    case "python": return parsePythonFormat(template);
+    case "java": return parseJavaFormat(template);
+    case "rust": return parseRustFormat(template);
+    case "bash": return parseBashFormat(template, style === "printf" ? "printf" : "echo");
+    default: return parseGoFormat(template);
+  }
 }
 
 export interface EmitResult {
@@ -51,7 +71,7 @@ export async function emitRecords(
     }
 
     // Parse format string for regex and confidence
-    const { regex, confidence } = parseGoFormat(result.template);
+    const { regex, confidence } = parseFormat(result.template, options.language, result.style);
 
     // Extract searchable keywords
     const keywords = extractKeywords(result.template);

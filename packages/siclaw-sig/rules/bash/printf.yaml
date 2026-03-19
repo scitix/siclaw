@@ -1,0 +1,13 @@
+rules:
+  - id: siclaw.bash.printf-printf
+    languages: [bash]
+    severity: INFO
+    message: "Bash printf log call"
+    metadata:
+      framework: printf
+      style: printf
+    pattern-either:
+      - pattern: printf $FMT
+      - pattern: printf "$FMT"
+      - pattern: printf $FMT $...ARGS
+      - pattern: printf "$FMT" $...ARGS

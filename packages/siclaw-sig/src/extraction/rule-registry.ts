@@ -13,7 +13,7 @@ import type { ExtractionOutput } from "./types.js";
 const __filename = fileURLToPath(import.meta.url);
 const RULES_BASE_DIR = path.resolve(path.dirname(__filename), "../../rules");
 
-const SUPPORTED_LANGUAGES = ["go"] as const;
+const SUPPORTED_LANGUAGES = ["go", "python", "java", "rust", "bash"] as const;
 
 /** Languages with built-in Semgrep rule sets. */
 export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
@@ -130,5 +130,6 @@ export async function extractLogs(options: {
     rulePaths,
     srcPath: options.srcPath,
     timeoutMs: options.timeoutMs,
+    language: options.language,
   });
 }

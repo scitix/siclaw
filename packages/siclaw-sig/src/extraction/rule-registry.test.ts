@@ -34,10 +34,13 @@ describe("discoverBuiltinRules", () => {
     expect(basenames).toEqual(sorted);
   });
 
-  it('throws for unsupported language "python"', async () => {
-    await expect(discoverBuiltinRules("python")).rejects.toThrow(
-      'Unsupported language "python"',
-    );
+  it('discovers Python rule YAML files from rules/python/', async () => {
+    const paths = await discoverBuiltinRules("python");
+    expect(paths.length).toBeGreaterThanOrEqual(1);
+    for (const p of paths) {
+      expect(p).toMatch(/\.yaml$/);
+      expect(p).toContain("/rules/python/");
+    }
   });
 
   it('throws for unsupported language "nonexistent"', async () => {

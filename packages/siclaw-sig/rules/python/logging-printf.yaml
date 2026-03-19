@@ -1,0 +1,29 @@
+rules:
+  - id: siclaw.python.logging-printf
+    languages: [python]
+    severity: INFO
+    message: "Python logging printf-style log call"
+    metadata:
+      framework: logging
+      style: printf
+    pattern-either:
+      - pattern: logging.error($FMT, ...)
+      - pattern: logging.error($FMT)
+      - pattern: logging.warning($FMT, ...)
+      - pattern: logging.warning($FMT)
+      - pattern: logging.info($FMT, ...)
+      - pattern: logging.info($FMT)
+      - pattern: logging.debug($FMT, ...)
+      - pattern: logging.debug($FMT)
+      - pattern: logging.critical($FMT, ...)
+      - pattern: logging.critical($FMT)
+      - pattern: $LOGGER.error($FMT, ...)
+      - pattern: $LOGGER.error($FMT)
+      - pattern: $LOGGER.warning($FMT, ...)
+      - pattern: $LOGGER.warning($FMT)
+      - pattern: $LOGGER.info($FMT, ...)
+      - pattern: $LOGGER.info($FMT)
+      - pattern: $LOGGER.debug($FMT, ...)
+      - pattern: $LOGGER.debug($FMT)
+      - pattern: $LOGGER.critical($FMT, ...)
+      - pattern: $LOGGER.critical($FMT)

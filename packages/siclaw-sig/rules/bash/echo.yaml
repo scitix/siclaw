@@ -1,0 +1,11 @@
+rules:
+  - id: siclaw.bash.echo-printf
+    languages: [bash]
+    severity: INFO
+    message: "Bash echo log call"
+    metadata:
+      framework: echo
+      style: printf
+    pattern-either:
+      - pattern: echo $FMT
+      - pattern: echo "$FMT"

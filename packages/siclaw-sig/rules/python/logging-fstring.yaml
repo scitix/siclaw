@@ -1,0 +1,29 @@
+rules:
+  - id: siclaw.python.logging-fstring
+    languages: [python]
+    severity: INFO
+    message: "Python logging f-string/format log call"
+    metadata:
+      framework: logging
+      style: printf
+    pattern-either:
+      - pattern: logging.error(f"...", ...)
+      - pattern: logging.error(f"...")
+      - pattern: logging.warning(f"...", ...)
+      - pattern: logging.warning(f"...")
+      - pattern: logging.info(f"...", ...)
+      - pattern: logging.info(f"...")
+      - pattern: logging.debug(f"...", ...)
+      - pattern: logging.debug(f"...")
+      - pattern: logging.critical(f"...", ...)
+      - pattern: logging.critical(f"...")
+      - pattern: $LOGGER.error(f"...", ...)
+      - pattern: $LOGGER.error(f"...")
+      - pattern: $LOGGER.warning(f"...", ...)
+      - pattern: $LOGGER.warning(f"...")
+      - pattern: $LOGGER.info(f"...", ...)
+      - pattern: $LOGGER.info(f"...")
+      - pattern: $LOGGER.debug(f"...", ...)
+      - pattern: $LOGGER.debug(f"...")
+      - pattern: $LOGGER.critical(f"...", ...)
+      - pattern: $LOGGER.critical(f"...")

@@ -1,0 +1,19 @@
+rules:
+  - id: siclaw.java.slf4j-printf
+    languages: [java]
+    severity: INFO
+    message: "SLF4J log call"
+    metadata:
+      framework: slf4j
+      style: printf
+    pattern-either:
+      - pattern: $LOGGER.error($FMT, ...)
+      - pattern: $LOGGER.error($FMT)
+      - pattern: $LOGGER.warn($FMT, ...)
+      - pattern: $LOGGER.warn($FMT)
+      - pattern: $LOGGER.info($FMT, ...)
+      - pattern: $LOGGER.info($FMT)
+      - pattern: $LOGGER.debug($FMT, ...)
+      - pattern: $LOGGER.debug($FMT)
+      - pattern: $LOGGER.trace($FMT, ...)
+      - pattern: $LOGGER.trace($FMT)

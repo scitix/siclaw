@@ -51,6 +51,7 @@ export async function runExtract(options: ExtractOptions): Promise<void> {
     component: options.component,
     version: options.version,
     srcPath: options.src,
+    language: options.lang,
   });
 
   // Collect rule IDs from extraction results
