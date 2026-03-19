@@ -21,10 +21,6 @@ export const LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
 export const COMPONENT_DEBUG_POD = "debug-pod";
 export const MANAGED_BY_SICLAW = "siclaw";
 
-// ── Lifecycle constants ──────────────────────────────────────────────
-
-export const ACTIVE_DEADLINE_BUFFER_S = 120;
-
 // ── Resource limit constants ────────────────────────────────────────
 export const DEBUG_POD_RESOURCE_REQUESTS = { cpu: "0", memory: "0" };
 export const DEBUG_POD_RESOURCE_LIMITS = { cpu: "500m", memory: "256Mi" };
@@ -61,6 +57,10 @@ export function buildDebugPodLabels(
  * Run kubectl with kubeconfig args prepended.
  * Thin wrapper around spawnAsync — centralises kubeconfig propagation
  * so that no caller needs to manually splice kubeconfigArgs.
+ *
+ * @internal This is an internal infrastructure helper that bypasses the
+ * 6-pass command validation pipeline intentionally. All arguments are
+ * programmatically constructed — never pass agent-controlled input.
  */
 export function kubectlExec(
   args: string[],
@@ -299,7 +299,6 @@ export class DebugPodCache {
     const entry = this.pods.get(key);
     if (!entry) return;
     this.pods.delete(key);
-    this.active.delete(key);
 
     console.info("[debug-pod] idle eviction", {
       podName: entry.podName,
@@ -308,10 +307,14 @@ export class DebugPodCache {
       userId: entry.userId,
     });
 
-    await deleteDebugPod(entry.podName, entry.env, {
-      namespace: entry.namespace,
-      nodeName: entry.nodeName,
-    });
+    try {
+      await deleteDebugPod(entry.podName, entry.env, {
+        namespace: entry.namespace,
+        nodeName: entry.nodeName,
+      });
+    } finally {
+      this.active.delete(key);
+    }
   }
 
   /** Check if a concurrency slot is held (for testing/diagnostics). */
@@ -378,6 +381,7 @@ export class DebugPodGC {
    * cluster access, only verifies kubectl binary is available.
    */
   async start(credentialsDir?: string): Promise<void> {
+    if (this.intervalHandle !== null) return;
     this.credentialsDir = credentialsDir;
 
     // Verify kubectl binary is available (--client doesn't need cluster access)
@@ -432,9 +436,9 @@ export class DebugPodGC {
     const config = loadConfig();
     const { debugNamespace, debugPodTTL } = config;
 
-    // Use component label only — each agentbox serves a single user,
+    // Use component + managed-by labels — each agentbox serves a single user,
     // and userId label may not match config (e.g., "unknown" vs "default").
-    const labelSelector = `${LABEL_COMPONENT}=${COMPONENT_DEBUG_POD}`;
+    const labelSelector = `${LABEL_COMPONENT}=${COMPONENT_DEBUG_POD},${LABEL_MANAGED_BY}=${MANAGED_BY_SICLAW}`;
 
     let listOutput: string;
     try {
