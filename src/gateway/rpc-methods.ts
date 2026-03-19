@@ -1857,7 +1857,6 @@ export function createRpcMethods(
     const username = context.auth!.username;
 
     const name = params.name as string;
-    const description = params.description as string | undefined;
     const type = params.type as string | undefined;
     const specs = params.specs as string | undefined;
     const rawScripts = params.scripts as
@@ -1865,6 +1864,11 @@ export function createRpcMethods(
       | undefined;
 
     if (!name) throw new Error("Missing required param: name");
+
+    // Auto-extract description from specs frontmatter; fall back to explicit param
+    const description = specs
+      ? skillWriter.parseFrontmatter(specs).description || (params.description as string | undefined)
+      : (params.description as string | undefined);
 
     // Resolve scripts: if content is missing, copy from user uploads directory
     let scripts: Array<{ name: string; content: string }> | undefined;
@@ -2135,28 +2139,33 @@ export function createRpcMethods(
       | undefined;
 
     // Resolve scripts: if content is missing, try DB then uploads dir then existing skill files
+    // NOTE: an explicit empty array means "delete all scripts" — do NOT fall back to existing
     let scripts: Array<{ name: string; content: string }> | undefined;
-    if (rawScripts && rawScripts.length > 0) {
-      const uploadsDir = path.join(skillsDir, "user", userId, "uploads");
-      let existingFiles: SkillFiles | null = null;
-      if (skillContentRepo) {
-        existingFiles = await skillContentRepo.read(skillId, "working");
-      }
-      const existingScriptsMap = new Map(
-        (existingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
-      );
-      scripts = rawScripts.map((s) => {
-        if (s.content) return { name: s.name, content: s.content };
-        // Try existing skill scripts
-        const existing = existingScriptsMap.get(s.name);
-        if (existing) return { name: s.name, content: existing };
-        // Try uploads directory
-        const uploadPath = path.join(uploadsDir, s.name);
-        if (fs.existsSync(uploadPath)) {
-          return { name: s.name, content: fs.readFileSync(uploadPath, "utf-8") };
+    if (Array.isArray(rawScripts)) {
+      if (rawScripts.length === 0) {
+        scripts = [];
+      } else {
+        const uploadsDir = path.join(skillsDir, "user", userId, "uploads");
+        let existingFiles: SkillFiles | null = null;
+        if (skillContentRepo) {
+          existingFiles = await skillContentRepo.read(skillId, "working");
         }
-        throw new Error(`Script "${s.name}" content not found`);
-      });
+        const existingScriptsMap = new Map(
+          (existingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
+        );
+        scripts = rawScripts.map((s) => {
+          if (s.content) return { name: s.name, content: s.content };
+          // Try existing skill scripts
+          const existing = existingScriptsMap.get(s.name);
+          if (existing) return { name: s.name, content: existing };
+          // Try uploads directory
+          const uploadPath = path.join(uploadsDir, s.name);
+          if (fs.existsSync(uploadPath)) {
+            return { name: s.name, content: fs.readFileSync(uploadPath, "utf-8") };
+          }
+          throw new Error(`Script "${s.name}" content not found`);
+        });
+      }
     }
 
     // Save content to DB
@@ -2172,8 +2181,13 @@ export function createRpcMethods(
 
     // Update DB metadata (name and dirName are immutable after creation)
     const updates: Record<string, unknown> = {};
-    if (params.description !== undefined)
+    // Auto-extract description from specs frontmatter
+    if (specs) {
+      const extracted = skillWriter.parseFrontmatter(specs).description;
+      if (extracted) updates.description = extracted;
+    } else if (params.description !== undefined) {
       updates.description = params.description;
+    }
     if (params.type) updates.type = params.type;
     if (params.labels !== undefined) {
       const cleaned = Array.isArray(params.labels)

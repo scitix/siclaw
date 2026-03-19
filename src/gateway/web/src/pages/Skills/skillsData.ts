@@ -134,7 +134,6 @@ export async function rpcSaveSkill(
     if (isNew) {
         await sendRpc('skill.create', {
             name: skill.name,
-            description: skill.description,
             type: skill.type,
             specs: skill.specs,
             scripts,
@@ -144,7 +143,6 @@ export async function rpcSaveSkill(
         await sendRpc('skill.update', {
             id: String(skill.id),
             name: skill.name,
-            description: skill.description,
             type: skill.type,
             specs: skill.specs,
             scripts,
