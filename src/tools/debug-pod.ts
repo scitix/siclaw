@@ -22,7 +22,7 @@ export const COMPONENT_DEBUG_POD = "debug-pod";
 export const MANAGED_BY_SICLAW = "siclaw";
 
 // ── Resource limit constants ────────────────────────────────────────
-export const DEBUG_POD_RESOURCE_REQUESTS = { cpu: "0", memory: "0" };
+export const DEBUG_POD_RESOURCE_REQUESTS = { cpu: "1m", memory: "1Mi" };
 export const DEBUG_POD_RESOURCE_LIMITS = { cpu: "500m", memory: "256Mi" };
 
 // ── Label helpers ────────────────────────────────────────────────────
@@ -341,6 +341,7 @@ export class DebugPodCache {
   private async evict(key: string): Promise<void> {
     const entry = this.pods.get(key);
     if (!entry) return;
+    clearTimeout(entry.idleTimer);
     this.pods.delete(key);
 
     console.info("[debug-pod] idle eviction", {

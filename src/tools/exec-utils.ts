@@ -347,8 +347,11 @@ export async function runInDebugPod(
       }
     }
 
-    // Check if pod is still alive — if gone or in terminal phase, evict stale cache entry
-    if (exitCode === null) {
+    // Check if pod is still alive — if gone or in terminal phase, evict stale cache entry.
+    // Trigger on: (a) non-numeric exit code (kubectl killed), or
+    //             (b) numeric exit code with "not found" in stderr (GC deleted the pod).
+    const maybeStale = exitCode === null || (exitCode !== 0 && stderr.includes("not found"));
+    if (maybeStale) {
       let podPhase = "";
       try {
         const phaseResult = await kubectlExec(
@@ -360,9 +363,11 @@ export async function runInDebugPod(
         );
         podPhase = phaseResult.stdout.trim();
       } catch {
-        podPhase = "";
+        // Probe failed (network error, pod gone) — don't evict on transient failure,
+        // let GC and idle timer handle cleanup instead.
+        podPhase = "Unknown";
       }
-      if (!podPhase || podPhase === "Succeeded" || podPhase === "Failed") {
+      if (podPhase === "Succeeded" || podPhase === "Failed" || podPhase === "") {
         debugPodCache.remove(spec.userId, spec.nodeName);
         return { stdout, stderr, exitCode };
       }

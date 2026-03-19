@@ -12,7 +12,7 @@ import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
 import type { BrainType } from "./core/brain-session.js";
-import { debugPodGC } from "./tools/debug-pod.js";
+import { debugPodGC, debugPodCache } from "./tools/debug-pod.js";
 
 
 // Parse arguments
@@ -228,6 +228,8 @@ if (session.sessionFile) {
   }
 }
 
+// Clean up cached debug pods
+try { await debugPodCache.evictAll(); } catch { /* ignore */ }
 // Shutdown MCP connections
 if (mcpManager) {
   try { await mcpManager.shutdown(); } catch { /* ignore */ }

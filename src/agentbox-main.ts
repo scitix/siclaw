@@ -14,7 +14,7 @@ import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
-import { debugPodGC } from "./tools/debug-pod.js";
+import { debugPodGC, debugPodCache } from "./tools/debug-pod.js";
 
 // Side-effect: register metrics subscriber. Also imported in http-server.ts,
 // but ESM guarantees single module evaluation — the subscriber registers only once.
@@ -140,6 +140,7 @@ async function main() {
   const shutdown = async () => {
     console.log("[agentbox] Shutting down...");
     debugPodGC.stop();
+    await debugPodCache.evictAll();
     await sessionManager.closeAll();
     server.close();
     if (metricsServer) metricsServer.close();
