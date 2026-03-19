@@ -12,6 +12,15 @@ import { sanitizeEnv } from "./sanitize-env.js";
 import { processToolOutput } from "./tool-render.js";
 import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
 import { loadConfig } from "../core/config.js";
+import {
+  buildDebugPodLabels,
+  ensureDebugNamespace,
+  DEBUG_POD_RESOURCE_REQUESTS,
+  DEBUG_POD_RESOURCE_LIMITS,
+  deleteDebugPod,
+  debugPodCache,
+  kubectlExec,
+} from "./debug-pod.js";
 
 // ── Name validators ──────────────────────────────────────────────────
 
@@ -143,6 +152,7 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  timedOut?: boolean;
 }
 
 /**
@@ -175,6 +185,7 @@ export function formatExecOutput(result: ExecResult): {
 // ── Debug Pod lifecycle ──────────────────────────────────────────────
 
 export interface DebugPodSpec {
+  userId: string;
   nodeName: string;
   /** Full command array for the container (including nsenter if needed). */
   command: string[];
@@ -184,124 +195,186 @@ export interface DebugPodSpec {
 /**
  * Run a command inside a privileged debug pod on a specific node.
  *
- * Manages the full 5-phase lifecycle:
- *   1. Create pod (kubectl run)
- *   2. Wait for terminal phase (Succeeded / Failed)
- *   3. Fetch logs
- *   4. Get exit code
- *   5. Cleanup (delete pod)
+ * Uses an always-reuse model:
+ *   - First call for a (userId, nodeName) pair creates a long-lived pod
+ *     with `sleep infinity` and caches it.
+ *   - Subsequent calls reuse the cached pod via `kubectl exec`.
+ *   - Idle pods are auto-deleted by DebugPodCache after the configured timeout.
+ *   - activeDeadlineSeconds (config.debugPodTTL) is the hard safety net.
  */
 export async function runInDebugPod(
   spec: DebugPodSpec,
   env: ExecEnv,
   opts: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<ExecResult> {
-  const image = spec.image || loadConfig().debugImage;
-  const podId = randomBytes(4).toString("hex");
-  const podName = `node-debug-${podId}`;
+  const config = loadConfig();
+  const image = spec.image || config.debugImage;
+  const debugNamespace = config.debugNamespace;
+  const idleTimeoutMs = config.debugPodIdleTimeout;
 
-  const cleanup = () => {
-    spawnAsync(
-      "kubectl",
-      [...env.kubeconfigArgs, "delete", "pod", podName, "--force", "--grace-period=0"],
-      10_000,
-      env.childEnv,
-    ).catch(() => {});
-  };
+  // ── Phase 0: Lookup or create a reusable pod ──────────────────────
+  const cached = debugPodCache.get(spec.userId, spec.nodeName);
+  let podName: string;
+  let isNewPod = false;
 
-  const overrides = JSON.stringify({
-    spec: {
-      nodeName: spec.nodeName,
-      hostPID: true,
-      hostNetwork: true,
-      containers: [{
-        name: podName,
-        image,
-        securityContext: { privileged: true },
-        command: spec.command,
-      }],
-      restartPolicy: "Never",
-    },
-  });
+  if (cached) {
+    podName = cached.podName;
+  } else {
+    // Acquire concurrency slot — throws if already held (e.g., concurrent creation race)
+    debugPodCache.acquire(spec.userId, spec.nodeName);
+    isNewPod = true;
 
-  try {
-    // Phase 1: Create pod
-    await spawnAsync(
-      "kubectl",
-      [
-        ...env.kubeconfigArgs,
-        "run", podName,
-        "--restart=Never",
-        `--image=${image}`,
-        `--overrides=${overrides}`,
-      ],
-      30_000,
-      env.childEnv,
-      opts.signal,
-    );
+    const podId = randomBytes(4).toString("hex");
+    podName = `node-debug-${podId}`;
 
-    // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
+    const labels = buildDebugPodLabels(spec.userId, spec.nodeName);
+    const activeDeadlineSeconds = config.debugPodTTL;
+
+    const overrides = JSON.stringify({
+      metadata: { labels },
+      spec: {
+        activeDeadlineSeconds,
+        nodeName: spec.nodeName,
+        hostPID: true,
+        hostNetwork: true,
+        containers: [{
+          name: podName,
+          image,
+          securityContext: { privileged: true },
+          command: ["sleep", "infinity"],
+          resources: {
+            requests: DEBUG_POD_RESOURCE_REQUESTS,
+            limits: DEBUG_POD_RESOURCE_LIMITS,
+          },
+        }],
+        restartPolicy: "Never",
+      },
+    });
+
     try {
-      await waitForPodDone(
-        podName, opts.timeoutMs, env.childEnv, opts.signal,
-        env.kubeconfigPath ?? undefined,
-      );
-    } catch {
-      // Timed out — still fetch logs before cleanup
-    }
+      // Ensure namespace
+      await ensureDebugNamespace(debugNamespace, env);
 
-    if (opts.signal?.aborted) {
-      cleanup();
-      return { stdout: "", stderr: "Aborted.", exitCode: null };
-    }
-
-    // Phase 3: Fetch logs
-    let stdout = "";
-    let stderr = "";
-    try {
-      const logsResult = await spawnAsync(
-        "kubectl",
-        [...env.kubeconfigArgs, "logs", podName],
-        10_000,
-        env.childEnv,
-      );
-      stdout = logsResult.stdout;
-      stderr = logsResult.stderr;
-    } catch (logErr: any) {
-      stdout = logErr.stdout ?? "";
-      stderr = logErr.stderr ?? "";
-    }
-
-    // Phase 4: Get exit code from pod status
-    let exitCode: number | null = null;
-    try {
-      const statusResult = await spawnAsync(
+      // Create the pod
+      await spawnAsync(
         "kubectl",
         [
-          ...env.kubeconfigArgs, "get", "pod", podName,
-          "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
+          ...env.kubeconfigArgs,
+          "-n", debugNamespace,
+          "run", podName,
+          "--restart=Never",
+          `--image=${image}`,
+          `--overrides=${overrides}`,
         ],
-        5_000,
+        30_000,
         env.childEnv,
+        opts.signal,
       );
-      const code = parseInt(statusResult.stdout.trim(), 10);
-      if (!isNaN(code)) exitCode = code;
-    } catch {
-      // ignore — exitCode stays null
+
+      // Wait for Running phase (adaptive polling from Plan 02-01)
+      const phase = await waitForPodDone(
+        podName, opts.timeoutMs, env.childEnv, opts.signal,
+        env.kubeconfigPath ?? undefined, debugNamespace, "Running",
+      );
+
+      if (phase !== "Running") {
+        // Pod went to terminal phase without reaching Running — creation failed
+        await deleteDebugPod(podName, env, {
+          namespace: debugNamespace,
+          nodeName: spec.nodeName,
+          force: true,
+        });
+        debugPodCache.remove(spec.userId, spec.nodeName);
+        return {
+          stdout: "",
+          stderr: `Debug pod failed to start (phase: ${phase}). Check node "${spec.nodeName}" status.`,
+          exitCode: null,
+        };
+      }
+
+      // Store in cache — idle timer starts now
+      debugPodCache.set(spec.userId, spec.nodeName, podName, debugNamespace, env, idleTimeoutMs);
+    } catch (err: any) {
+      // Pod creation failed — clean up and release slot
+      await deleteDebugPod(podName, env, {
+        namespace: debugNamespace,
+        nodeName: spec.nodeName,
+        force: true,
+      });
+      debugPodCache.remove(spec.userId, spec.nodeName);
+      return {
+        stdout: err.stdout?.trim() ?? "",
+        stderr: err.stderr?.trim() ?? err.message,
+        exitCode: typeof err.code === "number" ? err.code : null,
+      };
+    }
+  }
+
+  // ── Phase 1: Execute command via kubectl exec ─────────────────────
+  if (opts.signal?.aborted) {
+    return { stdout: "", stderr: "Aborted.", exitCode: null };
+  }
+
+  let stdout = "";
+  let stderr = "";
+  let exitCode: number | null = 0;
+  let timedOut = false;
+
+  try {
+    const result = await kubectlExec(
+      ["exec", podName, "--", ...spec.command],
+      env,
+      opts.timeoutMs,
+      opts.signal,
+      debugNamespace,
+    );
+    stdout = result.stdout;
+    stderr = result.stderr;
+    exitCode = 0;
+  } catch (err: any) {
+    stdout = err.stdout?.trim() ?? "";
+    stderr = err.stderr?.trim() ?? err.message;
+
+    if (typeof err.code === "number") {
+      exitCode = err.code;
+    } else {
+      // Non-numeric exit code: kubectl was killed (timeout/abort) or failed to connect.
+      // Distinguish timeout (SIGKILL from spawnAsync timer) from other failures by
+      // checking if the signal was SIGKILL and no meaningful stderr was produced —
+      // a killed-by-timeout process typically has empty or truncated stderr.
+      exitCode = null;
+      if (err.code === null && !stderr) {
+        timedOut = true;
+      }
     }
 
-    // Phase 5: Cleanup
-    cleanup();
-
-    return { stdout, stderr, exitCode };
-  } catch (err: any) {
-    cleanup();
-    return {
-      stdout: err.stdout?.trim() ?? "",
-      stderr: err.stderr?.trim() ?? err.message,
-      exitCode: typeof err.code === "number" ? err.code : null,
-    };
+    // Check if pod is still alive — if gone or in terminal phase, evict stale cache entry
+    if (exitCode === null) {
+      let podPhase = "";
+      try {
+        const phaseResult = await kubectlExec(
+          ["get", "pod", podName, "-o", "jsonpath={.status.phase}"],
+          env,
+          5_000,
+          undefined,
+          debugNamespace,
+        );
+        podPhase = phaseResult.stdout.trim();
+      } catch {
+        // Pod is gone
+        podPhase = "";
+      }
+      if (!podPhase || podPhase === "Succeeded" || podPhase === "Failed") {
+        debugPodCache.remove(spec.userId, spec.nodeName);
+        return { stdout, stderr, exitCode };
+      }
+    }
   }
+
+  // ── Phase 2: Reset idle timer ─────────────────────────────────────
+  debugPodCache.touch(spec.userId, spec.nodeName, idleTimeoutMs);
+
+  return { stdout, stderr, exitCode, ...(timedOut ? { timedOut: true } : {}) };
 }
 
 // ── Container netns resolution ───────────────────────────────────────

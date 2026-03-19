@@ -25,7 +25,7 @@ interface NodeScriptParams {
   timeout_seconds?: number;
 }
 
-export function createNodeScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createNodeScriptTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
   return {
     name: "node_script",
     label: "Node Script",
@@ -151,7 +151,7 @@ Examples:
       ];
 
       const execResult = await runInDebugPod(
-        { nodeName: params.node, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image },
         env,
         { timeoutMs: timeout, signal },
       );
