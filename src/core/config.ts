@@ -83,7 +83,7 @@ const DEFAULTS: SiclawConfig = {
   debugImage: "busybox:1.36",
   debugNamespace: "siclaw-debug",
   debugPodTTL: 600,
-  debugPodIdleTimeout: 30,
+  debugPodIdleTimeout: 60,
   allowedTools: null,
   mcpServers: {},
   debug: false,
