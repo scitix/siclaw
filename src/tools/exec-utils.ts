@@ -210,7 +210,7 @@ export async function runInDebugPod(
   const config = loadConfig();
   const image = spec.image || config.debugImage;
   const debugNamespace = config.debugNamespace;
-  const idleTimeoutMs = config.debugPodIdleTimeout;
+  const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
   // ── Phase 0: Lookup or create a reusable pod ──────────────────────
   const cached = debugPodCache.get(spec.userId, spec.nodeName);
@@ -312,6 +312,14 @@ export async function runInDebugPod(
 
   // ── Phase 1: Execute command via kubectl exec ─────────────────────
   if (opts.signal?.aborted) {
+    if (isNewPod) {
+      await deleteDebugPod(podName, env, {
+        namespace: debugNamespace,
+        nodeName: spec.nodeName,
+        force: true,
+      });
+      debugPodCache.remove(spec.userId, spec.nodeName);
+    }
     return { stdout: "", stderr: "Aborted.", exitCode: null };
   }
 
@@ -343,7 +351,7 @@ export async function runInDebugPod(
       // checking if the signal was SIGKILL and no meaningful stderr was produced —
       // a killed-by-timeout process typically has empty or truncated stderr.
       exitCode = null;
-      if (err.code === null && !stderr) {
+      if (err.code === null && !stderr && !opts.signal?.aborted) {
         timedOut = true;
       }
     }

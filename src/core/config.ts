@@ -57,6 +57,7 @@ export interface SiclawConfig {
   debugImage: string;
   debugNamespace: string;
   debugPodTTL: number;
+  /** Idle timeout before cached debug pods are evicted, in seconds. */
   debugPodIdleTimeout: number;
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
@@ -82,7 +83,7 @@ const DEFAULTS: SiclawConfig = {
   debugImage: "busybox:1.36",
   debugNamespace: "siclaw-debug",
   debugPodTTL: 600,
-  debugPodIdleTimeout: 30_000,
+  debugPodIdleTimeout: 30,
   allowedTools: null,
   mcpServers: {},
   debug: false,
