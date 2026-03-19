@@ -4,14 +4,15 @@ import { Globe, KeyRound, Plus, Pencil, Trash2, Loader2, Search, Upload } from '
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { usePermissions } from '@/hooks/usePermissions';
-import { EnvironmentDialog } from './components/EnvironmentDialog';
+import { ClusterDialog } from './components/ClusterDialog';
 import { KubeconfigUploadDialog } from './components/KubeconfigUploadDialog';
 
 /* ---------- Types ---------- */
 
-interface Environment {
+interface Cluster {
     id: string;
     name: string;
+    infraContext: string | null;
     isTest: boolean;
     apiServer: string;
     allowedServers: string[];
@@ -28,44 +29,44 @@ const TYPE_BADGE_COLORS = {
     testing: 'bg-amber-50 text-amber-700',
 } as const;
 
-type TabKey = 'environments' | 'ssh' | 'api';
+type TabKey = 'clusters' | 'ssh' | 'api';
 
 /* ---------- Page ---------- */
 
-export function EnvironmentsPage() {
+export function CredentialsPage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { isAdmin, loaded: permLoaded } = usePermissions(sendRpc, isConnected);
 
     const [searchParams, setSearchParams] = useSearchParams();
     const rawTab = searchParams.get('tab');
-    const activeTab: TabKey = rawTab === 'ssh' ? 'ssh' : rawTab === 'api' ? 'api' : rawTab === 'credentials' ? 'ssh' : 'environments';
+    const activeTab: TabKey = rawTab === 'ssh' ? 'ssh' : rawTab === 'api' ? 'api' : rawTab === 'credentials' ? 'ssh' : 'clusters';
     const setActiveTab = (tab: TabKey) => {
-        if (tab === 'environments') {
+        if (tab === 'clusters') {
             setSearchParams({});
         } else {
             setSearchParams({ tab });
         }
     };
 
-    const [environments, setEnvironments] = useState<Environment[]>([]);
+    const [clusters, setClusters] = useState<Cluster[]>([]);
     const [isAdminFromServer, setIsAdminFromServer] = useState(false);
     const [loading, setLoading] = useState(true);
     const [search, setSearch] = useState('');
     const [dialogOpen, setDialogOpen] = useState(false);
-    const [editingEnv, setEditingEnv] = useState<Environment | null>(null);
+    const [editingCluster, setEditingCluster] = useState<Cluster | null>(null);
     const [deleting, setDeleting] = useState<string | null>(null);
     const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
-    const [uploadEnvId, setUploadEnvId] = useState<string | undefined>();
+    const [uploadClusterId, setUploadClusterId] = useState<string | undefined>();
     const hasLoadedRef = useRef(false);
 
-    const loadEnvironments = useCallback(async () => {
+    const loadClusters = useCallback(async () => {
         setLoading(true);
         try {
-            const result = await sendRpc<{ environments: Environment[]; isAdmin: boolean }>('environment.list');
-            setEnvironments(result.environments ?? []);
+            const result = await sendRpc<{ clusters: Cluster[]; isAdmin: boolean }>('cluster.list');
+            setClusters(result.clusters ?? []);
             setIsAdminFromServer(result.isAdmin ?? false);
         } catch (err) {
-            console.error('[Environments] Failed to load:', err);
+            console.error('[Clusters] Failed to load:', err);
         } finally {
             setLoading(false);
         }
@@ -74,40 +75,40 @@ export function EnvironmentsPage() {
     useEffect(() => {
         if (isConnected && permLoaded && !hasLoadedRef.current) {
             hasLoadedRef.current = true;
-            loadEnvironments();
+            loadClusters();
         }
-    }, [isConnected, permLoaded, loadEnvironments]);
+    }, [isConnected, permLoaded, loadClusters]);
 
     const filtered = useMemo(() => {
-        if (!search.trim()) return environments;
+        if (!search.trim()) return clusters;
         const q = search.toLowerCase();
-        return environments.filter(env =>
-            env.name.toLowerCase().includes(q) ||
-            env.apiServer.toLowerCase().includes(q) ||
-            env.allowedServers.some(s => s.toLowerCase().includes(q))
+        return clusters.filter(c =>
+            c.name.toLowerCase().includes(q) ||
+            c.apiServer.toLowerCase().includes(q) ||
+            c.allowedServers.some(s => s.toLowerCase().includes(q))
         );
-    }, [environments, search]);
+    }, [clusters, search]);
 
     const openCreate = () => {
-        setEditingEnv(null);
+        setEditingCluster(null);
         setDialogOpen(true);
     };
 
-    const openEdit = (env: Environment) => {
-        setEditingEnv(env);
+    const openEdit = (cls: Cluster) => {
+        setEditingCluster(cls);
         setDialogOpen(true);
     };
 
-    const handleDelete = async (e: React.MouseEvent, env: Environment) => {
+    const handleDelete = async (e: React.MouseEvent, cls: Cluster) => {
         e.stopPropagation();
         if (deleting) return;
-        if (!window.confirm(`Delete environment "${env.name}"? This action cannot be undone.`)) return;
-        setDeleting(env.id);
+        if (!window.confirm(`Delete cluster "${cls.name}"? This action cannot be undone.`)) return;
+        setDeleting(cls.id);
         try {
-            await sendRpc('environment.delete', { id: env.id });
-            await loadEnvironments();
+            await sendRpc('cluster.delete', { id: cls.id });
+            await loadClusters();
         } catch (err) {
-            console.error('[Environments] Delete failed:', err);
+            console.error('[Clusters] Delete failed:', err);
         } finally {
             setDeleting(null);
         }
@@ -115,45 +116,45 @@ export function EnvironmentsPage() {
 
     const handleSaved = () => {
         setDialogOpen(false);
-        setEditingEnv(null);
-        loadEnvironments();
+        setEditingCluster(null);
+        loadClusters();
     };
 
-    const openUploadDialog = (envId?: string) => {
-        setUploadEnvId(envId);
+    const openUploadDialog = (clusterId?: string) => {
+        setUploadClusterId(clusterId);
         setUploadDialogOpen(true);
     };
 
     const handleUploadComplete = () => {
         setUploadDialogOpen(false);
-        setUploadEnvId(undefined);
-        loadEnvironments();
+        setUploadClusterId(undefined);
+        loadClusters();
     };
 
-    const handleRemoveKubeconfig = async (envId: string) => {
-        if (!window.confirm('Remove your kubeconfig for this environment?')) return;
+    const handleRemoveKubeconfig = async (clusterId: string) => {
+        if (!window.confirm('Remove your kubeconfig for this cluster?')) return;
         try {
-            await sendRpc('userEnvConfig.remove', { envId });
-            await loadEnvironments();
+            await sendRpc('userClusterConfig.remove', { clusterId });
+            await loadClusters();
         } catch (err) {
-            console.error('Failed to remove env config:', err);
+            console.error('Failed to remove cluster config:', err);
         }
     };
 
-    const uploadEnv = useMemo(() => environments.find(e => e.id === uploadEnvId), [environments, uploadEnvId]);
+    const uploadCluster = useMemo(() => clusters.find(c => c.id === uploadClusterId), [clusters, uploadClusterId]);
 
     const showAdmin = isAdmin || isAdminFromServer;
 
     /* Status badge for kubeconfig */
-    const getStatusBadge = (env: Environment) => {
-        if (env.hasUserKubeconfig) {
+    const getStatusBadge = (cls: Cluster) => {
+        if (cls.hasUserKubeconfig) {
             return (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-50 text-green-700">
                     Configured
                 </span>
             );
         }
-        if (env.hasDefaultKubeconfig && env.isTest) {
+        if (cls.hasDefaultKubeconfig && cls.isTest) {
             return (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-teal-50 text-teal-700">
                     Default
@@ -183,7 +184,7 @@ export function EnvironmentsPage() {
                     </div>
                     <div>
                         <h1 className="text-lg font-bold text-gray-900">Credentials</h1>
-                        <p className="text-xs text-gray-500">Manage Kubernetes environments, SSH and API credentials</p>
+                        <p className="text-xs text-gray-500">Manage Kubernetes clusters, SSH and API credentials</p>
                     </div>
                 </div>
             </header>
@@ -192,7 +193,7 @@ export function EnvironmentsPage() {
             <div className="border-b border-gray-200 bg-white px-6">
                 <nav className="flex gap-6 -mb-px">
                     {([
-                        { key: 'environments' as TabKey, label: 'Kubernetes' },
+                        { key: 'clusters' as TabKey, label: 'Kubernetes' },
                         { key: 'ssh' as TabKey, label: 'SSH' },
                         { key: 'api' as TabKey, label: 'API' },
                     ]).map(tab => (
@@ -214,7 +215,7 @@ export function EnvironmentsPage() {
 
             <div className="flex-1 overflow-y-auto p-8">
                 <div className="max-w-5xl mx-auto">
-                    {activeTab !== 'environments' ? (
+                    {activeTab !== 'clusters' ? (
                         <div className="text-center py-20">
                             <Globe className="w-12 h-12 text-gray-200 mx-auto mb-4" />
                             <div className="text-lg font-medium text-gray-500 mb-1">
@@ -232,7 +233,7 @@ export function EnvironmentsPage() {
                                         type="text"
                                         value={search}
                                         onChange={(e) => setSearch(e.target.value)}
-                                        placeholder="Search environments..."
+                                        placeholder="Search clusters..."
                                         className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                                     />
                                 </div>
@@ -256,11 +257,11 @@ export function EnvironmentsPage() {
                                 <div className="text-center py-20">
                                     <Globe className="w-12 h-12 text-gray-200 mx-auto mb-4" />
                                     <h3 className="text-sm font-medium text-gray-900 mb-1">
-                                        {environments.length === 0 ? 'No environments yet' : 'No matching environments'}
+                                        {clusters.length === 0 ? 'No clusters yet' : 'No matching clusters'}
                                     </h3>
                                     <p className="text-xs text-gray-500">
-                                        {environments.length === 0
-                                            ? (showAdmin ? 'Create your first environment to get started.' : 'No environments have been configured yet.')
+                                        {clusters.length === 0
+                                            ? (showAdmin ? 'Create your first cluster to get started.' : 'No clusters have been configured yet.')
                                             : 'Try adjusting your search.'}
                                     </p>
                                 </div>
@@ -277,46 +278,46 @@ export function EnvironmentsPage() {
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            {filtered.map((env) => (
+                                            {filtered.map((cls) => (
                                                 <tr
-                                                    key={env.id}
+                                                    key={cls.id}
                                                     className={cn(
                                                         "border-b border-gray-50 last:border-0 hover:bg-gray-50/50 transition-colors",
                                                         showAdmin && "cursor-pointer",
                                                     )}
-                                                    onClick={() => showAdmin && openEdit(env)}
+                                                    onClick={() => showAdmin && openEdit(cls)}
                                                 >
                                                     <td className="px-6 py-4">
-                                                        <span className="text-sm font-medium text-gray-900">{env.name}</span>
+                                                        <span className="text-sm font-medium text-gray-900">{cls.name}</span>
                                                     </td>
                                                     <td className="px-6 py-4">
                                                         <span className={cn(
                                                             "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium",
-                                                            env.isTest ? TYPE_BADGE_COLORS.testing : TYPE_BADGE_COLORS.production,
+                                                            cls.isTest ? TYPE_BADGE_COLORS.testing : TYPE_BADGE_COLORS.production,
                                                         )}>
-                                                            {env.isTest ? 'Testing' : 'Production'}
+                                                            {cls.isTest ? 'Testing' : 'Production'}
                                                         </span>
                                                     </td>
                                                     <td className="px-6 py-4">
-                                                        <span className="text-sm text-gray-500 font-mono text-xs">{env.apiServer}</span>
+                                                        <span className="text-sm text-gray-500 font-mono text-xs">{cls.apiServer}</span>
                                                     </td>
                                                     <td className="px-6 py-4">
-                                                        {getStatusBadge(env)}
+                                                        {getStatusBadge(cls)}
                                                     </td>
                                                     <td className="px-6 py-4 text-center">
                                                         <div className="inline-flex items-center gap-1">
                                                             {/* Upload / Replace kubeconfig (all users) */}
-                                                            {env.hasUserKubeconfig ? (
+                                                            {cls.hasUserKubeconfig ? (
                                                                 <>
                                                                     <button
-                                                                        onClick={(e) => { e.stopPropagation(); openUploadDialog(env.id); }}
+                                                                        onClick={(e) => { e.stopPropagation(); openUploadDialog(cls.id); }}
                                                                         className="px-2 py-1 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded transition-colors"
                                                                         title="Replace kubeconfig"
                                                                     >
                                                                         Replace
                                                                     </button>
                                                                     <button
-                                                                        onClick={(e) => { e.stopPropagation(); handleRemoveKubeconfig(env.id); }}
+                                                                        onClick={(e) => { e.stopPropagation(); handleRemoveKubeconfig(cls.id); }}
                                                                         className="px-2 py-1 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 rounded transition-colors"
                                                                         title="Remove kubeconfig"
                                                                     >
@@ -325,7 +326,7 @@ export function EnvironmentsPage() {
                                                                 </>
                                                             ) : (
                                                                 <button
-                                                                    onClick={(e) => { e.stopPropagation(); openUploadDialog(env.id); }}
+                                                                    onClick={(e) => { e.stopPropagation(); openUploadDialog(cls.id); }}
                                                                     className="px-2 py-1 text-xs font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded transition-colors"
                                                                     title="Upload kubeconfig"
                                                                 >
@@ -339,19 +340,19 @@ export function EnvironmentsPage() {
                                                                 <>
                                                                     <span className="w-px h-4 bg-gray-200 mx-1" />
                                                                     <button
-                                                                        onClick={(e) => { e.stopPropagation(); openEdit(env); }}
+                                                                        onClick={(e) => { e.stopPropagation(); openEdit(cls); }}
                                                                         className="p-1.5 text-gray-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
-                                                                        title="Edit environment"
+                                                                        title="Edit cluster"
                                                                     >
                                                                         <Pencil className="w-3.5 h-3.5" />
                                                                     </button>
                                                                     <button
-                                                                        onClick={(e) => handleDelete(e, env)}
-                                                                        disabled={deleting === env.id}
+                                                                        onClick={(e) => handleDelete(e, cls)}
+                                                                        disabled={deleting === cls.id}
                                                                         className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors disabled:opacity-50"
-                                                                        title="Delete environment"
+                                                                        title="Delete cluster"
                                                                     >
-                                                                        {deleting === env.id ? (
+                                                                        {deleting === cls.id ? (
                                                                             <Loader2 className="w-3.5 h-3.5 animate-spin" />
                                                                         ) : (
                                                                             <Trash2 className="w-3.5 h-3.5" />
@@ -372,24 +373,24 @@ export function EnvironmentsPage() {
                 </div>
             </div>
 
-            {/* Admin: Create / Edit environment dialog */}
+            {/* Admin: Create / Edit cluster dialog */}
             {dialogOpen && showAdmin && (
-                <EnvironmentDialog
-                    environment={editingEnv}
-                    onClose={() => { setDialogOpen(false); setEditingEnv(null); }}
+                <ClusterDialog
+                    cluster={editingCluster}
+                    onClose={() => { setDialogOpen(false); setEditingCluster(null); }}
                     onSaved={handleSaved}
                     sendRpc={sendRpc}
                 />
             )}
 
             {/* All users: Kubeconfig upload dialog */}
-            {uploadDialogOpen && uploadEnv && (
+            {uploadDialogOpen && uploadCluster && (
                 <KubeconfigUploadDialog
-                    envId={uploadEnv.id}
-                    envName={uploadEnv.name}
-                    apiServer={uploadEnv.apiServer}
-                    replacing={uploadEnv.hasUserKubeconfig}
-                    onClose={() => { setUploadDialogOpen(false); setUploadEnvId(undefined); }}
+                    clusterId={uploadCluster.id}
+                    clusterName={uploadCluster.name}
+                    apiServer={uploadCluster.apiServer}
+                    replacing={uploadCluster.hasUserKubeconfig}
+                    onClose={() => { setUploadDialogOpen(false); setUploadClusterId(undefined); }}
                     onUploaded={handleUploadComplete}
                     sendRpc={sendRpc}
                 />

@@ -15,7 +15,7 @@ interface Credential {
     type: string;
 }
 
-interface EnvOption {
+interface ClusterOption {
     id: string;
     name: string;
     isTest: boolean;
@@ -83,8 +83,8 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
     const [systemPrompt, setSystemPrompt] = useState(workspace?.configJson?.systemPrompt ?? '');
     const [saving, setSaving] = useState(false);
     const [envType, setEnvType] = useState<string>(workspace?.envType ?? 'prod');
-    const [selectedEnvs, setSelectedEnvs] = useState<Set<string>>(new Set());
-    const [allEnvs, setAllEnvs] = useState<EnvOption[]>([]);
+    const [selectedClusters, setSelectedClusters] = useState<Set<string>>(new Set());
+    const [allClusters, setAllClusters] = useState<ClusterOption[]>([]);
 
     // Skills filter state
     const [skillSearch, setSkillSearch] = useState('');
@@ -114,19 +114,19 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             .then(r => setAllCreds(r.credentials ?? []))
             .catch(() => {});
 
-        sendRpc<{ environments: EnvOption[] }>('environment.list')
-            .then(r => setAllEnvs(r.environments ?? []))
+        sendRpc<{ clusters: ClusterOption[] }>('cluster.list')
+            .then(r => setAllClusters(r.clusters ?? []))
             .catch(() => {});
 
         // Load existing config if editing
         if (workspace && !workspace.isDefault) {
-            sendRpc<{ skills: string[]; tools: string[]; credentials: string[]; environments: string[] }>(
+            sendRpc<{ skills: string[]; tools: string[]; credentials: string[]; clusters: string[] }>(
                 'workspace.getConfig', { id: workspace.id }
             ).then(cfg => {
                 setSelectedSkills(new Set(cfg.skills ?? []));
                 setSelectedTools(new Set(cfg.tools ?? []));
                 setSelectedCreds(new Set(cfg.credentials ?? []));
-                setSelectedEnvs(new Set(cfg.environments ?? []));
+                setSelectedClusters(new Set(cfg.clusters ?? []));
             }).catch(() => {});
         }
     }, [sendRpc, workspace]);
@@ -153,10 +153,10 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         return list;
     }, [allSkills, skillSearch, skillLabelFilter]);
 
-    // ── Derived: filtered environments by envType ──
-    const filteredEnvs = useMemo(() => {
-        return envType === 'test' ? allEnvs.filter(e => e.isTest) : allEnvs;
-    }, [allEnvs, envType]);
+    // ── Derived: filtered clusters by envType ──
+    const filteredClusters = useMemo(() => {
+        return envType === 'test' ? allClusters.filter(e => e.isTest) : allClusters;
+    }, [allClusters, envType]);
 
     const toggleSkill = useCallback((skillName: string) => {
         setSelectedSkills(prev => {
@@ -182,8 +182,8 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         });
     }, []);
 
-    const toggleEnv = useCallback((envId: string) => {
-        setSelectedEnvs(prev => {
+    const toggleCluster = useCallback((envId: string) => {
+        setSelectedClusters(prev => {
             const next = new Set(prev);
             next.has(envId) ? next.delete(envId) : next.add(envId);
             return next;
@@ -205,7 +205,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     sendRpc('workspace.setSkills', { workspaceId: wsId, skills: [...selectedSkills] }),
                     sendRpc('workspace.setTools', { workspaceId: wsId, tools: [...selectedTools] }),
                     sendRpc('workspace.setCredentials', { workspaceId: wsId, credentialIds: [...selectedCreds] }),
-                    sendRpc('workspace.setEnvironments', { workspaceId: wsId, envIds: [...selectedEnvs] }),
+                    sendRpc('workspace.setClusters', { workspaceId: wsId, clusterIds: [...selectedClusters] }),
                 ]);
             } else if (!isDefault) {
                 await sendRpc('workspace.update', {
@@ -218,7 +218,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     sendRpc('workspace.setSkills', { workspaceId: workspace!.id, skills: [...selectedSkills] }),
                     sendRpc('workspace.setTools', { workspaceId: workspace!.id, tools: [...selectedTools] }),
                     sendRpc('workspace.setCredentials', { workspaceId: workspace!.id, credentialIds: [...selectedCreds] }),
-                    sendRpc('workspace.setEnvironments', { workspaceId: workspace!.id, envIds: [...selectedEnvs] }),
+                    sendRpc('workspace.setClusters', { workspaceId: workspace!.id, clusterIds: [...selectedClusters] }),
                 ]);
             }
             onSaved();
@@ -230,7 +230,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
     };
 
     // ── Access tab counts ──
-    const accessCount = selectedCreds.size + selectedEnvs.size;
+    const accessCount = selectedCreds.size + selectedClusters.size;
 
     const tabs: { key: Tab; label: string }[] = [
         { key: 'general', label: 'General' },
@@ -309,7 +309,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                             Production
                                         </button>
                                         <button
-                                            onClick={() => { setEnvType('test'); setSelectedEnvs(new Set()); }}
+                                            onClick={() => { setEnvType('test'); setSelectedClusters(new Set()); }}
                                             className={`px-4 py-2 rounded-lg text-sm font-medium border ${
                                                 envType === 'test'
                                                     ? 'border-amber-500 bg-amber-50 text-amber-700'
@@ -483,24 +483,24 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     {/* ── Access Tab (Credentials + Environments combined) ── */}
                     {tab === 'access' && (
                         <div className="space-y-5">
-                            {/* K8s Environments section */}
+                            {/* K8s Clusters section */}
                             <div>
                                 <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
-                                    K8s Environments
+                                    K8s Clusters
                                 </h3>
-                                {filteredEnvs.length === 0 ? (
-                                    <p className="text-sm text-gray-400 py-2 text-center">No environments available</p>
+                                {filteredClusters.length === 0 ? (
+                                    <p className="text-sm text-gray-400 py-2 text-center">No clusters available</p>
                                 ) : (
                                     <div className="space-y-0.5">
-                                        {filteredEnvs.map(env => (
+                                        {filteredClusters.map(env => (
                                             <label
                                                 key={env.id}
                                                 className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer"
                                             >
                                                 <input
                                                     type="checkbox"
-                                                    checked={selectedEnvs.has(env.id)}
-                                                    onChange={() => toggleEnv(env.id)}
+                                                    checked={selectedClusters.has(env.id)}
+                                                    onChange={() => toggleCluster(env.id)}
                                                     className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
                                                 />
                                                 <span className="text-sm text-gray-900 flex-1">{env.name}</span>

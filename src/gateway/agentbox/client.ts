@@ -19,8 +19,6 @@ export interface PromptOptions {
   text: string;
   /** string = use this env, null = explicitly no env, undefined = keep current */
   kubeconfigPath?: string | null;
-  /** Environment ID for schedule filtering — string = use this env, null = no env */
-  envId?: string | null;
   /** Session mode — "web" | "channel" */
   mode?: string;
   /** Model provider to use for this prompt */
