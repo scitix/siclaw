@@ -74,6 +74,14 @@ export class GatewayClient {
   }
 
   /**
+   * Search the team knowledge base
+   */
+  async searchKnowledge(query: string, topK = 5, minScore = 0.35): Promise<import("../memory/types.js").MemorySearchResult> {
+    const url = `/api/internal/knowledge-search?query=${encodeURIComponent(query)}&topK=${topK}&minScore=${minScore}`;
+    return this.request(url, "GET");
+  }
+
+  /**
    * Return a GatewayClientLike adapter for use with resource handlers.
    * Keeps `request()` private while exposing a minimal interface.
    */

@@ -50,6 +50,7 @@ export const {
   userPermissions,
   sessionStats,
   systemConfig,
+  knowledgeDocs,
   mcpServers,
   feedbackReports,
   skillReviews,

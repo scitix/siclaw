@@ -20,6 +20,7 @@ import { loadConfig } from "../../core/config.js";
 import type { McpServerRepository } from "../db/repositories/mcp-server-repo.js";
 import type { ResourceType } from "../../shared/resource-sync.js";
 import { resolveUnderDir } from "../../shared/path-utils.js";
+import type { MemoryIndexer } from "../../memory/index.js";
 
 interface LocalBox {
   userId: string;
@@ -47,6 +48,8 @@ export class LocalSpawner implements BoxSpawner {
   private mcpRepo: McpServerRepository | null = null;
   /** Injected skill bundle provider (set via setSkillBundleProvider) */
   private skillBundleProvider: SkillBundleProvider | null = null;
+  /** Injected knowledge base indexer (set via setKnowledgeIndexer) */
+  private knowledgeIndexer: MemoryIndexer | null = null;
 
   constructor(basePort = 4000) {
     this.basePort = basePort;
@@ -61,6 +64,11 @@ export class LocalSpawner implements BoxSpawner {
   /** Inject skill bundle provider for local resource sync */
   setSkillBundleProvider(provider: SkillBundleProvider): void {
     this.skillBundleProvider = provider;
+  }
+
+  /** Inject knowledge base indexer for local knowledge_search */
+  setKnowledgeIndexer(indexer: MemoryIndexer): void {
+    this.knowledgeIndexer = indexer;
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
@@ -88,6 +96,10 @@ export class LocalSpawner implements BoxSpawner {
     const sessionManager = new AgentBoxSessionManager();
     // Set userId so sessions created in this box use per-user skill directories
     sessionManager.userId = userId;
+    // Pass knowledge indexer for knowledge_search tool
+    if (this.knowledgeIndexer) {
+      sessionManager.knowledgeIndexer = this.knowledgeIndexer;
+    }
     const httpServer = createHttpServer(sessionManager);
 
     // Start server

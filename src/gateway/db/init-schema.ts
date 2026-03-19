@@ -347,6 +347,18 @@ const DDL_STATEMENTS = [
     UNIQUE KEY uk_provider_model (provider_id, model_id)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS knowledge_docs (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(500) NOT NULL,
+    file_path VARCHAR(500) NOT NULL,
+    size_bytes INT NOT NULL DEFAULT 0,
+    chunk_count INT NOT NULL DEFAULT 0,
+    uploaded_by VARCHAR(32),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS mcp_servers (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
@@ -407,6 +419,7 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE cron_job_runs ADD INDEX idx_cron_job_runs_job (job_id, created_at)`,
   `ALTER TABLE cron_jobs ADD INDEX idx_cron_jobs_status_assigned (status, assigned_to)`,
   `ALTER TABLE cron_instances ADD INDEX idx_cron_instances_heartbeat (heartbeat_at)`,
+  `ALTER TABLE knowledge_docs ADD INDEX idx_knowledge_docs_name (name(255))`,
 ];
 
 export async function initSchema(db: Database): Promise<void> {
@@ -442,6 +455,8 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE clusters CHANGE COLUMN description infra_context TEXT`,
     `ALTER TABLE cron_jobs ADD COLUMN workspace_id VARCHAR(64)`,
     `ALTER TABLE cron_jobs ADD CONSTRAINT fk_cron_jobs_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id)`,
+    // Knowledge docs: drop description column
+    `ALTER TABLE knowledge_docs DROP COLUMN description`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

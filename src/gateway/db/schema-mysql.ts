@@ -406,6 +406,19 @@ export interface ReviewFinding {
   snippet?: string;
 }
 
+// ─── Knowledge Docs ─────────────────────────────
+
+export const knowledgeDocs = mysqlTable("knowledge_docs", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  name: varchar("name", { length: 500 }).notNull(),
+  filePath: varchar("file_path", { length: 500 }).notNull(),
+  sizeBytes: int("size_bytes").notNull().default(0),
+  chunkCount: int("chunk_count").notNull().default(0),
+  uploadedBy: varchar("uploaded_by", { length: 32 }).references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
 // ─── MCP Servers ────────────────────────────────
 
 export const mcpServers = mysqlTable("mcp_servers", {
