@@ -4,7 +4,7 @@
 **Date:** 2026-03-18
 **Status:** Active
 
-> **Note:** The Zod schemas in `packages/siclaw-sig/src/schema/` are the **source of truth** for field types, validation rules, and forward compatibility behavior. This document is a human-readable reference. If this document and the Zod schemas diverge, the Zod schemas win.
+> **Note:** The Zod schemas in `tools/siclaw-sig/src/schema/` are the **source of truth** for field types, validation rules, and forward compatibility behavior. This document is a human-readable reference. If this document and the Zod schemas diverge, the Zod schemas win.
 
 ---
 

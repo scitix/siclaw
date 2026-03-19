@@ -13,5 +13,5 @@
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist", "**/*.test.ts", "src/gateway/web"],
-  "references": [{ "path": "packages/siclaw-sig" }]
+  "references": [{ "path": "tools/siclaw-sig" }]
 }

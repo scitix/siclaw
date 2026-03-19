@@ -21,7 +21,7 @@ export interface MatchResult {
 
 /**
  * Regex for splitting on delimiters — whitespace and punctuation.
- * Same delimiter set as packages/siclaw-sig/src/parser/keywords.ts.
+ * Same delimiter set as tools/siclaw-sig/src/parser/keywords.ts.
  * Note: `.` and `/` are NOT in the delimiter set — they appear in namespace tokens.
  */
 const DELIMITER_RE = /[\s:=,;()\[\]{}<>|!?'"]+/;
