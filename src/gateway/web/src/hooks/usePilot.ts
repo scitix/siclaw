@@ -278,7 +278,7 @@ export function usePilot() {
     const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null);
     const DP_ACTIVE_STORAGE = 'siclaw_dp_active';
     const [dpActive, setDpActive] = useState(() => {
-        return localStorage.getItem(DP_ACTIVE_STORAGE) === 'true';
+        return sessionStorage.getItem(DP_ACTIVE_STORAGE) === 'true';
     });
     const [sessions, setSessions] = useState<Session[]>([]);
     const [currentSessionKey, setCurrentSessionKey] = useState<string | null>(() => {
@@ -345,11 +345,12 @@ export function usePilot() {
         dpTimersRef.current.clear();
     };
 
-    /** Reset all DP-related state (checklist, focus, progress) — toggle is user preference, not reset */
+    /** Reset all DP-related state including the active toggle */
     const resetDpState = () => {
         setDpChecklist(null);
         setDpFocus(null);
         setInvestigationProgress(null);
+        setDpActive(false);
     };
 
     // Persist currentSessionKey + workspace to sessionStorage (per-tab isolation)
@@ -363,9 +364,9 @@ export function usePilot() {
         }
     }, [currentSessionKey, workspaceId]);
 
-    // Persist dpActive to localStorage
+    // Persist dpActive to sessionStorage (cleared on tab close / logout)
     useEffect(() => {
-        localStorage.setItem(DP_ACTIVE_STORAGE, String(dpActive));
+        sessionStorage.setItem(DP_ACTIVE_STORAGE, String(dpActive));
     }, [dpActive]);
 
     // Persist selectedBrain to localStorage
