@@ -10,9 +10,9 @@ import { parseArgs, shellEscape } from "./command-sets.js";
 import {
   validateNodeName,
   prepareExecEnv,
-  runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { runInDebugPod } from "./debug-pod.js";
 import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 interface NodeScriptParams {

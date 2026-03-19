@@ -10,9 +10,9 @@ import {
   validatePodName,
   prepareExecEnv,
   resolveContainerNetns,
-  runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { runInDebugPod } from "./debug-pod.js";
 import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 interface NetnsScriptParams {
