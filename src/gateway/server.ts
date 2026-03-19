@@ -615,7 +615,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
         try {
           const data = JSON.parse(body) as {
             userId: string; sessionId: string; text: string;
-            timeoutMs?: number; caller?: string; envId?: string;
+            timeoutMs?: number; caller?: string;
             workspaceId?: string;
           };
           userId = data.userId;

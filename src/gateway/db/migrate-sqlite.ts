@@ -100,7 +100,6 @@ const DDL_STATEMENTS = [
     assigned_to TEXT,
     locked_by TEXT,
     locked_at INTEGER,
-    env_id TEXT,
     workspace_id TEXT
   )`,
 
@@ -141,9 +140,10 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
 
-  `CREATE TABLE IF NOT EXISTS environments (
+  `CREATE TABLE IF NOT EXISTS clusters (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    infra_context TEXT,
     is_test INTEGER NOT NULL DEFAULT 0,
     api_server TEXT NOT NULL DEFAULT '',
     created_by TEXT,
@@ -153,14 +153,14 @@ const DDL_STATEMENTS = [
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
 
-  `CREATE TABLE IF NOT EXISTS user_env_configs (
+  `CREATE TABLE IF NOT EXISTS user_cluster_configs (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    env_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+    cluster_id TEXT NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
     kubeconfig TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    UNIQUE (user_id, env_id)
+    UNIQUE (user_id, cluster_id)
   )`,
 
   `CREATE TABLE IF NOT EXISTS user_disabled_skills (
@@ -283,10 +283,10 @@ const DDL_STATEMENTS = [
     PRIMARY KEY (workspace_id, tool_name)
   )`,
 
-  `CREATE TABLE IF NOT EXISTS workspace_environments (
+  `CREATE TABLE IF NOT EXISTS workspace_clusters (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    env_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
-    PRIMARY KEY (workspace_id, env_id)
+    cluster_id TEXT NOT NULL REFERENCES clusters(id) ON DELETE CASCADE,
+    PRIMARY KEY (workspace_id, cluster_id)
   )`,
 
   `CREATE TABLE IF NOT EXISTS workspace_credentials (
@@ -364,8 +364,8 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_reviews_skill ON skill_reviews(skill_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_user_permissions_perm ON user_permissions(permission)`,
-  `CREATE INDEX IF NOT EXISTS idx_user_env_configs_user ON user_env_configs(user_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_user_env_configs_env ON user_env_configs(env_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_cluster_configs_user ON user_cluster_configs(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_user_cluster_configs_cluster ON user_cluster_configs(cluster_id)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_versions_skill ON skill_versions(skill_id, version)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_contents_skill ON skill_contents(skill_id)`,
   `CREATE INDEX IF NOT EXISTS idx_credentials_user ON credentials(user_id, type)`,
@@ -385,29 +385,43 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
   // Cast to 'any' since db is typed as MySql2Database (the unified type alias).
   const sdb = db as any;
 
-  for (const ddl of DDL_STATEMENTS) {
-    sdb.run(sql.raw(ddl));
-  }
-
-  // Schema migrations — handle existing databases missing new columns.
-  // Must run BEFORE index creation, since some indexes reference new columns.
+  // Schema migrations run FIRST — existing databases need column adds and table
+  // renames BEFORE DDL_STATEMENTS, because DDL uses new table names (clusters,
+  // user_cluster_configs, workspace_clusters). If DDL ran first, CREATE TABLE
+  // IF NOT EXISTS would create empty tables with new names, blocking the RENAME
+  // and leaving data stranded in old tables.
   const MIGRATIONS = [
     // ADR-011: environment isolation
     `ALTER TABLE workspaces ADD COLUMN env_type TEXT NOT NULL DEFAULT 'prod'`,
     `ALTER TABLE environments ADD COLUMN api_server TEXT NOT NULL DEFAULT ''`,
     `ALTER TABLE cron_jobs ADD COLUMN workspace_id TEXT`,
-  ];
-  // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
-  const BACKFILLS = [
-    `UPDATE environments SET api_server = TRIM(SUBSTR(allowed_servers, 1, CASE WHEN INSTR(allowed_servers, ',') > 0 THEN INSTR(allowed_servers, ',') - 1 ELSE LENGTH(allowed_servers) END)) WHERE api_server = '' AND allowed_servers != ''`,
+    `ALTER TABLE environments ADD COLUMN description TEXT`,
+    // Rename environments → clusters
+    `ALTER TABLE environments RENAME TO clusters`,
+    `ALTER TABLE user_env_configs RENAME TO user_cluster_configs`,
+    `ALTER TABLE workspace_environments RENAME TO workspace_clusters`,
+    `ALTER TABLE user_cluster_configs RENAME COLUMN env_id TO cluster_id`,
+    `ALTER TABLE workspace_clusters RENAME COLUMN env_id TO cluster_id`,
+    // Rename description → infra_context
+    `ALTER TABLE clusters RENAME COLUMN description TO infra_context`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
       sdb.run(sql.raw(stmt));
     } catch (_err: any) {
-      // Ignore "duplicate column name" errors (column already exists)
+      // Ignore errors: "duplicate column", "no such table" (fresh DB), "already renamed", etc.
     }
   }
+
+  // DDL: create tables that don't exist yet (fresh installs, or tables unaffected by migrations).
+  for (const ddl of DDL_STATEMENTS) {
+    sdb.run(sql.raw(ddl));
+  }
+
+  // Backfill: copy allowedServers[0] → apiServer for rows that haven't been set
+  const BACKFILLS = [
+    `UPDATE clusters SET api_server = TRIM(SUBSTR(allowed_servers, 1, CASE WHEN INSTR(allowed_servers, ',') > 0 THEN INSTR(allowed_servers, ',') - 1 ELSE LENGTH(allowed_servers) END)) WHERE api_server = '' AND allowed_servers != ''`,
+  ];
   for (const stmt of BACKFILLS) {
     try {
       sdb.run(sql.raw(stmt));

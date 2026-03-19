@@ -26,8 +26,8 @@ import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { CredentialRepository } from "./db/repositories/credential-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
-import { EnvironmentRepository } from "./db/repositories/env-repo.js";
-import { UserEnvConfigRepository } from "./db/repositories/user-env-config-repo.js";
+import { ClusterRepository } from "./db/repositories/cluster-repo.js";
+import { UserClusterConfigRepository } from "./db/repositories/user-cluster-config-repo.js";
 import { getLabelsForSkill, batchGetLabels, listAllLabels } from "./skill-labels.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
@@ -119,8 +119,8 @@ export function createRpcMethods(
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
   const mcpRepo = db ? new McpServerRepository(db) : null;
   const skillContentRepo = db ? new SkillContentRepository(db) : null;
-  const envRepo = db ? new EnvironmentRepository(db) : null;
-  const userEnvConfigRepo = db ? new UserEnvConfigRepository(db) : null;
+  const clusterRepo = db ? new ClusterRepository(db) : null;
+  const userClusterConfigRepo = db ? new UserClusterConfigRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
   /** Resolve workspaceId for a session from DB */
@@ -3324,7 +3324,7 @@ export function createRpcMethods(
 
     if (!name) throw new Error("Missing required param: name");
     if (type === "kubeconfig") {
-      throw new Error("Kubeconfig credentials are now managed via Environments. Use userEnvConfig.set instead.");
+      throw new Error("Kubeconfig credentials are now managed via Clusters. Use userClusterConfig.set instead.");
     }
     if (!type || !(CREDENTIAL_TYPES as readonly string[]).includes(type)) {
       throw new Error(`Invalid credential type. Must be one of: ${CREDENTIAL_TYPES.join(", ")}`);
@@ -3378,12 +3378,12 @@ export function createRpcMethods(
   });
 
   // ─────────────────────────────────────────────────
-  // Environment Methods (admin-only)
+  // Cluster Methods (admin-only)
   // ─────────────────────────────────────────────────
 
-  methods.set("environment.list", async (_params, context: RpcContext) => {
+  methods.set("cluster.list", async (_params, context: RpcContext) => {
     const userId = requireAuth(context);
-    if (!envRepo) return { environments: [], isAdmin: false };
+    if (!clusterRepo) return { clusters: [], isAdmin: false };
 
     const isAdmin = isAdminUser(context);
 
@@ -3394,18 +3394,19 @@ export function createRpcMethods(
       isTestOnly = dbUser?.testOnly ?? false;
     }
 
-    const allEnvs = await envRepo.list();
-    const visibleEnvs = isTestOnly ? allEnvs.filter((e) => e.isTest) : allEnvs;
+    const allClusters = await clusterRepo.list();
+    const visibleClusters = isTestOnly ? allClusters.filter((e) => e.isTest) : allClusters;
 
     // Fetch user's kubeconfig status
-    const userConfigs = userEnvConfigRepo ? await userEnvConfigRepo.listForUser(userId) : [];
-    const configMap = new Map(userConfigs.map((c) => [c.envId, c]));
+    const userConfigs = userClusterConfigRepo ? await userClusterConfigRepo.listForUser(userId) : [];
+    const configMap = new Map(userConfigs.map((c) => [c.clusterId, c]));
 
     return {
       isAdmin,
-      environments: visibleEnvs.map((e) => ({
+      clusters: visibleClusters.map((e) => ({
         id: e.id,
         name: e.name,
+        infraContext: e.infraContext ?? null,
         isTest: e.isTest,
         apiServer: e.apiServer,
         allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
@@ -3419,11 +3420,12 @@ export function createRpcMethods(
     };
   });
 
-  methods.set("environment.create", async (params, context: RpcContext) => {
+  methods.set("cluster.create", async (params, context: RpcContext) => {
     const userId = requireAdmin(context);
-    if (!envRepo) throw new Error("Database not available");
+    if (!clusterRepo) throw new Error("Database not available");
 
     const name = params.name as string;
+    const infraContext = (params.infraContext as string | undefined) ?? null;
     const isTest = params.isTest as boolean | undefined;
     const apiServer = params.apiServer as string;
     const rawAllowedServers = params.allowedServers;
@@ -3447,24 +3449,25 @@ export function createRpcMethods(
       throw new Error("defaultKubeconfig can only be set for test environments");
     }
 
-    const id = await envRepo.save(
-      { name, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null },
+    const id = await clusterRepo.save(
+      { name, infraContext, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null },
       userId,
     );
     return { id, name };
   });
 
-  methods.set("environment.update", async (params, context: RpcContext) => {
+  methods.set("cluster.update", async (params, context: RpcContext) => {
     requireAdmin(context);
-    if (!envRepo) throw new Error("Database not available");
+    if (!clusterRepo) throw new Error("Database not available");
 
     const id = params.id as string;
     if (!id) throw new Error("Missing required param: id");
 
-    const existing = await envRepo.getById(id);
-    if (!existing) throw new Error("Environment not found");
+    const existing = await clusterRepo.getById(id);
+    if (!existing) throw new Error("Cluster not found");
 
     const name = (params.name as string | undefined) ?? existing.name;
+    const infraContext = params.infraContext !== undefined ? (params.infraContext as string | null) : existing.infraContext;
     const apiServer = (params.apiServer as string | undefined) ?? existing.apiServer;
     const isTest = params.isTest !== undefined ? params.isTest as boolean : existing.isTest;
     const rawAllowed = params.allowedServers;
@@ -3497,11 +3500,11 @@ export function createRpcMethods(
     }
 
     const oldApiServer = existing.apiServer;
-    await envRepo.save({ id, name, isTest, apiServer, allowedServers, defaultKubeconfig });
+    await clusterRepo.save({ id, name, infraContext, isTest, apiServer, allowedServers, defaultKubeconfig });
 
     // If apiServer changed, invalidate mismatched user kubeconfigs
-    if (userEnvConfigRepo && apiServer !== oldApiServer) {
-      const fullConfigs = await userEnvConfigRepo.listFullForEnv(id);
+    if (userClusterConfigRepo && apiServer !== oldApiServer) {
+      const fullConfigs = await userClusterConfigRepo.listFullForCluster(id);
       const affectedUserIds = new Set<string>();
 
       for (const cfg of fullConfigs) {
@@ -3511,12 +3514,12 @@ export function createRpcMethods(
           const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
           const matches = servers.some((s) => apiServerHostMatch(s, apiServer));
           if (!matches) {
-            await userEnvConfigRepo.remove(cfg.userId, id);
+            await userClusterConfigRepo.remove(cfg.userId, id);
             affectedUserIds.add(cfg.userId);
           }
         } catch {
           // If kubeconfig can't be parsed, remove it as invalid
-          await userEnvConfigRepo.remove(cfg.userId, id);
+          await userClusterConfigRepo.remove(cfg.userId, id);
           affectedUserIds.add(cfg.userId);
         }
       }
@@ -3530,25 +3533,25 @@ export function createRpcMethods(
     return { status: "updated" };
   });
 
-  methods.set("environment.delete", async (params, context: RpcContext) => {
+  methods.set("cluster.delete", async (params, context: RpcContext) => {
     requireAdmin(context);
-    if (!envRepo) throw new Error("Database not available");
+    if (!clusterRepo) throw new Error("Database not available");
 
     const id = params.id as string;
     if (!id) throw new Error("Missing required param: id");
 
-    const existing = await envRepo.getById(id);
-    if (!existing) throw new Error("Environment not found");
+    const existing = await clusterRepo.getById(id);
+    if (!existing) throw new Error("Cluster not found");
 
     // Collect affected users before cleanup
     const affectedUserIds = new Set<string>();
-    if (userEnvConfigRepo) {
-      const envConfigs = await userEnvConfigRepo.listForEnv(id);
+    if (userClusterConfigRepo) {
+      const envConfigs = await userClusterConfigRepo.listForCluster(id);
       for (const c of envConfigs) affectedUserIds.add(c.userId);
-      await userEnvConfigRepo.removeAllForEnv(id);
+      await userClusterConfigRepo.removeAllForCluster(id);
     }
 
-    await envRepo.delete(id);
+    await clusterRepo.delete(id);
 
     // Push updated credentials to all affected users
     for (const uid of affectedUserIds) {
@@ -3559,16 +3562,16 @@ export function createRpcMethods(
   });
 
   // ─────────────────────────────────────────────────
-  // User Environment Config Methods (kubeconfig upload)
+  // User Cluster Config Methods (kubeconfig upload)
   // ─────────────────────────────────────────────────
 
-  methods.set("userEnvConfig.list", async (_params, context: RpcContext) => {
+  methods.set("userClusterConfig.list", async (_params, context: RpcContext) => {
     const userId = requireAuth(context);
-    if (!envRepo || !userEnvConfigRepo) return { configs: [] };
+    if (!clusterRepo || !userClusterConfigRepo) return { configs: [] };
 
-    // Fetch all environments and user's configs
-    const allEnvs = await envRepo.list();
-    const userConfigs = await userEnvConfigRepo.listForUser(userId);
+    // Fetch all clusters and user's configs
+    const allClusters = await clusterRepo.list();
+    const userConfigs = await userClusterConfigRepo.listForUser(userId);
 
     // Check if user is testOnly
     let isTestOnly = false;
@@ -3577,41 +3580,41 @@ export function createRpcMethods(
       isTestOnly = dbUser?.testOnly ?? false;
     }
 
-    // Filter out production environments for testOnly users
-    const visibleEnvs = isTestOnly ? allEnvs.filter((e) => e.isTest) : allEnvs;
+    // Filter out production clusters for testOnly users
+    const visibleClusters = isTestOnly ? allClusters.filter((e) => e.isTest) : allClusters;
 
-    const configMap = new Map(userConfigs.map((c) => [c.envId, c]));
+    const configMap = new Map(userConfigs.map((c) => [c.clusterId, c]));
 
     return {
-      configs: visibleEnvs.map((env) => ({
-        envId: env.id,
-        envName: env.name,
-        isTest: env.isTest,
-        apiServer: env.apiServer,
-        hasKubeconfig: configMap.has(env.id),
-        updatedAt: configMap.get(env.id)?.updatedAt ?? null,
+      configs: visibleClusters.map((cls) => ({
+        clusterId: cls.id,
+        clusterName: cls.name,
+        isTest: cls.isTest,
+        apiServer: cls.apiServer,
+        hasKubeconfig: configMap.has(cls.id),
+        updatedAt: configMap.get(cls.id)?.updatedAt ?? null,
       })),
     };
   });
 
-  methods.set("userEnvConfig.set", async (params, context: RpcContext) => {
+  methods.set("userClusterConfig.set", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    if (!envRepo || !userEnvConfigRepo) throw new Error("Database not available");
+    if (!clusterRepo || !userClusterConfigRepo) throw new Error("Database not available");
 
-    const envId = params.envId as string;
+    const clusterId = params.clusterId as string;
     const kubeconfig = params.kubeconfig as string;
-    if (!envId) throw new Error("Missing required param: envId");
+    if (!clusterId) throw new Error("Missing required param: clusterId");
     if (!kubeconfig) throw new Error("Missing required param: kubeconfig");
 
-    // Fetch environment
-    const env = await envRepo.getById(envId);
-    if (!env) throw new Error("Environment not found");
+    // Fetch cluster
+    const cluster = await clusterRepo.getById(clusterId);
+    if (!cluster) throw new Error("Cluster not found");
 
     // testOnly user check
     if (userRepo) {
       const dbUser = await userRepo.getById(userId);
-      if (dbUser?.testOnly && !env.isTest) {
-        throw new Error("Test-only users cannot configure production environments");
+      if (dbUser?.testOnly && !cluster.isTest) {
+        throw new Error("Test-only users cannot configure production clusters");
       }
     }
 
@@ -3624,25 +3627,25 @@ export function createRpcMethods(
     }
 
     // Validate apiServer appears in kubeconfig clusters
-    const clusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
-    const servers = clusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
-    if (!servers.some((s) => apiServerHostMatch(s, env.apiServer))) {
-      throw new Error(`Kubeconfig does not contain a cluster matching apiServer "${env.apiServer}"`);
+    const kubeClusters = (parsed?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+    const servers = kubeClusters.map((c) => c.cluster?.server).filter(Boolean) as string[];
+    if (!servers.some((s) => apiServerHostMatch(s, cluster.apiServer))) {
+      throw new Error(`Kubeconfig does not contain a cluster matching apiServer "${cluster.apiServer}"`);
     }
 
-    await userEnvConfigRepo.set(userId, envId, kubeconfig);
+    await userClusterConfigRepo.set(userId, clusterId, kubeconfig);
     pushCredentialsToUser(userId);
     return { status: "saved" };
   });
 
-  methods.set("userEnvConfig.remove", async (params, context: RpcContext) => {
+  methods.set("userClusterConfig.remove", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
-    if (!userEnvConfigRepo) throw new Error("Database not available");
+    if (!userClusterConfigRepo) throw new Error("Database not available");
 
-    const envId = params.envId as string;
-    if (!envId) throw new Error("Missing required param: envId");
+    const clusterId = params.clusterId as string;
+    if (!clusterId) throw new Error("Missing required param: clusterId");
 
-    await userEnvConfigRepo.remove(userId, envId);
+    await userClusterConfigRepo.remove(userId, clusterId);
     pushCredentialsToUser(userId);
     return { status: "removed" };
   });
@@ -3722,14 +3725,14 @@ export function createRpcMethods(
           throw new Error("Test-only users cannot create production workspaces");
         }
       }
-      // If changing to "test", verify all bound environments are test
-      if (params.envType === "test" && envRepo && workspaceRepo) {
-        const boundEnvIds = await workspaceRepo.getEnvironments(id);
-        if (boundEnvIds.length > 0) {
-          const boundEnvs = await envRepo.listByIds(boundEnvIds);
-          const nonTest = boundEnvs.filter((e) => !e.isTest);
+      // If changing to "test", verify all bound clusters are test
+      if (params.envType === "test" && clusterRepo && workspaceRepo) {
+        const boundClusterIds = await workspaceRepo.getClusters(id);
+        if (boundClusterIds.length > 0) {
+          const boundClusters = await clusterRepo.listByIds(boundClusterIds);
+          const nonTest = boundClusters.filter((e) => !e.isTest);
           if (nonTest.length > 0) {
-            throw new Error(`Cannot change to test type: workspace has ${nonTest.length} non-test environment(s) bound. Unbind them first.`);
+            throw new Error(`Cannot change to test type: workspace has ${nonTest.length} non-test cluster(s) bound. Unbind them first.`);
           }
         }
       }
@@ -3770,18 +3773,18 @@ export function createRpcMethods(
     const ws = await workspaceRepo.getById(id);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    const [wsSkills, wsTools, wsCreds, wsEnvIds] = await Promise.all([
+    const [wsSkills, wsTools, wsCreds, wsClusterIds] = await Promise.all([
       workspaceRepo.getSkills(id),
       workspaceRepo.getTools(id),
       workspaceRepo.getCredentials(id),
-      workspaceRepo.getEnvironments(id),
+      workspaceRepo.getClusters(id),
     ]);
 
-    // Fetch full environment details for bound environments
-    let envDetails: Array<{ id: string; name: string; isTest: boolean; apiServer: string }> = [];
-    if (envRepo && wsEnvIds.length > 0) {
-      const envs = await envRepo.listByIds(wsEnvIds);
-      envDetails = envs.map((e) => ({ id: e.id, name: e.name, isTest: e.isTest, apiServer: e.apiServer }));
+    // Fetch full cluster details for bound clusters
+    let clusterDetails: Array<{ id: string; name: string; isTest: boolean; apiServer: string }> = [];
+    if (clusterRepo && wsClusterIds.length > 0) {
+      const cls = await clusterRepo.listByIds(wsClusterIds);
+      clusterDetails = cls.map((e) => ({ id: e.id, name: e.name, isTest: e.isTest, apiServer: e.apiServer }));
     }
 
     return {
@@ -3789,8 +3792,8 @@ export function createRpcMethods(
       skills: wsSkills,
       tools: wsTools,
       credentials: wsCreds,
-      environments: wsEnvIds,
-      environmentDetails: envDetails,
+      clusters: wsClusterIds,
+      clusterDetails,
     };
   });
 
@@ -3871,45 +3874,45 @@ export function createRpcMethods(
     return { status: "updated" };
   });
 
-  methods.set("workspace.setEnvironments", async (params, context: RpcContext) => {
+  methods.set("workspace.setClusters", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     if (!workspaceRepo) throw new Error("Database not available");
 
     const workspaceId = params.workspaceId as string;
-    const envIds = params.envIds as string[];
-    if (!workspaceId || !Array.isArray(envIds)) throw new Error("Missing required params");
+    const clusterIds = params.clusterIds as string[];
+    if (!workspaceId || !Array.isArray(clusterIds)) throw new Error("Missing required params");
 
     const ws = await workspaceRepo.getById(workspaceId);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    // Validate: if workspace is test, all bound environments must be test
-    if (envIds.length > 0 && !envRepo) {
-      throw new Error("Environment database not available");
+    // Validate: if workspace is test, all bound clusters must be test
+    if (clusterIds.length > 0 && !clusterRepo) {
+      throw new Error("Cluster database not available");
     }
-    if (envIds.length > 0 && envRepo) {
-      const envs = await envRepo.listByIds(envIds);
-      if (envs.length !== envIds.length) {
-        throw new Error("One or more environments not found");
+    if (clusterIds.length > 0 && clusterRepo) {
+      const cls = await clusterRepo.listByIds(clusterIds);
+      if (cls.length !== clusterIds.length) {
+        throw new Error("One or more clusters not found");
       }
       if (ws.envType === "test") {
-        const nonTest = envs.filter((e) => !e.isTest);
+        const nonTest = cls.filter((e) => !e.isTest);
         if (nonTest.length > 0) {
-          throw new Error("Test workspaces can only bind test environments");
+          throw new Error("Test workspaces can only bind test clusters");
         }
       }
       // testOnly user check
       if (userRepo) {
         const dbUser = await userRepo.getById(userId);
         if (dbUser?.testOnly) {
-          const nonTest = envs.filter((e) => !e.isTest);
+          const nonTest = cls.filter((e) => !e.isTest);
           if (nonTest.length > 0) {
-            throw new Error("Test-only users cannot bind production environments");
+            throw new Error("Test-only users cannot bind production clusters");
           }
         }
       }
     }
 
-    await workspaceRepo.setEnvironments(workspaceId, envIds);
+    await workspaceRepo.setClusters(workspaceId, clusterIds);
 
     // Push updated credentials to running AgentBox for this workspace
     pushCredentialsToUser(userId);
@@ -3957,7 +3960,7 @@ export function createRpcMethods(
   /**
    * Build credential payload for a workspace.
    *
-   * Kubeconfigs: sourced from environment-bound userEnvConfigs (NOT credentials table).
+   * Kubeconfigs: sourced from cluster-bound userClusterConfigs (NOT credentials table).
    * Other credentials: from credentials table, filtered by workspace envType.
    *   - prod workspace: all workspace-linked credentials
    *   - test workspace: NO non-kubeconfig credentials (SSH, API tokens hidden)
@@ -3979,44 +3982,44 @@ export function createRpcMethods(
       if (ws) envType = ws.envType ?? "prod";
     }
 
-    // ── Step 2: Kubeconfigs from environments ──
-    if (envRepo && userEnvConfigRepo) {
-      // Default workspace: all environments; non-default: only workspace-bound
-      let envs: Awaited<ReturnType<typeof envRepo.list>>;
+    // ── Step 2: Kubeconfigs from clusters ──
+    if (clusterRepo && userClusterConfigRepo) {
+      // Default workspace: all clusters; non-default: only workspace-bound
+      let clusterList: Awaited<ReturnType<typeof clusterRepo.list>>;
       if (isDefault) {
-        envs = await envRepo.list();
+        clusterList = await clusterRepo.list();
       } else if (workspaceRepo) {
-        const boundEnvIds = await workspaceRepo.getEnvironments(workspaceId);
-        envs = boundEnvIds.length > 0 ? await envRepo.listByIds(boundEnvIds) : [];
+        const boundClusterIds = await workspaceRepo.getClusters(workspaceId);
+        clusterList = boundClusterIds.length > 0 ? await clusterRepo.listByIds(boundClusterIds) : [];
       } else {
-        envs = [];
+        clusterList = [];
       }
-      if (envs.length > 0) {
-        for (const env of envs) {
-          // Runtime filter: test workspace skips prod environments
-          if (envType === "test" && !env.isTest) continue;
+      if (clusterList.length > 0) {
+        for (const cls of clusterList) {
+          // Runtime filter: test workspace skips prod clusters
+          if (envType === "test" && !cls.isTest) continue;
 
-          // Get user's kubeconfig for this environment
-          const userConfig = await userEnvConfigRepo.get(userId, env.id);
+          // Get user's kubeconfig for this cluster
+          const userConfig = await userClusterConfigRepo.get(userId, cls.id);
           let kubeconfigContent = userConfig?.kubeconfig ?? null;
 
-          // Fallback to defaultKubeconfig for test environments
-          if (!kubeconfigContent && env.isTest && env.defaultKubeconfig) {
-            kubeconfigContent = env.defaultKubeconfig;
+          // Fallback to defaultKubeconfig for test clusters
+          if (!kubeconfigContent && cls.isTest && cls.defaultKubeconfig) {
+            kubeconfigContent = cls.defaultKubeconfig;
           }
 
           if (kubeconfigContent) {
-            const safeName = env.name.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const safeName = cls.name.replace(/[^a-zA-Z0-9_-]/g, "_");
             const filename = `${safeName}.kubeconfig`;
             files.push({ name: filename, content: kubeconfigContent });
             const fileNames = [filename];
             let metadata: Record<string, unknown> | undefined;
             try {
               const kc = yaml.load(kubeconfigContent) as Record<string, unknown>;
-              const clusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
+              const kcClusters = (kc?.clusters as Array<{ name: string; cluster?: { server?: string } }>) ?? [];
               const contexts = (kc?.contexts as Array<{ name: string; context?: { cluster?: string; namespace?: string } }>) ?? [];
               metadata = {
-                clusters: clusters.map((c) => ({ name: c.name, server: c.cluster?.server })),
+                clusters: kcClusters.map((c) => ({ name: c.name, server: c.cluster?.server })),
                 contexts: contexts.map((c) => ({ name: c.name, cluster: c.context?.cluster, namespace: c.context?.namespace })),
                 currentContext: kc?.["current-context"] as string | undefined,
               };
@@ -4024,9 +4027,9 @@ export function createRpcMethods(
               // ignore parse errors
             }
             manifest.push({
-              name: env.name,
+              name: cls.name,
               type: "kubeconfig",
-              description: `Kubeconfig for environment: ${env.name}`,
+              description: cls.infraContext || `Kubeconfig for cluster: ${cls.name}`,
               files: fileNames,
               ...(metadata ? { metadata } : {}),
             });
@@ -4218,12 +4221,12 @@ export function createRpcMethods(
         credentials[c.type] = (credentials[c.type] || 0) + 1;
       }
     }
-    if (envRepo && userEnvConfigRepo) {
-      const allEnvs = await envRepo.list();
+    if (clusterRepo && userClusterConfigRepo) {
+      const allEnvs = await clusterRepo.list();
       let kubeconfigCount = 0;
       for (const env of allEnvs) {
         // Count if user has a personal kubeconfig, OR if it's a test env with a default kubeconfig
-        const userConfig = await userEnvConfigRepo.get(userId, env.id);
+        const userConfig = await userClusterConfigRepo.get(userId, env.id);
         if (userConfig?.kubeconfig || (env.isTest && env.defaultKubeconfig)) {
           kubeconfigCount++;
         }

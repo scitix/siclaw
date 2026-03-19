@@ -154,7 +154,6 @@ export const cronJobs = sqliteTable("cron_jobs", {
   assignedTo: text("assigned_to"),
   lockedBy: text("locked_by"),
   lockedAt: integer("locked_at", { mode: "timestamp" }),
-  envId: text("env_id"),
   workspaceId: text("workspace_id").references(() => workspaces.id),
 });
 
@@ -291,11 +290,11 @@ export const workspaceTools = sqliteTable("workspace_tools", {
   pk: primaryKey({ columns: [table.workspaceId, table.toolName] }),
 }));
 
-export const workspaceEnvironments = sqliteTable("workspace_environments", {
+export const workspaceClusters = sqliteTable("workspace_clusters", {
   workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
-  envId: text("env_id").notNull().references(() => environments.id, { onDelete: "cascade" }),
+  clusterId: text("cluster_id").notNull().references(() => clusters.id, { onDelete: "cascade" }),
 }, (table) => ({
-  pk: primaryKey({ columns: [table.workspaceId, table.envId] }),
+  pk: primaryKey({ columns: [table.workspaceId, table.clusterId] }),
 }));
 
 export const workspaceCredentials = sqliteTable("workspace_credentials", {
@@ -316,11 +315,12 @@ export const userDisabledSkills = sqliteTable("user_disabled_skills", {
   pk: primaryKey({ columns: [table.userId, table.skillName] }),
 }));
 
-// ─── Environments ────────────────────────────────────
+// ─── Clusters ────────────────────────────────────────
 
-export const environments = sqliteTable("environments", {
+export const clusters = sqliteTable("clusters", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
+  infraContext: text("infra_context"),
   isTest: integer("is_test", { mode: "boolean" }).notNull().default(false),
   apiServer: text("api_server").notNull(),
   allowedServers: text("allowed_servers"),
@@ -330,12 +330,12 @@ export const environments = sqliteTable("environments", {
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
-// ─── User Environment Configs ────────────────────────
+// ─── User Cluster Configs ────────────────────────────
 
-export const userEnvConfigs = sqliteTable("user_env_configs", {
+export const userClusterConfigs = sqliteTable("user_cluster_configs", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id),
-  envId: text("env_id").notNull().references(() => environments.id),
+  clusterId: text("cluster_id").notNull().references(() => clusters.id),
   kubeconfig: text("kubeconfig").notNull(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
