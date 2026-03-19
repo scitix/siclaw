@@ -84,6 +84,61 @@ function apiServerHostMatch(kubeconfigServer: string, envApiServer: string): boo
 }
 
 
+// ── Feedback enrichment helpers ──────────────────────
+
+/**
+ * Read the session-feedback SKILL.md content, stripping YAML frontmatter.
+ * Uses import.meta.url to resolve the package root (works in both dev and K8s).
+ */
+const _feedbackModDir = path.dirname(fileURLToPath(import.meta.url));
+const _feedbackPkgRoot = path.resolve(_feedbackModDir, "..", "..");
+
+let _feedbackSkillCache: string | null = null;
+
+async function readFeedbackSkillContent(): Promise<string> {
+  if (_feedbackSkillCache) return _feedbackSkillCache;
+  const skillPath = path.join(_feedbackPkgRoot, "skills", "core", "session-feedback", "SKILL.md");
+  const raw = await fs.promises.readFile(skillPath, "utf-8");
+  // Strip YAML frontmatter (between --- delimiters)
+  const stripped = raw.replace(/^---[\s\S]*?---\s*/, "").trim();
+  _feedbackSkillCache = stripped;
+  return stripped;
+}
+
+/**
+ * Build a markdown timeline of the session's diagnostic activity.
+ */
+async function buildSessionTimeline(
+  chatRepo: ChatRepository,
+  sessionId: string,
+): Promise<string> {
+  const msgs = await chatRepo.getMessages(sessionId, { limit: 200 });
+  if (msgs.length === 0) return "_No messages in this session._";
+
+  const lines: string[] = [];
+  let stepNum = 0;
+  for (const msg of msgs) {
+    if (msg.role === "user") {
+      // Skip feedback sentinel messages from timeline
+      if (msg.content.startsWith("[Feedback]")) continue;
+      stepNum++;
+      const preview = msg.content.length > 100 ? msg.content.slice(0, 100) + "..." : msg.content;
+      lines.push(`${stepNum}. **User**: ${preview}`);
+    } else if (msg.role === "tool" && msg.toolName) {
+      stepNum++;
+      const outcome = msg.outcome ?? "unknown";
+      const duration = msg.durationMs != null ? ` (${msg.durationMs}ms)` : "";
+      lines.push(`${stepNum}. **Tool** \`${msg.toolName}\`: ${outcome}${duration}`);
+    } else if (msg.role === "assistant") {
+      // Summarize assistant messages briefly
+      const preview = msg.content.length > 100 ? msg.content.slice(0, 100) + "..." : msg.content;
+      stepNum++;
+      lines.push(`${stepNum}. **Assistant**: ${preview}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 export function createRpcMethods(
   agentBoxManager: AgentBoxManager,
   broadcast: BroadcastFn,
@@ -428,13 +483,15 @@ export function createRpcMethods(
         content: message,
       });
       await chatRepo.incrementMessageCount(sessionId);
-      // Update session metadata (title/preview)
-      const title =
-        message.length > 40 ? message.slice(0, 40) + "..." : message;
-      await chatRepo.updateSessionMeta(sessionId, {
-        title,
-        preview: message.slice(0, 100),
-      });
+      // Update session metadata (title/preview) — skip for feedback sentinel
+      if (!message.startsWith("[Feedback]")) {
+        const title =
+          message.length > 40 ? message.slice(0, 40) + "..." : message;
+        await chatRepo.updateSessionMeta(sessionId, {
+          title,
+          preview: message.slice(0, 100),
+        });
+      }
     }
 
     if (!sessionId) throw new Error("Failed to create session");
@@ -487,8 +544,30 @@ export function createRpcMethods(
     });
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
+    // === Feedback enrichment (system-level) ===
+    let promptText = message;
+    if (message.startsWith("[Feedback]") && !chatRepo) {
+      throw new Error("Feedback requires a database connection (not available in TUI mode).");
+    }
+    if (message.startsWith("[Feedback]") && chatRepo) {
+      try {
+        const skillContent = await readFeedbackSkillContent();
+        const timeline = await buildSessionTimeline(chatRepo, sessionId);
+        promptText = [
+          "## Session Feedback Instructions\n",
+          skillContent,
+          "\n## Current Session Diagnostic Timeline\n",
+          timeline,
+          "\n---\nThe user has requested a feedback session. Begin the interactive review now.",
+        ].join("\n");
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        throw new Error(`Feedback system unavailable: ${reason}`);
+      }
+    }
+
     // Send prompt
-    const result = await client.prompt({ sessionId, text: message, modelProvider, modelId, brainType, modelConfig, credentials });
+    const result = await client.prompt({ sessionId, text: promptText, modelProvider, modelId, brainType, modelConfig, credentials });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
 
     // Build redaction config from credential payload + model secrets (sanitize outbound WS stream)
