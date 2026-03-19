@@ -336,6 +336,7 @@ export const clusters = mysqlTable("clusters", {
   apiServer: varchar("api_server", { length: 512 }).notNull(),
   allowedServers: text("allowed_servers"),  // JSON array: ["10.0.0.1","k8s.example.com"]
   defaultKubeconfig: text("default_kubeconfig"),  // nullable, only when isTest=true
+  debugImage: text("debug_image"),
   createdBy: varchar("created_by", { length: 32 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

@@ -3662,6 +3662,7 @@ export function createRpcMethods(
         apiServer: e.apiServer,
         allowedServers: e.allowedServers ? e.allowedServers.split(",").map((s: string) => s.trim()).filter(Boolean) : [],
         hasDefaultKubeconfig: !!e.defaultKubeconfig,
+        debugImage: e.debugImage ?? null,
         hasUserKubeconfig: configMap.has(e.id),
         userConfigUpdatedAt: configMap.get(e.id)?.updatedAt?.toISOString?.() ?? configMap.get(e.id)?.updatedAt ?? null,
         createdBy: e.createdBy,
@@ -3682,6 +3683,7 @@ export function createRpcMethods(
     const rawAllowedServers = params.allowedServers;
     const allowedServers = Array.isArray(rawAllowedServers) ? rawAllowedServers.join(", ") : (rawAllowedServers as string | undefined);
     const defaultKubeconfig = params.defaultKubeconfig as string | undefined;
+    const debugImage = (params.debugImage as string | undefined)?.trim() || null;
 
     if (!name) throw new Error("Missing required param: name");
     if (!apiServer) throw new Error("Missing required param: apiServer");
@@ -3701,7 +3703,7 @@ export function createRpcMethods(
     }
 
     const id = await clusterRepo.save(
-      { name, infraContext, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null },
+      { name, infraContext, isTest, apiServer, allowedServers: allowedServers || null, defaultKubeconfig: defaultKubeconfig ?? null, debugImage },
       userId,
     );
     return { id, name };
@@ -3726,6 +3728,7 @@ export function createRpcMethods(
       ? (Array.isArray(rawAllowed) ? rawAllowed.join(", ") : rawAllowed as string | null)
       : existing.allowedServers;
     let defaultKubeconfig = params.defaultKubeconfig !== undefined ? params.defaultKubeconfig as string | null : existing.defaultKubeconfig;
+    const debugImage = params.debugImage !== undefined ? ((params.debugImage as string)?.trim() || null) : existing.debugImage;
 
     if (!apiServer?.trim()) {
       throw new Error("apiServer must be a non-empty string");
@@ -3751,7 +3754,7 @@ export function createRpcMethods(
     }
 
     const oldApiServer = existing.apiServer;
-    await clusterRepo.save({ id, name, infraContext, isTest, apiServer, allowedServers, defaultKubeconfig });
+    await clusterRepo.save({ id, name, infraContext, isTest, apiServer, allowedServers, defaultKubeconfig, debugImage });
 
     // If apiServer changed, invalidate mismatched user kubeconfigs
     if (userClusterConfigRepo && apiServer !== oldApiServer) {
@@ -4273,9 +4276,13 @@ export function createRpcMethods(
                 clusters: kcClusters.map((c) => ({ name: c.name, server: c.cluster?.server })),
                 contexts: contexts.map((c) => ({ name: c.name, cluster: c.context?.cluster, namespace: c.context?.namespace })),
                 currentContext: kc?.["current-context"] as string | undefined,
+                ...(cls.debugImage ? { debugImage: cls.debugImage } : {}),
               };
             } catch {
-              // ignore parse errors
+              // ignore parse errors — still attach debugImage if available
+              if (cls.debugImage) {
+                metadata = { debugImage: cls.debugImage };
+              }
             }
             manifest.push({
               name: cls.name,

@@ -160,6 +160,7 @@ const DDL_STATEMENTS = [
     created_by VARCHAR(32),
     allowed_servers TEXT,
     default_kubeconfig LONGTEXT,
+    debug_image TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
   )`,
@@ -457,6 +458,8 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE cron_jobs ADD CONSTRAINT fk_cron_jobs_workspace FOREIGN KEY (workspace_id) REFERENCES workspaces(id)`,
     // Knowledge docs: drop description column
     `ALTER TABLE knowledge_docs DROP COLUMN description`,
+    // Per-cluster debug image
+    `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
