@@ -182,6 +182,7 @@ export function loadConfig(): SiclawConfig {
     const v = parseInt(process.env.SICLAW_DEBUG_POD_TTL, 10);
     if (!isNaN(v)) cached.debugPodTTL = v;
   }
+  // Idle timeout in seconds (matches debugPodTTL unit)
   if (process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT) {
     const v = parseInt(process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT, 10);
     if (!isNaN(v)) cached.debugPodIdleTimeout = v;

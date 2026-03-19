@@ -104,11 +104,12 @@ export async function ensureDebugNamespace(
   }
 }
 
-// ── Concurrency limiter (internal) ──────────────────────────────────
+// ── Creation lock (internal) ─────────────────────────────────────────
 //
-// Merged into DebugPodCache below. The limiter Set tracks which
-// (userId, nodeName) slots are held — acquire/release is managed
-// exclusively by the cache's set/remove/evict methods.
+// The creating Map tracks in-flight pod creations. Concurrent callers
+// wait for the creation to complete, then re-check the cache.
+// Once a pod is cached (Running), any number of kubectl exec calls
+// can run concurrently against it.
 
 // ── Cleanup constants ───────────────────────────────────────────────
 
@@ -186,47 +187,83 @@ export interface CachedPod {
   idleTimer: ReturnType<typeof setTimeout>;
 }
 
-// ── Pod reuse cache (with integrated concurrency limiter) ───────────
+// ── Pod reuse cache (with creation-only lock) ───────────────────────
 
 /**
  * In-memory cache for reusable debug pods, keyed by "userId:nodeName".
  *
- * Owns both the pod cache AND the concurrency limiter. This ensures
- * acquire/release is always paired with set/remove/evict — callers
- * never need to manage the limiter separately.
+ * The creation lock ensures only one caller creates a pod for a given
+ * (userId, nodeName) pair. Concurrent callers wait for creation to
+ * complete, then reuse the cached pod. Once a pod is cached, any number
+ * of kubectl exec calls can run concurrently against it.
  *
- * - acquire(): reserves a slot (throws if already held)
- * - set(): stores a pod and starts its idle timer (slot must be held)
- * - remove(): clears cache entry AND releases the limiter slot
+ * - getOrCreate(): returns a cached pod or creates one (with lock)
+ * - touch(): resets idle timer after successful exec
+ * - remove(): clears cache entry (caller handles pod deletion)
  * - evict(): remove + delete the pod via kubectl
  *
  * Process crash loses all state — activeDeadlineSeconds is the safety net.
  */
 export class DebugPodCache {
   private readonly pods = new Map<string, CachedPod>();
-  private readonly active = new Set<string>();
+  private readonly creating = new Map<string, Promise<void>>();
 
   private key(userId: string, nodeName: string): string {
     return `${userId}:${nodeName}`;
   }
 
   /**
-   * Reserve a concurrency slot. Throws if a pod is already active
-   * for this (userId, nodeName) pair.
+   * Get a cached pod, or create one using the provided factory.
+   *
+   * - If a pod is already cached, returns it immediately.
+   * - If another caller is creating a pod for this key, waits for
+   *   creation to complete, then returns the cached result.
+   * - Otherwise, calls createFn() to create a new pod. createFn is
+   *   responsible for calling set() on success.
+   *
+   * Returns { pod, created }:
+   *   - pod: the cached pod entry (undefined if creation failed)
+   *   - created: true if this call was the one that ran createFn
    */
-  acquire(userId: string, nodeName: string): void {
+  async getOrCreate(
+    userId: string,
+    nodeName: string,
+    createFn: () => Promise<void>,
+  ): Promise<{ pod: CachedPod | undefined; created: boolean }> {
     const k = this.key(userId, nodeName);
-    if (this.active.has(k)) {
-      throw new Error(
-        `A debug pod is already running for user "${userId}" on node "${nodeName}". Wait for it to complete.`,
-      );
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      // Check cache first
+      const cached = this.pods.get(k);
+      if (cached) return { pod: cached, created: false };
+
+      // Another caller is creating — wait and re-check
+      const inflight = this.creating.get(k);
+      if (inflight) {
+        await inflight;
+        continue;
+      }
+
+      // We are the creator
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => { resolve = r; });
+      this.creating.set(k, promise);
+
+      try {
+        await createFn();
+        // createFn should have called set() on success
+        return { pod: this.pods.get(k), created: true };
+      } finally {
+        this.creating.delete(k);
+        resolve(); // wake up waiters
+      }
     }
-    this.active.add(k);
   }
 
   /**
    * Store a newly created pod in the cache and start its idle timer.
-   * The concurrency slot must already be held via acquire().
+   * Called by the createFn passed to getOrCreate().
    */
   set(
     userId: string,
@@ -278,7 +315,7 @@ export class DebugPodCache {
   }
 
   /**
-   * Remove a cache entry, clear its timer, and release the concurrency slot.
+   * Remove a cache entry and clear its timer.
    * Does NOT delete the pod — used when the caller handles deletion externally.
    */
   remove(userId: string, nodeName: string): void {
@@ -288,11 +325,10 @@ export class DebugPodCache {
       clearTimeout(entry.idleTimer);
       this.pods.delete(k);
     }
-    this.active.delete(k);
   }
 
   /**
-   * Evict a cache entry by key: release slot, delete the pod, remove from cache.
+   * Evict a cache entry by key: delete the pod, remove from cache.
    * Called by the idle timer. Errors are logged but not thrown.
    */
   private async evict(key: string): Promise<void> {
@@ -307,19 +343,15 @@ export class DebugPodCache {
       userId: entry.userId,
     });
 
-    try {
-      await deleteDebugPod(entry.podName, entry.env, {
-        namespace: entry.namespace,
-        nodeName: entry.nodeName,
-      });
-    } finally {
-      this.active.delete(key);
-    }
+    await deleteDebugPod(entry.podName, entry.env, {
+      namespace: entry.namespace,
+      nodeName: entry.nodeName,
+    });
   }
 
-  /** Check if a concurrency slot is held (for testing/diagnostics). */
-  isHeld(userId: string, nodeName: string): boolean {
-    return this.active.has(this.key(userId, nodeName));
+  /** Check if a pod is being created for this key (for testing/diagnostics). */
+  isCreating(userId: string, nodeName: string): boolean {
+    return this.creating.has(this.key(userId, nodeName));
   }
 
   /** Number of cached pods (for testing/diagnostics). */
