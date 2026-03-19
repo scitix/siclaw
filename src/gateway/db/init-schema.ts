@@ -395,6 +395,21 @@ const DDL_STATEMENTS = [
     created_at BIGINT NOT NULL
   )`,
 
+  `CREATE TABLE IF NOT EXISTS feedback_reports (
+    id VARCHAR(64) PRIMARY KEY,
+    session_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(32) NOT NULL,
+    workspace_id VARCHAR(64),
+    overall_rating INT CHECK(overall_rating BETWEEN 1 AND 5),
+    summary TEXT NOT NULL,
+    decision_points JSON,
+    strengths JSON,
+    improvements JSON,
+    tags JSON,
+    feedback_conversation JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
 ];
 
 // Indexes — handled separately since MySQL lacks CREATE INDEX IF NOT EXISTS
@@ -421,6 +436,8 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE cron_jobs ADD INDEX idx_cron_jobs_status_assigned (status, assigned_to)`,
   `ALTER TABLE cron_instances ADD INDEX idx_cron_instances_heartbeat (heartbeat_at)`,
   `ALTER TABLE knowledge_docs ADD INDEX idx_knowledge_docs_name (name(255))`,
+  `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_user (user_id, created_at)`,
+  `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_session (session_id)`,
 ];
 
 export async function initSchema(db: Database): Promise<void> {
