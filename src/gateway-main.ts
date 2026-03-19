@@ -1,4 +1,5 @@
 import type http from "node:http";
+import os from "node:os";
 import { loadGatewayConfig } from "./gateway/config.js";
 import { startGateway } from "./gateway/server.js";
 import { AgentBoxManager, LocalSpawner, K8sSpawner, ProcessSpawner } from "./gateway/agentbox/index.js";
@@ -56,12 +57,18 @@ try {
   // Internal plugin not available — running in open-source mode
 }
 
+// Instance ID for multi-replica cron coordination (K8s mode only)
+const instanceId = useK8s
+  ? (process.env.SICLAW_POD_NAME || os.hostname())
+  : undefined;
+
 // Start HTTP + WebSocket server
 const gateway = await startGateway({
   config,
   agentBoxManager,
   spawner,
   extraHttpHandlers,
+  instanceId,
 });
 
 // --- Channel subsystem ---

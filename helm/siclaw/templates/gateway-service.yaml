@@ -7,6 +7,12 @@ metadata:
     {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
 spec:
   type: {{ .Values.gateway.service.type }}
+  {{- if gt (int .Values.gateway.replicas) 1 }}
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: {{ .Values.gateway.sessionAffinityTimeout | default 10800 }}
+  {{- end }}
   ports:
     - port: {{ .Values.gateway.service.port }}
       targetPort: http

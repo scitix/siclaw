@@ -4,6 +4,11 @@
  * Replaces the standalone cron process. Runs timers directly in the
  * Gateway process and calls configRepo for DB access (no HTTP proxy).
  * Job execution delegates to /api/internal/agent-prompt on localhost.
+ *
+ * Multi-replica coordination: when `instanceId` is set (K8s mode),
+ * each replica registers as a cron instance, heartbeats, and only
+ * schedules jobs assigned to it. Single-instance mode (local/dev)
+ * skips coordination and schedules all active jobs.
  */
 
 import crypto from "node:crypto";
@@ -20,10 +25,15 @@ const SESSION_SOFT_DELETE_DAYS = 180;
 const SESSION_HARD_DELETE_DAYS = 30;
 const STATS_RETENTION_DAYS = 90;
 
+// Coordination constants (tuned values from old CronCoordinator — commit 7c41fa6)
+const RECONCILE_INTERVAL_MS = 15_000;  // 15s (includes heartbeat)
+const DEAD_THRESHOLD_MS = 30_000;      // 30s = 2× reconcile interval
+
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
 export class CronService {
   readonly scheduler: CronScheduler;
+  readonly instanceId: string | undefined;
   /** Channel notification callback — set by gateway-main after construction */
   onNotify?: (data: { userId: string; jobName: string; result: string; resultText: string; error?: string }) => void;
 
@@ -34,30 +44,41 @@ export class CronService {
   private staleLockTimer: NodeJS.Timeout | null = null;
   private purgeTimer: NodeJS.Timeout | null = null;
   private sessionPurgeTimer: NodeJS.Timeout | null = null;
+  private reconcileTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: {
     configRepo: ConfigRepository;
     notifRepo: NotificationRepository;
     sendToUser: SendToUserFn;
     gatewayPort: number;
+    instanceId?: string;
   }) {
     this.configRepo = opts.configRepo;
     this.notifRepo = opts.notifRepo;
     this.sendToUser = opts.sendToUser;
     this.gatewayPort = opts.gatewayPort;
+    this.instanceId = opts.instanceId;
     this.scheduler = new CronScheduler((job) => this.execute(job));
   }
 
   /** Load all active jobs and start background timers */
   async start(): Promise<void> {
-    // Load all active jobs
-    const jobs = await this.configRepo.listAllActiveCronJobs();
-    for (const job of jobs) {
-      this.scheduler.addOrUpdate(job as CronJobRow);
+    // Register this instance (multi-replica mode only)
+    if (this.instanceId) {
+      const endpoint = `http://${process.env.SICLAW_POD_IP || "localhost"}:${this.gatewayPort}`;
+      await this.configRepo.registerCronInstance(this.instanceId, endpoint);
     }
-    console.log(`[cron-service] Loaded ${jobs.length} active jobs`);
 
-    // Stale lock cleanup every 6 minutes
+    // Initial reconcile — loads jobs (all in single-instance, assigned in multi)
+    await this.reconcile();
+
+    // Reconcile loop (15s — includes heartbeat in multi-replica mode)
+    if (this.instanceId) {
+      this.reconcileTimer = setInterval(() => this.reconcileTick(), RECONCILE_INTERVAL_MS);
+      this.reconcileTimer.unref();
+    }
+
+    // Stale lock cleanup every 6 minutes (single-instance keeps this too)
     this.staleLockTimer = setInterval(async () => {
       try {
         await this.configRepo.clearStaleLocks(STALE_LOCK_CLEANUP_MS);
@@ -77,8 +98,98 @@ export class CronService {
     this.sessionPurgeTimer = setInterval(() => this.purgeSessions(), PURGE_INTERVAL_MS);
     this.sessionPurgeTimer.unref();
 
-    console.log("[cron-service] Started");
+    console.log(`[cron-service] Started${this.instanceId ? ` (instance=${this.instanceId})` : ""}`);
   }
+
+  // ── Coordination (ported from old CronCoordinator — commit 7c41fa6) ───
+
+  /** Main reconcile loop — single-instance fast path or full coordination */
+  private async reconcile(): Promise<void> {
+    if (!this.instanceId) {
+      // Single-instance: schedule everything (backward compatible)
+      const jobs = await this.configRepo.listAllActiveCronJobs();
+      for (const job of jobs) this.scheduler.addOrUpdate(job as CronJobRow);
+      console.log(`[cron-service] Loaded ${jobs.length} active jobs`);
+      return;
+    }
+
+    // 0. Heartbeat
+    await this.configRepo.updateHeartbeat(this.instanceId, this.scheduler.jobCount);
+
+    // 1. Clear stale execution locks
+    await this.configRepo.clearStaleLocks(STALE_LOCK_CLEANUP_MS);
+
+    // 2. Detect dead instances → reassign orphaned jobs
+    const dead = await this.configRepo.getDeadInstances(DEAD_THRESHOLD_MS);
+    for (const inst of dead) {
+      const target = await this.configRepo.getLeastLoadedInstance(DEAD_THRESHOLD_MS);
+      if (target) {
+        await this.configRepo.reassignOrphanedJobs(inst.instanceId, target.instanceId);
+        console.log(`[cron-service] Reassigned jobs from dead instance ${inst.instanceId} → ${target.instanceId}`);
+      }
+      await this.configRepo.deleteInstance(inst.instanceId);
+    }
+
+    // 3. Cancel stale local timers (DB deleted/paused/reassigned)
+    await this.cancelStaleJobs();
+
+    // 4. Claim unassigned jobs (only if we are least-loaded)
+    await this.claimUnassignedJobs();
+
+    // 5. Sync: load DB-assigned jobs missing from local scheduler
+    await this.syncAssignedJobs();
+  }
+
+  /** Claim unassigned active jobs — only if this instance is least-loaded */
+  private async claimUnassignedJobs(): Promise<void> {
+    const unassigned = await this.configRepo.getUnassignedActiveJobs();
+    if (!unassigned.length) return;
+
+    for (const job of unassigned) {
+      const leastLoaded = await this.configRepo.getLeastLoadedInstance(DEAD_THRESHOLD_MS);
+      if (!leastLoaded) break;
+      if (leastLoaded.instanceId !== this.instanceId!) break; // not least-loaded, let another instance claim
+
+      const claimed = await this.configRepo.claimUnassignedJob(job.id, this.instanceId!);
+      if (!claimed) continue; // another instance claimed first
+
+      await this.configRepo.updateHeartbeat(this.instanceId!, this.scheduler.jobCount + 1);
+      this.scheduler.addOrUpdate(job as CronJobRow);
+      console.log(`[cron-service] Claimed job ${job.id} (${job.name})`);
+    }
+  }
+
+  /** Cancel local timers for jobs that are deleted/paused/reassigned in DB */
+  private async cancelStaleJobs(): Promise<void> {
+    for (const jobId of this.scheduler.scheduledJobIds) {
+      const dbJob = await this.configRepo.getCronJobById(jobId);
+      if (!dbJob || dbJob.status !== "active" || dbJob.assignedTo !== this.instanceId) {
+        this.scheduler.cancel(jobId);
+      }
+    }
+  }
+
+  /** Load DB-assigned jobs that are missing from local scheduler */
+  private async syncAssignedJobs(): Promise<void> {
+    const dbJobs = await this.configRepo.listCronJobsByInstance(this.instanceId!);
+    const scheduled = new Set(this.scheduler.scheduledJobIds);
+    for (const job of dbJobs) {
+      if (!scheduled.has(job.id)) {
+        this.scheduler.addOrUpdate(job as CronJobRow);
+      }
+    }
+  }
+
+  /** Timer callback for reconcile loop */
+  private async reconcileTick(): Promise<void> {
+    try {
+      await this.reconcile();
+    } catch (err) {
+      console.warn("[cron-service] Reconcile failed:", err instanceof Error ? err.message : err);
+    }
+  }
+
+  // ── Job execution ─────────────────────────────────────────────────────
 
   /** Execute a single cron job */
   private async execute(job: CronJobRow): Promise<void> {
@@ -86,6 +197,13 @@ export class CronService {
     const current = await this.configRepo.getCronJobById(job.id);
     if (!current || current.status !== "active") {
       console.log(`[cron-service] Job ${job.id} no longer active, skipping`);
+      return;
+    }
+
+    // In multi-replica mode, verify we still own this job
+    if (this.instanceId && current.assignedTo !== this.instanceId) {
+      console.log(`[cron-service] Job ${job.id} reassigned to ${current.assignedTo}, skipping`);
+      this.scheduler.cancel(job.id);
       return;
     }
 
@@ -225,8 +343,8 @@ export class CronService {
     this.scheduler.cancel(jobId);
   }
 
-  /** Stop all timers and clean up */
-  stop(): void {
+  /** Stop all timers and clean up. Deregisters instance in multi-replica mode. */
+  async stop(): Promise<void> {
     this.scheduler.stop();
     if (this.staleLockTimer) {
       clearInterval(this.staleLockTimer);
@@ -240,6 +358,21 @@ export class CronService {
       clearInterval(this.sessionPurgeTimer);
       this.sessionPurgeTimer = null;
     }
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = null;
+    }
+
+    // Deregister instance and release jobs (multi-replica only)
+    if (this.instanceId) {
+      try {
+        await this.configRepo.releaseInstanceJobs(this.instanceId);
+        await this.configRepo.deleteInstance(this.instanceId);
+      } catch (err) {
+        console.warn("[cron-service] Deregister failed:", err instanceof Error ? err.message : err);
+      }
+    }
+
     console.log("[cron-service] Stopped");
   }
 

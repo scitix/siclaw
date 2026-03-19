@@ -185,10 +185,12 @@ export interface StartGatewayOptions {
   spawner?: import("./agentbox/spawner.js").BoxSpawner;
   extraRpcMethods?: Map<string, RpcHandler>;
   extraHttpHandlers?: Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>;
+  /** Pod name for multi-replica cron coordination. undefined = single-instance mode. */
+  instanceId?: string;
 }
 
 export async function startGateway(opts: StartGatewayOptions): Promise<GatewayServer> {
-  const { config, agentBoxManager, spawner, extraRpcMethods, extraHttpHandlers } = opts;
+  const { config, agentBoxManager, spawner, extraRpcMethods, extraHttpHandlers, instanceId } = opts;
 
   // Track users with active SSE prompt streams (web UI)
   const activePromptUsers = new Set<string>();
@@ -226,7 +228,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 
   // In-process cron service (replaces standalone cron process)
   const cronService = (configRepo && notifRepo)
-    ? new CronService({ configRepo, notifRepo, sendToUser, gatewayPort: config.port })
+    ? new CronService({ configRepo, notifRepo, sendToUser, gatewayPort: config.port, instanceId })
     : null;
 
   // System config repo (used by JWT, SSO, cert-manager, metrics cache, etc.)
@@ -399,6 +401,20 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   }
 
   await refreshSsoCache();
+
+  // Config cache TTL — poll DB every 30s so non-local replicas pick up changes
+  const CONFIG_CACHE_TTL_MS = 30_000;
+  const configCacheTimer = setInterval(async () => {
+    try {
+      await refreshCspCache();
+      await refreshMetricsConfig();
+      await refreshSsoCache();
+    } catch (err) {
+      console.warn("[gateway] Config cache refresh failed:", err instanceof Error ? err.message : err);
+    }
+  }, CONFIG_CACHE_TTL_MS);
+  configCacheTimer.unref();
+
   if (cachedOAuth2Config) {
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- TS can't narrow let vars captured by closures
     const cfg = cachedOAuth2Config as OAuth2Config;
@@ -1340,7 +1356,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     buildCredentialPayload,
     agentBoxTlsOptions,
     async close() {
-      cronService?.stop();
+      clearInterval(configCacheTimer);
+      await cronService?.stop();
       bindCodeStore.dispose();
       if (knowledgeIndexer) {
         try { knowledgeIndexer.close(); } catch { /* best-effort */ }

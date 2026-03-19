@@ -12,6 +12,7 @@ image:
 # -- Gateway
 gateway:
   replicas: 1
+  sessionAffinityTimeout: 10800  # 3 hours, only effective when replicas > 1
   service:
     type: NodePort
     port: 80

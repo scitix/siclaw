@@ -16,6 +16,17 @@ spec:
         {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 8 }}
     spec:
       serviceAccountName: {{ include "siclaw.fullname" . }}-gateway
+      {{- if gt (int .Values.gateway.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
       containers:
         - name: gateway
           image: {{ include "siclaw.image" (dict "component" "gateway" "ctx" .) }}
@@ -52,6 +63,14 @@ spec:
             {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
+            - name: SICLAW_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SICLAW_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: SICLAW_GATEWAY_HOSTNAME
               value: "{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local"
             {{- if .Values.database.existingSecret.name }}
