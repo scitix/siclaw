@@ -15,7 +15,7 @@ const THINKING_TIPS = [
     'Tip: Siclaw remembers findings across sessions \u2014 ask about past investigations',
     'Analyzing the situation...',
     'Tip: Use Skills to run reusable diagnostic scripts',
-    'Tip: You can steer the AI mid-response by typing in the input box',
+    'Tip: You can queue your next message while the AI is responding',
     'Working on it...',
 ];
 import { DpChecklistCard, type DpChecklistItem } from './DpChecklistCard';
@@ -196,7 +196,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     }, [sessionKey]);
 
     // Suggested reply draft — chip click populates input instead of sending immediately
-    const chipSeq = useRef(0);
+    const [chipSeq, setChipSeq] = useState(0);
     const [chipDraft, setChipDraft] = useState<string | null>(null);
 
     // Feedback hint: show once per session after agent finishes first response
@@ -447,7 +447,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                                     selectedWorkspaceId={selectedWorkspaceId}
                                     showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
-                                    onChipClick={(key) => { chipSeq.current++; setChipDraft(key + ' '); }}
+                                    onChipClick={(key) => { setChipSeq(s => s + 1); setChipDraft(key + ' '); }}
                                 />
                             ))}
 
@@ -471,7 +471,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq.current} />
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
 }
