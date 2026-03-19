@@ -325,6 +325,7 @@ export const clusters = sqliteTable("clusters", {
   apiServer: text("api_server").notNull(),
   allowedServers: text("allowed_servers"),
   defaultKubeconfig: text("default_kubeconfig"),
+  debugImage: text("debug_image"),
   createdBy: text("created_by"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
