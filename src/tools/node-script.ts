@@ -13,7 +13,7 @@ import {
   formatExecOutput,
 } from "./exec-utils.js";
 import { runInDebugPod } from "./debug-pod.js";
-import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
+import { resolveRequiredKubeconfig, resolveDebugImage } from "./kubeconfig-resolver.js";
 
 interface NodeScriptParams {
   node: string;
@@ -130,7 +130,8 @@ Examples:
         };
       }
 
-      const image = params.image || loadConfig().debugImage;
+      const clusterKey = params.kubeconfig || "default";
+      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
       // Security: shell-escape each argument to prevent injection via args parameter
@@ -151,7 +152,7 @@ Examples:
       ];
 
       const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey },
         env,
         { timeoutMs: timeout, signal },
       );

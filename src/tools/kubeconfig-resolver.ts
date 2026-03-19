@@ -11,6 +11,21 @@ interface CredentialEntry {
   name: string;
   type: string;
   files: string[];
+  metadata?: { debugImage?: string; [key: string]: unknown };
+}
+
+/**
+ * Read and parse manifest.json from the credentials directory.
+ * Returns an empty array on any failure (missing dir, missing file, parse error).
+ */
+function readManifestEntries(credentialsDir: string): CredentialEntry[] {
+  const manifestPath = join(credentialsDir, "manifest.json");
+  if (!existsSync(manifestPath)) return [];
+  try {
+    return JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -20,17 +35,14 @@ interface CredentialEntry {
 export function resolveKubeconfigPath(credentialsDir?: string): string | null {
   if (!credentialsDir) return null;
 
-  const manifestPath = join(credentialsDir, "manifest.json");
-  if (!existsSync(manifestPath)) return null;
+  const entries = readManifestEntries(credentialsDir);
+  const kubeEntry = entries.find((e) => e.type === "kubeconfig");
+  if (!kubeEntry) return null;
+
+  const kubeconfigFile = kubeEntry.files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntry.files[0];
+  if (!kubeconfigFile) return null;
 
   try {
-    const entries = JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
-    const kubeEntry = entries.find((e) => e.type === "kubeconfig");
-    if (!kubeEntry) return null;
-
-    const kubeconfigFile = kubeEntry.files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntry.files[0];
-    if (!kubeconfigFile) return null;
-
     return resolveUnderDir(credentialsDir, kubeconfigFile);
   } catch {
     return null;
@@ -43,13 +55,11 @@ export function resolveKubeconfigPath(credentialsDir?: string): string | null {
  * Returns null if no match found.
  */
 export function resolveKubeconfigByName(credentialsDir: string, name: string): string | null {
-  const manifestPath = join(credentialsDir, "manifest.json");
-  if (!existsSync(manifestPath)) return null;
+  const entries = readManifestEntries(credentialsDir);
+  const match = entries.find((e) => e.type === "kubeconfig" && e.name === name);
+  if (!match) return null;
+  const kubeconfigFile = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
   try {
-    const entries = JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
-    const match = entries.find((e) => e.type === "kubeconfig" && e.name === name);
-    if (!match) return null;
-    const kubeconfigFile = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
     return kubeconfigFile ? resolveUnderDir(credentialsDir, kubeconfigFile) : null;
   } catch {
     return null;
@@ -71,16 +81,7 @@ export function resolveRequiredKubeconfig(
 ): { path: string | null } | { error: string; availableNames?: string[] } {
   if (!credentialsDir) return { path: null };
 
-  const manifestPath = join(credentialsDir, "manifest.json");
-  if (!existsSync(manifestPath)) return { path: null };
-
-  let entries: CredentialEntry[];
-  try {
-    entries = JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
-  } catch {
-    return { path: null };
-  }
-
+  const entries = readManifestEntries(credentialsDir);
   const kubeEntries = entries.filter((e) => e.type === "kubeconfig");
 
   if (kubeEntries.length === 0) return { path: null };
@@ -121,4 +122,26 @@ export function resolveRequiredKubeconfig(
 
   const file = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
   return file ? safeResolve(file) : { error: `Kubeconfig "${name}" has no files` };
+}
+
+/**
+ * Resolve the debug image for a specific kubeconfig credential.
+ * Returns the per-cluster debugImage from manifest metadata, or null if not set.
+ *
+ * When name is undefined and there's exactly one kubeconfig, auto-selects it.
+ */
+export function resolveDebugImage(credentialsDir: string | undefined, name: string | undefined): string | null {
+  if (!credentialsDir) return null;
+
+  const entries = readManifestEntries(credentialsDir);
+  const kubeEntries = entries.filter((e) => e.type === "kubeconfig");
+
+  let match: CredentialEntry | undefined;
+  if (name) {
+    match = kubeEntries.find((e) => e.name === name);
+  } else if (kubeEntries.length === 1) {
+    match = kubeEntries[0];
+  }
+
+  return match?.metadata?.debugImage ?? null;
 }
