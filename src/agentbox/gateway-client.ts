@@ -5,6 +5,7 @@
  * Used by AgentBox to query metadata (settings, cron jobs, etc.)
  */
 
+import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
@@ -101,7 +102,7 @@ export class GatewayClient {
         ...(isHttps && this.tlsOptions ? this.tlsOptions : {}),
       };
 
-      const client = isHttps ? https : require("http");
+      const client = isHttps ? https : http;
       const req = client.request(requestOptions, (res: any) => {
         let data = "";
 
