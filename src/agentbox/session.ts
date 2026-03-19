@@ -79,6 +79,9 @@ export class AgentBoxSessionManager {
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
   userId?: string;
 
+  /** Optional knowledge base indexer — set by LocalSpawner for knowledge_search tool */
+  knowledgeIndexer?: MemoryIndexer;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -203,6 +206,7 @@ export class AgentBoxSessionManager {
       brainType: effectiveBrainType,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
+      knowledgeIndexer: this.knowledgeIndexer,
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session

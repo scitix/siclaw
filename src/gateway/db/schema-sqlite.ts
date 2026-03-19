@@ -393,6 +393,19 @@ export interface ReviewFinding {
   snippet?: string;
 }
 
+// ─── Knowledge Docs ─────────────────────────────
+
+export const knowledgeDocs = sqliteTable("knowledge_docs", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  filePath: text("file_path").notNull(),
+  sizeBytes: integer("size_bytes").notNull().default(0),
+  chunkCount: integer("chunk_count").notNull().default(0),
+  uploadedBy: text("uploaded_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
 // ─── MCP Servers ────────────────────────────────
 
 export const mcpServers = sqliteTable("mcp_servers", {

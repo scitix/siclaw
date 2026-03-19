@@ -336,6 +336,17 @@ const DDL_STATEMENTS = [
     created_at        INTEGER NOT NULL
   )`,
 
+  `CREATE TABLE IF NOT EXISTS knowledge_docs (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    uploaded_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
   `CREATE TABLE IF NOT EXISTS mcp_servers (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -393,6 +404,7 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_cron_instances_heartbeat ON cron_instances(heartbeat_at)`,
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_user ON feedback_reports(user_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_session ON feedback_reports(session_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_knowledge_docs_name ON knowledge_docs(name)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
@@ -421,6 +433,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE workspace_clusters RENAME COLUMN env_id TO cluster_id`,
     // Rename description → infra_context
     `ALTER TABLE clusters RENAME COLUMN description TO infra_context`,
+    // Knowledge docs: drop description column
+    `ALTER TABLE knowledge_docs DROP COLUMN description`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
@@ -458,6 +472,15 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     FOR EACH ROW
     BEGIN
       UPDATE mcp_servers SET updated_at = unixepoch() WHERE id = NEW.id;
+    END
+  `));
+
+  sdb.run(sql.raw(`
+    CREATE TRIGGER IF NOT EXISTS trg_knowledge_docs_updated_at
+    AFTER UPDATE ON knowledge_docs
+    FOR EACH ROW
+    BEGIN
+      UPDATE knowledge_docs SET updated_at = unixepoch() WHERE id = NEW.id;
     END
   `));
 

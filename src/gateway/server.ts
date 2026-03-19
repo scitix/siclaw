@@ -31,6 +31,7 @@ import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import { createResourceNotifier } from "./resource-notifier.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
+import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { MetricsAggregator } from "./metrics-aggregator.js";
@@ -288,6 +289,40 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   }
   if (db) metricsAggregator.setDb(db);
 
+  // ── Knowledge Base Indexer ─────────────────────────────────
+  let knowledgeIndexer: MemoryIndexer | null = null;
+  try {
+    const knowledgeDir = path.resolve(process.cwd(), loadConfig().paths.knowledgeDir);
+    if (!fs.existsSync(knowledgeDir)) {
+      fs.mkdirSync(knowledgeDir, { recursive: true });
+    }
+    if (db) {
+      const modelConfigRepo = new ModelConfigRepository(db);
+      const embeddingConfig = await modelConfigRepo.getResolvedEmbeddingConfig();
+      if (embeddingConfig?.baseUrl && embeddingConfig?.model) {
+        knowledgeIndexer = await createMemoryIndexer(knowledgeDir, {
+          baseUrl: embeddingConfig.baseUrl,
+          apiKey: embeddingConfig.apiKey,
+          model: embeddingConfig.model,
+          dimensions: embeddingConfig.dimensions,
+          search: { temporalDecay: { enabled: false, halfLifeDays: 0 } },
+        });
+        await knowledgeIndexer.sync();
+        knowledgeIndexer.startWatching();
+        console.log(`[gateway] Knowledge base indexer initialized for ${knowledgeDir}`);
+      } else {
+        console.warn("[gateway] Knowledge base indexer skipped: embedding config not set");
+      }
+    }
+  } catch (err) {
+    console.warn("[gateway] Knowledge base indexer init failed:", err);
+  }
+
+  // Wire knowledge indexer to LocalSpawner
+  if (localSpawner && knowledgeIndexer) {
+    localSpawner.setKnowledgeIndexer(knowledgeIndexer);
+  }
+
   // CSP frame-src cache for Grafana iframe embedding
   let cachedFrameSrc: string | null = null;
   const refreshCspCache = async () => {
@@ -319,7 +354,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await refreshMetricsConfig();
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService, knowledgeIndexer);
 
   // Wrap system.saveSection to refresh caches when settings change
   const origSaveSection = rpcMethods.get("system.saveSection");
@@ -796,6 +831,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       return;
     }
 
+    // /api/internal/knowledge-search is served on the HTTPS server only (mTLS required).
+
     // Internal notification purge endpoint: POST /api/internal/notifications/purge
     if (url === "/api/internal/notifications/purge" && method === "POST") {
       if (!db) {
@@ -1244,6 +1281,36 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             return;
           }
 
+          // Internal knowledge search endpoint: GET /api/internal/knowledge-search
+          if (url.startsWith("/api/internal/knowledge-search") && method === "GET") {
+            if (!knowledgeIndexer) {
+              res.writeHead(503, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Knowledge indexer not available" }));
+              return;
+            }
+            (async () => {
+              try {
+                const urlObj = new URL(url, `https://${req.headers.host}`);
+                const query = urlObj.searchParams.get("query") || "";
+                const topK = Math.min(Math.max(1, parseInt(urlObj.searchParams.get("topK") || "5", 10) || 5), 20);
+                const minScore = parseFloat(urlObj.searchParams.get("minScore") || "0.35") || 0.35;
+                if (!query.trim()) {
+                  res.writeHead(400, { "Content-Type": "application/json" });
+                  res.end(JSON.stringify({ error: "query parameter is required" }));
+                  return;
+                }
+                const result = await knowledgeIndexer.search(query, topK, minScore);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(result));
+              } catch (err) {
+                console.error("[gateway] knowledge-search error:", err);
+                res.writeHead(500, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ error: "Internal server error" }));
+              }
+            })();
+            return;
+          }
+
           // Default: 404 for unknown internal API paths
           res.writeHead(404, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Not found" }));
@@ -1275,6 +1342,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     async close() {
       cronService?.stop();
       bindCodeStore.dispose();
+      if (knowledgeIndexer) {
+        try { knowledgeIndexer.close(); } catch { /* best-effort */ }
+      }
       await agentBoxManager.cleanup();
       for (const ws of clients) {
         ws.close();
