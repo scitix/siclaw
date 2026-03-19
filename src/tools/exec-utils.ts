@@ -5,13 +5,11 @@
  * debug pod lifecycle, container netns resolution, and output formatting.
  */
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
 import { processToolOutput } from "./tool-render.js";
-import { checkNodeReady, waitForPodDone } from "./k8s-checks.js";
-import { loadConfig } from "../core/config.js";
+import { checkNodeReady } from "./k8s-checks.js";
 
 // ── Name validators ──────────────────────────────────────────────────
 
@@ -143,6 +141,7 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  timedOut?: boolean;
 }
 
 /**
@@ -168,138 +167,6 @@ export function formatExecOutput(result: ExecResult): {
     return {
       content: [{ type: "text", text: processToolOutput(errOutput) }],
       details: { exitCode: result.exitCode, error: true },
-    };
-  }
-}
-
-// ── Debug Pod lifecycle ──────────────────────────────────────────────
-
-export interface DebugPodSpec {
-  nodeName: string;
-  /** Full command array for the container (including nsenter if needed). */
-  command: string[];
-  image?: string;
-}
-
-/**
- * Run a command inside a privileged debug pod on a specific node.
- *
- * Manages the full 5-phase lifecycle:
- *   1. Create pod (kubectl run)
- *   2. Wait for terminal phase (Succeeded / Failed)
- *   3. Fetch logs
- *   4. Get exit code
- *   5. Cleanup (delete pod)
- */
-export async function runInDebugPod(
-  spec: DebugPodSpec,
-  env: ExecEnv,
-  opts: { timeoutMs: number; signal?: AbortSignal },
-): Promise<ExecResult> {
-  const image = spec.image || loadConfig().debugImage;
-  const podId = randomBytes(4).toString("hex");
-  const podName = `node-debug-${podId}`;
-
-  const cleanup = () => {
-    spawnAsync(
-      "kubectl",
-      [...env.kubeconfigArgs, "delete", "pod", podName, "--force", "--grace-period=0"],
-      10_000,
-      env.childEnv,
-    ).catch(() => {});
-  };
-
-  const overrides = JSON.stringify({
-    spec: {
-      nodeName: spec.nodeName,
-      hostPID: true,
-      hostNetwork: true,
-      containers: [{
-        name: podName,
-        image,
-        securityContext: { privileged: true },
-        command: spec.command,
-      }],
-      restartPolicy: "Never",
-    },
-  });
-
-  try {
-    // Phase 1: Create pod
-    await spawnAsync(
-      "kubectl",
-      [
-        ...env.kubeconfigArgs,
-        "run", podName,
-        "--restart=Never",
-        `--image=${image}`,
-        `--overrides=${overrides}`,
-      ],
-      30_000,
-      env.childEnv,
-      opts.signal,
-    );
-
-    // Phase 2: Wait for pod to reach terminal phase (Succeeded or Failed)
-    try {
-      await waitForPodDone(
-        podName, opts.timeoutMs, env.childEnv, opts.signal,
-        env.kubeconfigPath ?? undefined,
-      );
-    } catch {
-      // Timed out — still fetch logs before cleanup
-    }
-
-    if (opts.signal?.aborted) {
-      cleanup();
-      return { stdout: "", stderr: "Aborted.", exitCode: null };
-    }
-
-    // Phase 3: Fetch logs
-    let stdout = "";
-    let stderr = "";
-    try {
-      const logsResult = await spawnAsync(
-        "kubectl",
-        [...env.kubeconfigArgs, "logs", podName],
-        10_000,
-        env.childEnv,
-      );
-      stdout = logsResult.stdout;
-      stderr = logsResult.stderr;
-    } catch (logErr: any) {
-      stdout = logErr.stdout ?? "";
-      stderr = logErr.stderr ?? "";
-    }
-
-    // Phase 4: Get exit code from pod status
-    let exitCode: number | null = null;
-    try {
-      const statusResult = await spawnAsync(
-        "kubectl",
-        [
-          ...env.kubeconfigArgs, "get", "pod", podName,
-          "-o", "jsonpath={.status.containerStatuses[0].state.terminated.exitCode}",
-        ],
-        5_000,
-        env.childEnv,
-      );
-      const code = parseInt(statusResult.stdout.trim(), 10);
-      if (!isNaN(code)) exitCode = code;
-    } catch {
-      // ignore — exitCode stays null
-    }
-
-    // Phase 5: Cleanup
-    cleanup();
-
-    return { stdout, stderr, exitCode };
-  } catch (err: any) {
-    cleanup();
-    return {
-      stdout: err.stdout?.trim() ?? "",
-      stderr: err.stderr?.trim() ?? err.message,
-      exitCode: typeof err.code === "number" ? err.code : null,
     };
   }
 }

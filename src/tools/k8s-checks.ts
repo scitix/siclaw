@@ -48,12 +48,23 @@ export async function checkNodeReady(
 /** Terminal pod phases — once a pod reaches one of these, it won't change. */
 const TERMINAL_PHASES = new Set(["Succeeded", "Failed"]);
 
+/** Adaptive polling constants — start fast (500ms) and back off to 5s cap. */
+const POLL_INITIAL_MS = 500;
+const POLL_MAX_MS = 5_000;
+const POLL_BACKOFF_FACTOR = 1.5;
+
 /**
- * Poll a pod until it reaches a terminal phase (Succeeded or Failed).
- * Returns the final phase string, or throws on timeout / kubectl errors.
+ * Poll a pod until it reaches a target phase.
+ * Returns the matched phase string, or throws on timeout / abort.
  *
- * This replaces `kubectl wait --for=jsonpath={.status.phase}=Succeeded`
- * which hangs indefinitely when the pod fails (phase=Failed never matches).
+ * When `targetPhase` is `"Running"`: returns as soon as the pod reaches
+ * Running (or any terminal phase, to avoid hanging on immediate failure).
+ * When `targetPhase` is `"terminal"` or omitted: waits for Succeeded/Failed
+ * (original behavior).
+ *
+ * Uses adaptive backoff polling: starts at 500ms and increases by 1.5x
+ * each iteration up to a 5s cap — reduces cold-start latency while
+ * avoiding tight loops on long-running pods.
  */
 export async function waitForPodDone(
   podName: string,
@@ -61,8 +72,10 @@ export async function waitForPodDone(
   env?: NodeJS.ProcessEnv,
   signal?: AbortSignal,
   kubeconfigPath?: string,
+  namespace?: string,
+  targetPhase?: "Running" | "terminal",
 ): Promise<string> {
-  const pollInterval = 2_000;
+  let pollInterval = POLL_INITIAL_MS;
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -73,12 +86,18 @@ export async function waitForPodDone(
         "kubectl",
         [
           ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
-          "get", "pod", podName, "-o", "jsonpath={.status.phase}",
+          "get", "pod", podName,
+          ...(namespace ? ["-n", namespace] : []),
+          "-o", "jsonpath={.status.phase}",
         ],
         { timeout: KUBECTL_TIMEOUT, env },
       );
       const phase = stdout.trim();
-      if (TERMINAL_PHASES.has(phase)) return phase;
+      if (targetPhase === "Running") {
+        if (phase === "Running" || TERMINAL_PHASES.has(phase)) return phase;
+      } else {
+        if (TERMINAL_PHASES.has(phase)) return phase;
+      }
     } catch {
       // kubectl transient error — keep polling
     }
@@ -91,6 +110,8 @@ export async function waitForPodDone(
         signal.addEventListener("abort", onAbort, { once: true });
       }
     });
+
+    pollInterval = Math.min(pollInterval * POLL_BACKOFF_FACTOR, POLL_MAX_MS);
   }
 
   throw new Error(`Timed out waiting for pod "${podName}" to complete`);
