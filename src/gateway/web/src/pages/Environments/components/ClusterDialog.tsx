@@ -9,6 +9,7 @@ interface Cluster {
     isTest: boolean;
     apiServer: string;
     allowedServers: string[];
+    debugImage: string | null;
     hasDefaultKubeconfig: boolean;
 }
 
@@ -17,6 +18,7 @@ interface ClusterFormData {
     infraContext: string;
     isTest: boolean;
     apiServer: string;
+    debugImage: string;
     allowedServers: string;
     defaultKubeconfig: string;
 }
@@ -26,6 +28,7 @@ const EMPTY_FORM: ClusterFormData = {
     infraContext: '',
     isTest: false,
     apiServer: '',
+    debugImage: '',
     allowedServers: '',
     defaultKubeconfig: '',
 };
@@ -47,6 +50,7 @@ export function ClusterDialog({ cluster, onClose, onSaved, sendRpc }: ClusterDia
                 infraContext: cluster.infraContext ?? '',
                 isTest: cluster.isTest,
                 apiServer: cluster.apiServer,
+                debugImage: cluster.debugImage ?? '',
                 allowedServers: cluster.allowedServers.join(', '),
                 defaultKubeconfig: '',
             };
@@ -72,12 +76,15 @@ export function ClusterDialog({ cluster, onClose, onSaved, sendRpc }: ClusterDia
 
             const infraContext = form.infraContext.trim() || null;
 
+            const debugImage = form.debugImage.trim() || undefined;
+
             if (isNew) {
                 await sendRpc('cluster.create', {
                     name: form.name.trim(),
                     infraContext,
                     isTest: form.isTest,
                     apiServer: form.apiServer.trim(),
+                    debugImage,
                     allowedServers,
                     defaultKubeconfig,
                 });
@@ -88,6 +95,7 @@ export function ClusterDialog({ cluster, onClose, onSaved, sendRpc }: ClusterDia
                     infraContext,
                     isTest: form.isTest,
                     apiServer: form.apiServer.trim(),
+                    debugImage: form.debugImage.trim() || null,
                     allowedServers,
                     defaultKubeconfig,
                 });
@@ -191,6 +199,19 @@ export function ClusterDialog({ cluster, onClose, onSaved, sendRpc }: ClusterDia
                             className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
                         />
                         <p className="text-xs text-gray-400 mt-1">Must include explicit port, e.g. <span className="font-mono">:6443</span></p>
+                    </div>
+
+                    {/* Debug Image */}
+                    <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">Debug Image</label>
+                        <input
+                            type="text"
+                            value={form.debugImage}
+                            onChange={e => updateField('debugImage', e.target.value)}
+                            placeholder="registry.example.com/debug:v1"
+                            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">Container image for debug pods on this cluster. Leave empty to use default (<span className="font-mono">busybox:1.36</span>)</p>
                     </div>
 
                     {/* Allowed Servers */}

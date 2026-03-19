@@ -13,7 +13,7 @@ import {
   formatExecOutput,
 } from "./exec-utils.js";
 import { runInDebugPod } from "./debug-pod.js";
-import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
+import { resolveRequiredKubeconfig, resolveDebugImage } from "./kubeconfig-resolver.js";
 
 interface NetnsScriptParams {
   pod: string;
@@ -154,7 +154,8 @@ Examples:
         };
       }
 
-      const image = params.image || loadConfig().debugImage;
+      const clusterKey = params.kubeconfig || "default";
+      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
 
@@ -185,7 +186,7 @@ unshare --mount nsenter -t "$PID" -n -- sh -c 'mount -t sysfs none /sys 2>/dev/n
       ];
 
       const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: netns.nodeName, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: netns.nodeName, command: nsenterCmd, image, clusterKey },
         env,
         { timeoutMs: timeout, signal },
       );

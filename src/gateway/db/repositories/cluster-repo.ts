@@ -20,6 +20,7 @@ export class ClusterRepository {
         apiServer: clusters.apiServer,
         allowedServers: clusters.allowedServers,
         defaultKubeconfig: clusters.defaultKubeconfig,
+        debugImage: clusters.debugImage,
         createdBy: clusters.createdBy,
         createdAt: clusters.createdAt,
         updatedAt: clusters.updatedAt,
@@ -47,6 +48,7 @@ export class ClusterRepository {
         apiServer: clusters.apiServer,
         allowedServers: clusters.allowedServers,
         defaultKubeconfig: clusters.defaultKubeconfig,
+        debugImage: clusters.debugImage,
         createdBy: clusters.createdBy,
         createdAt: clusters.createdAt,
         updatedAt: clusters.updatedAt,
@@ -56,7 +58,7 @@ export class ClusterRepository {
   }
 
   async save(
-    cluster: { id?: string; name: string; infraContext?: string | null; isTest?: boolean; apiServer: string; allowedServers?: string | null; defaultKubeconfig?: string | null },
+    cluster: { id?: string; name: string; infraContext?: string | null; isTest?: boolean; apiServer: string; allowedServers?: string | null; defaultKubeconfig?: string | null; debugImage?: string | null },
     createdBy?: string,
   ): Promise<string> {
     if (!cluster.apiServer || typeof cluster.apiServer !== "string" || !cluster.apiServer.trim()) {
@@ -70,6 +72,7 @@ export class ClusterRepository {
       if (cluster.isTest !== undefined) updates.isTest = cluster.isTest;
       if (cluster.allowedServers !== undefined) updates.allowedServers = cluster.allowedServers;
       if (cluster.defaultKubeconfig !== undefined) updates.defaultKubeconfig = cluster.defaultKubeconfig;
+      if (cluster.debugImage !== undefined) updates.debugImage = cluster.debugImage;
       await this.db
         .update(clusters)
         .set(updates)
@@ -87,6 +90,7 @@ export class ClusterRepository {
       apiServer: cluster.apiServer,
       allowedServers: cluster.allowedServers ?? null,
       defaultKubeconfig: cluster.defaultKubeconfig ?? null,
+      debugImage: cluster.debugImage ?? null,
       createdBy: createdBy ?? null,
     });
     return id;
