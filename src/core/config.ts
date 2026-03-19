@@ -52,7 +52,7 @@ export interface SiclawConfig {
   providers: Record<string, ProviderConfig>;
   default?: { provider: string; modelId: string };
   embedding?: EmbeddingConfig;
-  paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string };
+  paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string };
   server: { port: number; gatewayUrl: string };
   debugImage: string;
   debugNamespace: string;
@@ -78,6 +78,7 @@ const DEFAULTS: SiclawConfig = {
     credentialsDir: ".siclaw/credentials",
     reposDir: ".siclaw/repos",
     docsDir: ".siclaw/docs",
+    knowledgeDir: ".siclaw/knowledge",
   },
   server: { port: 3000, gatewayUrl: "" },
   debugImage: "busybox:1.36",

@@ -46,6 +46,10 @@ import type { ResourceNotifier } from "../shared/resource-sync.js";
 import { sql, gte, sum, count } from "drizzle-orm";
 import { sessionStats } from "./db/schema.js";
 import type { MetricsAggregator } from "./metrics-aggregator.js";
+import { KnowledgeDocRepository } from "./db/repositories/knowledge-doc-repo.js";
+import type { MemoryIndexer } from "../memory/index.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
+import { loadConfig } from "../core/config.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -149,6 +153,7 @@ export function createRpcMethods(
   resourceNotifier?: ResourceNotifier,
   metricsAggregator?: MetricsAggregator,
   cronService?: CronService | null,
+  knowledgeIndexer?: MemoryIndexer | null,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
@@ -173,6 +178,7 @@ export function createRpcMethods(
   const workspaceRepo = db ? new WorkspaceRepository(db) : null;
   const sysConfigRepo = db ? new SystemConfigRepository(db) : null;
   const mcpRepo = db ? new McpServerRepository(db) : null;
+  const knowledgeDocRepo = db ? new KnowledgeDocRepository(db) : null;
   const skillContentRepo = db ? new SkillContentRepository(db) : null;
   const clusterRepo = db ? new ClusterRepository(db) : null;
   const userClusterConfigRepo = db ? new UserClusterConfigRepository(db) : null;
@@ -1118,7 +1124,6 @@ export function createRpcMethods(
 
     // Fallback: read from settings.json mcpServers (CLI / no-DB mode)
     try {
-      const { loadConfig } = await import("../core/config.js");
       const config = loadConfig();
       const servers: Array<Record<string, unknown>> = [];
       for (const [name, serverConfig] of Object.entries(config.mcpServers ?? {})) {
@@ -1219,6 +1224,159 @@ export function createRpcMethods(
     await mcpRepo.update(id, { enabled: newEnabled });
     await notifyMcpChange();
     return { id, enabled: newEnabled };
+  });
+
+  // ── Knowledge Base ────────────────────────────────
+
+  const knowledgeDir = path.resolve(process.cwd(), loadConfig().paths.knowledgeDir);
+
+  methods.set("kb.list", async (_params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!knowledgeDocRepo) throw new Error("Database not available");
+    const rows = await knowledgeDocRepo.list();
+    return {
+      docs: rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        filePath: r.filePath,
+        sizeBytes: r.sizeBytes,
+        chunkCount: r.chunkCount,
+        uploadedBy: r.uploadedBy,
+        createdAt: r.createdAt?.toISOString(),
+        updatedAt: r.updatedAt?.toISOString(),
+      })),
+    };
+  });
+
+  methods.set("kb.get", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!knowledgeDocRepo) throw new Error("Database not available");
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+    const doc = await knowledgeDocRepo.getById(id);
+    if (!doc) throw new Error("Document not found");
+
+    // Read file content (path traversal protected)
+    const fullPath = resolveUnderDir(knowledgeDir, doc.filePath);
+    let content = "";
+    if (fs.existsSync(fullPath)) {
+      content = fs.readFileSync(fullPath, "utf-8");
+    } else {
+      console.warn(`[kb-rpc] kb.get: file missing on disk for doc id=${id} path=${doc.filePath}`);
+    }
+    return {
+      id: doc.id,
+      name: doc.name,
+      filePath: doc.filePath,
+      sizeBytes: doc.sizeBytes,
+      chunkCount: doc.chunkCount,
+      uploadedBy: doc.uploadedBy,
+      createdAt: doc.createdAt?.toISOString(),
+      updatedAt: doc.updatedAt?.toISOString(),
+      content,
+    };
+  });
+
+  methods.set("kb.upload", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!knowledgeDocRepo) throw new Error("Database not available");
+
+    const name = params.name as string;
+    const content = params.content as string;
+    if (!name) throw new Error("Missing required param: name");
+    if (!content) throw new Error("Missing required param: content");
+
+    // Size limit: 5MB
+    const MAX_CONTENT_SIZE = 5 * 1024 * 1024;
+    const sizeBytes = Buffer.byteLength(content, "utf-8");
+    if (sizeBytes > MAX_CONTENT_SIZE) {
+      throw new Error(`Content too large: ${(sizeBytes / 1024 / 1024).toFixed(1)}MB exceeds 5MB limit`);
+    }
+
+    // Generate unique ID first, then build filename with ID prefix to avoid TOCTOU races
+    const docId = crypto.randomBytes(12).toString("hex");
+    let sanitized = name
+      .replace(/[^a-zA-Z0-9_\-. ]/g, "_")
+      .replace(/\s+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "");
+    if (!sanitized) sanitized = "document";
+    const baseName = sanitized.endsWith(".md") ? sanitized.slice(0, -3) : sanitized;
+    const filePath = `${baseName}_${docId.slice(0, 8)}.md`;
+
+    if (!fs.existsSync(knowledgeDir)) {
+      fs.mkdirSync(knowledgeDir, { recursive: true });
+    }
+    const fullPath = resolveUnderDir(knowledgeDir, filePath);
+
+    // Write file, then insert DB record (clean up file on DB failure)
+    fs.writeFileSync(fullPath, content, "utf-8");
+
+    try {
+      await knowledgeDocRepo.create({
+        id: docId,
+        name,
+        filePath,
+        sizeBytes,
+        uploadedBy: context.auth?.userId,
+      });
+    } catch (err) {
+      // Clean up orphaned file on DB insert failure
+      try { fs.unlinkSync(fullPath); } catch { /* best-effort cleanup */ }
+      throw err;
+    }
+
+    console.log(`[kb-rpc] kb.upload: name=${name}, file=${filePath}, size=${sizeBytes}, by=${context.auth?.username}`);
+
+    // Sync indexer and update chunk count
+    if (knowledgeIndexer) {
+      try {
+        await knowledgeIndexer.sync();
+        const chunkCount = knowledgeIndexer.countChunksByFile(filePath);
+        await knowledgeDocRepo.updateChunkCount(docId, chunkCount);
+      } catch (err) {
+        console.warn("[kb-rpc] Knowledge indexer sync failed:", err);
+      }
+    }
+
+    return { id: docId, name };
+  });
+
+  methods.set("kb.delete", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!knowledgeDocRepo) throw new Error("Database not available");
+
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+
+    const doc = await knowledgeDocRepo.getById(id);
+    if (!doc) throw new Error("Document not found");
+
+    // Delete metadata first (authoritative source of truth)
+    await knowledgeDocRepo.delete(id);
+
+    console.log(`[kb-rpc] kb.delete: id=${id}, name=${doc.name}, by=${context.auth?.username}`);
+
+    // Then delete file from disk (best-effort, path traversal protected)
+    try {
+      const fullPath = resolveUnderDir(knowledgeDir, doc.filePath);
+      if (fs.existsSync(fullPath)) {
+        fs.unlinkSync(fullPath);
+      }
+    } catch (err) {
+      console.warn(`[kb-rpc] kb.delete: file cleanup failed for ${doc.filePath}:`, err);
+    }
+
+    // Sync indexer to remove orphaned chunks
+    if (knowledgeIndexer) {
+      try {
+        await knowledgeIndexer.sync();
+      } catch (err) {
+        console.warn("[kb-rpc] Knowledge indexer sync failed after delete:", err);
+      }
+    }
+
+    return { ok: true };
   });
 
   methods.set("chat.steer", async (params, context: RpcContext) => {

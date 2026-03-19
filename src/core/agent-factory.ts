@@ -44,6 +44,7 @@ import { createMemorySearchTool } from "../tools/memory-search.js";
 import { createMemoryGetTool } from "../tools/memory-get.js";
 import { createCredentialListTool } from "../tools/credential-list.js";
 import { createClusterInfoTool } from "../tools/cluster-info.js";
+import { createKnowledgeSearchTool } from "../tools/knowledge-search.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
@@ -95,6 +96,8 @@ export interface CreateSiclawSessionOpts {
   mcpTools?: ToolDefinition[];
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
+  /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
+  knowledgeIndexer?: MemoryIndexer;
 }
 
 export interface SiclawSessionResult {
@@ -292,6 +295,7 @@ export async function createSiclawSession(
     createSaveFeedbackTool(sessionIdRef),
     createCredentialListTool(kubeconfigRef),
     createClusterInfoTool(kubeconfigRef),
+    createKnowledgeSearchTool(opts?.knowledgeIndexer),
   ];
 
   // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
@@ -336,7 +340,7 @@ export async function createSiclawSession(
 
   // Filter custom tools by workspace allow-list
   // Platform tools are exempt — they must always be available regardless of workspace config
-  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback"]);
+  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback", "knowledge_search"]);
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
   if (Array.isArray(allowedTools)) {
     const allowed = new Set(allowedTools);
