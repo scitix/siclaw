@@ -265,6 +265,7 @@ export async function createSiclawSession(
   const modelRegistry = new ModelRegistry(authStorage, modelsJson);
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
+  const userId = opts?.userId ?? "unknown";
   // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
   // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
   // a model-change notification — so this initialization does not conflict with that path.
@@ -279,12 +280,12 @@ export async function createSiclawSession(
 
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
-    createNodeExecTool(kubeconfigRef),
-    createNodeScriptTool(kubeconfigRef),
+    createNodeExecTool(kubeconfigRef, userId),
+    createNodeScriptTool(kubeconfigRef, userId),
     createPodScriptTool(kubeconfigRef),
-    createNetnsScriptTool(kubeconfigRef),
+    createNetnsScriptTool(kubeconfigRef, userId),
     createPodExecTool(kubeconfigRef),
-    createPodNsenterExecTool(kubeconfigRef),
+    createPodNsenterExecTool(kubeconfigRef, userId),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
     createInvestigationFeedbackTool(memoryRef),

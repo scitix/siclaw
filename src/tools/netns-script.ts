@@ -10,9 +10,9 @@ import {
   validatePodName,
   prepareExecEnv,
   resolveContainerNetns,
-  runInDebugPod,
   formatExecOutput,
 } from "./exec-utils.js";
+import { runInDebugPod } from "./debug-pod.js";
 import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
 
 interface NetnsScriptParams {
@@ -27,7 +27,7 @@ interface NetnsScriptParams {
   timeout_seconds?: number;
 }
 
-export function createNetnsScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createNetnsScriptTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
   return {
     name: "pod_netns_script",
     label: "Pod Netns Script",
@@ -185,7 +185,7 @@ unshare --mount nsenter -t "$PID" -n -- sh -c 'mount -t sysfs none /sys 2>/dev/n
       ];
 
       const execResult = await runInDebugPod(
-        { nodeName: netns.nodeName, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: netns.nodeName, command: nsenterCmd, image },
         env,
         { timeoutMs: timeout, signal },
       );
