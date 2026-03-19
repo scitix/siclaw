@@ -13,7 +13,7 @@ import {
   formatExecOutput,
 } from "./exec-utils.js";
 import { runInDebugPod } from "./debug-pod.js";
-import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
+import { resolveRequiredKubeconfig, resolveDebugImage } from "./kubeconfig-resolver.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
 export { ALLOWED_COMMANDS } from "./command-sets.js";
@@ -156,7 +156,8 @@ Examples:
         };
       }
 
-      const image = params.image || loadConfig().debugImage;
+      const clusterKey = params.kubeconfig || "default";
+      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const commands = extractCommands(params.command);
       const needsShell = commands.length > 1;
@@ -168,7 +169,7 @@ Examples:
         : ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...cmdArgs];
 
       const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey },
         env,
         { timeoutMs: timeout, signal },
       );

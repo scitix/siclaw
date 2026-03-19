@@ -192,10 +192,10 @@ export interface CachedPod {
 // ── Pod reuse cache (with creation-only lock) ───────────────────────
 
 /**
- * In-memory cache for reusable debug pods, keyed by "userId:nodeName".
+ * In-memory cache for reusable debug pods, keyed by "userId:clusterKey:nodeName".
  *
  * The creation lock ensures only one caller creates a pod for a given
- * (userId, nodeName) pair. Concurrent callers wait for creation to
+ * (userId, clusterKey, nodeName) triple. Concurrent callers wait for creation to
  * complete, then reuse the cached pod. Once a pod is cached, any number
  * of kubectl exec calls can run concurrently against it.
  *
@@ -210,8 +210,8 @@ export class DebugPodCache {
   private readonly pods = new Map<string, CachedPod>();
   private readonly creating = new Map<string, Promise<void>>();
 
-  private key(userId: string, nodeName: string): string {
-    return `${userId}:${nodeName}`;
+  private key(userId: string, clusterKey: string, nodeName: string): string {
+    return `${userId}:${clusterKey}:${nodeName}`;
   }
 
   /**
@@ -229,10 +229,11 @@ export class DebugPodCache {
    */
   async getOrCreate(
     userId: string,
+    clusterKey: string,
     nodeName: string,
     createFn: () => Promise<void>,
   ): Promise<{ pod: CachedPod | undefined; created: boolean }> {
-    const k = this.key(userId, nodeName);
+    const k = this.key(userId, clusterKey, nodeName);
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -269,13 +270,14 @@ export class DebugPodCache {
    */
   set(
     userId: string,
+    clusterKey: string,
     nodeName: string,
     podName: string,
     namespace: string,
     env: ExecEnv,
     idleTimeoutMs: number,
   ): void {
-    const k = this.key(userId, nodeName);
+    const k = this.key(userId, clusterKey, nodeName);
     const existing = this.pods.get(k);
     if (existing) clearTimeout(existing.idleTimer);
 
@@ -297,16 +299,16 @@ export class DebugPodCache {
    * Look up a cached pod. Returns undefined if no entry exists.
    * Does NOT reset the idle timer — call touch() after successful exec.
    */
-  get(userId: string, nodeName: string): CachedPod | undefined {
-    return this.pods.get(this.key(userId, nodeName));
+  get(userId: string, clusterKey: string, nodeName: string): CachedPod | undefined {
+    return this.pods.get(this.key(userId, clusterKey, nodeName));
   }
 
   /**
    * Reset the idle timer for an existing cache entry.
    * Called after each successful kubectl exec to keep the pod alive.
    */
-  touch(userId: string, nodeName: string, idleTimeoutMs: number): void {
-    const k = this.key(userId, nodeName);
+  touch(userId: string, clusterKey: string, nodeName: string, idleTimeoutMs: number): void {
+    const k = this.key(userId, clusterKey, nodeName);
     const entry = this.pods.get(k);
     if (!entry) return;
     clearTimeout(entry.idleTimer);
@@ -320,8 +322,8 @@ export class DebugPodCache {
    * Remove a cache entry and clear its timer.
    * Does NOT delete the pod — used when the caller handles deletion externally.
    */
-  remove(userId: string, nodeName: string): void {
-    const k = this.key(userId, nodeName);
+  remove(userId: string, clusterKey: string, nodeName: string): void {
+    const k = this.key(userId, clusterKey, nodeName);
     const entry = this.pods.get(k);
     if (entry) {
       clearTimeout(entry.idleTimer);
@@ -360,8 +362,8 @@ export class DebugPodCache {
   }
 
   /** Check if a pod is being created for this key (for testing/diagnostics). */
-  isCreating(userId: string, nodeName: string): boolean {
-    return this.creating.has(this.key(userId, nodeName));
+  isCreating(userId: string, clusterKey: string, nodeName: string): boolean {
+    return this.creating.has(this.key(userId, clusterKey, nodeName));
   }
 
   /** Number of cached pods (for testing/diagnostics). */
@@ -389,13 +391,15 @@ export interface DebugPodSpec {
   /** Full command array for the container (including nsenter if needed). */
   command: string[];
   image?: string;
+  /** Cluster identifier for cache isolation (credential name). Defaults to "default". */
+  clusterKey?: string;
 }
 
 /**
  * Run a command inside a privileged debug pod on a specific node.
  *
  * Uses an always-reuse model with creation-only locking:
- *   - First call for a (userId, nodeName) pair creates a long-lived pod
+ *   - First call for a (userId, clusterKey, nodeName) triple creates a long-lived pod
  *     with `sleep infinity` and caches it.
  *   - Concurrent callers wait for creation to complete, then reuse the pod.
  *   - Multiple kubectl exec calls can run concurrently on a cached pod.
@@ -409,6 +413,7 @@ export async function runInDebugPod(
 ): Promise<ExecResult> {
   const config = loadConfig();
   const image = spec.image || config.debugImage;
+  const clusterKey = spec.clusterKey || "default";
   const debugNamespace = config.debugNamespace;
   const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
@@ -417,6 +422,7 @@ export async function runInDebugPod(
   try {
     const result = await debugPodCache.getOrCreate(
       spec.userId,
+      clusterKey,
       spec.nodeName,
       async () => {
         const podId = randomBytes(4).toString("hex");
@@ -480,7 +486,7 @@ export async function runInDebugPod(
           }
 
           // Store in cache — idle timer starts now
-          debugPodCache.set(spec.userId, spec.nodeName, podName, debugNamespace, env, idleTimeoutMs);
+          debugPodCache.set(spec.userId, clusterKey, spec.nodeName, podName, debugNamespace, env, idleTimeoutMs);
         } catch (err) {
           // Creation failed — best-effort cleanup
           await deleteDebugPod(podName, env, {
@@ -567,14 +573,14 @@ export async function runInDebugPod(
         podPhase = "Unknown";
       }
       if (podPhase === "Succeeded" || podPhase === "Failed" || podPhase === "") {
-        debugPodCache.remove(spec.userId, spec.nodeName);
+        debugPodCache.remove(spec.userId, clusterKey, spec.nodeName);
         return { stdout, stderr, exitCode };
       }
     }
   }
 
   // ── Phase 2: Reset idle timer ─────────────────────────────────────
-  debugPodCache.touch(spec.userId, spec.nodeName, idleTimeoutMs);
+  debugPodCache.touch(spec.userId, clusterKey, spec.nodeName, idleTimeoutMs);
 
   return { stdout, stderr, exitCode, ...(timedOut ? { timedOut: true } : {}) };
 }

@@ -149,6 +149,7 @@ const DDL_STATEMENTS = [
     created_by TEXT,
     allowed_servers TEXT,
     default_kubeconfig TEXT,
+    debug_image TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
@@ -435,6 +436,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE clusters RENAME COLUMN description TO infra_context`,
     // Knowledge docs: drop description column
     `ALTER TABLE knowledge_docs DROP COLUMN description`,
+    // Per-cluster debug image
+    `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
