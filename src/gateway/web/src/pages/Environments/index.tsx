@@ -16,6 +16,7 @@ interface Cluster {
     isTest: boolean;
     apiServer: string;
     allowedServers: string[];
+    debugImage: string | null;
     hasDefaultKubeconfig: boolean;
     hasUserKubeconfig: boolean;
     userConfigUpdatedAt: string | null;
