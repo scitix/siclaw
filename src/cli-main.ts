@@ -12,6 +12,8 @@ import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
 import type { BrainType } from "./core/brain-session.js";
+import { debugPodGC } from "./tools/debug-pod.js";
+
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -47,6 +49,11 @@ const sessionManager = continueSession
 // Resolve credentialsDir from config and pass to session (fixes TUI credential_list + kubectl)
 const config = loadConfig();
 const credentialsDir = path.resolve(process.cwd(), config.paths.credentialsDir);
+
+// Start background GC for orphaned debug pods (best-effort; silently skips if no cluster)
+void debugPodGC.start(credentialsDir).catch((err) => {
+  console.warn("[siclaw] DebugPodGC start failed:", err);
+});
 
 // Create session via shared factory
 const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =

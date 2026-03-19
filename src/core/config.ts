@@ -55,6 +55,9 @@ export interface SiclawConfig {
   paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string };
   server: { port: number; gatewayUrl: string };
   debugImage: string;
+  debugNamespace: string;
+  debugPodTTL: number;
+  debugPodIdleTimeout: number;
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
   metrics?: { port?: number; token?: string; includeUserId?: boolean };
@@ -77,6 +80,9 @@ const DEFAULTS: SiclawConfig = {
   },
   server: { port: 3000, gatewayUrl: "" },
   debugImage: "busybox:1.36",
+  debugNamespace: "siclaw-debug",
+  debugPodTTL: 600,
+  debugPodIdleTimeout: 30_000,
   allowedTools: null,
   mcpServers: {},
   debug: false,
@@ -167,6 +173,17 @@ export function loadConfig(): SiclawConfig {
   }
   if (process.env.SICLAW_GATEWAY_URL) {
     cached.server.gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+  }
+  if (process.env.SICLAW_DEBUG_NAMESPACE) {
+    cached.debugNamespace = process.env.SICLAW_DEBUG_NAMESPACE;
+  }
+  if (process.env.SICLAW_DEBUG_POD_TTL) {
+    const v = parseInt(process.env.SICLAW_DEBUG_POD_TTL, 10);
+    if (!isNaN(v)) cached.debugPodTTL = v;
+  }
+  if (process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT) {
+    const v = parseInt(process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT, 10);
+    if (!isNaN(v)) cached.debugPodIdleTimeout = v;
   }
 
   return cached;

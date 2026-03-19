@@ -28,7 +28,7 @@ interface NodeExecParams {
   timeout_seconds?: number;
 }
 
-export function createNodeExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createNodeExecTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
   return {
     name: "node_exec",
     label: "Node Exec",
@@ -168,7 +168,7 @@ Examples:
         : ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...cmdArgs];
 
       const execResult = await runInDebugPod(
-        { nodeName: params.node, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image },
         env,
         { timeoutMs: timeout, signal },
       );

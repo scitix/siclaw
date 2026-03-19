@@ -25,7 +25,7 @@ interface PodNsenterExecParams {
   timeout_seconds?: number;
 }
 
-export function createPodNsenterExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createPodNsenterExecTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
   return {
     name: "pod_nsenter_exec",
     label: "Pod Nsenter Exec",
@@ -169,7 +169,7 @@ unshare --mount sh -c 'nsenter -t '"$PID"' -n -- mount -t sysfs none /sys 2>/dev
       ];
 
       const execResult = await runInDebugPod(
-        { nodeName: netns.nodeName, command: nsenterCmd, image },
+        { userId: userId ?? "unknown", nodeName: netns.nodeName, command: nsenterCmd, image },
         env,
         { timeoutMs: timeout, signal },
       );
