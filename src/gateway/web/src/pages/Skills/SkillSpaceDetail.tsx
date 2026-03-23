@@ -7,11 +7,12 @@ import { getCurrentUser } from '../../auth';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { Tooltip } from '../../components/Tooltip';
 import { AddSkillDialog } from './AddSkillDialog';
+import { useWorkspace } from '../../contexts/WorkspaceContext';
 import type { Skill, SkillSpace, SkillSpaceMember } from './skillsData';
 import {
     rpcGetSkillSpace, rpcUpdateSkillSpace, rpcDeleteSkillSpace,
     rpcAddSkillSpaceMember, rpcRemoveSkillSpaceMember,
-    rpcForkSkill, rpcDeleteSkill,
+    rpcForkSkill, rpcDeleteSkill, rpcRequestPublish, rpcWithdrawSkill, rpcGetSkillDiff, rpcGetSkillSystemCapabilities,
 } from './skillsData';
 
 function InlineEdit({ value, onSave, className, placeholder }: {
@@ -49,11 +50,13 @@ export function SkillSpaceDetailPage() {
     const { spaceId } = useParams();
     const navigate = useNavigate();
     const { sendRpc, isConnected } = useWebSocket();
+    const { currentWorkspace } = useWorkspace();
     const currentUser = getCurrentUser();
 
     const [spaceData, setSpaceData] = useState<(SkillSpace & { members: SkillSpaceMember[]; skills: Skill[] }) | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [skillSpaceEnabled, setSkillSpaceEnabled] = useState(false);
     const [addDialog, setAddDialog] = useState(false);
     const [showInvite, setShowInvite] = useState(false);
     const [inviteUsername, setInviteUsername] = useState('');
@@ -64,12 +67,17 @@ export function SkillSpaceDetailPage() {
     }>({ isOpen: false, title: '', description: '', variant: 'primary', confirmText: 'Confirm', onConfirm: () => {} });
 
     const isOwner = spaceData?.ownerId === currentUser?.id;
+    const isMaintainer = spaceData?.members.some(m => m.userId === currentUser?.id && (m.role === 'owner' || m.role === 'maintainer')) ?? false;
     const isMember = spaceData?.members.some(m => m.userId === currentUser?.id) ?? false;
 
     const reload = useCallback(async () => {
-        if (!spaceId || !isConnected) return;
+        if (!spaceId || !isConnected || !currentWorkspace?.id) return;
         try {
-            const data = await rpcGetSkillSpace(sendRpc, spaceId);
+            const [caps, data] = await Promise.all([
+                rpcGetSkillSystemCapabilities(sendRpc, currentWorkspace.id),
+                rpcGetSkillSpace(sendRpc, currentWorkspace.id, spaceId),
+            ]);
+            setSkillSpaceEnabled(caps.skillSpaceEnabled);
             setSpaceData({
                 ...data,
                 skills: data.skills.map((s: any) => ({ ...s, icon: null, version: `v${s.version || 1}`, enabled: s.enabled ?? true })),
@@ -80,15 +88,15 @@ export function SkillSpaceDetailPage() {
         } finally {
             setLoading(false);
         }
-    }, [spaceId, isConnected, sendRpc]);
+    }, [spaceId, isConnected, sendRpc, currentWorkspace?.id]);
 
     useEffect(() => { reload(); }, [reload]);
 
     const handleInvite = async () => {
-        if (!spaceId || !inviteUsername.trim()) return;
+        if (!spaceId || !inviteUsername.trim() || !currentWorkspace?.id) return;
         setInviteError(null);
         try {
-            await rpcAddSkillSpaceMember(sendRpc, spaceId, inviteUsername.trim());
+            await rpcAddSkillSpaceMember(sendRpc, currentWorkspace.id, spaceId, inviteUsername.trim());
             setInviteUsername('');
             setShowInvite(false);
             reload();
@@ -102,7 +110,7 @@ export function SkillSpaceDetailPage() {
             isOpen: true, title: 'Remove Member',
             description: `Remove "${username}" from this skill space?`,
             variant: 'danger', confirmText: 'Remove',
-            onConfirm: async () => { await rpcRemoveSkillSpaceMember(sendRpc, spaceId!, userId); reload(); },
+            onConfirm: async () => { await rpcRemoveSkillSpaceMember(sendRpc, currentWorkspace!.id, spaceId!, userId); reload(); },
         });
     };
 
@@ -112,7 +120,7 @@ export function SkillSpaceDetailPage() {
             description: 'You will lose access to all skills in this space.',
             variant: 'warning', confirmText: 'Leave',
             onConfirm: async () => {
-                await rpcRemoveSkillSpaceMember(sendRpc, spaceId!, currentUser!.id);
+                await rpcRemoveSkillSpaceMember(sendRpc, currentWorkspace!.id, spaceId!, currentUser!.id);
                 navigate('/skills?tab=myskills');
             },
         });
@@ -124,7 +132,7 @@ export function SkillSpaceDetailPage() {
             description: 'All skills must be removed first.',
             variant: 'danger', confirmText: 'Delete',
             onConfirm: async () => {
-                try { await rpcDeleteSkillSpace(sendRpc, spaceId!); navigate('/skills?tab=myskills'); }
+                try { await rpcDeleteSkillSpace(sendRpc, currentWorkspace!.id, spaceId!); navigate('/skills?tab=myskills'); }
                 catch (err: any) { setError(err.message || 'Failed to delete'); }
             },
         });
@@ -135,12 +143,57 @@ export function SkillSpaceDetailPage() {
             isOpen: true, title: 'Remove Skill',
             description: `Delete "${skill.name}" from this skill space?`,
             variant: 'danger', confirmText: 'Delete',
-            onConfirm: async () => { await rpcDeleteSkill(sendRpc, String(skill.id)); reload(); },
+            onConfirm: async () => { await rpcDeleteSkill(sendRpc, String(skill.id), currentWorkspace?.id); reload(); },
         });
+    };
+
+    const handleSubmitPromotion = async (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        try {
+            await rpcRequestPublish(sendRpc, String(skill.id), undefined, currentWorkspace.id);
+            await reload();
+        } catch (err: any) {
+            setError(err.message || 'Failed to submit promotion');
+        }
+    };
+
+    const handleWithdrawPromotion = async (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        try {
+            await rpcWithdrawSkill(sendRpc, String(skill.id), currentWorkspace.id);
+            await reload();
+        } catch (err: any) {
+            setError(err.message || 'Failed to withdraw promotion');
+        }
+    };
+
+    const handleViewDiff = async (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        try {
+            const result = await rpcGetSkillDiff(sendRpc, String(skill.id), false, currentWorkspace.id);
+            setConfirmDialog({
+                isOpen: true,
+                title: `${skill.name} vs Global`,
+                description: result.diff || 'No changes detected.',
+                variant: 'primary',
+                confirmText: 'Close',
+                onConfirm: () => {},
+            });
+        } catch (err: any) {
+            setError(err.message || 'Failed to load diff');
+        }
     };
 
     if (loading) {
         return <div className="flex items-center justify-center h-full"><div className="w-5 h-5 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" /></div>;
+    }
+    if (currentWorkspace?.envType !== 'test' || !skillSpaceEnabled) {
+        return (
+            <div className="flex flex-col items-center justify-center h-full gap-3">
+                <p className="text-sm text-gray-500">Skill Space is available only in K8s test workspaces.</p>
+                <button onClick={() => navigate('/skills?tab=myskills')} className="text-sm text-gray-600 hover:text-gray-900 underline">Back to Skills</button>
+            </div>
+        );
     }
     if (error || !spaceData) {
         return (
@@ -156,7 +209,7 @@ export function SkillSpaceDetailPage() {
             <ConfirmDialog isOpen={confirmDialog.isOpen} onClose={() => setConfirmDialog(p => ({ ...p, isOpen: false }))}
                 onConfirm={confirmDialog.onConfirm} title={confirmDialog.title} description={confirmDialog.description}
                 variant={confirmDialog.variant} confirmText={confirmDialog.confirmText} />
-            <AddSkillDialog isOpen={addDialog} skillSpaceId={spaceId!} skillSpaceName={spaceData.name}
+            <AddSkillDialog isOpen={addDialog} skillSpaceId={spaceId!} skillSpaceName={spaceData.name} workspaceId={currentWorkspace!.id}
                 sendRpc={sendRpc} onClose={() => setAddDialog(false)} onSuccess={reload} />
 
             {/* Header */}
@@ -167,19 +220,19 @@ export function SkillSpaceDetailPage() {
                 </button>
                 <div className="flex-1 min-w-0">
                     {isOwner ? (
-                        <InlineEdit value={spaceData.name} onSave={async name => { await rpcUpdateSkillSpace(sendRpc, spaceId!, { name }); reload(); }}
+                        <InlineEdit value={spaceData.name} onSave={async name => { await rpcUpdateSkillSpace(sendRpc, currentWorkspace!.id, spaceId!, { name }); reload(); }}
                             className="text-lg font-semibold text-gray-900" />
                     ) : (
                         <h1 className="text-lg font-semibold text-gray-900">{spaceData.name}</h1>
                     )}
                     {isOwner ? (
-                        <InlineEdit value={spaceData.description || ''} onSave={async description => { await rpcUpdateSkillSpace(sendRpc, spaceId!, { description }); reload(); }}
+                        <InlineEdit value={spaceData.description || ''} onSave={async description => { await rpcUpdateSkillSpace(sendRpc, currentWorkspace!.id, spaceId!, { description }); reload(); }}
                             className="text-sm text-gray-500 mt-0.5" placeholder="Add a description..." />
                     ) : spaceData.description ? (
                         <p className="text-sm text-gray-500 mt-0.5">{spaceData.description}</p>
                     ) : null}
                 </div>
-                {isOwner && (
+                {isMaintainer && (
                     <div className="relative">
                         <button onClick={() => { setShowInvite(!showInvite); setInviteError(null); }}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
@@ -236,7 +289,7 @@ export function SkillSpaceDetailPage() {
                 <section>
                     <div className="flex items-center justify-between mb-3">
                         <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Skills ({spaceData.skills.length})</h2>
-                        {isMember && (
+                        {isMaintainer && (
                             <button onClick={() => setAddDialog(true)}
                                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
                                 <Plus className="w-3.5 h-3.5" /> Add Skill
@@ -246,7 +299,7 @@ export function SkillSpaceDetailPage() {
                     {spaceData.skills.length === 0 ? (
                         <div className="text-center py-12 text-gray-400">
                             <p className="text-sm">No skills in this space yet.</p>
-                            {isMember && <button onClick={() => setAddDialog(true)} className="mt-2 text-sm text-gray-600 hover:text-gray-900 underline">Add your first skill</button>}
+                            {isMaintainer && <button onClick={() => setAddDialog(true)} className="mt-2 text-sm text-gray-600 hover:text-gray-900 underline">Add your first skill</button>}
                         </div>
                     ) : (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -255,10 +308,10 @@ export function SkillSpaceDetailPage() {
                                     className="group rounded-xl border border-gray-200 p-5 hover:shadow-md hover:border-gray-300 transition-all cursor-pointer flex flex-col">
                                     <div className="flex items-start justify-between mb-2">
                                         <h3 className="text-sm font-semibold text-gray-900 group-hover:text-gray-700 truncate flex-1">{skill.name}</h3>
-                                        {isMember && (
+                                        {isMaintainer && (
                                             <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity ml-2" onClick={e => e.stopPropagation()}>
                                                 <Tooltip content="Fork to Personal">
-                                                    <button onClick={() => rpcForkSkill(sendRpc, String(skill.id)).then(reload)} className="p-1 text-gray-300 hover:text-gray-600 rounded">
+                                                    <button onClick={() => rpcForkSkill(sendRpc, String(skill.id), { workspaceId: currentWorkspace!.id }).then(reload)} className="p-1 text-gray-300 hover:text-gray-600 rounded">
                                                         <GitFork className="w-3.5 h-3.5" />
                                                     </button>
                                                 </Tooltip>
@@ -271,9 +324,34 @@ export function SkillSpaceDetailPage() {
                                         )}
                                     </div>
                                     <p className="text-xs text-gray-500 line-clamp-2 flex-1">{skill.description || 'No description'}</p>
-                                    <div className="flex items-center gap-2 mt-3">
+                                    <div className="flex items-center gap-2 mt-3 flex-wrap">
                                         <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">{spaceData.name}</span>
+                                        <span className={cn(
+                                            "text-[10px] font-medium px-1.5 py-0.5 rounded border",
+                                            skill.reviewStatus === 'pending'
+                                                ? "bg-amber-50 text-amber-700 border-amber-200"
+                                                : skill.globalSkillId
+                                                    ? "bg-blue-50 text-blue-700 border-blue-200"
+                                                    : "bg-gray-50 text-gray-600 border-gray-200"
+                                        )}>
+                                            {skill.reviewStatus === 'pending' ? 'Pending Promotion' : skill.globalSkillId ? 'Shadows Global' : 'Draft'}
+                                        </span>
                                         <span className="text-[10px] text-gray-400">v{(skill as any).version || 1}</span>
+                                    </div>
+                                    <div className="mt-3 flex items-center gap-2 flex-wrap" onClick={e => e.stopPropagation()}>
+                                        <button onClick={() => handleViewDiff(skill)} className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-gray-600 bg-gray-50 border border-gray-200 rounded-md hover:bg-gray-100">
+                                            Diff vs Global
+                                        </button>
+                                        {isOwner && skill.reviewStatus !== 'pending' && (
+                                            <button onClick={() => handleSubmitPromotion(skill)} className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-white bg-gray-900 rounded-md hover:bg-gray-800">
+                                                Submit Promotion
+                                            </button>
+                                        )}
+                                        {isOwner && skill.reviewStatus === 'pending' && (
+                                            <button onClick={() => handleWithdrawPromotion(skill)} className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-md hover:bg-amber-100">
+                                                Withdraw
+                                            </button>
+                                        )}
                                     </div>
                                 </div>
                             ))}

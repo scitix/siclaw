@@ -89,8 +89,8 @@ export async function buildSkillBundle(
     }
   }
 
-  // 3. Skill space skills (from DB — skills in spaces the user is a member of)
-  if (skillSpaceRepo) {
+  // 3. Skill space skills are only exposed in dev/test bundles.
+  if (env === "dev" && skillSpaceRepo) {
     const userSpaces = await skillSpaceRepo.listForUser(userId);
     for (const space of userSpaces) {
       const spaceSkills = await skillRepo.listBySkillSpaceId(space.id);

@@ -16,7 +16,7 @@ import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
 import { SkillRepository } from "./db/repositories/skill-repo.js";
-import { SkillSpaceRepository } from "./db/repositories/skill-space-repo.js";
+import { SkillSpaceRepository, normalizeSkillSpaceRole } from "./db/repositories/skill-space-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
 import { VoteRepository } from "./db/repositories/vote-repo.js";
@@ -155,6 +155,7 @@ export function createRpcMethods(
   metricsAggregator?: MetricsAggregator,
   cronService?: CronService | null,
   knowledgeIndexer?: MemoryIndexer | null,
+  isK8sMode = false,
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
@@ -222,6 +223,50 @@ export function createRpcMethods(
   // Role labels — internal admin-only labels hidden from normal users
   const ROLE_LABELS = new Set(["sre", "developer"]);
 
+  async function resolveWorkspaceForUser(
+    userId: string,
+    workspaceId?: string,
+  ): Promise<Awaited<ReturnType<WorkspaceRepository["getById"]>> | null> {
+    if (!workspaceRepo) return null;
+    const workspace = workspaceId
+      ? await workspaceRepo.getById(workspaceId)
+      : await workspaceRepo.getOrCreateDefault(userId);
+    if (!workspace || workspace.userId !== userId) {
+      return null;
+    }
+    return workspace;
+  }
+
+  async function requireSkillSpaceWorkspace(
+    context: RpcContext,
+    workspaceId?: string,
+  ): Promise<Awaited<ReturnType<WorkspaceRepository["getById"]>>> {
+    const userId = requireAuth(context);
+    if (!isK8sMode) {
+      throw new Error("Skill Space is available only in K8s deployments");
+    }
+    if (!workspaceId) {
+      throw new Error("Missing required param: workspaceId");
+    }
+    const workspace = await resolveWorkspaceForUser(userId, workspaceId);
+    if (!workspace) {
+      throw new Error("Workspace not found");
+    }
+    if (workspace.envType !== "test") {
+      throw new Error("Skill Space is only available in test workspaces");
+    }
+    return workspace;
+  }
+
+  async function canUseSkillSpace(
+    userId: string,
+    workspaceId?: string,
+  ): Promise<boolean> {
+    if (!isK8sMode || !workspaceId) return false;
+    const workspace = await resolveWorkspaceForUser(userId, workspaceId);
+    return workspace?.envType === "test";
+  }
+
   // Skills PV file writer
   const skillsDir = process.env.SICLAW_SKILLS_DIR || "./skills";
   const skillWriter = new SkillFileWriter(skillsDir);
@@ -241,6 +286,16 @@ export function createRpcMethods(
       console.warn(`[resource-notify] All skill reload failed:`, err.message);
     });
   }
+
+  methods.set("system.capabilities", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const workspaceId = params?.workspaceId as string | undefined;
+    const skillSpaceEnabled = await canUseSkillSpace(userId, workspaceId);
+    return {
+      isK8sMode,
+      skillSpaceEnabled,
+    };
+  });
 
   /**
    * Push updated credentials to all active AgentBoxes for a user (fire-and-forget).
@@ -1593,6 +1648,8 @@ export function createRpcMethods(
     const search = params?.search as string | undefined;
     const pendingOnly = params?.pendingOnly as boolean | undefined;
     const skillSpaceId = params?.skillSpaceId as string | undefined;
+    const workspaceId = params?.workspaceId as string | undefined;
+    const skillSpaceEnabled = await canUseSkillSpace(userId, workspaceId);
 
     // Reviewer pending queue: return all pending skills regardless of author
     if (pendingOnly && skillRepo) {
@@ -1659,9 +1716,9 @@ export function createRpcMethods(
 
     // DB skills (when scope is not "builtin")
     let dbResult = { skills: [] as any[], hasMore: false };
-    if (scope !== "builtin") {
+    if (scope !== "builtin" && !(scope === "skillset" && !skillSpaceEnabled)) {
       const repoOpts: any = { limit, offset };
-      if (scope) repoOpts.scope = scope;
+      if (scope && !(scope === "skillset" && !skillSpaceEnabled)) repoOpts.scope = scope;
       if (search) repoOpts.search = search;
       dbResult = skillRepo
         ? await skillRepo.listForUser(userId, repoOpts)
@@ -1707,13 +1764,19 @@ export function createRpcMethods(
 
     // Skill space skills (when scope not filtered to builtin/team/global only, or when filtering by skillSpaceId)
     let skillSpaceSkills: any[] = [];
-    if (skillSpaceId && skillRepo) {
+    if (skillSpaceId && !skillSpaceEnabled) {
+      throw new Error("Skill Space is not available in the current workspace");
+    } else if (skillSpaceId && skillRepo) {
       // Filter by specific skill space
       const spaceSkills = await skillRepo.listBySkillSpaceId(skillSpaceId);
-      skillSpaceSkills = spaceSkills.map((s: any) => ({
-        ...s,
-        labels: filterLabels(s.labelsJson ?? undefined),
-        enabled: !disabled.has(s.name),
+      skillSpaceSkills = await Promise.all(spaceSkills.map(async (s: any) => {
+        const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "team");
+        return {
+          ...s,
+          labels: filterLabels(s.labelsJson ?? undefined),
+          enabled: !disabled.has(s.name),
+          globalSkillId: globalSkill?.id ?? null,
+        };
       }));
       if (search) {
         const q = search.toLowerCase();
@@ -1721,17 +1784,19 @@ export function createRpcMethods(
           s.name.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q)
         );
       }
-    } else if ((!scope || scope === "skillset") && skillSpaceRepo && skillRepo) {
+    } else if ((!scope || scope === "skillset") && skillSpaceEnabled && skillSpaceRepo && skillRepo) {
       // Include all user's skill space skills
       const userSpaces = await skillSpaceRepo.listForUser(userId);
       for (const space of userSpaces) {
         const spaceSkills = await skillRepo.listBySkillSpaceId(space.id);
         for (const s of spaceSkills) {
+          const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "team");
           const entry: any = {
             ...s,
             labels: filterLabels((s as any).labelsJson ?? undefined),
             enabled: !disabled.has(s.name),
             skillSpaceName: space.name,
+            globalSkillId: globalSkill?.id ?? null,
           };
           if (search) {
             const q = search.toLowerCase();
@@ -1882,10 +1947,25 @@ export function createRpcMethods(
     // Resolve skill space info for skillset-scoped skills
     let skillSpaceName: string | null = null;
     let isSpaceMember = false;
+    let isSpaceMaintainer = false;
+    let isSpaceOwner = false;
     if (meta.scope === "skillset" && meta.skillSpaceId && skillSpaceRepo) {
       const space = await skillSpaceRepo.getById(meta.skillSpaceId);
       if (space) skillSpaceName = space.name;
       isSpaceMember = await skillSpaceRepo.isMember(meta.skillSpaceId, userId);
+      isSpaceMaintainer = await skillSpaceRepo.isMaintainer(meta.skillSpaceId, userId);
+      isSpaceOwner = await skillSpaceRepo.isOwner(meta.skillSpaceId, userId);
+      if (!isSpaceMember) {
+        const isReviewer = context.auth?.username === "admin" ||
+          (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+        if (!isReviewer) throw new Error("Skill not found");
+      }
+    }
+
+    let globalSkillId: string | null = null;
+    if (meta.scope === "skillset" && skillRepo) {
+      const existingGlobal = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
+      globalSkillId = existingGlobal?.id ?? null;
     }
 
     return {
@@ -1898,8 +1978,9 @@ export function createRpcMethods(
       teamSourceSkillId: (meta as any).teamSourceSkillId ?? null,
       teamPinnedVersion: (meta as any).teamPinnedVersion ?? null,
       forkedFromId: (meta as any).forkedFromId ?? null,
+      globalSkillId,
       ...(skillSpaceName ? { skillSpaceName } : {}),
-      ...(meta.scope === "skillset" ? { isSpaceMember } : {}),
+      ...(meta.scope === "skillset" ? { isSpaceMember, isSpaceMaintainer, isSpaceOwner } : {}),
     };
   });
 
@@ -1944,6 +2025,7 @@ export function createRpcMethods(
 
     const forkedFromId = params.forkedFromId as string | undefined;
     const skillSpaceId = params.skillSpaceId as string | undefined;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillRepo) throw new Error("Database not available");
 
@@ -1960,9 +2042,10 @@ export function createRpcMethods(
 
     // Skill space membership check
     if (skillSpaceId) {
+      await requireSkillSpaceWorkspace(context, workspaceId);
       if (!skillSpaceRepo) throw new Error("Database not available");
-      const isMember = await skillSpaceRepo.isMember(skillSpaceId, userId);
-      if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
+      const isMaintainer = await skillSpaceRepo.isMaintainer(skillSpaceId, userId);
+      if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can create skills");
     }
 
     if (targetScope === "personal") {
@@ -2067,6 +2150,7 @@ export function createRpcMethods(
     if (!skillRepo) throw new Error("Database not available");
 
     const targetSkillSpaceId = params.targetSkillSpaceId as string | undefined;
+    const workspaceId = params.workspaceId as string | undefined;
 
     // ── 1. Resolve source skill metadata + content ──
     let sourceName: string;
@@ -2139,13 +2223,14 @@ export function createRpcMethods(
 
     if (targetSkillSpaceId) {
       // ── Fork to skill space ──
+      await requireSkillSpaceWorkspace(context, workspaceId);
       if (!skillSpaceRepo) throw new Error("Database not available");
 
       // Verify skill space exists and caller is a member
       const space = await skillSpaceRepo.getById(targetSkillSpaceId);
       if (!space) throw new Error("Target skill space not found");
-      const isMember = await skillSpaceRepo.isMember(targetSkillSpaceId, userId);
-      if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
+      const isMaintainer = await skillSpaceRepo.isMaintainer(targetSkillSpaceId, userId);
+      if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can add skills");
 
       // Check for duplicate in this specific space
       const spaceSkills = await skillRepo.listBySkillSpaceId(targetSkillSpaceId);
@@ -2265,10 +2350,12 @@ export function createRpcMethods(
 
     const skillId = params.skillId as string;
     const targetSkillSpaceId = params.targetSkillSpaceId as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!skillId) throw new Error("Missing required param: skillId");
     if (!targetSkillSpaceId) throw new Error("Missing required param: targetSkillSpaceId");
     if (!skillRepo) throw new Error("Database not available");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
@@ -2278,8 +2365,8 @@ export function createRpcMethods(
     // Verify target space exists and caller is a member
     const space = await skillSpaceRepo.getById(targetSkillSpaceId);
     if (!space) throw new Error("Target skill space not found");
-    const isMember = await skillSpaceRepo.isMember(targetSkillSpaceId, userId);
-    if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
+    const isMaintainer = await skillSpaceRepo.isMaintainer(targetSkillSpaceId, userId);
+    if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can move skills into the space");
 
     // Check for duplicate name in the target space
     const spaceSkills = await skillRepo.listBySkillSpaceId(targetSkillSpaceId);
@@ -2309,6 +2396,7 @@ export function createRpcMethods(
     const username = context.auth!.username;
 
     const skillId = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!skillId) throw new Error("Missing required param: id");
 
     if (!skillRepo) throw new Error("Database not available");
@@ -2325,9 +2413,10 @@ export function createRpcMethods(
     }
     // Skill space: check membership
     if (meta.scope === "skillset") {
+      await requireSkillSpaceWorkspace(context, workspaceId);
       if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
-      const isMember = await skillSpaceRepo.isMember(meta.skillSpaceId, userId);
-      if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
+      const isMaintainer = await skillSpaceRepo.isMaintainer(meta.skillSpaceId, userId);
+      if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can edit this skill");
     }
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Cannot edit another user's skill.");
@@ -2403,7 +2492,12 @@ export function createRpcMethods(
     await skillRepo.bumpVersion(skillId);
 
     // Notify reload
-    notifySkillReload(meta.authorId ?? userId);
+    if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
+      const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
+      for (const member of members) notifySkillReload(member.userId);
+    } else {
+      notifySkillReload(meta.authorId ?? userId);
+    }
     return { status: "updated" };
   });
 
@@ -2411,6 +2505,7 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const username = context.auth!.username;
     const skillId = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillRepo) throw new Error("Database not available");
@@ -2428,9 +2523,10 @@ export function createRpcMethods(
     }
     // Skillset skills require space membership
     if (meta.scope === "skillset") {
+      await requireSkillSpaceWorkspace(context, workspaceId);
       if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
-      const isMember = await skillSpaceRepo.isMember(meta.skillSpaceId, userId);
-      if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
+      const isMaintainer = await skillSpaceRepo.isMaintainer(meta.skillSpaceId, userId);
+      if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can delete this skill");
     }
 
     // Clean up votes
@@ -2503,6 +2599,13 @@ export function createRpcMethods(
       const isReviewer = context.auth?.username === "admin" ||
         (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
       if (!isReviewer) throw new Error("Skill not found");
+    } else if (meta.scope === "skillset") {
+      const isReviewer = context.auth?.username === "admin" ||
+        (permRepo ? await permRepo.hasPermission(userId, "skill_reviewer") : false);
+      const isMember = skillSpaceRepo && meta.skillSpaceId
+        ? await skillSpaceRepo.isMember(meta.skillSpaceId, userId)
+        : false;
+      if (!isReviewer && !isMember) throw new Error("Skill not found");
     }
 
     /** Build a unified diff string for specs + all scripts between two SkillFiles */
@@ -2544,6 +2647,24 @@ export function createRpcMethods(
       }
 
       return parts.length > 0 ? parts.join("\n") : "No changes detected.";
+    }
+
+    if (meta.scope === "skillset") {
+      let globalFiles: SkillFiles | null = null;
+      if (skillContentRepo) {
+        const globalSkill = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
+        if (globalSkill) {
+          globalFiles = await skillContentRepo.read(globalSkill.id, "published");
+        }
+      }
+
+      let stagingFiles: SkillFiles | null = null;
+      if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
+      if (!stagingFiles && skillContentRepo) {
+        stagingFiles = await skillContentRepo.read(skillId, "working");
+      }
+
+      return { diff: buildFullDiff(globalFiles, stagingFiles, "global", "skill-space") };
     }
 
     if (teamDiff) {
@@ -2662,6 +2783,7 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const skillId = params.id as string;
     const contributeToTeam = params.contributeToTeam as boolean | undefined;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillRepo) throw new Error("Database not available");
@@ -2669,14 +2791,29 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    if (meta.scope !== "personal") throw new Error("Only personal skills can be submitted");
-    if (meta.authorId !== userId) throw new Error("Cannot submit another user's skill");
+    if (meta.scope !== "personal" && meta.scope !== "skillset") {
+      throw new Error("Only personal and skill space skills can be submitted");
+    }
+    if (meta.scope === "personal" && meta.authorId !== userId) {
+      throw new Error("Cannot submit another user's skill");
+    }
+    if (meta.scope === "skillset") {
+      await requireSkillSpaceWorkspace(context, workspaceId);
+      if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
+      const isOwner = await skillSpaceRepo.isOwner(meta.skillSpaceId, userId);
+      if (!isOwner) {
+        throw new Error("Only the skill space owner can submit a promotion request");
+      }
+    }
 
     const isPending = (meta as any).reviewStatus === "pending";
     const publishedVersion = (meta as any).publishedVersion as number | null;
 
     // Guard: no changes since last publish — nothing to submit
     if (publishedVersion != null && meta.version <= publishedVersion) {
+      if (meta.scope === "skillset") {
+        throw new Error("No changes since the last promotion snapshot. Edit the skill before resubmitting.");
+      }
       if (contributeToTeam) {
         // Check if already contributed
         const contributionStatus = (meta as any).contributionStatus as string;
@@ -2704,7 +2841,7 @@ export function createRpcMethods(
     if (!isPending) {
       updates.reviewStatus = "pending";
     }
-    if (contributeToTeam) {
+    if (contributeToTeam && meta.scope === "personal") {
       updates.contributionStatus = "pending";
     }
     if (Object.keys(updates).length > 0) {
@@ -2727,11 +2864,11 @@ export function createRpcMethods(
 
     // 6. Notify reviewers (only on first submit to avoid flooding)
     if (!isPending) {
-      const kind = contributeToTeam ? "contribution" : "publish";
+      const kind = meta.scope === "skillset" || contributeToTeam ? "contribution" : "publish";
       notifyReviewers(skillId, meta.name, context.auth?.username ?? "unknown", kind).catch(console.error);
     }
 
-    return { status: "pending" };
+    return { status: meta.scope === "skillset" ? "pending_promotion" : "pending" };
   });
 
   /**
@@ -2829,10 +2966,59 @@ export function createRpcMethods(
         stagingVersion: 0,
       });
 
-      // 7. If contributionStatus === "pending", auto-promote to team
+      // 7. Promote approved Skill Space and contribution requests to Global/team.
+      if (meta.scope === "skillset") {
+        const publishedVer = newVersion;
+        const allTeam = await skillRepo.list({ scope: "team" });
+        const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
+
+        let teamSkillId: string;
+        const srcLabels = (meta as any).labelsJson as string[] | null;
+        if (existingTeam) {
+          teamSkillId = existingTeam.id;
+          await skillRepo.update(existingTeam.id, {
+            description: meta.description ?? undefined,
+            type: meta.type ?? undefined,
+            teamSourceSkillId: skillId,
+            teamPinnedVersion: publishedVer,
+            reviewStatus: "approved",
+            publishedVersion: publishedVer,
+            labels: srcLabels ?? undefined,
+          });
+          await skillRepo.bumpVersion(existingTeam.id);
+        } else {
+          teamSkillId = await skillRepo.create({
+            name: meta.name,
+            description: meta.description ?? undefined,
+            type: meta.type ?? undefined,
+            scope: "team",
+            authorId: meta.authorId ?? undefined,
+            dirName: meta.dirName,
+            labels: srcLabels ?? undefined,
+          });
+          await skillRepo.update(teamSkillId, {
+            teamSourceSkillId: skillId,
+            teamPinnedVersion: publishedVer,
+            reviewStatus: "approved",
+            publishedVersion: publishedVer,
+          });
+        }
+
+        if (skillContentRepo) {
+          await skillContentRepo.copyToSkill(skillId, teamSkillId, "published", "published");
+        }
+
+        notifyAllSkillReload();
+        if (skillSpaceRepo && meta.skillSpaceId) {
+          const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
+          for (const member of members) notifySkillReload(member.userId);
+        }
+      }
+
+      // 8. If contributionStatus === "pending", auto-promote to team
       const contributionStatus = (meta as any).contributionStatus as string;
       console.log(`[skill.review] contributionStatus="${contributionStatus}" authorId="${meta.authorId}" — promote=${contributionStatus === "pending" && !!meta.authorId}`);
-      if (contributionStatus === "pending" && meta.authorId) {
+      if (meta.scope === "personal" && contributionStatus === "pending" && meta.authorId) {
         const publishedVer = newVersion;
 
         // Copy published content → team skill (DB primary)
@@ -2885,7 +3071,7 @@ export function createRpcMethods(
         // Notify all users (team skill changed)
         console.log(`[skill.review] Contribution promoted to team successfully. Team skill id=${teamSkillId}`);
         notifyAllSkillReload();
-      } else {
+      } else if (meta.scope === "personal") {
         // Notify author's AgentBox
         if (meta.authorId) {
           notifySkillReload(meta.authorId);
@@ -2903,6 +3089,11 @@ export function createRpcMethods(
         contributionStatus: "none",
         stagingVersion: 0,
       });
+
+      if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
+        const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
+        for (const member of members) notifySkillReload(member.userId);
+      }
     }
 
     // Notify skill author
@@ -2913,10 +3104,14 @@ export function createRpcMethods(
       let message: string | undefined;
 
       if (isApproved) {
-        title = `Your skill "${meta.name}" has been approved and is now active in production`;
+        title = meta.scope === "skillset"
+          ? `Your Skill Space change "${meta.name}" has been merged to Global`
+          : `Your skill "${meta.name}" has been approved and is now active in production`;
         message = reason || undefined;
       } else {
-        title = `Your skill "${meta.name}" was rejected`;
+        title = meta.scope === "skillset"
+          ? `Your Skill Space promotion "${meta.name}" was rejected`
+          : `Your skill "${meta.name}" was rejected`;
         const parts: string[] = [
           "You can edit and resubmit.",
         ];
@@ -3538,6 +3733,7 @@ export function createRpcMethods(
   methods.set("skill.withdraw", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillId = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillRepo) throw new Error("Database not available");
@@ -3545,9 +3741,19 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Only the author can withdraw
-    if (meta.authorId !== userId) {
-      throw new Error("Forbidden: you can only withdraw your own submissions");
+    if (meta.scope === "personal") {
+      if (meta.authorId !== userId) {
+        throw new Error("Forbidden: you can only withdraw your own submissions");
+      }
+    } else if (meta.scope === "skillset") {
+      await requireSkillSpaceWorkspace(context, workspaceId);
+      if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
+      const isOwner = await skillSpaceRepo.isOwner(meta.skillSpaceId, userId);
+      if (!isOwner) {
+        throw new Error("Only the skill space owner can withdraw a promotion request");
+      }
+    } else {
+      throw new Error("Only personal and skill space submissions can be withdrawn");
     }
 
     const reviewStatus = (meta as any).reviewStatus as string;
@@ -3573,7 +3779,12 @@ export function createRpcMethods(
       await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
     }
 
-    notifySkillReload(userId);
+    if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
+      const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
+      for (const member of members) notifySkillReload(member.userId);
+    } else {
+      notifySkillReload(userId);
+    }
     return { status: "withdrawn", wasNew: false };
   });
 
@@ -3585,9 +3796,11 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const name = params.name as string;
     const description = params.description as string | undefined;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!name?.trim()) throw new Error("Missing required param: name");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const id = await skillSpaceRepo.create({
       name: name.trim(),
@@ -3597,9 +3810,11 @@ export function createRpcMethods(
     return { id, name: name.trim() };
   });
 
-  methods.set("skillSpace.list", async (_params, context: RpcContext) => {
+  methods.set("skillSpace.list", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
+    const workspaceId = params.workspaceId as string | undefined;
     if (!skillSpaceRepo) return { skillSpaces: [] };
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const spaces = await skillSpaceRepo.listForUser(userId);
     return { skillSpaces: spaces };
@@ -3608,8 +3823,10 @@ export function createRpcMethods(
   methods.set("skillSpace.get", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const id = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!id) throw new Error("Missing required param: id");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const space = await skillSpaceRepo.getById(id);
     if (!space) throw new Error("Skill space not found");
@@ -3619,7 +3836,16 @@ export function createRpcMethods(
     if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
 
     const members = await skillSpaceRepo.listMembers(id);
-    const spaceSkills = skillRepo ? await skillRepo.listBySkillSpaceId(id) : [];
+    let spaceSkills = skillRepo ? await skillRepo.listBySkillSpaceId(id) : [];
+    if (skillRepo) {
+      spaceSkills = await Promise.all(spaceSkills.map(async (skill: any) => {
+        const globalSkill = await skillRepo.getByDirNameAndScope(skill.dirName, "team");
+        return {
+          ...skill,
+          globalSkillId: globalSkill?.id ?? null,
+        };
+      }));
+    }
 
     // Enrich members with usernames
     const enrichedMembers = await Promise.all(members.map(async (m) => {
@@ -3644,8 +3870,10 @@ export function createRpcMethods(
   methods.set("skillSpace.update", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const id = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!id) throw new Error("Missing required param: id");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const isOwner = await skillSpaceRepo.isOwner(id, userId);
     if (!isOwner) throw new Error("Forbidden: only the owner can update this skill space");
@@ -3660,8 +3888,10 @@ export function createRpcMethods(
   methods.set("skillSpace.delete", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const id = params.id as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!id) throw new Error("Missing required param: id");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const isOwner = await skillSpaceRepo.isOwner(id, userId);
     if (!isOwner) throw new Error("Forbidden: only the owner can delete this skill space");
@@ -3677,14 +3907,16 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const skillSpaceId = params.skillSpaceId as string;
     const targetUsername = params.username as string;
-    const role = (params.role as string) || "member";
+    const role = normalizeSkillSpaceRole((params.role as string) || "maintainer");
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
     if (!targetUsername) throw new Error("Missing required param: username");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
-    const isOwner = await skillSpaceRepo.isOwner(skillSpaceId, userId);
-    if (!isOwner) throw new Error("Forbidden: only the owner can add members");
+    const isMaintainer = await skillSpaceRepo.isMaintainer(skillSpaceId, userId);
+    if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can add members");
 
     if (!userRepo) throw new Error("Database not available");
     const targetUser = await userRepo.getByUsername(targetUsername);
@@ -3702,10 +3934,12 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const skillSpaceId = params.skillSpaceId as string;
     const targetUserId = params.userId as string;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
     if (!targetUserId) throw new Error("Missing required param: userId");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     // Allow members to remove themselves (leave), but owner cannot leave
     const isSelfLeave = targetUserId === userId;
@@ -3734,8 +3968,10 @@ export function createRpcMethods(
   methods.set("skillSpace.listMembers", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillSpaceId = params.skillSpaceId as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const isMember = await skillSpaceRepo.isMember(skillSpaceId, userId);
     if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
@@ -3758,10 +3994,12 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const skillSpaceId = params.skillSpaceId as string;
     const enabled = params.enabled as boolean;
+    const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
     if (typeof enabled !== "boolean") throw new Error("Missing required param: enabled");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const isOwner = await skillSpaceRepo.isOwner(skillSpaceId, userId);
     if (!isOwner) throw new Error("Forbidden: only the owner can manage share links");
@@ -3775,8 +4013,10 @@ export function createRpcMethods(
   methods.set("skillSpace.joinByToken", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const token = params.token as string;
+    const workspaceId = params.workspaceId as string | undefined;
     if (!token) throw new Error("Missing required param: token");
     if (!skillSpaceRepo) throw new Error("Database not available");
+    await requireSkillSpaceWorkspace(context, workspaceId);
 
     const space = await skillSpaceRepo.getByInviteToken(token);
     if (!space) throw new Error("Invalid or expired invite link");
@@ -3784,7 +4024,7 @@ export function createRpcMethods(
     const alreadyMember = await skillSpaceRepo.isMember(space.id, userId);
     if (alreadyMember) return { spaceId: space.id, alreadyMember: true };
 
-    await skillSpaceRepo.addMember(space.id, userId, "member");
+    await skillSpaceRepo.addMember(space.id, userId, "maintainer");
     notifySkillReload(userId);
     return { spaceId: space.id, joined: true };
   });
@@ -5161,5 +5401,3 @@ export function createRpcMethods(
 
   return { methods, buildCredentialPayload, getSkillBundle, cleanupForWs };
 }
-
-
