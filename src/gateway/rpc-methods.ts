@@ -16,6 +16,7 @@ import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
 import { SkillRepository } from "./db/repositories/skill-repo.js";
+import { SkillSetRepository } from "./db/repositories/skill-set-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
 import { VoteRepository } from "./db/repositories/vote-repo.js";
@@ -182,6 +183,7 @@ export function createRpcMethods(
   const skillContentRepo = db ? new SkillContentRepository(db) : null;
   const clusterRepo = db ? new ClusterRepository(db) : null;
   const userClusterConfigRepo = db ? new UserClusterConfigRepository(db) : null;
+  const skillSetRepo = db ? new SkillSetRepository(db) : null;
   const scriptEvaluator = new ScriptEvaluator(modelConfigRepo);
 
   /** Resolve workspaceId for a session from DB */
@@ -1590,6 +1592,7 @@ export function createRpcMethods(
     const scope = params?.scope as string | undefined;
     const search = params?.search as string | undefined;
     const pendingOnly = params?.pendingOnly as boolean | undefined;
+    const skillSetId = params?.skillSetId as string | undefined;
 
     // Reviewer pending queue: return all pending skills regardless of author
     if (pendingOnly && skillRepo) {
@@ -1702,8 +1705,45 @@ export function createRpcMethods(
       });
     }
 
+    // Skill set skills (when scope not filtered to builtin/team/global only, or when filtering by skillSetId)
+    let skillSetSkills: any[] = [];
+    if (skillSetId && skillRepo) {
+      // Filter by specific skill set
+      const setSkills = await skillRepo.listBySkillSetId(skillSetId);
+      skillSetSkills = setSkills.map((s: any) => ({
+        ...s,
+        labels: filterLabels(s.labelsJson ?? undefined),
+        enabled: !disabled.has(s.name),
+      }));
+      if (search) {
+        const q = search.toLowerCase();
+        skillSetSkills = skillSetSkills.filter((s: any) =>
+          s.name.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q)
+        );
+      }
+    } else if ((!scope || scope === "skillset") && skillSetRepo && skillRepo) {
+      // Include all user's skill set skills
+      const userSets = await skillSetRepo.listForUser(userId);
+      for (const set of userSets) {
+        const setSkills = await skillRepo.listBySkillSetId(set.id);
+        for (const s of setSkills) {
+          const entry: any = {
+            ...s,
+            labels: filterLabels((s as any).labelsJson ?? undefined),
+            enabled: !disabled.has(s.name),
+            skillSetName: set.name,
+          };
+          if (search) {
+            const q = search.toLowerCase();
+            if (!entry.name.toLowerCase().includes(q) && !entry.description?.toLowerCase().includes(q)) continue;
+          }
+          skillSetSkills.push(entry);
+        }
+      }
+    }
+
     return {
-      skills: [...builtinSkills, ...dbResult.skills],
+      skills: [...builtinSkills, ...dbResult.skills, ...skillSetSkills],
       hasMore: dbResult.hasMore,
     };
   });
@@ -1892,6 +1932,7 @@ export function createRpcMethods(
       .replace(/^-|-$/g, "");
 
     const forkedFromId = params.forkedFromId as string | undefined;
+    const skillSetId = params.skillSetId as string | undefined;
 
     if (!skillRepo) throw new Error("Database not available");
 
@@ -1903,16 +1944,35 @@ export function createRpcMethods(
       }
     }
 
-    // Check for duplicate personal skill with same dirName
-    const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
-    const duplicate = existingResult.skills.find(
-      (s: any) => s.dirName === dirName && s.scope === "personal" && s.authorId === userId,
-    );
-    if (duplicate) {
-      throw new Error(
-        `A personal skill named "${name}" already exists (id: ${duplicate.id}). ` +
-        `Delete it first if you want to re-fork.`,
+    // Determine target scope
+    const targetScope = skillSetId ? "skillset" : "personal";
+
+    // Skill set membership check
+    if (skillSetId) {
+      if (!skillSetRepo) throw new Error("Database not available");
+      const isMember = await skillSetRepo.isMember(skillSetId, userId);
+      if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+    }
+
+    if (targetScope === "personal") {
+      // Check for duplicate personal skill with same dirName
+      const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
+      const duplicate = existingResult.skills.find(
+        (s: any) => s.dirName === dirName && s.scope === "personal" && s.authorId === userId,
       );
+      if (duplicate) {
+        throw new Error(
+          `A personal skill named "${name}" already exists (id: ${duplicate.id}). ` +
+          `Delete it first if you want to re-fork.`,
+        );
+      }
+    } else {
+      // Check for duplicate in skill set
+      const setSkills = await skillRepo.listBySkillSetId(skillSetId!);
+      const dupInSet = setSkills.find((s: any) => s.dirName === dirName);
+      if (dupInSet) {
+        throw new Error(`A skill named "${name}" already exists in this skill set`);
+      }
     }
 
     // Strict cross-scope duplicate check — only forks are allowed to shadow
@@ -1928,11 +1988,13 @@ export function createRpcMethods(
       }
     }
 
-    // Clean up residual directory from a previously deleted skill (no DB record but dir exists)
-    const residualDir = skillWriter.resolveDir("personal", dirName, userId);
-    if (fs.existsSync(residualDir)) {
-      console.log(`[rpc] Cleaning up residual skill directory: ${residualDir}`);
-      fs.rmSync(residualDir, { recursive: true, force: true });
+    if (targetScope === "personal") {
+      // Clean up residual directory from a previously deleted skill (no DB record but dir exists)
+      const residualDir = skillWriter.resolveDir("personal", dirName, userId);
+      if (fs.existsSync(residualDir)) {
+        console.log(`[rpc] Cleaning up residual skill directory: ${residualDir}`);
+        fs.rmSync(residualDir, { recursive: true, force: true });
+      }
     }
 
     // Resolve version inheritance for forks
@@ -1953,12 +2015,13 @@ export function createRpcMethods(
       name,
       description,
       type,
-      scope: "personal",
+      scope: targetScope as any,
       authorId: userId,
       dirName,
       forkedFromId: forkedFromId ?? undefined,
       version: inheritVersion,
       labels: labels && labels.length > 0 ? labels : undefined,
+      skillSetId: skillSetId ?? undefined,
     });
 
     // Save content to DB
@@ -1966,17 +2029,24 @@ export function createRpcMethods(
       await skillContentRepo.save(id, "working", { specs, scripts });
     }
 
-    // Always draft on create — visible in dev env immediately
-    notifySkillReload(userId);
+    // Notify reload
+    if (skillSetId && skillSetRepo) {
+      const members = await skillSetRepo.listMembers(skillSetId);
+      for (const m of members) notifySkillReload(m.userId);
+    } else {
+      notifySkillReload(userId);
+    }
     return {
       id, dirName, reviewStatus: "draft" as const,
       ...(forkedFromId ? { forkedFromId } : {}),
+      ...(skillSetId ? { skillSetId } : {}),
     };
   });
 
   // ─── skill.fork ─────────────────────────────────────
-  // Server-side fork: reads source content, creates personal copy.
+  // Server-side fork: reads source content, creates personal or skill-set copy.
   // Accepts optional overrides for specs/scripts (used by Pilot auto-fork).
+  // When targetSkillSetId is provided, forks into a skill set instead of personal scope.
   methods.set("skill.fork", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
 
@@ -1984,6 +2054,8 @@ export function createRpcMethods(
     if (!sourceId) throw new Error("Missing required param: sourceId");
 
     if (!skillRepo) throw new Error("Database not available");
+
+    const targetSkillSetId = params.targetSkillSetId as string | undefined;
 
     // ── 1. Resolve source skill metadata + content ──
     let sourceName: string;
@@ -2051,6 +2123,69 @@ export function createRpcMethods(
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "");
 
+    if (targetSkillSetId) {
+      // ── Fork to skill set ──
+      if (!skillSetRepo) throw new Error("Database not available");
+
+      // Verify skill set exists and caller is a member
+      const set = await skillSetRepo.getById(targetSkillSetId);
+      if (!set) throw new Error("Target skill set not found");
+      const isMember = await skillSetRepo.isMember(targetSkillSetId, userId);
+      if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+
+      // Check for duplicate in this specific set
+      const setSkills = await skillRepo.listBySkillSetId(targetSkillSetId);
+      const dupInSet = setSkills.find((s: any) => s.dirName === dirName);
+      if (dupInSet) {
+        throw new Error(`A skill named "${effectiveName}" already exists in this skill set`);
+      }
+
+      // Resolve version
+      let inheritVersion = 1;
+      if (sourceScope !== "builtin") {
+        const source = await skillRepo.getById(sourceId);
+        if (source) inheritVersion = source.version;
+      }
+
+      // Create skillset-scoped skill
+      const cleanedLabels = effectiveLabels?.map(l => l.trim()).filter(Boolean);
+      const id = await skillRepo.create({
+        name: effectiveName,
+        description: effectiveDescription,
+        type: effectiveType,
+        scope: "skillset",
+        authorId: userId,
+        dirName,
+        forkedFromId: sourceId,
+        version: inheritVersion,
+        labels: cleanedLabels && cleanedLabels.length > 0 ? cleanedLabels : undefined,
+        skillSetId: targetSkillSetId,
+      });
+
+      // Save content
+      if (skillContentRepo) {
+        await skillContentRepo.save(id, "working", {
+          specs: effectiveSpecs,
+          scripts: effectiveScripts,
+        });
+      }
+
+      // Notify all members to reload
+      const members = await skillSetRepo.listMembers(targetSkillSetId);
+      for (const m of members) notifySkillReload(m.userId);
+
+      return {
+        id,
+        dirName,
+        name: effectiveName,
+        forkedFromId: sourceId,
+        reviewStatus: "draft" as const,
+        hasScripts: effectiveScripts && effectiveScripts.length > 0,
+        skillSetId: targetSkillSetId,
+      };
+    }
+
+    // ── Fork to personal scope (original behavior) ──
     const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
     const duplicate = existingResult.skills.find(
       (s: any) => s.dirName === dirName && s.scope === "personal" && s.authorId === userId,
@@ -2109,6 +2244,52 @@ export function createRpcMethods(
     };
   });
 
+  // ─── skill.moveToSet ───────────────────────────────
+  // Move a personal skill into a skill set (changes scope, removes personal copy).
+  methods.set("skill.moveToSet", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+
+    const skillId = params.skillId as string;
+    const targetSkillSetId = params.targetSkillSetId as string;
+    if (!skillId) throw new Error("Missing required param: skillId");
+    if (!targetSkillSetId) throw new Error("Missing required param: targetSkillSetId");
+    if (!skillRepo) throw new Error("Database not available");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const meta = await skillRepo.getById(skillId);
+    if (!meta) throw new Error("Skill not found");
+    if (meta.scope !== "personal") throw new Error("Only personal skills can be moved to a skill set");
+    if (meta.authorId !== userId) throw new Error("Forbidden: you can only move your own skills");
+
+    // Verify target set exists and caller is a member
+    const set = await skillSetRepo.getById(targetSkillSetId);
+    if (!set) throw new Error("Target skill set not found");
+    const isMember = await skillSetRepo.isMember(targetSkillSetId, userId);
+    if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+
+    // Check for duplicate name in the target set
+    const setSkills = await skillRepo.listBySkillSetId(targetSkillSetId);
+    const dup = setSkills.find((s: any) => s.dirName === meta.dirName);
+    if (dup) {
+      throw new Error(`A skill named "${meta.name}" already exists in this skill set`);
+    }
+
+    // Move: update scope + skillSetId
+    await skillRepo.update(skillId, {
+      scope: "skillset",
+      skillSetId: targetSkillSetId,
+    });
+
+    // Notify original user + all set members
+    notifySkillReload(userId);
+    const members = await skillSetRepo.listMembers(targetSkillSetId);
+    for (const m of members) {
+      if (m.userId !== userId) notifySkillReload(m.userId);
+    }
+
+    return { status: "moved", skillId, targetSkillSetId };
+  });
+
   methods.set("skill.update", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const username = context.auth!.username;
@@ -2121,14 +2302,20 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Only personal skills can be edited directly
-    if (meta.scope !== "personal") {
+    // Only personal and skillset skills can be edited directly
+    if (meta.scope !== "personal" && meta.scope !== "skillset") {
       throw new Error(
-        `Cannot edit ${meta.scope} skills. Only personal skills can be modified. ` +
+        `Cannot edit ${meta.scope} skills. Only personal and skill set skills can be modified. ` +
         `Use skill.create to fork a personal copy.`,
       );
     }
-    if (meta.authorId !== userId) {
+    // Skillset: check membership
+    if (meta.scope === "skillset") {
+      if (!skillSetRepo || !meta.skillSetId) throw new Error("Database not available");
+      const isMember = await skillSetRepo.isMember(meta.skillSetId, userId);
+      if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+    }
+    if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Cannot edit another user's skill.");
     }
 
@@ -2225,6 +2412,12 @@ export function createRpcMethods(
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Forbidden: you can only delete your own personal skills");
     }
+    // Skillset skills require set membership
+    if (meta.scope === "skillset") {
+      if (!skillSetRepo || !meta.skillSetId) throw new Error("Database not available");
+      const isMember = await skillSetRepo.isMember(meta.skillSetId, userId);
+      if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+    }
 
     // Clean up votes
     if (voteRepo) await voteRepo.deleteForSkill(skillId);
@@ -2244,6 +2437,9 @@ export function createRpcMethods(
     // Notify reload
     if (meta.scope === "team") {
       notifyAllSkillReload();
+    } else if (meta.scope === "skillset" && skillSetRepo && meta.skillSetId) {
+      const members = await skillSetRepo.listMembers(meta.skillSetId);
+      for (const m of members) notifySkillReload(m.userId);
     } else {
       notifySkillReload(meta.authorId ?? userId);
     }
@@ -3365,6 +3561,165 @@ export function createRpcMethods(
 
     notifySkillReload(userId);
     return { status: "withdrawn", wasNew: false };
+  });
+
+  // ─────────────────────────────────────────────────
+  // Skill Set Methods (collaboration spaces)
+  // ─────────────────────────────────────────────────
+
+  methods.set("skillSet.create", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const name = params.name as string;
+    const description = params.description as string | undefined;
+
+    if (!name?.trim()) throw new Error("Missing required param: name");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const id = await skillSetRepo.create({
+      name: name.trim(),
+      description: description?.trim(),
+      ownerId: userId,
+    });
+    return { id, name: name.trim() };
+  });
+
+  methods.set("skillSet.list", async (_params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!skillSetRepo) return { skillSets: [] };
+
+    const sets = await skillSetRepo.listForUser(userId);
+    return { skillSets: sets };
+  });
+
+  methods.set("skillSet.get", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const set = await skillSetRepo.getById(id);
+    if (!set) throw new Error("Skill set not found");
+
+    // Must be a member to view
+    const isMember = await skillSetRepo.isMember(id, userId);
+    if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+
+    const members = await skillSetRepo.listMembers(id);
+    const setSkills = skillRepo ? await skillRepo.listBySkillSetId(id) : [];
+
+    // Enrich members with usernames
+    const enrichedMembers = await Promise.all(members.map(async (m) => {
+      let username: string | undefined;
+      if (userRepo) {
+        const u = await userRepo.getById(m.userId);
+        username = u?.username;
+      }
+      return { ...m, username };
+    }));
+
+    return { ...set, members: enrichedMembers, skills: setSkills };
+  });
+
+  methods.set("skillSet.update", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isOwner = await skillSetRepo.isOwner(id, userId);
+    if (!isOwner) throw new Error("Forbidden: only the owner can update this skill set");
+
+    const updates: { name?: string; description?: string } = {};
+    if (params.name !== undefined) updates.name = (params.name as string).trim();
+    if (params.description !== undefined) updates.description = (params.description as string)?.trim();
+    await skillSetRepo.update(id, updates);
+    return { status: "updated" };
+  });
+
+  methods.set("skillSet.delete", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const id = params.id as string;
+    if (!id) throw new Error("Missing required param: id");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isOwner = await skillSetRepo.isOwner(id, userId);
+    if (!isOwner) throw new Error("Forbidden: only the owner can delete this skill set");
+
+    const hasSkills = await skillSetRepo.hasSkills(id);
+    if (hasSkills) throw new Error("Cannot delete a skill set that still contains skills. Remove all skills first.");
+
+    await skillSetRepo.deleteById(id);
+    return { status: "deleted" };
+  });
+
+  methods.set("skillSet.addMember", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const skillSetId = params.skillSetId as string;
+    const targetUsername = params.username as string;
+    const role = (params.role as string) || "member";
+
+    if (!skillSetId) throw new Error("Missing required param: skillSetId");
+    if (!targetUsername) throw new Error("Missing required param: username");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isOwner = await skillSetRepo.isOwner(skillSetId, userId);
+    if (!isOwner) throw new Error("Forbidden: only the owner can add members");
+
+    if (!userRepo) throw new Error("Database not available");
+    const targetUser = await userRepo.getByUsername(targetUsername);
+    if (!targetUser) throw new Error(`User "${targetUsername}" not found`);
+
+    await skillSetRepo.addMember(skillSetId, targetUser.id, role);
+
+    // Notify the added user's AgentBox to reload skills
+    notifySkillReload(targetUser.id);
+
+    return { status: "added", userId: targetUser.id, username: targetUsername };
+  });
+
+  methods.set("skillSet.removeMember", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const skillSetId = params.skillSetId as string;
+    const targetUserId = params.userId as string;
+
+    if (!skillSetId) throw new Error("Missing required param: skillSetId");
+    if (!targetUserId) throw new Error("Missing required param: userId");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isOwner = await skillSetRepo.isOwner(skillSetId, userId);
+    if (!isOwner) throw new Error("Forbidden: only the owner can remove members");
+
+    // Cannot remove the owner
+    const targetIsOwner = await skillSetRepo.isOwner(skillSetId, targetUserId);
+    if (targetIsOwner) throw new Error("Cannot remove the owner from the skill set");
+
+    await skillSetRepo.removeMember(skillSetId, targetUserId);
+
+    // Notify the removed user's AgentBox to reload skills
+    notifySkillReload(targetUserId);
+
+    return { status: "removed" };
+  });
+
+  methods.set("skillSet.listMembers", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const skillSetId = params.skillSetId as string;
+    if (!skillSetId) throw new Error("Missing required param: skillSetId");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isMember = await skillSetRepo.isMember(skillSetId, userId);
+    if (!isMember) throw new Error("Forbidden: you are not a member of this skill set");
+
+    const members = await skillSetRepo.listMembers(skillSetId);
+    const enriched = await Promise.all(members.map(async (m) => {
+      let username: string | undefined;
+      if (userRepo) {
+        const u = await userRepo.getById(m.userId);
+        username = u?.username;
+      }
+      return { ...m, username };
+    }));
+    return { members: enriched };
   });
 
   // ─────────────────────────────────────────────────
@@ -4545,7 +4900,7 @@ export function createRpcMethods(
     const disabled = new Set(await skillRepo.listDisabledSkills(userId));
     // Map "test" → "dev" for skill bundle purposes (test = dev-like skill access)
     const bundleEnv: "prod" | "dev" = env === "test" ? "dev" : env;
-    return buildSkillBundle(userId, bundleEnv, skillWriter, skillRepo, skillContentRepo, disabled);
+    return buildSkillBundle(userId, bundleEnv, skillWriter, skillRepo, skillContentRepo, disabled, skillSetRepo ?? undefined);
   }
 
   /** Detach WebSocket from SSE streams — SSE continues so DB persistence and

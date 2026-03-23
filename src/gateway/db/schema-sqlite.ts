@@ -73,6 +73,27 @@ export const messages = sqliteTable("messages", {
   durationMs: integer("duration_ms"),
 });
 
+// ─── Skill Sets (collaboration spaces) ──────────────
+
+export const skillSets = sqliteTable("skill_sets", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  ownerId: text("owner_id").notNull().references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
+export const skillSetMembers = sqliteTable("skill_set_members", {
+  id: text("id").primaryKey(),
+  skillSetId: text("skill_set_id").notNull().references(() => skillSets.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  role: text("role").notNull().default("member"), // "owner" | "member"
+  joinedAt: integer("joined_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+}, (table) => ({
+  ukSetUser: uniqueIndex("uk_skill_set_member").on(table.skillSetId, table.userId),
+}));
+
 // ─── Skills ──────────────────────────────────────────
 
 export const skills = sqliteTable("skills", {
@@ -81,7 +102,7 @@ export const skills = sqliteTable("skills", {
   description: text("description"),
   type: text("type"),
   version: integer("version").notNull().default(1),
-  scope: text("scope").notNull().default("personal"), // "builtin" | "team" | "personal"
+  scope: text("scope").notNull().default("personal"), // "global" | "skillset" | "personal"
   authorId: text("author_id").references(() => users.id, { onDelete: "set null" }),
   status: text("status").default("installed"),
   contributionStatus: text("contribution_status").default("none"), // "none" | "pending" | "approved"
@@ -95,6 +116,7 @@ export const skills = sqliteTable("skills", {
   teamPinnedVersion: integer("team_pinned_version"),
   forkedFromId: text("forked_from_id"),
   labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
+  skillSetId: text("skill_set_id").references(() => skillSets.id, { onDelete: "set null" }),
 });
 
 // ─── Skill Contents ─────────────────────────────────

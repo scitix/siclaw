@@ -39,7 +39,7 @@ export type Skill = {
     specs?: string;
     scripts?: Script[];
     labels?: string[];
-    scope: 'builtin' | 'team' | 'personal';
+    scope: 'builtin' | 'team' | 'personal' | 'global' | 'skillset';
     author?: string;
     authorId?: string;
     contributionStatus?: 'none' | 'pending' | 'approved';
@@ -54,6 +54,8 @@ export type Skill = {
     teamSourceSkillId?: string | null;
     teamPinnedVersion?: number | null;
     stagingVersion?: number;
+    skillSetId?: string | null;
+    skillSetName?: string;
     forkedFromId?: string | null;
 };
 
@@ -241,16 +243,75 @@ export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, label
     return sendRpc('skill.updateLabels', { id, labels });
 }
 
-/** Fork a builtin/team skill to personal scope (server-side content copy) */
+/** Fork a builtin/team skill to personal or skill set scope (server-side content copy) */
 export async function rpcForkSkill(
     sendRpc: RpcSendFn,
     sourceId: string,
-    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }> },
-): Promise<{ id: string; dirName: string; name: string; forkedFromId: string }> {
+    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSetId?: string },
+): Promise<{ id: string; dirName: string; name: string; forkedFromId: string; skillSetId?: string }> {
     return sendRpc('skill.fork', { sourceId, ...overrides });
 }
 
 /** @deprecated Use rpcForkSkill instead */
 export async function rpcCopySkillToPersonal(sendRpc: RpcSendFn, id: string): Promise<{ id: string }> {
     return rpcForkSkill(sendRpc, String(id));
+}
+
+// ─── Skill Set RPC ───
+
+export interface SkillSet {
+    id: string;
+    name: string;
+    description?: string;
+    ownerId: string;
+    memberRole?: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+export interface SkillSetMember {
+    id: string;
+    skillSetId: string;
+    userId: string;
+    role: string;
+    username?: string;
+    joinedAt: string;
+}
+
+export async function rpcListSkillSets(sendRpc: RpcSendFn): Promise<SkillSet[]> {
+    const result = await sendRpc<{ skillSets: SkillSet[] }>('skillSet.list');
+    return result.skillSets ?? [];
+}
+
+export async function rpcCreateSkillSet(sendRpc: RpcSendFn, name: string, description?: string): Promise<{ id: string; name: string }> {
+    return sendRpc('skillSet.create', { name, description });
+}
+
+export async function rpcGetSkillSet(sendRpc: RpcSendFn, id: string): Promise<SkillSet & { members: SkillSetMember[]; skills: Skill[] }> {
+    return sendRpc('skillSet.get', { id });
+}
+
+export async function rpcUpdateSkillSet(sendRpc: RpcSendFn, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
+    return sendRpc('skillSet.update', { id, ...updates });
+}
+
+export async function rpcDeleteSkillSet(sendRpc: RpcSendFn, id: string): Promise<{ status: string }> {
+    return sendRpc('skillSet.delete', { id });
+}
+
+export async function rpcAddSkillSetMember(sendRpc: RpcSendFn, skillSetId: string, username: string): Promise<{ status: string; userId: string; username: string }> {
+    return sendRpc('skillSet.addMember', { skillSetId, username });
+}
+
+export async function rpcRemoveSkillSetMember(sendRpc: RpcSendFn, skillSetId: string, userId: string): Promise<{ status: string }> {
+    return sendRpc('skillSet.removeMember', { skillSetId, userId });
+}
+
+export async function rpcListSkillSetMembers(sendRpc: RpcSendFn, skillSetId: string): Promise<{ members: SkillSetMember[] }> {
+    return sendRpc('skillSet.listMembers', { skillSetId });
+}
+
+/** Move a personal skill into a skill set */
+export async function rpcMoveSkillToSet(sendRpc: RpcSendFn, skillId: string, targetSkillSetId: string): Promise<{ status: string }> {
+    return sendRpc('skill.moveToSet', { skillId, targetSkillSetId });
 }

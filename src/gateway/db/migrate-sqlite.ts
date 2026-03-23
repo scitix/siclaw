@@ -56,6 +56,24 @@ const DDL_STATEMENTS = [
     duration_ms INTEGER
   )`,
 
+  `CREATE TABLE IF NOT EXISTS skill_sets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_set_members (
+    id TEXT PRIMARY KEY,
+    skill_set_id TEXT NOT NULL REFERENCES skill_sets(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    UNIQUE (skill_set_id, user_id)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS skills (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -64,7 +82,7 @@ const DDL_STATEMENTS = [
     version INTEGER NOT NULL DEFAULT 1,
     published_version INTEGER,
     staging_version INTEGER NOT NULL DEFAULT 0,
-    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal')),
+    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
     author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
     status TEXT DEFAULT 'installed',
     contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
@@ -76,7 +94,8 @@ const DDL_STATEMENTS = [
     team_source_skill_id TEXT,
     team_pinned_version INTEGER,
     forked_from_id TEXT,
-    labels_json TEXT
+    labels_json TEXT,
+    skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL
   )`,
 
   `CREATE TABLE IF NOT EXISTS channels (
@@ -406,6 +425,9 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_user ON feedback_reports(user_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_session ON feedback_reports(session_id)`,
   `CREATE INDEX IF NOT EXISTS idx_knowledge_docs_name ON knowledge_docs(name)`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_set_members_user ON skill_set_members(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_set_members_set ON skill_set_members(skill_set_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skills_skill_set ON skills(skill_set_id)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
@@ -438,6 +460,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE knowledge_docs DROP COLUMN description`,
     // Per-cluster debug image
     `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
+    // Skill sets: add skill_set_id to skills
+    `ALTER TABLE skills ADD COLUMN skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
@@ -462,6 +486,60 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     } catch (_err: any) {
       // Backfill may fail on empty tables — safe to ignore
     }
+  }
+
+  // Widen skills.scope CHECK constraint to include 'global' and 'skillset'.
+  // SQLite cannot ALTER CHECK — must rebuild the table.
+  try {
+    // Only run if the old constraint still blocks new values
+    const needsRebuild = (() => {
+      try {
+        sdb.run(sql.raw(`INSERT INTO skills (id, name, dir_name, scope) VALUES ('__probe__', '__probe__', '__probe__', 'skillset')`));
+        sdb.run(sql.raw(`DELETE FROM skills WHERE id = '__probe__'`));
+        return false; // constraint already allows 'skillset'
+      } catch {
+        return true;
+      }
+    })();
+
+    if (needsRebuild) {
+      console.log("[db] Rebuilding skills table to widen scope CHECK constraint...");
+      sdb.run(sql.raw(`ALTER TABLE skills RENAME TO _skills_old`));
+      // Re-create with widened CHECK (matches DDL_STATEMENTS)
+      sdb.run(sql.raw(`CREATE TABLE skills (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        type TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        published_version INTEGER,
+        staging_version INTEGER NOT NULL DEFAULT 0,
+        scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
+        author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        status TEXT DEFAULT 'installed',
+        contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
+        review_status TEXT NOT NULL DEFAULT 'draft' CHECK(review_status IN ('draft', 'approved', 'pending')),
+        dir_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+        s3_key TEXT,
+        team_source_skill_id TEXT,
+        team_pinned_version INTEGER,
+        forked_from_id TEXT,
+        labels_json TEXT,
+        skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL
+      )`));
+      sdb.run(sql.raw(`INSERT INTO skills SELECT
+        id, name, description, type, version, published_version, staging_version,
+        scope, author_id, status, contribution_status, review_status, dir_name,
+        created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
+        forked_from_id, labels_json, skill_set_id
+      FROM _skills_old`));
+      sdb.run(sql.raw(`DROP TABLE _skills_old`));
+      console.log("[db] Skills table rebuilt successfully");
+    }
+  } catch (err: any) {
+    console.warn("[db] Skills table rebuild failed (non-fatal):", err.message);
   }
 
   for (const ddl of INDEX_STATEMENTS) {

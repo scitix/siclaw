@@ -59,7 +59,7 @@ export type DiagnosticEvent =
       type: "skill_call";
       skillName: string;
       scriptName: string;
-      scope: "builtin" | "team" | "personal";
+      scope: "builtin" | "team" | "personal" | "global" | "skillset";
       outcome: "success" | "error";
       durationMs: number;
       sessionId?: string;
