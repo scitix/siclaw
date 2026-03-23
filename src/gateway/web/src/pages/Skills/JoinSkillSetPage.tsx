@@ -12,8 +12,8 @@ export function JoinSkillSetPage() {
     useEffect(() => {
         if (!token || !isConnected) return;
 
-        rpcJoinByToken(sendRpc, token).then(result => {
-            navigate(`/skills/sets/${result.setId}`, { replace: true });
+        rpcJoinByToken(sendRpc, token).then(() => {
+            navigate('/skills?tab=myskills', { replace: true });
         }).catch((err: any) => {
             setError(err.message || 'Invalid or expired invite link');
         });
