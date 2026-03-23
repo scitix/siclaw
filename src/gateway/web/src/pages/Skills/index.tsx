@@ -7,6 +7,7 @@ import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSpaces
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
+import { DiffViewerModal } from '../../components/DiffViewerModal';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { useSkills } from '../../hooks/useSkills';
 import { usePermissions } from '../../hooks/usePermissions';
@@ -393,7 +394,7 @@ export function SkillsPage() {
                 confirmText={dialogState.confirmText}
             />
 
-            {skillCapabilities?.skillSpaceDevMode && currentWorkspace?.envType === 'test' && (
+            {skillCapabilities?.skillSpaceDevMode && (
                 <div className="px-6 py-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-200">
                     Skill Space Dev Mode is enabled locally. UI and review flow are available, but local runtime precedence is still disabled.
                 </div>
@@ -1082,7 +1083,7 @@ function ScriptReviewApprovalCard({
     const [expandedScripts, setExpandedScripts] = useState<Set<string>>(new Set());
     const [diffText, setDiffText] = useState<string | null>(null);
     const [diffLoading, setDiffLoading] = useState(false);
-    const [showDiff, setShowDiff] = useState(false);
+    const [diffModalOpen, setDiffModalOpen] = useState(false);
     const [confirmDialog, setConfirmDialog] = useState<{
         isOpen: boolean;
         title: string;
@@ -1128,11 +1129,11 @@ function ScriptReviewApprovalCard({
 
     const handleLoadDiff = async () => {
         if (diffText !== null) {
-            setShowDiff(!showDiff);
+            setDiffModalOpen(true);
             return;
         }
         setDiffLoading(true);
-        setShowDiff(true);
+        setDiffModalOpen(true);
         try {
             const diffResult = await rpcGetSkillDiff(
                 sendRpc, String(skill.id), isContributionReview,
@@ -1263,6 +1264,14 @@ function ScriptReviewApprovalCard({
                 description={errorDialog.message}
                 variant="danger"
                 confirmText="OK"
+            />
+            <DiffViewerModal
+                isOpen={diffModalOpen}
+                onClose={() => setDiffModalOpen(false)}
+                title={`${skill.name} Diff`}
+                subtitle={skill.scope === 'skillset' ? 'Global published -> Skill Space staging' : (isContributionReview ? 'Global published -> Contribution snapshot' : 'Published -> Staging')}
+                diffText={diffText}
+                isLoading={diffLoading}
             />
             {/* Header row */}
             <div
@@ -1406,38 +1415,20 @@ function ScriptReviewApprovalCard({
 
                             {/* Diff section */}
                             {(isScriptReview || isContributionReview) && (
-                                <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+                                <div className="bg-white rounded-lg border border-gray-200 p-4 flex items-center justify-between gap-4">
+                                    <div>
+                                        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Changes</h4>
+                                        <p className="text-sm text-gray-500">
+                                            Review this diff in a dedicated viewer with file grouping and split/unified modes.
+                                        </p>
+                                    </div>
                                     <button
                                         onClick={handleLoadDiff}
-                                        className="w-full flex items-center gap-2 px-4 py-3 text-sm text-left hover:bg-gray-50 transition-colors"
+                                        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
                                     >
-                                        <GitCommitHorizontal className="w-4 h-4 text-indigo-500" />
-                                        <span className="font-bold text-xs text-gray-400 uppercase tracking-wider flex-1">Changes (Diff)</span>
-                                        {diffLoading
-                                            ? <Loader2 className="w-3.5 h-3.5 animate-spin text-gray-400" />
-                                            : showDiff
-                                                ? <ChevronUp className="w-3.5 h-3.5 text-gray-400" />
-                                                : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
+                                        {diffLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitCommitHorizontal className="w-4 h-4" />}
+                                        Open Diff Viewer
                                     </button>
-                                    {showDiff && diffText !== null && (
-                                        <div className="border-t border-gray-100">
-                                            <pre className="p-3 bg-[#1e1e1e] text-xs font-mono overflow-x-auto max-h-80 overflow-y-auto">
-                                                {diffText.split('\n').map((line, i) => (
-                                                    <div
-                                                        key={i}
-                                                        className={cn(
-                                                            line.startsWith('+') && !line.startsWith('+++') ? 'text-green-400 bg-green-950/30' :
-                                                            line.startsWith('-') && !line.startsWith('---') ? 'text-red-400 bg-red-950/30' :
-                                                            line.startsWith('@@') ? 'text-cyan-400' :
-                                                            'text-[#d4d4d4]'
-                                                        )}
-                                                    >
-                                                        {line}
-                                                    </div>
-                                                ))}
-                                            </pre>
-                                        </div>
-                                    )}
                                 </div>
                             )}
 
