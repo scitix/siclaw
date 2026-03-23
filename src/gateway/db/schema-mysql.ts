@@ -83,6 +83,7 @@ export const skillSets = mysqlTable("skill_sets", {
   name: varchar("name", { length: 255 }).notNull().unique(),
   description: text("description"),
   ownerId: varchar("owner_id", { length: 32 }).notNull().references(() => users.id),
+  inviteToken: varchar("invite_token", { length: 64 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });

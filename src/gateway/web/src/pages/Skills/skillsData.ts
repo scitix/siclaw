@@ -56,6 +56,7 @@ export type Skill = {
     stagingVersion?: number;
     skillSetId?: string | null;
     skillSetName?: string;
+    isSetMember?: boolean;
     forkedFromId?: string | null;
 };
 
@@ -314,4 +315,14 @@ export async function rpcListSkillSetMembers(sendRpc: RpcSendFn, skillSetId: str
 /** Move a personal skill into a skill set */
 export async function rpcMoveSkillToSet(sendRpc: RpcSendFn, skillId: string, targetSkillSetId: string): Promise<{ status: string }> {
     return sendRpc('skill.moveToSet', { skillId, targetSkillSetId });
+}
+
+/** Toggle share link for a skill set (owner only) */
+export async function rpcToggleShareLink(sendRpc: RpcSendFn, skillSetId: string, enabled: boolean): Promise<{ token: string | null }> {
+    return sendRpc('skillSet.toggleShareLink', { skillSetId, enabled });
+}
+
+/** Join a skill set via invite token */
+export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string): Promise<{ setId: string; joined?: boolean; alreadyMember?: boolean }> {
+    return sendRpc('skillSet.joinByToken', { token });
 }

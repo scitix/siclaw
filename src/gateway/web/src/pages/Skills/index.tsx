@@ -1,9 +1,10 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork, ArrowRight } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import type { Skill, SkillReview, SkillSet } from './skillsData';
-import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSets, rpcCreateSkillSet, rpcDeleteSkillSet, rpcAddSkillSetMember, rpcRemoveSkillSetMember, rpcListSkillSetMembers, rpcForkSkill, rpcMoveSkillToSet, rpcGetSkills, type SkillSetMember } from './skillsData';
+import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSets, rpcCreateSkillSet, type SkillSetMember } from './skillsData';
+import { AddSkillDialog } from './AddSkillDialog';
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
@@ -34,7 +35,6 @@ export function SkillsPage() {
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
     const [skillSets, setSkillSets] = useState<SkillSet[]>([]);
-    const [collapsedSets, setCollapsedSets] = useState<Set<string>>(new Set());
     const [skillSetDialog, setSkillSetDialog] = useState<{
         isOpen: boolean;
         mode: 'create' | 'manage';
@@ -48,13 +48,7 @@ export function SkillsPage() {
         isOpen: boolean;
         skillSetId: string;
         skillSetName: string;
-        tab: 'global' | 'personal' | 'new';
-        globalSkills: Skill[];
-        loading: boolean;
-        newSkillName: string;
-        search: string;
-        selectedLabels: Set<string>;
-    }>({ isOpen: false, skillSetId: '', skillSetName: '', tab: 'global', globalSkills: [], loading: false, newSkillName: '', search: '', selectedLabels: new Set() });
+    }>({ isOpen: false, skillSetId: '', skillSetName: '' });
     const labelDropdownRef = useRef<HTMLDivElement>(null);
     const searchTimerRef = useRef<ReturnType<typeof setTimeout>>();
     const contentRef = useRef<HTMLDivElement>(null);
@@ -250,15 +244,6 @@ export function SkillsPage() {
         return [...groups.values()];
     }, [displaySkills, skillSets]);
 
-    const toggleSetCollapsed = (setId: string) => {
-        setCollapsedSets(prev => {
-            const next = new Set(prev);
-            if (next.has(setId)) next.delete(setId);
-            else next.add(setId);
-            return next;
-        });
-    };
-
     const handleCreateSkillSet = async () => {
         const name = skillSetDialog.newName?.trim();
         if (!name) return;
@@ -273,118 +258,16 @@ export function SkillsPage() {
         }
     };
 
-    const handleDeleteSkillSet = async (id: string) => {
-        try {
-            await rpcDeleteSkillSet(sendRpc, id);
-            const sets = await rpcListSkillSets(sendRpc);
-            setSkillSets(sets);
-            loadSkills(activeTab, searchInput);
-            setSkillSetDialog({ isOpen: false, mode: 'create' });
-        } catch (err: any) {
-            showError(err.message || 'Failed to delete skill set');
-        }
+
+
+    const openAddSkillDialog = (skillSet: SkillSet) => {
+        setAddSkillDialog({ isOpen: true, skillSetId: skillSet.id, skillSetName: skillSet.name });
     };
 
-    const handleAddMember = async () => {
-        if (!skillSetDialog.skillSet || !skillSetDialog.newMemberUsername?.trim()) return;
-        try {
-            await rpcAddSkillSetMember(sendRpc, skillSetDialog.skillSet.id, skillSetDialog.newMemberUsername.trim());
-            const { members } = await rpcListSkillSetMembers(sendRpc, skillSetDialog.skillSet.id);
-            setSkillSetDialog(prev => ({ ...prev, members, newMemberUsername: '' }));
-        } catch (err: any) {
-            showError(err.message || 'Failed to add member');
-        }
-    };
-
-    const handleRemoveMember = async (userId: string) => {
-        if (!skillSetDialog.skillSet) return;
-        try {
-            await rpcRemoveSkillSetMember(sendRpc, skillSetDialog.skillSet.id, userId);
-            const { members } = await rpcListSkillSetMembers(sendRpc, skillSetDialog.skillSet.id);
-            setSkillSetDialog(prev => ({ ...prev, members }));
-        } catch (err: any) {
-            showError(err.message || 'Failed to remove member');
-        }
-    };
-
-    const openManageDialog = async (skillSet: SkillSet) => {
-        try {
-            const { members } = await rpcListSkillSetMembers(sendRpc, skillSet.id);
-            setSkillSetDialog({
-                isOpen: true,
-                mode: 'manage',
-                skillSet,
-                members,
-                newName: skillSet.name,
-                newDescription: skillSet.description || '',
-                newMemberUsername: '',
-            });
-        } catch (err: any) {
-            showError(err.message || 'Failed to load skill set');
-        }
-    };
-
-    const openAddSkillDialog = async (skillSet: SkillSet) => {
-        setAddSkillDialog({
-            isOpen: true,
-            skillSetId: skillSet.id,
-            skillSetName: skillSet.name,
-            tab: 'global',
-            globalSkills: [],
-            loading: true,
-            newSkillName: '',
-            search: '',
-            selectedLabels: new Set(),
-        });
-        // Load global skills (builtin + team)
-        try {
-            const result = await rpcGetSkills(sendRpc, { limit: 200 });
-            const globals = result.skills.filter(s => s.scope === 'builtin' || s.scope === 'team');
-            setAddSkillDialog(prev => ({ ...prev, globalSkills: globals, loading: false }));
-        } catch {
-            setAddSkillDialog(prev => ({ ...prev, loading: false }));
-        }
-    };
-
-    const handleForkToSet = async (sourceId: string) => {
-        try {
-            await rpcForkSkill(sendRpc, sourceId, { targetSkillSetId: addSkillDialog.skillSetId });
-            setAddSkillDialog(prev => ({ ...prev, isOpen: false }));
-            loadSkills(activeTab, searchInput);
-            const sets = await rpcListSkillSets(sendRpc);
-            setSkillSets(sets);
-        } catch (err: any) {
-            showError(err.message || 'Failed to fork skill');
-        }
-    };
-
-    const handleMoveToSet = async (skillId: string) => {
-        try {
-            await rpcMoveSkillToSet(sendRpc, String(skillId), addSkillDialog.skillSetId);
-            setAddSkillDialog(prev => ({ ...prev, isOpen: false }));
-            loadSkills(activeTab, searchInput);
-            const sets = await rpcListSkillSets(sendRpc);
-            setSkillSets(sets);
-        } catch (err: any) {
-            showError(err.message || 'Failed to move skill');
-        }
-    };
-
-    const handleCreateInSet = async () => {
-        const name = addSkillDialog.newSkillName.trim();
-        if (!name) return;
-        try {
-            await sendRpc('skill.create', {
-                name,
-                skillSetId: addSkillDialog.skillSetId,
-            });
-            setAddSkillDialog(prev => ({ ...prev, isOpen: false }));
-            loadSkills(activeTab, searchInput);
-            const sets = await rpcListSkillSets(sendRpc);
-            setSkillSets(sets);
-        } catch (err: any) {
-            showError(err.message || 'Failed to create skill');
-        }
+    const handleAddSkillSuccess = async () => {
+        loadSkills(activeTab, searchInput);
+        const sets = await rpcListSkillSets(sendRpc);
+        setSkillSets(sets);
     };
 
     const handleCreateNew = () => navigate('/skills/new');
@@ -737,14 +620,14 @@ export function SkillsPage() {
                     </div>
                 ) : (
                     <div className="max-w-6xl mx-auto">
-                        {displaySkills.length === 0 && !isLoading && activeTab !== 'myskills' ? (
+                        {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading && activeTab !== 'myskills' ? (
                             <div className="flex flex-col items-center justify-center py-20 text-gray-400 text-sm">
                                 <Users className="w-8 h-8 mb-3 opacity-20" />
                                 No skills found.
                             </div>
                         ) : (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {displaySkills.map((skill) => (
+                        {(activeTab === 'myskills' ? displaySkills.filter(s => s.scope === 'personal') : displaySkills).map((skill) => (
                             <div
                                 key={skill.id}
                                 className={cn(
@@ -1012,17 +895,16 @@ export function SkillsPage() {
                         )}
                     </div>
                 )}
-                {/* Skill Set Groups — only on My Skills tab */}
+                {/* Skill Set Groups — card-based sections on My Skills tab */}
                 {activeTab === 'myskills' && !isLoading && skillSetGroups.length > 0 && (
                     <div className="px-6 pb-4 space-y-4">
                         {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
                             <div key={skillSet.id} className="border rounded-xl overflow-hidden">
-                                <div className="flex items-center justify-between px-4 py-3 bg-gray-50 border-b">
+                                <div className="flex items-center justify-between px-4 py-3 bg-gray-50/80 border-b">
                                     <button
-                                        onClick={() => toggleSetCollapsed(skillSet.id)}
+                                        onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
                                         className="flex items-center gap-2 text-sm font-medium text-gray-700 hover:text-gray-900"
                                     >
-                                        {collapsedSets.has(skillSet.id) ? <ChevronDown className="w-4 h-4" /> : <ChevronUp className="w-4 h-4" />}
                                         <Users className="w-4 h-4 text-green-600" />
                                         {skillSet.name}
                                         <span className="text-xs text-gray-400 font-normal">({setSkills.length} skills)</span>
@@ -1036,40 +918,36 @@ export function SkillsPage() {
                                                 <Plus className="w-4 h-4" />
                                             </button>
                                         </Tooltip>
-                                        <Tooltip content="Manage Skill Set">
+                                        <Tooltip content="Open Skill Set">
                                             <button
-                                                onClick={() => openManageDialog(skillSet)}
+                                                onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
                                                 className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
                                             >
-                                                <Settings className="w-4 h-4" />
+                                                <ArrowRight className="w-4 h-4" />
                                             </button>
                                         </Tooltip>
                                     </div>
                                 </div>
-                                {!collapsedSets.has(skillSet.id) && (
-                                    <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                        {setSkills.map(skill => (
-                                            <div
-                                                key={skill.id}
-                                                onClick={() => navigate(`/skills/${skill.id}`)}
-                                                className="group rounded-lg border p-4 hover:shadow-sm transition-all cursor-pointer flex items-center justify-between"
-                                            >
-                                                <div>
-                                                    <div className="font-medium text-sm text-gray-900">{skill.name}</div>
-                                                    <div className="text-xs text-gray-500 mt-1 line-clamp-1">{skill.description}</div>
-                                                </div>
-                                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-50 text-green-700 border border-green-200 whitespace-nowrap">
-                                                    skillset
-                                                </span>
+                                <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    {setSkills.map(skill => (
+                                        <div
+                                            key={skill.id}
+                                            onClick={() => navigate(`/skills/${skill.id}`)}
+                                            className="group rounded-lg border p-4 hover:shadow-sm transition-all cursor-pointer flex items-center justify-between"
+                                        >
+                                            <div className="min-w-0 flex-1">
+                                                <div className="font-medium text-sm text-gray-900 truncate">{skill.name}</div>
+                                                <div className="text-xs text-gray-500 mt-1 line-clamp-1">{skill.description}</div>
                                             </div>
-                                        ))}
-                                        {setSkills.length === 0 && (
-                                            <div className="col-span-full text-sm text-gray-400 text-center py-6">
-                                                No skills in this set yet. Fork a global skill to add one.
-                                            </div>
-                                        )}
-                                    </div>
-                                )}
+                                        </div>
+                                    ))}
+                                    {setSkills.length === 0 && (
+                                        <div className="col-span-full text-sm text-gray-400 text-center py-6">
+                                            No skills yet.{' '}
+                                            <button onClick={() => openAddSkillDialog(skillSet)} className="underline hover:text-gray-600">Add one</button>
+                                        </div>
+                                    )}
+                                </div>
                             </div>
                         ))}
                     </div>
@@ -1095,269 +973,52 @@ export function SkillsPage() {
                 )}
             </div>
 
-            {/* Add Skill to Set Dialog */}
-            {addSkillDialog.isOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setAddSkillDialog(prev => ({ ...prev, isOpen: false }))}>
-                    <div className="bg-white rounded-xl shadow-lg w-full max-w-lg mx-4 flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
-                        <div className="px-6 pt-5 pb-3">
-                            <h3 className="text-lg font-semibold">Add Skill to {addSkillDialog.skillSetName}</h3>
-                            <div className="flex gap-1 mt-3 border-b">
-                                {([
-                                    { id: 'global' as const, label: 'Fork from Global' },
-                                    { id: 'personal' as const, label: 'Move from My Skills' },
-                                    { id: 'new' as const, label: 'Create New' },
-                                ]).map(t => (
-                                    <button
-                                        key={t.id}
-                                        onClick={() => setAddSkillDialog(prev => ({ ...prev, tab: t.id }))}
-                                        className={cn(
-                                            "px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors",
-                                            addSkillDialog.tab === t.id
-                                                ? "border-green-600 text-green-700"
-                                                : "border-transparent text-gray-500 hover:text-gray-700"
-                                        )}
-                                    >
-                                        {t.label}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-
-                        <div className="px-6 pb-5 overflow-y-auto flex-1 min-h-0">
-                            {addSkillDialog.tab === 'global' && (() => {
-                                const q = addSkillDialog.search.toLowerCase();
-                                const selLabels = addSkillDialog.selectedLabels;
-                                const filtered = addSkillDialog.globalSkills.filter(s => {
-                                    if (q && !s.name.toLowerCase().includes(q) && !s.description?.toLowerCase().includes(q)) return false;
-                                    if (selLabels.size > 0 && ![...selLabels].every(l => (s.labels ?? []).includes(l))) return false;
-                                    return true;
-                                });
-                                // Collect labels from global skills for chips
-                                const labelCounts = new Map<string, number>();
-                                for (const s of addSkillDialog.globalSkills) {
-                                    for (const l of s.labels ?? []) labelCounts.set(l, (labelCounts.get(l) ?? 0) + 1);
-                                }
-                                const toggleDialogLabel = (l: string) => {
-                                    setAddSkillDialog(prev => {
-                                        const next = new Set(prev.selectedLabels);
-                                        if (next.has(l)) next.delete(l); else next.add(l);
-                                        return { ...prev, selectedLabels: next };
-                                    });
-                                };
-                                return (
-                                <div className="mt-2">
-                                    {/* Search + label filter */}
-                                    <div className="flex items-center gap-2 mb-2">
-                                        <div className="relative flex-1">
-                                            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-gray-400" />
-                                            <input
-                                                type="text"
-                                                placeholder="Search skills..."
-                                                value={addSkillDialog.search}
-                                                onChange={e => setAddSkillDialog(prev => ({ ...prev, search: e.target.value }))}
-                                                className="w-full pl-8 pr-3 py-1.5 border rounded-lg text-sm focus:outline-none focus:ring-1 focus:ring-green-300"
-                                            />
-                                        </div>
-                                    </div>
-                                    {labelCounts.size > 0 && (
-                                        <div className="flex flex-wrap gap-1 mb-2">
-                                            {[...labelCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).map(([l, c]) => (
-                                                <button
-                                                    key={l}
-                                                    onClick={() => toggleDialogLabel(l)}
-                                                    className={cn(
-                                                        "px-2 py-0.5 rounded-full text-xs border transition-colors",
-                                                        selLabels.has(l)
-                                                            ? "bg-green-100 text-green-800 border-green-300"
-                                                            : "bg-gray-50 text-gray-600 border-gray-200 hover:bg-gray-100"
-                                                    )}
-                                                >
-                                                    {l} <span className="text-gray-400 ml-0.5">{c}</span>
-                                                </button>
-                                            ))}
-                                        </div>
-                                    )}
-                                    {/* Skill list */}
-                                    <div className="space-y-1">
-                                    {addSkillDialog.loading ? (
-                                        <div className="flex items-center justify-center py-8"><Loader2 className="w-5 h-5 animate-spin text-gray-400" /></div>
-                                    ) : filtered.length === 0 ? (
-                                        <div className="text-sm text-gray-400 text-center py-8">No matching skills.</div>
-                                    ) : (
-                                        filtered.map(s => (
-                                            <button
-                                                key={s.id}
-                                                onClick={() => handleForkToSet(String(s.id))}
-                                                className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-green-50 transition-colors flex items-center justify-between group"
-                                            >
-                                                <div className="min-w-0 flex-1">
-                                                    <div className="text-sm font-medium text-gray-900">{s.name}</div>
-                                                    <div className="text-xs text-gray-500 line-clamp-1">{s.description}</div>
-                                                    {(s.labels ?? []).length > 0 && (
-                                                        <div className="flex gap-1 mt-1 flex-wrap">
-                                                            {s.labels!.map(l => (
-                                                                <span key={l} className={cn("px-1.5 py-0 rounded text-[10px] border", labelColors[l] || "bg-gray-50 text-gray-600 border-gray-200")}>{l}</span>
-                                                            ))}
-                                                        </div>
-                                                    )}
-                                                </div>
-                                                <GitFork className="w-4 h-4 text-gray-300 group-hover:text-green-600 shrink-0 ml-2" />
-                                            </button>
-                                        ))
-                                    )}
-                                    </div>
-                                </div>
-                                );
-                            })()}
-
-                            {addSkillDialog.tab === 'personal' && (
-                                <div className="space-y-1 mt-2">
-                                    {skills.filter(s => s.scope === 'personal').length === 0 ? (
-                                        <div className="text-sm text-gray-400 text-center py-8">No personal skills to move.</div>
-                                    ) : (
-                                        skills.filter(s => s.scope === 'personal').map(s => (
-                                            <button
-                                                key={s.id}
-                                                onClick={() => handleMoveToSet(String(s.id))}
-                                                className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-green-50 transition-colors flex items-center justify-between group"
-                                            >
-                                                <div>
-                                                    <div className="text-sm font-medium text-gray-900">{s.name}</div>
-                                                    <div className="text-xs text-gray-500 line-clamp-1">{s.description}</div>
-                                                </div>
-                                                <span className="text-xs text-gray-400 group-hover:text-green-600 shrink-0 ml-2">Move →</span>
-                                            </button>
-                                        ))
-                                    )}
-                                </div>
-                            )}
-
-                            {addSkillDialog.tab === 'new' && (
-                                <div className="mt-3 space-y-3">
-                                    <input
-                                        type="text"
-                                        placeholder="New skill name"
-                                        value={addSkillDialog.newSkillName}
-                                        onChange={e => setAddSkillDialog(prev => ({ ...prev, newSkillName: e.target.value }))}
-                                        className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
-                                        autoFocus
-                                        onKeyDown={e => e.key === 'Enter' && handleCreateInSet()}
-                                    />
-                                    <button
-                                        onClick={handleCreateInSet}
-                                        disabled={!addSkillDialog.newSkillName.trim()}
-                                        className="w-full px-4 py-2 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg disabled:opacity-50"
-                                    >
-                                        Create in {addSkillDialog.skillSetName}
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </div>
-            )}
+            {/* Add Skill to Set Dialog (shared component) */}
+            <AddSkillDialog
+                isOpen={addSkillDialog.isOpen}
+                skillSetId={addSkillDialog.skillSetId}
+                skillSetName={addSkillDialog.skillSetName}
+                sendRpc={sendRpc}
+                onClose={() => setAddSkillDialog(prev => ({ ...prev, isOpen: false }))}
+                onSuccess={handleAddSkillSuccess}
+            />
 
             {/* Skill Set Dialog */}
             {skillSetDialog.isOpen && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}>
                     <div className="bg-white rounded-xl shadow-lg w-full max-w-md mx-4 p-6" onClick={e => e.stopPropagation()}>
-                        {skillSetDialog.mode === 'create' ? (
-                            <>
-                                <h3 className="text-lg font-semibold mb-4">Create Skill Set</h3>
-                                <div className="space-y-3">
-                                    <input
-                                        type="text"
-                                        placeholder="Skill set name"
-                                        value={skillSetDialog.newName || ''}
-                                        onChange={e => setSkillSetDialog(p => ({ ...p, newName: e.target.value }))}
-                                        className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
-                                        autoFocus
-                                    />
-                                    <textarea
-                                        placeholder="Description (optional)"
-                                        value={skillSetDialog.newDescription || ''}
-                                        onChange={e => setSkillSetDialog(p => ({ ...p, newDescription: e.target.value }))}
-                                        className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300 h-20 resize-none"
-                                    />
-                                </div>
-                                <div className="flex justify-end gap-2 mt-4">
-                                    <button
-                                        onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}
-                                        className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border rounded-lg hover:bg-gray-50"
-                                    >
-                                        Cancel
-                                    </button>
-                                    <button
-                                        onClick={handleCreateSkillSet}
-                                        disabled={!skillSetDialog.newName?.trim()}
-                                        className="px-4 py-2 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg disabled:opacity-50"
-                                    >
-                                        Create
-                                    </button>
-                                </div>
-                            </>
-                        ) : (
-                            <>
-                                <h3 className="text-lg font-semibold mb-4">Manage: {skillSetDialog.skillSet?.name}</h3>
-
-                                {/* Members */}
-                                <div className="mb-4">
-                                    <div className="text-sm font-medium text-gray-700 mb-2">Members</div>
-                                    <div className="space-y-1 max-h-40 overflow-y-auto">
-                                        {skillSetDialog.members?.map(m => (
-                                            <div key={m.userId} className="flex items-center justify-between px-3 py-1.5 bg-gray-50 rounded-lg text-sm">
-                                                <span>{m.username || m.userId} {m.role === 'owner' && <span className="text-xs text-gray-400">(owner)</span>}</span>
-                                                {m.role !== 'owner' && skillSetDialog.skillSet?.ownerId === currentUser?.id && (
-                                                    <button onClick={() => handleRemoveMember(m.userId)} className="text-red-500 hover:text-red-700 text-xs">
-                                                        Remove
-                                                    </button>
-                                                )}
-                                            </div>
-                                        ))}
-                                    </div>
-                                    {skillSetDialog.skillSet?.ownerId === currentUser?.id && (
-                                        <div className="flex gap-2 mt-2">
-                                            <input
-                                                type="text"
-                                                placeholder="Username"
-                                                value={skillSetDialog.newMemberUsername || ''}
-                                                onChange={e => setSkillSetDialog(p => ({ ...p, newMemberUsername: e.target.value }))}
-                                                className="flex-1 px-3 py-1.5 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
-                                                onKeyDown={e => e.key === 'Enter' && handleAddMember()}
-                                            />
-                                            <button
-                                                onClick={handleAddMember}
-                                                disabled={!skillSetDialog.newMemberUsername?.trim()}
-                                                className="px-3 py-1.5 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg disabled:opacity-50"
-                                            >
-                                                Add
-                                            </button>
-                                        </div>
-                                    )}
-                                </div>
-
-                                <div className="flex justify-between mt-4">
-                                    {skillSetDialog.skillSet?.ownerId === currentUser?.id && (
-                                        <button
-                                            onClick={() => {
-                                                if (confirm('Are you sure you want to delete this skill set?')) {
-                                                    handleDeleteSkillSet(skillSetDialog.skillSet!.id);
-                                                }
-                                            }}
-                                            className="px-3 py-2 text-sm font-medium text-red-600 hover:bg-red-50 border border-red-200 rounded-lg"
-                                        >
-                                            Delete Skill Set
-                                        </button>
-                                    )}
-                                    <button
-                                        onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}
-                                        className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border rounded-lg hover:bg-gray-50 ml-auto"
-                                    >
-                                        Close
-                                    </button>
-                                </div>
-                            </>
-                        )}
+                        <h3 className="text-lg font-semibold mb-4">Create Skill Set</h3>
+                        <div className="space-y-3">
+                            <input
+                                type="text"
+                                placeholder="Skill set name"
+                                value={skillSetDialog.newName || ''}
+                                onChange={e => setSkillSetDialog(p => ({ ...p, newName: e.target.value }))}
+                                className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
+                                autoFocus
+                            />
+                            <textarea
+                                placeholder="Description (optional)"
+                                value={skillSetDialog.newDescription || ''}
+                                onChange={e => setSkillSetDialog(p => ({ ...p, newDescription: e.target.value }))}
+                                className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300 h-20 resize-none"
+                            />
+                        </div>
+                        <div className="flex justify-end gap-2 mt-4">
+                            <button
+                                onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}
+                                className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border rounded-lg hover:bg-gray-50"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={handleCreateSkillSet}
+                                disabled={!skillSetDialog.newName?.trim()}
+                                className="px-4 py-2 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg disabled:opacity-50"
+                            >
+                                Create
+                            </button>
+                        </div>
                     </div>
                 </div>
             )}
