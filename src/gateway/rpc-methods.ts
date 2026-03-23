@@ -222,6 +222,7 @@ export function createRpcMethods(
 
   // Role labels — internal admin-only labels hidden from normal users
   const ROLE_LABELS = new Set(["sre", "developer"]);
+  const skillSpaceDevMode = process.env.SICLAW_ENABLE_SKILL_SPACE_DEV === "1";
 
   async function resolveWorkspaceForUser(
     userId: string,
@@ -243,7 +244,9 @@ export function createRpcMethods(
   ): Promise<Awaited<ReturnType<WorkspaceRepository["getById"]>>> {
     const userId = requireAuth(context);
     if (!isK8sMode) {
-      throw new Error("Skill Space is available only in K8s deployments");
+      if (!skillSpaceDevMode) {
+        throw new Error("Skill Space is available only in K8s deployments");
+      }
     }
     if (!workspaceId) {
       throw new Error("Missing required param: workspaceId");
@@ -262,7 +265,7 @@ export function createRpcMethods(
     userId: string,
     workspaceId?: string,
   ): Promise<boolean> {
-    if (!isK8sMode || !workspaceId) return false;
+    if ((!isK8sMode && !skillSpaceDevMode) || !workspaceId) return false;
     const workspace = await resolveWorkspaceForUser(userId, workspaceId);
     return workspace?.envType === "test";
   }
@@ -293,6 +296,7 @@ export function createRpcMethods(
     const skillSpaceEnabled = await canUseSkillSpace(userId, workspaceId);
     return {
       isK8sMode,
+      skillSpaceDevMode,
       skillSpaceEnabled,
     };
   });
