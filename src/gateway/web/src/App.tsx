@@ -7,6 +7,7 @@ import { SsoCallback } from './pages/Login/SsoCallback';
 import { PilotPage } from './pages/Pilot';
 import { SkillsPage } from './pages/Skills';
 import { SkillEditor } from './pages/Skills/SkillEditor';
+import { SkillSetDetailPage } from './pages/Skills/SkillSetDetail';
 import { JoinSkillSetPage } from './pages/Skills/JoinSkillSetPage';
 import { ChannelsPage } from './pages/Channels';
 import { TriggersPage } from './pages/Triggers';
@@ -54,6 +55,7 @@ const router = createBrowserRouter([
                         children: [
                             { index: true, element: <SkillsPage /> },
                             { path: 'sets/join/:token', element: <JoinSkillSetPage /> },
+                            { path: 'sets/:setId', element: <SkillSetDetailPage /> },
                             { path: ':id', element: <SkillEditor /> },
                         ],
                     },
