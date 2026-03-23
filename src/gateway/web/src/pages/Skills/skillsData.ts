@@ -65,6 +65,7 @@ export type Skill = {
 
 export type SkillSystemCapabilities = {
     isK8sMode: boolean;
+    skillSpaceDevMode?: boolean;
     skillSpaceEnabled: boolean;
 };
 
