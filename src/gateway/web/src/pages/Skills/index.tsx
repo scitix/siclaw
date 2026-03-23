@@ -1,10 +1,9 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork, ArrowRight } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import type { Skill, SkillReview, SkillSet } from './skillsData';
 import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSets, rpcCreateSkillSet, type SkillSetMember } from './skillsData';
-import { SkillSetSection } from './SkillSetSection';
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
@@ -612,6 +611,10 @@ export function SkillsPage() {
                                 No skills found.
                             </div>
                         ) : (
+                        <>
+                        {activeTab === 'myskills' && (
+                            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Personal Skills</h3>
+                        )}
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                         {(activeTab === 'myskills' ? displaySkills.filter(s => s.scope === 'personal') : displaySkills).map((skill) => (
                             <div
@@ -878,30 +881,40 @@ export function SkillsPage() {
                             </button>
                         )}
                         </div>
+                        </>
                         )}
                     </div>
                 )}
-                {/* Skill Set Groups — inline sections on My Skills tab */}
-                {activeTab === 'myskills' && !isLoading && skillSetGroups.length > 0 && (
-                    <div className="px-6 pb-4 space-y-4">
-                        {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
-                            <SkillSetSection
-                                key={skillSet.id}
-                                skillSet={skillSet}
-                                skills={setSkills}
-                                sendRpc={sendRpc}
-                                onReload={() => { loadSkills(activeTab, searchInput); rpcListSkillSets(sendRpc).then(setSkillSets); }}
-                            />
-                        ))}
-                    </div>
-                )}
-
-                {/* Create Skill Set Button — only on My Skills tab */}
+                {/* Shared Skills — compact skill set list on My Skills tab */}
                 {activeTab === 'myskills' && !isLoading && (
                     <div className="px-6 pb-6">
+                        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Shared Skills</h3>
+                        {skillSetGroups.length > 0 && (
+                            <div className="space-y-2 mb-3">
+                                {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
+                                    <button
+                                        key={skillSet.id}
+                                        onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
+                                        className="w-full text-left border rounded-lg px-4 py-3 hover:shadow-sm hover:border-gray-300 transition-all flex items-center justify-between group"
+                                    >
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex items-center gap-2">
+                                                <Users className="w-3.5 h-3.5 text-green-600 shrink-0" />
+                                                <span className="text-sm font-medium text-gray-900 truncate">{skillSet.name}</span>
+                                                <span className="text-xs text-gray-400 shrink-0">{setSkills.length} skills</span>
+                                            </div>
+                                            {skillSet.description && (
+                                                <p className="text-xs text-gray-500 mt-0.5 ml-5.5 line-clamp-1">{skillSet.description}</p>
+                                            )}
+                                        </div>
+                                        <ArrowRight className="w-4 h-4 text-gray-300 group-hover:text-gray-500 shrink-0 ml-2" />
+                                    </button>
+                                ))}
+                            </div>
+                        )}
                         <button
                             onClick={() => setSkillSetDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
-                            className="w-full border-2 border-dashed border-gray-200 rounded-xl p-4 flex items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-2"
+                            className="w-full border-2 border-dashed border-gray-200 rounded-lg p-3 flex items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-2"
                         >
                             <Plus className="w-4 h-4" />
                             <span className="font-medium text-sm">Create Skill Set</span>
