@@ -255,7 +255,7 @@ export function createRpcMethods(
     if (!workspace) {
       throw new Error("Workspace not found");
     }
-    if (workspace.envType !== "test") {
+    if (!skillSpaceDevMode && workspace.envType !== "test") {
       throw new Error("Skill Space is only available in test workspaces");
     }
     return workspace;
@@ -267,7 +267,8 @@ export function createRpcMethods(
   ): Promise<boolean> {
     if ((!isK8sMode && !skillSpaceDevMode) || !workspaceId) return false;
     const workspace = await resolveWorkspaceForUser(userId, workspaceId);
-    return workspace?.envType === "test";
+    if (!workspace) return false;
+    return skillSpaceDevMode || workspace.envType === "test";
   }
 
   // Skills PV file writer
@@ -2659,6 +2660,19 @@ export function createRpcMethods(
         const globalSkill = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
         if (globalSkill) {
           globalFiles = await skillContentRepo.read(globalSkill.id, "published");
+        }
+      }
+
+      if (!globalFiles && meta.forkedFromId) {
+        if (meta.forkedFromId.startsWith("builtin:") || meta.forkedFromId.startsWith("core:") || meta.forkedFromId.startsWith("extension:")) {
+          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":")[1] : meta.forkedFromId;
+          globalFiles = skillWriter.readSkill("builtin", dirName);
+        } else if (skillContentRepo) {
+          const sourceMeta = await skillRepo.getById(meta.forkedFromId);
+          if (sourceMeta) {
+            const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
+            globalFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+          }
         }
       }
 
