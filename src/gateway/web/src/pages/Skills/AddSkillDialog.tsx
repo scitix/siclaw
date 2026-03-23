@@ -36,13 +36,14 @@ export interface AddSkillDialogProps {
     isOpen: boolean;
     skillSpaceId: string;
     skillSpaceName: string;
+    workspaceId: string;
     sendRpc: RpcSendFn;
     onClose: () => void;
     onSuccess: () => void;
 }
 
 export function AddSkillDialog({
-    isOpen, skillSpaceId, skillSpaceName, sendRpc, onClose, onSuccess,
+    isOpen, skillSpaceId, skillSpaceName, workspaceId, sendRpc, onClose, onSuccess,
 }: AddSkillDialogProps) {
     const [tab, setTab] = useState<'global' | 'personal' | 'new'>('global');
     const [search, setSearch] = useState('');
@@ -67,8 +68,8 @@ export function AddSkillDialog({
         setSelectedLabels(new Set());
 
         Promise.all([
-            rpcGetSkills(sendRpc, { limit: 200 }),
-            rpcGetSkillSpace(sendRpc, skillSpaceId),
+            rpcGetSkills(sendRpc, { limit: 200, workspaceId }),
+            rpcGetSkillSpace(sendRpc, workspaceId, skillSpaceId),
         ]).then(([result, spaceDetail]) => {
             setGlobalSkills(result.skills.filter(s => s.scope === 'builtin' || s.scope === 'team'));
             setPersonalSkills(result.skills.filter(s => s.scope === 'personal'));
@@ -77,14 +78,14 @@ export function AddSkillDialog({
         }).catch(() => {
             setLoading(false);
         });
-    }, [isOpen, skillSpaceId, sendRpc]);
+    }, [isOpen, skillSpaceId, workspaceId, sendRpc]);
 
     if (!isOpen) return null;
 
     const handleFork = async (sourceId: string) => {
         setError(null);
         try {
-            await rpcForkSkill(sendRpc, sourceId, { targetSkillSpaceId: skillSpaceId });
+            await rpcForkSkill(sendRpc, sourceId, { targetSkillSpaceId: skillSpaceId, workspaceId });
             onSuccess();
             onClose();
         } catch (err: any) {
@@ -95,7 +96,7 @@ export function AddSkillDialog({
     const handleMove = async (skillId: string) => {
         setError(null);
         try {
-            await rpcMoveSkillToSpace(sendRpc, String(skillId), skillSpaceId);
+            await rpcMoveSkillToSpace(sendRpc, String(skillId), skillSpaceId, workspaceId);
             onSuccess();
             onClose();
         } catch (err: any) {
@@ -108,7 +109,7 @@ export function AddSkillDialog({
         if (!name) return;
         setError(null);
         try {
-            await sendRpc('skill.create', { name, skillSpaceId });
+            await sendRpc('skill.create', { name, skillSpaceId, workspaceId });
             onSuccess();
             onClose();
         } catch (err: any) {

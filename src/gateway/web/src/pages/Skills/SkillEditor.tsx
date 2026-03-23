@@ -14,6 +14,7 @@ import { rpcGetSkillById, rpcSaveSkill, rpcDeleteSkill, rpcCopySkillToPersonal, 
 import { getCurrentUser } from '../../auth';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { useWorkspace } from '../../contexts/WorkspaceContext';
 
 const DEFAULT_SPEC_TEMPLATE = `---
 name: new-skill
@@ -119,6 +120,7 @@ export function SkillEditor() {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const { sendRpc, isConnected } = useWebSocket();
+    const { currentWorkspace } = useWorkspace();
     const [isExpanded, setIsExpanded] = useState(false);
     const [formData, setFormData] = useState<Skill | null>(null);
     const [activeScriptId, setActiveScriptId] = useState<string | null>(null);
@@ -173,7 +175,7 @@ export function SkillEditor() {
         if (!id || isNew) return;
         try {
             await rpcRollbackSkill(sendRpc, id, version);
-            const skill = await rpcGetSkillById(sendRpc, id);
+            const skill = await rpcGetSkillById(sendRpc, id, currentWorkspace?.id);
             if (skill) {
                 const loaded = {
                     ...skill,
@@ -241,7 +243,7 @@ export function SkillEditor() {
         loadedIdRef.current = id;
 
         let cancelled = false;
-        rpcGetSkillById(sendRpc, id).then(skill => {
+        rpcGetSkillById(sendRpc, id, currentWorkspace?.id).then(skill => {
             if (cancelled) return;
             if (skill) {
                 const loaded = {
@@ -255,7 +257,7 @@ export function SkillEditor() {
             }
         });
         return () => { cancelled = true; };
-    }, [id, navigate, isConnected, sendRpc]);
+    }, [id, navigate, isConnected, sendRpc, currentWorkspace?.id]);
 
     // Auto-open history panel when navigated with ?history=true
     useEffect(() => {
@@ -310,7 +312,7 @@ export function SkillEditor() {
         if (!formData) return;
         try {
             setIsSaving(true);
-            await rpcSaveSkill(sendRpc, formData, isNew);
+            await rpcSaveSkill(sendRpc, formData, isNew, currentWorkspace?.id);
             if (id) clearDraft(id);
             setServerData(formData); // Mark current state as "saved" so isDirty becomes false
             isSaveNavigatingRef.current = true;
@@ -330,7 +332,7 @@ export function SkillEditor() {
     const handleDeleteConfirm = async () => {
         if (!formData) return;
         try {
-            await rpcDeleteSkill(sendRpc, String(formData.id));
+            await rpcDeleteSkill(sendRpc, String(formData.id), currentWorkspace?.id);
             if (id) clearDraft(id);
             isSaveNavigatingRef.current = true;
             navigate('/skills');

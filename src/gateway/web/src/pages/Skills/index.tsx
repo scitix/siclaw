@@ -10,18 +10,21 @@ import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { useSkills } from '../../hooks/useSkills';
 import { usePermissions } from '../../hooks/usePermissions';
+import { useWorkspace } from '../../contexts/WorkspaceContext';
+import { rpcGetSkillSystemCapabilities } from './skillsData';
 
 export function SkillsPage() {
     const navigate = useNavigate();
     const [searchParams, setSearchParams] = useSearchParams();
     const { sendRpc, isConnected } = useWebSocket();
+    const { currentWorkspace } = useWorkspace();
     const {
         skills, isLoading, isLoadingMore, hasMore, loadSkills, loadMore,
         toggleEnabled, requestPublish, publishSkill, copyToPersonal,
         approveSkill: doApprove, rejectSkill: doReject,
         deleteSkill: doDelete, voteSkill, revertSkill, reviewSkill,
         withdrawSkill: doWithdraw,
-    } = useSkills(sendRpc);
+    } = useSkills(sendRpc, currentWorkspace?.id);
 
     const currentUser = getCurrentUser();
     const isAdmin = currentUser?.username === 'admin';
@@ -35,6 +38,7 @@ export function SkillsPage() {
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
     const [skillSpaces, setSkillSpaces] = useState<SkillSpace[]>([]);
     const [myView, setMyView] = useState<'personal' | 'shared'>('personal');
+    const [skillSpaceEnabled, setSkillSpaceEnabled] = useState(false);
     const [skillSpaceDialog, setSkillSpaceDialog] = useState<{
         isOpen: boolean;
         mode: 'create' | 'manage';
@@ -196,12 +200,28 @@ export function SkillsPage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
+        if (isConnected && currentWorkspace?.id && !hasLoadedRef.current) {
             hasLoadedRef.current = true;
             loadSkills(activeTab, '');
-            rpcListSkillSpaces(sendRpc).then(setSkillSpaces).catch(() => {});
+            rpcGetSkillSystemCapabilities(sendRpc, currentWorkspace.id).then((caps) => {
+                setSkillSpaceEnabled(caps.skillSpaceEnabled);
+                if (caps.skillSpaceEnabled) {
+                    rpcListSkillSpaces(sendRpc, currentWorkspace.id).then(setSkillSpaces).catch(() => {});
+                } else {
+                    setSkillSpaces([]);
+                    if (myView === 'shared') setMyView('personal');
+                }
+            }).catch(() => {
+                setSkillSpaceEnabled(false);
+                setSkillSpaces([]);
+                if (myView === 'shared') setMyView('personal');
+            });
         }
-    }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [isConnected, currentWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+        hasLoadedRef.current = false;
+    }, [currentWorkspace?.id]);
 
     // Sync activeTab from URL when searchParams change (e.g., navigation from notifications)
     useEffect(() => {
@@ -242,10 +262,11 @@ export function SkillsPage() {
     const handleCreateSkillSpace = async () => {
         const name = skillSpaceDialog.newName?.trim();
         if (!name) return;
+        if (!currentWorkspace?.id) return;
         try {
-            await rpcCreateSkillSpace(sendRpc, name, skillSpaceDialog.newDescription);
+            await rpcCreateSkillSpace(sendRpc, currentWorkspace.id, name, skillSpaceDialog.newDescription);
             setSkillSpaceDialog({ isOpen: false, mode: 'create' });
-            const spaces = await rpcListSkillSpaces(sendRpc);
+            const spaces = await rpcListSkillSpaces(sendRpc, currentWorkspace.id);
             setSkillSpaces(spaces);
             loadSkills(activeTab, searchInput);
         } catch (err: any) {
@@ -276,12 +297,15 @@ export function SkillsPage() {
 
     const handlePublish = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
+        const isSkillSpace = skill.scope === 'skillset';
         setDialogState({
             isOpen: true,
-            title: 'Publish Skill',
-            description: `Are you sure you want to publish "${skill.name}"? It will be reviewed by an admin before becoming available in production.`,
+            title: isSkillSpace ? 'Submit Promotion' : 'Publish Skill',
+            description: isSkillSpace
+                ? `Submit "${skill.name}" from Skill Space for review? Once approved, it will merge into Global.`
+                : `Are you sure you want to publish "${skill.name}"? It will be reviewed by an admin before becoming available in production.`,
             variant: 'primary',
-            confirmText: 'Request Publish',
+            confirmText: isSkillSpace ? 'Submit Promotion' : 'Request Publish',
             onConfirm: () => { requestPublish(skill).catch((err: any) => showError(err?.message || String(err))); }
         });
     };
@@ -329,10 +353,13 @@ export function SkillsPage() {
 
     const handleWithdraw = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
+        const isSkillSpace = skill.scope === 'skillset';
         setDialogState({
             isOpen: true,
-            title: 'Withdraw Publish Request',
-            description: `Withdraw the publish request for "${skill.name}"? The skill will revert to its previous state.`,
+            title: isSkillSpace ? 'Withdraw Promotion Request' : 'Withdraw Publish Request',
+            description: isSkillSpace
+                ? `Withdraw the promotion request for "${skill.name}"? The working copy will stay in Skill Space.`
+                : `Withdraw the publish request for "${skill.name}"? The skill will revert to its previous state.`,
             variant: 'warning',
             confirmText: 'Withdraw',
             onConfirm: () => { doWithdraw(skill); }
@@ -615,7 +642,7 @@ export function SkillsPage() {
                         <>
                         {activeTab === 'myskills' && (
                             <div className="flex gap-1 mb-4">
-                                {([{ id: 'personal' as const, label: 'Personal' }, { id: 'shared' as const, label: 'Shared' }]).map(v => (
+                                {([{ id: 'personal' as const, label: 'Personal' }, ...(skillSpaceEnabled ? [{ id: 'shared' as const, label: 'Shared' }] : [])]).map(v => (
                                     <button key={v.id} onClick={() => setMyView(v.id)}
                                         className={cn("px-3 py-1 text-xs font-medium rounded-lg transition-colors",
                                             myView === v.id ? "bg-gray-900 text-white" : "text-gray-500 hover:bg-gray-100")}>
@@ -625,11 +652,16 @@ export function SkillsPage() {
                             </div>
                         )}
                         {/* Shared view — skill space cards in grid */}
-                        {activeTab === 'myskills' && myView === 'shared' ? (
+                        {activeTab === 'myskills' && myView === 'shared' && skillSpaceEnabled ? (
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                                 {skillSpaceGroups.map(({ skillSpace, skills: spaceSkills }) => (
                                     <div key={skillSpace.id} onClick={() => navigate(`/skills/spaces/${skillSpace.id}`)}
                                         className="group rounded-xl border p-6 hover:shadow-md transition-all duration-200 flex flex-col cursor-pointer bg-white border-gray-200 hover:border-gray-300">
+                                        {(() => {
+                                            const pendingCount = spaceSkills.filter(skill => skill.reviewStatus === 'pending').length;
+                                            const shadowCount = spaceSkills.filter(skill => skill.globalSkillId).length;
+                                            return (
+                                                <>
                                         <div className="flex items-start justify-between mb-3">
                                             <div className="p-2 rounded-lg bg-green-50">
                                                 <Users className="w-5 h-5 text-green-600" />
@@ -641,8 +673,21 @@ export function SkillsPage() {
                                             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">
                                                 {spaceSkills.length} skills
                                             </span>
-                                            <span className="text-[10px] text-gray-400">{skillSpace.memberRole || 'member'}</span>
+                                            {pendingCount > 0 && (
+                                                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                                                    {pendingCount} pending
+                                                </span>
+                                            )}
+                                            {shadowCount > 0 && (
+                                                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
+                                                    {shadowCount} shadowing
+                                                </span>
+                                            )}
+                                            <span className="text-[10px] text-gray-400">{skillSpace.memberRole || 'maintainer'}</span>
                                         </div>
+                                                </>
+                                            );
+                                        })()}
                                     </div>
                                 ))}
                                 <button onClick={() => setSkillSpaceDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
@@ -816,7 +861,7 @@ export function SkillsPage() {
                                     </div>
 
                                     <div className="flex items-center gap-1">
-                                        {skill.scope === 'personal' && skill.reviewStatus === 'pending' && (
+                                        {(skill.scope === 'personal' || skill.scope === 'skillset') && skill.reviewStatus === 'pending' && (
                                             <Tooltip content="Withdraw">
                                                 <button
                                                     onClick={(e) => handleWithdraw(e, skill)}
@@ -860,6 +905,17 @@ export function SkillsPage() {
                                             </Tooltip>
                                         )}
 
+                                        {skill.scope === 'skillset' && skill.reviewStatus !== 'pending' && (
+                                            <Tooltip content="Submit Promotion">
+                                                <button
+                                                    onClick={(e) => handlePublish(e, skill)}
+                                                    className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                                                >
+                                                    <Upload className="w-4 h-4" />
+                                                </button>
+                                            </Tooltip>
+                                        )}
+
                                         {/* Admin actions for team skills */}
                                         {isAdmin && skill.scope === 'team' && (
                                             <Tooltip content="Revert to Personal">
@@ -883,12 +939,12 @@ export function SkillsPage() {
                                             </Tooltip>
                                         )}
 
-                                        <Tooltip content={skill.scope === 'personal' ? "Configure Skill" : "View Details"}>
+                                        <Tooltip content={skill.scope === 'personal' || skill.scope === 'skillset' ? "Configure Skill" : "View Details"}>
                                             <button
                                                 onClick={() => navigate(`/skills/${skill.id}`)}
                                                 className="p-1.5 text-gray-400 hover:text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
                                             >
-                                                {skill.scope === 'personal' ? <Settings className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                                {skill.scope === 'personal' || skill.scope === 'skillset' ? <Settings className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                                             </button>
                                         </Tooltip>
 
@@ -1110,9 +1166,13 @@ function ScriptReviewApprovalCard({
             setConfirmDialog({
                 isOpen: true,
                 title: 'Approve Skill',
-                description: `Are you sure you want to approve "${skill.name}"? It will become active in production.`,
+                description: skill.scope === 'skillset'
+                    ? `Approve "${skill.name}" and merge it into Global?`
+                    : `Are you sure you want to approve "${skill.name}"? It will become active in production.`,
                 variant: 'primary',
-                confirmText: isContributionReview ? 'Approve & Publish to Team' : 'Approve',
+                confirmText: skill.scope === 'skillset'
+                    ? 'Approve & Merge to Global'
+                    : (isContributionReview ? 'Approve & Publish to Team' : 'Approve'),
                 onConfirm: () => executeDecision('approve'),
             });
         } else {
@@ -1232,7 +1292,7 @@ function ScriptReviewApprovalCard({
                                     "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold border",
                                     "bg-amber-50 text-amber-700 border-amber-200"
                                 )}>
-                                    <FilePlus2 className="w-2.5 h-2.5" /> Publish Request
+                                    <FilePlus2 className="w-2.5 h-2.5" /> {skill.scope === 'skillset' ? 'Merge to Global' : 'Publish Request'}
                                 </span>
                             )}
                             {isContributionReview && (
@@ -1443,7 +1503,7 @@ function ScriptReviewApprovalCard({
                                             className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-green-700 bg-green-50 border border-green-200 hover:bg-green-100 rounded-lg transition-all disabled:opacity-50"
                                         >
                                             <Check className="w-4 h-4" />
-                                            {isContributionReview ? 'Approve & Publish to Team' : 'Approve'}
+                                            {skill.scope === 'skillset' ? 'Approve & Merge to Global' : (isContributionReview ? 'Approve & Publish to Team' : 'Approve')}
                                         </button>
                                     </div>
                                 </div>

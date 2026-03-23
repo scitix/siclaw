@@ -57,7 +57,15 @@ export type Skill = {
     skillSpaceId?: string | null;
     skillSpaceName?: string;
     isSpaceMember?: boolean;
+    isSpaceMaintainer?: boolean;
+    isSpaceOwner?: boolean;
     forkedFromId?: string | null;
+    globalSkillId?: string | null;
+};
+
+export type SkillSystemCapabilities = {
+    isK8sMode: boolean;
+    skillSpaceEnabled: boolean;
 };
 
 // Icon mapping for skills loaded from backend
@@ -84,6 +92,7 @@ export interface SkillListParams {
     scope?: string;
     search?: string;
     pendingOnly?: boolean;
+    workspaceId?: string;
 }
 
 export interface SkillListResult {
@@ -108,8 +117,8 @@ export async function rpcGetSkills(
     return { skills, hasMore: result.hasMore ?? false };
 }
 
-export async function rpcGetSkillById(sendRpc: RpcSendFn, id: string): Promise<Skill | null> {
-    const result = await sendRpc<any>('skill.get', { id });
+export async function rpcGetSkillById(sendRpc: RpcSendFn, id: string, workspaceId?: string): Promise<Skill | null> {
+    const result = await sendRpc<any>('skill.get', { id, workspaceId });
     if (!result) return null;
     return {
         ...result,
@@ -132,6 +141,7 @@ export async function rpcSaveSkill(
     sendRpc: RpcSendFn,
     skill: Skill,
     isNew: boolean,
+    workspaceId?: string,
 ): Promise<void> {
     const scripts = skill.scripts?.map(s => ({ name: s.name, content: s.content }));
     if (isNew) {
@@ -141,6 +151,7 @@ export async function rpcSaveSkill(
             specs: skill.specs,
             scripts,
             labels: skill.labels,
+            workspaceId,
         });
     } else {
         await sendRpc('skill.update', {
@@ -149,12 +160,13 @@ export async function rpcSaveSkill(
             type: skill.type,
             specs: skill.specs,
             scripts,
+            workspaceId,
         });
     }
 }
 
-export async function rpcDeleteSkill(sendRpc: RpcSendFn, id: string): Promise<void> {
-    await sendRpc('skill.delete', { id });
+export async function rpcDeleteSkill(sendRpc: RpcSendFn, id: string, workspaceId?: string): Promise<void> {
+    await sendRpc('skill.delete', { id, workspaceId });
 }
 
 export async function rpcVoteSkill(
@@ -179,23 +191,26 @@ export async function rpcReviewDecision(
     decision: 'approve' | 'reject',
     reason?: string,
     stagingVersion?: number,
+    workspaceId?: string,
 ): Promise<{ status: string }> {
-    return sendRpc('skill.review', { id, decision, reason, stagingVersion });
+    return sendRpc('skill.review', { id, decision, reason, stagingVersion, workspaceId });
 }
 
 export async function rpcRequestPublish(
     sendRpc: RpcSendFn,
     id: string,
     contributeToTeam?: boolean,
+    workspaceId?: string,
 ): Promise<{ status: string }> {
-    return sendRpc('skill.submit', { id, contributeToTeam });
+    return sendRpc('skill.submit', { id, contributeToTeam, workspaceId });
 }
 
 export async function rpcWithdrawSkill(
     sendRpc: RpcSendFn,
     id: string,
+    workspaceId?: string,
 ): Promise<{ status: string; wasNew: boolean }> {
-    return sendRpc('skill.withdraw', { id });
+    return sendRpc('skill.withdraw', { id, workspaceId });
 }
 
 export async function rpcGetSkillReview(
@@ -216,8 +231,9 @@ export async function rpcGetSkillDiff(
     sendRpc: RpcSendFn,
     id: string,
     teamDiff?: boolean,
+    workspaceId?: string,
 ): Promise<{ diff: string }> {
-    return sendRpc('skill.diff', { id, teamDiff });
+    return sendRpc('skill.diff', { id, teamDiff, workspaceId });
 }
 
 export async function rpcRollbackSkill(
@@ -248,7 +264,7 @@ export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, label
 export async function rpcForkSkill(
     sendRpc: RpcSendFn,
     sourceId: string,
-    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSpaceId?: string },
+    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSpaceId?: string; workspaceId?: string },
 ): Promise<{ id: string; dirName: string; name: string; forkedFromId: string; skillSpaceId?: string }> {
     return sendRpc('skill.fork', { sourceId, ...overrides });
 }
@@ -279,50 +295,54 @@ export interface SkillSpaceMember {
     joinedAt: string;
 }
 
-export async function rpcListSkillSpaces(sendRpc: RpcSendFn): Promise<SkillSpace[]> {
-    const result = await sendRpc<{ skillSpaces: SkillSpace[] }>('skillSpace.list');
+export async function rpcListSkillSpaces(sendRpc: RpcSendFn, workspaceId: string): Promise<SkillSpace[]> {
+    const result = await sendRpc<{ skillSpaces: SkillSpace[] }>('skillSpace.list', { workspaceId });
     return result.skillSpaces ?? [];
 }
 
-export async function rpcCreateSkillSpace(sendRpc: RpcSendFn, name: string, description?: string): Promise<{ id: string; name: string }> {
-    return sendRpc('skillSpace.create', { name, description });
+export async function rpcCreateSkillSpace(sendRpc: RpcSendFn, workspaceId: string, name: string, description?: string): Promise<{ id: string; name: string }> {
+    return sendRpc('skillSpace.create', { workspaceId, name, description });
 }
 
-export async function rpcGetSkillSpace(sendRpc: RpcSendFn, id: string): Promise<SkillSpace & { members: SkillSpaceMember[]; skills: Skill[] }> {
-    return sendRpc('skillSpace.get', { id });
+export async function rpcGetSkillSpace(sendRpc: RpcSendFn, workspaceId: string, id: string): Promise<SkillSpace & { members: SkillSpaceMember[]; skills: Skill[] }> {
+    return sendRpc('skillSpace.get', { workspaceId, id });
 }
 
-export async function rpcUpdateSkillSpace(sendRpc: RpcSendFn, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
-    return sendRpc('skillSpace.update', { id, ...updates });
+export async function rpcUpdateSkillSpace(sendRpc: RpcSendFn, workspaceId: string, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
+    return sendRpc('skillSpace.update', { workspaceId, id, ...updates });
 }
 
-export async function rpcDeleteSkillSpace(sendRpc: RpcSendFn, id: string): Promise<{ status: string }> {
-    return sendRpc('skillSpace.delete', { id });
+export async function rpcDeleteSkillSpace(sendRpc: RpcSendFn, workspaceId: string, id: string): Promise<{ status: string }> {
+    return sendRpc('skillSpace.delete', { workspaceId, id });
 }
 
-export async function rpcAddSkillSpaceMember(sendRpc: RpcSendFn, skillSpaceId: string, username: string): Promise<{ status: string; userId: string; username: string }> {
-    return sendRpc('skillSpace.addMember', { skillSpaceId, username });
+export async function rpcAddSkillSpaceMember(sendRpc: RpcSendFn, workspaceId: string, skillSpaceId: string, username: string): Promise<{ status: string; userId: string; username: string }> {
+    return sendRpc('skillSpace.addMember', { workspaceId, skillSpaceId, username });
 }
 
-export async function rpcRemoveSkillSpaceMember(sendRpc: RpcSendFn, skillSpaceId: string, userId: string): Promise<{ status: string }> {
-    return sendRpc('skillSpace.removeMember', { skillSpaceId, userId });
+export async function rpcRemoveSkillSpaceMember(sendRpc: RpcSendFn, workspaceId: string, skillSpaceId: string, userId: string): Promise<{ status: string }> {
+    return sendRpc('skillSpace.removeMember', { workspaceId, skillSpaceId, userId });
 }
 
-export async function rpcListSkillSpaceMembers(sendRpc: RpcSendFn, skillSpaceId: string): Promise<{ members: SkillSpaceMember[] }> {
-    return sendRpc('skillSpace.listMembers', { skillSpaceId });
+export async function rpcListSkillSpaceMembers(sendRpc: RpcSendFn, workspaceId: string, skillSpaceId: string): Promise<{ members: SkillSpaceMember[] }> {
+    return sendRpc('skillSpace.listMembers', { workspaceId, skillSpaceId });
 }
 
 /** Move a personal skill into a skill space */
-export async function rpcMoveSkillToSpace(sendRpc: RpcSendFn, skillId: string, targetSkillSpaceId: string): Promise<{ status: string }> {
-    return sendRpc('skill.moveToSpace', { skillId, targetSkillSpaceId });
+export async function rpcMoveSkillToSpace(sendRpc: RpcSendFn, skillId: string, targetSkillSpaceId: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.moveToSpace', { skillId, targetSkillSpaceId, workspaceId });
 }
 
 /** Toggle share link for a skill space (owner only) */
-export async function rpcToggleShareLink(sendRpc: RpcSendFn, skillSpaceId: string, enabled: boolean): Promise<{ token: string | null }> {
-    return sendRpc('skillSpace.toggleShareLink', { skillSpaceId, enabled });
+export async function rpcToggleShareLink(sendRpc: RpcSendFn, workspaceId: string, skillSpaceId: string, enabled: boolean): Promise<{ token: string | null }> {
+    return sendRpc('skillSpace.toggleShareLink', { workspaceId, skillSpaceId, enabled });
 }
 
 /** Join a skill space via invite token */
-export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string): Promise<{ spaceId: string; joined?: boolean; alreadyMember?: boolean }> {
-    return sendRpc('skillSpace.joinByToken', { token });
+export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string, workspaceId: string): Promise<{ spaceId: string; joined?: boolean; alreadyMember?: boolean }> {
+    return sendRpc('skillSpace.joinByToken', { token, workspaceId });
+}
+
+export async function rpcGetSkillSystemCapabilities(sendRpc: RpcSendFn, workspaceId?: string): Promise<SkillSystemCapabilities> {
+    return sendRpc('system.capabilities', workspaceId ? { workspaceId } : {});
 }

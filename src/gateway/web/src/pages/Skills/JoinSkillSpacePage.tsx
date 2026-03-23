@@ -2,22 +2,24 @@ import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { rpcJoinByToken } from './skillsData';
+import { useWorkspace } from '../../contexts/WorkspaceContext';
 
 export function JoinSkillSpacePage() {
     const { token } = useParams();
     const navigate = useNavigate();
     const { sendRpc, isConnected } = useWebSocket();
+    const { currentWorkspace } = useWorkspace();
     const [error, setError] = useState<string | null>(null);
 
     useEffect(() => {
-        if (!token || !isConnected) return;
+        if (!token || !isConnected || !currentWorkspace?.id) return;
 
-        rpcJoinByToken(sendRpc, token).then(() => {
+        rpcJoinByToken(sendRpc, token, currentWorkspace.id).then(() => {
             navigate('/skills?tab=myskills', { replace: true });
         }).catch((err: any) => {
             setError(err.message || 'Invalid or expired invite link');
         });
-    }, [token, isConnected, sendRpc, navigate]);
+    }, [token, isConnected, sendRpc, navigate, currentWorkspace?.id]);
 
     if (error) {
         return (

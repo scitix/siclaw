@@ -354,7 +354,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await refreshMetricsConfig();
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService, knowledgeIndexer);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService, knowledgeIndexer, isK8sMode);
 
   // Wrap system.saveSection to refresh caches when settings change
   const origSaveSection = rpcMethods.get("system.saveSection");
@@ -1461,4 +1461,3 @@ async function resolveJwtSecret(sysConfigRepo: SystemConfigRepository | null): P
 
   return generated;
 }
-

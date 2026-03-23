@@ -20,6 +20,12 @@ export interface UpdateSkillSpaceInput {
   inviteToken?: string | null;
 }
 
+export type SkillSpaceRole = "owner" | "maintainer";
+
+export function normalizeSkillSpaceRole(role?: string | null): SkillSpaceRole {
+  return role === "owner" ? "owner" : "maintainer";
+}
+
 export class SkillSpaceRepository {
   constructor(private db: Database) {}
 
@@ -86,19 +92,22 @@ export class SkillSpaceRepository {
       .from(skillSpaceMembers)
       .innerJoin(skillSpaces, eq(skillSpaceMembers.skillSpaceId, skillSpaces.id))
       .where(eq(skillSpaceMembers.userId, userId));
-    return rows;
+    return rows.map((row) => ({
+      ...row,
+      memberRole: normalizeSkillSpaceRole(row.memberRole),
+    }));
   }
 
   // ─── Member management ────────────────────────────
 
-  async addMember(skillSpaceId: string, userId: string, role: string = "member"): Promise<string> {
+  async addMember(skillSpaceId: string, userId: string, role: string = "maintainer"): Promise<string> {
     const id = crypto.randomUUID();
     try {
       await this.db.insert(skillSpaceMembers).values({
         id,
         skillSpaceId,
         userId,
-        role,
+        role: normalizeSkillSpaceRole(role),
       });
     } catch (err) {
       if (isUniqueViolation(err)) {
@@ -121,10 +130,14 @@ export class SkillSpaceRepository {
   }
 
   async listMembers(skillSpaceId: string) {
-    return this.db
+    const rows = await this.db
       .select()
       .from(skillSpaceMembers)
       .where(eq(skillSpaceMembers.skillSpaceId, skillSpaceId));
+    return rows.map((row) => ({
+      ...row,
+      role: normalizeSkillSpaceRole(row.role),
+    }));
   }
 
   async getMembership(skillSpaceId: string, userId: string) {
@@ -138,7 +151,11 @@ export class SkillSpaceRepository {
         ),
       )
       .limit(1);
-    return rows[0] ?? null;
+    if (!rows[0]) return null;
+    return {
+      ...rows[0],
+      role: normalizeSkillSpaceRole(rows[0].role),
+    };
   }
 
   async isOwner(skillSpaceId: string, userId: string): Promise<boolean> {
@@ -149,6 +166,11 @@ export class SkillSpaceRepository {
   async isMember(skillSpaceId: string, userId: string): Promise<boolean> {
     const m = await this.getMembership(skillSpaceId, userId);
     return m !== null;
+  }
+
+  async isMaintainer(skillSpaceId: string, userId: string): Promise<boolean> {
+    const m = await this.getMembership(skillSpaceId, userId);
+    return m?.role === "owner" || m?.role === "maintainer";
   }
 
   /** Check if a skill space has any skills (used before deletion) */
