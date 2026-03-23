@@ -2,8 +2,8 @@ import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, Clipboar
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import type { Skill, SkillReview, SkillSet } from './skillsData';
-import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSets, rpcCreateSkillSet, type SkillSetMember } from './skillsData';
+import type { Skill, SkillReview, SkillSpace } from './skillsData';
+import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSpaces, rpcCreateSkillSpace, type SkillSpaceMember } from './skillsData';
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
@@ -33,13 +33,13 @@ export function SkillsPage() {
     const [searchInput, setSearchInput] = useState('');
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
-    const [skillSets, setSkillSets] = useState<SkillSet[]>([]);
+    const [skillSpaces, setSkillSpaces] = useState<SkillSpace[]>([]);
     const [myView, setMyView] = useState<'personal' | 'shared'>('personal');
-    const [skillSetDialog, setSkillSetDialog] = useState<{
+    const [skillSpaceDialog, setSkillSpaceDialog] = useState<{
         isOpen: boolean;
         mode: 'create' | 'manage';
-        skillSet?: SkillSet;
-        members?: SkillSetMember[];
+        skillSpace?: SkillSpace;
+        members?: SkillSpaceMember[];
         newName?: string;
         newDescription?: string;
         newMemberUsername?: string;
@@ -199,7 +199,7 @@ export function SkillsPage() {
         if (isConnected && !hasLoadedRef.current) {
             hasLoadedRef.current = true;
             loadSkills(activeTab, '');
-            rpcListSkillSets(sendRpc).then(setSkillSets).catch(() => {});
+            rpcListSkillSpaces(sendRpc).then(setSkillSpaces).catch(() => {});
         }
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -224,32 +224,32 @@ export function SkillsPage() {
             return [...selectedLabels].every(l => sl.includes(l));
         });
 
-    // Group skills for My Skills tab by scope (personal vs skill set)
-    const skillSetGroups = useMemo(() => {
-        const groups: Map<string, { skillSet: SkillSet; skills: Skill[] }> = new Map();
-        for (const set of skillSets) {
-            groups.set(set.id, { skillSet: set, skills: [] });
+    // Group skills for My Skills tab by scope (personal vs skill space)
+    const skillSpaceGroups = useMemo(() => {
+        const groups: Map<string, { skillSpace: SkillSpace; skills: Skill[] }> = new Map();
+        for (const space of skillSpaces) {
+            groups.set(space.id, { skillSpace: space, skills: [] });
         }
         for (const skill of displaySkills) {
-            if (skill.scope === 'skillset' && skill.skillSetId) {
-                const group = groups.get(skill.skillSetId);
+            if (skill.scope === 'skillset' && skill.skillSpaceId) {
+                const group = groups.get(skill.skillSpaceId);
                 if (group) group.skills.push(skill);
             }
         }
         return [...groups.values()];
-    }, [displaySkills, skillSets]);
+    }, [displaySkills, skillSpaces]);
 
-    const handleCreateSkillSet = async () => {
-        const name = skillSetDialog.newName?.trim();
+    const handleCreateSkillSpace = async () => {
+        const name = skillSpaceDialog.newName?.trim();
         if (!name) return;
         try {
-            await rpcCreateSkillSet(sendRpc, name, skillSetDialog.newDescription);
-            setSkillSetDialog({ isOpen: false, mode: 'create' });
-            const sets = await rpcListSkillSets(sendRpc);
-            setSkillSets(sets);
+            await rpcCreateSkillSpace(sendRpc, name, skillSpaceDialog.newDescription);
+            setSkillSpaceDialog({ isOpen: false, mode: 'create' });
+            const spaces = await rpcListSkillSpaces(sendRpc);
+            setSkillSpaces(spaces);
             loadSkills(activeTab, searchInput);
         } catch (err: any) {
-            showError(err.message || 'Failed to create skill set');
+            showError(err.message || 'Failed to create skill space');
         }
     };
 
@@ -619,38 +619,38 @@ export function SkillsPage() {
                                     <button key={v.id} onClick={() => setMyView(v.id)}
                                         className={cn("px-3 py-1 text-xs font-medium rounded-lg transition-colors",
                                             myView === v.id ? "bg-gray-900 text-white" : "text-gray-500 hover:bg-gray-100")}>
-                                        {v.label}{v.id === 'shared' && skillSetGroups.length > 0 ? ` (${skillSetGroups.length})` : ''}
+                                        {v.label}{v.id === 'shared' && skillSpaceGroups.length > 0 ? ` (${skillSpaceGroups.length})` : ''}
                                     </button>
                                 ))}
                             </div>
                         )}
-                        {/* Shared view — skill set cards in grid */}
+                        {/* Shared view — skill space cards in grid */}
                         {activeTab === 'myskills' && myView === 'shared' ? (
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
-                                    <div key={skillSet.id} onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
+                                {skillSpaceGroups.map(({ skillSpace, skills: spaceSkills }) => (
+                                    <div key={skillSpace.id} onClick={() => navigate(`/skills/spaces/${skillSpace.id}`)}
                                         className="group rounded-xl border p-6 hover:shadow-md transition-all duration-200 flex flex-col cursor-pointer bg-white border-gray-200 hover:border-gray-300">
                                         <div className="flex items-start justify-between mb-3">
                                             <div className="p-2 rounded-lg bg-green-50">
                                                 <Users className="w-5 h-5 text-green-600" />
                                             </div>
                                         </div>
-                                        <h3 className="font-semibold text-sm text-gray-900 mb-1 truncate">{skillSet.name}</h3>
-                                        <p className="text-xs text-gray-500 line-clamp-2 flex-1 mb-3">{skillSet.description || 'No description'}</p>
+                                        <h3 className="font-semibold text-sm text-gray-900 mb-1 truncate">{skillSpace.name}</h3>
+                                        <p className="text-xs text-gray-500 line-clamp-2 flex-1 mb-3">{skillSpace.description || 'No description'}</p>
                                         <div className="flex items-center gap-2 mt-auto">
                                             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">
-                                                {setSkills.length} skills
+                                                {spaceSkills.length} skills
                                             </span>
-                                            <span className="text-[10px] text-gray-400">{skillSet.memberRole || 'member'}</span>
+                                            <span className="text-[10px] text-gray-400">{skillSpace.memberRole || 'member'}</span>
                                         </div>
                                     </div>
                                 ))}
-                                <button onClick={() => setSkillSetDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
+                                <button onClick={() => setSkillSpaceDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
                                     className="group rounded-xl border-2 border-dashed border-gray-200 p-6 flex flex-col items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-3 min-h-[200px]">
                                     <div className="p-3 rounded-full bg-gray-50 group-hover:bg-white">
                                         <Plus className="w-6 h-6" />
                                     </div>
-                                    <span className="font-semibold text-sm">Create Skill Set</span>
+                                    <span className="font-semibold text-sm">Create Skill Space</span>
                                 </button>
                             </div>
                         ) : (
@@ -805,7 +805,7 @@ export function SkillsPage() {
                                             {skill.scope === 'skillset' && <Users className="w-3 h-3" />}
                                             {skill.scope === 'builtin' ? 'Global' :
                                                 skill.scope === 'team' ? 'Global' :
-                                                    skill.scope === 'skillset' ? (skill.skillSetName || 'Skill Set') :
+                                                    skill.scope === 'skillset' ? (skill.skillSpaceName || 'Skill Space') :
                                                         'Personal'}
                                         </span>
                                         {(skill.scope === 'team' || skill.scope === 'personal' || skill.scope === 'skillset') && (
@@ -933,37 +933,37 @@ export function SkillsPage() {
                 )}
             </div>
 
-            {/* Skill Set Dialog */}
-            {skillSetDialog.isOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}>
+            {/* Skill Space Dialog */}
+            {skillSpaceDialog.isOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setSkillSpaceDialog({ isOpen: false, mode: 'create' })}>
                     <div className="bg-white rounded-xl shadow-lg w-full max-w-md mx-4 p-6" onClick={e => e.stopPropagation()}>
-                        <h3 className="text-lg font-semibold mb-4">Create Skill Set</h3>
+                        <h3 className="text-lg font-semibold mb-4">Create Skill Space</h3>
                         <div className="space-y-3">
                             <input
                                 type="text"
-                                placeholder="Skill set name"
-                                value={skillSetDialog.newName || ''}
-                                onChange={e => setSkillSetDialog(p => ({ ...p, newName: e.target.value }))}
+                                placeholder="Skill space name"
+                                value={skillSpaceDialog.newName || ''}
+                                onChange={e => setSkillSpaceDialog(p => ({ ...p, newName: e.target.value }))}
                                 className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300"
                                 autoFocus
                             />
                             <textarea
                                 placeholder="Description (optional)"
-                                value={skillSetDialog.newDescription || ''}
-                                onChange={e => setSkillSetDialog(p => ({ ...p, newDescription: e.target.value }))}
+                                value={skillSpaceDialog.newDescription || ''}
+                                onChange={e => setSkillSpaceDialog(p => ({ ...p, newDescription: e.target.value }))}
                                 className="w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-300 h-20 resize-none"
                             />
                         </div>
                         <div className="flex justify-end gap-2 mt-4">
                             <button
-                                onClick={() => setSkillSetDialog({ isOpen: false, mode: 'create' })}
+                                onClick={() => setSkillSpaceDialog({ isOpen: false, mode: 'create' })}
                                 className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border rounded-lg hover:bg-gray-50"
                             >
                                 Cancel
                             </button>
                             <button
-                                onClick={handleCreateSkillSet}
-                                disabled={!skillSetDialog.newName?.trim()}
+                                onClick={handleCreateSkillSpace}
+                                disabled={!skillSpaceDialog.newName?.trim()}
                                 className="px-4 py-2 text-sm font-medium text-white bg-green-600 hover:bg-green-700 rounded-lg disabled:opacity-50"
                             >
                                 Create
@@ -1162,7 +1162,7 @@ function ScriptReviewApprovalCard({
         team: { label: 'Global', cls: 'bg-blue-50 text-blue-700 border-blue-100', icon: Users },
         global: { label: 'Global', cls: 'bg-gray-100 text-gray-700', icon: Lock },
         personal: { label: 'Personal', cls: 'bg-purple-50 text-purple-700 border-purple-100', icon: User },
-        skillset: { label: 'Skill Set', cls: 'bg-green-50 text-green-700 border-green-100', icon: Users },
+        skillset: { label: 'Skill Space', cls: 'bg-green-50 text-green-700 border-green-100', icon: Users },
     };
     const scopeConfig = scopeConfigMap[skill.scope] || { label: skill.scope, cls: 'bg-gray-100 text-gray-600', icon: User };
 
