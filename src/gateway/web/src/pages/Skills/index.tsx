@@ -1,4 +1,4 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork, ArrowRight } from 'lucide-react';
+import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -34,6 +34,7 @@ export function SkillsPage() {
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
     const [skillSets, setSkillSets] = useState<SkillSet[]>([]);
+    const [myView, setMyView] = useState<'personal' | 'shared'>('personal');
     const [skillSetDialog, setSkillSetDialog] = useState<{
         isOpen: boolean;
         mode: 'create' | 'manage';
@@ -613,8 +614,46 @@ export function SkillsPage() {
                         ) : (
                         <>
                         {activeTab === 'myskills' && (
-                            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Personal Skills</h3>
+                            <div className="flex gap-1 mb-4">
+                                {([{ id: 'personal' as const, label: 'Personal' }, { id: 'shared' as const, label: 'Shared' }]).map(v => (
+                                    <button key={v.id} onClick={() => setMyView(v.id)}
+                                        className={cn("px-3 py-1 text-xs font-medium rounded-lg transition-colors",
+                                            myView === v.id ? "bg-gray-900 text-white" : "text-gray-500 hover:bg-gray-100")}>
+                                        {v.label}{v.id === 'shared' && skillSetGroups.length > 0 ? ` (${skillSetGroups.length})` : ''}
+                                    </button>
+                                ))}
+                            </div>
                         )}
+                        {/* Shared view — skill set cards in grid */}
+                        {activeTab === 'myskills' && myView === 'shared' ? (
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
+                                    <div key={skillSet.id} onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
+                                        className="group rounded-xl border p-6 hover:shadow-md transition-all duration-200 flex flex-col cursor-pointer bg-white border-gray-200 hover:border-gray-300">
+                                        <div className="flex items-start justify-between mb-3">
+                                            <div className="p-2 rounded-lg bg-green-50">
+                                                <Users className="w-5 h-5 text-green-600" />
+                                            </div>
+                                        </div>
+                                        <h3 className="font-semibold text-sm text-gray-900 mb-1 truncate">{skillSet.name}</h3>
+                                        <p className="text-xs text-gray-500 line-clamp-2 flex-1 mb-3">{skillSet.description || 'No description'}</p>
+                                        <div className="flex items-center gap-2 mt-auto">
+                                            <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">
+                                                {setSkills.length} skills
+                                            </span>
+                                            <span className="text-[10px] text-gray-400">{skillSet.memberRole || 'member'}</span>
+                                        </div>
+                                    </div>
+                                ))}
+                                <button onClick={() => setSkillSetDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
+                                    className="group rounded-xl border-2 border-dashed border-gray-200 p-6 flex flex-col items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-3 min-h-[200px]">
+                                    <div className="p-3 rounded-full bg-gray-50 group-hover:bg-white">
+                                        <Plus className="w-6 h-6" />
+                                    </div>
+                                    <span className="font-semibold text-sm">Create Skill Set</span>
+                                </button>
+                            </div>
+                        ) : (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                         {(activeTab === 'myskills' ? displaySkills.filter(s => s.scope === 'personal') : displaySkills).map((skill) => (
                             <div
@@ -868,8 +907,8 @@ export function SkillsPage() {
                             </div>
                         ))}
 
-                        {/* Add New Placeholder — only for personal tab */}
-                        {(activeTab === 'myskills') && (
+                        {/* Add New Placeholder — only for personal view */}
+                        {(activeTab !== 'myskills' || myView === 'personal') && (
                             <button
                                 onClick={handleCreateNew}
                                 className="border-2 border-dashed border-gray-200 rounded-xl p-6 flex flex-col items-center justify-center text-gray-400 hover:border-primary-300 hover:text-primary-600 hover:bg-primary-50/50 transition-all gap-3 min-h-[200px]"
@@ -881,44 +920,9 @@ export function SkillsPage() {
                             </button>
                         )}
                         </div>
+                        )}
                         </>
                         )}
-                    </div>
-                )}
-                {/* Shared Skills — compact skill set list on My Skills tab */}
-                {activeTab === 'myskills' && !isLoading && (
-                    <div className="px-6 pb-6">
-                        <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Shared Skills</h3>
-                        {skillSetGroups.length > 0 && (
-                            <div className="space-y-2 mb-3">
-                                {skillSetGroups.map(({ skillSet, skills: setSkills }) => (
-                                    <button
-                                        key={skillSet.id}
-                                        onClick={() => navigate(`/skills/sets/${skillSet.id}`)}
-                                        className="w-full text-left border rounded-lg px-4 py-3 hover:shadow-sm hover:border-gray-300 transition-all flex items-center justify-between group"
-                                    >
-                                        <div className="min-w-0 flex-1">
-                                            <div className="flex items-center gap-2">
-                                                <Users className="w-3.5 h-3.5 text-green-600 shrink-0" />
-                                                <span className="text-sm font-medium text-gray-900 truncate">{skillSet.name}</span>
-                                                <span className="text-xs text-gray-400 shrink-0">{setSkills.length} skills</span>
-                                            </div>
-                                            {skillSet.description && (
-                                                <p className="text-xs text-gray-500 mt-0.5 ml-5.5 line-clamp-1">{skillSet.description}</p>
-                                            )}
-                                        </div>
-                                        <ArrowRight className="w-4 h-4 text-gray-300 group-hover:text-gray-500 shrink-0 ml-2" />
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-                        <button
-                            onClick={() => setSkillSetDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
-                            className="w-full border-2 border-dashed border-gray-200 rounded-lg p-3 flex items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-2"
-                        >
-                            <Plus className="w-4 h-4" />
-                            <span className="font-medium text-sm">Create Skill Set</span>
-                        </button>
                     </div>
                 )}
 
