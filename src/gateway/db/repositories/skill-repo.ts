@@ -20,7 +20,7 @@ export interface CreateSkillInput {
   forkedFromId?: string;
   version?: number;
   labels?: string[];
-  skillSetId?: string;
+  skillSpaceId?: string;
 }
 
 export interface UpdateSkillInput {
@@ -38,7 +38,7 @@ export interface UpdateSkillInput {
   teamPinnedVersion?: number | null;
   forkedFromId?: string | null;
   labels?: string[] | null;
-  skillSetId?: string | null;
+  skillSpaceId?: string | null;
 }
 
 export class SkillRepository {
@@ -131,7 +131,7 @@ export class SkillRepository {
       contributionStatus: "none",
       forkedFromId: input.forkedFromId ?? null,
       labelsJson: input.labels ?? null,
-      skillSetId: input.skillSetId ?? null,
+      skillSpaceId: input.skillSpaceId ?? null,
     });
     return id;
   }
@@ -155,7 +155,7 @@ export class SkillRepository {
     if (updates.teamPinnedVersion !== undefined) setFields.teamPinnedVersion = updates.teamPinnedVersion;
     if (updates.forkedFromId !== undefined) setFields.forkedFromId = updates.forkedFromId;
     if (updates.labels !== undefined) setFields.labelsJson = updates.labels;
-    if (updates.skillSetId !== undefined) setFields.skillSetId = updates.skillSetId;
+    if (updates.skillSpaceId !== undefined) setFields.skillSpaceId = updates.skillSpaceId;
 
     await this.db.update(skills).set(setFields).where(eq(skills.id, id));
   }
@@ -251,22 +251,22 @@ export class SkillRepository {
       );
   }
 
-  // ─── Skill Set queries ────────────────────────────
+  // ─── Skill Space queries ───────────────────────────
 
-  /** List skills belonging to a specific skill set */
-  async listBySkillSetId(skillSetId: string) {
+  /** List skills belonging to a specific skill space */
+  async listBySkillSpaceId(skillSpaceId: string) {
     return this.db
       .select()
       .from(skills)
-      .where(eq(skills.skillSetId, skillSetId));
+      .where(eq(skills.skillSpaceId, skillSpaceId));
   }
 
-  /** List skills belonging to any of the given skill set IDs */
-  async listBySkillSetIds(skillSetIds: string[]) {
-    if (skillSetIds.length === 0) return [];
+  /** List skills belonging to any of the given skill space IDs */
+  async listBySkillSpaceIds(skillSpaceIds: string[]) {
+    if (skillSpaceIds.length === 0) return [];
     return this.db
       .select()
       .from(skills)
-      .where(inArray(skills.skillSetId, skillSetIds));
+      .where(inArray(skills.skillSpaceId, skillSpaceIds));
   }
 }

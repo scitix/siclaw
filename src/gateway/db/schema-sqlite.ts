@@ -73,9 +73,9 @@ export const messages = sqliteTable("messages", {
   durationMs: integer("duration_ms"),
 });
 
-// ─── Skill Sets (collaboration spaces) ──────────────
+// ─── Skill Spaces (collaboration spaces) ─────────────
 
-export const skillSets = sqliteTable("skill_sets", {
+export const skillSpaces = sqliteTable("skill_spaces", {
   id: text("id").primaryKey(),
   name: text("name").notNull().unique(),
   description: text("description"),
@@ -85,14 +85,14 @@ export const skillSets = sqliteTable("skill_sets", {
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 
-export const skillSetMembers = sqliteTable("skill_set_members", {
+export const skillSpaceMembers = sqliteTable("skill_space_members", {
   id: text("id").primaryKey(),
-  skillSetId: text("skill_set_id").notNull().references(() => skillSets.id, { onDelete: "cascade" }),
+  skillSpaceId: text("skill_space_id").notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   role: text("role").notNull().default("member"), // "owner" | "member"
   joinedAt: integer("joined_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 }, (table) => ({
-  ukSetUser: uniqueIndex("uk_skill_set_member").on(table.skillSetId, table.userId),
+  ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),
 }));
 
 // ─── Skills ──────────────────────────────────────────
@@ -117,7 +117,7 @@ export const skills = sqliteTable("skills", {
   teamPinnedVersion: integer("team_pinned_version"),
   forkedFromId: text("forked_from_id"),
   labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
-  skillSetId: text("skill_set_id").references(() => skillSets.id, { onDelete: "set null" }),
+  skillSpaceId: text("skill_space_id").references(() => skillSpaces.id, { onDelete: "set null" }),
 });
 
 // ─── Skill Contents ─────────────────────────────────

@@ -54,9 +54,9 @@ export type Skill = {
     teamSourceSkillId?: string | null;
     teamPinnedVersion?: number | null;
     stagingVersion?: number;
-    skillSetId?: string | null;
-    skillSetName?: string;
-    isSetMember?: boolean;
+    skillSpaceId?: string | null;
+    skillSpaceName?: string;
+    isSpaceMember?: boolean;
     forkedFromId?: string | null;
 };
 
@@ -244,12 +244,12 @@ export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, label
     return sendRpc('skill.updateLabels', { id, labels });
 }
 
-/** Fork a builtin/team skill to personal or skill set scope (server-side content copy) */
+/** Fork a builtin/team skill to personal or skill space scope (server-side content copy) */
 export async function rpcForkSkill(
     sendRpc: RpcSendFn,
     sourceId: string,
-    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSetId?: string },
-): Promise<{ id: string; dirName: string; name: string; forkedFromId: string; skillSetId?: string }> {
+    overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSpaceId?: string },
+): Promise<{ id: string; dirName: string; name: string; forkedFromId: string; skillSpaceId?: string }> {
     return sendRpc('skill.fork', { sourceId, ...overrides });
 }
 
@@ -258,9 +258,9 @@ export async function rpcCopySkillToPersonal(sendRpc: RpcSendFn, id: string): Pr
     return rpcForkSkill(sendRpc, String(id));
 }
 
-// ─── Skill Set RPC ───
+// ─── Skill Space RPC ───
 
-export interface SkillSet {
+export interface SkillSpace {
     id: string;
     name: string;
     description?: string;
@@ -270,59 +270,59 @@ export interface SkillSet {
     updatedAt: string;
 }
 
-export interface SkillSetMember {
+export interface SkillSpaceMember {
     id: string;
-    skillSetId: string;
+    skillSpaceId: string;
     userId: string;
     role: string;
     username?: string;
     joinedAt: string;
 }
 
-export async function rpcListSkillSets(sendRpc: RpcSendFn): Promise<SkillSet[]> {
-    const result = await sendRpc<{ skillSets: SkillSet[] }>('skillSet.list');
-    return result.skillSets ?? [];
+export async function rpcListSkillSpaces(sendRpc: RpcSendFn): Promise<SkillSpace[]> {
+    const result = await sendRpc<{ skillSpaces: SkillSpace[] }>('skillSpace.list');
+    return result.skillSpaces ?? [];
 }
 
-export async function rpcCreateSkillSet(sendRpc: RpcSendFn, name: string, description?: string): Promise<{ id: string; name: string }> {
-    return sendRpc('skillSet.create', { name, description });
+export async function rpcCreateSkillSpace(sendRpc: RpcSendFn, name: string, description?: string): Promise<{ id: string; name: string }> {
+    return sendRpc('skillSpace.create', { name, description });
 }
 
-export async function rpcGetSkillSet(sendRpc: RpcSendFn, id: string): Promise<SkillSet & { members: SkillSetMember[]; skills: Skill[] }> {
-    return sendRpc('skillSet.get', { id });
+export async function rpcGetSkillSpace(sendRpc: RpcSendFn, id: string): Promise<SkillSpace & { members: SkillSpaceMember[]; skills: Skill[] }> {
+    return sendRpc('skillSpace.get', { id });
 }
 
-export async function rpcUpdateSkillSet(sendRpc: RpcSendFn, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
-    return sendRpc('skillSet.update', { id, ...updates });
+export async function rpcUpdateSkillSpace(sendRpc: RpcSendFn, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
+    return sendRpc('skillSpace.update', { id, ...updates });
 }
 
-export async function rpcDeleteSkillSet(sendRpc: RpcSendFn, id: string): Promise<{ status: string }> {
-    return sendRpc('skillSet.delete', { id });
+export async function rpcDeleteSkillSpace(sendRpc: RpcSendFn, id: string): Promise<{ status: string }> {
+    return sendRpc('skillSpace.delete', { id });
 }
 
-export async function rpcAddSkillSetMember(sendRpc: RpcSendFn, skillSetId: string, username: string): Promise<{ status: string; userId: string; username: string }> {
-    return sendRpc('skillSet.addMember', { skillSetId, username });
+export async function rpcAddSkillSpaceMember(sendRpc: RpcSendFn, skillSpaceId: string, username: string): Promise<{ status: string; userId: string; username: string }> {
+    return sendRpc('skillSpace.addMember', { skillSpaceId, username });
 }
 
-export async function rpcRemoveSkillSetMember(sendRpc: RpcSendFn, skillSetId: string, userId: string): Promise<{ status: string }> {
-    return sendRpc('skillSet.removeMember', { skillSetId, userId });
+export async function rpcRemoveSkillSpaceMember(sendRpc: RpcSendFn, skillSpaceId: string, userId: string): Promise<{ status: string }> {
+    return sendRpc('skillSpace.removeMember', { skillSpaceId, userId });
 }
 
-export async function rpcListSkillSetMembers(sendRpc: RpcSendFn, skillSetId: string): Promise<{ members: SkillSetMember[] }> {
-    return sendRpc('skillSet.listMembers', { skillSetId });
+export async function rpcListSkillSpaceMembers(sendRpc: RpcSendFn, skillSpaceId: string): Promise<{ members: SkillSpaceMember[] }> {
+    return sendRpc('skillSpace.listMembers', { skillSpaceId });
 }
 
-/** Move a personal skill into a skill set */
-export async function rpcMoveSkillToSet(sendRpc: RpcSendFn, skillId: string, targetSkillSetId: string): Promise<{ status: string }> {
-    return sendRpc('skill.moveToSet', { skillId, targetSkillSetId });
+/** Move a personal skill into a skill space */
+export async function rpcMoveSkillToSpace(sendRpc: RpcSendFn, skillId: string, targetSkillSpaceId: string): Promise<{ status: string }> {
+    return sendRpc('skill.moveToSpace', { skillId, targetSkillSpaceId });
 }
 
-/** Toggle share link for a skill set (owner only) */
-export async function rpcToggleShareLink(sendRpc: RpcSendFn, skillSetId: string, enabled: boolean): Promise<{ token: string | null }> {
-    return sendRpc('skillSet.toggleShareLink', { skillSetId, enabled });
+/** Toggle share link for a skill space (owner only) */
+export async function rpcToggleShareLink(sendRpc: RpcSendFn, skillSpaceId: string, enabled: boolean): Promise<{ token: string | null }> {
+    return sendRpc('skillSpace.toggleShareLink', { skillSpaceId, enabled });
 }
 
-/** Join a skill set via invite token */
-export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string): Promise<{ setId: string; joined?: boolean; alreadyMember?: boolean }> {
-    return sendRpc('skillSet.joinByToken', { token });
+/** Join a skill space via invite token */
+export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string): Promise<{ spaceId: string; joined?: boolean; alreadyMember?: boolean }> {
+    return sendRpc('skillSpace.joinByToken', { token });
 }

@@ -2,21 +2,21 @@
  * Skill Bundle Builder
  *
  * Builds a SkillBundle for AgentBox consumption.
- * Only includes team + personal + skillset skills — builtin skills are baked into the AgentBox Docker image.
+ * Only includes team + personal + skill-space skills — builtin skills are baked into the AgentBox Docker image.
  */
 
 import crypto from "node:crypto";
 import type { SkillFileWriter } from "./file-writer.js";
 import type { SkillRepository } from "../db/repositories/skill-repo.js";
 import type { SkillContentRepository } from "../db/repositories/skill-content-repo.js";
-import type { SkillSetRepository } from "../db/repositories/skill-set-repo.js";
+import type { SkillSpaceRepository } from "../db/repositories/skill-space-repo.js";
 
 export interface SkillBundleEntry {
   dirName: string;
   scope: "team" | "personal" | "skillset";
   specs: string;
   scripts: Array<{ name: string; content: string }>;
-  skillSetId?: string;
+  skillSpaceId?: string;
 }
 
 export interface SkillBundle {
@@ -42,7 +42,7 @@ export async function buildSkillBundle(
   skillRepo: SkillRepository,
   skillContentRepo: SkillContentRepository,
   disabledSkills?: Set<string>,
-  skillSetRepo?: SkillSetRepository,
+  skillSpaceRepo?: SkillSpaceRepository,
 ): Promise<SkillBundle> {
   const skills: SkillBundleEntry[] = [];
   const disabled = disabledSkills ?? new Set<string>();
@@ -89,12 +89,12 @@ export async function buildSkillBundle(
     }
   }
 
-  // 3. Skill set skills (from DB — skills in sets the user is a member of)
-  if (skillSetRepo) {
-    const userSets = await skillSetRepo.listForUser(userId);
-    for (const set of userSets) {
-      const setSkills = await skillRepo.listBySkillSetId(set.id);
-      for (const meta of setSkills) {
+  // 3. Skill space skills (from DB — skills in spaces the user is a member of)
+  if (skillSpaceRepo) {
+    const userSpaces = await skillSpaceRepo.listForUser(userId);
+    for (const space of userSpaces) {
+      const spaceSkills = await skillRepo.listBySkillSpaceId(space.id);
+      for (const meta of spaceSkills) {
         if (disabled.has(meta.name)) continue;
         const files = await skillContentRepo.read(meta.id, "working");
         if (!files) continue;
@@ -103,7 +103,7 @@ export async function buildSkillBundle(
           scope: "skillset",
           specs: files.specs ?? "",
           scripts: files.scripts ?? [],
-          skillSetId: set.id,
+          skillSpaceId: space.id,
         });
       }
     }

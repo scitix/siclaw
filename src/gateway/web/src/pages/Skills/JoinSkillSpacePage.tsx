@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { rpcJoinByToken } from './skillsData';
 
-export function JoinSkillSetPage() {
+export function JoinSkillSpacePage() {
     const { token } = useParams();
     const navigate = useNavigate();
     const { sendRpc, isConnected } = useWebSocket();

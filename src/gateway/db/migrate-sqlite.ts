@@ -56,7 +56,7 @@ const DDL_STATEMENTS = [
     duration_ms INTEGER
   )`,
 
-  `CREATE TABLE IF NOT EXISTS skill_sets (
+  `CREATE TABLE IF NOT EXISTS skill_spaces (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
     description TEXT,
@@ -66,13 +66,13 @@ const DDL_STATEMENTS = [
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
 
-  `CREATE TABLE IF NOT EXISTS skill_set_members (
+  `CREATE TABLE IF NOT EXISTS skill_space_members (
     id TEXT PRIMARY KEY,
-    skill_set_id TEXT NOT NULL REFERENCES skill_sets(id) ON DELETE CASCADE,
+    skill_space_id TEXT NOT NULL REFERENCES skill_spaces(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role TEXT NOT NULL DEFAULT 'member',
     joined_at INTEGER NOT NULL DEFAULT (unixepoch()),
-    UNIQUE (skill_set_id, user_id)
+    UNIQUE (skill_space_id, user_id)
   )`,
 
   `CREATE TABLE IF NOT EXISTS skills (
@@ -96,7 +96,7 @@ const DDL_STATEMENTS = [
     team_pinned_version INTEGER,
     forked_from_id TEXT,
     labels_json TEXT,
-    skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL
+    skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
   )`,
 
   `CREATE TABLE IF NOT EXISTS channels (
@@ -426,9 +426,9 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_user ON feedback_reports(user_id, created_at)`,
   `CREATE INDEX IF NOT EXISTS idx_feedback_reports_session ON feedback_reports(session_id)`,
   `CREATE INDEX IF NOT EXISTS idx_knowledge_docs_name ON knowledge_docs(name)`,
-  `CREATE INDEX IF NOT EXISTS idx_skill_set_members_user ON skill_set_members(user_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_skill_set_members_set ON skill_set_members(skill_set_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_skills_skill_set ON skills(skill_set_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_space_members_user ON skill_space_members(user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skill_space_members_space ON skill_space_members(skill_space_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skills_skill_space ON skills(skill_space_id)`,
 ];
 
 export async function runSqliteMigrations(db: Database): Promise<void> {
@@ -461,10 +461,15 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE knowledge_docs DROP COLUMN description`,
     // Per-cluster debug image
     `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
-    // Skill sets: add skill_set_id to skills
-    `ALTER TABLE skills ADD COLUMN skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL`,
-    // Skill sets: invite token for share links
-    `ALTER TABLE skill_sets ADD COLUMN invite_token TEXT`,
+    // Rename skill_sets → skill_spaces, skill_set_members → skill_space_members
+    `ALTER TABLE skill_sets RENAME TO skill_spaces`,
+    `ALTER TABLE skill_set_members RENAME TO skill_space_members`,
+    `ALTER TABLE skill_space_members RENAME COLUMN skill_set_id TO skill_space_id`,
+    `ALTER TABLE skills RENAME COLUMN skill_set_id TO skill_space_id`,
+    // Skill spaces: add skill_space_id to skills (fresh DBs that never had skill_sets)
+    `ALTER TABLE skills ADD COLUMN skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL`,
+    // Skill spaces: invite token for share links
+    `ALTER TABLE skill_spaces ADD COLUMN invite_token TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
@@ -530,9 +535,14 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
         team_pinned_version INTEGER,
         forked_from_id TEXT,
         labels_json TEXT,
-        skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL
+        skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
       )`));
-      sdb.run(sql.raw(`INSERT INTO skills SELECT
+      sdb.run(sql.raw(`INSERT INTO skills (
+        id, name, description, type, version, published_version, staging_version,
+        scope, author_id, status, contribution_status, review_status, dir_name,
+        created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
+        forked_from_id, labels_json, skill_space_id
+      ) SELECT
         id, name, description, type, version, published_version, staging_version,
         scope, author_id, status, contribution_status, review_status, dir_name,
         created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,

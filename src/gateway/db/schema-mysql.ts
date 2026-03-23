@@ -76,9 +76,9 @@ export const messages = mysqlTable("messages", {
   durationMs: int("duration_ms"),
 });
 
-// ─── Skill Sets (collaboration spaces) ──────────────
+// ─── Skill Spaces (collaboration spaces) ─────────────
 
-export const skillSets = mysqlTable("skill_sets", {
+export const skillSpaces = mysqlTable("skill_spaces", {
   id: varchar("id", { length: 64 }).primaryKey(),
   name: varchar("name", { length: 255 }).notNull().unique(),
   description: text("description"),
@@ -88,14 +88,14 @@ export const skillSets = mysqlTable("skill_sets", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
-export const skillSetMembers = mysqlTable("skill_set_members", {
+export const skillSpaceMembers = mysqlTable("skill_space_members", {
   id: varchar("id", { length: 64 }).primaryKey(),
-  skillSetId: varchar("skill_set_id", { length: 64 }).notNull().references(() => skillSets.id, { onDelete: "cascade" }),
+  skillSpaceId: varchar("skill_space_id", { length: 64 }).notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
   userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id, { onDelete: "cascade" }),
   role: varchar("role", { length: 20 }).notNull().default("member"), // "owner" | "member"
   joinedAt: timestamp("joined_at").notNull().defaultNow(),
 }, (table) => ({
-  ukSetUser: uniqueIndex("uk_skill_set_member").on(table.skillSetId, table.userId),
+  ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),
 }));
 
 // ─── Skills ──────────────────────────────────────────
@@ -128,7 +128,7 @@ export const skills = mysqlTable("skills", {
   teamPinnedVersion: int("team_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
   labelsJson: json("labels_json").$type<string[]>(),
-  skillSetId: varchar("skill_set_id", { length: 64 }).references(() => skillSets.id),
+  skillSpaceId: varchar("skill_space_id", { length: 64 }).references(() => skillSpaces.id),
 });
 
 // ─── Skill Contents ─────────────────────────────────

@@ -1,5 +1,5 @@
 /**
- * Shared AddSkillDialog — used by both SkillsPage (index.tsx) and SkillSetDetail.tsx.
+ * Shared AddSkillDialog — used by both SkillsPage (index.tsx) and SkillSpaceDetail.tsx.
  * Includes: three tabs (Fork from Global / From My Skills / Create New),
  * search, label filter chips, inline error, existing skill filtering, Move/Fork dual actions.
  */
@@ -9,7 +9,7 @@ import { Search, X, GitFork, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { Skill } from './skillsData';
 import {
-    rpcGetSkills, rpcGetSkillSet, rpcForkSkill, rpcMoveSkillToSet,
+    rpcGetSkills, rpcGetSkillSpace, rpcForkSkill, rpcMoveSkillToSpace,
     type RpcSendFn,
 } from './skillsData';
 
@@ -34,15 +34,15 @@ const LABEL_COLORS: Record<string, string> = {
 
 export interface AddSkillDialogProps {
     isOpen: boolean;
-    skillSetId: string;
-    skillSetName: string;
+    skillSpaceId: string;
+    skillSpaceName: string;
     sendRpc: RpcSendFn;
     onClose: () => void;
     onSuccess: () => void;
 }
 
 export function AddSkillDialog({
-    isOpen, skillSetId, skillSetName, sendRpc, onClose, onSuccess,
+    isOpen, skillSpaceId, skillSpaceName, sendRpc, onClose, onSuccess,
 }: AddSkillDialogProps) {
     const [tab, setTab] = useState<'global' | 'personal' | 'new'>('global');
     const [search, setSearch] = useState('');
@@ -68,23 +68,23 @@ export function AddSkillDialog({
 
         Promise.all([
             rpcGetSkills(sendRpc, { limit: 200 }),
-            rpcGetSkillSet(sendRpc, skillSetId),
-        ]).then(([result, setDetail]) => {
+            rpcGetSkillSpace(sendRpc, skillSpaceId),
+        ]).then(([result, spaceDetail]) => {
             setGlobalSkills(result.skills.filter(s => s.scope === 'builtin' || s.scope === 'team'));
             setPersonalSkills(result.skills.filter(s => s.scope === 'personal'));
-            setExistingNames(new Set((setDetail.skills ?? []).map((s: Skill) => s.name)));
+            setExistingNames(new Set((spaceDetail.skills ?? []).map((s: Skill) => s.name)));
             setLoading(false);
         }).catch(() => {
             setLoading(false);
         });
-    }, [isOpen, skillSetId, sendRpc]);
+    }, [isOpen, skillSpaceId, sendRpc]);
 
     if (!isOpen) return null;
 
     const handleFork = async (sourceId: string) => {
         setError(null);
         try {
-            await rpcForkSkill(sendRpc, sourceId, { targetSkillSetId: skillSetId });
+            await rpcForkSkill(sendRpc, sourceId, { targetSkillSpaceId: skillSpaceId });
             onSuccess();
             onClose();
         } catch (err: any) {
@@ -95,7 +95,7 @@ export function AddSkillDialog({
     const handleMove = async (skillId: string) => {
         setError(null);
         try {
-            await rpcMoveSkillToSet(sendRpc, String(skillId), skillSetId);
+            await rpcMoveSkillToSpace(sendRpc, String(skillId), skillSpaceId);
             onSuccess();
             onClose();
         } catch (err: any) {
@@ -108,7 +108,7 @@ export function AddSkillDialog({
         if (!name) return;
         setError(null);
         try {
-            await sendRpc('skill.create', { name, skillSetId });
+            await sendRpc('skill.create', { name, skillSpaceId });
             onSuccess();
             onClose();
         } catch (err: any) {
@@ -151,7 +151,7 @@ export function AddSkillDialog({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
             <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg mx-4 flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
                 <div className="px-6 pt-5 pb-3 border-b">
-                    <h3 className="text-base font-semibold text-gray-900">Add Skill to {skillSetName}</h3>
+                    <h3 className="text-base font-semibold text-gray-900">Add Skill to {skillSpaceName}</h3>
                     <div className="flex gap-1 mt-3">
                         {tabs.map(t => (
                             <button
@@ -305,7 +305,7 @@ export function AddSkillDialog({
                                 disabled={!newName.trim()}
                                 className="w-full px-4 py-2 text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 rounded-lg disabled:opacity-40"
                             >
-                                Create in {skillSetName}
+                                Create in {skillSpaceName}
                             </button>
                         </div>
                     )}

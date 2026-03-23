@@ -7,10 +7,10 @@ import { getCurrentUser } from '../../auth';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { Tooltip } from '../../components/Tooltip';
 import { AddSkillDialog } from './AddSkillDialog';
-import type { Skill, SkillSet, SkillSetMember } from './skillsData';
+import type { Skill, SkillSpace, SkillSpaceMember } from './skillsData';
 import {
-    rpcGetSkillSet, rpcUpdateSkillSet, rpcDeleteSkillSet,
-    rpcAddSkillSetMember, rpcRemoveSkillSetMember,
+    rpcGetSkillSpace, rpcUpdateSkillSpace, rpcDeleteSkillSpace,
+    rpcAddSkillSpaceMember, rpcRemoveSkillSpaceMember,
     rpcForkSkill, rpcDeleteSkill,
 } from './skillsData';
 
@@ -45,13 +45,13 @@ function InlineEdit({ value, onSave, className, placeholder }: {
     );
 }
 
-export function SkillSetDetailPage() {
-    const { setId } = useParams();
+export function SkillSpaceDetailPage() {
+    const { spaceId } = useParams();
     const navigate = useNavigate();
     const { sendRpc, isConnected } = useWebSocket();
     const currentUser = getCurrentUser();
 
-    const [setData, setSetData] = useState<(SkillSet & { members: SkillSetMember[]; skills: Skill[] }) | null>(null);
+    const [spaceData, setSpaceData] = useState<(SkillSpace & { members: SkillSpaceMember[]; skills: Skill[] }) | null>(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [addDialog, setAddDialog] = useState(false);
@@ -63,32 +63,32 @@ export function SkillSetDetailPage() {
         variant: 'primary' | 'danger' | 'warning'; confirmText: string; onConfirm: () => void;
     }>({ isOpen: false, title: '', description: '', variant: 'primary', confirmText: 'Confirm', onConfirm: () => {} });
 
-    const isOwner = setData?.ownerId === currentUser?.id;
-    const isMember = setData?.members.some(m => m.userId === currentUser?.id) ?? false;
+    const isOwner = spaceData?.ownerId === currentUser?.id;
+    const isMember = spaceData?.members.some(m => m.userId === currentUser?.id) ?? false;
 
     const reload = useCallback(async () => {
-        if (!setId || !isConnected) return;
+        if (!spaceId || !isConnected) return;
         try {
-            const data = await rpcGetSkillSet(sendRpc, setId);
-            setSetData({
+            const data = await rpcGetSkillSpace(sendRpc, spaceId);
+            setSpaceData({
                 ...data,
                 skills: data.skills.map((s: any) => ({ ...s, icon: null, version: `v${s.version || 1}`, enabled: s.enabled ?? true })),
             });
             setError(null);
         } catch (err: any) {
-            setError(err.message || 'Failed to load skill set');
+            setError(err.message || 'Failed to load skill space');
         } finally {
             setLoading(false);
         }
-    }, [setId, isConnected, sendRpc]);
+    }, [spaceId, isConnected, sendRpc]);
 
     useEffect(() => { reload(); }, [reload]);
 
     const handleInvite = async () => {
-        if (!setId || !inviteUsername.trim()) return;
+        if (!spaceId || !inviteUsername.trim()) return;
         setInviteError(null);
         try {
-            await rpcAddSkillSetMember(sendRpc, setId, inviteUsername.trim());
+            await rpcAddSkillSpaceMember(sendRpc, spaceId, inviteUsername.trim());
             setInviteUsername('');
             setShowInvite(false);
             reload();
@@ -100,31 +100,31 @@ export function SkillSetDetailPage() {
     const handleRemoveMember = (userId: string, username: string) => {
         setConfirmDialog({
             isOpen: true, title: 'Remove Member',
-            description: `Remove "${username}" from this skill set?`,
+            description: `Remove "${username}" from this skill space?`,
             variant: 'danger', confirmText: 'Remove',
-            onConfirm: async () => { await rpcRemoveSkillSetMember(sendRpc, setId!, userId); reload(); },
+            onConfirm: async () => { await rpcRemoveSkillSpaceMember(sendRpc, spaceId!, userId); reload(); },
         });
     };
 
     const handleLeave = () => {
         setConfirmDialog({
-            isOpen: true, title: 'Leave Skill Set',
-            description: 'You will lose access to all skills in this set.',
+            isOpen: true, title: 'Leave Skill Space',
+            description: 'You will lose access to all skills in this space.',
             variant: 'warning', confirmText: 'Leave',
             onConfirm: async () => {
-                await rpcRemoveSkillSetMember(sendRpc, setId!, currentUser!.id);
+                await rpcRemoveSkillSpaceMember(sendRpc, spaceId!, currentUser!.id);
                 navigate('/skills?tab=myskills');
             },
         });
     };
 
-    const handleDeleteSet = () => {
+    const handleDeleteSpace = () => {
         setConfirmDialog({
-            isOpen: true, title: 'Delete Skill Set',
+            isOpen: true, title: 'Delete Skill Space',
             description: 'All skills must be removed first.',
             variant: 'danger', confirmText: 'Delete',
             onConfirm: async () => {
-                try { await rpcDeleteSkillSet(sendRpc, setId!); navigate('/skills?tab=myskills'); }
+                try { await rpcDeleteSkillSpace(sendRpc, spaceId!); navigate('/skills?tab=myskills'); }
                 catch (err: any) { setError(err.message || 'Failed to delete'); }
             },
         });
@@ -133,7 +133,7 @@ export function SkillSetDetailPage() {
     const handleDeleteSkill = (skill: Skill) => {
         setConfirmDialog({
             isOpen: true, title: 'Remove Skill',
-            description: `Delete "${skill.name}" from this skill set?`,
+            description: `Delete "${skill.name}" from this skill space?`,
             variant: 'danger', confirmText: 'Delete',
             onConfirm: async () => { await rpcDeleteSkill(sendRpc, String(skill.id)); reload(); },
         });
@@ -142,10 +142,10 @@ export function SkillSetDetailPage() {
     if (loading) {
         return <div className="flex items-center justify-center h-full"><div className="w-5 h-5 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" /></div>;
     }
-    if (error || !setData) {
+    if (error || !spaceData) {
         return (
             <div className="flex flex-col items-center justify-center h-full gap-3">
-                <p className="text-sm text-gray-500">{error || 'Skill set not found'}</p>
+                <p className="text-sm text-gray-500">{error || 'Skill space not found'}</p>
                 <button onClick={() => navigate('/skills?tab=myskills')} className="text-sm text-gray-600 hover:text-gray-900 underline">Back to Skills</button>
             </div>
         );
@@ -156,7 +156,7 @@ export function SkillSetDetailPage() {
             <ConfirmDialog isOpen={confirmDialog.isOpen} onClose={() => setConfirmDialog(p => ({ ...p, isOpen: false }))}
                 onConfirm={confirmDialog.onConfirm} title={confirmDialog.title} description={confirmDialog.description}
                 variant={confirmDialog.variant} confirmText={confirmDialog.confirmText} />
-            <AddSkillDialog isOpen={addDialog} skillSetId={setId!} skillSetName={setData.name}
+            <AddSkillDialog isOpen={addDialog} skillSpaceId={spaceId!} skillSpaceName={spaceData.name}
                 sendRpc={sendRpc} onClose={() => setAddDialog(false)} onSuccess={reload} />
 
             {/* Header */}
@@ -167,16 +167,16 @@ export function SkillSetDetailPage() {
                 </button>
                 <div className="flex-1 min-w-0">
                     {isOwner ? (
-                        <InlineEdit value={setData.name} onSave={async name => { await rpcUpdateSkillSet(sendRpc, setId!, { name }); reload(); }}
+                        <InlineEdit value={spaceData.name} onSave={async name => { await rpcUpdateSkillSpace(sendRpc, spaceId!, { name }); reload(); }}
                             className="text-lg font-semibold text-gray-900" />
                     ) : (
-                        <h1 className="text-lg font-semibold text-gray-900">{setData.name}</h1>
+                        <h1 className="text-lg font-semibold text-gray-900">{spaceData.name}</h1>
                     )}
                     {isOwner ? (
-                        <InlineEdit value={setData.description || ''} onSave={async description => { await rpcUpdateSkillSet(sendRpc, setId!, { description }); reload(); }}
+                        <InlineEdit value={spaceData.description || ''} onSave={async description => { await rpcUpdateSkillSpace(sendRpc, spaceId!, { description }); reload(); }}
                             className="text-sm text-gray-500 mt-0.5" placeholder="Add a description..." />
-                    ) : setData.description ? (
-                        <p className="text-sm text-gray-500 mt-0.5">{setData.description}</p>
+                    ) : spaceData.description ? (
+                        <p className="text-sm text-gray-500 mt-0.5">{spaceData.description}</p>
                     ) : null}
                 </div>
                 {isOwner && (
@@ -207,10 +207,10 @@ export function SkillSetDetailPage() {
                 <section>
                     <div className="flex items-center gap-2 mb-3">
                         <Users className="w-4 h-4 text-gray-400" />
-                        <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Members ({setData.members.length})</h2>
+                        <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Members ({spaceData.members.length})</h2>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                        {setData.members.map(m => (
+                        {spaceData.members.map(m => (
                             <div key={m.id} className={cn("inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm border",
                                 m.role === 'owner' ? "bg-amber-50 border-amber-200" : "bg-gray-50 border-gray-200")}>
                                 {m.role === 'owner' && <Crown className="w-3 h-3 text-amber-500" />}
@@ -227,7 +227,7 @@ export function SkillSetDetailPage() {
                     </div>
                     {!isOwner && isMember && (
                         <button onClick={handleLeave} className="mt-3 inline-flex items-center gap-1.5 text-xs text-gray-400 hover:text-red-500 transition-colors">
-                            <LogOut className="w-3 h-3" /> Leave this set
+                            <LogOut className="w-3 h-3" /> Leave this space
                         </button>
                     )}
                 </section>
@@ -235,7 +235,7 @@ export function SkillSetDetailPage() {
                 {/* Skills */}
                 <section>
                     <div className="flex items-center justify-between mb-3">
-                        <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Skills ({setData.skills.length})</h2>
+                        <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Skills ({spaceData.skills.length})</h2>
                         {isMember && (
                             <button onClick={() => setAddDialog(true)}
                                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition-colors">
@@ -243,14 +243,14 @@ export function SkillSetDetailPage() {
                             </button>
                         )}
                     </div>
-                    {setData.skills.length === 0 ? (
+                    {spaceData.skills.length === 0 ? (
                         <div className="text-center py-12 text-gray-400">
-                            <p className="text-sm">No skills in this set yet.</p>
+                            <p className="text-sm">No skills in this space yet.</p>
                             {isMember && <button onClick={() => setAddDialog(true)} className="mt-2 text-sm text-gray-600 hover:text-gray-900 underline">Add your first skill</button>}
                         </div>
                     ) : (
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {setData.skills.map(skill => (
+                            {spaceData.skills.map(skill => (
                                 <div key={skill.id} onClick={() => navigate(`/skills/${skill.id}`)}
                                     className="group rounded-xl border border-gray-200 p-5 hover:shadow-md hover:border-gray-300 transition-all cursor-pointer flex flex-col">
                                     <div className="flex items-start justify-between mb-2">
@@ -272,7 +272,7 @@ export function SkillSetDetailPage() {
                                     </div>
                                     <p className="text-xs text-gray-500 line-clamp-2 flex-1">{skill.description || 'No description'}</p>
                                     <div className="flex items-center gap-2 mt-3">
-                                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">{setData.name}</span>
+                                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">{spaceData.name}</span>
                                         <span className="text-[10px] text-gray-400">v{(skill as any).version || 1}</span>
                                     </div>
                                 </div>
@@ -284,9 +284,9 @@ export function SkillSetDetailPage() {
                 {/* Danger zone */}
                 {isOwner && (
                     <section className="pt-6 border-t">
-                        <button onClick={handleDeleteSet}
+                        <button onClick={handleDeleteSpace}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 transition-colors">
-                            <Trash2 className="w-3.5 h-3.5" /> Delete Skill Set
+                            <Trash2 className="w-3.5 h-3.5" /> Delete Skill Space
                         </button>
                     </section>
                 )}

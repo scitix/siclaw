@@ -47,7 +47,7 @@ export class SkillFileWriter {
     scope: SkillFileScope,
     dirName: string,
     userId?: string,
-    skillSetId?: string,
+    skillSpaceId?: string,
   ): string {
     switch (scope) {
       case "builtin":
@@ -57,7 +57,7 @@ export class SkillFileWriter {
       case "personal":
         return path.join(this.skillsDir, "user", userId || "unknown", dirName);
       case "skillset":
-        return path.join(this.skillsDir, "skillset", skillSetId || "unknown", dirName);
+        return path.join(this.skillsDir, "skillset", skillSpaceId || "unknown", dirName);
     }
   }
 
@@ -66,9 +66,9 @@ export class SkillFileWriter {
     scope: SkillFileScope,
     dirName: string,
     files: SkillFiles,
-    opts: { userId?: string; skillSetId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<{ skillDir: string }> {
-    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSetId);
+    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSpaceId);
 
     // Ensure directory exists
     if (!fs.existsSync(skillDir)) {
@@ -115,9 +115,9 @@ export class SkillFileWriter {
     scope: SkillFileScope,
     dirName: string,
     userId?: string,
-    skillSetId?: string,
+    skillSpaceId?: string,
   ): SkillFiles | null {
-    let skillDir = this.resolveDir(scope, dirName, userId, skillSetId);
+    let skillDir = this.resolveDir(scope, dirName, userId, skillSpaceId);
 
     // Fallback to Docker-baked cwd/skills/{core,extension} for builtin skills
     if (!fs.existsSync(skillDir) && scope === "builtin") {
@@ -253,9 +253,9 @@ export class SkillFileWriter {
   async deleteSkill(
     scope: SkillFileScope,
     dirName: string,
-    opts: { userId?: string; skillSetId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<void> {
-    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSetId);
+    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSpaceId);
 
     if (fs.existsSync(skillDir)) {
       fs.rmSync(skillDir, { recursive: true, force: true });
@@ -387,10 +387,10 @@ export class SkillFileWriter {
     scope: SkillFileScope,
     oldDirName: string,
     newDirName: string,
-    opts: { userId?: string; skillSetId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<void> {
-    const oldDir = this.resolveDir(scope, oldDirName, opts.userId, opts.skillSetId);
-    const newDir = this.resolveDir(scope, newDirName, opts.userId, opts.skillSetId);
+    const oldDir = this.resolveDir(scope, oldDirName, opts.userId, opts.skillSpaceId);
+    const newDir = this.resolveDir(scope, newDirName, opts.userId, opts.skillSpaceId);
 
     if (!fs.existsSync(oldDir)) {
       throw new Error(`Skill directory not found: ${oldDir}`);

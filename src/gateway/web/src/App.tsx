@@ -7,8 +7,8 @@ import { SsoCallback } from './pages/Login/SsoCallback';
 import { PilotPage } from './pages/Pilot';
 import { SkillsPage } from './pages/Skills';
 import { SkillEditor } from './pages/Skills/SkillEditor';
-import { SkillSetDetailPage } from './pages/Skills/SkillSetDetail';
-import { JoinSkillSetPage } from './pages/Skills/JoinSkillSetPage';
+import { SkillSpaceDetailPage } from './pages/Skills/SkillSpaceDetail';
+import { JoinSkillSpacePage } from './pages/Skills/JoinSkillSpacePage';
 import { ChannelsPage } from './pages/Channels';
 import { TriggersPage } from './pages/Triggers';
 import { CronPage } from './pages/Cron';
@@ -54,8 +54,8 @@ const router = createBrowserRouter([
                         path: 'skills',
                         children: [
                             { index: true, element: <SkillsPage /> },
-                            { path: 'sets/join/:token', element: <JoinSkillSetPage /> },
-                            { path: 'sets/:setId', element: <SkillSetDetailPage /> },
+                            { path: 'spaces/join/:token', element: <JoinSkillSpacePage /> },
+                            { path: 'spaces/:spaceId', element: <SkillSpaceDetailPage /> },
                             { path: ':id', element: <SkillEditor /> },
                         ],
                     },
