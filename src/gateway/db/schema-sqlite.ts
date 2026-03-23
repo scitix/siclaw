@@ -80,6 +80,7 @@ export const skillSets = sqliteTable("skill_sets", {
   name: text("name").notNull().unique(),
   description: text("description"),
   ownerId: text("owner_id").notNull().references(() => users.id),
+  inviteToken: text("invite_token"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });

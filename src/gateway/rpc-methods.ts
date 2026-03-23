@@ -1795,7 +1795,7 @@ export function createRpcMethods(
   });
 
   methods.set("skill.get", async (params, context: RpcContext) => {
-    requireAuth(context);
+    const userId = requireAuth(context);
     const skillId = params.id as string;
     if (!skillId) throw new Error("Missing required param: id");
 
@@ -1879,6 +1879,15 @@ export function createRpcMethods(
     const mergedLabels = [...new Set([...dbLabels, ...fsLabels])];
     const { labelsJson: _lj, ...metaRest } = meta as any;
 
+    // Resolve skill set info for skillset-scoped skills
+    let skillSetName: string | null = null;
+    let isSetMember = false;
+    if (meta.scope === "skillset" && meta.skillSetId && skillSetRepo) {
+      const set = await skillSetRepo.getById(meta.skillSetId);
+      if (set) skillSetName = set.name;
+      isSetMember = await skillSetRepo.isMember(meta.skillSetId, userId);
+    }
+
     return {
       ...metaRest,
       labels: mergedLabels.length > 0 ? mergedLabels : undefined,
@@ -1889,6 +1898,8 @@ export function createRpcMethods(
       teamSourceSkillId: (meta as any).teamSourceSkillId ?? null,
       teamPinnedVersion: (meta as any).teamPinnedVersion ?? null,
       forkedFromId: (meta as any).forkedFromId ?? null,
+      ...(skillSetName ? { skillSetName } : {}),
+      ...(meta.scope === "skillset" ? { isSetMember } : {}),
     };
   });
 
@@ -2083,7 +2094,10 @@ export function createRpcMethods(
       const sourceMeta = await skillRepo.getById(sourceId);
       if (!sourceMeta) throw new Error(`Source skill not found: ${sourceId}`);
       if (sourceMeta.scope === "personal") {
-        throw new Error("Cannot fork personal skills. Only builtin and team skills can be forked.");
+        // Allow forking own personal skill into a skill set (keeps original)
+        if (!targetSkillSetId || sourceMeta.authorId !== userId) {
+          throw new Error("Cannot fork personal skills. Only builtin and team skills can be forked.");
+        }
       }
       sourceName = sourceMeta.name;
       sourceDescription = sourceMeta.description ?? undefined;
@@ -3617,7 +3631,14 @@ export function createRpcMethods(
       return { ...m, username };
     }));
 
-    return { ...set, members: enrichedMembers, skills: setSkills };
+    const isOwner = set.ownerId === userId;
+    return {
+      ...set,
+      members: enrichedMembers,
+      skills: setSkills,
+      // Only expose invite token to the owner
+      inviteToken: isOwner ? (set as any).inviteToken ?? null : undefined,
+    };
   });
 
   methods.set("skillSet.update", async (params, context: RpcContext) => {
@@ -3686,12 +3707,21 @@ export function createRpcMethods(
     if (!targetUserId) throw new Error("Missing required param: userId");
     if (!skillSetRepo) throw new Error("Database not available");
 
-    const isOwner = await skillSetRepo.isOwner(skillSetId, userId);
-    if (!isOwner) throw new Error("Forbidden: only the owner can remove members");
+    // Allow members to remove themselves (leave), but owner cannot leave
+    const isSelfLeave = targetUserId === userId;
+    if (isSelfLeave) {
+      const targetIsOwner = await skillSetRepo.isOwner(skillSetId, userId);
+      if (targetIsOwner) throw new Error("Owner cannot leave the skill set. Transfer ownership or delete the set.");
+    } else {
+      const isOwner = await skillSetRepo.isOwner(skillSetId, userId);
+      if (!isOwner) throw new Error("Forbidden: only the owner can remove other members");
+    }
 
-    // Cannot remove the owner
-    const targetIsOwner = await skillSetRepo.isOwner(skillSetId, targetUserId);
-    if (targetIsOwner) throw new Error("Cannot remove the owner from the skill set");
+    // Cannot remove the owner (double check for non-self-leave path)
+    if (!isSelfLeave) {
+      const targetIsOwner = await skillSetRepo.isOwner(skillSetId, targetUserId);
+      if (targetIsOwner) throw new Error("Cannot remove the owner from the skill set");
+    }
 
     await skillSetRepo.removeMember(skillSetId, targetUserId);
 
@@ -3720,6 +3750,43 @@ export function createRpcMethods(
       return { ...m, username };
     }));
     return { members: enriched };
+  });
+
+  // ─── Skill Set Share Link ─────────────────────────
+
+  methods.set("skillSet.toggleShareLink", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const skillSetId = params.skillSetId as string;
+    const enabled = params.enabled as boolean;
+
+    if (!skillSetId) throw new Error("Missing required param: skillSetId");
+    if (typeof enabled !== "boolean") throw new Error("Missing required param: enabled");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const isOwner = await skillSetRepo.isOwner(skillSetId, userId);
+    if (!isOwner) throw new Error("Forbidden: only the owner can manage share links");
+
+    const token = enabled ? crypto.randomUUID() : null;
+    await skillSetRepo.update(skillSetId, { inviteToken: token });
+
+    return { token };
+  });
+
+  methods.set("skillSet.joinByToken", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const token = params.token as string;
+    if (!token) throw new Error("Missing required param: token");
+    if (!skillSetRepo) throw new Error("Database not available");
+
+    const set = await skillSetRepo.getByInviteToken(token);
+    if (!set) throw new Error("Invalid or expired invite link");
+
+    const alreadyMember = await skillSetRepo.isMember(set.id, userId);
+    if (alreadyMember) return { setId: set.id, alreadyMember: true };
+
+    await skillSetRepo.addMember(set.id, userId, "member");
+    notifySkillReload(userId);
+    return { setId: set.id, joined: true };
   });
 
   // ─────────────────────────────────────────────────

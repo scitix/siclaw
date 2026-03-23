@@ -136,7 +136,7 @@ export function SkillEditor() {
     const [serverData, setServerData] = useState<Skill | null>(null);
     const [draftRestored, setDraftRestored] = useState<{ savedAt: number } | null>(null);
     const isNew = id === 'new';
-    const isReadOnly = !!formData && formData.scope !== 'personal';
+    const isReadOnly = !!formData && formData.scope !== 'personal' && !(formData.scope === 'skillset' && formData.isSetMember);
     const currentUser = getCurrentUser();
     const isAdmin = currentUser?.username === 'admin';
     const isOwner = formData?.authorId === currentUser?.id;
@@ -473,13 +473,15 @@ export function SkillEditor() {
                             <span className={cn(
                                 "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium",
                                 formData.scope === 'builtin' ? "bg-gray-100 text-gray-700"
+                                    : formData.scope === 'skillset' ? "bg-green-50 text-green-700"
                                     : "bg-blue-50 text-blue-700"
                             )}>
                                 {formData.scope === 'builtin' ? <Lock className="w-2.5 h-2.5" />
                                     : <Users className="w-2.5 h-2.5" />}
                                 {formData.scope === 'builtin' ? 'System Skills'
-                                    : 'Team Skills'}
-                                <span className="text-gray-400 ml-0.5">· Read-only</span>
+                                    : formData.scope === 'skillset' ? (formData.skillSetName || 'Skill Set')
+                                    : 'Global Skills'}
+                                {isReadOnly && <span className="text-gray-400 ml-0.5">· Read-only</span>}
                             </span>
                         )}
                     </div>

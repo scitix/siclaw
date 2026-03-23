@@ -17,6 +17,7 @@ export interface CreateSkillSetInput {
 export interface UpdateSkillSetInput {
   name?: string;
   description?: string;
+  inviteToken?: string | null;
 }
 
 export class SkillSetRepository {
@@ -53,7 +54,17 @@ export class SkillSetRepository {
     const setFields: Record<string, unknown> = { updatedAt: new Date() };
     if (updates.name !== undefined) setFields.name = updates.name;
     if (updates.description !== undefined) setFields.description = updates.description;
+    if (updates.inviteToken !== undefined) setFields.inviteToken = updates.inviteToken;
     await this.db.update(skillSets).set(setFields).where(eq(skillSets.id, id));
+  }
+
+  async getByInviteToken(token: string) {
+    const rows = await this.db
+      .select()
+      .from(skillSets)
+      .where(eq(skillSets.inviteToken, token))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async deleteById(id: string) {

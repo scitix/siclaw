@@ -61,6 +61,7 @@ const DDL_STATEMENTS = [
     name TEXT NOT NULL UNIQUE,
     description TEXT,
     owner_id TEXT NOT NULL REFERENCES users(id),
+    invite_token TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
@@ -462,6 +463,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
     // Skill sets: add skill_set_id to skills
     `ALTER TABLE skills ADD COLUMN skill_set_id TEXT REFERENCES skill_sets(id) ON DELETE SET NULL`,
+    // Skill sets: invite token for share links
+    `ALTER TABLE skill_sets ADD COLUMN invite_token TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
