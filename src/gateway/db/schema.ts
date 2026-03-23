@@ -25,6 +25,8 @@ export const {
   userProfiles,
   sessions,
   messages,
+  skillSets,
+  skillSetMembers,
   skills,
   skillContents,
   skillVersions,

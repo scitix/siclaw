@@ -34,6 +34,29 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
     const [currentScope, setCurrentScope] = useState<string>('all');
     const [searchQuery, setSearchQuery] = useState('');
 
+    // Map UI tab name → RPC scope filter
+    const mapTabToScope = (tab: string): string | undefined => {
+        switch (tab) {
+            case 'all': return undefined;
+            case 'approvals': return undefined;
+            case 'global': return undefined; // fetch all, filter client-side
+            case 'myskills': return undefined; // fetch all, filter client-side
+            default: return tab;
+        }
+    };
+
+    // Client-side filter for virtual tabs
+    const filterByTab = (skills: Skill[], tab: string): Skill[] => {
+        switch (tab) {
+            case 'global':
+                return skills.filter(s => s.scope === 'builtin' || s.scope === 'team' || s.scope === 'global');
+            case 'myskills':
+                return skills.filter(s => s.scope === 'personal' || s.scope === 'skillset');
+            default:
+                return skills;
+        }
+    };
+
     // Load first page (resets list)
     const loadSkills = useCallback(async (scope?: string, search?: string) => {
         const s = scope ?? currentScope;
@@ -45,11 +68,11 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
             const result = await rpcGetSkills(sendRpc, {
                 limit: PAGE_SIZE,
                 offset: 0,
-                scope: s === 'all' || s === 'approvals' ? undefined : s,
+                scope: mapTabToScope(s),
                 search: q || undefined,
                 pendingOnly: s === 'approvals' ? true : undefined,
             });
-            setSkills(result.skills);
+            setSkills(filterByTab(result.skills, s));
             setHasMore(result.hasMore);
         } catch (err) {
             console.error('[useSkills] Failed to load:', err);
@@ -66,11 +89,12 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
             const result = await rpcGetSkills(sendRpc, {
                 limit: PAGE_SIZE,
                 offset: skills.length,
-                scope: currentScope === 'all' || currentScope === 'approvals' ? undefined : currentScope,
+                scope: mapTabToScope(currentScope),
                 search: searchQuery || undefined,
                 pendingOnly: currentScope === 'approvals' ? true : undefined,
             });
-            setSkills(prev => [...prev, ...result.skills]);
+            const newSkills = filterByTab(result.skills, currentScope);
+            setSkills(prev => [...prev, ...newSkills]);
             setHasMore(result.hasMore);
         } catch (err) {
             console.error('[useSkills] Failed to load more:', err);

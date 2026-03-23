@@ -76,6 +76,27 @@ export const messages = mysqlTable("messages", {
   durationMs: int("duration_ms"),
 });
 
+// ─── Skill Sets (collaboration spaces) ──────────────
+
+export const skillSets = mysqlTable("skill_sets", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  name: varchar("name", { length: 255 }).notNull().unique(),
+  description: text("description"),
+  ownerId: varchar("owner_id", { length: 32 }).notNull().references(() => users.id),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const skillSetMembers = mysqlTable("skill_set_members", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  skillSetId: varchar("skill_set_id", { length: 64 }).notNull().references(() => skillSets.id, { onDelete: "cascade" }),
+  userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id, { onDelete: "cascade" }),
+  role: varchar("role", { length: 20 }).notNull().default("member"), // "owner" | "member"
+  joinedAt: timestamp("joined_at").notNull().defaultNow(),
+}, (table) => ({
+  ukSetUser: uniqueIndex("uk_skill_set_member").on(table.skillSetId, table.userId),
+}));
+
 // ─── Skills ──────────────────────────────────────────
 
 export const skills = mysqlTable("skills", {
@@ -84,7 +105,7 @@ export const skills = mysqlTable("skills", {
   description: text("description"),
   type: varchar("type", { length: 50 }),
   version: int("version").notNull().default(1),
-  scope: mysqlEnum("scope", ["builtin", "team", "personal"])
+  scope: mysqlEnum("scope", ["builtin", "team", "personal", "global", "skillset"])
     .notNull()
     .default("personal"),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
@@ -106,6 +127,7 @@ export const skills = mysqlTable("skills", {
   teamPinnedVersion: int("team_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
   labelsJson: json("labels_json").$type<string[]>(),
+  skillSetId: varchar("skill_set_id", { length: 64 }).references(() => skillSets.id),
 });
 
 // ─── Skill Contents ─────────────────────────────────

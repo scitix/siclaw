@@ -2,19 +2,21 @@
  * Skill Bundle Builder
  *
  * Builds a SkillBundle for AgentBox consumption.
- * Only includes team + personal skills — builtin skills are baked into the AgentBox Docker image.
+ * Only includes team + personal + skillset skills — builtin skills are baked into the AgentBox Docker image.
  */
 
 import crypto from "node:crypto";
 import type { SkillFileWriter } from "./file-writer.js";
 import type { SkillRepository } from "../db/repositories/skill-repo.js";
 import type { SkillContentRepository } from "../db/repositories/skill-content-repo.js";
+import type { SkillSetRepository } from "../db/repositories/skill-set-repo.js";
 
 export interface SkillBundleEntry {
   dirName: string;
-  scope: "team" | "personal";
+  scope: "team" | "personal" | "skillset";
   specs: string;
   scripts: Array<{ name: string; content: string }>;
+  skillSetId?: string;
 }
 
 export interface SkillBundle {
@@ -40,6 +42,7 @@ export async function buildSkillBundle(
   skillRepo: SkillRepository,
   skillContentRepo: SkillContentRepository,
   disabledSkills?: Set<string>,
+  skillSetRepo?: SkillSetRepository,
 ): Promise<SkillBundle> {
   const skills: SkillBundleEntry[] = [];
   const disabled = disabledSkills ?? new Set<string>();
@@ -83,6 +86,26 @@ export async function buildSkillBundle(
         specs: files.specs ?? "",
         scripts: files.scripts ?? [],
       });
+    }
+  }
+
+  // 3. Skill set skills (from DB — skills in sets the user is a member of)
+  if (skillSetRepo) {
+    const userSets = await skillSetRepo.listForUser(userId);
+    for (const set of userSets) {
+      const setSkills = await skillRepo.listBySkillSetId(set.id);
+      for (const meta of setSkills) {
+        if (disabled.has(meta.name)) continue;
+        const files = await skillContentRepo.read(meta.id, "working");
+        if (!files) continue;
+        skills.push({
+          dirName: meta.dirName,
+          scope: "skillset",
+          specs: files.specs ?? "",
+          scripts: files.scripts ?? [],
+          skillSetId: set.id,
+        });
+      }
     }
   }
 
