@@ -389,9 +389,20 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
+    // IMPORTANT: append after DP markers, not prepend before them.
+    // Prepending would break marker detection in pi-agent extension input handlers
+    // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
-      promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+      // Find a safe injection point: after DP markers but before the user's actual text
+      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_SKIP]\n"];
+      const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
+      if (matchedMarker) {
+        // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
+        promptText = matchedMarker + `[System: respond in ${detectedLang}]\n` + promptText.slice(matchedMarker.length);
+      } else {
+        promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+      }
     }
 
     // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
