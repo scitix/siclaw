@@ -39,10 +39,13 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user)
+      [[ $# -ge 2 ]] || { echo "${PREFIX} ERROR: --user requires an argument" >&2; exit 1; }
       user_filter="$2"; shift 2 ;;
     --workspace)
+      [[ $# -ge 2 ]] || { echo "${PREFIX} ERROR: --workspace requires an argument" >&2; exit 1; }
       workspace_filter="$2"; shift 2 ;;
     --older-than)
+      [[ $# -ge 2 ]] || { echo "${PREFIX} ERROR: --older-than requires an argument" >&2; exit 1; }
       older_than_days="$2"; shift 2 ;;
     --dry-run)
       dry_run=true; shift ;;
@@ -61,8 +64,18 @@ if [[ -n "$workspace_filter" && -z "$user_filter" ]]; then
   exit 1
 fi
 
-if [[ -n "$older_than_days" ]] && ! [[ "$older_than_days" =~ ^[0-9]+$ ]]; then
-  echo "${PREFIX} ERROR: --older-than must be a positive integer" >&2
+if [[ -n "$user_filter" ]] && ! [[ "$user_filter" =~ ^[a-f0-9-]{1,64}$ ]]; then
+  echo "${PREFIX} ERROR: invalid --user value (expected hex id)" >&2
+  exit 1
+fi
+
+if [[ -n "$workspace_filter" ]] && ! [[ "$workspace_filter" =~ ^[a-f0-9-]{1,64}$ ]]; then
+  echo "${PREFIX} ERROR: invalid --workspace value (expected hex/uuid)" >&2
+  exit 1
+fi
+
+if [[ -n "$older_than_days" ]] && ! [[ "$older_than_days" =~ ^[1-9][0-9]*$ ]]; then
+  echo "${PREFIX} ERROR: --older-than must be a positive integer (>0)" >&2
   exit 1
 fi
 
@@ -134,7 +147,8 @@ for f in "${matched_files[@]}"; do
   uid="${rel%%/*}"
   rest="${rel#*/}"
   wsid="${rest%%/*}"
-  file_date="$(basename "$f" | head -c 10)"
+  basename_f=$(basename "$f")
+  file_date="${basename_f:0:10}"
 
   key="${uid}|${wsid}"
 
@@ -177,13 +191,22 @@ echo "${PREFIX} Deleting ${total} file(s)..."
 deleted=0
 failed=0
 for f in "${matched_files[@]}"; do
+  # Path traversal guard
+  real_f=$(realpath -m "$f")
+  if [[ "$real_f" != "${BASE_DIR}/"* ]]; then
+    echo "${PREFIX} WARN: Skipping path outside BASE_DIR: ${f}" >&2
+    failed=$((failed + 1))
+    continue
+  fi
   if rm "$f" 2>/dev/null; then
-    ((deleted++))
+    deleted=$((deleted + 1))
   else
     echo "${PREFIX} WARN: Failed to delete ${f}" >&2
-    ((failed++))
+    failed=$((failed + 1))
   fi
 done
 
 echo "${PREFIX} Done. Deleted: ${deleted}, Failed: ${failed}"
 echo "${PREFIX} Note: .memory.db index will be cleaned up on next indexer.sync()"
+
+[[ $failed -eq 0 ]] || exit 2
