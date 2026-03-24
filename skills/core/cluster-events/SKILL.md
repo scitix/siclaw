@@ -3,6 +3,8 @@ name: cluster-events
 description: >-
   Analyze cluster-wide Kubernetes events to identify issues and patterns.
   Aggregates Warning events, detects high-frequency patterns, and correlates related events.
+  Use when the user asks to check cluster events, investigate k8s warnings, diagnose pod
+  failures from events, audit event logs, or troubleshoot cluster-wide issues.
 ---
 
 # Cluster Events Analysis
