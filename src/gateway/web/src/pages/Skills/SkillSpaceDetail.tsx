@@ -73,7 +73,6 @@ export function SkillSpaceDetailPage() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [skillSpaceEnabled, setSkillSpaceEnabled] = useState(false);
-    const [skillSpaceDevMode, setSkillSpaceDevMode] = useState(false);
     const [addDialog, setAddDialog] = useState(false);
     const [showInvite, setShowInvite] = useState(false);
     const [inviteUsername, setInviteUsername] = useState('');
@@ -120,7 +119,6 @@ export function SkillSpaceDetailPage() {
                 rpcGetSkillSpace(sendRpc, currentWorkspace.id, spaceId),
             ]);
             setSkillSpaceEnabled(caps.skillSpaceEnabled);
-            setSkillSpaceDevMode(!!caps.skillSpaceDevMode);
             setSpaceData({
                 ...data,
                 skills: data.skills.map((s: any) => ({ ...s, icon: null, version: `v${s.version || 1}`, enabled: s.enabled ?? true })),
@@ -368,12 +366,6 @@ export function SkillSpaceDetailPage() {
             />
             <AddSkillDialog isOpen={addDialog} skillSpaceId={spaceId!} skillSpaceName={spaceData.name} workspaceId={currentWorkspace!.id}
                 sendRpc={sendRpc} onClose={() => setAddDialog(false)} onSuccess={reload} />
-
-            {skillSpaceDevMode && (
-                <div className="px-6 py-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-200">
-                    Skill Space Dev Mode is enabled locally. You can debug the collaboration UI and review flow here, but local runtime loading is still disabled.
-                </div>
-            )}
             {flashMessage && (
                 <div
                     className={cn(

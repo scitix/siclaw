@@ -222,7 +222,6 @@ export function createRpcMethods(
 
   // Role labels — internal admin-only labels hidden from normal users
   const ROLE_LABELS = new Set(["sre", "developer"]);
-  const skillSpaceDevMode = process.env.SICLAW_ENABLE_SKILL_SPACE_DEV === "1";
 
   async function resolveWorkspaceForUser(
     userId: string,
@@ -244,9 +243,7 @@ export function createRpcMethods(
   ): Promise<Awaited<ReturnType<WorkspaceRepository["getById"]>>> {
     const userId = requireAuth(context);
     if (!isK8sMode) {
-      if (!skillSpaceDevMode) {
-        throw new Error("Skill Space is available only in K8s deployments");
-      }
+      throw new Error("Skill Space is available only in K8s deployments");
     }
     if (!workspaceId) {
       throw new Error("Missing required param: workspaceId");
@@ -255,7 +252,7 @@ export function createRpcMethods(
     if (!workspace) {
       throw new Error("Workspace not found");
     }
-    if (!skillSpaceDevMode && workspace.envType !== "test") {
+    if (workspace.envType !== "test") {
       throw new Error("Skill Space is only available in test workspaces");
     }
     return workspace;
@@ -265,10 +262,10 @@ export function createRpcMethods(
     userId: string,
     workspaceId?: string,
   ): Promise<boolean> {
-    if ((!isK8sMode && !skillSpaceDevMode) || !workspaceId) return false;
+    if (!isK8sMode || !workspaceId) return false;
     const workspace = await resolveWorkspaceForUser(userId, workspaceId);
     if (!workspace) return false;
-    return skillSpaceDevMode || workspace.envType === "test";
+    return workspace.envType === "test";
   }
 
   type ComposerSkillOption = {
@@ -432,7 +429,7 @@ export function createRpcMethods(
       }
     }
 
-    const skillSpaceAvailable = isK8sMode || skillSpaceDevMode;
+    const skillSpaceAvailable = isK8sMode;
     const skillSpaces: ComposerSkillSpaceOption[] = [];
     if (skillSpaceAvailable && skillSpaceRepo && skillRepo) {
       const spaces = await skillSpaceRepo.listForUser(userId);
@@ -637,7 +634,6 @@ export function createRpcMethods(
     const skillSpaceEnabled = await canUseSkillSpace(userId, workspaceId);
     return {
       isK8sMode,
-      skillSpaceDevMode,
       skillSpaceEnabled,
     };
   });
