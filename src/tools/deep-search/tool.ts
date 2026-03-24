@@ -7,6 +7,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { deepSearchEvents } from "./events.js";
 import type { KubeconfigRef, LlmConfigRef } from "../../core/agent-factory.js";
 import type { MemoryIndexer } from "../../memory/indexer.js";
+import type { DpStateRef } from "../dp-tools.js";
 
 /** Mutable ref to the shared memory indexer (set after session creation). */
 export interface MemoryRef {
@@ -108,30 +109,23 @@ function renderDeepSearchResult(result: any, options: any, theme: any) {
   return new Text("\n" + (hint ? hint + "\n" : "") + styled.join("\n"), 0, 0);
 }
 
-export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef, llmConfigRef?: LlmConfigRef, memoryRef?: MemoryRef): ToolDefinition {
+export function createDeepSearchTool(kubeconfigRef?: KubeconfigRef, llmConfigRef?: LlmConfigRef, memoryRef?: MemoryRef, dpStateRef?: DpStateRef): ToolDefinition {
   return {
     name: "deep_search",
     label: "Deep Search",
-    description: `Perform a structured, hypothesis-driven investigation of a Kubernetes infrastructure issue.
+    description: `Perform parallel hypothesis validation for a Kubernetes infrastructure issue.
+
+IMPORTANT: This tool is only available in Deep Investigation mode (activated via /dp, Ctrl+I, or the magnifying glass toggle).
 
 This tool launches independent sub-agents to validate hypotheses with targeted tool calls.
+You must complete the investigation-and-confirm cycle before calling this tool:
+1. Triage: run commands to gather context
+2. Propose: call propose_hypotheses with your findings and hypotheses
+3. Wait: the user must confirm your hypotheses
+4. Execute: call deep_search — hypotheses and triageContext are automatically provided from the confirmed data
 
-RECOMMENDED WORKFLOW (triage-first):
-1. Do quick triage yourself first (3-5 tool calls to confirm environment, mode, problem)
-2. Show findings to user, propose hypotheses, let user confirm
-3. Call deep_search with triageContext + hypotheses to skip Phase 1/2
-   → All budget goes to Phase 3 validation (maximum efficiency)
-
-FALLBACK (autonomous):
-- Call with just question → runs all 4 phases autonomously (less efficient)
-
-Use this tool when:
-- The issue requires investigating multiple potential causes
-- You need systematic parallel validation of hypotheses
-- RDMA/RoCE troubleshooting with complex failure modes
-
-Do NOT use for simple queries that can be answered with 1-2 kubectl commands.
-Do triage first before calling this tool — confirm the problem exists and gather basic context.`,
+Do NOT call this tool without user confirmation of hypotheses.
+Do NOT use for simple queries that can be answered with 1-2 kubectl commands.`,
     parameters: Type.Object({
       question: Type.String({
         description:
@@ -172,12 +166,46 @@ Do triage first before calling this tool — confirm the problem exists and gath
     }),
     renderResult: renderDeepSearchResult,
     async execute(_toolCallId, rawParams) {
+      // --- DP mode runtime gate ---
+      if (!dpStateRef || dpStateRef.status === "idle") {
+        return {
+          content: [{ type: "text", text:
+            "deep_search is only available in Deep Investigation mode.\n" +
+            "In normal mode, use standard tools (bash, run_skill) for lightweight diagnostics.\n" +
+            "To activate: use /dp command, Ctrl+I shortcut, or the magnifying glass toggle in web UI." }],
+          details: { error: true, reason: "not_in_dp_mode" },
+        };
+      }
+      if (dpStateRef.status === "awaiting_confirmation") {
+        return {
+          content: [{ type: "text", text:
+            "Cannot execute deep_search: hypotheses have not been confirmed yet.\n" +
+            "Wait for the user to review and confirm the proposed hypotheses before proceeding." }],
+          details: { error: true, reason: "awaiting_confirmation" },
+        };
+      }
+      if (dpStateRef.status !== "validating") {
+        return {
+          content: [{ type: "text", text:
+            `Cannot execute deep_search: current DP status is "${dpStateRef.status}".\n` +
+            "deep_search can only run when status is 'validating' (after user confirms hypotheses)." }],
+          details: { error: true, reason: "invalid_status" },
+        };
+      }
+
       const params = rawParams as DeepSearchParams;
       const budget = params.budget === "quick" ? QUICK_BUDGET : NORMAL_BUDGET;
 
-      // Defensive: LLM sometimes passes hypotheses as JSON string instead of array
+      // --- Resolve hypotheses: prefer confirmed state, fallback to tool params ---
       let hypotheses: DeepSearchHypothesis[] | undefined;
-      if (typeof params.hypotheses === "string") {
+      if (dpStateRef.confirmedHypotheses && dpStateRef.confirmedHypotheses.length > 0) {
+        // Use confirmed data from state machine (source of truth)
+        hypotheses = dpStateRef.confirmedHypotheses.map(h => ({
+          text: h.text,
+          confidence: h.confidence,
+          suggestedTools: [], // suggestedTools not tracked in DpHypothesis — engine will infer
+        }));
+      } else if (typeof params.hypotheses === "string") {
         try {
           const parsed = JSON.parse(params.hypotheses);
           hypotheses = Array.isArray(parsed) ? parsed : parsed?.hypotheses;
@@ -188,10 +216,35 @@ Do triage first before calling this tool — confirm the problem exists and gath
         hypotheses = params.hypotheses;
       }
 
+      // --- Hard reject if no confirmed hypotheses available ---
+      if (!hypotheses || hypotheses.length === 0) {
+        return {
+          content: [{ type: "text", text:
+            "Cannot execute deep_search: no confirmed hypotheses available.\n" +
+            "The investigation loop must complete before deep_search can run:\n" +
+            "1. Call propose_hypotheses with triageContext and hypotheses\n" +
+            "2. Wait for user to confirm\n" +
+            "3. Then call deep_search — confirmed hypotheses are provided automatically." }],
+          details: { error: true, reason: "no_hypotheses" },
+        };
+      }
+
+      // --- Resolve triageContext: prefer state, fallback to tool params ---
+      const triageContext = dpStateRef.triageContextDraft || params.triageContext;
+      if (!triageContext) {
+        return {
+          content: [{ type: "text", text:
+            "Cannot execute deep_search: no triage context available.\n" +
+            "The main agent must provide triageContext when calling propose_hypotheses.\n" +
+            "This context is automatically passed to deep_search after user confirms." }],
+          details: { error: true, reason: "no_triage_context" },
+        };
+      }
+
       try {
         const result = await investigate(params.question, {
           budget,
-          triageContext: params.triageContext,
+          triageContext,
           hypotheses,
           kubeconfigRef,
           // Pass current main model's LLM config to sub-agents

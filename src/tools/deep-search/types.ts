@@ -64,17 +64,17 @@ export interface DeepSearchBudget {
 }
 
 export const NORMAL_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 15,
-  maxHypotheses: 5,
+  maxContextCalls: 15,  // Fallback only — in DP mode, PL agent handles Phase 1 (triage)
+  maxHypotheses: 5,     // Fallback only — in DP mode, PL agent handles Phase 2 (hypotheses)
   maxCallsPerHypothesis: 10,
-  maxTotalCalls: 75,
+  maxTotalCalls: 75,    // When Phase 1+2 are skipped, this budget goes to Phase 3 validation
   maxParallel: 3,
   maxDurationMs: 300_000, // 5 minutes
 };
 
 export const QUICK_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 10,
-  maxHypotheses: 3,
+  maxContextCalls: 10,  // Fallback only — in DP mode, PL agent handles Phase 1
+  maxHypotheses: 3,     // Fallback only — in DP mode, PL agent handles Phase 2
   maxCallsPerHypothesis: 8,
   maxTotalCalls: 40,
   maxParallel: 3,
