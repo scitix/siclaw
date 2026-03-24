@@ -76,6 +76,9 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     // Pipeline output can't be intercepted mid-pipe, so we block pre-execution.
     // Only block Secret and ConfigMap — Pod is too commonly queried to block in
     // pipelines; Pod env sanitization is handled by the kubectl tool instead.
+    // ACCEPTED RISK: `kubectl get pod -o json | jq .spec` in a pipeline won't
+    // have Pod env vars sanitized. Mitigation: the agent typically uses the
+    // kubectl tool (not bash) for structured output, which does sanitize.
     const sensitiveSubcommands = ["get", "describe"];
     if (sensitiveSubcommands.includes(subcommand)) {
       const sensitiveResource = detectSensitiveResource(args);
