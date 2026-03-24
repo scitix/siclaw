@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveUnderDir } from "../../shared/path-utils.js";
 
 export interface SkillFiles {
   specs?: string;
@@ -42,7 +43,7 @@ export class SkillFileWriter {
     console.log("[skill-writer] Initialized skills directory:", this.skillsDir);
   }
 
-  /** Resolve skill directory path */
+  /** Resolve skill directory path (traversal-safe) */
   resolveDir(
     scope: SkillFileScope,
     dirName: string,
@@ -51,15 +52,15 @@ export class SkillFileWriter {
   ): string {
     switch (scope) {
       case "builtin":
-        return path.join(this.skillsDir, "core", dirName);
+        return resolveUnderDir(this.skillsDir, "core", dirName);
       case "team":
-        return path.join(this.skillsDir, "team", dirName);
+        return resolveUnderDir(this.skillsDir, "team", dirName);
       case "personal":
         if (!userId) throw new Error("userId is required for personal scope");
-        return path.join(this.skillsDir, "user", userId, dirName);
+        return resolveUnderDir(this.skillsDir, "user", userId, dirName);
       case "skillset":
         if (!skillSpaceId) throw new Error("skillSpaceId is required for skillset scope");
-        return path.join(this.skillsDir, "skillset", skillSpaceId, dirName);
+        return resolveUnderDir(this.skillsDir, "skillset", skillSpaceId, dirName);
     }
   }
 
@@ -276,9 +277,9 @@ export class SkillFileWriter {
     }
   }
 
-  /** Resolve published snapshot directory path */
+  /** Resolve published snapshot directory path (traversal-safe) */
   resolvePublishedDir(userId: string, dirName: string): string {
-    return path.join(this.skillsDir, "user", userId, ".published", dirName);
+    return resolveUnderDir(this.skillsDir, "user", userId, ".published", dirName);
   }
 
   /** Snapshot working copy to .published/ directory */
@@ -334,9 +335,9 @@ export class SkillFileWriter {
     }
   }
 
-  /** Resolve staging snapshot directory path */
+  /** Resolve staging snapshot directory path (traversal-safe) */
   resolveStagingDir(userId: string, dirName: string): string {
-    return path.join(this.skillsDir, "user", userId, ".staging", dirName);
+    return resolveUnderDir(this.skillsDir, "user", userId, ".staging", dirName);
   }
 
   /** Snapshot working copy to .staging/ directory */

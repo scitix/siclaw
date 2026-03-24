@@ -16,7 +16,7 @@ import type { BroadcastFn, RpcHandler, RpcContext } from "./ws-protocol.js";
 import type { Database } from "./db/index.js";
 import { ChatRepository } from "./db/repositories/chat-repo.js";
 import { SkillRepository } from "./db/repositories/skill-repo.js";
-import { SkillSpaceRepository, normalizeSkillSpaceRole } from "./db/repositories/skill-space-repo.js";
+import { SkillSpaceRepository } from "./db/repositories/skill-space-repo.js";
 import { UserRepository } from "./db/repositories/user-repo.js";
 import { ConfigRepository } from "./db/repositories/config-repo.js";
 import { VoteRepository } from "./db/repositories/vote-repo.js";
@@ -3179,6 +3179,9 @@ export function createRpcMethods(
     }
 
     const isPending = (meta as any).reviewStatus === "pending";
+    if (isPending) {
+      throw new Error("This skill is already pending review. Withdraw it before resubmitting.");
+    }
     const publishedVersion = (meta as any).publishedVersion as number | null;
 
     // Guard: no changes since last publish — nothing to submit
@@ -4276,7 +4279,6 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const skillSpaceId = params.skillSpaceId as string;
     const targetUsername = params.username as string;
-    const role = normalizeSkillSpaceRole((params.role as string) || "maintainer");
     const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
