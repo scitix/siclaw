@@ -137,11 +137,11 @@ export function DpChecklistCard({ items, investigationProgress, onDismiss }: DpC
     const hasError = items.some(i => i.status === 'error');
     const current = items.find(i => i.status === 'in_progress') || items.find(i => i.status === 'pending');
 
-    // Show hypothesis tree when deep_search is in_progress or just done (before investigationProgress is cleared)
+    // Show hypothesis tree when deep_search has run (in_progress, done, or error with partial results)
     const deepSearchItem = items.find(i => i.id === 'deep_search');
     const hypotheses = investigationProgress?.hypotheses ?? [];
     const showHypothesisTree =
-        (deepSearchItem?.status === 'in_progress' || deepSearchItem?.status === 'done')
+        (deepSearchItem?.status === 'in_progress' || deepSearchItem?.status === 'done' || deepSearchItem?.status === 'error')
         && hypotheses.length > 0;
 
     return (

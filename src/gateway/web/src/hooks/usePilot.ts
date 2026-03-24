@@ -965,9 +965,12 @@ export function usePilot() {
     }, [isConnected, sendRpc, currentSessionKey, loadSessions]);
 
     // Reset loading state when WebSocket disconnects mid-generation.
-    // Give a 15s grace window for WS to auto-reconnect (SSH tunnel flaps,
+    // Give a grace window for WS to auto-reconnect (SSH tunnel flaps,
     // browser sleep, network blips). Backend SSE continues independently.
+    // deep_search runs long sub-agent tasks — use 60s grace instead of 15s.
     const disconnectTimerRef = useRef<ReturnType<typeof setTimeout>>();
+    const deepSearchRunning = dpChecklist?.some(i => i.id === 'deep_search' && i.status === 'in_progress');
+    const disconnectGraceMs = deepSearchRunning ? 60_000 : 15_000;
     useEffect(() => {
         if (!isConnected && isLoading) {
             disconnectTimerRef.current = setTimeout(() => {
@@ -989,9 +992,10 @@ export function usePilot() {
                     );
                 });
                 setDpFocus(null);
-                setInvestigationProgress(null);
+                // Preserve hypothesis tree data on error — only clear the live action indicator
+                setInvestigationProgress(prev => prev ? { ...prev, currentAction: undefined } : null);
                 dpTimeout(() => resetDpState(), 10_000);
-            }, 15_000);
+            }, disconnectGraceMs);
         }
         return () => {
             if (disconnectTimerRef.current) {
@@ -1003,9 +1007,11 @@ export function usePilot() {
 
     // Stale-loading watchdog: if isLoading but no agent events for too long,
     // the backend likely died silently — reset UI so user isn't stuck.
-    // DP phases send frequent progress events, so use a shorter timeout (45s).
-    // Non-DP conversations keep the original 120s timeout.
-    const staleTimeoutMs = dpChecklist ? 45_000 : 120_000;
+    // deep_search (Phase 3) runs long sub-agent LLM calls that can go 60s+
+    // without events — use 5 min to avoid false positives.
+    // Other DP phases use 90s; non-DP keeps 120s.
+    const deepSearchActive = dpChecklist?.some(i => i.id === 'deep_search' && i.status === 'in_progress');
+    const staleTimeoutMs = deepSearchActive ? 300_000 : dpChecklist ? 90_000 : 120_000;
     useEffect(() => {
         if (isLoading) {
             lastAgentEventRef.current = Date.now();
@@ -1030,7 +1036,8 @@ export function usePilot() {
                         );
                     });
                     setDpFocus(null);
-                    setInvestigationProgress(null);
+                    // Preserve hypothesis tree data on error — only clear the live action indicator
+                    setInvestigationProgress(prev => prev ? { ...prev, currentAction: undefined } : null);
                     dpTimeout(() => resetDpState(), 10_000);
                 }
             }, 15_000); // check every 15s

@@ -1909,6 +1909,24 @@ export function createRpcMethods(
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
+    // Validate DP control markers against authoritative state (same as chat.send)
+    const dpControlAction = detectDpControlAction(text);
+    if (dpControlAction && sessionId) {
+      try {
+        const agentClient = new AgentBoxClient(stream.endpoint, 5000, agentBoxTlsOptions);
+        const dpState = await agentClient.getDpState(stream.sessionId);
+        if (dpState?.dpStatus !== "awaiting_confirmation") {
+          throw new Error(
+            `Cannot ${dpControlAction} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`,
+          );
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[rpc] Rejected DP control marker in steer for session ${sessionId}: ${reason}`);
+        throw new Error(reason);
+      }
+    }
+
     // Track DP markers in steer messages (card buttons during active agent)
     if (streamKey) {
       const dpTransition = detectDpMarker(text, streamKey);
