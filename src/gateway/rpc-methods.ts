@@ -252,20 +252,14 @@ export function createRpcMethods(
     if (!workspace) {
       throw new Error("Workspace not found");
     }
-    if (workspace.envType !== "test") {
-      throw new Error("Skill Space is only available in test workspaces");
-    }
     return workspace;
   }
 
   async function canUseSkillSpace(
-    userId: string,
-    workspaceId?: string,
+    _userId: string,
+    _workspaceId?: string,
   ): Promise<boolean> {
-    if (!isK8sMode || !workspaceId) return false;
-    const workspace = await resolveWorkspaceForUser(userId, workspaceId);
-    if (!workspace) return false;
-    return workspace.envType === "test";
+    return isK8sMode;
   }
 
   type ComposerSkillOption = {
