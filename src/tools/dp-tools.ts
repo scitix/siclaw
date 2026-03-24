@@ -88,6 +88,18 @@ export interface DpStateRef {
 }
 
 /**
+ * Writable version of DpStateRef — held only by the extension (single writer).
+ * Tools and agentbox receive the readonly DpStateRef view of the same object.
+ */
+export interface MutableDpStateRef {
+  status: DpStatus;
+  triageContextDraft?: string;
+  confirmedHypotheses?: DpHypothesis[];
+  question?: string;
+  round?: number;
+}
+
+/**
  * Unconditionally rebuild checklist item states from dpState.status.
  * This is a pure state→view derivation: the status enum fully determines
  * all 4 item states. No forward-only guards — supports regression
@@ -126,8 +138,9 @@ export function syncChecklistFromStatus(state: DpState): void {
     case "concluding":
       items[0].status = "done";
       items[1].status = "done";
-      // deep_search was skipped if user chose "skip to conclusion"
-      items[2].status = items[2].status === "done" ? "done" : "skipped";
+      // deep_search ran → was "in_progress" during validating → mark done
+      // deep_search skipped → was still "pending" → mark skipped
+      items[2].status = (items[2].status === "in_progress" || items[2].status === "done") ? "done" : "skipped";
       items[3].status = "in_progress";
       break;
     case "completed":
