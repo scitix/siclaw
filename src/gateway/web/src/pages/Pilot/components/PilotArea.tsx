@@ -254,6 +254,37 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         return null;
     }, [messages]);
 
+    // Show "Dig deeper" button when agent finished a diagnostic turn with a conclusion
+    const showTraceButton = useMemo(() => {
+        if (isLoading) return false;
+        // Don't show during active Deep Investigation — DP checklist is the continuation mechanism
+        if (dpActive || (dpChecklist && dpChecklist.length > 0)) return false;
+        // Find the last user message to delimit the current turn
+        let turnStart = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') { turnStart = i; break; }
+        }
+        if (turnStart < 0) return false;
+        // Filter hidden messages (update_plan, end_investigation) to avoid false lastToolIdx
+        const turnMessages = messages.slice(turnStart + 1).filter(m => !m.hidden);
+        // Must have at least one diagnostic tool call (excluding deep_search — already the deepest path)
+        const DIAGNOSTIC_TOOLS = new Set(['bash', 'pod_exec', 'pod_nsenter_exec', 'node_exec', 'node_script', 'pod_netns_script', 'run_skill']);
+        const hasDiagnostic = turnMessages.some(m => m.role === 'tool' && DIAGNOSTIC_TOOLS.has(m.toolName ?? ''));
+        // The conclusion must come AFTER the last tool call — if the agent ran tools
+        // but never gave a summary, it didn't conclude (e.g. "let me analyze" + tools + silence)
+        let lastAssistantIdx = -1;
+        let lastToolIdx = -1;
+        for (let i = turnMessages.length - 1; i >= 0; i--) {
+            if (lastAssistantIdx < 0 && turnMessages[i].role === 'assistant') lastAssistantIdx = i;
+            if (lastToolIdx < 0 && turnMessages[i].role === 'tool') lastToolIdx = i;
+            if (lastAssistantIdx >= 0 && lastToolIdx >= 0) break;
+        }
+        const hasConclusion = lastAssistantIdx > lastToolIdx && lastToolIdx >= 0
+            && (turnMessages[lastAssistantIdx]?.content?.trim().length ?? 0) > 0;
+        const stillStreaming = turnMessages.some(m => m.isStreaming);
+        return hasDiagnostic && hasConclusion && !stillStreaming;
+    }, [messages, isLoading, dpActive, dpChecklist]);
+
     // Check if latest hypotheses were already confirmed.
     // Three signals (any one is sufficient):
     // 1. deep_search tool message exists after hypotheses (works when complete or in live session)
@@ -450,6 +481,21 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     onChipClick={(key) => { setChipSeq(s => s + 1); setChipDraft(key + ' '); }}
                                 />
                             ))}
+
+                            {/* Trace root cause button — shown when agent stopped at intermediate cause */}
+                            {showTraceButton && (
+                                <div className="flex justify-start pl-12 my-2">
+                                    <button
+                                        type="button"
+                                        disabled={isLoading}
+                                        onClick={() => sendMessage('Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.')}
+                                        className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white text-sm font-medium shadow-sm hover:shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                    >
+                                        <SearchCode className="w-4 h-4" />
+                                        Dig deeper
+                                    </button>
+                                </div>
+                            )}
 
                             {/* DP Checklist Card — persistent progress during Deep Investigation */}
                             {dpChecklist && dpChecklist.length > 0 && (
