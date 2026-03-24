@@ -841,10 +841,6 @@ export function createRpcMethods(
     dpStatus: DpStatus;
     checklist: DpChecklist | null;
     dpQuestion?: string;
-    /** AgentBox session ID (for dp-state endpoint recovery) */
-    agentboxSessionId?: string;
-    /** AgentBox endpoint URL (for dp-state endpoint recovery when activeStreams is empty) */
-    agentboxEndpoint?: string;
   }
   const dpStatusCache = new Map<string, DpStatusCache>();
 
@@ -906,6 +902,19 @@ export function createRpcMethods(
     if (text.startsWith("[DP_REINVESTIGATE]")) return "reinvestigate";
     if (text.startsWith("[DP_SKIP]")) return "skip";
     return null;
+  }
+
+  /** Validate DP control markers against authoritative agentbox dp-state. */
+  async function validateDpControl(text: string, endpoint: string, agentboxSessionId: string, sessionId: string): Promise<void> {
+    const action = detectDpControlAction(text);
+    if (!action) return;
+    const agentClient = new AgentBoxClient(endpoint, 5000, agentBoxTlsOptions);
+    const dpState = await agentClient.getDpState(agentboxSessionId);
+    if (dpState?.dpStatus !== "awaiting_confirmation") {
+      const reason = `Cannot ${action} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`;
+      console.warn(`[rpc] Rejected DP control marker for session ${sessionId}: ${reason}`);
+      throw new Error(reason);
+    }
   }
 
   // ─────────────────────────────────────────────────
@@ -1015,20 +1024,8 @@ export function createRpcMethods(
     });
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
-    const dpControlAction = detectDpControlAction(message);
-    if (sessionId && dpControlAction) {
-      try {
-        const dpState = await client.getDpState(sessionId);
-        if (dpState?.dpStatus !== "awaiting_confirmation") {
-          throw new Error(
-            `Cannot ${dpControlAction} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`,
-          );
-        }
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        console.warn(`[rpc] Rejected DP control marker for session ${sessionId}: ${reason}`);
-        throw new Error(reason);
-      }
+    if (sessionId) {
+      await validateDpControl(message, handle.endpoint, sessionId, sessionId);
     }
 
     // === Feedback enrichment (system-level) ===
@@ -1082,12 +1079,6 @@ export function createRpcMethods(
       const dpCache = dpStatusCache.get(dpStreamKey)!;
       dpStatusCache.set(streamKey, dpCache);
       dpStatusCache.delete(dpStreamKey);
-    }
-    // Store agentbox endpoint for recovery (needed when activeStreams is empty)
-    const dpCache = dpStatusCache.get(streamKey);
-    if (dpCache) {
-      dpCache.agentboxSessionId = result.sessionId;
-      dpCache.agentboxEndpoint = handle.endpoint;
     }
     // Emit dp_status event after prompt is accepted (sessionId now known)
     if (dpTransition) {
@@ -1909,23 +1900,7 @@ export function createRpcMethods(
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
-    // Validate DP control markers against authoritative state (same as chat.send)
-    const dpControlAction = detectDpControlAction(text);
-    if (dpControlAction && sessionId) {
-      try {
-        const agentClient = new AgentBoxClient(stream.endpoint, 5000, agentBoxTlsOptions);
-        const dpState = await agentClient.getDpState(stream.sessionId);
-        if (dpState?.dpStatus !== "awaiting_confirmation") {
-          throw new Error(
-            `Cannot ${dpControlAction} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`,
-          );
-        }
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        console.warn(`[rpc] Rejected DP control marker in steer for session ${sessionId}: ${reason}`);
-        throw new Error(reason);
-      }
-    }
+    await validateDpControl(text, stream.endpoint, stream.sessionId, sessionId ?? stream.sessionId);
 
     // Track DP markers in steer messages (card buttons during active agent)
     if (streamKey) {
@@ -2037,7 +2012,7 @@ export function createRpcMethods(
       }
     }
 
-    return {
+    const result = {
       sessionId: snap?.sessionId,
       events,
       promptActive,
@@ -2046,6 +2021,7 @@ export function createRpcMethods(
       dpQuestion: dpQuestion ?? null,
       confirmedHypotheses: confirmedHypotheses ?? null,
     };
+    return result;
   });
 
   methods.set("chat.history", async (params, context: RpcContext) => {

@@ -202,10 +202,6 @@ try {
   dpWorkflow = raw.replace(/^---[\s\S]*?---\n*/, "").trim();
 } catch { /* SKILL.md not found — workflow injection disabled */ }
 
-export function getDpWorkflow(): string {
-  return dpWorkflow;
-}
-
 export function buildActivationMessage(question: string): string {
   const parts = [`[DEEP_INVESTIGATION] User requested a deep investigation:\n\n${question}`];
   if (dpWorkflow) {
