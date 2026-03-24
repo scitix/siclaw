@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWebSocket, type WsMessage } from './useWebSocket';
 import { rpcGetSkills, type Skill } from '@/pages/Skills/skillsData';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
+import { parseHypotheses as parseHypothesesText } from '@/pages/Pilot/components/HypothesesCard';
 
 export interface ModelInfo {
     id: string;
@@ -266,6 +267,8 @@ export function usePilot() {
     const workspaceId = currentWorkspace?.id;
     const prevWorkspaceIdRef = useRef<string | undefined>(workspaceId);
     const [messages, setMessages] = useState<PilotMessage[]>([]);
+    const messagesRef = useRef<PilotMessage[]>([]);
+    messagesRef.current = messages;
     const [investigationProgress, setInvestigationProgress] = useState<InvestigationProgress | null>(null);
     const [dpFocus, setDpFocus] = useState<string | null>(null);
     const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null);
@@ -1082,35 +1085,72 @@ export function usePilot() {
                 setDpFocus(focus ? focus.id : null);
             }
 
+            // Build hypothesis text lookup from the latest propose_hypotheses message in chat history.
+            // This is the same data source the HypothesesCard uses — guaranteed to have correct titles.
+            const hypothesesTextMap = new Map<string, string>();
+            {
+                // messagesRef holds the already-loaded chat.history messages
+                const msgs = messagesRef.current;
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i];
+                    if (m.toolName === 'propose_hypotheses' && (m.toolDetails?.hypotheses || m.toolInput)) {
+                        const raw = m.toolDetails?.hypotheses;
+                        if (Array.isArray(raw)) {
+                            // Structured path (SDK brain)
+                            (raw as Array<{ id?: string; text?: string }>).forEach((h, idx) => {
+                                hypothesesTextMap.set(h.id ?? `H${idx + 1}`, h.text ?? '');
+                            });
+                        } else {
+                            // Pi-agent path (string) — reuse HypothesesCard's parser
+                            const source = (raw as string | undefined) || m.toolInput || '';
+                            if (source) {
+                                const parsed = parseHypothesesText(source);
+                                parsed.forEach((h, idx) => {
+                                    hypothesesTextMap.set(`H${idx + 1}`, h.title);
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+                // Fallback: use confirmedHypotheses from agentbox dp-state (may have empty text
+                // due to extension parser mismatch, but better than nothing)
+                if (hypothesesTextMap.size === 0 && snap.confirmedHypotheses) {
+                    snap.confirmedHypotheses.forEach(h => {
+                        if (h.text) hypothesesTextMap.set(h.id, h.text);
+                    });
+                }
+            }
+
             // Replay investigation progress for hypothesis tree (deep_search sub-agent detail)
             if (snap.events && snap.events.length > 0) {
                 let state: InvestigationProgress = { hypotheses: [] };
                 for (const ev of snap.events) {
                     state = reduceInvestigationProgress(state, ev);
                 }
-                // Backfill hypothesis text from confirmedHypotheses (authoritative source from agentbox).
-                // dpProgressSnapshots may lose initial hypothesis events on gateway restart,
-                // leaving hypotheses with id-only (e.g. "H1") but no title text.
-                if (snap.confirmedHypotheses && snap.confirmedHypotheses.length > 0) {
-                    const textMap = new Map(snap.confirmedHypotheses.map(h => [h.id, h.text]));
+                // Backfill missing hypothesis titles from chat history / confirmedHypotheses
+                if (hypothesesTextMap.size > 0) {
                     state = {
                         ...state,
                         hypotheses: state.hypotheses.map(h =>
-                            !h.text && textMap.has(h.id)
-                                ? { ...h, text: textMap.get(h.id)! }
+                            !h.text && hypothesesTextMap.has(h.id)
+                                ? { ...h, text: hypothesesTextMap.get(h.id)! }
                                 : h
                         ),
                     };
                 }
                 setInvestigationProgress(state);
-            } else if (snap.confirmedHypotheses && snap.confirmedHypotheses.length > 0 && snap.promptActive) {
-                // No progress events cached (gateway restart), but we know hypotheses from agentbox.
-                // Pre-populate so the hypothesis tree isn't empty.
+            } else if (hypothesesTextMap.size > 0 && snap.promptActive) {
+                // No progress events cached, but we have hypothesis names from history.
+                // Pre-populate so the tree shows titles immediately.
+                const entries = snap.confirmedHypotheses ?? Array.from(hypothesesTextMap.entries()).map(
+                    ([id, text]) => ({ id, text, confidence: 0 }),
+                );
                 setInvestigationProgress({
-                    hypotheses: snap.confirmedHypotheses.map(h => ({
+                    hypotheses: entries.map(h => ({
                         id: h.id,
-                        text: h.text,
-                        status: 'validating',
+                        text: hypothesesTextMap.get(h.id) || h.text || '',
+                        status: 'validating' as const,
                         confidence: h.confidence,
                         callsUsed: 0,
                         maxCalls: 10,
