@@ -814,6 +814,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // --- tool_call: system event → status transition + progress rendering ---
 
   api.on("tool_call", (event, ctx) => {
+    // Block all tools during awaiting_confirmation — model must wait for user.
+    // This prevents the model from continuing to call tools after propose_hypotheses
+    // in the same turn (the steer interrupt may not catch parallel tool calls).
+    if (dpStatus === "awaiting_confirmation" && event.toolName !== "propose_hypotheses") {
+      throw new Error(
+        "Blocked: waiting for user to confirm/adjust/skip hypotheses. " +
+        "Do not call any tools until the user responds."
+      );
+    }
     // Clear hypotheses widget when model proceeds to next tool
     if (event.toolName !== "propose_hypotheses") {
       ctx.ui.setWidget("dp-hypotheses", undefined);
