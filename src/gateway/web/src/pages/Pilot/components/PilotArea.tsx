@@ -279,7 +279,8 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
             if (lastToolIdx < 0 && turnMessages[i].role === 'tool') lastToolIdx = i;
             if (lastAssistantIdx >= 0 && lastToolIdx >= 0) break;
         }
-        const hasConclusion = lastAssistantIdx > lastToolIdx && lastToolIdx >= 0;
+        const hasConclusion = lastAssistantIdx > lastToolIdx && lastToolIdx >= 0
+            && (turnMessages[lastAssistantIdx]?.content?.trim().length ?? 0) > 0;
         const stillStreaming = turnMessages.some(m => m.isStreaming);
         return hasDiagnostic && hasConclusion && !stillStreaming;
     }, [messages, isLoading, dpActive, dpChecklist]);
