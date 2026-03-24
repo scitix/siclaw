@@ -17,6 +17,7 @@ interface ClusterOption {
 }
 
 type Tab = 'general' | 'skills' | 'tools' | 'access';
+type SkillsSubtab = 'global' | 'spaces' | 'personal';
 
 type SkillComposerSkillOption = {
     id: string;
@@ -152,6 +153,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         skillSpaces: [],
     });
     const [composer, setComposer] = useState<WorkspaceSkillComposer>(normalizeComposer());
+    const [skillsSubtab, setSkillsSubtab] = useState<SkillsSubtab>('global');
     const [globalSearch, setGlobalSearch] = useState('');
     const [personalSearch, setPersonalSearch] = useState('');
     const [skillSpaceSearch, setSkillSpaceSearch] = useState('');
@@ -714,251 +716,279 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                             </div>
 
                             <section className="rounded-2xl border border-gray-200 bg-white p-4">
-                                <div className="flex items-center justify-between gap-4 mb-3">
-                                    <div>
-                                        <h3 className="text-sm font-semibold text-gray-900">Global Skills</h3>
-                                        <p className="text-xs text-gray-500 mt-1">Pick the builtin and team skills this workspace should load.</p>
-                                    </div>
-                                </div>
-                                <div className="relative mb-2">
-                                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-                                    <input
-                                        type="text"
-                                        value={globalSearch}
-                                        onChange={e => setGlobalSearch(e.target.value)}
-                                        placeholder="Search global skills..."
-                                        className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                                    />
-                                </div>
-                                {globalLabels.length > 0 && (
-                                    <div className="flex flex-wrap gap-1 mb-2">
+                                <div className="flex gap-2 mb-4 border-b border-gray-100 pb-3 overflow-x-auto">
+                                    {([
+                                        { id: 'global' as const, label: `Global (${composer.globalSkillRefs.length})` },
+                                        { id: 'spaces' as const, label: `Skill Spaces (${composer.skillSpaces.length})` },
+                                        { id: 'personal' as const, label: `Personal (${composer.personalSkillIds.length})` },
+                                    ]).map(item => (
                                         <button
-                                            onClick={() => setGlobalLabelFilter(null)}
-                                            className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                                                !globalLabelFilter ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                            key={item.id}
+                                            onClick={() => setSkillsSubtab(item.id)}
+                                            className={`px-3 py-1.5 text-sm font-medium rounded-lg whitespace-nowrap transition-colors ${
+                                                skillsSubtab === item.id
+                                                    ? 'bg-indigo-600 text-white'
+                                                    : 'text-gray-600 bg-gray-100 hover:bg-gray-200'
                                             }`}
                                         >
-                                            All
+                                            {item.label}
                                         </button>
-                                        {globalLabels.map(label => (
-                                            <button
-                                                key={label}
-                                                onClick={() => setGlobalLabelFilter(globalLabelFilter === label ? null : label)}
-                                                className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                                                    globalLabelFilter === label ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                                                }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
-                                    </div>
-                                )}
-                                <SelectAllBar
-                                    total={filteredGlobalSkills.length}
-                                    selected={filteredGlobalSkills.filter(skill => selectedGlobalRefSet.has(skill.ref)).length}
-                                    onSelectAll={() => setComposer(prev => ({
-                                        ...prev,
-                                        globalSkillRefs: [...new Set([...prev.globalSkillRefs, ...filteredGlobalSkills.map(skill => skill.ref)])],
-                                    }))}
-                                    onDeselectAll={() => setComposer(prev => ({
-                                        ...prev,
-                                        globalSkillRefs: prev.globalSkillRefs.filter(ref => !filteredGlobalSkills.some(skill => skill.ref === ref)),
-                                    }))}
-                                />
-                                <div className="max-h-56 overflow-y-auto space-y-0.5">
-                                    {filteredGlobalSkills.map(skill => (
-                                        <label key={skill.ref} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer">
-                                            <input
-                                                type="checkbox"
-                                                checked={selectedGlobalRefSet.has(skill.ref)}
-                                                onChange={() => toggleGlobalSkill(skill.ref)}
-                                                className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-                                            />
-                                            <div className="min-w-0 flex-1">
-                                                <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
-                                            </div>
-                                            {skill.labels && skill.labels.length > 0 && (
-                                                <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
-                                            )}
-                                            <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">{sourceLabel(skill.scope)}</span>
-                                        </label>
                                     ))}
-                                    {filteredGlobalSkills.length === 0 && (
-                                        <p className="text-sm text-gray-400 py-4 text-center">No global skills match.</p>
-                                    )}
                                 </div>
-                            </section>
 
-                            <section className="rounded-2xl border border-gray-200 bg-white p-4">
-                                <div className="flex items-center justify-between gap-4 mb-3">
+                                {skillsSubtab === 'global' && (
                                     <div>
-                                        <h3 className="text-sm font-semibold text-gray-900">Skill Spaces</h3>
-                                        <p className="text-xs text-gray-500 mt-1">
-                                            Select whole spaces, then expand them to disable specific skills inside each selected space.
-                                        </p>
-                                    </div>
-                                    {!composerOptions.skillSpaceAvailable && (
-                                        <span className="text-xs text-gray-400">Unavailable in this deployment</span>
-                                    )}
-                                </div>
-                                <div className="relative mb-2">
-                                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-                                    <input
-                                        type="text"
-                                        value={skillSpaceSearch}
-                                        onChange={e => setSkillSpaceSearch(e.target.value)}
-                                        placeholder="Search skill spaces..."
-                                        className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                                    />
-                                </div>
-                                <div className="space-y-3 max-h-[26rem] overflow-y-auto">
-                                    {filteredSkillSpaces.map(space => {
-                                        const selection = composer.skillSpaces.find(entry => entry.skillSpaceId === space.id);
-                                        const disabledIds = new Set(selection?.disabledSkillIds ?? []);
-                                        const isSelected = !!selection;
-                                        const canToggle = composerOptions.skillSpaceAvailable && (envType === 'test' || isSelected);
-                                        return (
-                                            <div key={space.id} className={`rounded-xl border ${isSelected ? 'border-indigo-200 bg-indigo-50/40' : 'border-gray-200 bg-white'}`}>
-                                                <div className="flex items-start gap-3 px-4 py-3">
+                                        <div className="flex items-center justify-between gap-4 mb-3">
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-gray-900">Global Skills</h3>
+                                                <p className="text-xs text-gray-500 mt-1">Pick the builtin and team skills this workspace should load.</p>
+                                            </div>
+                                        </div>
+                                        <div className="relative mb-2">
+                                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                                            <input
+                                                type="text"
+                                                value={globalSearch}
+                                                onChange={e => setGlobalSearch(e.target.value)}
+                                                placeholder="Search global skills..."
+                                                className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                                            />
+                                        </div>
+                                        {globalLabels.length > 0 && (
+                                            <div className="flex flex-wrap gap-1 mb-2">
+                                                <button
+                                                    onClick={() => setGlobalLabelFilter(null)}
+                                                    className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                                                        !globalLabelFilter ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                                    }`}
+                                                >
+                                                    All
+                                                </button>
+                                                {globalLabels.map(label => (
+                                                    <button
+                                                        key={label}
+                                                        onClick={() => setGlobalLabelFilter(globalLabelFilter === label ? null : label)}
+                                                        className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                                                            globalLabelFilter === label ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                                        }`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
+                                        <SelectAllBar
+                                            total={filteredGlobalSkills.length}
+                                            selected={filteredGlobalSkills.filter(skill => selectedGlobalRefSet.has(skill.ref)).length}
+                                            onSelectAll={() => setComposer(prev => ({
+                                                ...prev,
+                                                globalSkillRefs: [...new Set([...prev.globalSkillRefs, ...filteredGlobalSkills.map(skill => skill.ref)])],
+                                            }))}
+                                            onDeselectAll={() => setComposer(prev => ({
+                                                ...prev,
+                                                globalSkillRefs: prev.globalSkillRefs.filter(ref => !filteredGlobalSkills.some(skill => skill.ref === ref)),
+                                            }))}
+                                        />
+                                        <div className="max-h-[26rem] overflow-y-auto space-y-0.5">
+                                            {filteredGlobalSkills.map(skill => (
+                                                <label key={skill.ref} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer">
                                                     <input
                                                         type="checkbox"
-                                                        checked={isSelected}
-                                                        disabled={!canToggle}
-                                                        onChange={() => toggleSkillSpace(space.id)}
-                                                        className="mt-1 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
+                                                        checked={selectedGlobalRefSet.has(skill.ref)}
+                                                        onChange={() => toggleGlobalSkill(skill.ref)}
+                                                        className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
                                                     />
                                                     <div className="min-w-0 flex-1">
-                                                        <div className="flex items-center gap-2">
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => toggleExpandedSpace(space.id)}
-                                                                className="text-gray-400 hover:text-gray-600"
-                                                            >
-                                                                {expandedSpaceIds.has(space.id) ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                                                            </button>
-                                                            <div className="font-medium text-gray-900">{space.name}</div>
-                                                            <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">{space.memberRole || 'maintainer'}</span>
-                                                            <span className="text-xs text-gray-400">{space.skills.length} skills</span>
-                                                        </div>
-                                                        <p className="text-xs text-gray-500 mt-1">{space.description || 'No description'}</p>
+                                                        <div className="text-sm text-gray-900 truncate">{skill.name}</div>
+                                                        <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
                                                     </div>
-                                                </div>
-                                                {expandedSpaceIds.has(space.id) && (
-                                                    <div className="border-t border-gray-100 px-4 py-3 space-y-1 bg-white/70">
-                                                        {space.skills.map(skill => {
-                                                            const included = !disabledIds.has(skill.id);
-                                                            return (
-                                                                <label key={skill.id} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-gray-50">
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={included}
-                                                                        disabled={!isSelected || envType === 'prod'}
-                                                                        onChange={() => toggleDisabledSkillInSpace(space.id, skill.id)}
-                                                                        className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
-                                                                    />
-                                                                    <div className="min-w-0 flex-1">
-                                                                        <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                                        <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
-                                                                    </div>
-                                                                    {skill.labels && skill.labels.length > 0 && (
-                                                                        <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
-                                                                    )}
-                                                                </label>
-                                                            );
-                                                        })}
-                                                    </div>
-                                                )}
-                                            </div>
-                                        );
-                                    })}
-                                    {filteredSkillSpaces.length === 0 && (
-                                        <p className="text-sm text-gray-400 py-4 text-center">No Skill Spaces match.</p>
-                                    )}
-                                </div>
-                            </section>
-
-                            <section className="rounded-2xl border border-gray-200 bg-white p-4">
-                                <div className="flex items-center justify-between gap-4 mb-3">
-                                    <div>
-                                        <h3 className="text-sm font-semibold text-gray-900">Personal Skills</h3>
-                                        <p className="text-xs text-gray-500 mt-1">Select the exact personal overrides this workspace should use.</p>
-                                    </div>
-                                </div>
-                                <div className="relative mb-2">
-                                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
-                                    <input
-                                        type="text"
-                                        value={personalSearch}
-                                        onChange={e => setPersonalSearch(e.target.value)}
-                                        placeholder="Search personal skills..."
-                                        className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
-                                    />
-                                </div>
-                                {personalLabels.length > 0 && (
-                                    <div className="flex flex-wrap gap-1 mb-2">
-                                        <button
-                                            onClick={() => setPersonalLabelFilter(null)}
-                                            className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                                                !personalLabelFilter ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                                            }`}
-                                        >
-                                            All
-                                        </button>
-                                        {personalLabels.map(label => (
-                                            <button
-                                                key={label}
-                                                onClick={() => setPersonalLabelFilter(personalLabelFilter === label ? null : label)}
-                                                className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                                                    personalLabelFilter === label ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
-                                                }`}
-                                            >
-                                                {label}
-                                            </button>
-                                        ))}
+                                                    {skill.labels && skill.labels.length > 0 && (
+                                                        <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
+                                                    )}
+                                                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">{sourceLabel(skill.scope)}</span>
+                                                </label>
+                                            ))}
+                                            {filteredGlobalSkills.length === 0 && (
+                                                <p className="text-sm text-gray-400 py-4 text-center">No global skills match.</p>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
-                                <SelectAllBar
-                                    total={filteredPersonalSkills.length}
-                                    selected={filteredPersonalSkills.filter(skill => selectedPersonalIdSet.has(skill.id)).length}
-                                    disableSelectAll={envType !== 'test'}
-                                    onSelectAll={() => setComposer(prev => ({
-                                        ...prev,
-                                        personalSkillIds: [...new Set([...prev.personalSkillIds, ...filteredPersonalSkills.map(skill => skill.id)])],
-                                    }))}
-                                    onDeselectAll={() => setComposer(prev => ({
-                                        ...prev,
-                                        personalSkillIds: prev.personalSkillIds.filter(id => !filteredPersonalSkills.some(skill => skill.id === id)),
-                                    }))}
-                                />
-                                <div className="max-h-56 overflow-y-auto space-y-0.5">
-                                    {filteredPersonalSkills.map(skill => {
-                                        const isSelected = selectedPersonalIdSet.has(skill.id);
-                                        const canToggle = envType === 'test' || isSelected;
-                                        return (
-                                            <label key={skill.id} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={isSelected}
-                                                    disabled={!canToggle}
-                                                    onChange={() => togglePersonalSkill(skill.id)}
-                                                    className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
-                                                />
-                                                <div className="min-w-0 flex-1">
-                                                    <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                    <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
-                                                </div>
-                                                {skill.labels && skill.labels.length > 0 && (
-                                                    <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
-                                                )}
-                                                <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">personal</span>
-                                            </label>
-                                        );
-                                    })}
-                                    {filteredPersonalSkills.length === 0 && (
-                                        <p className="text-sm text-gray-400 py-4 text-center">No personal skills match.</p>
-                                    )}
-                                </div>
+
+                                {skillsSubtab === 'spaces' && (
+                                    <div>
+                                        <div className="flex items-center justify-between gap-4 mb-3">
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-gray-900">Skill Spaces</h3>
+                                                <p className="text-xs text-gray-500 mt-1">
+                                                    Select whole spaces, then expand them to disable specific skills inside each selected space.
+                                                </p>
+                                            </div>
+                                            {!composerOptions.skillSpaceAvailable && (
+                                                <span className="text-xs text-gray-400">Unavailable in this deployment</span>
+                                            )}
+                                        </div>
+                                        <div className="relative mb-2">
+                                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                                            <input
+                                                type="text"
+                                                value={skillSpaceSearch}
+                                                onChange={e => setSkillSpaceSearch(e.target.value)}
+                                                placeholder="Search skill spaces..."
+                                                className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                                            />
+                                        </div>
+                                        <div className="space-y-3 max-h-[26rem] overflow-y-auto">
+                                            {filteredSkillSpaces.map(space => {
+                                                const selection = composer.skillSpaces.find(entry => entry.skillSpaceId === space.id);
+                                                const disabledIds = new Set(selection?.disabledSkillIds ?? []);
+                                                const isSelected = !!selection;
+                                                const canToggle = composerOptions.skillSpaceAvailable && (envType === 'test' || isSelected);
+                                                return (
+                                                    <div key={space.id} className={`rounded-xl border ${isSelected ? 'border-indigo-200 bg-indigo-50/40' : 'border-gray-200 bg-white'}`}>
+                                                        <div className="flex items-start gap-3 px-4 py-3">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={isSelected}
+                                                                disabled={!canToggle}
+                                                                onChange={() => toggleSkillSpace(space.id)}
+                                                                className="mt-1 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
+                                                            />
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className="flex items-center gap-2">
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => toggleExpandedSpace(space.id)}
+                                                                        className="text-gray-400 hover:text-gray-600"
+                                                                    >
+                                                                        {expandedSpaceIds.has(space.id) ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                                                                    </button>
+                                                                    <div className="font-medium text-gray-900">{space.name}</div>
+                                                                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">{space.memberRole || 'maintainer'}</span>
+                                                                    <span className="text-xs text-gray-400">{space.skills.length} skills</span>
+                                                                </div>
+                                                                <p className="text-xs text-gray-500 mt-1">{space.description || 'No description'}</p>
+                                                            </div>
+                                                        </div>
+                                                        {expandedSpaceIds.has(space.id) && (
+                                                            <div className="border-t border-gray-100 px-4 py-3 space-y-1 bg-white/70">
+                                                                {space.skills.map(skill => {
+                                                                    const included = !disabledIds.has(skill.id);
+                                                                    return (
+                                                                        <label key={skill.id} className="flex items-center gap-3 px-2 py-1.5 rounded-lg hover:bg-gray-50">
+                                                                            <input
+                                                                                type="checkbox"
+                                                                                checked={included}
+                                                                                disabled={!isSelected || envType === 'prod'}
+                                                                                onChange={() => toggleDisabledSkillInSpace(space.id, skill.id)}
+                                                                                className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
+                                                                            />
+                                                                            <div className="min-w-0 flex-1">
+                                                                                <div className="text-sm text-gray-900 truncate">{skill.name}</div>
+                                                                                <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
+                                                                            </div>
+                                                                            {skill.labels && skill.labels.length > 0 && (
+                                                                                <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
+                                                                            )}
+                                                                        </label>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                            {filteredSkillSpaces.length === 0 && (
+                                                <p className="text-sm text-gray-400 py-4 text-center">No Skill Spaces match.</p>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {skillsSubtab === 'personal' && (
+                                    <div>
+                                        <div className="flex items-center justify-between gap-4 mb-3">
+                                            <div>
+                                                <h3 className="text-sm font-semibold text-gray-900">Personal Skills</h3>
+                                                <p className="text-xs text-gray-500 mt-1">Select the exact personal overrides this workspace should use.</p>
+                                            </div>
+                                        </div>
+                                        <div className="relative mb-2">
+                                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                                            <input
+                                                type="text"
+                                                value={personalSearch}
+                                                onChange={e => setPersonalSearch(e.target.value)}
+                                                placeholder="Search personal skills..."
+                                                className="w-full pl-9 pr-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                                            />
+                                        </div>
+                                        {personalLabels.length > 0 && (
+                                            <div className="flex flex-wrap gap-1 mb-2">
+                                                <button
+                                                    onClick={() => setPersonalLabelFilter(null)}
+                                                    className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                                                        !personalLabelFilter ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                                    }`}
+                                                >
+                                                    All
+                                                </button>
+                                                {personalLabels.map(label => (
+                                                    <button
+                                                        key={label}
+                                                        onClick={() => setPersonalLabelFilter(personalLabelFilter === label ? null : label)}
+                                                        className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                                                            personalLabelFilter === label ? 'bg-indigo-100 text-indigo-700' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                                        }`}
+                                                    >
+                                                        {label}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        )}
+                                        <SelectAllBar
+                                            total={filteredPersonalSkills.length}
+                                            selected={filteredPersonalSkills.filter(skill => selectedPersonalIdSet.has(skill.id)).length}
+                                            disableSelectAll={envType !== 'test'}
+                                            onSelectAll={() => setComposer(prev => ({
+                                                ...prev,
+                                                personalSkillIds: [...new Set([...prev.personalSkillIds, ...filteredPersonalSkills.map(skill => skill.id)])],
+                                            }))}
+                                            onDeselectAll={() => setComposer(prev => ({
+                                                ...prev,
+                                                personalSkillIds: prev.personalSkillIds.filter(id => !filteredPersonalSkills.some(skill => skill.id === id)),
+                                            }))}
+                                        />
+                                        <div className="max-h-[26rem] overflow-y-auto space-y-0.5">
+                                            {filteredPersonalSkills.map(skill => {
+                                                const isSelected = selectedPersonalIdSet.has(skill.id);
+                                                const canToggle = envType === 'test' || isSelected;
+                                                return (
+                                                    <label key={skill.id} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-gray-50 cursor-pointer">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={isSelected}
+                                                            disabled={!canToggle}
+                                                            onChange={() => togglePersonalSkill(skill.id)}
+                                                            className="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 disabled:opacity-40"
+                                                        />
+                                                        <div className="min-w-0 flex-1">
+                                                            <div className="text-sm text-gray-900 truncate">{skill.name}</div>
+                                                            <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
+                                                        </div>
+                                                        {skill.labels && skill.labels.length > 0 && (
+                                                            <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
+                                                        )}
+                                                        <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 shrink-0">personal</span>
+                                                    </label>
+                                                );
+                                            })}
+                                            {filteredPersonalSkills.length === 0 && (
+                                                <p className="text-sm text-gray-400 py-4 text-center">No personal skills match.</p>
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
                             </section>
                         </div>
                     )}
