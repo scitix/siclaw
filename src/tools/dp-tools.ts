@@ -230,8 +230,8 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
     label: "Propose Hypotheses",
     description:
       "Present hypotheses to the user as a structured UI card. " +
-      "Use this to communicate your investigation thinking and align direction before committing to deep_search. " +
-      "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.\n" +
+      "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
+      "Your text before this tool call should be ≤3 sentences (triage summary + transition).\n" +
       "In Deep Investigation mode: you MUST wait for the user's response after calling this tool. " +
       "Do NOT call deep_search until the user explicitly confirms.",
     parameters: Type.Object({
@@ -242,22 +242,21 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
             description:
               "A specific, testable hypothesis statement (one sentence). " +
               "NOT a title, category name, or group heading. " +
-              'Good: "Firewall rules blocking inter-node communication on port 6443". ' +
-              'Bad: "Check cluster demo".',
+              'Good: "Evicted pods exhausted ResourceQuota, blocking new pod creation". ' +
+              'Bad: "Check resource limits".',
           }),
-          confidence: Type.Number({ description: "Prior confidence 0-100" }),
+          confidence: Type.Number({ description: "Prior confidence 0-100 based on evidence strength" }),
           description: Type.Optional(
             Type.String({
               description:
-                "Brief explanation: why this hypothesis is plausible and how to validate it. " +
-                "Include relevant technical context, affected components, and key validation commands.",
+                "1-2 sentence explanation: why this is plausible and how to validate it.",
             })
           ),
         }),
         {
           description:
-            "Each element is one distinct, independent hypothesis. " +
-            "Do NOT include overall titles or summary items — only concrete hypotheses.",
+            "2-4 hypotheses max. Each must be a specific, testable claim — not a category or topic. " +
+            "Quality over quantity: drop low-confidence filler hypotheses.",
         }
       ),
       triageContext: Type.Optional(
