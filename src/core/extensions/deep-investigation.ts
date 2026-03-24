@@ -3,7 +3,6 @@ import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { deepSearchEvents, type ProgressEvent } from "../../tools/deep-search/events.js";
 import {
-  type ChecklistItemStatus,
   type DpChecklist,
   type MutableDpStateRef,
   type DpStatus,
@@ -34,14 +33,6 @@ import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
  */
 
 const WIDGET_ID = "deep-search-tree";
-
-function markItem(cl: DpChecklist, id: string, status: ChecklistItemStatus, summary?: string): void {
-  const item = cl.items.find((i) => i.id === id);
-  if (item) {
-    item.status = status;
-    if (summary) item.summary = summary;
-  }
-}
 
 // --- Theme safety ---
 
@@ -901,7 +892,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // --- context: filter UI-only custom messages ---
 
   // Custom types that are UI-only metadata — must never be sent to the LLM.
-  const DP_FILTER_TYPES = new Set(["dp-mode", "dp-checklist-sync"]);
+  const DP_FILTER_TYPES = new Set(["dp-mode"]);
 
   api.on("context", async (event) => {
     return {

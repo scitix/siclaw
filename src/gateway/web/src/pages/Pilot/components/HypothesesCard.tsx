@@ -222,7 +222,6 @@ export interface ConfirmedHypothesis {
 export interface HypothesesCardProps {
     message: PilotMessage;
     sendMessage?: (text: string) => void;
-    abortResponse?: () => void;
     onHypothesesConfirmed?: (hypotheses: ConfirmedHypothesis[]) => void;
     superseded?: boolean;
     /** True when a deep_search exists after this card — survives page refresh */

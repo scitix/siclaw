@@ -769,7 +769,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
             return <InvestigationCard message={message} progress={message.isStreaming ? investigationProgress : undefined} sendMessage={sendMessage} updateMessageMeta={updateMessageMeta} />;
         }
         if (message.toolName === 'propose_hypotheses' && !message.isStreaming) {
-            return <HypothesesCard message={message} sendMessage={sendMessage} abortResponse={abortResponse} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
+            return <HypothesesCard message={message} sendMessage={sendMessage} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
         }
         return <ToolItem message={message} skills={skills} onEditSkill={onEditSkill} />;
     }

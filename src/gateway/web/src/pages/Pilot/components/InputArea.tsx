@@ -64,7 +64,6 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
     const deepInvestigation = dpActive ?? false;
     const setDeepInvestigation = onSetDpActive ?? (() => {});
 
-
     // Action menu state
     const [showActionMenu, setShowActionMenu] = useState(false);
 
