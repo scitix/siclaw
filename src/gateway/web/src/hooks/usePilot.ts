@@ -1065,6 +1065,7 @@ export function usePilot() {
                 dpStatus?: string | null;
                 checklist?: DpChecklistItem[] | null;
                 dpQuestion?: string | null;
+                confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }> | null;
             }>('chat.dpProgress', { sessionId: targetSession });
 
             // Restore loading state if prompt is still active
@@ -1087,7 +1088,34 @@ export function usePilot() {
                 for (const ev of snap.events) {
                     state = reduceInvestigationProgress(state, ev);
                 }
+                // Backfill hypothesis text from confirmedHypotheses (authoritative source from agentbox).
+                // dpProgressSnapshots may lose initial hypothesis events on gateway restart,
+                // leaving hypotheses with id-only (e.g. "H1") but no title text.
+                if (snap.confirmedHypotheses && snap.confirmedHypotheses.length > 0) {
+                    const textMap = new Map(snap.confirmedHypotheses.map(h => [h.id, h.text]));
+                    state = {
+                        ...state,
+                        hypotheses: state.hypotheses.map(h =>
+                            !h.text && textMap.has(h.id)
+                                ? { ...h, text: textMap.get(h.id)! }
+                                : h
+                        ),
+                    };
+                }
                 setInvestigationProgress(state);
+            } else if (snap.confirmedHypotheses && snap.confirmedHypotheses.length > 0 && snap.promptActive) {
+                // No progress events cached (gateway restart), but we know hypotheses from agentbox.
+                // Pre-populate so the hypothesis tree isn't empty.
+                setInvestigationProgress({
+                    hypotheses: snap.confirmedHypotheses.map(h => ({
+                        id: h.id,
+                        text: h.text,
+                        status: 'validating',
+                        confidence: h.confidence,
+                        callsUsed: 0,
+                        maxCalls: 10,
+                    })),
+                });
             }
         } catch {
             // Gateway may not support extended dpProgress yet
