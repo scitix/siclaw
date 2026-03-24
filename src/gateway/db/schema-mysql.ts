@@ -303,6 +303,14 @@ export const workspaces = mysqlTable("workspaces", {
     systemPrompt?: string;
     icon?: string;
     color?: string;
+    skillComposer?: {
+      globalSkillRefs?: string[];
+      personalSkillIds?: string[];
+      skillSpaces?: Array<{
+        skillSpaceId: string;
+        disabledSkillIds?: string[];
+      }>;
+    };
   }>(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

@@ -292,6 +292,14 @@ export const workspaces = sqliteTable("workspaces", {
     systemPrompt?: string;
     icon?: string;
     color?: string;
+    skillComposer?: {
+      globalSkillRefs?: string[];
+      personalSkillIds?: string[];
+      skillSpaces?: Array<{
+        skillSpaceId: string;
+        disabledSkillIds?: string[];
+      }>;
+    };
   }>(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
