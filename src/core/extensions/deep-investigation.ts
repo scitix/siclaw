@@ -438,17 +438,23 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     label: "Propose Hypotheses",
     description:
       "Present hypotheses to the user as an interactive review card. " +
-      "In TUI: the tool BLOCKS until the user makes a decision (proceed / adjust / skip). " +
+      "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
+      "Your text before this tool call should be ≤3 sentences (triage summary + transition).\n" +
+      "In TUI: BLOCKS until user decides (proceed / adjust / skip). " +
       "In web UI: returns immediately — you MUST wait for the user's next message. " +
-      "Use this to align investigation direction before committing to deep_search. " +
-      "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.\n" +
-      "In Deep Investigation mode: you MUST wait for the user's response after calling this tool. " +
       "Do NOT call deep_search until the user explicitly confirms.",
     parameters: Type.Object({
       hypotheses: Type.String({
         description:
-          "Formatted hypothesis list in markdown. Each hypothesis should include: " +
-          "description, validation method (skill script paths), and confidence percentage.",
+          "Hypothesis list in strict markdown format. Use numbered headings with inline confidence:\n" +
+          "### 1. Specific testable statement (Confidence: 75%)\n" +
+          "Brief explanation of why this is plausible and how to validate it.\n" +
+          "---\n" +
+          "### 2. Another specific statement (Confidence: 60%)\n" +
+          "Brief explanation.\n\n" +
+          "Rules: 2-4 hypotheses max. Each must be a specific, testable claim — not a category or topic. " +
+          "Separate hypotheses with --- on its own line. " +
+          "Keep each hypothesis to 2-3 lines (title + explanation). No sub-lists, no verbose detail.",
       }),
       triageContext: Type.String({
         description:
@@ -845,6 +851,18 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       }
       activeUI = ctx.ui;
       resetProgressState();
+    }
+  });
+
+  // --- tool_result: force-stop after propose_hypotheses in web mode ---
+  // In TUI mode, propose_hypotheses blocks via ctx.ui.select() so the model can't continue.
+  // In web mode, it returns immediately — the model sees the result and may keep generating
+  // text (tool calls are blocked, but text isn't). Abort the turn to prevent premature conclusions.
+
+  api.on("tool_result", (event, ctx) => {
+    if (event.toolName === "propose_hypotheses" && dpStatus === "awaiting_confirmation" && !ctx.hasUI) {
+      console.log("[dp-extension] Aborting turn after propose_hypotheses (web mode — force wait for user)");
+      ctx.abort();
     }
   });
 

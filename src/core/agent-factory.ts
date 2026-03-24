@@ -652,6 +652,12 @@ export async function createSiclawSession(
     thinkingLevel: "high",
   });
 
+  // Trigger session_start for extension state restoration.
+  // In web/gateway mode, bindExtensions() is never called by the TUI layer,
+  // so session_start doesn't fire and extensions can't restore persisted state
+  // (e.g. DP mode status after session release/rebuild).
+  await session.bindExtensions({});
+
   // ── Input streamFn wrappers (modify context.messages before API call) ──
 
   // 1. Sanitize malformed tool calls (drop incomplete blocks)

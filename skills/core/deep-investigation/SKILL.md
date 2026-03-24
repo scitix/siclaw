@@ -59,18 +59,34 @@ Gather environment context and confirm the problem exists.
 
 ### Phase 2: Propose Hypotheses (investigating → awaiting_confirmation)
 
-Formulate 3-5 ranked hypotheses based on triage findings.
+Formulate 2-4 ranked hypotheses based on triage findings. Quality over quantity —
+every hypothesis must be specific and testable.
 
-1. Call `propose_hypotheses` with your hypothesis list AND `triageContext`.
-2. **STOP and wait for the user's response.** This is mandatory, not optional.
+1. Write a **brief transition sentence** (1-2 sentences max) in your text response,
+   e.g. "Based on the triage, I've identified the following hypotheses."
+2. Call `propose_hypotheses` with your hypothesis list AND `triageContext`.
+3. **STOP and wait for the user's response.** This is mandatory, not optional.
    - The user may confirm → proceed to Phase 3
    - The user may provide feedback → revise hypotheses, do more triage if needed,
      then call `propose_hypotheses` again (this loop can repeat)
    - The user may ask to skip → present conclusion based on current findings
-3. **Do NOT call deep_search without explicit user confirmation.**
+4. **Do NOT call deep_search without explicit user confirmation.**
+
+**CRITICAL output rule**: Do NOT list or describe hypotheses in your text response.
+The `propose_hypotheses` tool renders a dedicated interactive UI card that displays
+all hypotheses with confidence scores and action buttons. Repeating them in text
+creates ugly duplication. Your text should ONLY contain the triage summary and a
+short transition. All hypothesis content goes into the tool call parameters.
 
 The investigate-propose-feedback loop can repeat as many times as needed.
 Each round improves hypothesis quality.
+
+**What makes a good hypothesis:**
+- One specific, testable statement — not a category or topic
+- Good: "Evicted pods exhausted ResourceQuota, blocking new pod creation"
+- Bad: "Check resource limits" or "Memory issues"
+- Each hypothesis should be independent (not sub-points of the same idea)
+- Include confidence based on evidence strength, not gut feeling
 
 ### Phase 3: Deep Search Validation (validating)
 
@@ -83,9 +99,13 @@ Only proceed after the user explicitly confirms hypotheses.
 
 ### Phase 4: Present Findings (concluding → completed)
 
-After deep_search completes, synthesize results into a conclusion.
+After deep_search completes, synthesize results into a focused conclusion.
 
-1. Write a clear conclusion with root cause analysis and recommendations.
+1. Lead with the **single most likely root cause** — not a list of everything you checked.
+2. Support it with the key evidence from deep_search (validated/invalidated hypotheses).
+3. Provide actionable recommendations (specific commands or config changes).
+4. If multiple root causes are confirmed, prioritize by impact — mention the primary
+   cause first, secondary causes briefly after.
 
 ### Phase 5: Feedback (optional)
 
@@ -108,7 +128,7 @@ If the user confirms, corrects, or rejects the diagnosis:
 
 ## Guidelines
 
-1. **Use propose_hypotheses for communication**: Always use the tool (not plain text) to present hypotheses — it renders a proper UI card and saves the triage context for deep_search.
+1. **The card IS your output**: `propose_hypotheses` renders an interactive card — that is the user-facing presentation. Do NOT write hypotheses in your text. No markdown lists, no numbered hypotheses, no "Hypothesis 1: ..." in text. Your text response should be ≤3 sentences: triage summary + transition.
 2. **Always include triageContext**: When calling propose_hypotheses, pass your triage findings as the triageContext parameter. This is automatically provided to deep_search when the user confirms.
 3. **Wait for user confirmation**: After propose_hypotheses, you MUST wait. Do NOT call deep_search without explicit user approval.
 4. **Be cost-aware with deep_search**: It launches parallel sub-agents consuming 30-60 tool calls. The interactive planning loop ensures the investigation direction is right before committing resources.
