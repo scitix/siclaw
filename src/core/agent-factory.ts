@@ -41,7 +41,6 @@ import {
   createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
-  getDpWorkflow,
 } from "../tools/dp-tools.js";
 import { createMemorySearchTool } from "../tools/memory-search.js";
 import { createMemoryGetTool } from "../tools/memory-get.js";

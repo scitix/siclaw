@@ -591,7 +591,7 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
         return { isDeepInvestigation: true, text: content.replace(dpMatch[0], '').trim() };
     }
     // Strip DP state control markers (confirm/adjust/skip)
-    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|SKIP)\]\n*/);
+    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|SKIP|EXIT)\]\n*/);
     if (controlMatch) {
         return { isDeepInvestigation: true, text: content.replace(controlMatch[0], '').trim() };
     }

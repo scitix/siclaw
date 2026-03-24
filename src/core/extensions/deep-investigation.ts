@@ -301,14 +301,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
   function disableDpMode(ctx: ExtensionContext): void {
     if (dpStatus === "idle") return;
+    // Clear state before setDpStatus so dpStateRef snapshot is clean on idle
     checklist = null;
-    setDpStatus("idle");
     dpQuestion = undefined;
     dpTriageContextDraft = undefined;
     dpHypothesesDraft = undefined;
     dpConfirmedHypotheses = undefined;
     dpRound = 0;
     dpLastUserFeedback = undefined;
+    setDpStatus("idle");
     persistState();
     if (ctx.hasUI) ctx.ui.notify("Deep Investigation OFF");
     pendingActivation = false;
