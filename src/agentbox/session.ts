@@ -75,6 +75,7 @@ export interface PersistedDpStateSnapshot {
   dpStatus: DpStatus;
   question?: string;
   round?: number;
+  confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
 }
 
 /** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
@@ -385,6 +386,7 @@ export class AgentBoxSessionManager {
           dpStatus?: DpStatus;
           dpQuestion?: string;
           dpRound?: number;
+          dpConfirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
           checklist?: { question?: string };
           phase?: string;
           question?: string;
@@ -397,6 +399,7 @@ export class AgentBoxSessionManager {
           dpStatus: entry.data.dpStatus,
           question: entry.data.dpQuestion ?? entry.data.checklist?.question,
           round: entry.data.dpRound,
+          confirmedHypotheses: entry.data.dpConfirmedHypotheses,
         };
       }
 
