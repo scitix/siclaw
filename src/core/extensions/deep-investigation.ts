@@ -552,11 +552,19 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
       // Non-TUI mode (web UI, RPC): no interactive dialog.
       // Status already set to awaiting_confirmation above.
-      // The user's next steer/message will drive the next transition.
+      // CRITICAL: Use steer to interrupt the agent turn — prevents model from
+      // continuing to call tools (deep_search, bash, etc.) without user confirmation.
+      // "steer" mode = remaining tools in this turn are skipped.
+      if (isDpMode) {
+        api.sendUserMessage(
+          "Hypotheses have been presented to the user. STOP and wait for the user to confirm, adjust, or skip. " +
+          "Do NOT call any more tools until the user responds.",
+          { deliverAs: "steer" },
+        );
+      }
+
       const responseText = isDpMode
-        ? "Hypotheses presented to user. You MUST wait for the user's next message before proceeding. " +
-          "The user will either: (1) confirm to proceed with deep_search, (2) provide feedback to adjust hypotheses, " +
-          "or (3) ask to skip. Do NOT call deep_search until the user explicitly confirms."
+        ? "Hypotheses presented to user. Waiting for user confirmation."
         : "Hypotheses presented to user. Decide whether to proceed based on user engagement.";
 
       return {
