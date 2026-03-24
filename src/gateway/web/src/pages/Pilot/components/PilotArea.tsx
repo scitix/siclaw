@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban } from 'lucide-react';
+import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban, Play, MessageSquare, SkipForward } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import { InputArea } from './InputArea';
@@ -517,6 +517,43 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
+            {/* Floating hypothesis action bar — visible when awaiting user confirmation */}
+            {dpChecklist?.some(i => i.id === 'hypotheses' && i.status === 'in_progress') && !latestHypothesesConfirmed && (
+                <div className="border-t border-indigo-100 bg-indigo-50/80 backdrop-blur-sm px-4 py-2">
+                    <div className="max-w-5xl mx-auto flex items-center gap-3">
+                        <span className="text-xs text-indigo-600 font-medium">Hypotheses awaiting review</span>
+                        <div className="flex items-center gap-2 ml-auto">
+                            <button
+                                type="button"
+                                onClick={() => sendMessage('[DP_CONFIRM]\nThe user has confirmed hypotheses.')}
+                                className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 transition-colors cursor-pointer"
+                            >
+                                <Play className="w-3 h-3" />
+                                Confirm & Run
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    const feedback = prompt('Feedback for hypothesis adjustment:');
+                                    if (feedback?.trim()) sendMessage(`[DP_ADJUST]\n${feedback.trim()}`);
+                                }}
+                                className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-indigo-600 hover:bg-indigo-100 transition-colors cursor-pointer"
+                            >
+                                <MessageSquare className="w-3 h-3" />
+                                Modify
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => sendMessage('[DP_SKIP]\nSkip validation and present conclusion.')}
+                                className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-500 hover:bg-gray-100 transition-colors cursor-pointer"
+                            >
+                                <SkipForward className="w-3 h-3" />
+                                Skip
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
             <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
