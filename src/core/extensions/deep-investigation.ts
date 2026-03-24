@@ -184,6 +184,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       (dpStateRef as any).status = status;
       (dpStateRef as any).triageContextDraft = dpTriageContextDraft;
       (dpStateRef as any).confirmedHypotheses = dpConfirmedHypotheses;
+      (dpStateRef as any).question = dpQuestion;
+      (dpStateRef as any).round = dpRound;
     }
     // Derive checklist from status (single direction: status → checklist)
     if (checklist) syncChecklistFromStatus({ checklist, status, round: dpRound });
@@ -421,7 +423,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       disableDpMode(ctx);
       return {
         content: [{ type: "text" as const, text: `Investigation ended: ${reason}` }],
-        details: {},
+        details: { dpStatus: "completed" as const },
       };
     },
   });
@@ -517,7 +519,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
           }
           return {
             content: [{ type: "text" as const, text: `User wants adjustments: ${feedback ?? "(no details)"}. Revise hypotheses and call propose_hypotheses again.` }],
-            details: { hypotheses: hypothesesText, userChoice: "adjust", feedback },
+            details: { hypotheses: hypothesesText, userChoice: "adjust", feedback, dpStatus: dpStatus },
           };
         }
 
@@ -530,7 +532,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
           }
           return {
             content: [{ type: "text" as const, text: "User chose to skip deep search. Present conclusion based on current findings." }],
-            details: { hypotheses: hypothesesText, userChoice: "skip" },
+            details: { hypotheses: hypothesesText, userChoice: "skip", dpStatus: dpStatus },
           };
         }
 
@@ -543,7 +545,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
         }
         return {
           content: [{ type: "text" as const, text: "User approved hypotheses. Proceed with deep_search to validate them." }],
-          details: { hypotheses: hypothesesText, userChoice: "proceed" },
+          details: { hypotheses: hypothesesText, userChoice: "proceed", dpStatus: dpStatus },
         };
       }
 
@@ -558,7 +560,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
       return {
         content: [{ type: "text" as const, text: responseText }],
-        details: { hypotheses: hypothesesText, triageContext },
+        details: { hypotheses: hypothesesText, triageContext, dpStatus: dpStatus },
       };
     },
   });
@@ -842,7 +844,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // --- context: filter UI-only custom messages ---
 
   // Custom types that are UI-only metadata — must never be sent to the LLM.
-  const DP_FILTER_TYPES = new Set(["dp-checklist-sync"]);
+  const DP_FILTER_TYPES = new Set(["dp-mode", "dp-checklist-sync"]);
 
   api.on("context", async (event) => {
     return {
