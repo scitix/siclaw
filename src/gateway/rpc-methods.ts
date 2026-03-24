@@ -2051,9 +2051,9 @@ export function createRpcMethods(
 
     // DB skills (when scope is not "builtin")
     let dbResult = { skills: [] as any[], hasMore: false };
-    if (scope !== "builtin" && !(scope === "skillset" && !skillSpaceEnabled)) {
+    if (scope !== "builtin" && scope !== "skillset" && !(scope === "skillset" && !skillSpaceEnabled)) {
       const repoOpts: any = { limit, offset };
-      if (scope && !(scope === "skillset" && !skillSpaceEnabled)) repoOpts.scope = scope;
+      if (scope) repoOpts.scope = scope;
       if (search) repoOpts.search = search;
       dbResult = skillRepo
         ? await skillRepo.listForUser(userId, repoOpts)
@@ -2715,6 +2715,12 @@ export function createRpcMethods(
       scope: "skillset",
       skillSpaceId: targetSkillSpaceId,
     });
+
+    // Clean up old personal skill directory to prevent shadowing
+    const residualDir = skillWriter.resolveDir("personal", meta.dirName, userId);
+    if (fs.existsSync(residualDir)) {
+      fs.rmSync(residualDir, { recursive: true, force: true });
+    }
 
     // Notify original user + all space members
     notifySkillReload(userId);
@@ -4265,6 +4271,10 @@ export function createRpcMethods(
 
     const isMaintainer = await skillSpaceRepo.isMaintainer(skillSpaceId, userId);
     if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can add members");
+    if (role === "owner") {
+      const isOwner = await skillSpaceRepo.isOwner(skillSpaceId, userId);
+      if (!isOwner) throw new Error("Forbidden: only the owner can assign the owner role");
+    }
 
     if (!userRepo) throw new Error("Database not available");
     const targetUser = await userRepo.getByUsername(targetUsername);
@@ -5082,7 +5092,7 @@ export function createRpcMethods(
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
     const envTypeParam = params.envType as string | undefined;
-    const envType = (envTypeParam === "prod" || envTypeParam === "test" ? envTypeParam : ws.envType) as "prod" | "test";
+    const envType: "prod" | "test" = envTypeParam === "prod" || envTypeParam === "test" ? envTypeParam : ws.envType === "test" ? "test" : "prod";
     const options = await listWorkspaceComposerOptions(userId, isAdminUser(context));
     const sanitized = sanitizeWorkspaceComposer(
       normalizeWorkspaceSkillComposer(params.skillComposer),

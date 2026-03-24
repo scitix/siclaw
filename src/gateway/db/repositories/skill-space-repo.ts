@@ -31,18 +31,20 @@ export class SkillSpaceRepository {
 
   async create(input: CreateSkillSpaceInput): Promise<string> {
     const id = crypto.randomUUID();
-    await this.db.insert(skillSpaces).values({
-      id,
-      name: input.name,
-      description: input.description ?? null,
-      ownerId: input.ownerId,
-    });
-    // Auto-add owner as member with "owner" role
-    await this.db.insert(skillSpaceMembers).values({
-      id: crypto.randomUUID(),
-      skillSpaceId: id,
-      userId: input.ownerId,
-      role: "owner",
+    await this.db.transaction(async (tx) => {
+      await tx.insert(skillSpaces).values({
+        id,
+        name: input.name,
+        description: input.description ?? null,
+        ownerId: input.ownerId,
+      });
+      // Auto-add owner as member with "owner" role
+      await tx.insert(skillSpaceMembers).values({
+        id: crypto.randomUUID(),
+        skillSpaceId: id,
+        userId: input.ownerId,
+        role: "owner",
+      });
     });
     return id;
   }

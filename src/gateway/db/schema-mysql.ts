@@ -92,7 +92,7 @@ export const skillSpaceMembers = mysqlTable("skill_space_members", {
   id: varchar("id", { length: 64 }).primaryKey(),
   skillSpaceId: varchar("skill_space_id", { length: 64 }).notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
   userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id, { onDelete: "cascade" }),
-  role: varchar("role", { length: 20 }).notNull().default("member"), // "owner" | "member"
+  role: varchar("role", { length: 20 }).notNull().default("maintainer"), // "owner" | "maintainer"
   joinedAt: timestamp("joined_at").notNull().defaultNow(),
 }, (table) => ({
   ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),

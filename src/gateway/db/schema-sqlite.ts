@@ -89,7 +89,7 @@ export const skillSpaceMembers = sqliteTable("skill_space_members", {
   id: text("id").primaryKey(),
   skillSpaceId: text("skill_space_id").notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
-  role: text("role").notNull().default("member"), // "owner" | "member"
+  role: text("role").notNull().default("maintainer"), // "owner" | "maintainer"
   joinedAt: integer("joined_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 }, (table) => ({
   ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),
