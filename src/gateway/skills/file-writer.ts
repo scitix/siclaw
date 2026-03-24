@@ -55,9 +55,11 @@ export class SkillFileWriter {
       case "team":
         return path.join(this.skillsDir, "team", dirName);
       case "personal":
-        return path.join(this.skillsDir, "user", userId || "unknown", dirName);
+        if (!userId) throw new Error("userId is required for personal scope");
+        return path.join(this.skillsDir, "user", userId, dirName);
       case "skillset":
-        return path.join(this.skillsDir, "skillset", skillSpaceId || "unknown", dirName);
+        if (!skillSpaceId) throw new Error("skillSpaceId is required for skillset scope");
+        return path.join(this.skillsDir, "skillset", skillSpaceId, dirName);
     }
   }
 

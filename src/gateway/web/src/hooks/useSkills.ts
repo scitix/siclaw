@@ -34,26 +34,14 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
     const [currentScope, setCurrentScope] = useState<string>('all');
     const [searchQuery, setSearchQuery] = useState('');
 
-    // Map UI tab name → RPC scope filter
+    // Map UI tab name → RPC scope filter (server-side filtering for correct pagination)
     const mapTabToScope = (tab: string): string | undefined => {
         switch (tab) {
             case 'all': return undefined;
             case 'approvals': return undefined;
-            case 'global': return undefined; // fetch all, filter client-side
-            case 'myskills': return undefined; // fetch all, filter client-side
+            case 'global': return 'global';
+            case 'myskills': return 'myskills';
             default: return tab;
-        }
-    };
-
-    // Client-side filter for virtual tabs
-    const filterByTab = (skills: Skill[], tab: string): Skill[] => {
-        switch (tab) {
-            case 'global':
-                return skills.filter(s => s.scope === 'builtin' || s.scope === 'team' || s.scope === 'global');
-            case 'myskills':
-                return skills.filter(s => s.scope === 'personal' || s.scope === 'skillset');
-            default:
-                return skills;
         }
     };
 
@@ -73,7 +61,7 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
                 pendingOnly: s === 'approvals' ? true : undefined,
                 workspaceId,
             });
-            setSkills(filterByTab(result.skills, s));
+            setSkills(result.skills);
             setHasMore(result.hasMore);
         } catch (err) {
             console.error('[useSkills] Failed to load:', err);
@@ -95,8 +83,7 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
                 pendingOnly: currentScope === 'approvals' ? true : undefined,
                 workspaceId,
             });
-            const newSkills = filterByTab(result.skills, currentScope);
-            setSkills(prev => [...prev, ...newSkills]);
+            setSkills(prev => [...prev, ...result.skills]);
             setHasMore(result.hasMore);
         } catch (err) {
             console.error('[useSkills] Failed to load more:', err);

@@ -2017,9 +2017,14 @@ export function createRpcMethods(
       return filtered.length > 0 ? filtered : undefined;
     };
 
+    // Resolve virtual scopes: "global" → builtin + team, "myskills" → personal + skillset
+    const isGlobalTab = scope === "global";
+    const isMySkillsTab = scope === "myskills";
+    const effectiveScope = isGlobalTab || isMySkillsTab ? undefined : scope;
+
     // Builtin skills from filesystem (merged core + extension, only on first page)
     let builtinSkills: any[] = [];
-    if (offset === 0 && (!scope || scope === "builtin")) {
+    if (offset === 0 && (!effectiveScope || effectiveScope === "builtin" || isGlobalTab)) {
       const scanned = skillWriter.scanScope("builtin");
       const skillKeys = scanned.map(s => `builtin:${s.dirName}`);
       const labelsMap = batchGetLabels(skillKeys);
@@ -2049,11 +2054,14 @@ export function createRpcMethods(
       }
     }
 
-    // DB skills (when scope is not "builtin")
+    // DB skills
     let dbResult = { skills: [] as any[], hasMore: false };
-    if (scope !== "builtin" && scope !== "skillset") {
+    const skipDbQuery = effectiveScope === "builtin" || effectiveScope === "skillset";
+    if (!skipDbQuery) {
       const repoOpts: any = { limit, offset };
-      if (scope) repoOpts.scope = scope;
+      if (isGlobalTab) repoOpts.scope = "team";
+      else if (isMySkillsTab) repoOpts.scope = "personal";
+      else if (effectiveScope) repoOpts.scope = effectiveScope;
       if (search) repoOpts.search = search;
       dbResult = skillRepo
         ? await skillRepo.listForUser(userId, repoOpts)
@@ -2121,7 +2129,7 @@ export function createRpcMethods(
           s.name.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q)
         );
       }
-    } else if ((!scope || scope === "skillset") && skillSpaceEnabled && skillSpaceRepo && skillRepo) {
+    } else if ((!effectiveScope || effectiveScope === "skillset" || isMySkillsTab) && skillSpaceEnabled && skillSpaceRepo && skillRepo) {
       // Include all user's skill space skills
       const userSpaces = await skillSpaceRepo.listForUser(userId);
       for (const space of userSpaces) {
@@ -4278,16 +4286,14 @@ export function createRpcMethods(
 
     const isMaintainer = await skillSpaceRepo.isMaintainer(skillSpaceId, userId);
     if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can add members");
-    if (role === "owner") {
-      const isOwner = await skillSpaceRepo.isOwner(skillSpaceId, userId);
-      if (!isOwner) throw new Error("Forbidden: only the owner can assign the owner role");
-    }
+    // New members are always "maintainer" — ownership is set only at creation time
+    const memberRole = "maintainer" as const;
 
     if (!userRepo) throw new Error("Database not available");
     const targetUser = await userRepo.getByUsername(targetUsername);
     if (!targetUser) throw new Error(`User "${targetUsername}" not found`);
 
-    await skillSpaceRepo.addMember(skillSpaceId, targetUser.id, role);
+    await skillSpaceRepo.addMember(skillSpaceId, targetUser.id, memberRole);
 
     // Notify the added user's AgentBox to reload skills
     notifySkillReload(targetUser.id);

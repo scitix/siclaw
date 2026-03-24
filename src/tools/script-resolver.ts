@@ -45,9 +45,9 @@ interface ScopeDir {
 const SCOPE_MAP: Record<string, SkillScope> = {
   user: "personal",
   skillset: "skillset",
-  extension: "global",
-  team: "global",
-  core: "global",
+  extension: "team",
+  team: "team",
+  core: "builtin",
 };
 
 /**
