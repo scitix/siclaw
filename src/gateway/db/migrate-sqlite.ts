@@ -498,61 +498,58 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
 
   // Widen skills.scope CHECK constraint to include 'global' and 'skillset'.
   // SQLite cannot ALTER CHECK — must rebuild the table.
-  try {
-    // Only run if the old constraint still blocks new values
-    const needsRebuild = (() => {
-      try {
-        sdb.run(sql.raw(`INSERT INTO skills (id, name, dir_name, scope) VALUES ('__probe__', '__probe__', '__probe__', 'skillset')`));
-        sdb.run(sql.raw(`DELETE FROM skills WHERE id = '__probe__'`));
-        return false; // constraint already allows 'skillset'
-      } catch {
-        return true;
-      }
-    })();
-
-    if (needsRebuild) {
-      console.log("[db] Rebuilding skills table to widen scope CHECK constraint...");
-      sdb.run(sql.raw(`ALTER TABLE skills RENAME TO _skills_old`));
-      // Re-create with widened CHECK (matches DDL_STATEMENTS)
-      sdb.run(sql.raw(`CREATE TABLE skills (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        description TEXT,
-        type TEXT,
-        version INTEGER NOT NULL DEFAULT 1,
-        published_version INTEGER,
-        staging_version INTEGER NOT NULL DEFAULT 0,
-        scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
-        author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        status TEXT DEFAULT 'installed',
-        contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
-        review_status TEXT NOT NULL DEFAULT 'draft' CHECK(review_status IN ('draft', 'approved', 'pending')),
-        dir_name TEXT NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        s3_key TEXT,
-        team_source_skill_id TEXT,
-        team_pinned_version INTEGER,
-        forked_from_id TEXT,
-        labels_json TEXT,
-        skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
-      )`));
-      sdb.run(sql.raw(`INSERT INTO skills (
-        id, name, description, type, version, published_version, staging_version,
-        scope, author_id, status, contribution_status, review_status, dir_name,
-        created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
-        forked_from_id, labels_json, skill_space_id
-      ) SELECT
-        id, name, description, type, version, published_version, staging_version,
-        scope, author_id, status, contribution_status, review_status, dir_name,
-        created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
-        forked_from_id, labels_json, skill_space_id
-      FROM _skills_old`));
-      sdb.run(sql.raw(`DROP TABLE _skills_old`));
-      console.log("[db] Skills table rebuilt successfully");
+  // Only run if the old constraint still blocks new values
+  const needsRebuild = (() => {
+    try {
+      sdb.run(sql.raw(`INSERT INTO skills (id, name, dir_name, scope) VALUES ('__probe__', '__probe__', '__probe__', 'skillset')`));
+      sdb.run(sql.raw(`DELETE FROM skills WHERE id = '__probe__'`));
+      return false; // constraint already allows 'skillset'
+    } catch {
+      return true;
     }
-  } catch (err: any) {
-    console.warn("[db] Skills table rebuild failed (non-fatal):", err.message);
+  })();
+
+  if (needsRebuild) {
+    console.log("[db] Rebuilding skills table to widen scope CHECK constraint...");
+    sdb.run(sql.raw(`BEGIN IMMEDIATE`));
+    sdb.run(sql.raw(`ALTER TABLE skills RENAME TO _skills_old`));
+    sdb.run(sql.raw(`CREATE TABLE skills (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      type TEXT,
+      version INTEGER NOT NULL DEFAULT 1,
+      published_version INTEGER,
+      staging_version INTEGER NOT NULL DEFAULT 0,
+      scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
+      author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+      status TEXT DEFAULT 'installed',
+      contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
+      review_status TEXT NOT NULL DEFAULT 'draft' CHECK(review_status IN ('draft', 'approved', 'pending')),
+      dir_name TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      s3_key TEXT,
+      team_source_skill_id TEXT,
+      team_pinned_version INTEGER,
+      forked_from_id TEXT,
+      labels_json TEXT,
+      skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
+    )`));
+    sdb.run(sql.raw(`INSERT INTO skills (
+      id, name, description, type, version, published_version, staging_version,
+      scope, author_id, status, contribution_status, review_status, dir_name,
+      created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
+      forked_from_id, labels_json, skill_space_id
+    ) SELECT
+      id, name, description, type, version, published_version, staging_version,
+      scope, author_id, status, contribution_status, review_status, dir_name,
+      created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
+      forked_from_id, labels_json, skill_space_id
+    FROM _skills_old`));
+    sdb.run(sql.raw(`DROP TABLE _skills_old`));
+    sdb.run(sql.raw(`COMMIT`));
+    console.log("[db] Skills table rebuilt successfully");
   }
 
   for (const ddl of INDEX_STATEMENTS) {
