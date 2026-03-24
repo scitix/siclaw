@@ -227,7 +227,7 @@ export class AgentBoxClient {
    * Get DP investigation state for recovery.
    * Returns { dpStatus, question, round } from the session's live dpStateRef.
    */
-  async getDpState(sessionId: string): Promise<{ dpStatus: string; question?: string; round?: number }> {
+  async getDpState(sessionId: string): Promise<{ dpStatus: string; question?: string; round?: number; confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }> }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/dp-state`);
     return resp.json();
   }

@@ -2002,6 +2002,7 @@ export function createRpcMethods(
     let dpStatus: string | undefined;
     let dpChecklist: DpChecklist | null = null;
     let dpQuestion: string | undefined;
+    let confirmedHypotheses: Array<{ id: string; text: string; confidence: number }> | undefined;
 
     // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror).
     // Use findAgentBoxForSession to locate agentbox independent of activeStreams/cache.
@@ -2015,6 +2016,7 @@ export function createRpcMethods(
         if (resp?.dpStatus && resp.dpStatus !== "idle") {
           dpStatus = resp.dpStatus;
           dpQuestion = resp.question;
+          confirmedHypotheses = resp.confirmedHypotheses;
           // Derive checklist from authoritative dpStatus
           const cl = createChecklist(dpQuestion ?? "");
           syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus } as DpState);
@@ -2042,6 +2044,7 @@ export function createRpcMethods(
       dpStatus: dpStatus ?? null,
       checklist: dpChecklist?.items ?? null,
       dpQuestion: dpQuestion ?? null,
+      confirmedHypotheses: confirmedHypotheses ?? null,
     };
   });
 

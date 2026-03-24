@@ -692,6 +692,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           dpStatus: managed.dpStateRef.status,
           question: managed.dpStateRef.question,
           round: managed.dpStateRef.round,
+          confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
         });
         return;
       }
@@ -702,6 +703,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           dpStatus: managed.dpState.status,
           question: managed.dpState.question,
           round: managed.dpState.round,
+          confirmedHypotheses: managed.dpState.confirmedHypotheses,
         });
         return;
       }
