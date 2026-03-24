@@ -198,6 +198,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     // Suggested reply draft — chip click populates input instead of sending immediately
     const [chipSeq, setChipSeq] = useState(0);
     const [chipDraft, setChipDraft] = useState<string | null>(null);
+    const [showHypothesesLocator, setShowHypothesesLocator] = useState(false);
 
     // Feedback hint: show once per session after agent finishes first response
     const hasShownFeedbackHintRef = useRef(false);
@@ -301,6 +302,10 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         return false;
     }, [messages, latestHypothesesId, dpChecklist]);
 
+    const latestHypothesesAwaitingReview = useMemo(() => {
+        return latestHypothesesId != null && !latestHypothesesConfirmed;
+    }, [latestHypothesesConfirmed, latestHypothesesId]);
+
     // Handles three cases:
     // 1. Initial load / session switch (0 → N): force scroll to bottom
     // 2. Prepend (load more): restore scroll position so view doesn't jump
@@ -340,6 +345,51 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         }
         prevMsgCountRef.current = messages.length;
     }, [messages, scrollToBottom]);
+
+    useEffect(() => {
+        if (!latestHypothesesAwaitingReview || !latestHypothesesId) {
+            setShowHypothesesLocator(false);
+            return;
+        }
+
+        const root = scrollContainerRef.current;
+        if (!root) return;
+
+        let observer: IntersectionObserver | null = null;
+        const rafId = requestAnimationFrame(() => {
+            const card = document.querySelector<HTMLElement>(
+                `[data-hypotheses-card-id="${latestHypothesesId}"]`,
+            );
+            if (!card) {
+                setShowHypothesesLocator(false);
+                return;
+            }
+
+            observer = new IntersectionObserver(
+                ([entry]) => {
+                    setShowHypothesesLocator(!entry.isIntersecting || entry.intersectionRatio < 0.2);
+                },
+                {
+                    root,
+                    threshold: [0, 0.2, 0.6, 1],
+                },
+            );
+            observer.observe(card);
+        });
+
+        return () => {
+            cancelAnimationFrame(rafId);
+            observer?.disconnect();
+        };
+    }, [latestHypothesesAwaitingReview, latestHypothesesId, messages.length]);
+
+    const scrollToLatestHypothesesCard = useCallback(() => {
+        if (!latestHypothesesId) return;
+        const card = document.querySelector<HTMLElement>(
+            `[data-hypotheses-card-id="${latestHypothesesId}"]`,
+        );
+        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, [latestHypothesesId]);
 
     // Session restore is multi-step: messages load first, then DP progress restores,
     // and the checklist card may grow as hypotheses/current action arrive. Keep the
@@ -517,20 +567,17 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
-            {/* Floating hypothesis reminder — scroll-to-card only, no action buttons */}
-            {dpChecklist?.some(i => i.id === 'hypotheses' && i.status === 'in_progress') && !latestHypothesesConfirmed && (
-                <div className="border-t border-indigo-100 bg-indigo-50/60 backdrop-blur-sm px-4 py-1.5">
-                    <div className="max-w-5xl mx-auto">
+            {showHypothesesLocator && (
+                <div className="px-4 pb-2">
+                    <div className="max-w-5xl mx-auto flex justify-end">
                         <button
                             type="button"
-                            onClick={() => {
-                                const cards = document.querySelectorAll('[data-hypotheses-card]');
-                                const last = cards[cards.length - 1];
-                                if (last) last.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            }}
-                            className="text-xs text-indigo-600 font-medium hover:text-indigo-800 transition-colors cursor-pointer"
+                            onClick={scrollToLatestHypothesesCard}
+                            className="flex items-center gap-1.5 rounded-full border border-indigo-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-indigo-700 shadow-sm backdrop-blur-sm transition-colors hover:bg-indigo-50 hover:text-indigo-800 cursor-pointer"
                         >
-                            Hypotheses awaiting review — click to view ↑
+                            <SearchCode className="w-3.5 h-3.5" />
+                            <span>Review hypotheses</span>
+                            <ChevronRight className="w-3 h-3 -rotate-90" />
                         </button>
                     </div>
                 </div>
