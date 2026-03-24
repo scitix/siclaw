@@ -8,7 +8,6 @@ import { PilotPage } from './pages/Pilot';
 import { SkillsPage } from './pages/Skills';
 import { SkillEditor } from './pages/Skills/SkillEditor';
 import { SkillSpaceDetailPage } from './pages/Skills/SkillSpaceDetail';
-import { JoinSkillSpacePage } from './pages/Skills/JoinSkillSpacePage';
 import { ChannelsPage } from './pages/Channels';
 import { TriggersPage } from './pages/Triggers';
 import { CronPage } from './pages/Cron';
@@ -54,7 +53,6 @@ const router = createBrowserRouter([
                         path: 'skills',
                         children: [
                             { index: true, element: <SkillsPage /> },
-                            { path: 'spaces/join/:token', element: <JoinSkillSpacePage /> },
                             { path: 'spaces/:spaceId', element: <SkillSpaceDetailPage /> },
                             { path: ':id', element: <SkillEditor /> },
                         ],
