@@ -333,15 +333,6 @@ export async function rpcMoveSkillToSpace(sendRpc: RpcSendFn, skillId: string, t
     return sendRpc('skill.moveToSpace', { skillId, targetSkillSpaceId, workspaceId });
 }
 
-/** Toggle share link for a skill space (owner only) */
-export async function rpcToggleShareLink(sendRpc: RpcSendFn, workspaceId: string, skillSpaceId: string, enabled: boolean): Promise<{ token: string | null }> {
-    return sendRpc('skillSpace.toggleShareLink', { workspaceId, skillSpaceId, enabled });
-}
-
-/** Join a skill space via invite token */
-export async function rpcJoinByToken(sendRpc: RpcSendFn, token: string, workspaceId: string): Promise<{ spaceId: string; joined?: boolean; alreadyMember?: boolean }> {
-    return sendRpc('skillSpace.joinByToken', { token, workspaceId });
-}
 
 export async function rpcGetSkillSystemCapabilities(sendRpc: RpcSendFn, workspaceId?: string): Promise<SkillSystemCapabilities> {
     return sendRpc('system.capabilities', workspaceId ? { workspaceId } : {});

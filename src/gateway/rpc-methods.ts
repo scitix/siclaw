@@ -2101,8 +2101,10 @@ export function createRpcMethods(
     let skillSpaceSkills: any[] = [];
     if (skillSpaceId && !skillSpaceEnabled) {
       throw new Error("Skill Space is not available in the current workspace");
-    } else if (skillSpaceId && skillRepo) {
-      // Filter by specific skill space
+    } else if (skillSpaceId && skillRepo && skillSpaceRepo) {
+      // Filter by specific skill space — verify caller is a member
+      const isMember = await skillSpaceRepo.isMember(skillSpaceId, userId);
+      if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
       const spaceSkills = await skillRepo.listBySkillSpaceId(skillSpaceId);
       skillSpaceSkills = await Promise.all(spaceSkills.map(async (s: any) => {
         const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "team");
@@ -2180,11 +2182,15 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Permission: personal = owner, team = admin
+    // Permission: personal = owner, team = admin, skillset = maintainer
     if (meta.scope === "builtin") throw new Error("Cannot edit builtin skill labels");
     if (meta.scope === "team") requireAdmin(context);
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Forbidden: you can only edit your own skill labels");
+    }
+    if (meta.scope === "skillset" && meta.skillSpaceId && skillSpaceRepo) {
+      const isMaintainer = await skillSpaceRepo.isMaintainer(meta.skillSpaceId, userId);
+      if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can edit labels");
     }
 
     // Sanitize: trim, dedupe, remove empty
@@ -2905,11 +2911,15 @@ export function createRpcMethods(
     if (!skillVersionRepo) throw new Error("Database not available");
     if (!skillRepo) throw new Error("Database not available");
 
-    // Personal skills: only author can view history
+    // Access control: personal → author only, skillset → member only
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Skill not found");
+    }
+    if (meta.scope === "skillset" && meta.skillSpaceId && skillSpaceRepo) {
+      const isMember = await skillSpaceRepo.isMember(meta.skillSpaceId, userId);
+      if (!isMember) throw new Error("Skill not found");
     }
 
     const versions = await skillVersionRepo.listForSkill(skillId);
@@ -3363,10 +3373,6 @@ export function createRpcMethods(
         }
 
         notifyAllSkillReload();
-        if (skillSpaceRepo && meta.skillSpaceId) {
-          const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
-          for (const member of members) notifySkillReload(member.userId);
-        }
       }
 
       // 8. If contributionStatus === "pending", auto-promote to team
@@ -4216,8 +4222,6 @@ export function createRpcMethods(
       ...space,
       members: enrichedMembers,
       skills: spaceSkills,
-      // Only expose invite token to the owner
-      inviteToken: isOwner ? (space as any).inviteToken ?? null : undefined,
     };
   });
 
@@ -4253,7 +4257,10 @@ export function createRpcMethods(
     const hasSkills = await skillSpaceRepo.hasSkills(id);
     if (hasSkills) throw new Error("Cannot delete a skill space that still contains skills. Remove all skills first.");
 
+    // Notify members before deletion (CASCADE will remove membership rows)
+    const members = await skillSpaceRepo.listMembers(id);
     await skillSpaceRepo.deleteById(id);
+    for (const m of members) notifySkillReload(m.userId);
     return { status: "deleted" };
   });
 
@@ -4344,47 +4351,6 @@ export function createRpcMethods(
       return { ...m, username };
     }));
     return { members: enriched };
-  });
-
-  // ─── Skill Space Share Link ─────────────────────────
-
-  methods.set("skillSpace.toggleShareLink", async (params, context: RpcContext) => {
-    const userId = requireAuth(context);
-    const skillSpaceId = params.skillSpaceId as string;
-    const enabled = params.enabled as boolean;
-    const workspaceId = params.workspaceId as string | undefined;
-
-    if (!skillSpaceId) throw new Error("Missing required param: skillSpaceId");
-    if (typeof enabled !== "boolean") throw new Error("Missing required param: enabled");
-    if (!skillSpaceRepo) throw new Error("Database not available");
-    await requireSkillSpaceWorkspace(context, workspaceId);
-
-    const isOwner = await skillSpaceRepo.isOwner(skillSpaceId, userId);
-    if (!isOwner) throw new Error("Forbidden: only the owner can manage share links");
-
-    const token = enabled ? crypto.randomUUID() : null;
-    await skillSpaceRepo.update(skillSpaceId, { inviteToken: token });
-
-    return { token };
-  });
-
-  methods.set("skillSpace.joinByToken", async (params, context: RpcContext) => {
-    const userId = requireAuth(context);
-    const token = params.token as string;
-    const workspaceId = params.workspaceId as string | undefined;
-    if (!token) throw new Error("Missing required param: token");
-    if (!skillSpaceRepo) throw new Error("Database not available");
-    await requireSkillSpaceWorkspace(context, workspaceId);
-
-    const space = await skillSpaceRepo.getByInviteToken(token);
-    if (!space) throw new Error("Invalid or expired invite link");
-
-    const alreadyMember = await skillSpaceRepo.isMember(space.id, userId);
-    if (alreadyMember) return { spaceId: space.id, alreadyMember: true };
-
-    await skillSpaceRepo.addMember(space.id, userId, "maintainer");
-    notifySkillReload(userId);
-    return { spaceId: space.id, joined: true };
   });
 
   // ─────────────────────────────────────────────────

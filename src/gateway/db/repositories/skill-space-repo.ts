@@ -17,7 +17,6 @@ export interface CreateSkillSpaceInput {
 export interface UpdateSkillSpaceInput {
   name?: string;
   description?: string;
-  inviteToken?: string | null;
 }
 
 export type SkillSpaceRole = "owner" | "maintainer";
@@ -31,21 +30,28 @@ export class SkillSpaceRepository {
 
   async create(input: CreateSkillSpaceInput): Promise<string> {
     const id = crypto.randomUUID();
-    await this.db.transaction(async (tx) => {
-      await tx.insert(skillSpaces).values({
-        id,
-        name: input.name,
-        description: input.description ?? null,
-        ownerId: input.ownerId,
+    try {
+      await this.db.transaction(async (tx) => {
+        await tx.insert(skillSpaces).values({
+          id,
+          name: input.name,
+          description: input.description ?? null,
+          ownerId: input.ownerId,
+        });
+        // Auto-add owner as member with "owner" role
+        await tx.insert(skillSpaceMembers).values({
+          id: crypto.randomUUID(),
+          skillSpaceId: id,
+          userId: input.ownerId,
+          role: "owner",
+        });
       });
-      // Auto-add owner as member with "owner" role
-      await tx.insert(skillSpaceMembers).values({
-        id: crypto.randomUUID(),
-        skillSpaceId: id,
-        userId: input.ownerId,
-        role: "owner",
-      });
-    });
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        throw new Error(`A skill space named "${input.name}" already exists`);
+      }
+      throw err;
+    }
     return id;
   }
 
@@ -62,17 +68,7 @@ export class SkillSpaceRepository {
     const setFields: Record<string, unknown> = { updatedAt: new Date() };
     if (updates.name !== undefined) setFields.name = updates.name;
     if (updates.description !== undefined) setFields.description = updates.description;
-    if (updates.inviteToken !== undefined) setFields.inviteToken = updates.inviteToken;
     await this.db.update(skillSpaces).set(setFields).where(eq(skillSpaces.id, id));
-  }
-
-  async getByInviteToken(token: string) {
-    const rows = await this.db
-      .select()
-      .from(skillSpaces)
-      .where(eq(skillSpaces.inviteToken, token))
-      .limit(1);
-    return rows[0] ?? null;
   }
 
   async deleteById(id: string) {
