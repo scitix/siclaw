@@ -457,13 +457,27 @@ export async function createSiclawSession(
     }
   }
 
-  // Priority: team/personal > builtin — higher-specificity scopes first.
+  // Priority: personal > skillset > builtin — higher-specificity scopes first.
   // Local mode: scan per-user dir only (avoids loading other users' skills).
   // K8s mode: scan skillsBase flat (single-user pod).
   const dynamicSkillBase = opts?.userId
     ? path.join(skillsBase, "user", opts.userId)
     : skillsBase;
-  const skillsDirs = [dynamicSkillBase, ...builtinPaths];
+
+  // Enumerate skillset directories (skillset/{setId}/) for skill resolution
+  const skillsetBase = path.join(skillsBase, "skillset");
+  const skillsetDirs: string[] = [];
+  if (fs.existsSync(skillsetBase)) {
+    try {
+      for (const entry of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
+        if (entry.isDirectory()) {
+          skillsetDirs.push(path.join(skillsetBase, entry.name));
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  const skillsDirs = [dynamicSkillBase, ...skillsetDirs, ...builtinPaths];
 
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};

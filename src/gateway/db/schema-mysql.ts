@@ -76,6 +76,28 @@ export const messages = mysqlTable("messages", {
   durationMs: int("duration_ms"),
 });
 
+// ─── Skill Spaces (collaboration spaces) ─────────────
+
+export const skillSpaces = mysqlTable("skill_spaces", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  name: varchar("name", { length: 255 }).notNull().unique(),
+  description: text("description"),
+  ownerId: varchar("owner_id", { length: 32 }).notNull().references(() => users.id),
+  inviteToken: varchar("invite_token", { length: 64 }),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const skillSpaceMembers = mysqlTable("skill_space_members", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  skillSpaceId: varchar("skill_space_id", { length: 64 }).notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
+  userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id, { onDelete: "cascade" }),
+  role: varchar("role", { length: 20 }).notNull().default("maintainer"), // "owner" | "maintainer"
+  joinedAt: timestamp("joined_at").notNull().defaultNow(),
+}, (table) => ({
+  ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),
+}));
+
 // ─── Skills ──────────────────────────────────────────
 
 export const skills = mysqlTable("skills", {
@@ -84,7 +106,7 @@ export const skills = mysqlTable("skills", {
   description: text("description"),
   type: varchar("type", { length: 50 }),
   version: int("version").notNull().default(1),
-  scope: mysqlEnum("scope", ["builtin", "team", "personal"])
+  scope: mysqlEnum("scope", ["builtin", "team", "personal", "global", "skillset"])
     .notNull()
     .default("personal"),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
@@ -106,6 +128,7 @@ export const skills = mysqlTable("skills", {
   teamPinnedVersion: int("team_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
   labelsJson: json("labels_json").$type<string[]>(),
+  skillSpaceId: varchar("skill_space_id", { length: 64 }).references(() => skillSpaces.id),
 });
 
 // ─── Skill Contents ─────────────────────────────────
@@ -280,6 +303,14 @@ export const workspaces = mysqlTable("workspaces", {
     systemPrompt?: string;
     icon?: string;
     color?: string;
+    skillComposer?: {
+      globalSkillRefs?: string[];
+      personalSkillIds?: string[];
+      skillSpaces?: Array<{
+        skillSpaceId: string;
+        disabledSkillIds?: string[];
+      }>;
+    };
   }>(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),

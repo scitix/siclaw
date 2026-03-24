@@ -3,21 +3,24 @@
  */
 
 import crypto from "node:crypto";
-import { eq, and, or, sql } from "drizzle-orm";
+import { eq, and, or, sql, inArray } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { skills, userDisabledSkills } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
+
+export type SkillScope = "builtin" | "team" | "personal" | "global" | "skillset";
 
 export interface CreateSkillInput {
   name: string;
   description?: string;
   type?: string;
-  scope: "builtin" | "team" | "personal";
+  scope: SkillScope;
   authorId?: string;
   dirName: string;
   forkedFromId?: string;
   version?: number;
   labels?: string[];
+  skillSpaceId?: string;
 }
 
 export interface UpdateSkillInput {
@@ -27,7 +30,7 @@ export interface UpdateSkillInput {
   status?: string;
   contributionStatus?: "none" | "pending" | "approved";
   reviewStatus?: "draft" | "pending" | "approved";
-  scope?: "builtin" | "team" | "personal";
+  scope?: SkillScope;
   dirName?: string;
   publishedVersion?: number | null;
   stagingVersion?: number;
@@ -35,6 +38,7 @@ export interface UpdateSkillInput {
   teamPinnedVersion?: number | null;
   forkedFromId?: string | null;
   labels?: string[] | null;
+  skillSpaceId?: string | null;
 }
 
 export class SkillRepository {
@@ -56,7 +60,7 @@ export class SkillRepository {
   async listForUser(userId: string, opts?: {
     limit?: number;
     offset?: number;
-    scope?: "builtin" | "team" | "personal";
+    scope?: SkillScope;
     search?: string;
   }) {
     const limit = opts?.limit ?? 30;
@@ -127,6 +131,7 @@ export class SkillRepository {
       contributionStatus: "none",
       forkedFromId: input.forkedFromId ?? null,
       labelsJson: input.labels ?? null,
+      skillSpaceId: input.skillSpaceId ?? null,
     });
     return id;
   }
@@ -150,6 +155,7 @@ export class SkillRepository {
     if (updates.teamPinnedVersion !== undefined) setFields.teamPinnedVersion = updates.teamPinnedVersion;
     if (updates.forkedFromId !== undefined) setFields.forkedFromId = updates.forkedFromId;
     if (updates.labels !== undefined) setFields.labelsJson = updates.labels;
+    if (updates.skillSpaceId !== undefined) setFields.skillSpaceId = updates.skillSpaceId;
 
     await this.db.update(skills).set(setFields).where(eq(skills.id, id));
   }
@@ -243,5 +249,24 @@ export class SkillRepository {
           eq(userDisabledSkills.skillName, skillName),
         ),
       );
+  }
+
+  // ─── Skill Space queries ───────────────────────────
+
+  /** List skills belonging to a specific skill space */
+  async listBySkillSpaceId(skillSpaceId: string) {
+    return this.db
+      .select()
+      .from(skills)
+      .where(eq(skills.skillSpaceId, skillSpaceId));
+  }
+
+  /** List skills belonging to any of the given skill space IDs */
+  async listBySkillSpaceIds(skillSpaceIds: string[]) {
+    if (skillSpaceIds.length === 0) return [];
+    return this.db
+      .select()
+      .from(skills)
+      .where(inArray(skills.skillSpaceId, skillSpaceIds));
   }
 }

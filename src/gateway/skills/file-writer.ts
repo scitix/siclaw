@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { resolveUnderDir } from "../../shared/path-utils.js";
 
 export interface SkillFiles {
   specs?: string;
@@ -18,11 +19,13 @@ export interface SkillFiles {
   }>;
 }
 
+export type SkillFileScope = "builtin" | "team" | "personal" | "skillset";
+
 export interface ScannedSkill {
   dirName: string;
   name: string;
   description: string;
-  scope: "builtin" | "team" | "personal";
+  scope: SkillFileScope;
   scripts: string[];
 }
 
@@ -31,7 +34,7 @@ export class SkillFileWriter {
 
   /** Initialize Skills PV (ensure dirs exist) */
   async init(): Promise<void> {
-    for (const sub of ["core", "extension", "team", "user", "platform"]) {
+    for (const sub of ["core", "extension", "team", "user", "skillset", "platform"]) {
       const dir = path.join(this.skillsDir, sub);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -40,30 +43,35 @@ export class SkillFileWriter {
     console.log("[skill-writer] Initialized skills directory:", this.skillsDir);
   }
 
-  /** Resolve skill directory path */
+  /** Resolve skill directory path (traversal-safe) */
   resolveDir(
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
     dirName: string,
     userId?: string,
+    skillSpaceId?: string,
   ): string {
     switch (scope) {
       case "builtin":
-        return path.join(this.skillsDir, "core", dirName);
+        return resolveUnderDir(this.skillsDir, "core", dirName);
       case "team":
-        return path.join(this.skillsDir, "team", dirName);
+        return resolveUnderDir(this.skillsDir, "team", dirName);
       case "personal":
-        return path.join(this.skillsDir, "user", userId || "unknown", dirName);
+        if (!userId) throw new Error("userId is required for personal scope");
+        return resolveUnderDir(this.skillsDir, "user", userId, dirName);
+      case "skillset":
+        if (!skillSpaceId) throw new Error("skillSpaceId is required for skillset scope");
+        return resolveUnderDir(this.skillsDir, "skillset", skillSpaceId, dirName);
     }
   }
 
   /** Write skill files to disk */
   async writeSkill(
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
     dirName: string,
     files: SkillFiles,
-    opts: { userId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<{ skillDir: string }> {
-    const skillDir = this.resolveDir(scope, dirName, opts.userId);
+    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSpaceId);
 
     // Ensure directory exists
     if (!fs.existsSync(skillDir)) {
@@ -107,11 +115,12 @@ export class SkillFileWriter {
 
   /** Read skill files from disk */
   readSkill(
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
     dirName: string,
     userId?: string,
+    skillSpaceId?: string,
   ): SkillFiles | null {
-    let skillDir = this.resolveDir(scope, dirName, userId);
+    let skillDir = this.resolveDir(scope, dirName, userId, skillSpaceId);
 
     // Fallback to Docker-baked cwd/skills/{core,extension} for builtin skills
     if (!fs.existsSync(skillDir) && scope === "builtin") {
@@ -183,7 +192,7 @@ export class SkillFileWriter {
   /** Scan a single directory for skills */
   private scanDir(
     dir: string,
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
   ): ScannedSkill[] {
     if (!fs.existsSync(dir)) return [];
 
@@ -220,7 +229,9 @@ export class SkillFileWriter {
   }
 
   /** Scan all skills under a scope directory */
-  scanScope(scope: "builtin" | "team"): ScannedSkill[] {
+  scanScope(scope: "builtin" | "team" | "global"): ScannedSkill[] {
+    // "global" is an alias for builtin (builtin + team merged)
+    if (scope === "global") return [...this.scanScope("builtin"), ...this.scanScope("team")];
     if (scope === "builtin") {
       const results: ScannedSkill[] = [];
       const seen = new Set<string>();
@@ -243,11 +254,11 @@ export class SkillFileWriter {
 
   /** Delete skill files from disk (including .published/ if present) */
   async deleteSkill(
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
     dirName: string,
-    opts: { userId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<void> {
-    const skillDir = this.resolveDir(scope, dirName, opts.userId);
+    const skillDir = this.resolveDir(scope, dirName, opts.userId, opts.skillSpaceId);
 
     if (fs.existsSync(skillDir)) {
       fs.rmSync(skillDir, { recursive: true, force: true });
@@ -266,9 +277,9 @@ export class SkillFileWriter {
     }
   }
 
-  /** Resolve published snapshot directory path */
+  /** Resolve published snapshot directory path (traversal-safe) */
   resolvePublishedDir(userId: string, dirName: string): string {
-    return path.join(this.skillsDir, "user", userId, ".published", dirName);
+    return resolveUnderDir(this.skillsDir, "user", userId, ".published", dirName);
   }
 
   /** Snapshot working copy to .published/ directory */
@@ -324,9 +335,9 @@ export class SkillFileWriter {
     }
   }
 
-  /** Resolve staging snapshot directory path */
+  /** Resolve staging snapshot directory path (traversal-safe) */
   resolveStagingDir(userId: string, dirName: string): string {
-    return path.join(this.skillsDir, "user", userId, ".staging", dirName);
+    return resolveUnderDir(this.skillsDir, "user", userId, ".staging", dirName);
   }
 
   /** Snapshot working copy to .staging/ directory */
@@ -376,13 +387,13 @@ export class SkillFileWriter {
 
   /** Rename a skill directory on disk (and its .published/ dir if present) */
   async renameDir(
-    scope: "builtin" | "team" | "personal",
+    scope: SkillFileScope,
     oldDirName: string,
     newDirName: string,
-    opts: { userId?: string },
+    opts: { userId?: string; skillSpaceId?: string },
   ): Promise<void> {
-    const oldDir = this.resolveDir(scope, oldDirName, opts.userId);
-    const newDir = this.resolveDir(scope, newDirName, opts.userId);
+    const oldDir = this.resolveDir(scope, oldDirName, opts.userId, opts.skillSpaceId);
+    const newDir = this.resolveDir(scope, newDirName, opts.userId, opts.skillSpaceId);
 
     if (!fs.existsSync(oldDir)) {
       throw new Error(`Skill directory not found: ${oldDir}`);

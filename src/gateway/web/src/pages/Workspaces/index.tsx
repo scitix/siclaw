@@ -5,6 +5,22 @@ import { WorkspaceDialog } from './WorkspaceDialog';
 import type { Workspace } from '@/contexts/WorkspaceContext';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 
+type WorkspaceSkillComposer = {
+    globalSkillRefs?: string[];
+    personalSkillIds?: string[];
+    skillSpaces?: Array<{
+        skillSpaceId: string;
+        disabledSkillIds?: string[];
+    }>;
+};
+
+type WorkspaceSummary = {
+    effectiveSkills: number;
+    globalCount: number;
+    skillSpaceCount: number;
+    personalCount: number;
+};
+
 const COLORS: Record<string, string> = {
     indigo: 'bg-indigo-500',
     blue: 'bg-blue-500',
@@ -26,7 +42,7 @@ export function WorkspacesPage() {
     const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
     const [editingWs, setEditingWs] = useState<Workspace | null>(null);
     const [isCreating, setIsCreating] = useState(false);
-    const [skillCounts, setSkillCounts] = useState<Record<string, number>>({});
+    const [skillSummaries, setSkillSummaries] = useState<Record<string, WorkspaceSummary>>({});
     const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
     const [clusterCounts, setClusterCounts] = useState<Record<string, number>>({});
     const hasLoadedRef = useRef(false);
@@ -41,10 +57,18 @@ export function WorkspacesPage() {
             // Load config counts for each non-default workspace
             for (const ws of list) {
                 if (ws.isDefault) continue;
-                sendRpc<{ skills: string[]; tools: string[]; clusters: string[] }>(
+                sendRpc<{ skills: string[]; skillComposer?: WorkspaceSkillComposer; tools: string[]; clusters: string[] }>(
                     'workspace.getConfig', { id: ws.id }
                 ).then(cfg => {
-                    setSkillCounts(prev => ({ ...prev, [ws.id]: cfg.skills?.length ?? 0 }));
+                    setSkillSummaries(prev => ({
+                        ...prev,
+                        [ws.id]: {
+                            effectiveSkills: cfg.skills?.length ?? 0,
+                            globalCount: cfg.skillComposer?.globalSkillRefs?.length ?? 0,
+                            skillSpaceCount: cfg.skillComposer?.skillSpaces?.length ?? 0,
+                            personalCount: cfg.skillComposer?.personalSkillIds?.length ?? 0,
+                        },
+                    }));
                     setToolCounts(prev => ({ ...prev, [ws.id]: cfg.tools?.length ?? 0 }));
                     setClusterCounts(prev => ({ ...prev, [ws.id]: cfg.clusters?.length ?? 0 }));
                 }).catch(() => {});
@@ -134,7 +158,21 @@ export function WorkspacesPage() {
                                         <>
                                             <div className="flex items-center gap-2">
                                                 <span className="w-3.5 text-center text-xs font-mono text-gray-400">S</span>
-                                                <span>{skillCounts[ws.id] ?? 0} skills</span>
+                                                <span>{skillSummaries[ws.id]?.effectiveSkills ?? 0} effective skills</span>
+                                            </div>
+                                            <div className="grid grid-cols-3 gap-2 pt-1">
+                                                <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1.5">
+                                                    <div className="text-[10px] uppercase tracking-wide text-gray-400">Global</div>
+                                                    <div className="text-sm font-semibold text-gray-700">{skillSummaries[ws.id]?.globalCount ?? 0}</div>
+                                                </div>
+                                                <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1.5">
+                                                    <div className="text-[10px] uppercase tracking-wide text-gray-400">Spaces</div>
+                                                    <div className="text-sm font-semibold text-gray-700">{skillSummaries[ws.id]?.skillSpaceCount ?? 0}</div>
+                                                </div>
+                                                <div className="rounded-lg border border-gray-200 bg-gray-50 px-2 py-1.5">
+                                                    <div className="text-[10px] uppercase tracking-wide text-gray-400">Personal</div>
+                                                    <div className="text-sm font-semibold text-gray-700">{skillSummaries[ws.id]?.personalCount ?? 0}</div>
+                                                </div>
                                             </div>
                                             <div className="flex items-center gap-2">
                                                 <span className="w-3.5 text-center text-xs font-mono text-gray-400">T</span>

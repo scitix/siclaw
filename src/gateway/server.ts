@@ -354,7 +354,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await refreshMetricsConfig();
 
   // Create RPC methods using AgentBoxManager
-  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService, knowledgeIndexer);
+  const { methods: rpcMethods, buildCredentialPayload, getSkillBundle, cleanupForWs } = createRpcMethods(agentBoxManager, broadcast, db, sendToUser, activePromptUsers, agentBoxTlsOptions, resourceNotifier, metricsAggregator, cronService, knowledgeIndexer, isK8sMode);
 
   // Wrap system.saveSection to refresh caches when settings change
   const origSaveSection = rpcMethods.get("system.saveSection");
@@ -1232,10 +1232,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                   return;
                 }
 
-                const bundle = await getSkillBundle(identity.userId, identity.env);
+                const bundle = await getSkillBundle(identity.userId, identity.env, identity.workspaceId);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(bundle));
-                console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} skills=${bundle.skills.length}`);
+                console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} workspaceId=${identity.workspaceId ?? "n/a"} skills=${bundle.skills.length}`);
               } catch (err) {
                 console.error("[gateway] skills/bundle error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });
@@ -1461,4 +1461,3 @@ async function resolveJwtSecret(sysConfigRepo: SystemConfigRepository | null): P
 
   return generated;
 }
-
