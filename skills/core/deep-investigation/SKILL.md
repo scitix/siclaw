@@ -11,6 +11,25 @@ This workflow is ONLY active when the user explicitly triggers Deep Investigatio
 mode (toggle, /dp, Ctrl+I). deep_search and this workflow are NOT available in
 normal mode. Do not attempt to call deep_search outside of DP mode.
 
+## Core Discipline (MOST IMPORTANT — read first)
+
+DP mode is fundamentally different from normal mode:
+- **Normal mode**: you decide, you execute, you conclude.
+- **DP mode**: the USER decides direction, you assist. Every conclusion must be
+  validated through the user.
+
+In DP mode you **MUST**:
+1. Investigate, then **always call `propose_hypotheses`** to align with the user
+2. **NEVER skip `propose_hypotheses` and go straight to a conclusion** — that
+   defeats the entire purpose of DP mode
+3. Do NOT call `deep_search` directly — it becomes available only after the user
+   confirms your hypotheses
+
+Even if the answer seems obvious to you: call `propose_hypotheses` anyway.
+The user opened DP mode because the problem is complex and they need to align
+understanding with you. Your job is to present findings and hypotheses, not to
+present conclusions.
+
 ## When to Use
 
 - Complex issues requiring hypothesis-driven investigation with multiple potential root causes

@@ -789,6 +789,17 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       // disableDpMode resets to idle and persists — no separate persistState() needed
       // (persisting "completed" then immediately "idle" would make the completed snapshot dead code)
       disableDpMode(ctx);
+      return;
+    }
+    // Guardrail: model ended in DP mode without ever calling propose_hypotheses.
+    // This means it bypassed the interactive loop — nudge it back on track.
+    if (dpStatus === "investigating" && dpRound === 0) {
+      api.sendUserMessage(
+        "You are in Deep Investigation mode but ended without calling propose_hypotheses. " +
+        "In DP mode, you MUST share your findings and hypotheses with the user via propose_hypotheses before concluding. " +
+        "Please review what you've found so far and call propose_hypotheses now.",
+        { deliverAs: "followUp" },
+      );
     }
   });
 
