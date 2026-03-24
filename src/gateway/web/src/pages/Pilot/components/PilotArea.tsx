@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban, Play, MessageSquare, SkipForward } from 'lucide-react';
+import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban, Play, MessageSquare } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import { InputArea } from './InputArea';
@@ -534,20 +534,19 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                             <button
                                 type="button"
                                 onClick={() => {
-                                    const feedback = prompt('Feedback for hypothesis adjustment:');
+                                    const feedback = prompt('Feedback or guidance:');
                                     if (feedback?.trim()) sendMessage(`[DP_ADJUST]\n${feedback.trim()}`);
                                 }}
                                 className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-indigo-600 hover:bg-indigo-100 transition-colors cursor-pointer"
                             >
                                 <MessageSquare className="w-3 h-3" />
-                                Modify
+                                Adjust
                             </button>
                             <button
                                 type="button"
                                 onClick={() => sendMessage('[DP_SKIP]\nSkip validation and present conclusion.')}
-                                className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-500 hover:bg-gray-100 transition-colors cursor-pointer"
+                                className="text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer"
                             >
-                                <SkipForward className="w-3 h-3" />
                                 Skip
                             </button>
                         </div>
@@ -628,7 +627,7 @@ function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean
         return { isDeepInvestigation: true, text: content.replace(dpMatch[0], '').trim() };
     }
     // Strip DP state control markers (confirm/adjust/skip)
-    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|SKIP|EXIT)\]\n*/);
+    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|REINVESTIGATE|SKIP|EXIT)\]\n*/);
     if (controlMatch) {
         return { isDeepInvestigation: true, text: content.replace(controlMatch[0], '').trim() };
     }
