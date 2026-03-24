@@ -894,6 +894,7 @@ export function createRpcMethods(
     }
     if (text.startsWith("[DP_CONFIRM]")) return { status: "validating" };
     if (text.startsWith("[DP_ADJUST]")) return { status: "investigating" };
+    if (text.startsWith("[DP_REINVESTIGATE]")) return { status: "investigating" };
     if (text.startsWith("[DP_SKIP]")) return { status: "concluding" };
     if (text.startsWith("[DP_EXIT]")) return { status: "completed" };
     return null;

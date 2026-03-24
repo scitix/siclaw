@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Search, CheckCircle2, Send, X, MessageSquare, ChevronRight, Play, SkipForward } from 'lucide-react';
+import { Search, CheckCircle2, X, MessageSquare, ChevronRight, Play, RefreshCw, PenLine } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import type { PilotMessage } from '@/hooks/usePilot';
@@ -229,7 +229,7 @@ export interface HypothesesCardProps {
     alreadyConfirmed?: boolean;
 }
 
-export function HypothesesCard({ message, sendMessage, abortResponse, onHypothesesConfirmed, superseded, alreadyConfirmed }: HypothesesCardProps) {
+export function HypothesesCard({ message, sendMessage, onHypothesesConfirmed, superseded, alreadyConfirmed }: HypothesesCardProps) {
     const [feedbackMode, setFeedbackMode] = useState(false);
     const [feedbackText, setFeedbackText] = useState('');
     const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
@@ -298,9 +298,21 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
         }
     };
 
-    const handleSendFeedback = () => {
+    /** Light adjust: tweak hypotheses without re-investigation */
+    const handleModify = () => {
         if (feedbackText.trim() && sendMessage) {
             sendMessage(`[DP_ADJUST]\n${feedbackText.trim()}`);
+            setFeedbackMode(false);
+            setFeedbackText('');
+            setConfirmed(true);
+        }
+    };
+
+    /** Heavy adjust: go back to Phase 1, run new commands, then re-propose */
+    const handleReinvestigate = () => {
+        if (sendMessage) {
+            const hint = feedbackText.trim();
+            sendMessage(`[DP_REINVESTIGATE]\n${hint || 'Re-investigate from a different angle.'}`);
             setFeedbackMode(false);
             setFeedbackText('');
             setConfirmed(true);
@@ -311,12 +323,6 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
         if (sendMessage) {
             sendMessage('[DP_SKIP]\nSkip validation and present conclusion.');
             setConfirmed(true);
-        }
-    };
-
-    const handleExit = () => {
-        if (abortResponse) {
-            abortResponse();
         }
     };
 
@@ -420,38 +426,50 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                     </div>
                 )}
 
-                {/* Feedback input */}
+                {/* Adjust panel: input + Modify/Re-investigate buttons */}
                 {feedbackMode && (
-                    <div className="mb-3 flex gap-2">
-                        <input
-                            type="text"
-                            value={feedbackText}
-                            onChange={(e) => setFeedbackText(e.target.value)}
-                            onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && handleSendFeedback()}
-                            placeholder="Add/modify hypotheses..."
-                            className="flex-1 text-sm border border-indigo-200 rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400"
-                            autoFocus
-                        />
-                        <button
-                            type="button"
-                            onClick={handleSendFeedback}
-                            disabled={!feedbackText.trim()}
-                            className="text-xs font-medium px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1 cursor-pointer"
-                        >
-                            <Send className="w-3 h-3" />
-                            Send
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => { setFeedbackMode(false); setFeedbackText(''); }}
-                            className="text-xs font-medium px-2 py-1.5 rounded-md text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors cursor-pointer"
-                        >
-                            <X className="w-3.5 h-3.5" />
-                        </button>
+                    <div className="mb-3 space-y-2">
+                        <div className="flex gap-2">
+                            <input
+                                type="text"
+                                value={feedbackText}
+                                onChange={(e) => setFeedbackText(e.target.value)}
+                                onKeyDown={(e) => e.key === 'Enter' && !e.nativeEvent.isComposing && handleModify()}
+                                placeholder="Feedback or guidance..."
+                                className="flex-1 text-sm border border-indigo-200 rounded-md px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                                autoFocus
+                            />
+                            <button
+                                type="button"
+                                onClick={() => { setFeedbackMode(false); setFeedbackText(''); }}
+                                className="text-xs font-medium px-2 py-1.5 rounded-md text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors cursor-pointer"
+                            >
+                                <X className="w-3.5 h-3.5" />
+                            </button>
+                        </div>
+                        <div className="flex gap-2">
+                            <button
+                                type="button"
+                                onClick={handleModify}
+                                disabled={!feedbackText.trim()}
+                                className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                            >
+                                <PenLine className="w-3 h-3" />
+                                Modify
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleReinvestigate}
+                                className="flex items-center gap-1 text-xs font-medium px-3 py-1.5 rounded-md text-indigo-600 border border-indigo-200 hover:bg-indigo-50 transition-colors cursor-pointer"
+                            >
+                                <RefreshCw className="w-3 h-3" />
+                                Re-investigate
+                            </button>
+                        </div>
                     </div>
                 )}
 
-                {/* Action buttons */}
+                {/* Action buttons: Confirm / Adjust / Skip */}
                 {showActions && (
                     <div className="flex items-center gap-2 pt-2 border-t border-indigo-100">
                         <button
@@ -468,23 +486,14 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                             className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-indigo-600 hover:bg-indigo-100 transition-colors cursor-pointer"
                         >
                             <MessageSquare className="w-3 h-3" />
-                            Modify
+                            Adjust
                         </button>
                         <button
                             type="button"
                             onClick={handleSkip}
-                            className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors cursor-pointer"
+                            className="text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors cursor-pointer"
                         >
-                            <SkipForward className="w-3 h-3" />
                             Skip
-                        </button>
-                        <button
-                            type="button"
-                            onClick={handleExit}
-                            className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-500 hover:bg-gray-100 hover:text-red-600 transition-colors cursor-pointer"
-                        >
-                            <X className="w-3 h-3" />
-                            Cancel
                         </button>
                     </div>
                 )}
