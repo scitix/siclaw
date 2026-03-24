@@ -1071,6 +1071,16 @@ export function usePilot() {
                 confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }> | null;
             }>('chat.dpProgress', { sessionId: targetSession });
 
+            console.log('[restoreDpProgress]', {
+                promptActive: snap.promptActive,
+                events: snap.events?.length ?? 0,
+                dpStatus: snap.dpStatus,
+                checklist: snap.checklist?.map(i => `${i.id}:${i.status}`).join(','),
+                confirmedH: snap.confirmedHypotheses?.length ?? 0,
+                historyH: hypothesesTextMap.size,
+                historyTexts: Array.from(hypothesesTextMap.values()).map(t => t?.slice(0, 25)),
+            });
+
             // Restore loading state if prompt is still active
             if (snap.promptActive) {
                 setIsLoading(true);
