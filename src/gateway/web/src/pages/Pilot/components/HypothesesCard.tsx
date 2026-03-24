@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Search, CheckCircle2, Send, X, MessageSquare, ChevronRight, Play } from 'lucide-react';
+import { Search, CheckCircle2, Send, X, MessageSquare, ChevronRight, Play, SkipForward } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import type { PilotMessage } from '@/hooks/usePilot';
@@ -292,7 +292,7 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
 
     const handleConfirm = () => {
         if (sendMessage) {
-            sendMessage('The user has confirmed hypotheses. Please call deep_search to validate them.');
+            sendMessage('[DP_CONFIRM]\nThe user has confirmed hypotheses.');
             setConfirmed(true);
             emitConfirmed();
         }
@@ -300,11 +300,17 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
 
     const handleSendFeedback = () => {
         if (feedbackText.trim() && sendMessage) {
-            sendMessage(`User feedback: ${feedbackText.trim()}. Please revise the hypotheses based on this feedback, then call propose_hypotheses again to present the updated hypotheses and wait for user confirmation before calling deep_search.`);
+            sendMessage(`[DP_ADJUST]\n${feedbackText.trim()}`);
             setFeedbackMode(false);
             setFeedbackText('');
             setConfirmed(true);
-            // Don't call emitConfirmed() here — the LLM will re-propose hypotheses for user review.
+        }
+    };
+
+    const handleSkip = () => {
+        if (sendMessage) {
+            sendMessage('[DP_SKIP]\nSkip validation and present conclusion.');
+            setConfirmed(true);
         }
     };
 
@@ -463,6 +469,14 @@ export function HypothesesCard({ message, sendMessage, abortResponse, onHypothes
                         >
                             <MessageSquare className="w-3 h-3" />
                             Modify
+                        </button>
+                        <button
+                            type="button"
+                            onClick={handleSkip}
+                            className="flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-md text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors cursor-pointer"
+                        >
+                            <SkipForward className="w-3 h-3" />
+                            Skip
                         </button>
                         <button
                             type="button"

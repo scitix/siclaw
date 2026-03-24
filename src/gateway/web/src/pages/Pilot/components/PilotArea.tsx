@@ -583,11 +583,17 @@ function parseSkillRef(content: string): { skillName: string | null; text: strin
     return { skillName: null, text: content };
 }
 
-/** Parse [Deep Investigation] marker from user messages */
+/** Parse [Deep Investigation] and DP control markers from user messages */
 function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean; text: string } {
-    const match = content.match(/\[Deep Investigation\]\n*/);
-    if (match) {
-        return { isDeepInvestigation: true, text: content.replace(match[0], '').trim() };
+    // Strip activation marker
+    const dpMatch = content.match(/\[Deep Investigation\]\n*/);
+    if (dpMatch) {
+        return { isDeepInvestigation: true, text: content.replace(dpMatch[0], '').trim() };
+    }
+    // Strip DP state control markers (confirm/adjust/skip)
+    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|SKIP)\]\n*/);
+    if (controlMatch) {
+        return { isDeepInvestigation: true, text: content.replace(controlMatch[0], '').trim() };
     }
     return { isDeepInvestigation: false, text: content };
 }

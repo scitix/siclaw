@@ -1822,18 +1822,10 @@ export function createRpcMethods(
     return { status: "aborted" };
   });
 
-  methods.set("chat.confirmHypotheses", async (params, context: RpcContext) => {
-    const userId = requireAuth(context);
-    const sessionId = params.sessionId as string | undefined;
-
-    // Hypotheses confirmation is handled via steer messages from the frontend.
-    // This RPC is a gate-clear signal — acknowledge it so the frontend knows it was received.
-    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
-    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
-    if (stream) {
-      const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
-      await client.steerSession(stream.sessionId, "[hypotheses confirmed]");
-    }
+  methods.set("chat.confirmHypotheses", async (_params, context: RpcContext) => {
+    requireAuth(context);
+    // Confirmation is now handled by [DP_CONFIRM] marker in the sendMessage path.
+    // This RPC is kept for frontend compatibility — no steer needed.
     return { status: "confirmed" };
   });
 

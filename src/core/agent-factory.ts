@@ -36,6 +36,8 @@ import { createInvestigationFeedbackTool } from "../tools/investigation-feedback
 import { createSaveFeedbackTool } from "../tools/save-feedback.js";
 import {
   type DpState,
+  type DpStateRef,
+  createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
   getDpWorkflow,
@@ -281,6 +283,10 @@ export async function createSiclawSession(
   // can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
 
+  // DP state ref — shared between deep_search tool (read-only gate) and the
+  // deep-investigation extension (writes state). The extension binds this at init.
+  const dpStateRef: DpStateRef = { status: "idle" };
+
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
     createNodeExecTool(kubeconfigRef, userId),
@@ -290,7 +296,7 @@ export async function createSiclawSession(
     createPodExecTool(kubeconfigRef),
     createPodNsenterExecTool(kubeconfigRef, userId),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
-    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
+    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
     createInvestigationFeedbackTool(memoryRef),
     createSaveFeedbackTool(sessionIdRef),
     createCredentialListTool(kubeconfigRef),
@@ -499,7 +505,7 @@ export async function createSiclawSession(
       return parts;
     },
     // Extension registration order: compactionSafeguard handles session_before_compact.
-    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef, dpStateRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();
@@ -532,7 +538,7 @@ export async function createSiclawSession(
     const sdkTools = [...customTools];
 
     // DP tools for SDK brain — mutable state shared with http-server via dpState ref
-    const dpState: DpState = { checklist: null };
+    const dpState: DpState = createDpState();
     sdkTools.push(
       createProposeHypothesesTool(dpState),
       createEndInvestigationTool(dpState),
@@ -544,30 +550,9 @@ export async function createSiclawSession(
     const appendParts = buildAppendSystemPrompt(memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
 
-    // Inject deep investigation judgment framework
-    const dpWorkflow = getDpWorkflow();
-    if (dpWorkflow) {
-      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Investigation Capability
-
-You have access to deep investigation tools. Use judgment about when and how:
-
-**When to investigate autonomously:**
-- Problem has a clear direction → call deep_search directly with your triage context
-- User gives specific instruction (e.g. "validate H1 and H3") → execute immediately
-
-**When to consult the user first:**
-- Multiple plausible root causes and investigation will be expensive
-- User is actively engaged in the discussion (asking questions, giving feedback)
-- You're unsure about the investigation direction
-
-**Cost awareness:**
-deep_search launches parallel sub-agents consuming 30-60 tool calls.
-Like any expensive operation, confirm direction with the user when the path isn't clear.
-Use propose_hypotheses to present your thinking and get user alignment.
-
-**When user explicitly activates Deep Investigation mode (magnifying glass / /dp / Ctrl+I):**
-Follow the structured workflow described in the deep-investigation skill guide.`;
-    }
+    // Investigation Capability prompt removed — deep_search is now DP-mode-only.
+    // The workflow instructions are injected via buildActivationMessage() when
+    // the user explicitly triggers DP mode.
 
     // Append workspace custom prompt
     if (opts?.systemPromptAppend) {
