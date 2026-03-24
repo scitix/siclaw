@@ -22,7 +22,7 @@ Options:
   --workspace <wsId>       Filter by workspace (requires --user)
   --older-than <days>      Only clean files older than N days (by filename date)
   --dry-run                List matching files without deleting (default)
-  --confirm                Actually delete files
+  --confirm                Actually delete files (no interactive prompt)
   -h, --help               Show this help
 
 Examples:
@@ -171,13 +171,7 @@ if $dry_run; then
   exit 0
 fi
 
-# Second confirmation
-echo "${PREFIX} About to DELETE ${total} file(s). This cannot be undone."
-read -r -p "${PREFIX} Type 'yes' to confirm: " answer
-if [[ "$answer" != "yes" ]]; then
-  echo "${PREFIX} Aborted."
-  exit 0
-fi
+echo "${PREFIX} Deleting ${total} file(s)..."
 
 # Delete
 deleted=0
