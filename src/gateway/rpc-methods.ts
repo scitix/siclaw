@@ -841,7 +841,10 @@ export function createRpcMethods(
     dpStatus: DpStatus;
     checklist: DpChecklist | null;
     dpQuestion?: string;
-    sessionId?: string;
+    /** AgentBox session ID (for dp-state endpoint recovery) */
+    agentboxSessionId?: string;
+    /** AgentBox endpoint URL (for dp-state endpoint recovery when activeStreams is empty) */
+    agentboxEndpoint?: string;
   }
   const dpStatusCache = new Map<string, DpStatusCache>();
 
@@ -872,7 +875,7 @@ export function createRpcMethods(
       userId,
       sessionId,
       dpStatus: cache.dpStatus,
-      checklist: cache.checklist,
+      checklist: cache.checklist?.items ?? null,
       dpQuestion: cache.dpQuestion,
     };
     if (sendToUser) {
@@ -1030,10 +1033,6 @@ export function createRpcMethods(
     const dpTransition = detectDpMarker(message, dpStreamKey);
     if (dpTransition) {
       transitionDpStatus(dpStreamKey, dpTransition.status, dpTransition.question);
-      if (dpTransition.status !== "idle") {
-        const cache = dpStatusCache.get(dpStreamKey);
-        if (cache) cache.sessionId = sessionId;
-      }
     }
 
     // Send prompt
@@ -1056,9 +1055,14 @@ export function createRpcMethods(
     // Fixup dpStatusCache key if sessionId was assigned lazily
     if (dpStreamKey !== streamKey && dpStatusCache.has(dpStreamKey)) {
       const dpCache = dpStatusCache.get(dpStreamKey)!;
-      dpCache.sessionId = result.sessionId;
       dpStatusCache.set(streamKey, dpCache);
       dpStatusCache.delete(dpStreamKey);
+    }
+    // Store agentbox endpoint for recovery (needed when activeStreams is empty)
+    const dpCache = dpStatusCache.get(streamKey);
+    if (dpCache) {
+      dpCache.agentboxSessionId = result.sessionId;
+      dpCache.agentboxEndpoint = handle.endpoint;
     }
     // Emit dp_status event after prompt is accepted (sessionId now known)
     if (dpTransition) {
@@ -1956,12 +1960,16 @@ export function createRpcMethods(
     let dpChecklist: DpChecklist | null = null;
     let dpQuestion: string | undefined;
 
-    // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror)
+    // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror).
+    // Use activeStreams first (prompt running), then dpStatusCache (prompt ended but DP alive).
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
-    if (stream) {
+    const cachedDp = dpStatusCache.get(snapKey);
+    const agentboxEndpoint = stream?.endpoint ?? cachedDp?.agentboxEndpoint;
+    const agentboxSessionId = stream?.sessionId ?? cachedDp?.agentboxSessionId;
+    if (agentboxEndpoint && agentboxSessionId) {
       try {
-        const agentClient = new AgentBoxClient(stream.endpoint, 5000, agentBoxTlsOptions);
-        const resp = await agentClient.getDpState(stream.sessionId);
+        const agentClient = new AgentBoxClient(agentboxEndpoint, 5000, agentBoxTlsOptions);
+        const resp = await agentClient.getDpState(agentboxSessionId);
         if (resp?.dpStatus && resp.dpStatus !== "idle") {
           dpStatus = resp.dpStatus;
           dpQuestion = resp.question;
@@ -1990,7 +1998,7 @@ export function createRpcMethods(
       events,
       promptActive,
       dpStatus: dpStatus ?? null,
-      checklist: dpChecklist,
+      checklist: dpChecklist?.items ?? null,
       dpQuestion: dpQuestion ?? null,
     };
   });
