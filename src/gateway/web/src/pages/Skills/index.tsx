@@ -637,7 +637,7 @@ export function SkillsPage() {
                     </div>
                 ) : (
                     <div className="max-w-6xl mx-auto">
-                        {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading ? (
+                        {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading && activeTab !== 'myskills' ? (
                             <div className="flex flex-col items-center justify-center py-20 text-gray-400 text-sm">
                                 <Users className="w-8 h-8 mb-3 opacity-20" />
                                 No skills found.

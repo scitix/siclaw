@@ -2051,7 +2051,7 @@ export function createRpcMethods(
 
     // DB skills (when scope is not "builtin")
     let dbResult = { skills: [] as any[], hasMore: false };
-    if (scope !== "builtin" && scope !== "skillset" && !(scope === "skillset" && !skillSpaceEnabled)) {
+    if (scope !== "builtin" && scope !== "skillset") {
       const repoOpts: any = { limit, offset };
       if (scope) repoOpts.scope = scope;
       if (search) repoOpts.search = search;
