@@ -297,6 +297,13 @@ export function createRpcMethods(
     skillSpaces: ComposerSkillSpaceOption[];
   };
 
+  type ComposerCleanup = {
+    removedGlobalSkillRefs: number;
+    removedPersonalSkillIds: number;
+    removedSkillSpaces: number;
+    removedDisabledSkillIds: number;
+  };
+
   function filterRoleLabels(labels: string[] | undefined, isAdmin: boolean): string[] | undefined {
     if (!labels || labels.length === 0) return undefined;
     if (isAdmin) return labels;
@@ -334,6 +341,49 @@ export function createRpcMethods(
                 : [],
             }))
         : [],
+    };
+  }
+
+  function sanitizeWorkspaceComposer(
+    composer: WorkspaceSkillComposer,
+    options: ComposerOptions,
+  ): { composer: WorkspaceSkillComposer; cleanup: ComposerCleanup } {
+    const normalized = normalizeWorkspaceSkillComposer(composer);
+    const globalMap = new Map(options.globalSkills.map((skill) => [skill.ref, skill]));
+    const personalMap = new Map(options.personalSkills.map((skill) => [skill.id, skill]));
+    const skillSpaceMap = new Map(options.skillSpaces.map((space) => [space.id, space]));
+
+    const globalSkillRefs = normalized.globalSkillRefs.filter((ref) => globalMap.has(ref));
+    const personalSkillIds = normalized.personalSkillIds.filter((id) => personalMap.has(id));
+    const skillSpaces = normalized.skillSpaces
+      .filter((selection) => skillSpaceMap.has(selection.skillSpaceId))
+      .map((selection) => {
+        const space = skillSpaceMap.get(selection.skillSpaceId)!;
+        const validSkillIds = new Set(space.skills.map((skill) => skill.id));
+        return {
+          skillSpaceId: selection.skillSpaceId,
+          disabledSkillIds: selection.disabledSkillIds.filter((id) => validSkillIds.has(id)),
+        };
+      });
+
+    const removedDisabledSkillIds = normalized.skillSpaces.reduce((count, selection) => {
+      const sanitizedSelection = skillSpaces.find((entry) => entry.skillSpaceId === selection.skillSpaceId);
+      const sanitizedCount = sanitizedSelection?.disabledSkillIds.length ?? 0;
+      return count + Math.max(0, selection.disabledSkillIds.length - sanitizedCount);
+    }, 0);
+
+    return {
+      composer: {
+        globalSkillRefs,
+        personalSkillIds,
+        skillSpaces,
+      },
+      cleanup: {
+        removedGlobalSkillRefs: Math.max(0, normalized.globalSkillRefs.length - globalSkillRefs.length),
+        removedPersonalSkillIds: Math.max(0, normalized.personalSkillIds.length - personalSkillIds.length),
+        removedSkillSpaces: Math.max(0, normalized.skillSpaces.length - skillSpaces.length),
+        removedDisabledSkillIds,
+      },
     };
   }
 
@@ -436,11 +486,17 @@ export function createRpcMethods(
     workspace: NonNullable<Awaited<ReturnType<typeof resolveWorkspaceForUser>>>,
     isAdmin: boolean,
     options?: ComposerOptions,
-  ): Promise<{ composer: WorkspaceSkillComposer; options: ComposerOptions }> {
+  ): Promise<{ composer: WorkspaceSkillComposer; options: ComposerOptions; cleanup: ComposerCleanup | null }> {
     const resolvedOptions = options ?? await listWorkspaceComposerOptions(userId, isAdmin);
     const savedComposer = await workspaceRepo?.getSkillComposer(workspace.id);
     if (savedComposer) {
-      return { composer: normalizeWorkspaceSkillComposer(savedComposer), options: resolvedOptions };
+      const sanitized = sanitizeWorkspaceComposer(savedComposer, resolvedOptions);
+      const hasCleanup = Object.values(sanitized.cleanup).some((count) => count > 0);
+      return {
+        composer: sanitized.composer,
+        options: resolvedOptions,
+        cleanup: hasCleanup ? sanitized.cleanup : null,
+      };
     }
 
     const legacySkills = await workspaceRepo?.getSkills(workspace.id) ?? [];
@@ -455,12 +511,14 @@ export function createRpcMethods(
           skillSpaces: [],
         },
         options: resolvedOptions,
+        cleanup: null,
       };
     }
 
     return {
       composer: buildLegacyFallbackComposer(workspace, resolvedOptions),
       options: resolvedOptions,
+      cleanup: null,
     };
   }
 
@@ -4990,7 +5048,7 @@ export function createRpcMethods(
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
     const isAdmin = isAdminUser(context);
-    const { composer, options } = await resolveWorkspaceComposer(userId, ws, isAdmin);
+    const { composer, options, cleanup } = await resolveWorkspaceComposer(userId, ws, isAdmin);
 
     const [wsTools, wsCreds, wsClusterIds] = await Promise.all([
       workspaceRepo.getTools(id),
@@ -5009,6 +5067,7 @@ export function createRpcMethods(
       workspace: ws,
       skills: buildEffectiveSkillSummary(composer, options),
       skillComposer: composer,
+      skillComposerCleanup: cleanup,
       tools: wsTools,
       credentials: wsCreds,
       clusters: wsClusterIds,
@@ -5035,11 +5094,11 @@ export function createRpcMethods(
     const envTypeParam = params.envType as string | undefined;
     const envType = (envTypeParam === "prod" || envTypeParam === "test" ? envTypeParam : ws.envType) as "prod" | "test";
     const options = await listWorkspaceComposerOptions(userId, isAdminUser(context));
-    const composer = validateWorkspaceComposer(
+    const sanitized = sanitizeWorkspaceComposer(
       normalizeWorkspaceSkillComposer(params.skillComposer),
-      envType,
       options,
     );
+    const composer = validateWorkspaceComposer(sanitized.composer, envType, options);
 
     await workspaceRepo.setSkillComposer(workspaceId, composer);
     notifySkillReload(userId);
@@ -5048,6 +5107,7 @@ export function createRpcMethods(
       status: "updated",
       skillComposer: composer,
       effectiveSkills: buildEffectiveSkillSummary(composer, options),
+      skillComposerCleanup: sanitized.cleanup,
     };
   });
 

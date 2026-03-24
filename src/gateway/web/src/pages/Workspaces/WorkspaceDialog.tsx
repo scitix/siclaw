@@ -54,6 +54,13 @@ interface SkillComposerOptions {
     skillSpaces: SkillComposerSpaceOption[];
 }
 
+interface SkillComposerCleanup {
+    removedGlobalSkillRefs: number;
+    removedPersonalSkillIds: number;
+    removedSkillSpaces: number;
+    removedDisabledSkillIds: number;
+}
+
 const COLOR_OPTIONS = [
     { name: 'indigo', class: 'bg-indigo-500' },
     { name: 'blue', class: 'bg-blue-500' },
@@ -161,6 +168,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
     const [personalLabelFilter, setPersonalLabelFilter] = useState<string | null>(null);
     const [expandedSpaceIds, setExpandedSpaceIds] = useState<Set<string>>(new Set());
     const [saveError, setSaveError] = useState<string | null>(null);
+    const [composerCleanupNotice, setComposerCleanupNotice] = useState<string | null>(null);
     const [confirmDialog, setConfirmDialog] = useState<{
         isOpen: boolean;
         title: string;
@@ -190,6 +198,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     workspace && !workspace.isDefault
                         ? sendRpc<{
                             skillComposer?: WorkspaceSkillComposer;
+                            skillComposerCleanup?: SkillComposerCleanup | null;
                             tools: string[];
                             credentials: string[];
                             clusters: string[];
@@ -208,11 +217,23 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     setSelectedCreds(new Set(configResult.credentials ?? []));
                     setSelectedClusters(new Set(configResult.clusters ?? []));
                     setExpandedSpaceIds(new Set((configResult.skillComposer?.skillSpaces ?? []).map(entry => entry.skillSpaceId)));
+                    const cleanup = configResult.skillComposerCleanup;
+                    const removedParts: string[] = [];
+                    if (cleanup?.removedGlobalSkillRefs) removedParts.push(`${cleanup.removedGlobalSkillRefs} unavailable Global skill${cleanup.removedGlobalSkillRefs === 1 ? '' : 's'}`);
+                    if (cleanup?.removedPersonalSkillIds) removedParts.push(`${cleanup.removedPersonalSkillIds} unavailable Personal skill${cleanup.removedPersonalSkillIds === 1 ? '' : 's'}`);
+                    if (cleanup?.removedSkillSpaces) removedParts.push(`${cleanup.removedSkillSpaces} unavailable Skill Space selection${cleanup.removedSkillSpaces === 1 ? '' : 's'}`);
+                    if (cleanup?.removedDisabledSkillIds) removedParts.push(`${cleanup.removedDisabledSkillIds} stale disabled-skill override${cleanup.removedDisabledSkillIds === 1 ? '' : 's'}`);
+                    setComposerCleanupNotice(
+                        removedParts.length > 0
+                            ? `Cleaned up ${removedParts.join(', ')} from this workspace configuration. Save to persist the cleanup.`
+                            : null,
+                    );
                 } else {
                     setComposer(normalizeComposer());
                     setSelectedTools(new Set());
                     setSelectedCreds(new Set());
                     setSelectedClusters(new Set());
+                    setComposerCleanupNotice(null);
                 }
             } catch (err) {
                 console.error('Failed to load workspace dialog data:', err);
@@ -504,6 +525,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                     sendRpc('workspace.setClusters', { workspaceId: workspace!.id, clusterIds: [...selectedClusters] }),
                 ]);
             }
+            setComposerCleanupNotice(null);
             onSaved();
         } catch (err: any) {
             console.error('Failed to save workspace:', err);
@@ -711,6 +733,12 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                                 <div key={warning}>{warning}</div>
                                             ))}
                                         </div>
+                                    </div>
+                                )}
+                                {composerCleanupNotice && (
+                                    <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                                        <div className="font-medium mb-1">Unavailable selections were removed</div>
+                                        <div>{composerCleanupNotice}</div>
                                     </div>
                                 )}
                             </div>
