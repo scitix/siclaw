@@ -12,8 +12,8 @@ import {
 import {
   detectSensitiveResource,
   getOutputFormat,
-  sanitizeJSON,
 } from "./kubectl-sanitize.js";
+import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -199,34 +199,18 @@ Examples:
           };
         }
 
-        // For -o yaml: rewrite to -o json internally
-        let execArgs = args;
-        let convertedFromYaml = false;
-        if (outputFormat === "yaml") {
-          execArgs = args.map((a, idx) => {
-            // Only replace the value associated with -o/--output flag
-            const prev = args[idx - 1];
-            if (a === "yaml" && (prev === "-o" || prev === "--output")) return "json";
-            if (a === "-o=yaml") return "-o=json";
-            if (a === "-oyaml") return "-ojson";
-            if (a === "--output=yaml") return "--output=json";
-            return a;
-          });
-          convertedFromYaml = true;
-        }
-
-        // For -o json or converted yaml: execute and sanitize
-        if (outputFormat === "json" || outputFormat === "yaml") {
+        // Output sanitization via framework (json → sanitize, yaml → rewrite to json + sanitize)
+        // Block actions (jsonpath/go-template/describe) are handled above; framework only does sanitize/rewrite.
+        const action = analyzeOutput("kubectl", args);
+        if (action) {
+          const execArgs = action.type === "rewrite" ? action.newArgs : args;
           const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
           try {
             const { stdout, stderr } = await execFileAsync("kubectl", execArgs, {
               timeout,
               maxBuffer: 1024 * 1024 * 10,
             });
-            let sanitized = sanitizeJSON(stdout.trim(), sensitiveResource);
-            if (convertedFromYaml) {
-              sanitized += "\n\nNote: Output converted from YAML to JSON for reliable sanitization.";
-            }
+            const sanitized = applySanitizer(stdout.trim(), action);
             const output = sanitized +
               (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
             return {
@@ -236,7 +220,7 @@ Examples:
           } catch (err: any) {
             // Sanitize err.stdout too — partial output may contain sensitive data
             const sanitizedStdout = err.stdout?.trim()
-              ? sanitizeJSON(err.stdout.trim(), sensitiveResource)
+              ? applySanitizer(err.stdout.trim(), action)
               : "";
             const output = `Exit code: ${err.code ?? "unknown"}\n${sanitizedStdout}\n${err.stderr?.trim() ?? err.message}`;
             return {
