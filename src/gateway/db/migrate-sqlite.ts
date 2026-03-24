@@ -70,7 +70,7 @@ const DDL_STATEMENTS = [
     id TEXT PRIMARY KEY,
     skill_space_id TEXT NOT NULL REFERENCES skill_spaces(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL DEFAULT 'member',
+    role TEXT NOT NULL DEFAULT 'maintainer',
     joined_at INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE (skill_space_id, user_id)
   )`,
@@ -546,7 +546,7 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
         id, name, description, type, version, published_version, staging_version,
         scope, author_id, status, contribution_status, review_status, dir_name,
         created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
-        forked_from_id, labels_json, skill_set_id
+        forked_from_id, labels_json, skill_space_id
       FROM _skills_old`));
       sdb.run(sql.raw(`DROP TABLE _skills_old`));
       console.log("[db] Skills table rebuilt successfully");

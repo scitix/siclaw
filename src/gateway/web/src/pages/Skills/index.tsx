@@ -31,9 +31,12 @@ export function SkillsPage() {
     const isAdmin = currentUser?.username === 'admin';
     const { isReviewer } = usePermissions(sendRpc, isConnected);
 
-    const tabFromUrl = searchParams.get('tab') as 'all' | 'global' | 'myskills' | 'approvals' | null;
-    const savedTab = sessionStorage.getItem('skills_tab') as typeof tabFromUrl;
-    const [activeTab, setActiveTab] = useState<'all' | 'global' | 'myskills' | 'approvals'>(tabFromUrl || savedTab || 'all');
+    const validTabs = new Set(['all', 'global', 'myskills', 'approvals'] as const);
+    type SkillTab = 'all' | 'global' | 'myskills' | 'approvals';
+    const tabFromUrl = searchParams.get('tab') as SkillTab | null;
+    const savedTab = sessionStorage.getItem('skills_tab') as SkillTab | null;
+    const resolvedTab: SkillTab = (tabFromUrl && validTabs.has(tabFromUrl) ? tabFromUrl : null) || (savedTab && validTabs.has(savedTab) ? savedTab : null) || 'all';
+    const [activeTab, setActiveTab] = useState<SkillTab>(resolvedTab);
     const [searchInput, setSearchInput] = useState('');
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
@@ -634,7 +637,7 @@ export function SkillsPage() {
                     </div>
                 ) : (
                     <div className="max-w-6xl mx-auto">
-                        {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading && activeTab !== 'myskills' ? (
+                        {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading ? (
                             <div className="flex flex-col items-center justify-center py-20 text-gray-400 text-sm">
                                 <Users className="w-8 h-8 mb-3 opacity-20" />
                                 No skills found.

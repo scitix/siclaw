@@ -75,7 +75,7 @@ const DDL_STATEMENTS = [
     id VARCHAR(64) PRIMARY KEY,
     skill_space_id VARCHAR(64) NOT NULL,
     user_id VARCHAR(32) NOT NULL,
-    role VARCHAR(50) NOT NULL DEFAULT 'member',
+    role VARCHAR(50) NOT NULL DEFAULT 'maintainer',
     joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
