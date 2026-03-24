@@ -103,7 +103,10 @@ export async function buildSkillBundle(
     }
   }
 
-  // 3. Skill space skills are only exposed in dev/test bundles.
+  // 3. Skill space skills — intentionally dev-only for now.
+  //    Skillset skills are working copies that may contain unreviewed changes.
+  //    Production bundles only include published team/personal skills.
+  //    TODO: Document this constraint in an ADR when skillset→prod promotion is designed.
   if (env === "dev" && skillSpaceRepo) {
     const userSpaces = await skillSpaceRepo.listForUser(userId);
     for (const space of userSpaces) {
