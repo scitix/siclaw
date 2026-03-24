@@ -331,7 +331,7 @@ export function HypothesesCard({ message, sendMessage, onHypothesesConfirmed, su
     };
 
     return (
-        <div className="pl-12" data-hypotheses-card>
+        <div className="pl-12" data-hypotheses-card data-hypotheses-card-id={message.id}>
             <div className={cn(
                 "rounded-lg border px-4 py-3 max-w-2xl transition-colors",
                 isDone ? "border-indigo-200 bg-indigo-50/50" : "border-blue-200 bg-blue-50/50"
