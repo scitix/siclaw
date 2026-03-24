@@ -575,7 +575,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     if (!pendingActivation) return { action: "continue" as const };
     // Don't intercept if already has DP markers
     if (event.text.startsWith("[Deep Investigation]") || event.text.startsWith("[DP_EXIT]")
-        || event.text.startsWith("[DP_CONFIRM]") || event.text.startsWith("[DP_ADJUST]") || event.text.startsWith("[DP_SKIP]")) {
+        || event.text.startsWith("[DP_CONFIRM]") || event.text.startsWith("[DP_ADJUST]") || event.text.startsWith("[DP_REINVESTIGATE]") || event.text.startsWith("[DP_SKIP]")) {
       return { action: "continue" as const };
     }
     pendingActivation = false;
@@ -650,7 +650,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       };
     }
 
-    // --- Adjust: awaiting_confirmation → investigating ---
+    // --- Adjust (light): tweak hypotheses without new investigation ---
     if (event.text.startsWith("[DP_ADJUST]")) {
       const feedback = event.text.replace(/^\[DP_ADJUST\]\n?/, "").trim();
       dpLastUserFeedback = feedback || undefined;
@@ -659,7 +659,20 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       updateStatus(ctx);
       return {
         action: "transform" as const,
-        text: `The user has requested adjustments to the hypotheses. Their feedback:\n\n${feedback || "(no specific feedback)"}\n\nPlease revise your investigation based on this feedback, then call propose_hypotheses again with updated hypotheses.`,
+        text: `The user wants to adjust the hypotheses. Their feedback:\n\n${feedback || "(no specific feedback)"}\n\nRevise the hypotheses based on this feedback and call propose_hypotheses again. You do NOT need to run additional commands — just refine the hypotheses.`,
+      };
+    }
+
+    // --- Re-investigate (heavy): go back to Phase 1, run new commands, then re-propose ---
+    if (event.text.startsWith("[DP_REINVESTIGATE]")) {
+      const hint = event.text.replace(/^\[DP_REINVESTIGATE\]\n?/, "").trim();
+      dpLastUserFeedback = hint || undefined;
+      setDpStatus("investigating");
+      persistState();
+      updateStatus(ctx);
+      return {
+        action: "transform" as const,
+        text: `The user wants you to re-investigate from a different angle before proposing new hypotheses.${hint ? ` Their guidance:\n\n${hint}` : ""}\n\nRun additional diagnostic commands to gather new information, then call propose_hypotheses with fresh hypotheses based on your new findings. Do NOT just rephrase the previous hypotheses — investigate first.`,
       };
     }
 

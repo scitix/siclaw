@@ -395,7 +395,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
       // Find a safe injection point: after DP markers but before the user's actual text
-      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_SKIP]\n"];
+      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_REINVESTIGATE]\n", "[DP_SKIP]\n"];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
       if (matchedMarker) {
         // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
