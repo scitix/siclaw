@@ -51,6 +51,7 @@ import { KnowledgeDocRepository } from "./db/repositories/knowledge-doc-repo.js"
 import type { MemoryIndexer } from "../memory/index.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { loadConfig } from "../core/config.js";
+import { type DpStatus, type DpChecklist, createChecklist, syncChecklistFromStatus, type DpState } from "../tools/dp-tools.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -835,6 +836,66 @@ export function createRpcMethods(
     updatedAt: number;
   }>();
 
+  // DP status cache — real-time mirror (NOT source of truth; agentbox dp-state endpoint is authoritative)
+  interface DpStatusCache {
+    dpStatus: DpStatus;
+    checklist: DpChecklist | null;
+    dpQuestion?: string;
+    sessionId?: string;
+  }
+  const dpStatusCache = new Map<string, DpStatusCache>();
+
+  function transitionDpStatus(streamKey: string, newStatus: DpStatus, question?: string): void {
+    let cache = dpStatusCache.get(streamKey);
+    if (!cache) {
+      cache = { dpStatus: "idle", checklist: null };
+      dpStatusCache.set(streamKey, cache);
+    }
+    cache.dpStatus = newStatus;
+    if (question !== undefined) cache.dpQuestion = question;
+    if (newStatus !== "idle" && !cache.checklist) {
+      cache.checklist = createChecklist(cache.dpQuestion ?? "");
+    }
+    if (cache.checklist) {
+      syncChecklistFromStatus({ checklist: cache.checklist, status: newStatus } as DpState);
+    }
+    if (newStatus === "completed") {
+      setTimeout(() => dpStatusCache.delete(streamKey), 10_000);
+    }
+  }
+
+  function emitDpStatus(streamKey: string, userId: string, sessionId: string): void {
+    const cache = dpStatusCache.get(streamKey);
+    if (!cache) return;
+    const payload = {
+      type: "dp_status",
+      userId,
+      sessionId,
+      dpStatus: cache.dpStatus,
+      checklist: cache.checklist,
+      dpQuestion: cache.dpQuestion,
+    };
+    if (sendToUser) {
+      sendToUser(userId, "agent_event", payload);
+    }
+  }
+
+  /** Detect DP markers in user text → return target status, or null if no transition. */
+  function detectDpMarker(text: string, streamKey: string): { status: DpStatus; question?: string } | null {
+    if (text.startsWith("[Deep Investigation]")) {
+      const cache = dpStatusCache.get(streamKey);
+      const q = text.replace(/^\[Deep Investigation\]\n?/, "").trim() || undefined;
+      if (!cache || cache.dpStatus === "idle") return { status: "investigating", question: q };
+      if (cache.dpStatus === "awaiting_confirmation") return { status: "investigating" }; // implicit adjust
+      return null; // already in DP, no transition
+    }
+    if (text.startsWith("[DP_CONFIRM]")) return { status: "validating" };
+    if (text.startsWith("[DP_ADJUST]")) return { status: "investigating" };
+    if (text.startsWith("[DP_SKIP]")) return { status: "concluding" };
+    if (text.startsWith("[DP_EXIT]")) return { status: "completed" };
+    return null;
+  }
+
   // ─────────────────────────────────────────────────
   // Chat Methods
   // ─────────────────────────────────────────────────
@@ -964,6 +1025,17 @@ export function createRpcMethods(
       }
     }
 
+    // Track DP status from user markers (before sending prompt)
+    const dpStreamKey = sessionId ? `${userId}:${sessionId}` : `${userId}:pending`;
+    const dpTransition = detectDpMarker(message, dpStreamKey);
+    if (dpTransition) {
+      transitionDpStatus(dpStreamKey, dpTransition.status, dpTransition.question);
+      if (dpTransition.status !== "idle") {
+        const cache = dpStatusCache.get(dpStreamKey);
+        if (cache) cache.sessionId = sessionId;
+      }
+    }
+
     // Send prompt
     const result = await client.prompt({ sessionId, text: promptText, modelProvider, modelId, brainType, modelConfig, credentials });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
@@ -980,6 +1052,18 @@ export function createRpcMethods(
 
     // Cancel previous SSE subscription for this session
     const streamKey = `${userId}:${result.sessionId}`;
+
+    // Fixup dpStatusCache key if sessionId was assigned lazily
+    if (dpStreamKey !== streamKey && dpStatusCache.has(dpStreamKey)) {
+      const dpCache = dpStatusCache.get(dpStreamKey)!;
+      dpCache.sessionId = result.sessionId;
+      dpStatusCache.set(streamKey, dpCache);
+      dpStatusCache.delete(dpStreamKey);
+    }
+    // Emit dp_status event after prompt is accepted (sessionId now known)
+    if (dpTransition) {
+      emitDpStatus(streamKey, userId, result.sessionId);
+    }
     const existingStream = activeStreams.get(streamKey);
     if (existingStream) {
       existingStream.abort();
@@ -1108,6 +1192,21 @@ export function createRpcMethods(
               }
               snap.events.push(progress);
               snap.updatedAt = Date.now();
+            }
+          }
+
+          // Track DP status from tool events (reads dpStatus from tool result details)
+          if (eventType === "tool_execution_end") {
+            const details = (eventData.result as { details?: { dpStatus?: string } } | undefined)?.details;
+            if (details?.dpStatus) {
+              transitionDpStatus(streamKey, details.dpStatus as DpStatus);
+              emitDpStatus(streamKey, userId, result.sessionId);
+            }
+          } else if (eventType === "agent_end") {
+            const cache = dpStatusCache.get(streamKey);
+            if (cache?.dpStatus === "concluding") {
+              transitionDpStatus(streamKey, "completed");
+              emitDpStatus(streamKey, userId, result.sessionId);
             }
           }
 
@@ -1781,6 +1880,15 @@ export function createRpcMethods(
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
+    // Track DP markers in steer messages (card buttons during active agent)
+    if (streamKey) {
+      const dpTransition = detectDpMarker(text, streamKey);
+      if (dpTransition) {
+        transitionDpStatus(streamKey, dpTransition.status, dpTransition.question);
+        emitDpStatus(streamKey, userId, stream.sessionId);
+      }
+    }
+
     const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
     await client.steerSession(stream.sessionId, text);
     return { status: "steered" };
@@ -1835,12 +1943,56 @@ export function createRpcMethods(
     const snapKey = sessionId ? `${userId}:${sessionId}` : userId;
     const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
     const promptActive = streamKey ? activeStreams.has(streamKey) : false;
+
+    // Progress events for hypothesis tree (deep_search engine detail)
     const snap = dpProgressSnapshots.get(snapKey);
-    if (!snap || Date.now() - snap.updatedAt > 600_000) {
+    if (snap && Date.now() - snap.updatedAt > 600_000) {
       dpProgressSnapshots.delete(snapKey);
-      return { events: null, promptActive };
     }
-    return { sessionId: snap.sessionId, events: snap.events, promptActive };
+    const events = snap && Date.now() - snap.updatedAt <= 600_000 ? snap.events : null;
+
+    // DP status: try agentbox (authoritative), fallback to gateway cache
+    let dpStatus: string | undefined;
+    let dpChecklist: DpChecklist | null = null;
+    let dpQuestion: string | undefined;
+
+    // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror)
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
+    if (stream) {
+      try {
+        const agentClient = new AgentBoxClient(stream.endpoint, 5000, agentBoxTlsOptions);
+        const resp = await agentClient.getDpState(stream.sessionId);
+        if (resp?.dpStatus && resp.dpStatus !== "idle") {
+          dpStatus = resp.dpStatus;
+          dpQuestion = resp.question;
+          // Derive checklist from authoritative dpStatus
+          const cl = createChecklist(dpQuestion ?? "");
+          syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus } as DpState);
+          dpChecklist = cl;
+        }
+      } catch {
+        // Agentbox unreachable — fallback below
+      }
+    }
+
+    // Fallback: gateway cache
+    if (!dpStatus) {
+      const cache = dpStatusCache.get(snapKey);
+      if (cache && cache.dpStatus !== "idle") {
+        dpStatus = cache.dpStatus;
+        dpChecklist = cache.checklist;
+        dpQuestion = cache.dpQuestion;
+      }
+    }
+
+    return {
+      sessionId: snap?.sessionId,
+      events,
+      promptActive,
+      dpStatus: dpStatus ?? null,
+      checklist: dpChecklist,
+      dpQuestion: dpQuestion ?? null,
+    };
   });
 
   methods.set("chat.history", async (params, context: RpcContext) => {
