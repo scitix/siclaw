@@ -26,13 +26,24 @@ export interface UseSkillsResult {
     rollbackSkill: (skill: Skill, version: number) => Promise<void>;
 }
 
-export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
+export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsResult {
     const [skills, setSkills] = useState<Skill[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [isLoadingMore, setIsLoadingMore] = useState(false);
     const [hasMore, setHasMore] = useState(false);
     const [currentScope, setCurrentScope] = useState<string>('all');
     const [searchQuery, setSearchQuery] = useState('');
+
+    // Map UI tab name → RPC scope filter (server-side filtering for correct pagination)
+    const mapTabToScope = (tab: string): string | undefined => {
+        switch (tab) {
+            case 'all': return undefined;
+            case 'approvals': return undefined;
+            case 'global': return 'global';
+            case 'myskills': return 'myskills';
+            default: return tab;
+        }
+    };
 
     // Load first page (resets list)
     const loadSkills = useCallback(async (scope?: string, search?: string) => {
@@ -45,9 +56,10 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
             const result = await rpcGetSkills(sendRpc, {
                 limit: PAGE_SIZE,
                 offset: 0,
-                scope: s === 'all' || s === 'approvals' ? undefined : s,
+                scope: mapTabToScope(s),
                 search: q || undefined,
                 pendingOnly: s === 'approvals' ? true : undefined,
+                workspaceId,
             });
             setSkills(result.skills);
             setHasMore(result.hasMore);
@@ -56,7 +68,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
         } finally {
             setIsLoading(false);
         }
-    }, [sendRpc, currentScope, searchQuery]);
+    }, [sendRpc, currentScope, searchQuery, workspaceId]);
 
     // Load next page (append to list)
     const loadMore = useCallback(async () => {
@@ -66,9 +78,10 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
             const result = await rpcGetSkills(sendRpc, {
                 limit: PAGE_SIZE,
                 offset: skills.length,
-                scope: currentScope === 'all' || currentScope === 'approvals' ? undefined : currentScope,
+                scope: mapTabToScope(currentScope),
                 search: searchQuery || undefined,
                 pendingOnly: currentScope === 'approvals' ? true : undefined,
+                workspaceId,
             });
             setSkills(prev => [...prev, ...result.skills]);
             setHasMore(result.hasMore);
@@ -77,7 +90,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
         } finally {
             setIsLoadingMore(false);
         }
-    }, [sendRpc, skills.length, currentScope, searchQuery, isLoadingMore, hasMore]);
+    }, [sendRpc, skills.length, currentScope, searchQuery, isLoadingMore, hasMore, workspaceId]);
 
     const toggleEnabled = useCallback(async (skill: Skill) => {
         const newEnabled = !skill.enabled;
@@ -92,42 +105,42 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
     }, [sendRpc]);
 
     const publishSkill = useCallback(async (skill: Skill, contributeToTeam?: boolean) => {
-        await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam });
+        await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam, workspaceId });
         await loadSkills();
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     const requestPublish = useCallback(async (skill: Skill) => {
-        await rpcRequestPublish(sendRpc, String(skill.id));
+        await rpcRequestPublish(sendRpc, String(skill.id), undefined, workspaceId);
         await loadSkills();
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     const approveSkill = useCallback(async (skill: Skill) => {
         try {
-            await sendRpc('skill.review', { id: String(skill.id), decision: 'approve' });
+            await sendRpc('skill.review', { id: String(skill.id), decision: 'approve', workspaceId });
             await loadSkills();
         } catch (err) {
             console.error('[useSkills] approveSkill failed:', err);
         }
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     const rejectSkill = useCallback(async (skill: Skill, reason?: string) => {
         try {
-            await sendRpc('skill.review', { id: String(skill.id), decision: 'reject', reason });
+            await sendRpc('skill.review', { id: String(skill.id), decision: 'reject', reason, workspaceId });
             await loadSkills();
         } catch (err) {
             console.error('[useSkills] rejectSkill failed:', err);
         }
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     const deleteSkill = useCallback(async (skill: Skill) => {
         try {
-            await sendRpc('skill.delete', { id: String(skill.id) });
+            await sendRpc('skill.delete', { id: String(skill.id), workspaceId });
             // Remove from local state immediately (no need to refetch)
             setSkills(prev => prev.filter(s => s.id !== skill.id));
         } catch (err) {
             console.error('[useSkills] deleteSkill failed:', err);
         }
-    }, [sendRpc]);
+    }, [sendRpc, workspaceId]);
 
     const copyToPersonal = useCallback(async (skill: Skill) => {
         try {
@@ -162,9 +175,9 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
     }, [sendRpc, loadSkills]);
 
     const reviewSkill = useCallback(async (skill: Skill, decision: 'approve' | 'reject', reason?: string, stagingVersion?: number) => {
-        await rpcReviewDecision(sendRpc, String(skill.id), decision, reason, stagingVersion);
+        await rpcReviewDecision(sendRpc, String(skill.id), decision, reason, stagingVersion, workspaceId);
         await loadSkills();
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     const rollbackSkill = useCallback(async (skill: Skill, version: number) => {
         try {
@@ -177,7 +190,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
 
     const withdrawSkill = useCallback(async (skill: Skill) => {
         try {
-            const result = await rpcWithdrawSkill(sendRpc, String(skill.id));
+            const result = await rpcWithdrawSkill(sendRpc, String(skill.id), workspaceId);
             if (result.wasNew) {
                 // New skill was deleted entirely — remove from local state
                 setSkills(prev => prev.filter(s => s.id !== skill.id));
@@ -188,7 +201,7 @@ export function useSkills(sendRpc: RpcSendFn): UseSkillsResult {
         } catch (err) {
             console.error('[useSkills] withdrawSkill failed:', err);
         }
-    }, [sendRpc, loadSkills]);
+    }, [sendRpc, loadSkills, workspaceId]);
 
     return {
         skills,

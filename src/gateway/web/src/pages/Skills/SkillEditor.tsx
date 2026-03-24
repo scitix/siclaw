@@ -8,12 +8,13 @@ import Prism from 'prismjs';
 import 'prismjs/components/prism-python';
 import 'prismjs/components/prism-bash';
 import 'prismjs/themes/prism-dark.css';
-import { useParams, useNavigate, useSearchParams, useBlocker } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams, useBlocker, useLocation } from 'react-router-dom';
 import type { Skill, Script } from './skillsData';
 import { rpcGetSkillById, rpcSaveSkill, rpcDeleteSkill, rpcCopySkillToPersonal, rpcGetSkillHistory, rpcRollbackSkill, rpcUpdateSkillLabels } from './skillsData';
 import { getCurrentUser } from '../../auth';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { useWorkspace } from '../../contexts/WorkspaceContext';
 
 const DEFAULT_SPEC_TEMPLATE = `---
 name: new-skill
@@ -117,8 +118,10 @@ function formatTimeAgo(ts: number): string {
 export function SkillEditor() {
     const { id } = useParams();
     const navigate = useNavigate();
+    const location = useLocation();
     const [searchParams] = useSearchParams();
     const { sendRpc, isConnected } = useWebSocket();
+    const { currentWorkspace } = useWorkspace();
     const [isExpanded, setIsExpanded] = useState(false);
     const [formData, setFormData] = useState<Skill | null>(null);
     const [activeScriptId, setActiveScriptId] = useState<string | null>(null);
@@ -136,10 +139,12 @@ export function SkillEditor() {
     const [serverData, setServerData] = useState<Skill | null>(null);
     const [draftRestored, setDraftRestored] = useState<{ savedAt: number } | null>(null);
     const isNew = id === 'new';
-    const isReadOnly = !!formData && formData.scope !== 'personal';
+    const isReadOnly = !!formData && formData.scope !== 'personal' && !(formData.scope === 'skillset' && formData.isSpaceMember);
     const currentUser = getCurrentUser();
     const isAdmin = currentUser?.username === 'admin';
     const isOwner = formData?.authorId === currentUser?.id;
+    const fromSkillSpaceId = (location.state as { fromSkillSpaceId?: string } | null)?.fromSkillSpaceId;
+    const backTarget = fromSkillSpaceId ? `/skills/spaces/${fromSkillSpaceId}` : '/skills';
 
     const handleFork = async () => {
         if (!formData || !id) return;
@@ -173,7 +178,7 @@ export function SkillEditor() {
         if (!id || isNew) return;
         try {
             await rpcRollbackSkill(sendRpc, id, version);
-            const skill = await rpcGetSkillById(sendRpc, id);
+            const skill = await rpcGetSkillById(sendRpc, id, currentWorkspace?.id);
             if (skill) {
                 const loaded = {
                     ...skill,
@@ -241,7 +246,7 @@ export function SkillEditor() {
         loadedIdRef.current = id;
 
         let cancelled = false;
-        rpcGetSkillById(sendRpc, id).then(skill => {
+        rpcGetSkillById(sendRpc, id, currentWorkspace?.id).then(skill => {
             if (cancelled) return;
             if (skill) {
                 const loaded = {
@@ -251,11 +256,11 @@ export function SkillEditor() {
                 };
                 applyWithDraftCheck(loaded);
             } else {
-                navigate('/skills');
+                navigate(backTarget);
             }
         });
         return () => { cancelled = true; };
-    }, [id, navigate, isConnected, sendRpc]);
+    }, [id, navigate, isConnected, sendRpc, currentWorkspace?.id]);
 
     // Auto-open history panel when navigated with ?history=true
     useEffect(() => {
@@ -310,11 +315,11 @@ export function SkillEditor() {
         if (!formData) return;
         try {
             setIsSaving(true);
-            await rpcSaveSkill(sendRpc, formData, isNew);
+            await rpcSaveSkill(sendRpc, formData, isNew, currentWorkspace?.id);
             if (id) clearDraft(id);
             setServerData(formData); // Mark current state as "saved" so isDirty becomes false
             isSaveNavigatingRef.current = true;
-            navigate('/skills');
+            navigate(backTarget);
         } catch (err) {
             console.error('[SkillEditor] Save failed:', err);
         } finally {
@@ -330,10 +335,10 @@ export function SkillEditor() {
     const handleDeleteConfirm = async () => {
         if (!formData) return;
         try {
-            await rpcDeleteSkill(sendRpc, String(formData.id));
+            await rpcDeleteSkill(sendRpc, String(formData.id), currentWorkspace?.id);
             if (id) clearDraft(id);
             isSaveNavigatingRef.current = true;
-            navigate('/skills');
+            navigate(backTarget);
         } catch (err) {
             console.error('[SkillEditor] Delete failed:', err);
         }
@@ -451,7 +456,7 @@ export function SkillEditor() {
             <header className="flex items-center justify-between px-6 py-3 border-b border-gray-100 bg-white shrink-0 h-14">
                 <div className="flex items-center gap-4">
                     <Tooltip content="Back to Skills">
-                        <button onClick={() => navigate('/skills')} className="p-2 -ml-2 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors">
+                        <button onClick={() => navigate(backTarget)} className="p-2 -ml-2 text-gray-400 hover:text-gray-700 rounded-lg hover:bg-gray-100 transition-colors">
                             <ArrowLeft className="w-5 h-5" />
                         </button>
                     </Tooltip>
@@ -473,13 +478,15 @@ export function SkillEditor() {
                             <span className={cn(
                                 "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium",
                                 formData.scope === 'builtin' ? "bg-gray-100 text-gray-700"
+                                    : formData.scope === 'skillset' ? "bg-green-50 text-green-700"
                                     : "bg-blue-50 text-blue-700"
                             )}>
                                 {formData.scope === 'builtin' ? <Lock className="w-2.5 h-2.5" />
                                     : <Users className="w-2.5 h-2.5" />}
                                 {formData.scope === 'builtin' ? 'System Skills'
-                                    : 'Team Skills'}
-                                <span className="text-gray-400 ml-0.5">· Read-only</span>
+                                    : formData.scope === 'skillset' ? (formData.skillSpaceName || 'Skill Space')
+                                    : 'Global Skills'}
+                                {isReadOnly && <span className="text-gray-400 ml-0.5">· Read-only</span>}
                             </span>
                         )}
                     </div>

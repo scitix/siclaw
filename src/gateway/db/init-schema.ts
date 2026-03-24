@@ -60,6 +60,28 @@ const DDL_STATEMENTS = [
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
   )`,
 
+  `CREATE TABLE IF NOT EXISTS skill_spaces (
+    id VARCHAR(64) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description TEXT,
+    owner_id VARCHAR(32) NOT NULL,
+    invite_token VARCHAR(255),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (owner_id) REFERENCES users(id)
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_space_members (
+    id VARCHAR(64) PRIMARY KEY,
+    skill_space_id VARCHAR(64) NOT NULL,
+    user_id VARCHAR(32) NOT NULL,
+    role VARCHAR(50) NOT NULL DEFAULT 'maintainer',
+    joined_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_space_user (skill_space_id, user_id)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS skills (
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
@@ -68,7 +90,7 @@ const DDL_STATEMENTS = [
     version INT NOT NULL DEFAULT 1,
     published_version INT NULL,
     staging_version INT NOT NULL DEFAULT 0,
-    scope ENUM('builtin', 'team', 'personal') NOT NULL DEFAULT 'personal',
+    scope ENUM('builtin', 'team', 'personal', 'global', 'skillset') NOT NULL DEFAULT 'personal',
     author_id VARCHAR(32),
     status VARCHAR(50) DEFAULT 'installed',
     contribution_status ENUM('none', 'pending', 'approved') DEFAULT 'none',
@@ -81,7 +103,9 @@ const DDL_STATEMENTS = [
     team_pinned_version INT NULL,
     forked_from_id VARCHAR(64) NULL,
     labels_json JSON NULL,
-    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL
+    skill_space_id VARCHAR(64) NULL,
+    FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL,
+    FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE SET NULL
   )`,
 
   `CREATE TABLE IF NOT EXISTS channels (
@@ -438,6 +462,8 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE knowledge_docs ADD INDEX idx_knowledge_docs_name (name(255))`,
   `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_user (user_id, created_at)`,
   `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_session (session_id)`,
+  `ALTER TABLE skill_space_members ADD INDEX idx_skill_space_members_space (skill_space_id)`,
+  `ALTER TABLE skills ADD INDEX idx_skills_skill_space (skill_space_id)`,
 ];
 
 export async function initSchema(db: Database): Promise<void> {
@@ -477,6 +503,10 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE knowledge_docs DROP COLUMN description`,
     // Per-cluster debug image
     `ALTER TABLE clusters ADD COLUMN debug_image TEXT`,
+    // Skill Spaces
+    `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal','global','skillset') NOT NULL DEFAULT 'personal'`,
+    `ALTER TABLE skills ADD COLUMN skill_space_id VARCHAR(64) NULL`,
+    `ALTER TABLE skills ADD CONSTRAINT fk_skills_skill_space FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE SET NULL`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

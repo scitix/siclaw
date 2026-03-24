@@ -63,9 +63,10 @@ interface SkillBundlePayload {
   version: string;
   skills: Array<{
     dirName: string;
-    scope: "team" | "personal";
+    scope: "team" | "personal" | "skillset";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
+    skillSpaceId?: string;
   }>;
   disabledBuiltins?: string[];
 }
@@ -83,10 +84,10 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     const config = loadConfig();
     const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
 
-    // Clear only bundle-managed scope subdirectories (team/ and user/)
+    // Clear only bundle-managed scope subdirectories (team/, user/, skillset/)
     // Never wipe the entire skillsDir — that would destroy core/ and other dirs
     if (fs.existsSync(skillsDir)) {
-      for (const scopeDir of ["team", "user"]) {
+      for (const scopeDir of ["team", "user", "skillset"]) {
         const scopePath = path.join(skillsDir, scopeDir);
         if (fs.existsSync(scopePath)) {
           fs.rmSync(scopePath, { recursive: true });
@@ -97,12 +98,18 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     }
 
     for (const skill of payload.skills) {
-      // Write into scope subdirectory so getSkillScriptDirs() layer 2 matches naturally
-      if (skill.scope !== "personal" && skill.scope !== "team") {
-        console.warn(`[resource-handlers] Unexpected skill scope "${skill.scope}" for "${skill.dirName}", defaulting to "team"`);
+      let skillDir: string;
+      if (skill.scope === "personal") {
+        skillDir = resolveUnderDir(skillsDir, "user", skill.dirName);
+      } else if (skill.scope === "skillset") {
+        if (!skill.skillSpaceId) {
+          console.warn(`[resource-handlers] Missing skillSpaceId for skillset skill "${skill.dirName}", skipping`);
+          continue;
+        }
+        skillDir = resolveUnderDir(skillsDir, "skillset", skill.skillSpaceId, skill.dirName);
+      } else {
+        skillDir = resolveUnderDir(skillsDir, "team", skill.dirName);
       }
-      const scopeDir = skill.scope === "personal" ? "user" : "team";
-      const skillDir = resolveUnderDir(skillsDir, scopeDir, skill.dirName);
       fs.mkdirSync(skillDir, { recursive: true });
 
       if (skill.specs) {

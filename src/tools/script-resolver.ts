@@ -31,9 +31,9 @@ function loadDisabledBuiltins(): Set<string> {
 
 /**
  * Skill scope directories to search (in priority order, CLI fallback).
- * Higher-specificity scopes first: personal > team > builtin.
+ * Higher-specificity scopes first: personal > skillset > team > builtin.
  */
-const SKILL_SCOPES = ["user", "extension", "team", "core"];
+const SKILL_SCOPES = ["user", "skillset", "extension", "team", "core"];
 
 /** Directory entry with associated scope */
 interface ScopeDir {
@@ -44,6 +44,7 @@ interface ScopeDir {
 /** Map scope directory names to SkillScope values */
 const SCOPE_MAP: Record<string, SkillScope> = {
   user: "personal",
+  skillset: "skillset",
   extension: "team",
   team: "team",
   core: "builtin",
@@ -64,9 +65,23 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
   const directPath = path.join(base, skill, "scripts");
   if (fs.existsSync(directPath)) return [{ dir: directPath, scope: "team" }];
 
-  // 2. Scope subdirectories (user > extension > team > core)
+  // 2. Scope subdirectories (user > skillset > extension > team > core)
   const dirs: ScopeDir[] = [];
   for (const scopeName of SKILL_SCOPES) {
+    if (scopeName === "skillset") {
+      // Skillset has an extra level: skillset/{setId}/{skillName}/scripts
+      const skillsetBase = path.join(base, "skillset");
+      if (fs.existsSync(skillsetBase)) {
+        try {
+          for (const setDir of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
+            if (!setDir.isDirectory()) continue;
+            const dir = path.join(skillsetBase, setDir.name, skill, "scripts");
+            if (fs.existsSync(dir)) dirs.push({ dir, scope: "skillset" });
+          }
+        } catch { /* ignore */ }
+      }
+      continue;
+    }
     const dir = path.join(base, scopeName, skill, "scripts");
     if (fs.existsSync(dir)) dirs.push({ dir, scope: SCOPE_MAP[scopeName] });
   }
@@ -106,10 +121,26 @@ function getSkillBaseDirs(): string[] {
     return dirs;
   }
 
-  // 2. Scope subdirectories (user > extension > team > core)
-  const dirs = SKILL_SCOPES
-    .map((scope) => path.join(base, scope))
-    .filter((dir) => fs.existsSync(dir));
+  // 2. Scope subdirectories (user > skillset > extension > team > core)
+  const dirs: string[] = [];
+  for (const scope of SKILL_SCOPES) {
+    if (scope === "skillset") {
+      // Skillset has an extra level: skillset/{setId}/
+      const skillsetBase = path.join(base, "skillset");
+      if (fs.existsSync(skillsetBase)) {
+        try {
+          for (const setDir of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
+            if (setDir.isDirectory()) {
+              dirs.push(path.join(skillsetBase, setDir.name));
+            }
+          }
+        } catch { /* ignore */ }
+      }
+      continue;
+    }
+    const dir = path.join(base, scope);
+    if (fs.existsSync(dir)) dirs.push(dir);
+  }
 
   // 3. Builtin fallback (skills/{core,extension}/ from Docker image)
   for (const bDir of builtinDirs()) {
@@ -119,16 +150,29 @@ function getSkillBaseDirs(): string[] {
   return dirs;
 }
 
-/** Check if a skill exists in the materialized bundle (personal/team) */
+/** Check if a skill exists in the materialized bundle (personal/skillset/team) */
 export function skillExistsInBundle(skillName: string): boolean {
   const base = skillsBase();
   // Legacy flat layout
   const directDir = path.join(base, skillName);
   if (fs.existsSync(directDir) && fs.statSync(directDir).isDirectory()) return true;
   // Scope subdirectory layout
-  for (const scopeDir of ["user", "extension", "team"]) {
+  for (const scopeDir of ["user", "skillset", "extension", "team"]) {
     const dir = path.join(base, scopeDir, skillName);
     if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
+    // For skillset, check subdirectories (skillset/{setId}/{skillName})
+    if (scopeDir === "skillset") {
+      const skillsetBase = path.join(base, "skillset");
+      if (fs.existsSync(skillsetBase)) {
+        try {
+          for (const setDir of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
+            if (!setDir.isDirectory()) continue;
+            const skillDir = path.join(skillsetBase, setDir.name, skillName);
+            if (fs.existsSync(skillDir) && fs.statSync(skillDir).isDirectory()) return true;
+          }
+        } catch { /* ignore */ }
+      }
+    }
   }
   return false;
 }
@@ -144,7 +188,7 @@ export function skillExistsAsBuiltin(skillName: string): boolean {
   return false;
 }
 
-export type SkillScope = "builtin" | "team" | "personal";
+export type SkillScope = "builtin" | "team" | "personal" | "global" | "skillset";
 
 export interface ResolvedScript {
   path: string;

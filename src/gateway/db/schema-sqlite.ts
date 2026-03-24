@@ -73,6 +73,28 @@ export const messages = sqliteTable("messages", {
   durationMs: integer("duration_ms"),
 });
 
+// ─── Skill Spaces (collaboration spaces) ─────────────
+
+export const skillSpaces = sqliteTable("skill_spaces", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  description: text("description"),
+  ownerId: text("owner_id").notNull().references(() => users.id),
+  inviteToken: text("invite_token"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+});
+
+export const skillSpaceMembers = sqliteTable("skill_space_members", {
+  id: text("id").primaryKey(),
+  skillSpaceId: text("skill_space_id").notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  role: text("role").notNull().default("maintainer"), // "owner" | "maintainer"
+  joinedAt: integer("joined_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
+}, (table) => ({
+  ukSpaceUser: uniqueIndex("uk_skill_space_member").on(table.skillSpaceId, table.userId),
+}));
+
 // ─── Skills ──────────────────────────────────────────
 
 export const skills = sqliteTable("skills", {
@@ -81,7 +103,7 @@ export const skills = sqliteTable("skills", {
   description: text("description"),
   type: text("type"),
   version: integer("version").notNull().default(1),
-  scope: text("scope").notNull().default("personal"), // "builtin" | "team" | "personal"
+  scope: text("scope").notNull().default("personal"), // "global" | "skillset" | "personal"
   authorId: text("author_id").references(() => users.id, { onDelete: "set null" }),
   status: text("status").default("installed"),
   contributionStatus: text("contribution_status").default("none"), // "none" | "pending" | "approved"
@@ -95,6 +117,7 @@ export const skills = sqliteTable("skills", {
   teamPinnedVersion: integer("team_pinned_version"),
   forkedFromId: text("forked_from_id"),
   labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
+  skillSpaceId: text("skill_space_id").references(() => skillSpaces.id, { onDelete: "set null" }),
 });
 
 // ─── Skill Contents ─────────────────────────────────
@@ -269,6 +292,14 @@ export const workspaces = sqliteTable("workspaces", {
     systemPrompt?: string;
     icon?: string;
     color?: string;
+    skillComposer?: {
+      globalSkillRefs?: string[];
+      personalSkillIds?: string[];
+      skillSpaces?: Array<{
+        skillSpaceId: string;
+        disabledSkillIds?: string[];
+      }>;
+    };
   }>(),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),

@@ -14,6 +14,14 @@ import {
 } from "../schema.js";
 
 export type Workspace = typeof workspaces.$inferSelect;
+export interface WorkspaceSkillComposer {
+  globalSkillRefs: string[];
+  personalSkillIds: string[];
+  skillSpaces: Array<{
+    skillSpaceId: string;
+    disabledSkillIds: string[];
+  }>;
+}
 
 export class WorkspaceRepository {
   constructor(private db: Database) {}
@@ -90,6 +98,45 @@ export class WorkspaceRepository {
       .update(workspaces)
       .set(updates)
       .where(eq(workspaces.id, id));
+  }
+
+  async getSkillComposer(workspaceId: string): Promise<WorkspaceSkillComposer | null> {
+    const ws = await this.getById(workspaceId);
+    const composer = ws?.configJson?.skillComposer as WorkspaceSkillComposer | undefined;
+    if (!composer) return null;
+    return {
+      globalSkillRefs: Array.isArray(composer.globalSkillRefs) ? [...new Set(composer.globalSkillRefs.filter(Boolean))] : [],
+      personalSkillIds: Array.isArray(composer.personalSkillIds) ? [...new Set(composer.personalSkillIds.filter(Boolean))] : [],
+      skillSpaces: Array.isArray(composer.skillSpaces)
+        ? composer.skillSpaces
+            .filter((entry) => entry && typeof entry.skillSpaceId === "string" && entry.skillSpaceId)
+            .map((entry) => ({
+              skillSpaceId: entry.skillSpaceId,
+              disabledSkillIds: Array.isArray(entry.disabledSkillIds)
+                ? [...new Set(entry.disabledSkillIds.filter(Boolean))]
+                : [],
+            }))
+        : [],
+    };
+  }
+
+  async setSkillComposer(workspaceId: string, composer: WorkspaceSkillComposer): Promise<void> {
+    const ws = await this.getById(workspaceId);
+    if (!ws) throw new Error("Workspace not found");
+    const nextConfig = {
+      ...(ws.configJson ?? {}),
+      skillComposer: {
+        globalSkillRefs: [...new Set(composer.globalSkillRefs.filter(Boolean))],
+        personalSkillIds: [...new Set(composer.personalSkillIds.filter(Boolean))],
+        skillSpaces: composer.skillSpaces
+          .filter((entry) => entry.skillSpaceId)
+          .map((entry) => ({
+            skillSpaceId: entry.skillSpaceId,
+            disabledSkillIds: [...new Set((entry.disabledSkillIds ?? []).filter(Boolean))],
+          })),
+      },
+    };
+    await this.update(workspaceId, { configJson: nextConfig });
   }
 
   async delete(id: string): Promise<void> {
