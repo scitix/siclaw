@@ -2,7 +2,7 @@ import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, Clipboar
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import type { Skill, SkillReview, SkillSpace, SkillSystemCapabilities } from './skillsData';
+import type { Skill, SkillReview, SkillSpace } from './skillsData';
 import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSpaces, rpcCreateSkillSpace, type SkillSpaceMember } from './skillsData';
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
@@ -40,7 +40,6 @@ export function SkillsPage() {
     const [skillSpaces, setSkillSpaces] = useState<SkillSpace[]>([]);
     const [myView, setMyView] = useState<'personal' | 'shared'>('personal');
     const [skillSpaceEnabled, setSkillSpaceEnabled] = useState(false);
-    const [skillCapabilities, setSkillCapabilities] = useState<SkillSystemCapabilities | null>(null);
     const [skillSpaceDialog, setSkillSpaceDialog] = useState<{
         isOpen: boolean;
         mode: 'create' | 'manage';
@@ -206,7 +205,6 @@ export function SkillsPage() {
             hasLoadedRef.current = true;
             loadSkills(activeTab, '');
             rpcGetSkillSystemCapabilities(sendRpc, currentWorkspace.id).then((caps) => {
-                setSkillCapabilities(caps);
                 setSkillSpaceEnabled(caps.skillSpaceEnabled);
                 if (caps.skillSpaceEnabled) {
                     rpcListSkillSpaces(sendRpc, currentWorkspace.id).then(setSkillSpaces).catch(() => {});
@@ -215,7 +213,6 @@ export function SkillsPage() {
                     if (myView === 'shared') setMyView('personal');
                 }
             }).catch(() => {
-                setSkillCapabilities(null);
                 setSkillSpaceEnabled(false);
                 setSkillSpaces([]);
                 if (myView === 'shared') setMyView('personal');
@@ -393,12 +390,6 @@ export function SkillsPage() {
                 variant={dialogState.variant}
                 confirmText={dialogState.confirmText}
             />
-
-            {skillCapabilities?.skillSpaceDevMode && (
-                <div className="px-6 py-2 text-xs text-amber-700 bg-amber-50 border-b border-amber-200">
-                    Skill Space Dev Mode is enabled locally. UI and review flow are available, but local runtime precedence is still disabled.
-                </div>
-            )}
 
             {/* Revert Dialog with reason textarea */}
             {revertDialog.isOpen && (
