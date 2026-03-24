@@ -37,6 +37,7 @@ import { createSaveFeedbackTool } from "../tools/save-feedback.js";
 import {
   type DpState,
   type DpStateRef,
+  type MutableDpStateRef,
   createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
@@ -285,9 +286,11 @@ export async function createSiclawSession(
   // can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
 
-  // DP state ref — shared between deep_search tool (read-only gate) and the
-  // deep-investigation extension (writes state). The extension binds this at init.
-  const dpStateRef: DpStateRef = { status: "idle" };
+  // DP state ref — shared object, two views:
+  // - MutableDpStateRef: held by the extension (single writer)
+  // - DpStateRef (readonly): passed to tools and agentbox for read-only access
+  const mutableDpStateRef: MutableDpStateRef = { status: "idle" };
+  const dpStateRef: DpStateRef = mutableDpStateRef;
 
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
@@ -507,7 +510,7 @@ export async function createSiclawSession(
       return parts;
     },
     // Extension registration order: compactionSafeguard handles session_before_compact.
-    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef, dpStateRef), (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();

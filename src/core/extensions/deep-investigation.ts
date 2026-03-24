@@ -5,7 +5,7 @@ import { deepSearchEvents, type ProgressEvent } from "../../tools/deep-search/ev
 import {
   type ChecklistItemStatus,
   type DpChecklist,
-  type DpStateRef,
+  type MutableDpStateRef,
   type DpStatus,
   type DpHypothesis,
   createChecklist,
@@ -164,7 +164,7 @@ function formatHypothesesWidget(text: string, theme: any): string[] {
 
 // --- Extension ---
 
-export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?: MemoryRef, dpStateRef?: DpStateRef): void {
+export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?: MemoryRef, dpStateRef?: MutableDpStateRef): void {
   // --- DP state machine (source of truth) ---
   // All status transitions happen via setDpStatus() which is driven ONLY by
   // deterministic system events (tool_call, tool_result, user UI actions, agent_end).
@@ -179,13 +179,13 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
   function setDpStatus(status: DpStatus): void {
     dpStatus = status;
-    // Sync the read-only ref so deep_search tool gate can see current state
+    // Sync the mutable ref so tools and agentbox can see current state
     if (dpStateRef) {
-      (dpStateRef as any).status = status;
-      (dpStateRef as any).triageContextDraft = dpTriageContextDraft;
-      (dpStateRef as any).confirmedHypotheses = dpConfirmedHypotheses;
-      (dpStateRef as any).question = dpQuestion;
-      (dpStateRef as any).round = dpRound;
+      dpStateRef.status = status;
+      dpStateRef.triageContextDraft = dpTriageContextDraft;
+      dpStateRef.confirmedHypotheses = dpConfirmedHypotheses;
+      dpStateRef.question = dpQuestion;
+      dpStateRef.round = dpRound;
     }
     // Derive checklist from status (single direction: status → checklist)
     if (checklist) syncChecklistFromStatus({ checklist, status, round: dpRound });
@@ -578,6 +578,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     // Directly build activation message (don't rely on handler chaining)
     const question = event.text.trim();
     if (!question) return { action: "continue" as const };
+    dpQuestion = question;
     if (checklist) checklist.question = question;
     persistState();
     return {
@@ -783,8 +784,9 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   api.on("agent_end", (_event, ctx) => {
     if (dpStatus === "concluding") {
       setDpStatus("completed");
-      persistState();
       updateStatus(ctx);
+      // disableDpMode resets to idle and persists — no separate persistState() needed
+      // (persisting "completed" then immediately "idle" would make the completed snapshot dead code)
       disableDpMode(ctx);
     }
   });

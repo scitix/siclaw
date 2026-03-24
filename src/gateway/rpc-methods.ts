@@ -1978,8 +1978,8 @@ export function createRpcMethods(
           dpChecklist = cl;
         }
       }
-    } catch {
-      // Agentbox unreachable — fallback below
+    } catch (err) {
+      console.warn("[rpc] dp-state fetch failed, using cache:", err instanceof Error ? err.message : err);
     }
 
     // Fallback: gateway cache
