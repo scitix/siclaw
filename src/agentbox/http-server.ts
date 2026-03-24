@@ -685,28 +685,31 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
 
-    if (!managed) {
-      sendJson(res, 404, { error: "Session not found" });
-      return;
+    if (managed) {
+      // pi-agent brain: read from dpStateRef (updated by extension on every state change)
+      if (managed.dpStateRef) {
+        sendJson(res, 200, {
+          dpStatus: managed.dpStateRef.status,
+          question: managed.dpStateRef.question,
+          round: managed.dpStateRef.round,
+        });
+        return;
+      }
+
+      // SDK brain: read from dpState
+      if (managed.dpState) {
+        sendJson(res, 200, {
+          dpStatus: managed.dpState.status,
+          question: managed.dpState.question,
+          round: managed.dpState.round,
+        });
+        return;
+      }
     }
 
-    // pi-agent brain: read from dpStateRef (updated by extension on every state change)
-    if (managed.dpStateRef) {
-      sendJson(res, 200, {
-        dpStatus: managed.dpStateRef.status,
-        question: managed.dpStateRef.question,
-        round: managed.dpStateRef.round,
-      });
-      return;
-    }
-
-    // SDK brain: read from dpState
-    if (managed.dpState) {
-      sendJson(res, 200, {
-        dpStatus: managed.dpState.status,
-        question: managed.dpState.question,
-        round: managed.dpState.round,
-      });
+    const persisted = sessionManager.getPersistedDpState(sessionId);
+    if (persisted) {
+      sendJson(res, 200, persisted);
       return;
     }
 

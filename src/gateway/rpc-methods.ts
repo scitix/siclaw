@@ -900,6 +900,14 @@ export function createRpcMethods(
     return null;
   }
 
+  function detectDpControlAction(text: string): "confirm" | "adjust" | "reinvestigate" | "skip" | null {
+    if (text.startsWith("[DP_CONFIRM]")) return "confirm";
+    if (text.startsWith("[DP_ADJUST]")) return "adjust";
+    if (text.startsWith("[DP_REINVESTIGATE]")) return "reinvestigate";
+    if (text.startsWith("[DP_SKIP]")) return "skip";
+    return null;
+  }
+
   // ─────────────────────────────────────────────────
   // Chat Methods
   // ─────────────────────────────────────────────────
@@ -1006,6 +1014,22 @@ export function createRpcMethods(
       podEnv,
     });
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
+
+    const dpControlAction = detectDpControlAction(message);
+    if (sessionId && dpControlAction) {
+      try {
+        const dpState = await client.getDpState(sessionId);
+        if (dpState?.dpStatus !== "awaiting_confirmation") {
+          throw new Error(
+            `Cannot ${dpControlAction} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`,
+          );
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        console.warn(`[rpc] Rejected DP control marker for session ${sessionId}: ${reason}`);
+        throw new Error(reason);
+      }
+    }
 
     // === Feedback enrichment (system-level) ===
     let promptText = message;
