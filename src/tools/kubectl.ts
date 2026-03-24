@@ -9,6 +9,11 @@ import {
   parseArgs,
   validateCommandRestrictions,
 } from "./command-sets.js";
+import {
+  detectSensitiveResource,
+  getOutputFormat,
+  sanitizeJSON,
+} from "./kubectl-sanitize.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -137,6 +142,111 @@ Examples:
             details: { blocked: true, subcommand: "exec" },
           };
         }
+      }
+
+      // Block "kubectl config view --raw" — leaks full kubeconfig with certs/tokens
+      if (subcommand === "config") {
+        const configSub = args.filter((a) => !a.startsWith("-"));
+        const hasView = configSub.includes("view");
+        const hasRaw = args.includes("--raw");
+        if (hasView && hasRaw) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "kubectl config view --raw is not allowed — it exposes credentials.",
+              }, null, 2),
+            }],
+            details: { blocked: true, subcommand: "config" },
+          };
+        }
+      }
+
+      // Sensitive resource protection (Secret, ConfigMap, Pod)
+      const sensitiveSubcommands = ["get", "describe"];
+      const sensitiveResource = sensitiveSubcommands.includes(subcommand)
+        ? detectSensitiveResource(args)
+        : null;
+
+      if (sensitiveResource) {
+        const outputFormat = getOutputFormat(args);
+
+        // Block describe for ConfigMap/Pod (human-readable format can't be reliably sanitized)
+        if (subcommand === "describe" && sensitiveResource !== "secret") {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: `"kubectl describe ${sensitiveResource}" may expose sensitive data that cannot be reliably sanitized.`,
+                hint: `Use "kubectl get ${sensitiveResource} <name> -o json" instead — structured output is automatically sanitized.`,
+              }, null, 2),
+            }],
+            details: { blocked: true, subcommand: "describe", sensitiveResource },
+          };
+        }
+
+        // Block template-based output formats (can't reliably sanitize)
+        if (outputFormat === "jsonpath" || outputFormat === "go-template" || outputFormat === "custom-columns") {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: `"-o ${outputFormat}" is not allowed for ${sensitiveResource} resources — template output cannot be reliably sanitized.`,
+                hint: `Use "-o json" instead — JSON output is automatically sanitized to redact sensitive values.`,
+              }, null, 2),
+            }],
+            details: { blocked: true, outputFormat, sensitiveResource },
+          };
+        }
+
+        // For -o yaml: rewrite to -o json internally
+        let execArgs = args;
+        let convertedFromYaml = false;
+        if (outputFormat === "yaml") {
+          execArgs = args.map((a, idx) => {
+            // Only replace the value associated with -o/--output flag
+            const prev = args[idx - 1];
+            if (a === "yaml" && (prev === "-o" || prev === "--output")) return "json";
+            if (a === "-o=yaml") return "-o=json";
+            if (a === "-oyaml") return "-ojson";
+            if (a === "--output=yaml") return "--output=json";
+            return a;
+          });
+          convertedFromYaml = true;
+        }
+
+        // For -o json or converted yaml: execute and sanitize
+        if (outputFormat === "json" || outputFormat === "yaml") {
+          const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
+          try {
+            const { stdout, stderr } = await execFileAsync("kubectl", execArgs, {
+              timeout,
+              maxBuffer: 1024 * 1024 * 10,
+            });
+            let sanitized = sanitizeJSON(stdout.trim(), sensitiveResource);
+            if (convertedFromYaml) {
+              sanitized += "\n\nNote: Output converted from YAML to JSON for reliable sanitization.";
+            }
+            const output = sanitized +
+              (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+            return {
+              content: [{ type: "text", text: processToolOutput(output) }],
+              details: { exitCode: 0, sanitized: true },
+            };
+          } catch (err: any) {
+            // Sanitize err.stdout too — partial output may contain sensitive data
+            const sanitizedStdout = err.stdout?.trim()
+              ? sanitizeJSON(err.stdout.trim(), sensitiveResource)
+              : "";
+            const output = `Exit code: ${err.code ?? "unknown"}\n${sanitizedStdout}\n${err.stderr?.trim() ?? err.message}`;
+            return {
+              content: [{ type: "text", text: processToolOutput(output) }],
+              details: { exitCode: err.code, error: true, sanitized: true },
+            };
+          }
+        }
+
+        // Default table / -o wide / -o name: safe, fall through to normal execution
       }
 
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
