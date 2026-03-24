@@ -23,7 +23,7 @@ interface ParsedHypothesis {
  *   Each block contains description, confidence, validation tools.
  * Strategy 2: Numbered/bulleted list fallback.
  */
-function parseHypotheses(input: string): ParsedHypothesis[] {
+export function parseHypotheses(input: string): ParsedHypothesis[] {
     if (!input) return [];
 
     // Strategy 1: Split by --- separators
