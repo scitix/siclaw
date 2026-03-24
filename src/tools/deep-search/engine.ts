@@ -618,7 +618,7 @@ export async function investigate(
       hypothesis.trace = result.trace;
       globalCallsUsed += result.callsUsed;
 
-      onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence });
+      onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence, text: hypothesis.text });
     } catch (err) {
       // Charge minimum 1 call so failed attempts aren't zero-cost —
       // the sub-agent may have made calls before throwing, but we
@@ -629,7 +629,7 @@ export async function investigate(
         hypothesis.status = "inconclusive";
         hypothesis.confidence = 0;
         hypothesis.reasoning = `Sub-agent error: ${err instanceof Error ? err.message : String(err)}`;
-        onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "inconclusive", confidence: 0 });
+        onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "inconclusive", confidence: 0, text: hypothesis.text });
         retryQueue.push(hypothesis);
       }
       // Second failure → leave as inconclusive (already marked)
@@ -707,7 +707,7 @@ export async function investigate(
   for (const h of hypotheses) {
     if (h.status === "pending") {
       h.status = "skipped";
-      onProgress?.({ type: "hypothesis", id: h.id, status: "skipped", confidence: h.confidence });
+      onProgress?.({ type: "hypothesis", id: h.id, status: "skipped", confidence: h.confidence, text: h.text });
     }
   }
 
