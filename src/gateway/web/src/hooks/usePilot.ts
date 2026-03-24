@@ -417,10 +417,7 @@ export function usePilot() {
                         setInvestigationProgress(prev => prev ?? { hypotheses: [] });
                         // Checklist creation now handled by dp_status event from gateway.
                     }
-                    // Handle end_investigation: immediately reset all DP state
-                    if (toolName === 'end_investigation') {
-                        resetDpState();
-                    }
+                    // end_investigation cleanup now driven by dp_status "completed" event from gateway.
                     setMessages(prev => [...prev, {
                         id: `tool-${Date.now()}`,
                         role: 'tool' as const,

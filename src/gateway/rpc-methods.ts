@@ -1961,14 +1961,13 @@ export function createRpcMethods(
     let dpQuestion: string | undefined;
 
     // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror).
-    // Use activeStreams first (prompt running), then dpStatusCache (prompt ended but DP alive).
+    // Use findAgentBoxForSession to locate agentbox independent of activeStreams/cache.
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
-    const cachedDp = dpStatusCache.get(snapKey);
-    const agentboxEndpoint = stream?.endpoint ?? cachedDp?.agentboxEndpoint;
-    const agentboxSessionId = stream?.sessionId ?? cachedDp?.agentboxSessionId;
-    if (agentboxEndpoint && agentboxSessionId) {
-      try {
-        const agentClient = new AgentBoxClient(agentboxEndpoint, 5000, agentBoxTlsOptions);
+    const agentboxSessionId = stream?.sessionId ?? sessionId;
+    try {
+      const handle = await findAgentBoxForSession(userId, sessionId);
+      if (handle && agentboxSessionId) {
+        const agentClient = new AgentBoxClient(handle.endpoint, 5000, agentBoxTlsOptions);
         const resp = await agentClient.getDpState(agentboxSessionId);
         if (resp?.dpStatus && resp.dpStatus !== "idle") {
           dpStatus = resp.dpStatus;
@@ -1978,9 +1977,9 @@ export function createRpcMethods(
           syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus } as DpState);
           dpChecklist = cl;
         }
-      } catch {
-        // Agentbox unreachable — fallback below
       }
+    } catch {
+      // Agentbox unreachable — fallback below
     }
 
     // Fallback: gateway cache
