@@ -83,6 +83,8 @@ export interface DpStateRef {
   readonly status: DpStatus;
   readonly triageContextDraft?: string;
   readonly confirmedHypotheses?: DpHypothesis[];
+  readonly question?: string;
+  readonly round?: number;
 }
 
 /**

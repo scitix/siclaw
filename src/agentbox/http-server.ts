@@ -665,6 +665,44 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
+   * GET /api/sessions/:sessionId/dp-state - read DP investigation state for recovery
+   *
+   * Returns the current dpStateRef (live mirror of persisted dp-mode entries).
+   * Used by gateway's chat.dpProgress to provide authoritative recovery data.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/dp-state", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (!managed) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    // pi-agent brain: read from dpStateRef (updated by extension on every state change)
+    if (managed.dpStateRef) {
+      sendJson(res, 200, {
+        dpStatus: managed.dpStateRef.status,
+        question: managed.dpStateRef.question,
+        round: managed.dpStateRef.round,
+      });
+      return;
+    }
+
+    // SDK brain: read from dpState
+    if (managed.dpState) {
+      sendJson(res, 200, {
+        dpStatus: managed.dpState.status,
+        question: managed.dpState.question,
+        round: managed.dpState.round,
+      });
+      return;
+    }
+
+    sendJson(res, 200, { dpStatus: "idle" });
+  });
+
+  /**
    * POST /api/sessions/:sessionId/clear-queue - clear queued steer/followUp messages
    */
   addRoute("POST", "/api/sessions/:sessionId/clear-queue", async (_req, res, params) => {

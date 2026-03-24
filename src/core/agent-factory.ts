@@ -118,6 +118,8 @@ export interface SiclawSessionResult {
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
+  dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
   sessionIdRef: { current: string };
 
@@ -694,5 +696,5 @@ export async function createSiclawSession(
   installToolResultContextGuard({ agent: session.agent, contextWindowTokens: contextWindow });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

@@ -20,7 +20,7 @@ import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import type { DpState } from "../tools/dp-tools.js";
+import type { DpState, DpStateRef } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 // topic-consolidator import removed — consolidation disabled
@@ -63,6 +63,8 @@ export interface ManagedSession {
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
+  dpStateRef?: DpStateRef;
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
@@ -243,6 +245,7 @@ export class AgentBoxSessionManager {
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
       dpState: result.dpState,
+      dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
     };

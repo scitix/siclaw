@@ -261,6 +261,7 @@ Do NOT use for simple queries that can be answered with 1-2 kubectl commands.`,
         return {
           content: [{ type: "text", text: summary }],
           details: {
+            dpStatus: "concluding" as const,
             investigationId: result.investigationId,
             totalToolCalls: result.totalToolCalls,
             durationMs: result.totalDurationMs,
