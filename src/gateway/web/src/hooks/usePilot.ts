@@ -504,6 +504,7 @@ export function usePilot() {
                         resetDpState();
                         break;
                     }
+                    setDpActive(true);
                     if (checklist) {
                         setDpChecklist(checklist);
                         const focus = checklist.find(i => i.status === 'in_progress');
@@ -814,7 +815,7 @@ export function usePilot() {
                 message: text,
                 modelProvider: selectedModel?.provider,
                 modelId: selectedModel?.id,
-                brainType: selectedBrain,
+                brainType: currentSessionKey ? (sessionBrainType ?? undefined) : selectedBrain,
                 workspaceId,
             });
             // Lock brain selector to the actual session brain type
@@ -831,7 +832,7 @@ export function usePilot() {
             console.error('Failed to send message:', err);
             setIsLoading(false);
         }
-    }, [isConnected, isLoading, currentSessionKey, selectedModel, selectedBrain, sendRpc]);
+    }, [isConnected, isLoading, currentSessionKey, selectedModel, selectedBrain, sendRpc, sessionBrainType]);
 
     const abortResponse = useCallback(async () => {
         if (!isConnected) return;
@@ -1067,6 +1068,7 @@ export function usePilot() {
             // Restore dpStatus/checklist regardless of promptActive.
             // awaiting_confirmation = prompt ended but DP is still alive.
             if (snap.checklist && snap.dpStatus && snap.dpStatus !== 'idle') {
+                setDpActive(true);
                 setDpChecklist(snap.checklist);
                 const focus = snap.checklist.find(i => i.status === 'in_progress');
                 setDpFocus(focus ? focus.id : null);
