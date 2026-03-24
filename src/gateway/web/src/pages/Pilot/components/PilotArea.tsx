@@ -487,8 +487,9 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                 <div className="flex justify-start pl-12 my-2">
                                     <button
                                         type="button"
+                                        disabled={isLoading}
                                         onClick={() => sendMessage('Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.')}
-                                        className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white text-sm font-medium shadow-sm hover:shadow-md transition-all cursor-pointer"
+                                        className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white text-sm font-medium shadow-sm hover:shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         <SearchCode className="w-4 h-4" />
                                         Dig deeper
