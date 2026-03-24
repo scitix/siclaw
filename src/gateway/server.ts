@@ -1232,10 +1232,10 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                   return;
                 }
 
-                const bundle = await getSkillBundle(identity.userId, identity.env);
+                const bundle = await getSkillBundle(identity.userId, identity.env, identity.workspaceId);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(bundle));
-                console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} skills=${bundle.skills.length}`);
+                console.log(`[gateway] Skill bundle served for userId=${identity.userId} env=${identity.env} workspaceId=${identity.workspaceId ?? "n/a"} skills=${bundle.skills.length}`);
               } catch (err) {
                 console.error("[gateway] skills/bundle error:", err);
                 res.writeHead(500, { "Content-Type": "application/json" });

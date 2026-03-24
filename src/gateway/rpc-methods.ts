@@ -25,7 +25,7 @@ import { SkillReviewRepository } from "./db/repositories/skill-review-repo.js";
 import { PermissionRepository } from "./db/repositories/permission-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { CredentialRepository } from "./db/repositories/credential-repo.js";
-import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
+import { WorkspaceRepository, type WorkspaceSkillComposer } from "./db/repositories/workspace-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { ClusterRepository } from "./db/repositories/cluster-repo.js";
 import { UserClusterConfigRepository } from "./db/repositories/user-cluster-config-repo.js";
@@ -159,7 +159,7 @@ export function createRpcMethods(
 ): {
   methods: Map<string, RpcHandler>;
   buildCredentialPayload: (userId: string, workspaceId: string, isDefault: boolean) => Promise<{ manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>; files: Array<{ name: string; content: string; mode?: number }> }>;
-  getSkillBundle: (userId: string, env: "prod" | "dev" | "test") => Promise<SkillBundle>;
+  getSkillBundle: (userId: string, env: "prod" | "dev" | "test", workspaceId?: string) => Promise<SkillBundle>;
   /** Abort all SSE streams associated with a specific WebSocket connection */
   cleanupForWs: (ws: WebSocket) => void;
 } {
@@ -269,6 +269,288 @@ export function createRpcMethods(
     const workspace = await resolveWorkspaceForUser(userId, workspaceId);
     if (!workspace) return false;
     return skillSpaceDevMode || workspace.envType === "test";
+  }
+
+  type ComposerSkillOption = {
+    id: string;
+    ref: string;
+    name: string;
+    dirName: string;
+    description?: string | null;
+    labels?: string[];
+    scope: "builtin" | "team" | "personal" | "skillset";
+    skillSpaceId?: string;
+  };
+
+  type ComposerSkillSpaceOption = {
+    id: string;
+    name: string;
+    description?: string | null;
+    memberRole?: string;
+    skills: ComposerSkillOption[];
+  };
+
+  type ComposerOptions = {
+    skillSpaceAvailable: boolean;
+    globalSkills: ComposerSkillOption[];
+    personalSkills: ComposerSkillOption[];
+    skillSpaces: ComposerSkillSpaceOption[];
+  };
+
+  function filterRoleLabels(labels: string[] | undefined, isAdmin: boolean): string[] | undefined {
+    if (!labels || labels.length === 0) return undefined;
+    if (isAdmin) return labels;
+    const filtered = labels.filter((l) => !ROLE_LABELS.has(l));
+    return filtered.length > 0 ? filtered : undefined;
+  }
+
+  function mergeSkillLabels(
+    scope: "builtin" | "team" | "personal" | "skillset",
+    dirName: string,
+    dbLabels: string[] | undefined,
+    isAdmin: boolean,
+  ): string[] | undefined {
+    const fsLabels = scope === "builtin" ? batchGetLabels([`builtin:${dirName}`]).get(`builtin:${dirName}`) ?? [] : getLabelsForSkill(`${scope}:${dirName}`);
+    return filterRoleLabels([...new Set([...(dbLabels ?? []), ...fsLabels])], isAdmin);
+  }
+
+  function normalizeWorkspaceSkillComposer(raw: unknown): WorkspaceSkillComposer {
+    const composer = (raw ?? {}) as Partial<WorkspaceSkillComposer>;
+    return {
+      globalSkillRefs: Array.isArray(composer.globalSkillRefs)
+        ? [...new Set(composer.globalSkillRefs.filter((ref): ref is string => typeof ref === "string" && ref.length > 0))]
+        : [],
+      personalSkillIds: Array.isArray(composer.personalSkillIds)
+        ? [...new Set(composer.personalSkillIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+        : [],
+      skillSpaces: Array.isArray(composer.skillSpaces)
+        ? composer.skillSpaces
+            .filter((entry) =>
+              !!entry && typeof entry.skillSpaceId === "string" && entry.skillSpaceId.length > 0)
+            .map((entry) => ({
+              skillSpaceId: entry.skillSpaceId,
+              disabledSkillIds: Array.isArray(entry.disabledSkillIds)
+                ? [...new Set(entry.disabledSkillIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
+                : [],
+            }))
+        : [],
+    };
+  }
+
+  async function listWorkspaceComposerOptions(userId: string, isAdmin: boolean): Promise<ComposerOptions> {
+    const globalSkills: ComposerSkillOption[] = [];
+    const builtinSkills = skillWriter.scanScope("builtin");
+    const builtinLabels = batchGetLabels(builtinSkills.map((skill) => `builtin:${skill.dirName}`));
+    for (const skill of builtinSkills) {
+      globalSkills.push({
+        id: `builtin:${skill.dirName}`,
+        ref: `builtin:${skill.dirName}`,
+        name: skill.name,
+        dirName: skill.dirName,
+        description: skill.description,
+        labels: filterRoleLabels(builtinLabels.get(`builtin:${skill.dirName}`) ?? [], isAdmin),
+        scope: "builtin",
+      });
+    }
+
+    const personalSkills: ComposerSkillOption[] = [];
+    if (skillRepo) {
+      const teamSkills = await skillRepo.list({ scope: "team" });
+      for (const meta of teamSkills) {
+        globalSkills.push({
+          id: meta.id,
+          ref: `team:${meta.id}`,
+          name: meta.name,
+          dirName: meta.dirName,
+          description: meta.description,
+          labels: mergeSkillLabels("team", meta.dirName, (meta as any).labelsJson ?? undefined, isAdmin),
+          scope: "team",
+        });
+      }
+
+      const personalResult = await skillRepo.listForUser(userId, { scope: "personal", limit: 500 });
+      for (const meta of personalResult.skills) {
+        personalSkills.push({
+          id: meta.id,
+          ref: `personal:${meta.id}`,
+          name: meta.name,
+          dirName: meta.dirName,
+          description: meta.description,
+          labels: mergeSkillLabels("personal", meta.dirName, (meta as any).labelsJson ?? undefined, isAdmin),
+          scope: "personal",
+        });
+      }
+    }
+
+    const skillSpaceAvailable = isK8sMode || skillSpaceDevMode;
+    const skillSpaces: ComposerSkillSpaceOption[] = [];
+    if (skillSpaceAvailable && skillSpaceRepo && skillRepo) {
+      const spaces = await skillSpaceRepo.listForUser(userId);
+      for (const space of spaces) {
+        const spaceSkills = await skillRepo.listBySkillSpaceId(space.id);
+        skillSpaces.push({
+          id: space.id,
+          name: space.name,
+          description: space.description,
+          memberRole: space.memberRole,
+          skills: spaceSkills.map((meta: any) => ({
+            id: meta.id,
+            ref: `skillset:${meta.id}`,
+            name: meta.name,
+            dirName: meta.dirName,
+            description: meta.description,
+            labels: mergeSkillLabels("skillset", meta.dirName, meta.labelsJson ?? undefined, isAdmin),
+            scope: "skillset" as const,
+            skillSpaceId: space.id,
+          })),
+        });
+      }
+    }
+
+    globalSkills.sort((a, b) => a.name.localeCompare(b.name));
+    personalSkills.sort((a, b) => a.name.localeCompare(b.name));
+    skillSpaces.sort((a, b) => a.name.localeCompare(b.name));
+    for (const space of skillSpaces) {
+      space.skills.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    return { skillSpaceAvailable, globalSkills, personalSkills, skillSpaces };
+  }
+
+  function buildLegacyFallbackComposer(
+    workspace: NonNullable<Awaited<ReturnType<typeof resolveWorkspaceForUser>>>,
+    options: ComposerOptions,
+  ): WorkspaceSkillComposer {
+    const allowTestOnly = workspace.envType === "test";
+    return {
+      globalSkillRefs: options.globalSkills.map((skill) => skill.ref),
+      personalSkillIds: allowTestOnly ? options.personalSkills.map((skill) => skill.id) : [],
+      skillSpaces: allowTestOnly && options.skillSpaceAvailable
+        ? options.skillSpaces.map((space) => ({ skillSpaceId: space.id, disabledSkillIds: [] }))
+        : [],
+    };
+  }
+
+  async function resolveWorkspaceComposer(
+    userId: string,
+    workspace: NonNullable<Awaited<ReturnType<typeof resolveWorkspaceForUser>>>,
+    isAdmin: boolean,
+    options?: ComposerOptions,
+  ): Promise<{ composer: WorkspaceSkillComposer; options: ComposerOptions }> {
+    const resolvedOptions = options ?? await listWorkspaceComposerOptions(userId, isAdmin);
+    const savedComposer = await workspaceRepo?.getSkillComposer(workspace.id);
+    if (savedComposer) {
+      return { composer: normalizeWorkspaceSkillComposer(savedComposer), options: resolvedOptions };
+    }
+
+    const legacySkills = await workspaceRepo?.getSkills(workspace.id) ?? [];
+    if (legacySkills.length > 0) {
+      const globalRefs = resolvedOptions.globalSkills
+        .filter((skill) => legacySkills.includes(skill.name) || legacySkills.includes(skill.dirName))
+        .map((skill) => skill.ref);
+      return {
+        composer: {
+          globalSkillRefs: [...new Set(globalRefs)],
+          personalSkillIds: [],
+          skillSpaces: [],
+        },
+        options: resolvedOptions,
+      };
+    }
+
+    return {
+      composer: buildLegacyFallbackComposer(workspace, resolvedOptions),
+      options: resolvedOptions,
+    };
+  }
+
+  function validateWorkspaceComposer(
+    composer: WorkspaceSkillComposer,
+    envType: "prod" | "test",
+    options: ComposerOptions,
+  ): WorkspaceSkillComposer {
+    const normalized = normalizeWorkspaceSkillComposer(composer);
+    const globalMap = new Map(options.globalSkills.map((skill) => [skill.ref, skill]));
+    const personalMap = new Map(options.personalSkills.map((skill) => [skill.id, skill]));
+    const skillSpaceMap = new Map(options.skillSpaces.map((space) => [space.id, space]));
+
+    for (const ref of normalized.globalSkillRefs) {
+      if (!globalMap.has(ref)) throw new Error(`Unknown global skill selection: ${ref}`);
+    }
+    for (const id of normalized.personalSkillIds) {
+      if (!personalMap.has(id)) throw new Error(`Unknown personal skill selection: ${id}`);
+    }
+
+    if (envType === "prod" && normalized.personalSkillIds.length > 0) {
+      throw new Error("Production workspaces cannot include Personal skills");
+    }
+    if (envType === "prod" && normalized.skillSpaces.length > 0) {
+      throw new Error("Production workspaces cannot include Skill Spaces");
+    }
+    if (envType === "test" && normalized.skillSpaces.length > 0 && !options.skillSpaceAvailable) {
+      throw new Error("Skill Space is not available in this deployment");
+    }
+
+    const seenSpaceDirNames = new Map<string, string>();
+    for (const selection of normalized.skillSpaces) {
+      const space = skillSpaceMap.get(selection.skillSpaceId);
+      if (!space) throw new Error(`Unknown Skill Space selection: ${selection.skillSpaceId}`);
+      const disabledIds = new Set(selection.disabledSkillIds);
+      const validSkillIds = new Set(space.skills.map((skill) => skill.id));
+      for (const disabledId of disabledIds) {
+        if (!validSkillIds.has(disabledId)) {
+          throw new Error(`Invalid disabled Skill Space skill: ${disabledId}`);
+        }
+      }
+      for (const skill of space.skills) {
+        if (disabledIds.has(skill.id)) continue;
+        const existingSpace = seenSpaceDirNames.get(skill.dirName);
+        if (existingSpace && existingSpace !== selection.skillSpaceId) {
+          throw new Error(`Resolve Skill Space conflict for "${skill.name}" before saving this workspace`);
+        }
+        seenSpaceDirNames.set(skill.dirName, selection.skillSpaceId);
+      }
+    }
+
+    return normalized;
+  }
+
+  function buildEffectiveSkillSummary(
+    composer: WorkspaceSkillComposer,
+    options: ComposerOptions,
+  ): string[] {
+    const winners = new Map<string, { key: string; priority: number }>();
+    const register = (dirName: string, key: string, priority: number) => {
+      const current = winners.get(dirName);
+      if (!current || priority > current.priority) {
+        winners.set(dirName, { key, priority });
+      }
+    };
+
+    const globalMap = new Map(options.globalSkills.map((skill) => [skill.ref, skill]));
+    const personalMap = new Map(options.personalSkills.map((skill) => [skill.id, skill]));
+    const skillSpaceMap = new Map(options.skillSpaces.map((space) => [space.id, space]));
+
+    for (const ref of composer.globalSkillRefs) {
+      const skill = globalMap.get(ref);
+      if (!skill) continue;
+      register(skill.dirName, skill.name, skill.scope === "team" ? 1 : 0);
+    }
+    for (const selection of composer.skillSpaces) {
+      const space = skillSpaceMap.get(selection.skillSpaceId);
+      if (!space) continue;
+      const disabledIds = new Set(selection.disabledSkillIds);
+      for (const skill of space.skills) {
+        if (disabledIds.has(skill.id)) continue;
+        register(skill.dirName, skill.name, 2);
+      }
+    }
+    for (const id of composer.personalSkillIds) {
+      const skill = personalMap.get(id);
+      if (!skill) continue;
+      register(skill.dirName, skill.name, 3);
+    }
+    return [...winners.values()].map((entry) => entry.key);
   }
 
   // Skills PV file writer
@@ -4707,8 +4989,10 @@ export function createRpcMethods(
     const ws = await workspaceRepo.getById(id);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    const [wsSkills, wsTools, wsCreds, wsClusterIds] = await Promise.all([
-      workspaceRepo.getSkills(id),
+    const isAdmin = isAdminUser(context);
+    const { composer, options } = await resolveWorkspaceComposer(userId, ws, isAdmin);
+
+    const [wsTools, wsCreds, wsClusterIds] = await Promise.all([
       workspaceRepo.getTools(id),
       workspaceRepo.getCredentials(id),
       workspaceRepo.getClusters(id),
@@ -4723,11 +5007,47 @@ export function createRpcMethods(
 
     return {
       workspace: ws,
-      skills: wsSkills,
+      skills: buildEffectiveSkillSummary(composer, options),
+      skillComposer: composer,
       tools: wsTools,
       credentials: wsCreds,
       clusters: wsClusterIds,
       clusterDetails,
+    };
+  });
+
+  methods.set("workspace.skillComposerOptions", async (_params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const options = await listWorkspaceComposerOptions(userId, isAdminUser(context));
+    return options;
+  });
+
+  methods.set("workspace.setSkillComposer", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!workspaceRepo) throw new Error("Database not available");
+
+    const workspaceId = params.workspaceId as string;
+    if (!workspaceId) throw new Error("Missing required param: workspaceId");
+
+    const ws = await workspaceRepo.getById(workspaceId);
+    if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
+
+    const envTypeParam = params.envType as string | undefined;
+    const envType = (envTypeParam === "prod" || envTypeParam === "test" ? envTypeParam : ws.envType) as "prod" | "test";
+    const options = await listWorkspaceComposerOptions(userId, isAdminUser(context));
+    const composer = validateWorkspaceComposer(
+      normalizeWorkspaceSkillComposer(params.skillComposer),
+      envType,
+      options,
+    );
+
+    await workspaceRepo.setSkillComposer(workspaceId, composer);
+    notifySkillReload(userId);
+
+    return {
+      status: "updated",
+      skillComposer: composer,
+      effectiveSkills: buildEffectiveSkillSummary(composer, options),
     };
   });
 
@@ -4742,14 +5062,19 @@ export function createRpcMethods(
     const ws = await workspaceRepo.getById(workspaceId);
     if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
 
-    await workspaceRepo.setSkills(workspaceId, skills);
-
-    // Rebuild workspace skills directory
-    const wsTools = await workspaceRepo.getTools(workspaceId);
-    await syncWorkspaceSkills(userId, workspaceId, ws.isDefault, skills, wsTools);
+    const options = await listWorkspaceComposerOptions(userId, isAdminUser(context));
+    const selectedGlobalRefs = options.globalSkills
+      .filter((skill) => skills.includes(skill.name) || skills.includes(skill.dirName) || skills.includes(skill.ref))
+      .map((skill) => skill.ref);
+    const composer = validateWorkspaceComposer({
+      globalSkillRefs: selectedGlobalRefs,
+      personalSkillIds: [],
+      skillSpaces: [],
+    }, (ws.envType as "prod" | "test") ?? "prod", options);
+    await workspaceRepo.setSkillComposer(workspaceId, composer);
     notifySkillReload(userId);
 
-    return { status: "updated" };
+    return { status: "updated", skillComposer: composer };
   });
 
   methods.set("workspace.setTools", async (params, context: RpcContext) => {
@@ -5220,12 +5545,28 @@ export function createRpcMethods(
 
   /** Build a skill bundle for a given user and environment (used by mTLS bundle API).
    *  "test" maps to "dev" behavior (working copies of personal skills). */
-  async function getSkillBundle(userId: string, env: "prod" | "dev" | "test"): Promise<SkillBundle> {
+  async function getSkillBundle(userId: string, env: "prod" | "dev" | "test", workspaceId?: string): Promise<SkillBundle> {
     if (!skillRepo || !skillContentRepo) throw new Error("Database not available");
     const disabled = new Set(await skillRepo.listDisabledSkills(userId));
     // Map "test" → "dev" for skill bundle purposes (test = dev-like skill access)
     const bundleEnv: "prod" | "dev" = env === "test" ? "dev" : env;
-    return buildSkillBundle(userId, bundleEnv, skillWriter, skillRepo, skillContentRepo, disabled, skillSpaceRepo ?? undefined);
+    let composer: WorkspaceSkillComposer | null = null;
+    if (workspaceId && workspaceRepo) {
+      const workspace = await resolveWorkspaceForUser(userId, workspaceId);
+      if (workspace) {
+        composer = (await resolveWorkspaceComposer(userId, workspace, true)).composer;
+      }
+    }
+    return buildSkillBundle(
+      userId,
+      bundleEnv,
+      skillWriter,
+      skillRepo,
+      skillContentRepo,
+      disabled,
+      skillSpaceRepo ?? undefined,
+      composer,
+    );
   }
 
   /** Detach WebSocket from SSE streams — SSE continues so DB persistence and
