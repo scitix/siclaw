@@ -170,25 +170,28 @@ Do NOT use for simple queries that can be answered with 1-2 kubectl commands.`,
       if (!dpStateRef || dpStateRef.status === "idle") {
         return {
           content: [{ type: "text", text:
-            "deep_search is only available in Deep Investigation mode.\n" +
-            "In normal mode, use standard tools (bash, run_skill) for lightweight diagnostics.\n" +
-            "To activate: use /dp command, Ctrl+I shortcut, or the magnifying glass toggle in web UI." }],
+            "deep_search is not available in normal mode. Use standard tools (kubectl, bash) instead.\n" +
+            "To activate Deep Investigation: use /dp command, Ctrl+I, or the magnifying glass toggle." }],
           details: { error: true, reason: "not_in_dp_mode" },
         };
       }
-      if (dpStateRef.status === "awaiting_confirmation") {
+      if (dpStateRef.status === "investigating" || dpStateRef.status === "awaiting_confirmation") {
         return {
           content: [{ type: "text", text:
-            "Cannot execute deep_search: hypotheses have not been confirmed yet.\n" +
-            "Wait for the user to review and confirm the proposed hypotheses before proceeding." }],
-          details: { error: true, reason: "awaiting_confirmation" },
+            "deep_search is not available yet. You must first:\n" +
+            "1. Investigate using kubectl and standard tools\n" +
+            "2. Call propose_hypotheses to share your findings and hypotheses with the user\n" +
+            "3. Wait for the user to confirm\n" +
+            "deep_search becomes available only after user confirmation.\n" +
+            "Do NOT call deep_search again — call propose_hypotheses instead." }],
+          details: { error: true, reason: "hypotheses_not_confirmed" },
         };
       }
       if (dpStateRef.status !== "validating") {
         return {
           content: [{ type: "text", text:
-            `Cannot execute deep_search: current DP status is "${dpStateRef.status}".\n` +
-            "deep_search can only run when status is 'validating' (after user confirms hypotheses)." }],
+            `Cannot execute deep_search: current status is "${dpStateRef.status}".\n` +
+            "deep_search can only run after user confirms hypotheses." }],
           details: { error: true, reason: "invalid_status" },
         };
       }
