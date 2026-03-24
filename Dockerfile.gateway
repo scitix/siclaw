@@ -50,7 +50,7 @@ COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
 
 # Copy maintenance scripts
-COPY scripts/ ./scripts/
+COPY scripts/memory-cleanup.sh ./scripts/
 
 # Create data directory
 RUN mkdir -p .siclaw
