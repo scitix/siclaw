@@ -102,10 +102,10 @@ export const EVIDENCE_TAIL_CHARS = 1500;
 // --- Engine constants ---
 
 /** Early exit threshold: skip remaining hypotheses if one reaches this confidence.
- *  When a validated hypothesis exceeds this, remaining pending hypotheses are skipped
- *  to save budget. Hypotheses are validated in confidence-descending order, so the
- *  most likely root cause is checked first. */
-export const EARLY_EXIT_CONFIDENCE = 80;
+ *  When a validated hypothesis exceeds this, remaining PENDING hypotheses are skipped
+ *  (already-running validations continue). Set high (90) because real issues often
+ *  have multiple contributing factors — only skip when root cause is near-certain. */
+export const EARLY_EXIT_CONFIDENCE = 90;
 
 /** Debug trace output truncation: max total chars per tool result. */
 export const TRACE_MAX_OUTPUT = 2000;
