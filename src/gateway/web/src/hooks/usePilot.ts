@@ -739,11 +739,12 @@ export function usePilot() {
         setPendingMessages([]);
         clearDpTimers();
         resetDpState();
+        let loadedMsgs: PilotMessage[] = [];
         try {
             const result = await sendRpc<{ messages: PilotMessage[]; hasMore: boolean }>('chat.history', { sessionId: sessionKey });
             if (loadHistoryRequestIdRef.current !== requestId) return;
-            const mapped = mapMessages(result.messages ?? []);
-            setMessages(mapped);
+            loadedMsgs = mapMessages(result.messages ?? []);
+            setMessages(loadedMsgs);
             setHasMore(result.hasMore ?? false);
         } catch (err) {
             if (loadHistoryRequestIdRef.current === requestId) {
@@ -764,7 +765,7 @@ export function usePilot() {
         // Restore deep investigation progress (checklist cards, hypothesis tree).
         // Pass sessionKey explicitly to avoid race with async currentSessionKeyRef update.
         if (loadHistoryRequestIdRef.current !== requestId) return;
-        await restoreDpProgressRef.current(sessionKey, mapped);
+        await restoreDpProgressRef.current(sessionKey, loadedMsgs);
     }, [isConnected, sendRpc]);
 
     const loadMoreHistory = useCallback(async () => {
