@@ -30,7 +30,12 @@ export interface ScannedSkill {
 }
 
 export class SkillFileWriter {
-  constructor(private skillsDir: string) {}
+  private skillsDir: string;
+  constructor(skillsDir: string) {
+    // resolveUnderDir requires an absolute base — resolve defensively so callers
+    // can pass relative paths (e.g. ".siclaw/skills" from config).
+    this.skillsDir = path.resolve(skillsDir);
+  }
 
   /** Initialize Skills PV (ensure dirs exist) */
   async init(): Promise<void> {
