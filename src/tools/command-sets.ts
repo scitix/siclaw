@@ -1153,3 +1153,58 @@ export function validateCommandRestrictions(
 
   return null;
 }
+
+// ── Container-context sensitive path patterns ────────────────────
+
+/**
+ * Paths that must never be accessed through exec tools.
+ * Used by validateCommand (Pass 6) and validateExecCommand.
+ *
+ * These are paths whose content cannot be reliably sanitized post-execution
+ * (binary data, unstructured secrets, password hashes, etc.).
+ * Commands whose output CAN be sanitized (env, printenv, crictl inspect)
+ * are handled by output-sanitizer instead.
+ */
+export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
+  // K8s SA token & mounted secrets
+  /\/run\/secrets\//,
+  /\/var\/run\/secrets\//,
+  // Process info (anchored to avoid over-matching)
+  /\/proc\/[^/]+\/environ$/,
+  /\/proc\/[^/]+\/cmdline$/,
+  /\/proc\/[^/]+\/fd\//,
+  /\/proc\/[^/]+\/mem$/,
+  /\/proc\/[^/]+\/maps$/,
+  /\/proc\/[^/]+\/smaps$/,
+  /\/proc\/kcore$/,
+  // System credentials
+  /\/etc\/shadow$/,
+  /\/etc\/gshadow$/,
+  /\/etc\/master\.passwd$/,
+  // SSH
+  /[/]\.ssh\//,
+  /id_rsa$/,
+  /id_ed25519$/,
+  /id_ecdsa$/,
+  // TLS key material (.pem excluded — CA certs are public and needed for SRE diagnostics)
+  /\.key$/,
+  /\.p12$/,
+  /\.pfx$/,
+  /\.jks$/,
+  // Cloud provider credentials
+  /[/]\.aws\//,
+  /[/]\.gcp\//,
+  /[/]\.azure\//,
+  /[/]\.docker\/config\.json/,
+  // K8s control plane
+  /\/etc\/kubernetes\/pki\//,
+  /\/etc\/kubernetes\/admin\.conf/,
+  /\/var\/lib\/kubelet\//,
+  /\/var\/lib\/etcd\//,
+  // Shell/DB history
+  /\.bash_history/,
+  /\.zsh_history/,
+  /\.mysql_history/,
+  /\.psql_history/,
+  /\.node_repl_history/,
+];
