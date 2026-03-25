@@ -615,14 +615,10 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     }
 
     // Already in DP: strip marker.
-    // If awaiting_confirmation, free-text input is implicit "adjust" — back to investigating.
+    // If awaiting_confirmation, let the dedicated DP_CONFIRM/DP_ADJUST handler below handle it.
     if (dpStatus === "awaiting_confirmation") {
-      dpLastUserFeedback = userText;
-      setDpStatus("investigating");
-      persistState();
-      updateStatus(ctx);
+      return { action: "transform" as const, text: userText };
     }
-
     // Pass through the stripped text as normal conversation
     return {
       action: "transform" as const,
