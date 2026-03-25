@@ -275,7 +275,7 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
       const hypotheses = rawHypotheses.filter((h) => {
         const text = h.text.trim();
         if (text.startsWith("|")) return false;
-        if (/假设提案|(?:revised|proposed|updated)\s*hypothes[ei]s/i.test(text)) return false;
+        if (/(?:hypothesis|hypotheses)\s*(?:proposal|summary|list|overview)|(?:revised|proposed|updated)\s*hypothes[ei]s/i.test(text)) return false;
         return true;
       });
 

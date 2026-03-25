@@ -541,12 +541,11 @@ export async function createSiclawSession(
     // Restricted file tools are already in customTools (pushed above)
     const sdkTools = [...customTools];
 
-    // DP tools for SDK brain — mutable state shared with http-server via dpState ref
+    // DP tools are NOT registered for SDK brain — the interactive DP workflow
+    // (propose_hypotheses → user confirm → deep_search) requires pi-agent extension
+    // handlers for [DP_CONFIRM]/[DP_ADJUST]/[DP_SKIP] markers. Without those,
+    // SDK brain DP gets stuck at awaiting_confirmation. Tracked for future work.
     const dpState: DpState = createDpState();
-    sdkTools.push(
-      createProposeHypothesesTool(dpState),
-      createEndInvestigationTool(dpState),
-    );
 
     const systemPrompt = buildSreSystemPrompt(memoryDir, mode);
 
