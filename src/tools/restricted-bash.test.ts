@@ -359,11 +359,11 @@ describe("createRestrictedBashTool", () => {
 
   describe("allows kubectl pipelines", () => {
     const allowedCmds = [
-      "kubectl get pods -A",
+      "kubectl get pods -n default",
       "kubectl get pods | grep Error",
       "kubectl get pods -o json | jq '.items[]'",
-      "kubectl get pods -A | grep -i error | wc -l",
-      "kubectl logs my-pod | tail -100",
+      "kubectl get pods -n default | grep -i error | wc -l",
+      "kubectl logs my-pod --tail=500 | tail -100",
       "kubectl get nodes -o json | jq '.items[].metadata.labels' | sort",
       "sleep 2 && kubectl get pods",
       "echo 'test' | grep test",
@@ -1284,15 +1284,15 @@ describe("createRestrictedBashTool — pipe-only text command enforcement", () =
 
   // Allowed: text commands after pipe |
   const allowedPiped = [
-    "kubectl get pods -A | grep Running",
+    "kubectl get pods -n default | grep Running",
     "kubectl get pods -o json | jq '.items[]'",
-    "kubectl get pods -A | grep -i error | wc -l",
-    "kubectl logs my-pod | tail -100",
+    "kubectl get pods -n default | grep -i error | wc -l",
+    "kubectl logs my-pod --tail=500 | tail -100",
     "kubectl get nodes -o json | jq . | sort",
     "echo test | cut -f1 -d,",
     "echo 'hello world' | tr ' ' '\\n'",
     "kubectl top pods | head -5",
-    "kubectl get pods -A | sort | uniq -c",
+    "kubectl get pods -n kube-system | sort | uniq -c",
     "echo 'a,b,c' | column -t -s,",
     "kubectl get pods | grep Error | wc -l",
     "echo test | grep test",
@@ -1352,7 +1352,7 @@ describe("validateKubectlInPipeline — sensitive resource protection", () => {
   });
 
   it("blocks kubectl get secrets -o yaml", () => {
-    const err = validateKubectlInPipeline(["kubectl get secrets -A -o yaml"]);
+    const err = validateKubectlInPipeline(["kubectl get secrets -n default -o yaml"]);
     expect(err).not.toBeNull();
     expect(err).toContain("not allowed in a pipeline");
   });
@@ -1368,8 +1368,14 @@ describe("validateKubectlInPipeline — sensitive resource protection", () => {
     expect(err).not.toBeNull();
   });
 
-  it("allows kubectl get secret -A (default table)", () => {
-    expect(validateKubectlInPipeline(["kubectl get secret -A"])).toBeNull();
+  it("blocks kubectl get secret -A (no selector — rate protection)", () => {
+    const err = validateKubectlInPipeline(["kubectl get secret -A"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("overload the API server");
+  });
+
+  it("allows kubectl get secret -A -l app=web (has selector)", () => {
+    expect(validateKubectlInPipeline(["kubectl get secret -A -l app=web"])).toBeNull();
   });
 
   it("allows kubectl get secret -o name", () => {
@@ -1392,8 +1398,8 @@ describe("validateKubectlInPipeline — sensitive resource protection", () => {
     expect(err).not.toBeNull();
   });
 
-  it("allows kubectl get configmap (default table)", () => {
-    expect(validateKubectlInPipeline(["kubectl get configmap -A"])).toBeNull();
+  it("allows kubectl get configmap (default table, with namespace)", () => {
+    expect(validateKubectlInPipeline(["kubectl get configmap -n default"])).toBeNull();
   });
 
   // ConfigMap describe — blocked (prints full data)
@@ -1443,4 +1449,63 @@ describe("validateKubectlInPipeline — sensitive resource protection", () => {
     const err = validateKubectlInPipeline(["kubectl -n kube-system get secret -o json"]);
     expect(err).not.toBeNull();
   });
+});
+
+describe("validateKubectlInPipeline — rate protection", () => {
+  // ── logs without --tail/--since ──
+  it("blocks kubectl logs without --tail or --since", () => {
+    const err = validateKubectlInPipeline(["kubectl logs my-pod"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("--tail");
+  });
+
+  it("allows kubectl logs with --tail=N", () => {
+    expect(validateKubectlInPipeline(["kubectl logs my-pod --tail=1000"])).toBeNull();
+  });
+
+  it("allows kubectl logs with --tail N (space-separated)", () => {
+    expect(validateKubectlInPipeline(["kubectl logs my-pod --tail 500"])).toBeNull();
+  });
+
+  it("allows kubectl logs with --since", () => {
+    expect(validateKubectlInPipeline(["kubectl logs my-pod --since=1h"])).toBeNull();
+  });
+
+  it("allows kubectl logs with --since-time", () => {
+    expect(validateKubectlInPipeline(["kubectl logs my-pod --since-time=2024-01-01T00:00:00Z"])).toBeNull();
+  });
+
+  // ── -A/--all-namespaces without selectors ──
+  const blockedCmds = [
+    "kubectl get pods -A",
+    "kubectl get pods --all-namespaces",
+    "kubectl describe pods -A",
+    "kubectl events -A",
+    "kubectl events --all-namespaces",
+    "kubectl top pods -A",
+    "kubectl top pods --all-namespaces",
+  ];
+
+  for (const cmd of blockedCmds) {
+    it(`blocks: ${cmd}`, () => {
+      const err = validateKubectlInPipeline([cmd]);
+      expect(err).not.toBeNull();
+      expect(err).toContain("overload the API server");
+    });
+  }
+
+  const allowedCmds = [
+    { cmd: "kubectl get pods -A -l app=web", reason: "has -l" },
+    { cmd: "kubectl get pods -A --field-selector=status.phase=Running", reason: "has --field-selector" },
+    { cmd: "kubectl get pods -A --selector=app=web", reason: "has --selector" },
+    { cmd: "kubectl get pods -n default", reason: "no -A" },
+    { cmd: "kubectl auth can-i --list -A", reason: "auth not restricted" },
+    { cmd: "kubectl version", reason: "not restricted subcommand" },
+  ];
+
+  for (const { cmd, reason } of allowedCmds) {
+    it(`allows: ${cmd} (${reason})`, () => {
+      expect(validateKubectlInPipeline([cmd])).toBeNull();
+    });
+  }
 });
