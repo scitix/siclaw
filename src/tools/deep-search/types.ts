@@ -64,17 +64,17 @@ export interface DeepSearchBudget {
 }
 
 export const NORMAL_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 15,
-  maxHypotheses: 5,
+  maxContextCalls: 15,  // Fallback only — in DP mode, PL agent handles Phase 1 (triage)
+  maxHypotheses: 5,     // Fallback only — in DP mode, PL agent handles Phase 2 (hypotheses)
   maxCallsPerHypothesis: 10,
-  maxTotalCalls: 75,
+  maxTotalCalls: 75,    // When Phase 1+2 are skipped, this budget goes to Phase 3 validation
   maxParallel: 3,
   maxDurationMs: 300_000, // 5 minutes
 };
 
 export const QUICK_BUDGET: DeepSearchBudget = {
-  maxContextCalls: 10,
-  maxHypotheses: 3,
+  maxContextCalls: 10,  // Fallback only — in DP mode, PL agent handles Phase 1
+  maxHypotheses: 3,     // Fallback only — in DP mode, PL agent handles Phase 2
   maxCallsPerHypothesis: 8,
   maxTotalCalls: 40,
   maxParallel: 3,
@@ -101,10 +101,15 @@ export const EVIDENCE_TAIL_CHARS = 1500;
 
 // --- Engine constants ---
 
-/** Early exit threshold: skip remaining hypotheses if one reaches this confidence.
- *  Set to 101 to effectively disable early exit (validate all hypotheses by default).
- *  Lower to 80 to re-enable root-cause-first mode. */
-export const EARLY_EXIT_CONFIDENCE = 101;
+/** When a validated hypothesis reaches this confidence, low-confidence pending
+ *  hypotheses (below EARLY_EXIT_SKIP_BELOW) are skipped to save budget.
+ *  Higher-confidence hypotheses still get validated — real issues often have
+ *  multiple contributing factors. */
+export const EARLY_EXIT_CONFIDENCE = 85;
+
+/** Hypotheses below this confidence are skipped once early exit triggers.
+ *  Hypotheses at or above this threshold are always validated regardless. */
+export const EARLY_EXIT_SKIP_BELOW = 60;
 
 /** Debug trace output truncation: max total chars per tool result. */
 export const TRACE_MAX_OUTPUT = 2000;
