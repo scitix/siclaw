@@ -7,7 +7,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
-import { SAFE_SUBCOMMANDS, validateExecCommand } from "./kubectl.js";
+import { SAFE_SUBCOMMANDS, validateExecCommand, hasAllNamespacesWithoutSelector } from "./kubectl.js";
 import { detectSensitiveResource, getOutputFormat } from "./kubectl-sanitize.js";
 import { loadConfig } from "../core/config.js";
 import {
@@ -58,6 +58,29 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     if (subcommand === "exec") {
       const execCheck = validateExecCommand(args);
       if (execCheck) return execCheck;
+    }
+
+    // ── Rate protection: logs without --tail/--since ─────────────
+    if (subcommand === "logs") {
+      const hasTail = args.some(a => a === "--tail" || a.startsWith("--tail="));
+      const hasSince = args.some(a =>
+        a === "--since" || a.startsWith("--since=") ||
+        a === "--since-time" || a.startsWith("--since-time="),
+      );
+      if (!hasTail && !hasSince) {
+        return JSON.stringify({
+          error: "kubectl logs without --tail or --since can pull excessive data from the kubelet.",
+          hint: 'Add --tail=<N> or --since=<duration>, e.g. "kubectl logs my-pod --tail=1000".',
+        }, null, 2);
+      }
+    }
+
+    // ── Rate protection: -A/--all-namespaces without selectors ───
+    if (hasAllNamespacesWithoutSelector(args, subcommand)) {
+      return JSON.stringify({
+        error: `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`,
+        hint: "Use -n <namespace> to target a specific namespace, or add -l <label> / --field-selector <selector> to narrow the query.",
+      }, null, 2);
     }
 
     // Block "kubectl config view --raw" — leaks full kubeconfig with certs/tokens
