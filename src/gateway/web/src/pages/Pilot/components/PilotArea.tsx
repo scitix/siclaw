@@ -520,7 +520,6 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     isInPanel={panelMessage?.id === msg.id}
                                     investigationProgress={investigationProgress}
                                     sendMessage={sendMessage}
-                                    abortResponse={abortResponse}
                                     dpFocus={dpFocus}
                                     dpChecklistActive={dpChecklist != null && dpChecklist.length > 0}
                                     onHypothesesConfirmed={onHypothesesConfirmed}
@@ -715,7 +714,7 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -730,7 +729,6 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     isInPanel?: boolean;
     investigationProgress?: InvestigationProgress | null;
     sendMessage?: (text: string) => void;
-    abortResponse?: () => void;
     dpFocus?: string | null;
     /** True when DpChecklistCard is active — used to hide InvestigationCard even if dpFocus is transiently null */
     dpChecklistActive?: boolean;
