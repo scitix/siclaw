@@ -399,15 +399,15 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   }
 
   // 6. Sensitive path patterns (secondary defense layer)
+  // Check ALL commands against sensitive path patterns — not gated by
+  // FILE_READING_CMDS, because any command with a sensitive path in its
+  // arguments is a potential leak vector.
   if (options?.sensitivePathPatterns) {
     for (const cmd of commands) {
-      const binary = getCommandBinary(cmd);
-      if (binary && FILE_READING_CMDS.has(binary)) {
-        if (options.sensitivePathPatterns.some((re) => re.test(cmd))) {
-          return JSON.stringify({
-            error: "Reading credential or config files is not allowed.",
-          }, null, 2);
-        }
+      if (options.sensitivePathPatterns.some((re) => re.test(cmd))) {
+        return JSON.stringify({
+          error: "Accessing sensitive paths is not allowed.",
+        }, null, 2);
       }
     }
   }

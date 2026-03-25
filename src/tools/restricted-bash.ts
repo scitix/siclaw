@@ -7,10 +7,12 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
+import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand } from "./kubectl.js";
 import { detectSensitiveResource, getOutputFormat } from "./kubectl-sanitize.js";
 import { loadConfig } from "../core/config.js";
 import {
+  CONTAINER_SENSITIVE_PATHS,
   getCommandBinary,
   parseArgs,
   validateCommandRestrictions,
@@ -192,12 +194,13 @@ export function isSkillScript(cmd: string): boolean {
 // ── Sensitive path patterns ──────────────────────────────────────────
 
 const SENSITIVE_PATH_RE = [
+  ...CONTAINER_SENSITIVE_PATHS,
+  // Local-only patterns (protect agentbox's own credentials)
   /\.siclaw\/credentials\//,
   /\.siclaw\/config\//,
   /\$\{?KUBECONFIG\}?/,
   /\/etc\/siclaw\//,
   /\.kube\//,
-  /\/proc\/self\/environ/,
   /\.credentials\//,
 ];
 
@@ -279,6 +282,33 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const commands = _extractCommands(command);
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
+
+      // Post-execution output sanitization: determine which command's output to sanitize.
+      // For kubectl exec, use the inner command after "--".
+      // For other commands/pipelines, use the last command (determines output format).
+      const outputAction = (() => {
+        // Check for kubectl exec in the pipeline
+        for (const cmd of commands) {
+          const bin = getCommandBinary(cmd);
+          if (bin === "kubectl") {
+            const args = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
+            const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+            if (sub === "exec") {
+              const dashIdx = args.indexOf("--");
+              if (dashIdx >= 0 && dashIdx < args.length - 1) {
+                const innerArgs = args.slice(dashIdx + 1);
+                const innerBin = innerArgs[0]?.split("/").pop() ?? "";
+                return analyzeOutput(innerBin, innerArgs.slice(1));
+              }
+            }
+          }
+        }
+        // For non-kubectl-exec commands, use the last command in the pipeline
+        const lastCmd = commands[commands.length - 1];
+        const lastArgs = parseArgs(lastCmd);
+        const lastBin = getCommandBinary(lastCmd);
+        return lastBin ? analyzeOutput(lastBin, lastArgs.slice(1)) : null;
+      })();
       const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
 
       try {
@@ -347,14 +377,16 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         signal?.removeEventListener("abort", onAbort);
 
-        const output = stdout.trim() +
+        const sanitizedStdout = applySanitizer(stdout.trim(), outputAction);
+        const output = sanitizedStdout +
           (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+        const sanitizedStdout = applySanitizer(err.stdout?.trim() ?? "", outputAction);
+        const output = `Exit code: ${err.code ?? "unknown"}\n${sanitizedStdout}\n${err.stderr?.trim() ?? err.message}`;
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode: err.code, error: true },

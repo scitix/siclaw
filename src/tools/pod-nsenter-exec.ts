@@ -3,8 +3,9 @@ import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult } from "./tool-render.js";
+import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 import { loadConfig } from "../core/config.js";
-import { parseArgs } from "./command-sets.js";
+import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
 import { validateCommand } from "./command-validator.js";
 import {
   validatePodName,
@@ -126,7 +127,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command, { context: "nsenter" });
+      const cmdErr = validateCommand(params.command, { context: "nsenter", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -148,8 +149,16 @@ Examples:
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const cmdArgs = parseArgs(params.command);
 
+      // Post-execution output sanitization
+      // Convention: binary is separate, args does NOT include binary itself
+      const binary = cmdArgs[0]?.split("/").pop() ?? "";
+      const action = analyzeOutput(binary, cmdArgs.slice(1));
+
+      // Use rewritten args if action requires it
+      const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
+
       // Escape single quotes in command args for embedding in shell script
-      const escapedArgs = cmdArgs.map(a => a.replace(/'/g, "'\\''")).map(a => `'${a}'`).join(" ");
+      const escapedArgs = execArgs.map(a => a.replace(/'/g, "'\\''")).map(a => `'${a}'`).join(" ");
 
       // The inner script runs on the host via outer nsenter,
       // then uses inner nsenter to enter only the pod's network namespace.
@@ -182,6 +191,8 @@ unshare --mount sh -c 'nsenter -t '"$PID"' -n -- mount -t sysfs none /sys 2>/dev
         };
       }
 
+      // Apply output sanitization before formatting
+      execResult.stdout = applySanitizer(execResult.stdout, action);
       return formatExecOutput(execResult);
     },
   };
