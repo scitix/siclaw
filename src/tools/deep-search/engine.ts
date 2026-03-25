@@ -24,6 +24,7 @@ import type {
 import {
   NORMAL_BUDGET,
   EARLY_EXIT_CONFIDENCE,
+  EARLY_EXIT_SKIP_BELOW,
   TRACE_MAX_OUTPUT,
   TRACE_HEAD_CHARS,
   TRACE_TAIL_CHARS,
@@ -644,7 +645,7 @@ export async function investigate(
 
   await new Promise<void>((resolvePool) => {
     function tryStartNext() {
-      while (activeCount < budget.maxParallel && !rootCauseFound) {
+      while (activeCount < budget.maxParallel) {
         // Timeout check
         if (Date.now() - startTime > budget.maxDurationMs) {
           timedOut = true;
@@ -659,6 +660,14 @@ export async function investigate(
         // Pick from retry queue first, then main queue
         const hypothesis = retryQueue.shift() ?? queue.shift();
         if (!hypothesis) break;
+
+        // Smart skip: if a high-confidence root cause was found, skip low-confidence
+        // hypotheses to save budget — but still validate reasonably likely ones.
+        if (rootCauseFound && hypothesis.confidence < EARLY_EXIT_SKIP_BELOW) {
+          hypothesis.status = "skipped";
+          onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "skipped", confidence: hypothesis.confidence, text: hypothesis.text });
+          continue;
+        }
 
         const isRetry = hypothesis.status === "inconclusive";
 
