@@ -20,7 +20,7 @@ import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import type { DpState } from "../tools/dp-tools.js";
+import type { DpState, DpStateRef, DpStatus } from "../tools/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 // topic-consolidator import removed — consolidation disabled
@@ -63,10 +63,19 @@ export interface ManagedSession {
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
+  dpStateRef?: DpStateRef;
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
+}
+
+export interface PersistedDpStateSnapshot {
+  dpStatus: DpStatus;
+  question?: string;
+  round?: number;
+  confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
 }
 
 /** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
@@ -243,6 +252,7 @@ export class AgentBoxSessionManager {
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
       dpState: result.dpState,
+      dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
     };
@@ -358,6 +368,53 @@ export class AgentBoxSessionManager {
    */
   get(sessionId: string): ManagedSession | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  /**
+   * Read the last persisted dp-mode snapshot from the session JSONL without
+   * restoring the full session into memory.
+   */
+  getPersistedDpState(sessionId: string): PersistedDpStateSnapshot | null {
+    try {
+      const sessionDir = path.join(this.getBaseSessionDir(), sessionId);
+      if (!fs.existsSync(sessionDir)) return null;
+
+      const frameworkSessionManager = SessionManager.continueRecent(process.cwd(), sessionDir);
+      const entry = frameworkSessionManager.getEntries()
+        .filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "dp-mode")
+        .pop() as { data?: {
+          dpStatus?: DpStatus;
+          dpQuestion?: string;
+          dpRound?: number;
+          dpConfirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
+          checklist?: { question?: string };
+          phase?: string;
+          question?: string;
+        } } | undefined;
+
+      if (!entry?.data) return null;
+
+      if (entry.data.dpStatus) {
+        return {
+          dpStatus: entry.data.dpStatus,
+          question: entry.data.dpQuestion ?? entry.data.checklist?.question,
+          round: entry.data.dpRound,
+          confirmedHypotheses: entry.data.dpConfirmedHypotheses,
+        };
+      }
+
+      // Legacy fallback: any persisted checklist/phase means the session was in DP.
+      if (entry.data.checklist || (entry.data.phase && entry.data.phase !== "idle")) {
+        return {
+          dpStatus: "investigating",
+          question: entry.data.question ?? entry.data.checklist?.question,
+        };
+      }
+    } catch (err) {
+      console.warn(`[agentbox-session] Failed to read persisted dp-state for ${sessionId}:`, err);
+    }
+
+    return null;
   }
 
   /**

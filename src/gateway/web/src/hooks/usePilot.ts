@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { useWebSocket, type WsMessage } from './useWebSocket';
 import { rpcGetSkills, type Skill } from '@/pages/Skills/skillsData';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
+import { parseHypotheses as parseHypothesesText } from '@/pages/Pilot/components/HypothesesCard';
 
 export interface ModelInfo {
     id: string;
@@ -160,14 +161,7 @@ export type BrainType = "pi-agent" | "claude-sdk";
 
 type DpChecklistItem = { id: string; label: string; status: 'pending' | 'in_progress' | 'done' | 'skipped' | 'error'; summary?: string };
 
-function createDefaultDpChecklist(): DpChecklistItem[] {
-    return [
-        { id: 'triage', label: 'Quick triage', status: 'pending' },
-        { id: 'hypotheses', label: 'Propose hypotheses', status: 'pending' },
-        { id: 'deep_search', label: 'Deep search validation', status: 'pending' },
-        { id: 'conclusion', label: 'Present findings', status: 'pending' },
-    ];
-}
+// createDefaultDpChecklist() removed — checklist is now created by gateway via syncChecklistFromStatus().
 
 /** Parse tool input from DB (stored as JSON string) into display string */
 function parseToolInput(toolName: string, raw: string): string {
@@ -273,6 +267,8 @@ export function usePilot() {
     const workspaceId = currentWorkspace?.id;
     const prevWorkspaceIdRef = useRef<string | undefined>(workspaceId);
     const [messages, setMessages] = useState<PilotMessage[]>([]);
+    const messagesRef = useRef<PilotMessage[]>([]);
+    messagesRef.current = messages;
     const [investigationProgress, setInvestigationProgress] = useState<InvestigationProgress | null>(null);
     const [dpFocus, setDpFocus] = useState<string | null>(null);
     const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null);
@@ -326,7 +322,7 @@ export function usePilot() {
     // Guards async session switches: only the latest loadHistory request may write UI state.
     const loadHistoryRequestIdRef = useRef(0);
     // Ref for restoring DP progress (used by loadHistory to call restoreDpProgress which is defined later)
-    const restoreDpProgressRef = useRef<(sessionKey?: string | null) => Promise<void>>(async () => {});
+    const restoreDpProgressRef = useRef<(sessionKey?: string | null, loadedMessages?: PilotMessage[]) => Promise<void>>(async () => {});
     // DP-related timeout refs (for cleanup on abort/session switch)
     const dpTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
@@ -422,22 +418,9 @@ export function usePilot() {
                     // Initialize investigation progress for deep_search (preserve optimistic state if present)
                     if (toolName === 'deep_search') {
                         setInvestigationProgress(prev => prev ?? { hypotheses: [] });
-                        // Ensure dpChecklist exists so InvestigationCard is hidden in favor of DpChecklistCard.
-                        // Covers page refresh where restoreDpProgress returned empty (Phase 3 hadn't started yet).
-                        setDpChecklist(prev => {
-                            if (prev) return prev;
-                            const checklist = createDefaultDpChecklist();
-                            checklist[0].status = 'done';         // triage
-                            checklist[1].status = 'done';         // hypotheses
-                            checklist[2].status = 'in_progress';  // deep_search
-                            return checklist;
-                        });
-                        setDpFocus(prev => prev ?? 'deep_search');
+                        // Checklist creation now handled by dp_status event from gateway.
                     }
-                    // Handle end_investigation: immediately reset all DP state
-                    if (toolName === 'end_investigation') {
-                        resetDpState();
-                    }
+                    // end_investigation cleanup now driven by dp_status "completed" event from gateway.
                     setMessages(prev => [...prev, {
                         id: `tool-${Date.now()}`,
                         role: 'tool' as const,
@@ -468,17 +451,9 @@ export function usePilot() {
                     // When deep_search completes, mark all remaining checklist items
                     // as done and auto-clear after 3s. This replaces the old
                     // manage_checklist(conclusion=done) trigger.
+                    // deep_search completion: checklist update comes from dp_status event.
+                    // Auto-clear hypothesis tree after all hypotheses finish.
                     if (endedToolName === 'deep_search') {
-                        setDpChecklist(prev => {
-                            if (!prev) return prev;
-                            return prev.map(i =>
-                                i.status === 'pending' || i.status === 'in_progress'
-                                    ? { ...i, status: 'done' as const }
-                                    : i
-                            );
-                        });
-                        setDpFocus(null);
-                        dpTimeout(() => resetDpState(), 3000);
                         dpTimeout(() => {
                             setInvestigationProgress(prev => {
                                 if (prev && prev.hypotheses.every(h =>
@@ -513,68 +488,39 @@ export function usePilot() {
                 case 'tool_progress': {
                     const progress = payload.progress as Record<string, unknown> | undefined;
                     if (payload.toolName === 'deep_search' && progress) {
+                        // Hypothesis-level detail (sub-agent progress tree) — kept for validating phase
                         setInvestigationProgress(prev => {
                             const state = prev ?? { hypotheses: [] };
                             return reduceInvestigationProgress(state, progress);
                         });
-                        // Map engine phase events to dpChecklist (system-driven, not LLM-driven).
-                        // Phase mapping logic mirrors applyPhaseToChecklist() in dp-tools.ts
-                        // and restoreDpProgress below. Keep all three in sync.
-                        if (progress.type === 'phase') {
-                            const phaseStr = typeof progress.phase === 'string' ? progress.phase : '';
-                            const m = phaseStr.match(/(\d+)/);
-                            const phaseNum = m ? parseInt(m[1], 10) : 0;
-                            if (phaseNum >= 1) {
-                                setDpChecklist(prev => {
-                                    // Only update existing checklist — don't create one for
-                                    // standalone deep_search (no DP mode active).
-                                    if (!prev) return prev;
-                                    const items: DpChecklistItem[] = prev.map(i => ({ ...i }));
-                                    for (let i = 0; i < items.length; i++) {
-                                        if (i < phaseNum - 1) {
-                                            // Forward-only: don't regress already-done items
-                                            if (items[i].status !== 'done' && items[i].status !== 'skipped') {
-                                                items[i].status = 'done';
-                                            }
-                                        } else if (i === phaseNum - 1) {
-                                            if (items[i].status !== 'done' && items[i].status !== 'skipped') {
-                                                items[i].status = 'in_progress';
-                                            }
-                                        }
-                                    }
-                                    const focus = items.find(i => i.status === 'in_progress');
-                                    setDpFocus(focus ? focus.id : null);
-                                    return items;
-                                });
-                            }
-                        }
+                        // Checklist updates now come from dp_status events (gateway-emitted).
+                        // Phase N/4 mapping removed — dpStatus is the single source of truth.
+                    }
+                    break;
+                }
+
+                // dp_status: gateway-emitted synthetic event — single source for checklist state
+                case 'dp_status': {
+                    const dpStatus = payload.dpStatus as string | undefined;
+                    const checklist = payload.checklist as DpChecklistItem[] | null | undefined;
+                    if (!dpStatus || dpStatus === 'idle') {
+                        resetDpState();
+                        break;
+                    }
+                    setDpActive(true);
+                    if (checklist) {
+                        setDpChecklist(checklist);
+                        const focus = checklist.find(i => i.status === 'in_progress');
+                        setDpFocus(focus ? focus.id : null);
+                    }
+                    if (dpStatus === 'completed') {
+                        dpTimeout(() => resetDpState(), 3000);
                     }
                     break;
                 }
 
                 case 'message_start': {
                     const msg = payload.message as { role?: string; customType?: string; details?: Record<string, unknown>; content?: Array<{ type: string; text?: string }> } | undefined;
-                    // Handle dp-checklist-sync: backend auto-completed items on agent_end
-                    if (msg?.customType === 'dp-checklist-sync' && msg.details?.items) {
-                        const syncItems = msg.details.items as Array<{ id: string; status: string; summary?: string }>;
-                        setDpChecklist(prev => {
-                            if (!prev) return prev;
-                            const items = prev.map(i => ({ ...i }));
-                            for (const sync of syncItems) {
-                                const item = items.find(i => i.id === sync.id);
-                                if (item) {
-                                    item.status = sync.status as DpChecklistItem['status'];
-                                    if (sync.summary) item.summary = sync.summary;
-                                }
-                            }
-                            const allDone = items.every(i => i.status === 'done' || i.status === 'skipped');
-                            if (allDone) {
-                                dpTimeout(() => resetDpState(), 3000);
-                            }
-                            return items;
-                        });
-                        break;
-                    }
 
                     // Show steer (user) messages injected mid-conversation.
                     // The initial prompt's user message is already displayed by sendMessage,
@@ -662,28 +608,8 @@ export function usePilot() {
                     loadModelsRef.current();
                     fetchModelRef.current();
 
-                    // DP safety-net: auto-complete checklist when agent ends.
-                    // The backend agent_end handler sends dp-checklist-sync, but
-                    // it's async and may not arrive before SSE closes (race condition).
-                    // Mirror the backend logic here to ensure frontend consistency.
-                    // Only skip if hypotheses phase isn't done yet — model is waiting
-                    // for user confirmation (gate blocked), not truly finished.
-                    setDpChecklist(prev => {
-                        if (!prev) return prev;
-                        const hypoItem = prev.find(i => i.id === 'hypotheses');
-                        // If hypotheses phase isn't done, the agent is likely waiting
-                        // for user confirmation — don't auto-complete
-                        if (hypoItem && hypoItem.status !== 'done' && hypoItem.status !== 'skipped') return prev;
-                        const hasIncomplete = prev.some(i => i.status === 'pending' || i.status === 'in_progress');
-                        if (!hasIncomplete) return prev;
-                        const completed = prev.map(i =>
-                            i.status === 'pending' || i.status === 'in_progress'
-                                ? { ...i, status: 'done' as const, summary: i.summary || 'Auto-completed' }
-                                : i
-                        );
-                        dpTimeout(() => resetDpState(), 3000);
-                        return completed;
-                    });
+                    // DP checklist completion now handled by dp_status "completed" event from gateway.
+                    // No safety-net needed — gateway emits dp_status on agent_end when status is concluding.
                     break;
             }
         }
@@ -813,10 +739,12 @@ export function usePilot() {
         setPendingMessages([]);
         clearDpTimers();
         resetDpState();
+        let loadedMsgs: PilotMessage[] = [];
         try {
             const result = await sendRpc<{ messages: PilotMessage[]; hasMore: boolean }>('chat.history', { sessionId: sessionKey });
             if (loadHistoryRequestIdRef.current !== requestId) return;
-            setMessages(mapMessages(result.messages ?? []));
+            loadedMsgs = mapMessages(result.messages ?? []);
+            setMessages(loadedMsgs);
             setHasMore(result.hasMore ?? false);
         } catch (err) {
             if (loadHistoryRequestIdRef.current === requestId) {
@@ -837,7 +765,7 @@ export function usePilot() {
         // Restore deep investigation progress (checklist cards, hypothesis tree).
         // Pass sessionKey explicitly to avoid race with async currentSessionKeyRef update.
         if (loadHistoryRequestIdRef.current !== requestId) return;
-        await restoreDpProgressRef.current(sessionKey);
+        await restoreDpProgressRef.current(sessionKey, loadedMsgs);
     }, [isConnected, sendRpc]);
 
     const loadMoreHistory = useCallback(async () => {
@@ -875,13 +803,7 @@ export function usePilot() {
             return;
         }
 
-        // Eagerly init DP checklist when starting a Deep Investigation
-        if (text.startsWith('[Deep Investigation]')) {
-            setDpChecklist(createDefaultDpChecklist().map(i =>
-                i.id === 'triage' ? { ...i, status: 'in_progress' as const } : i
-            ));
-            setDpFocus('triage');
-        }
+        // DP checklist init now handled by dp_status "investigating" event from gateway.
 
         const userMsg: PilotMessage = {
             id: `user-${Date.now()}`,
@@ -898,7 +820,7 @@ export function usePilot() {
                 message: text,
                 modelProvider: selectedModel?.provider,
                 modelId: selectedModel?.id,
-                brainType: selectedBrain,
+                brainType: currentSessionKey ? (sessionBrainType ?? undefined) : selectedBrain,
                 workspaceId,
             });
             // Lock brain selector to the actual session brain type
@@ -915,7 +837,7 @@ export function usePilot() {
             console.error('Failed to send message:', err);
             setIsLoading(false);
         }
-    }, [isConnected, isLoading, currentSessionKey, selectedModel, selectedBrain, sendRpc]);
+    }, [isConnected, isLoading, currentSessionKey, selectedModel, selectedBrain, sendRpc, sessionBrainType]);
 
     const abortResponse = useCallback(async () => {
         if (!isConnected) return;
@@ -996,26 +918,9 @@ export function usePilot() {
         sendMessage('[DP_EXIT]\nPlease briefly summarize the current investigation progress and findings.');
     }, [dismissDpChecklist, sendMessage]);
 
-    /** Optimistic UI: immediately show hypothesis tree + deep_search in_progress when user confirms */
+    /** Populate hypothesis tree when user confirms. Checklist update comes from dp_status event. */
     const confirmHypotheses = useCallback((hypotheses: Array<{ id: string; text: string; confidence: number }>) => {
-        // Mark triage+hypotheses as done, deep_search as in_progress
-        setDpChecklist(prev => {
-            if (!prev) return prev;
-            return prev.map(item => {
-                if (item.id === 'triage' && item.status !== 'done') {
-                    return { ...item, status: 'done' as const, summary: item.summary || 'Done' };
-                }
-                if (item.id === 'hypotheses' && item.status !== 'done') {
-                    return { ...item, status: 'done' as const, summary: item.summary || 'Confirmed' };
-                }
-                if (item.id === 'deep_search') {
-                    return { ...item, status: 'in_progress' as const };
-                }
-                return item;
-            });
-        });
-        setDpFocus('deep_search');
-        // Populate hypothesis tree with pending status
+        // Pre-populate hypothesis tree with pending status (optimistic UI for sub-agent progress)
         setInvestigationProgress({
             hypotheses: hypotheses.map(h => ({
                 id: h.id,
@@ -1026,8 +931,7 @@ export function usePilot() {
                 maxCalls: 10,
             })),
         });
-        // Try to clear gate via dedicated RPC. This may fail if the agent session
-        // has already ended (normal — the steer message's input handler clears it instead).
+        // Compat: fire-and-forget RPC (no-op on backend, kept for older gateway versions)
         sendRpc('chat.confirmHypotheses', { sessionId: currentSessionKeyRef.current }).catch(() => {});
     }, [sendRpc]);
 
@@ -1066,9 +970,12 @@ export function usePilot() {
     }, [isConnected, sendRpc, currentSessionKey, loadSessions]);
 
     // Reset loading state when WebSocket disconnects mid-generation.
-    // Give a 15s grace window for WS to auto-reconnect (SSH tunnel flaps,
+    // Give a grace window for WS to auto-reconnect (SSH tunnel flaps,
     // browser sleep, network blips). Backend SSE continues independently.
+    // deep_search runs long sub-agent tasks — use 60s grace instead of 15s.
     const disconnectTimerRef = useRef<ReturnType<typeof setTimeout>>();
+    const deepSearchRunning = dpChecklist?.some(i => i.id === 'deep_search' && i.status === 'in_progress');
+    const disconnectGraceMs = deepSearchRunning ? 60_000 : 15_000;
     useEffect(() => {
         if (!isConnected && isLoading) {
             disconnectTimerRef.current = setTimeout(() => {
@@ -1090,9 +997,10 @@ export function usePilot() {
                     );
                 });
                 setDpFocus(null);
-                setInvestigationProgress(null);
+                // Preserve hypothesis tree data on error — only clear the live action indicator
+                setInvestigationProgress(prev => prev ? { ...prev, currentAction: undefined } : null);
                 dpTimeout(() => resetDpState(), 10_000);
-            }, 15_000);
+            }, disconnectGraceMs);
         }
         return () => {
             if (disconnectTimerRef.current) {
@@ -1100,13 +1008,15 @@ export function usePilot() {
                 disconnectTimerRef.current = undefined;
             }
         };
-    }, [isConnected, isLoading]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [isConnected, isLoading, disconnectGraceMs]);
 
     // Stale-loading watchdog: if isLoading but no agent events for too long,
     // the backend likely died silently — reset UI so user isn't stuck.
-    // DP phases send frequent progress events, so use a shorter timeout (45s).
-    // Non-DP conversations keep the original 120s timeout.
-    const staleTimeoutMs = dpChecklist ? 45_000 : 120_000;
+    // deep_search (Phase 3) runs long sub-agent LLM calls that can go 60s+
+    // without events — use 5 min to avoid false positives.
+    // Other DP phases use 90s; non-DP keeps 120s.
+    const deepSearchActive = dpChecklist?.some(i => i.id === 'deep_search' && i.status === 'in_progress');
+    const staleTimeoutMs = deepSearchActive ? 300_000 : dpChecklist ? 90_000 : 120_000;
     useEffect(() => {
         if (isLoading) {
             lastAgentEventRef.current = Date.now();
@@ -1131,7 +1041,8 @@ export function usePilot() {
                         );
                     });
                     setDpFocus(null);
-                    setInvestigationProgress(null);
+                    // Preserve hypothesis tree data on error — only clear the live action indicator
+                    setInvestigationProgress(prev => prev ? { ...prev, currentAction: undefined } : null);
                     dpTimeout(() => resetDpState(), 10_000);
                 }
             }, 15_000); // check every 15s
@@ -1144,9 +1055,10 @@ export function usePilot() {
         }
     }, [isLoading, staleTimeoutMs]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    /** Restore deep_search progress from gateway snapshot after WS reconnect / page refresh.
+    /** Restore DP progress from gateway snapshot after WS reconnect / page refresh.
+     *  Uses dpStatus from agentbox (authoritative) or gateway cache (fallback).
      *  Accepts an explicit sessionKey to avoid race with async state updates. */
-    const restoreDpProgress = useCallback(async (sessionKey?: string | null) => {
+    const restoreDpProgress = useCallback(async (sessionKey?: string | null, loadedMessages?: PilotMessage[]) => {
         if (!isConnected) return;
         const targetSession = sessionKey ?? currentSessionKeyRef.current;
         if (!targetSession) return;
@@ -1155,54 +1067,100 @@ export function usePilot() {
                 sessionId?: string;
                 events: Array<Record<string, unknown>> | null;
                 promptActive?: boolean;
+                dpStatus?: string | null;
+                checklist?: DpChecklistItem[] | null;
+                dpQuestion?: string | null;
+                confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }> | null;
             }>('chat.dpProgress', { sessionId: targetSession });
-            // If prompt is still running on the backend, restore loading state
+
+            // Restore loading state if prompt is still active
             if (snap.promptActive) {
                 setIsLoading(true);
             }
-            // Snapshot data is only meaningful while a deep investigation is still active.
-            // If the prompt has already finished, restoring the old phase/checklist leaves
-            // the UI stuck showing a stale "Present findings" card for completed sessions.
-            if (!snap.promptActive) return;
 
-            // Replay events through the same reducer used for live progress
-            let state: InvestigationProgress = { hypotheses: [] };
+            // Restore dpStatus/checklist regardless of promptActive.
+            // awaiting_confirmation = prompt ended but DP is still alive.
+            if (snap.checklist && snap.dpStatus && snap.dpStatus !== 'idle') {
+                setDpActive(true);
+                setDpChecklist(snap.checklist);
+                const focus = snap.checklist.find(i => i.status === 'in_progress');
+                setDpFocus(focus ? focus.id : null);
+            }
+
+            // Build hypothesis text lookup from the latest propose_hypotheses message in chat history.
+            // This is the same data source the HypothesesCard uses — guaranteed to have correct titles.
+            const hypothesesTextMap = new Map<string, string>();
+            {
+                // Use explicitly passed messages (avoids React batching race with messagesRef)
+                const msgs = loadedMessages ?? messagesRef.current;
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i];
+                    if (m.toolName === 'propose_hypotheses' && (m.toolDetails?.hypotheses || m.toolInput)) {
+                        const raw = m.toolDetails?.hypotheses;
+                        if (Array.isArray(raw)) {
+                            // Structured path (SDK brain)
+                            (raw as Array<{ id?: string; text?: string }>).forEach((h, idx) => {
+                                hypothesesTextMap.set(h.id ?? `H${idx + 1}`, h.text ?? '');
+                            });
+                        } else {
+                            // Pi-agent path (string) — reuse HypothesesCard's parser
+                            const source = (raw as string | undefined) || m.toolInput || '';
+                            if (source) {
+                                const parsed = parseHypothesesText(source);
+                                parsed.forEach((h, idx) => {
+                                    hypothesesTextMap.set(`H${idx + 1}`, h.title);
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+                // Fallback: use confirmedHypotheses from agentbox dp-state (may have empty text
+                // due to extension parser mismatch, but better than nothing)
+                if (hypothesesTextMap.size === 0 && snap.confirmedHypotheses) {
+                    snap.confirmedHypotheses.forEach(h => {
+                        if (h.text) hypothesesTextMap.set(h.id, h.text);
+                    });
+                }
+            }
+
+            // Replay investigation progress for hypothesis tree (deep_search sub-agent detail)
             if (snap.events && snap.events.length > 0) {
+                let state: InvestigationProgress = { hypotheses: [] };
                 for (const ev of snap.events) {
                     state = reduceInvestigationProgress(state, ev);
                 }
-                setInvestigationProgress(state);
-            }
-
-            // Always create dpChecklist when prompt is active, even without events.
-            // Without this, a page refresh during deep_search shows the bare
-            // InvestigationCard (no progress bars) instead of DpChecklistCard.
-            // Phase mapping mirrors applyPhaseToChecklist() in dp-tools.ts
-            // and the tool_progress handler above. Keep all three in sync.
-            const phase = state.phase;
-            const checklist = createDefaultDpChecklist();
-            const phaseNum = phase ? parseInt(phase.match(/(\d+)/)?.[1] ?? '0') : 0;
-            if (phaseNum >= 1) {
-                // Map engine phases to checklist items: 1→triage, 2→hypotheses, 3→deep_search, 4→conclusion
-                for (let i = 0; i < checklist.length; i++) {
-                    if (i < phaseNum - 1) {
-                        checklist[i].status = 'done';
-                    } else if (i === phaseNum - 1) {
-                        checklist[i].status = 'in_progress';
-                    }
+                // Backfill missing hypothesis titles from chat history / confirmedHypotheses
+                if (hypothesesTextMap.size > 0) {
+                    state = {
+                        ...state,
+                        hypotheses: state.hypotheses.map(h =>
+                            !h.text && hypothesesTextMap.has(h.id)
+                                ? { ...h, text: hypothesesTextMap.get(h.id)! }
+                                : h
+                        ),
+                    };
                 }
-            } else {
-                // No phase info — default to deep_search in_progress so
-                // DpChecklistCard renders instead of bare InvestigationCard.
-                checklist[0].status = 'done';
-                checklist[1].status = 'done';
-                checklist[2].status = 'in_progress';
+                setInvestigationProgress(state);
+            } else if (hypothesesTextMap.size > 0 && snap.promptActive) {
+                // No progress events cached, but we have hypothesis names from history.
+                // Pre-populate so the tree shows titles immediately.
+                const entries = snap.confirmedHypotheses ?? Array.from(hypothesesTextMap.entries()).map(
+                    ([id, text]) => ({ id, text, confidence: 0 }),
+                );
+                setInvestigationProgress({
+                    hypotheses: entries.map(h => ({
+                        id: h.id,
+                        text: hypothesesTextMap.get(h.id) || h.text || '',
+                        status: 'validating' as const,
+                        confidence: h.confidence,
+                        callsUsed: 0,
+                        maxCalls: 10,
+                    })),
+                });
             }
-            setDpChecklist(checklist);
-            const focus = checklist.find(i => i.status === 'in_progress');
-            setDpFocus(focus ? focus.id : null);
         } catch {
-            // Ignore — gateway may not support this RPC yet
+            // Gateway may not support extended dpProgress yet
         }
     }, [isConnected, sendRpc]);
     restoreDpProgressRef.current = restoreDpProgress;

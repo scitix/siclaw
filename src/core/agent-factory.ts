@@ -36,9 +36,11 @@ import { createInvestigationFeedbackTool } from "../tools/investigation-feedback
 import { createSaveFeedbackTool } from "../tools/save-feedback.js";
 import {
   type DpState,
+  type DpStateRef,
+  type MutableDpStateRef,
+  createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
-  getDpWorkflow,
 } from "../tools/dp-tools.js";
 import { createMemorySearchTool } from "../tools/memory-search.js";
 import { createMemoryGetTool } from "../tools/memory-get.js";
@@ -116,6 +118,8 @@ export interface SiclawSessionResult {
   memoryIndexer?: MemoryIndexer;
   /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
   dpState?: DpState;
+  /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
+  dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
   sessionIdRef: { current: string };
 
@@ -281,6 +285,12 @@ export async function createSiclawSession(
   // can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
 
+  // DP state ref — shared object, two views:
+  // - MutableDpStateRef: held by the extension (single writer)
+  // - DpStateRef (readonly): passed to tools and agentbox for read-only access
+  const mutableDpStateRef: MutableDpStateRef = { status: "idle" };
+  const dpStateRef: DpStateRef = mutableDpStateRef;
+
   const customTools: ToolDefinition[] = [
     createRestrictedBashTool(kubeconfigRef),
     createNodeExecTool(kubeconfigRef, userId),
@@ -290,7 +300,7 @@ export async function createSiclawSession(
     createPodExecTool(kubeconfigRef),
     createPodNsenterExecTool(kubeconfigRef, userId),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
-    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef),
+    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
     createInvestigationFeedbackTool(memoryRef),
     createSaveFeedbackTool(sessionIdRef),
     createCredentialListTool(kubeconfigRef),
@@ -499,7 +509,7 @@ export async function createSiclawSession(
       return parts;
     },
     // Extension registration order: compactionSafeguard handles session_before_compact.
-    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef), (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef), (api) => setupExtension(api, credentialsDir)],
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();
@@ -531,12 +541,11 @@ export async function createSiclawSession(
     // Restricted file tools are already in customTools (pushed above)
     const sdkTools = [...customTools];
 
-    // DP tools for SDK brain — mutable state shared with http-server via dpState ref
-    const dpState: DpState = { checklist: null };
-    sdkTools.push(
-      createProposeHypothesesTool(dpState),
-      createEndInvestigationTool(dpState),
-    );
+    // DP tools are NOT registered for SDK brain — the interactive DP workflow
+    // (propose_hypotheses → user confirm → deep_search) requires pi-agent extension
+    // handlers for [DP_CONFIRM]/[DP_ADJUST]/[DP_SKIP] markers. Without those,
+    // SDK brain DP gets stuck at awaiting_confirmation. Tracked for future work.
+    const dpState: DpState = createDpState();
 
     const systemPrompt = buildSreSystemPrompt(memoryDir, mode);
 
@@ -544,30 +553,9 @@ export async function createSiclawSession(
     const appendParts = buildAppendSystemPrompt(memoryDir);
     let systemPromptAppend = appendParts.join("\n") || undefined;
 
-    // Inject deep investigation judgment framework
-    const dpWorkflow = getDpWorkflow();
-    if (dpWorkflow) {
-      systemPromptAppend = (systemPromptAppend ?? "") + `\n\n## Investigation Capability
-
-You have access to deep investigation tools. Use judgment about when and how:
-
-**When to investigate autonomously:**
-- Problem has a clear direction → call deep_search directly with your triage context
-- User gives specific instruction (e.g. "validate H1 and H3") → execute immediately
-
-**When to consult the user first:**
-- Multiple plausible root causes and investigation will be expensive
-- User is actively engaged in the discussion (asking questions, giving feedback)
-- You're unsure about the investigation direction
-
-**Cost awareness:**
-deep_search launches parallel sub-agents consuming 30-60 tool calls.
-Like any expensive operation, confirm direction with the user when the path isn't clear.
-Use propose_hypotheses to present your thinking and get user alignment.
-
-**When user explicitly activates Deep Investigation mode (magnifying glass / /dp / Ctrl+I):**
-Follow the structured workflow described in the deep-investigation skill guide.`;
-    }
+    // Investigation Capability prompt removed — deep_search is now DP-mode-only.
+    // The workflow instructions are injected via buildActivationMessage() when
+    // the user explicitly triggers DP mode.
 
     // Append workspace custom prompt
     if (opts?.systemPromptAppend) {
@@ -663,6 +651,15 @@ Follow the structured workflow described in the deep-investigation skill guide.`
     thinkingLevel: "high",
   });
 
+  // Trigger session_start for extension state restoration.
+  // In web/gateway mode, bindExtensions() is never called by the TUI layer,
+  // so session_start doesn't fire and extensions can't restore persisted state
+  // (e.g. DP mode status after session release/rebuild).
+  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings, session_start
+  // fires again — but the handler resets state first (checklist=null, dpStatus=idle)
+  // then restores from JSONL, so double-fire is idempotent.
+  await session.bindExtensions({});
+
   // ── Input streamFn wrappers (modify context.messages before API call) ──
 
   // 1. Sanitize malformed tool calls (drop incomplete blocks)
@@ -709,5 +706,5 @@ Follow the structured workflow described in the deep-investigation skill guide.`
   installToolResultContextGuard({ agent: session.agent, contextWindowTokens: contextWindow });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

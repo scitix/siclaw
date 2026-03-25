@@ -198,6 +198,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     // Suggested reply draft — chip click populates input instead of sending immediately
     const [chipSeq, setChipSeq] = useState(0);
     const [chipDraft, setChipDraft] = useState<string | null>(null);
+    const [showHypothesesLocator, setShowHypothesesLocator] = useState(false);
 
     // Feedback hint: show once per session after agent finishes first response
     const hasShownFeedbackHintRef = useRef(false);
@@ -301,6 +302,10 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         return false;
     }, [messages, latestHypothesesId, dpChecklist]);
 
+    const latestHypothesesAwaitingReview = useMemo(() => {
+        return latestHypothesesId != null && !latestHypothesesConfirmed;
+    }, [latestHypothesesConfirmed, latestHypothesesId]);
+
     // Handles three cases:
     // 1. Initial load / session switch (0 → N): force scroll to bottom
     // 2. Prepend (load more): restore scroll position so view doesn't jump
@@ -340,6 +345,51 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         }
         prevMsgCountRef.current = messages.length;
     }, [messages, scrollToBottom]);
+
+    useEffect(() => {
+        if (!latestHypothesesAwaitingReview || !latestHypothesesId) {
+            setShowHypothesesLocator(false);
+            return;
+        }
+
+        const root = scrollContainerRef.current;
+        if (!root) return;
+
+        let observer: IntersectionObserver | null = null;
+        const rafId = requestAnimationFrame(() => {
+            const card = document.querySelector<HTMLElement>(
+                `[data-hypotheses-card-id="${latestHypothesesId}"]`,
+            );
+            if (!card) {
+                setShowHypothesesLocator(false);
+                return;
+            }
+
+            observer = new IntersectionObserver(
+                ([entry]) => {
+                    setShowHypothesesLocator(!entry.isIntersecting || entry.intersectionRatio < 0.2);
+                },
+                {
+                    root,
+                    threshold: [0, 0.2, 0.6, 1],
+                },
+            );
+            observer.observe(card);
+        });
+
+        return () => {
+            cancelAnimationFrame(rafId);
+            observer?.disconnect();
+        };
+    }, [latestHypothesesAwaitingReview, latestHypothesesId, messages.length]);
+
+    const scrollToLatestHypothesesCard = useCallback(() => {
+        if (!latestHypothesesId) return;
+        const card = document.querySelector<HTMLElement>(
+            `[data-hypotheses-card-id="${latestHypothesesId}"]`,
+        );
+        if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, [latestHypothesesId]);
 
     // Session restore is multi-step: messages load first, then DP progress restores,
     // and the checklist card may grow as hypotheses/current action arrive. Keep the
@@ -470,7 +520,6 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     isInPanel={panelMessage?.id === msg.id}
                                     investigationProgress={investigationProgress}
                                     sendMessage={sendMessage}
-                                    abortResponse={abortResponse}
                                     dpFocus={dpFocus}
                                     dpChecklistActive={dpChecklist != null && dpChecklist.length > 0}
                                     onHypothesesConfirmed={onHypothesesConfirmed}
@@ -517,6 +566,21 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     <div ref={scrollRef} />
                 </div>
             </div>
+            {showHypothesesLocator && (
+                <div className="px-4 pb-2">
+                    <div className="max-w-5xl mx-auto flex justify-end">
+                        <button
+                            type="button"
+                            onClick={scrollToLatestHypothesesCard}
+                            className="flex items-center gap-1.5 rounded-full border border-indigo-200 bg-white/95 px-3 py-1.5 text-xs font-medium text-indigo-700 shadow-sm backdrop-blur-sm transition-colors hover:bg-indigo-50 hover:text-indigo-800 cursor-pointer"
+                        >
+                            <SearchCode className="w-3.5 h-3.5" />
+                            <span>Review hypotheses</span>
+                            <ChevronRight className="w-3 h-3 -rotate-90" />
+                        </button>
+                    </div>
+                </div>
+            )}
             <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
@@ -583,11 +647,17 @@ function parseSkillRef(content: string): { skillName: string | null; text: strin
     return { skillName: null, text: content };
 }
 
-/** Parse [Deep Investigation] marker from user messages */
+/** Parse [Deep Investigation] and DP control markers from user messages */
 function parseDeepInvestigation(content: string): { isDeepInvestigation: boolean; text: string } {
-    const match = content.match(/\[Deep Investigation\]\n*/);
-    if (match) {
-        return { isDeepInvestigation: true, text: content.replace(match[0], '').trim() };
+    // Strip activation marker
+    const dpMatch = content.match(/\[Deep Investigation\]\n*/);
+    if (dpMatch) {
+        return { isDeepInvestigation: true, text: content.replace(dpMatch[0], '').trim() };
+    }
+    // Strip DP state control markers (confirm/adjust/skip)
+    const controlMatch = content.match(/\[DP_(?:CONFIRM|ADJUST|REINVESTIGATE|SKIP|EXIT)\]\n*/);
+    if (controlMatch) {
+        return { isDeepInvestigation: true, text: content.replace(controlMatch[0], '').trim() };
     }
     return { isDeepInvestigation: false, text: content };
 }
@@ -644,7 +714,7 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, abortResponse, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
+function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     skills?: Skill[];
@@ -659,7 +729,6 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     isInPanel?: boolean;
     investigationProgress?: InvestigationProgress | null;
     sendMessage?: (text: string) => void;
-    abortResponse?: () => void;
     dpFocus?: string | null;
     /** True when DpChecklistCard is active — used to hide InvestigationCard even if dpFocus is transiently null */
     dpChecklistActive?: boolean;
@@ -698,7 +767,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
             return <InvestigationCard message={message} progress={message.isStreaming ? investigationProgress : undefined} sendMessage={sendMessage} updateMessageMeta={updateMessageMeta} />;
         }
         if (message.toolName === 'propose_hypotheses' && !message.isStreaming) {
-            return <HypothesesCard message={message} sendMessage={sendMessage} abortResponse={abortResponse} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
+            return <HypothesesCard message={message} sendMessage={sendMessage} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
         }
         return <ToolItem message={message} skills={skills} onEditSkill={onEditSkill} />;
     }
