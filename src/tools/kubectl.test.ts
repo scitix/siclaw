@@ -244,6 +244,169 @@ describe("createKubectlTool", () => {
     });
   });
 
+  describe("sensitive resource protection", () => {
+    // config view --raw — pre-execution block
+    it("blocks config view --raw", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "config view --raw" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("not allowed");
+      expect(result.content[0].text).toContain("credentials");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("allows config view (without --raw)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "config view" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("not allowed");
+    });
+
+    // Secret — block jsonpath/go-template/custom-columns
+    it("blocks get secret -o jsonpath", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret my-secret -o jsonpath='{.data.password}'" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("not allowed");
+      expect(result.content[0].text).toContain("jsonpath");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("blocks get secret -ojsonpath (shorthand, no space)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret my-secret -ojsonpath='{.data.password}'" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("not allowed");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("blocks get secret -o go-template", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret my-secret -o go-template={{.data}}" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("not allowed");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("blocks get configmap -o custom-columns", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get configmap -o custom-columns=DATA:.data" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("not allowed");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    // describe — block for configmap/pod, allow for secret
+    it("blocks describe configmap", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "describe configmap my-config" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("sensitive data");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("blocks describe pod", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "describe pod my-pod" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).toContain("sensitive data");
+      expect((result.details as any).blocked).toBe(true);
+    });
+
+    it("allows describe secret (safe — only shows byte counts)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "describe secret my-secret" },
+        undefined,
+        {} as any,
+      );
+      // Should not be blocked by our guardrail (may fail for other reasons like no cluster)
+      expect(result.content[0].text).not.toContain("sensitive data");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+
+    // Default table — always allowed
+    it("allows get secret (default table)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret -A" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("not allowed");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+
+    it("allows get secret -o wide", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret -o wide" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("not allowed");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+
+    it("allows get secret -o name", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get secret -o name" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("not allowed");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+
+    // Non-sensitive resources — not affected
+    it("allows get deployment -o json (not sensitive)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "get deployment -o json" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("not allowed");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+
+    it("allows describe deployment (not sensitive)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "describe deployment my-deploy" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("sensitive data");
+      expect((result.details as any).blocked).toBeFalsy();
+    });
+  });
+
   describe("timeout clamping", () => {
     it("clamps timeout to 120 seconds max", async () => {
       // This tests that even with timeout_seconds=999, it doesn't hang forever.
