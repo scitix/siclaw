@@ -55,6 +55,44 @@ export function SkillsPage() {
     const labelDropdownRef = useRef<HTMLDivElement>(null);
     const searchTimerRef = useRef<ReturnType<typeof setTimeout>>();
     const contentRef = useRef<HTMLDivElement>(null);
+    const [personalDiffModal, setPersonalDiffModal] = useState<{
+        isOpen: boolean;
+        title: string;
+        subtitle: string;
+        diffText: string | null;
+        isLoading: boolean;
+    }>({ isOpen: false, title: '', subtitle: '', diffText: null, isLoading: false });
+
+    const handlePersonalDiff = async (skill: Skill) => {
+        setPersonalDiffModal({
+            isOpen: true,
+            title: `${skill.name} Diff`,
+            subtitle: 'Loading comparison...',
+            diffText: null,
+            isLoading: true,
+        });
+        try {
+            const result = await rpcGetSkillDiff(sendRpc, String(skill.id));
+            setPersonalDiffModal({
+                isOpen: true,
+                title: `${skill.name} Diff`,
+                subtitle: result.baselineLabel && result.compareLabel
+                    ? `${result.baselineLabel} -> ${result.compareLabel}`
+                    : 'Personal diff',
+                diffText: result.diff || 'No changes detected.',
+                isLoading: false,
+            });
+        } catch (err: any) {
+            setPersonalDiffModal({
+                isOpen: true,
+                title: `${skill.name} Diff`,
+                subtitle: 'Personal diff',
+                diffText: 'Failed to load diff.',
+                isLoading: false,
+            });
+            console.error('[Skills] Failed to load personal fork diff:', err);
+        }
+    };
 
     // Label color mapping by category
     const labelColors: Record<string, string> = {
@@ -318,8 +356,8 @@ export function SkillsPage() {
         e.stopPropagation();
         setDialogState({
             isOpen: true,
-            title: 'Contribute to Team',
-            description: `Contribute "${skill.name}" to the team? An admin will review before it becomes a shared team skill.`,
+            title: 'Contribute to Global',
+            description: `Contribute "${skill.name}" to global? An admin will review before it becomes a shared global skill.`,
             variant: 'primary',
             confirmText: 'Contribute',
             onConfirm: () => { publishSkill(skill, true).catch((err: any) => showError(err?.message || String(err))); }
@@ -331,7 +369,7 @@ export function SkillsPage() {
         setDialogState({
             isOpen: true,
             title: 'Fork to Personal',
-            description: `This will fork "${skill.name}" into your personal skills. You can edit and customize the fork, and optionally contribute changes back to the team.`,
+            description: `This will fork "${skill.name}" into your personal skills. You can edit and customize the fork, and optionally contribute changes back to global.`,
             variant: 'primary',
             confirmText: 'Fork Skill',
             onConfirm: () => { copyToPersonal(skill); }
@@ -888,7 +926,7 @@ export function SkillsPage() {
                                         )}
 
                                         {skill.scope === 'personal' && skill.reviewStatus === 'approved' && skill.contributionStatus !== 'pending' && (
-                                            <Tooltip content="Contribute to Team">
+                                            <Tooltip content="Contribute to Global">
                                                 <button
                                                     onClick={(e) => handleContribute(e, skill)}
                                                     className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
@@ -939,6 +977,17 @@ export function SkillsPage() {
                                                     className="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
                                                 >
                                                     <GitCommitHorizontal className="w-4 h-4" />
+                                                </button>
+                                            </Tooltip>
+                                        )}
+
+                                        {skill.scope === 'personal' && (skill.forkedFromId || (skill.publishedVersion && skill.publishedVersion > 0)) && (
+                                            <Tooltip content="View Diff">
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); handlePersonalDiff(skill); }}
+                                                    className="p-1.5 text-gray-400 hover:text-cyan-600 hover:bg-cyan-50 rounded-lg transition-colors"
+                                                >
+                                                    <Eye className="w-4 h-4" />
                                                 </button>
                                             </Tooltip>
                                         )}
@@ -1032,6 +1081,15 @@ export function SkillsPage() {
                     </div>
                 </div>
             )}
+
+            <DiffViewerModal
+                isOpen={personalDiffModal.isOpen}
+                onClose={() => setPersonalDiffModal(prev => ({ ...prev, isOpen: false }))}
+                title={personalDiffModal.title}
+                subtitle={personalDiffModal.subtitle}
+                diffText={personalDiffModal.diffText}
+                isLoading={personalDiffModal.isLoading}
+            />
         </div>
     );
 }
@@ -1176,7 +1234,7 @@ function ScriptReviewApprovalCard({
                 variant: 'primary',
                 confirmText: skill.scope === 'skillset'
                     ? 'Approve & Merge to Global'
-                    : (isContributionReview ? 'Approve & Publish to Team' : 'Approve'),
+                    : (isContributionReview ? 'Approve & Publish to Global' : 'Approve'),
                 onConfirm: () => executeDecision('approve'),
             });
         } else {
@@ -1497,7 +1555,7 @@ function ScriptReviewApprovalCard({
                                             className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-green-700 bg-green-50 border border-green-200 hover:bg-green-100 rounded-lg transition-all disabled:opacity-50"
                                         >
                                             <Check className="w-4 h-4" />
-                                            {skill.scope === 'skillset' ? 'Approve & Merge to Global' : (isContributionReview ? 'Approve & Publish to Team' : 'Approve')}
+                                            {skill.scope === 'skillset' ? 'Approve & Merge to Global' : (isContributionReview ? 'Approve & Publish to Global' : 'Approve')}
                                         </button>
                                     </div>
                                 </div>

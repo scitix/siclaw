@@ -232,7 +232,7 @@ export async function rpcGetSkillDiff(
     id: string,
     teamDiff?: boolean,
     workspaceId?: string,
-): Promise<{ diff: string }> {
+): Promise<{ diff: string; baselineLabel?: string; compareLabel?: string }> {
     return sendRpc('skill.diff', { id, teamDiff, workspaceId });
 }
 
