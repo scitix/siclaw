@@ -856,10 +856,15 @@ export function createRpcMethods(
       cache.checklist = createChecklist(cache.dpQuestion ?? "");
     }
     if (cache.checklist) {
-      syncChecklistFromStatus({ checklist: cache.checklist, status: newStatus } as DpState);
+      syncChecklistFromStatus({ checklist: cache.checklist, status: newStatus });
     }
     if (newStatus === "completed") {
-      setTimeout(() => dpStatusCache.delete(streamKey), 10_000);
+      setTimeout(() => {
+        // Only delete if still completed — a new investigation may have started
+        if (dpStatusCache.get(streamKey)?.dpStatus === "completed") {
+          dpStatusCache.delete(streamKey);
+        }
+      }, 10_000);
     }
   }
 
@@ -1994,7 +1999,7 @@ export function createRpcMethods(
           confirmedHypotheses = resp.confirmedHypotheses;
           // Derive checklist from authoritative dpStatus
           const cl = createChecklist(dpQuestion ?? "");
-          syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus } as DpState);
+          syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus });
           dpChecklist = cl;
         }
       }
