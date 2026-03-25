@@ -656,6 +656,9 @@ export async function createSiclawSession(
   // In web/gateway mode, bindExtensions() is never called by the TUI layer,
   // so session_start doesn't fire and extensions can't restore persisted state
   // (e.g. DP mode status after session release/rebuild).
+  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings, session_start
+  // fires again — but the handler resets state first (checklist=null, dpStatus=idle)
+  // then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
   // ── Input streamFn wrappers (modify context.messages before API call) ──

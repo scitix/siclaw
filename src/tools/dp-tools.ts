@@ -105,7 +105,7 @@ export interface MutableDpStateRef {
  * all 4 item states. No forward-only guards — supports regression
  * (e.g. awaiting_confirmation → investigating when user adjusts).
  */
-export function syncChecklistFromStatus(state: DpState): void {
+export function syncChecklistFromStatus(state: Pick<DpState, "checklist" | "status">): void {
   if (!state.checklist) return;
   const items = state.checklist.items;
   if (items.length < 4) return;

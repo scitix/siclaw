@@ -322,7 +322,7 @@ export function usePilot() {
     // Guards async session switches: only the latest loadHistory request may write UI state.
     const loadHistoryRequestIdRef = useRef(0);
     // Ref for restoring DP progress (used by loadHistory to call restoreDpProgress which is defined later)
-    const restoreDpProgressRef = useRef<(sessionKey?: string | null) => Promise<void>>(async () => {});
+    const restoreDpProgressRef = useRef<(sessionKey?: string | null, loadedMessages?: PilotMessage[]) => Promise<void>>(async () => {});
     // DP-related timeout refs (for cleanup on abort/session switch)
     const dpTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
@@ -742,7 +742,8 @@ export function usePilot() {
         try {
             const result = await sendRpc<{ messages: PilotMessage[]; hasMore: boolean }>('chat.history', { sessionId: sessionKey });
             if (loadHistoryRequestIdRef.current !== requestId) return;
-            setMessages(mapMessages(result.messages ?? []));
+            const mapped = mapMessages(result.messages ?? []);
+            setMessages(mapped);
             setHasMore(result.hasMore ?? false);
         } catch (err) {
             if (loadHistoryRequestIdRef.current === requestId) {
@@ -763,7 +764,7 @@ export function usePilot() {
         // Restore deep investigation progress (checklist cards, hypothesis tree).
         // Pass sessionKey explicitly to avoid race with async currentSessionKeyRef update.
         if (loadHistoryRequestIdRef.current !== requestId) return;
-        await restoreDpProgressRef.current(sessionKey);
+        await restoreDpProgressRef.current(sessionKey, mapped);
     }, [isConnected, sendRpc]);
 
     const loadMoreHistory = useCallback(async () => {
@@ -1006,7 +1007,7 @@ export function usePilot() {
                 disconnectTimerRef.current = undefined;
             }
         };
-    }, [isConnected, isLoading]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [isConnected, isLoading, disconnectGraceMs]);
 
     // Stale-loading watchdog: if isLoading but no agent events for too long,
     // the backend likely died silently — reset UI so user isn't stuck.
@@ -1056,7 +1057,7 @@ export function usePilot() {
     /** Restore DP progress from gateway snapshot after WS reconnect / page refresh.
      *  Uses dpStatus from agentbox (authoritative) or gateway cache (fallback).
      *  Accepts an explicit sessionKey to avoid race with async state updates. */
-    const restoreDpProgress = useCallback(async (sessionKey?: string | null) => {
+    const restoreDpProgress = useCallback(async (sessionKey?: string | null, loadedMessages?: PilotMessage[]) => {
         if (!isConnected) return;
         const targetSession = sessionKey ?? currentSessionKeyRef.current;
         if (!targetSession) return;
@@ -1089,8 +1090,8 @@ export function usePilot() {
             // This is the same data source the HypothesesCard uses — guaranteed to have correct titles.
             const hypothesesTextMap = new Map<string, string>();
             {
-                // messagesRef holds the already-loaded chat.history messages
-                const msgs = messagesRef.current;
+                // Use explicitly passed messages (avoids React batching race with messagesRef)
+                const msgs = loadedMessages ?? messagesRef.current;
                 for (let i = msgs.length - 1; i >= 0; i--) {
                     const m = msgs[i];
                     if (m.toolName === 'propose_hypotheses' && (m.toolDetails?.hypotheses || m.toolInput)) {

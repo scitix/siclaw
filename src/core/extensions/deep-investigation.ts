@@ -179,7 +179,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       dpStateRef.round = dpRound;
     }
     // Derive checklist from status (single direction: status → checklist)
-    if (checklist) syncChecklistFromStatus({ checklist, status, round: dpRound });
+    if (checklist) syncChecklistFromStatus({ checklist, status });
   }
 
   // --- Legacy mode state ---
@@ -187,6 +187,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   let pendingActivation = false;
   let pendingFeedbackId: string | null = null;
   let deepSearchRan = false;
+  let dpHadToolCalls = false;
   let feedbackCleanup: (() => void) | null = null;
 
   // --- Progress rendering state ---
@@ -799,14 +800,16 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     if (dpStatus === "concluding") {
       setDpStatus("completed");
       updateStatus(ctx);
-      // disableDpMode resets to idle and persists — no separate persistState() needed
-      // (persisting "completed" then immediately "idle" would make the completed snapshot dead code)
+      // "completed" is transient — disableDpMode immediately resets to idle and persists that.
+      // The JSONL never contains a "completed" entry; it goes straight from the last active
+      // status to "idle". This is intentional: "completed" only exists in-memory for the
+      // dp_status event to reach the frontend before teardown.
       disableDpMode(ctx);
       return;
     }
-    // Guardrail: model ended in DP mode without ever calling propose_hypotheses.
-    // This means it bypassed the interactive loop — nudge it back on track.
-    if (dpStatus === "investigating" && dpRound === 0) {
+    // Guardrail: model investigated (ran tools) but ended without calling propose_hypotheses.
+    // Only fires when tool calls were made — allows clarifying questions without nudging.
+    if (dpStatus === "investigating" && dpRound === 0 && dpHadToolCalls) {
       api.sendUserMessage(
         "You are in Deep Investigation mode but ended without calling propose_hypotheses. " +
         "In DP mode, you MUST share your findings and hypotheses with the user via propose_hypotheses before concluding. " +
@@ -819,9 +822,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // --- tool_call: system event → status transition + progress rendering ---
 
   api.on("tool_call", (event, ctx) => {
+    dpHadToolCalls = true;
     // Block all tools during awaiting_confirmation — model must wait for user.
-    // This prevents the model from continuing to call tools after propose_hypotheses
-    // in the same turn (the steer interrupt may not catch parallel tool calls).
     if (dpStatus === "awaiting_confirmation" && event.toolName !== "propose_hypotheses") {
       throw new Error(
         "Blocked: waiting for user to confirm/adjust/skip hypotheses. " +
@@ -836,7 +838,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     if (event.toolName === "deep_search") {
       if (dpStatus === "validating") {
         // Already validating (set by user confirm) — just sync checklist
-        syncChecklistFromStatus({ checklist, status: dpStatus, round: dpRound });
+        syncChecklistFromStatus({ checklist, status: dpStatus });
         persistState();
         updateStatus(ctx);
       }
@@ -887,6 +889,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   // Clean up feedback hint when agent starts processing next message
   api.on("agent_start", () => {
     feedbackCleanup?.();
+    dpHadToolCalls = false;
   });
 
   // --- context: filter UI-only custom messages ---
