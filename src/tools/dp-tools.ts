@@ -227,7 +227,7 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
     description:
       "Present hypotheses to the user as a structured UI card. " +
       "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
-      "Your text before this tool call should be ≤3 sentences (triage summary + transition).\n" +
+      "You MUST write 2-3 sentences of triage summary BEFORE calling this tool (empty message + card is bad UX).\n" +
       "In Deep Investigation mode: you MUST wait for the user's response after calling this tool. " +
       "Do NOT call deep_search until the user explicitly confirms.",
     parameters: Type.Object({

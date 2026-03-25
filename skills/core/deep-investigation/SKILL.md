@@ -62,8 +62,10 @@ Gather environment context and confirm the problem exists.
 Formulate 2-4 ranked hypotheses based on triage findings. Quality over quantity —
 every hypothesis must be specific and testable.
 
-1. Write a **brief transition sentence** (1-2 sentences max) in your text response,
-   e.g. "Based on the triage, I've identified the following hypotheses."
+1. **BEFORE calling the tool**, write a brief triage summary in your text response
+   (2-3 sentences). Summarize what you found, what is abnormal, and what direction
+   the hypotheses take. This gives the user context before seeing the card.
+   Do NOT skip this — an empty message followed by a card is bad UX.
 2. Call `propose_hypotheses` with your hypothesis list AND `triageContext`.
 3. **STOP and wait for the user's response.** This is mandatory, not optional.
    - The user may confirm → proceed to Phase 3

@@ -431,7 +431,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     description:
       "Present hypotheses to the user as an interactive review card. " +
       "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
-      "Your text before this tool call should be ≤3 sentences (triage summary + transition).\n" +
+      "You MUST write 2-3 sentences of triage summary BEFORE calling this tool (empty message + card is bad UX).\n" +
       "In TUI: BLOCKS until user decides (proceed / adjust / skip). " +
       "In web UI: returns immediately — you MUST wait for the user's next message. " +
       "Do NOT call deep_search until the user explicitly confirms.",
