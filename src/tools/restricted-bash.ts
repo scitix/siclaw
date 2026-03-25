@@ -8,6 +8,7 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand } from "./kubectl.js";
+import { detectSensitiveResource, getOutputFormat } from "./kubectl-sanitize.js";
 import { loadConfig } from "../core/config.js";
 import {
   getCommandBinary,
@@ -68,6 +69,39 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
         return JSON.stringify({
           error: "kubectl config view --raw is not allowed — it exposes credentials.",
         }, null, 2);
+      }
+    }
+
+    // Block sensitive resource access with structured output in pipelines.
+    // Pipeline output can't be intercepted mid-pipe, so we block pre-execution.
+    // Only block Secret and ConfigMap — Pod is too commonly queried to block in
+    // pipelines; Pod env sanitization is handled by the kubectl tool instead.
+    // ACCEPTED RISK: `kubectl get pod -o json | jq .spec` in a pipeline won't
+    // have Pod env vars sanitized. Mitigation: the agent typically uses the
+    // kubectl tool (not bash) for structured output, which does sanitize.
+    const sensitiveSubcommands = ["get", "describe"];
+    if (sensitiveSubcommands.includes(subcommand)) {
+      const sensitiveResource = detectSensitiveResource(args);
+      if (sensitiveResource && sensitiveResource !== "pod") {
+        // Block describe for ConfigMap (sensitive data in human-readable format)
+        if (subcommand === "describe" && sensitiveResource === "configmap") {
+          return JSON.stringify({
+            error: `"kubectl describe ${sensitiveResource}" may expose sensitive data in a pipeline.`,
+            hint: `Use the kubectl tool directly: kubectl("get ${sensitiveResource} <name> -o json") — structured output is automatically sanitized.`,
+          }, null, 2);
+        }
+
+        // Block structured output formats that expose sensitive data
+        const outputFormat = getOutputFormat(args);
+        const blockedFormats = ["json", "yaml", "jsonpath", "go-template", "custom-columns"];
+        if (outputFormat && blockedFormats.includes(outputFormat)) {
+          return JSON.stringify({
+            error: `"kubectl get ${sensitiveResource} -o ${outputFormat}" is not allowed in a pipeline — sensitive data cannot be sanitized mid-pipe.`,
+            hint: `Use the kubectl tool directly: kubectl("get ${sensitiveResource} <name> -o json") — structured output is automatically sanitized.`,
+          }, null, 2);
+        }
+
+        // Default table / -o wide / -o name: safe, allow through
       }
     }
   }
