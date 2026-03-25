@@ -101,11 +101,15 @@ export const EVIDENCE_TAIL_CHARS = 1500;
 
 // --- Engine constants ---
 
-/** Early exit threshold: skip remaining hypotheses if one reaches this confidence.
- *  When a validated hypothesis exceeds this, remaining PENDING hypotheses are skipped
- *  (already-running validations continue). Set high (90) because real issues often
- *  have multiple contributing factors — only skip when root cause is near-certain. */
-export const EARLY_EXIT_CONFIDENCE = 90;
+/** When a validated hypothesis reaches this confidence, low-confidence pending
+ *  hypotheses (below EARLY_EXIT_SKIP_BELOW) are skipped to save budget.
+ *  Higher-confidence hypotheses still get validated — real issues often have
+ *  multiple contributing factors. */
+export const EARLY_EXIT_CONFIDENCE = 85;
+
+/** Hypotheses below this confidence are skipped once early exit triggers.
+ *  Hypotheses at or above this threshold are always validated regardless. */
+export const EARLY_EXIT_SKIP_BELOW = 60;
 
 /** Debug trace output truncation: max total chars per tool result. */
 export const TRACE_MAX_OUTPUT = 2000;
