@@ -18,7 +18,7 @@ description: "Architecture, lifecycle, approval workflow, and deployment-mode be
 
 Skills are **packaged diagnostic procedures** — each skill is a directory containing a specification
 (`SKILL.md`) and executable scripts (`scripts/`). The agent reads the spec to understand *when* and
-*how* to use a skill, then executes its scripts via the `run_skill` tool.
+*how* to use a skill, then executes its scripts via the `local_script` tool.
 
 ### The Security–Flexibility Trade-off
 
@@ -246,9 +246,9 @@ Local mode syncs to per-user directories to maintain filesystem isolation
 
 ## 6. Skill Execution
 
-### run_skill Tool
+### local_script Tool
 
-The `run_skill` tool (`src/tools/run-skill.ts`) is the primary execution path:
+The `local_script` tool (`src/tools/run-skill.ts`) is the primary execution path:
 
 1. **Path resolution**: `resolveSkillScript(skill, script)` searches scope directories
    in priority order (personal > extension > team > core)
@@ -261,7 +261,7 @@ The `run_skill` tool (`src/tools/run-skill.ts`) is the primary execution path:
 
 The `restricted-bash` tool also allows skill script execution. `isSkillScript()` whitelists
 commands matching `bash|sh|python3 skills/{core,extension,team,user}/*/scripts/*`.
-This is a secondary path — `run_skill` is preferred.
+This is a secondary path — `local_script` is preferred.
 
 ---
 
@@ -280,7 +280,7 @@ const skillsDirs = [dynamicSkillBase, ...builtinPaths];
 
 The loader auto-discovers skills by scanning for `SKILL.md` files, parsing frontmatter,
 and injecting descriptions into the system prompt. The agent then knows which skills are
-available and can invoke them via `run_skill`.
+available and can invoke them via `local_script`.
 
 ### Deep Search Sub-Agents
 
@@ -328,7 +328,7 @@ original. The forked copy can later be contributed back to team via the approval
 
 ```
 Execution & Resolution
-  src/tools/run-skill.ts              run_skill tool (primary execution path)
+  src/tools/run-skill.ts              local_script tool (primary execution path)
   src/tools/script-resolver.ts        Skill path resolution, scope priority
   src/tools/restricted-bash.ts        Bash whitelist (isSkillScript)
   src/tools/fork-skill.ts             fork_skill tool

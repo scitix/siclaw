@@ -269,7 +269,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         // Filter hidden messages (update_plan, end_investigation) to avoid false lastToolIdx
         const turnMessages = messages.slice(turnStart + 1).filter(m => !m.hidden);
         // Must have at least one diagnostic tool call (excluding deep_search — already the deepest path)
-        const DIAGNOSTIC_TOOLS = new Set(['bash', 'pod_exec', 'pod_nsenter_exec', 'node_exec', 'node_script', 'pod_netns_script', 'run_skill']);
+        const DIAGNOSTIC_TOOLS = new Set(['bash', 'pod_exec', 'pod_nsenter_exec', 'node_exec', 'node_script', 'pod_netns_script', 'local_script']);
         const hasDiagnostic = turnMessages.some(m => m.role === 'tool' && DIAGNOSTIC_TOOLS.has(m.toolName ?? ''));
         // The conclusion must come AFTER the last tool call — if the agent ran tools
         // but never gave a summary, it didn't conclude (e.g. "let me analyze" + tools + silence)
@@ -894,9 +894,9 @@ function ToolItem({ message, skills, onEditSkill }: { message: PilotMessage; ski
     // Auto-expand while streaming
     const isOpen = message.isStreaming || expanded;
 
-    // Check if this is a run_skill call with an editable (personal) skill
+    // Check if this is a local_script call with an editable (personal) skill
     const editableSkill = (() => {
-        if (message.toolName !== 'run_skill' || !skills || !onEditSkill) return null;
+        if (message.toolName !== 'local_script' || !skills || !onEditSkill) return null;
         const skillName = message.toolInput;
         if (!skillName) return null;
         return skills.find(s =>

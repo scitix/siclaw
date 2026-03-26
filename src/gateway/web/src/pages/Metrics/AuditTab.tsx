@@ -33,7 +33,7 @@ const DATE_RANGES = [
     { label: 'Last 30d', value: '30d', ms: 2592000_000 },
 ] as const;
 
-const TOOL_OPTIONS = ['All', 'bash', 'restricted_bash', 'run_skill', 'node_exec', 'pod_exec', 'kubectl'] as const;
+const TOOL_OPTIONS = ['All', 'bash', 'restricted_bash', 'local_script', 'node_exec', 'pod_exec', 'kubectl'] as const;
 const STATUS_OPTIONS = ['All', 'success', 'error', 'blocked'] as const;
 
 function parseToolInput(toolName: string | null, toolInput: string | null): string {
@@ -44,7 +44,7 @@ function parseToolInput(toolName: string | null, toolInput: string | null): stri
             case 'bash':
             case 'restricted_bash':
                 return parsed.command ?? toolInput;
-            case 'run_skill':
+            case 'local_script':
                 return [parsed.skill, parsed.script].filter(Boolean).join('/');
             case 'node_exec':
             case 'pod_exec':
@@ -372,7 +372,7 @@ function DetailPanel({ detail }: { detail: AuditDetail }) {
                 <span className="text-gray-400">Tool</span>
                 <span className="font-mono text-gray-700">{detail.toolName}</span>
 
-                {parsedInput && detail.toolName === 'run_skill' && (
+                {parsedInput && detail.toolName === 'local_script' && (
                     <>
                         <span className="text-gray-400">Skill</span>
                         <span className="font-mono text-gray-700">{(parsedInput as any).skill}</span>

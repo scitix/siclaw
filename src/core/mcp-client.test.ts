@@ -111,7 +111,7 @@ describe("isMcpTool", () => {
   });
 
   it("returns false for non-MCP tool names", () => {
-    expect(isMcpTool("run_skill")).toBe(false);
+    expect(isMcpTool("local_script")).toBe(false);
     expect(isMcpTool("pod_exec")).toBe(false);
     expect(isMcpTool("server__tool")).toBe(false);
   });
