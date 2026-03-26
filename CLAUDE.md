@@ -38,7 +38,7 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 
 > Full spec: `docs/design/security.md` — read it before touching execution tools, Dockerfile, or K8s manifests.
 
-Primary defense: **OS-level user isolation** — child processes run as `sandbox` user (cannot read credentials); `kubectl` has setgid `kubecred` group (ADR-010). Secondary defense: **whitelist-only command validation** — binaries must be in `ALLOWED_COMMANDS` (`src/tools/command-sets.ts`). `sed`, `awk`, `nc`, `wget` are **intentionally excluded**. kubectl is **read-only** (13 safe subcommands; all write ops permanently blocked).
+Primary defense: **OS-level user isolation** — child processes run as `sandbox` user (cannot read credentials); `kubectl` has setgid `kubecred` group (ADR-010). Secondary defense: **whitelist-only command validation** — binaries must be in `ALLOWED_COMMANDS` (`src/tools/infra/command-sets.ts`). `sed`, `awk`, `nc`, `wget` are **intentionally excluded**. kubectl is **read-only** (13 safe subcommands; all write ops permanently blocked).
 
 ### 🔴 sql.js: Single-Process Lock
 
