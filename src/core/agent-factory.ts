@@ -90,6 +90,8 @@ export interface CreateSiclawSessionOpts {
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for workspace customization */
   systemPromptAppend?: string;
+  /** Custom system prompt template from workspace settings (overrides DEFAULT_TEMPLATE) */
+  systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
   /** Pre-initialized shared MCP client manager (AgentBox level) — skips per-session init */
@@ -500,7 +502,7 @@ export async function createSiclawSession(
 
   const loader = new DefaultResourceLoader({
     cwd,
-    systemPromptOverride: () => buildSreSystemPrompt(memoryDir, mode),
+    systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
       const parts = buildAppendSystemPrompt(memoryDir, memoryIndexerRef);
       if (workspaceSystemPromptAppend) {
@@ -547,7 +549,7 @@ export async function createSiclawSession(
     // SDK brain DP gets stuck at awaiting_confirmation. Tracked for future work.
     const dpState: DpState = createDpState();
 
-    const systemPrompt = buildSreSystemPrompt(memoryDir, mode);
+    const systemPrompt = buildSreSystemPrompt(mode, opts?.systemPromptTemplate);
 
     // Build the same append content that pi-agent gets via appendSystemPromptOverride
     const appendParts = buildAppendSystemPrompt(memoryDir);
