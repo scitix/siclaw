@@ -174,10 +174,10 @@ Examples:
       // Build nsenter command (use rewritten args for single-command case)
       let nsenterCmd: string[];
       if (needsShell) {
-        // Shell pipeline — rewrite not supported for pipelines, run as-is
+        // Shell pipeline — run as-is
         nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", params.command];
       } else {
-        const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
+        const execArgs = cmdArgs;
         nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...execArgs];
       }
 

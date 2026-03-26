@@ -151,8 +151,8 @@ Examples:
       const binary = cmdArgs[0]?.split("/").pop() ?? "";
       const action = analyzeOutput(binary, cmdArgs.slice(1));
 
-      // Build kubectl exec args (use rewritten args if action requires it)
-      const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
+      // Build kubectl exec args
+      const execArgs = cmdArgs;
       const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
