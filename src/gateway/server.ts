@@ -26,6 +26,8 @@ import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { FeedbackRepository } from "./db/repositories/feedback-repo.js";
 import { loadConfig } from "../core/config.js";
+import { KnowledgeDocRepository } from "./db/repositories/knowledge-doc-repo.js";
+import { resolveUnderDir } from "../shared/path-utils.js";
 import { buildMergedMcpConfig } from "./mcp-config-builder.js";
 import { CertificateManager } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
@@ -297,6 +299,42 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
       fs.mkdirSync(knowledgeDir, { recursive: true });
     }
     if (db) {
+      // Restore missing knowledge files from DB, and backfill content for legacy docs
+      try {
+        const knowledgeDocRepo = new KnowledgeDocRepository(db);
+        const docs = await knowledgeDocRepo.list();
+        let restored = 0;
+        let backfilled = 0;
+        for (const doc of docs) {
+          try {
+            const fullPath = resolveUnderDir(knowledgeDir, doc.filePath);
+            const fileExists = fs.existsSync(fullPath);
+            if (!fileExists && doc.content) {
+              // File missing on disk but content in DB — restore it
+              const dir = path.dirname(fullPath);
+              if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(fullPath, doc.content, "utf-8");
+              restored++;
+            } else if (fileExists && !doc.content) {
+              // File on disk but no content in DB (pre-upgrade doc) — backfill
+              const content = fs.readFileSync(fullPath, "utf-8");
+              await knowledgeDocRepo.updateContent(doc.id, content);
+              backfilled++;
+            }
+          } catch (err) {
+            console.warn(`[gateway] Knowledge file sync failed for ${doc.filePath}:`, err);
+          }
+        }
+        if (restored > 0) {
+          console.log(`[gateway] Restored ${restored} knowledge file(s) from database`);
+        }
+        if (backfilled > 0) {
+          console.log(`[gateway] Backfilled content for ${backfilled} legacy knowledge doc(s)`);
+        }
+      } catch (err) {
+        console.warn("[gateway] Knowledge file recovery failed:", err);
+      }
+
       const modelConfigRepo = new ModelConfigRepository(db);
       const embeddingConfig = await modelConfigRepo.getResolvedEmbeddingConfig();
       if (embeddingConfig?.baseUrl && embeddingConfig?.model) {

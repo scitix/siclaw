@@ -27,6 +27,7 @@ export class KnowledgeDocRepository {
     id?: string;
     name: string;
     filePath: string;
+    content?: string;
     sizeBytes: number;
     uploadedBy?: string;
   }): Promise<string> {
@@ -36,6 +37,7 @@ export class KnowledgeDocRepository {
       id,
       name: data.name,
       filePath: data.filePath,
+      content: data.content ?? null,
       sizeBytes: data.sizeBytes,
       chunkCount: 0,
       uploadedBy: data.uploadedBy ?? null,
@@ -49,6 +51,13 @@ export class KnowledgeDocRepository {
     await this.db
       .update(knowledgeDocs)
       .set({ chunkCount: count })
+      .where(eq(knowledgeDocs.id, id));
+  }
+
+  async updateContent(id: string, content: string): Promise<void> {
+    await this.db
+      .update(knowledgeDocs)
+      .set({ content })
       .where(eq(knowledgeDocs.id, id));
   }
 
