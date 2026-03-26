@@ -263,15 +263,15 @@ When a skill includes scripts, choose the correct execution tool based on **wher
 |------|-----------|-------------|
 | `local_script` | Local (AgentBox) | Scripts that call kubectl from outside the cluster (most common) |
 | `node_script` | On a K8s node (host namespaces) | Scripts needing host tools, filesystem, /proc, /sys, devices |
+| `node_script` + `netns` | Node + pod's network namespace | Network diagnostics needing host tools + pod's network view |
 | `pod_script` | Inside a pod (kubectl exec) | Scripts running diagnostics inside a running pod |
-| `pod_netns_script` | Node + pod's network namespace | Network diagnostics needing host tools + pod's network view |
 
 ### Decision Guide
 
 1. **Does the script just run kubectl commands?** → `local_script` (default choice)
 2. **Does it need access to a node's filesystem, processes, or hardware?** → `node_script`
 3. **Does it need to run inside a specific pod's container?** → `pod_script`
-4. **Does it need host network tools (tcpdump, ip, ss) scoped to a pod's network?** → `pod_netns_script`
+4. **Does it need host network tools (tcpdump, ip, ss) scoped to a pod's network?** → `resolve_pod_netns` + `node_script` with `netns` param
 
 ### Examples for each mode
 
@@ -295,11 +295,12 @@ Use the `pod_script` tool:
 pod_script: pod="<pod>", namespace="<ns>", skill="pod-diagnose", script="check.sh"
 ```
 
-#### pod_netns_script — pod network namespace + host tools
+#### node_script + netns — pod network namespace + host tools
 ```markdown
 ## Tool
-Use the `pod_netns_script` tool:
-pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
+First resolve the pod's network namespace, then run with netns param:
+resolve_pod_netns: pod="<pod>", namespace="<ns>"
+node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
 ```
 
 **Important**: Always document the chosen tool in a `## Tool` section within the SKILL.md so users and the bot know how to invoke the skill correctly.

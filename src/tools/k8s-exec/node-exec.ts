@@ -24,6 +24,7 @@ export { validateCommand } from "../infra/command-validator.js";
 interface NodeExecParams {
   node: string;
   command: string;
+  netns?: string;
   kubeconfig?: string;
   image?: string;
   timeout_seconds?: number;
@@ -79,7 +80,11 @@ Examples:
 - node: "node-1", command: "cat /etc/os-release"
 - node: "node-1", command: "curl -s http://10.0.0.1:8080/healthz"
 - node: "node-1", command: "ps aux | head -20"
-- node: "node-1", command: "journalctl -u kubelet -n 100 | grep error"`,
+- node: "node-1", command: "journalctl -u kubelet -n 100 | grep error"
+
+To run in a pod's network namespace (host tools + pod's network view), first call resolve_pod_netns to get the netns name, then:
+- node: "node-1", netns: "abc123", command: "ip addr show"
+- node: "node-1", netns: "abc123", command: "rdma dev show"`,
     parameters: Type.Object({
       node: Type.String({
         description: "Kubernetes node name to debug",
@@ -88,6 +93,11 @@ Examples:
         description:
           'Diagnostic command to run on the node (e.g. "ip addr show", "nvidia-smi")',
       }),
+      netns: Type.Optional(
+        Type.String({
+          description: 'Network namespace name (from resolve_pod_netns). When set, command runs inside that netns via "ip netns exec".',
+        }),
+      ),
       kubeconfig: Type.Optional(
         Type.String({
           description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
@@ -146,6 +156,15 @@ Examples:
         };
       }
 
+      // Validate netns name if provided (must be alphanumeric/dash/underscore — prevent shell injection)
+      const netns = params.netns?.trim();
+      if (netns && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(netns)) {
+        return {
+          content: [{ type: "text", text: `Error: invalid netns name "${netns}". Must be alphanumeric, dashes, underscores (max 64 chars).` }],
+          details: { blocked: true, reason: "invalid_netns_name" },
+        };
+      }
+
       // Check node exists and is Ready
       const nodeCheckErr = await checkNodeReady(
         params.node, env.childEnv, env.kubeconfigPath ?? undefined,
@@ -172,10 +191,14 @@ Examples:
       const action = analyzeOutput(lastBinary, lastArgs.slice(1));
 
       // Build nsenter command (use rewritten args for single-command case)
+      // When netns is specified, wrap with "ip netns exec <name>" to run
+      // in the pod's network namespace using host tools.
+      const netnsPrefix = netns ? `ip netns exec ${netns} ` : "";
       let nsenterCmd: string[];
-      if (needsShell) {
-        // Shell pipeline — run as-is
-        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", params.command];
+      if (needsShell || netnsPrefix) {
+        // Shell mode — needed for pipelines or netns wrapping
+        const shellCmd = netnsPrefix + params.command;
+        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", shellCmd];
       } else {
         const execArgs = cmdArgs;
         nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...execArgs];

@@ -87,20 +87,27 @@ export function spawnAsync(
   timeout: number,
   env?: NodeJS.ProcessEnv,
   signal?: AbortSignal,
+  /** Optional data to write to the child's stdin (pipe mode). */
+  stdinData?: string,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
     const child = spawn(cmd, args, {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [stdinData !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
       env,
     });
+    // Write stdin data and close — the child reads the script from stdin
+    if (stdinData !== undefined && child.stdin) {
+      child.stdin.write(stdinData);
+      child.stdin.end();
+    }
     const onAbort = () => child.kill("SIGKILL");
     signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout!.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
     });
-    child.stderr.on("data", (chunk: Buffer) => {
+    child.stderr!.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
     const timer = setTimeout(() => {
@@ -121,6 +128,19 @@ export function spawnAsync(
       reject(err);
     });
   });
+}
+
+/**
+ * Build a shell command that reads a script from stdin and executes it.
+ *
+ * - bash: `bash -s -- args`  (`-s` = read commands from stdin)
+ * - python3: `python3 - args` (`-` = read script from stdin; `-s` is a different flag in python)
+ */
+export function stdinExecCmd(interpreter: "bash" | "python3", escapedArgs?: string): string {
+  if (interpreter === "python3") {
+    return escapedArgs ? `python3 - ${escapedArgs}` : "python3 -";
+  }
+  return escapedArgs ? `bash -s -- ${escapedArgs}` : "bash -s";
 }
 
 /**

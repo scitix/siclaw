@@ -1,5 +1,4 @@
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
@@ -7,7 +6,7 @@ import { resolveScript } from "../infra/script-resolver.js";
 import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
-import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
+import { validatePodName, prepareExecEnv, spawnAsync, stdinExecCmd } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 
 interface PodScriptParams {
@@ -142,83 +141,31 @@ Examples:
         };
       }
 
-      // Build kubectl exec args
-      const kubectlArgs = [...env.kubeconfigArgs, "exec", "-i", pod, "-n", namespace];
+      // Build kubectl exec args — pipe script via stdin, no temp files inside pod
+      const kubectlArgs = [...env.kubeconfigArgs, "-n", namespace, "-i", "exec", pod];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }
-
-      // Use the appropriate interpreter
-      const ext = resolved.interpreter === "python3" ? ".py" : ".sh";
-      const execCmd = escapedArgs
-        ? `cat > /tmp/_s${ext} && chmod +x /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${escapedArgs}; r=$?; rm -f /tmp/_s${ext}; exit $r`
-        : `cat > /tmp/_s${ext} && chmod +x /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext}; r=$?; rm -f /tmp/_s${ext}; exit $r`;
+      const execCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
       kubectlArgs.push("--", "sh", "-c", execCmd);
 
-      return new Promise((resolve) => {
-        let stdout = "";
-        let stderr = "";
-
-        const child = spawn("kubectl", kubectlArgs, {
-          stdio: ["pipe", "pipe", "pipe"],
-          env: env.childEnv,
-        });
-
-        const onAbort = () => child.kill("SIGKILL");
-        signal?.addEventListener("abort", onAbort, { once: true });
-
-        child.stdout.on("data", (chunk: Buffer) => {
-          stdout += chunk.toString();
-        });
-        child.stderr.on("data", (chunk: Buffer) => {
-          stderr += chunk.toString();
-        });
-
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-        }, timeout);
-
-        // Pipe script content via stdin
-        child.stdin.write(resolved.content);
-        child.stdin.end();
-
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          const output =
-            stdout.trim() +
-            (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
-
-          if (code === 0) {
-            resolve({
-              content: [{ type: "text", text: processToolOutput(output) }],
-              details: { exitCode: 0 },
-            });
-          } else {
-            const errOutput = `Exit code: ${code ?? "unknown"}\n${output}`;
-            resolve({
-              content: [
-                { type: "text", text: processToolOutput(errOutput) },
-              ],
-              details: { exitCode: code, error: true },
-            });
-          }
-        });
-
-        child.on("error", (err) => {
-          clearTimeout(timer);
-          signal?.removeEventListener("abort", onAbort);
-          resolve({
-            content: [
-              {
-                type: "text",
-                text: processToolOutput(`Error: ${err.message}`),
-              },
-            ],
-            details: { error: true },
-          });
-        });
-      });
+      try {
+        const result = await spawnAsync("kubectl", kubectlArgs, timeout, env.childEnv, signal, resolved.content);
+        const output = result.stdout.trim() +
+          (result.stderr.trim() ? `\n\nSTDERR:\n${result.stderr.trim()}` : "");
+        return {
+          content: [{ type: "text", text: processToolOutput(output) }],
+          details: { exitCode: 0 },
+        };
+      } catch (err: any) {
+        const stdout = err.stdout?.trim() ?? "";
+        const stderr = err.stderr?.trim() ?? err.message;
+        const output = `Exit code: ${err.code ?? "unknown"}\n${stdout}${stderr ? `\n\nSTDERR:\n${stderr}` : ""}`;
+        return {
+          content: [{ type: "text", text: processToolOutput(output) }],
+          details: { exitCode: err.code ?? null, error: true },
+        };
+      }
     },
   };
 }
