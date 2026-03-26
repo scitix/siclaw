@@ -13,8 +13,8 @@ import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/agent-factory.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
-import { deepSearchEvents } from "../tools/deep-search/events.js";
-import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/dp-tools.js";
+import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";
+import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/workflow/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
