@@ -126,6 +126,7 @@ export function SkillEditor() {
     const [formData, setFormData] = useState<Skill | null>(null);
     const [activeScriptId, setActiveScriptId] = useState<string | null>(null);
     const [isSaving, setIsSaving] = useState(false);
+    const [saveError, setSaveError] = useState<string | null>(null);
     const [showAddMenu, setShowAddMenu] = useState(false);
     const [showCategoryDropdown, setShowCategoryDropdown] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -228,7 +229,7 @@ export function SkillEditor() {
                 icon: Code2,
                 status: 'not_installed',
                 version: '0.0.1',
-                specs: DEFAULT_SPEC_TEMPLATE,
+                specs: DEFAULT_SPEC_TEMPLATE.replace(/^name:\s*.+$/m, 'name: New Custom Skill'),
                 scripts: [],
                 scope: 'personal',
                 author: 'Current User',
@@ -315,13 +316,15 @@ export function SkillEditor() {
         if (!formData) return;
         try {
             setIsSaving(true);
+            setSaveError(null);
             await rpcSaveSkill(sendRpc, formData, isNew, currentWorkspace?.id);
             if (id) clearDraft(id);
             setServerData(formData); // Mark current state as "saved" so isDirty becomes false
             isSaveNavigatingRef.current = true;
             navigate(backTarget);
-        } catch (err) {
+        } catch (err: any) {
             console.error('[SkillEditor] Save failed:', err);
+            setSaveError(err?.message || 'Save failed');
         } finally {
             setIsSaving(false);
         }
@@ -404,7 +407,18 @@ export function SkillEditor() {
 
     const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         if (formData) {
-            setFormData({ ...formData, name: e.target.value });
+            const newName = e.target.value;
+            // Sync name into specs frontmatter
+            let specs = formData.specs || '';
+            const fmMatch = specs.match(/^(---\n)([\s\S]*?)(\n---)/);
+            if (fmMatch) {
+                const yaml = fmMatch[2];
+                const updatedYaml = yaml.match(/^name:\s*.+$/m)
+                    ? yaml.replace(/^name:\s*.+$/m, `name: ${newName}`)
+                    : `name: ${newName}\n${yaml}`;
+                specs = `${fmMatch[1]}${updatedYaml}${fmMatch[3]}${specs.slice(fmMatch[0].length)}`;
+            }
+            setFormData({ ...formData, name: newName, specs });
         }
     };
 
@@ -554,6 +568,14 @@ export function SkillEditor() {
                     )}
                 </div>
             </header>
+
+            {/* Save error banner */}
+            {saveError && (
+                <div className="px-6 py-2.5 bg-red-50 border-b border-red-200 flex items-center gap-2 shrink-0">
+                    <span className="text-sm text-red-800">{saveError}</span>
+                    <button onClick={() => setSaveError(null)} className="ml-auto text-red-400 hover:text-red-600"><X className="w-4 h-4" /></button>
+                </div>
+            )}
 
             {/* Draft restore banner */}
             {draftRestored && (
@@ -723,7 +745,15 @@ export function SkillEditor() {
                             <div className="relative flex-1 group/editor">
                                 <textarea
                                     value={formData.specs}
-                                    onChange={(e) => !isReadOnly && setFormData({ ...formData, specs: e.target.value })}
+                                    onChange={(e) => {
+                                        if (isReadOnly) return;
+                                        const newSpecs = e.target.value;
+                                        // Sync frontmatter name → UI name
+                                        const fmMatch = newSpecs.match(/^---\n([\s\S]*?)\n---/);
+                                        const nameMatch = fmMatch?.[1]?.match(/^name:\s*(.+)$/m);
+                                        const fmName = nameMatch ? nameMatch[1].trim() : undefined;
+                                        setFormData({ ...formData, specs: newSpecs, ...(fmName !== undefined ? { name: fmName } : {}) });
+                                    }}
                                     readOnly={isReadOnly}
                                     className={cn(
                                         "w-full h-full px-4 py-3 border border-gray-200 rounded-lg text-xs font-mono text-gray-700 outline-none resize-none leading-relaxed transition-all",

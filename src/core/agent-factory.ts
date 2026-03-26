@@ -19,21 +19,21 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
-import { createRestrictedBashTool } from "../tools/restricted-bash.js";
-import { createNodeExecTool } from "../tools/node-exec.js";
-import { createNodeScriptTool } from "../tools/node-script.js";
-import { createPodScriptTool } from "../tools/pod-script.js";
-import { createNetnsScriptTool } from "../tools/netns-script.js";
-import { createPodExecTool } from "../tools/pod-exec.js";
-import { createPodNsenterExecTool } from "../tools/pod-nsenter-exec.js";
-import { createCreateSkillTool } from "../tools/create-skill.js";
-import { createRunSkillTool } from "../tools/run-skill.js";
-import { createUpdateSkillTool } from "../tools/update-skill.js";
-import { createForkSkillTool } from "../tools/fork-skill.js";
-import { createManageScheduleTool } from "../tools/manage-schedule.js";
-import { createDeepSearchTool, type MemoryRef } from "../tools/deep-search/tool.js";
-import { createInvestigationFeedbackTool } from "../tools/investigation-feedback.js";
-import { createSaveFeedbackTool } from "../tools/save-feedback.js";
+import { createRestrictedBashTool } from "../tools/shell/restricted-bash.js";
+import { createNodeExecTool } from "../tools/k8s-exec/node-exec.js";
+import { createNodeScriptTool } from "../tools/k8s-script/node-script.js";
+import { createPodScriptTool } from "../tools/k8s-script/pod-script.js";
+import { createNetnsScriptTool } from "../tools/k8s-script/netns-script.js";
+import { createPodExecTool } from "../tools/k8s-exec/pod-exec.js";
+import { createPodNsenterExecTool } from "../tools/k8s-exec/pod-nsenter-exec.js";
+import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
+import { createRunSkillTool } from "../tools/shell/run-skill.js";
+import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
+import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
+import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
+import { createDeepSearchTool, type MemoryRef } from "../tools/workflow/deep-search/tool.js";
+import { createInvestigationFeedbackTool } from "../tools/query/investigation-feedback.js";
+import { createSaveFeedbackTool } from "../tools/workflow/save-feedback.js";
 import {
   type DpState,
   type DpStateRef,
@@ -41,12 +41,12 @@ import {
   createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
-} from "../tools/dp-tools.js";
-import { createMemorySearchTool } from "../tools/memory-search.js";
-import { createMemoryGetTool } from "../tools/memory-get.js";
-import { createCredentialListTool } from "../tools/credential-list.js";
-import { createClusterInfoTool } from "../tools/cluster-info.js";
-import { createKnowledgeSearchTool } from "../tools/knowledge-search.js";
+} from "../tools/workflow/dp-tools.js";
+import { createMemorySearchTool } from "../tools/query/memory-search.js";
+import { createMemoryGetTool } from "../tools/query/memory-get.js";
+import { createCredentialListTool } from "../tools/query/credential-list.js";
+import { createClusterInfoTool } from "../tools/query/cluster-info.js";
+import { createKnowledgeSearchTool } from "../tools/query/knowledge-search.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
@@ -292,22 +292,28 @@ export async function createSiclawSession(
   const dpStateRef: DpStateRef = mutableDpStateRef;
 
   const customTools: ToolDefinition[] = [
-    createRestrictedBashTool(kubeconfigRef),
+    // ── K8s command execution (k8s-exec/) ──
     createNodeExecTool(kubeconfigRef, userId),
+    createPodExecTool(kubeconfigRef),
+    createPodNsenterExecTool(kubeconfigRef, userId),
+    // ── K8s script execution (k8s-script/) ──
     createNodeScriptTool(kubeconfigRef, userId),
     createPodScriptTool(kubeconfigRef),
     createNetnsScriptTool(kubeconfigRef, userId),
-    createPodExecTool(kubeconfigRef),
-    createPodNsenterExecTool(kubeconfigRef, userId),
+    // ── Local shell (shell/) ──
+    createRestrictedBashTool(kubeconfigRef),
     createRunSkillTool(kubeconfigRef, sessionIdRef),
-    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
+    // ── Data query (query/) ──
     createInvestigationFeedbackTool(memoryRef),
-    createSaveFeedbackTool(sessionIdRef),
     createCredentialListTool(kubeconfigRef),
     createClusterInfoTool(kubeconfigRef),
     createKnowledgeSearchTool(opts?.knowledgeIndexer),
+    // ── Workflow (workflow/) ──
+    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
+    createSaveFeedbackTool(sessionIdRef),
   ];
 
+  // ── Workflow: conditional tools ──
   // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
   if (mode !== "cli") {
     customTools.push(createManageScheduleTool(kubeconfigRef));
@@ -599,7 +605,7 @@ export async function createSiclawSession(
 
   // -- Pi-agent brain path (default) --
 
-  // Initialize memory indexer for pi-agent (hybrid search over memory/*.md)
+  // ── Data query: memory tools (query/) — require memoryIndexer, pushed after init ──
   let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
   try {
     if (memoryIndexer) {

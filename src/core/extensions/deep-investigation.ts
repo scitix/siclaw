@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { deepSearchEvents, type ProgressEvent } from "../../tools/deep-search/events.js";
+import { deepSearchEvents, type ProgressEvent } from "../../tools/workflow/deep-search/events.js";
 import {
   type DpChecklist,
   type MutableDpStateRef,
@@ -10,8 +10,8 @@ import {
   createChecklist,
   syncChecklistFromStatus,
   buildActivationMessage,
-} from "../../tools/dp-tools.js";
-import type { MemoryRef } from "../../tools/deep-search/tool.js";
+} from "../../tools/workflow/dp-tools.js";
+import type { MemoryRef } from "../../tools/workflow/deep-search/tool.js";
 import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
 
 
