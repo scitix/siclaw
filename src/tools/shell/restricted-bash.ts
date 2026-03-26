@@ -7,9 +7,9 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
-import { analyzeOutput, applySanitizer } from "../infra/output-sanitizer.js";
+import { analyzeOutput, applySanitizer, redactSensitiveContent } from "../infra/output-sanitizer.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand, hasAllNamespacesWithoutSelector } from "../infra/command-sets.js";
-import { detectSensitiveResource, getOutputFormat } from "../infra/kubectl-sanitize.js";
+import { detectSensitiveResource } from "../infra/kubectl-sanitize.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -97,38 +97,9 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       }
     }
 
-    // Block sensitive resource access with structured output in pipelines.
-    // Pipeline output can't be intercepted mid-pipe, so we block pre-execution.
-    // Only block Secret and ConfigMap — Pod is too commonly queried to block in
-    // pipelines; Pod env sanitization is handled by the kubectl tool instead.
-    // ACCEPTED RISK: `kubectl get pod -o json | jq .spec` in a pipeline won't
-    // have Pod env vars sanitized. Mitigation: the agent typically uses the
-    // kubectl tool (not bash) for structured output, which does sanitize.
-    const sensitiveSubcommands = ["get", "describe"];
-    if (sensitiveSubcommands.includes(subcommand)) {
-      const sensitiveResource = detectSensitiveResource(args);
-      if (sensitiveResource && sensitiveResource !== "pod") {
-        // Block describe for ConfigMap (sensitive data in human-readable format)
-        if (subcommand === "describe" && sensitiveResource === "configmap") {
-          return JSON.stringify({
-            error: `"kubectl describe ${sensitiveResource}" may expose sensitive data in a pipeline.`,
-            hint: `Use the kubectl tool directly: kubectl("get ${sensitiveResource} <name> -o json") — structured output is automatically sanitized.`,
-          }, null, 2);
-        }
-
-        // Block structured output formats that expose sensitive data
-        const outputFormat = getOutputFormat(args);
-        const blockedFormats = ["json", "yaml", "jsonpath", "go-template", "custom-columns"];
-        if (outputFormat && blockedFormats.includes(outputFormat)) {
-          return JSON.stringify({
-            error: `"kubectl get ${sensitiveResource} -o ${outputFormat}" is not allowed in a pipeline — sensitive data cannot be sanitized mid-pipe.`,
-            hint: `Use the kubectl tool directly: kubectl("get ${sensitiveResource} <name> -o json") — structured output is automatically sanitized.`,
-          }, null, 2);
-        }
-
-        // Default table / -o wide / -o name: safe, allow through
-      }
-    }
+    // Sensitive resource access (Secret, ConfigMap, Pod) is handled by
+    // post-execution sanitization via OUTPUT_RULES["kubectl"] + pipeline
+    // fallback redaction. No pre-execution blocking needed here.
   }
   return null;
 }
@@ -332,6 +303,19 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         const lastBin = getCommandBinary(lastCmd);
         return lastBin ? analyzeOutput(lastBin, lastArgs.slice(1)) : null;
       })();
+
+      // Pipeline fallback: if a pipeline contains kubectl get/describe on a
+      // sensitive resource, apply line-level redaction on final output as a
+      // safety net (the last command may be jq/grep with no sanitizer).
+      const hasSensitiveKubectlInPipeline = commands.length > 1 && commands.some(cmd => {
+        const bin = getCommandBinary(cmd);
+        if (bin !== "kubectl") return false;
+        const kArgs = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
+        const sub = kArgs.find((a) => !a.startsWith("-"))?.toLowerCase();
+        if (sub !== "get" && sub !== "describe") return false;
+        return detectSensitiveResource(kArgs) !== null;
+      });
+
       const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
 
       try {
@@ -400,7 +384,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         signal?.removeEventListener("abort", onAbort);
 
-        const sanitizedStdout = applySanitizer(stdout.trim(), outputAction);
+        let sanitizedStdout = applySanitizer(stdout.trim(), outputAction);
+        if (hasSensitiveKubectlInPipeline) sanitizedStdout = redactSensitiveContent(sanitizedStdout);
         const output = sanitizedStdout +
           (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
@@ -408,7 +393,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           details: { exitCode: 0 },
         };
       } catch (err: any) {
-        const sanitizedStdout = applySanitizer(err.stdout?.trim() ?? "", outputAction);
+        let sanitizedStdout = applySanitizer(err.stdout?.trim() ?? "", outputAction);
+        if (hasSensitiveKubectlInPipeline) sanitizedStdout = redactSensitiveContent(sanitizedStdout);
         const output = `Exit code: ${err.code ?? "unknown"}\n${sanitizedStdout}\n${err.stderr?.trim() ?? err.message}`;
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
