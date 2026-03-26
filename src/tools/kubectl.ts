@@ -6,6 +6,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
 import {
   ALLOWED_COMMANDS,
+  CONTAINER_SENSITIVE_PATHS,
   parseArgs,
   validateCommandRestrictions,
 } from "./command-sets.js";
@@ -344,6 +345,14 @@ export function validateExecCommand(args: string[]): string | null {
   const execCmd = args.slice(dashDashIndex + 1).join(" ");
   const restrictionErr = validateCommandRestrictions(execCmd);
   if (restrictionErr) return restrictionErr;
+
+  // Check sensitive path patterns (validateExecCommand does not go through
+  // Pass 6 of validateCommand, so we check explicitly here)
+  if (CONTAINER_SENSITIVE_PATHS.some((re) => re.test(execCmd))) {
+    return JSON.stringify({
+      error: "Accessing sensitive paths inside containers is not allowed.",
+    }, null, 2);
+  }
 
   return null;
 }
