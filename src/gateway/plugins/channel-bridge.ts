@@ -322,7 +322,7 @@ export function createChannelBridge(
           }
           // bash: show the command
           if (args.command) return String(args.command).split("\n")[0].slice(0, 200);
-          // run_skill: show "skill/script args"
+          // local_script: show "skill/script args"
           if (args.skill && args.script) {
             const s = `${args.skill}/${args.script}`;
             return args.args ? `${s} ${String(args.args).slice(0, 100)}` : s;

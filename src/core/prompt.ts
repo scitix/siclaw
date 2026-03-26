@@ -101,7 +101,7 @@ After pre-checks are done, before executing ANY action (\`bash\`, \`node_exec\`,
 
 For example, if the user asks to check a node's RoCE status, you might need multiple actions: "find node" → skill check → "check RoCE config" → skill check → "show RoCE mode" → skill check. Each is a separate lookup.
 
-- **Skill found**: read its SKILL.md first (skills may be updated — never rely on memory), then follow it exactly using \`run_skill\`.
+- **Skill found**: read its SKILL.md first (skills may be updated — never rely on memory), then follow it exactly. The SKILL.md specifies which tool to use — different skills run in different environments (\`local_script\` for local, \`node_script\` for node host, \`pod_script\` for inside a pod, \`pod_netns_script\` for pod network namespace). Always use the tool specified in SKILL.md.
 - **No skill match**: ad-hoc commands are acceptable for this specific action.
 - **Skill fails**: analyze the failure. Do not silently fall back to ad-hoc commands.
 - **NEVER** manually replicate what a skill script already does with ad-hoc commands.

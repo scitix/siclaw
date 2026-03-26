@@ -155,7 +155,7 @@ Tools (read docs/design/tools.md for development guide)
 
 Skills
   src/gateway/skills/skill-bundle.ts  buildSkillBundle() — team + personal only
-  src/tools/shell/run-skill.ts        run_skill tool
+  src/tools/shell/run-skill.ts        local_script tool
   src/tools/infra/script-resolver.ts  Skill path resolution
   skills/core/                        Built-in diagnostic skills
 

@@ -115,7 +115,7 @@ function parseBlock(block: string, fallbackIndex: number): ParsedHypothesis {
 
         // Skip raw tool references (these are for the agent, not the user)
         if (line.match(/^\*{0,2}(?:validation tools?|verification tools?)\*{0,2}[:\s]/i)) continue;
-        if (line.match(/`(node_exec|pod_exec|bash|run_skill|node_script)[:\s]/)) {
+        if (line.match(/`(node_exec|pod_exec|bash|local_script|node_script)[:\s]/)) {
             detailLines.push(cleanMarkdown(line));
             continue;
         }
