@@ -12,7 +12,7 @@ import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
 import type { BrainType } from "./core/brain-session.js";
-import { debugPodGC, debugPodCache } from "./tools/debug-pod.js";
+import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
 
 
 // Parse arguments

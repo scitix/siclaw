@@ -101,7 +101,7 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 - Max output: 10 MB combined stdout+stderr
 - Env injected: `SICLAW_DEBUG_IMAGE`, `KUBECONFIG`, `SICLAW_CREDENTIALS_DIR`
 
-**Source**: `src/tools/run-skill.ts`
+**Source**: `src/tools/shell/run-skill.ts`
 
 ---
 
@@ -139,7 +139,7 @@ Pass 5 — COMMAND_RULES         Per-command: pipeOnly, noFilePaths, blockedFlag
 Pass 6 — Sensitive Paths       Block commands targeting credential/config file paths
 ```
 
-**Source**: `src/tools/command-validator.ts`, `src/tools/command-sets.ts`
+**Source**: `src/tools/infra/command-validator.ts`, `src/tools/infra/command-sets.ts`
 
 ### 3.3 Explicitly Excluded Binaries
 
@@ -288,7 +288,7 @@ Memory search (`memory_search` tool) is only available when an embedding provide
 | maxParallel | 3 | 3 |
 | maxDurationMs | 300,000 (5 min) | 180,000 (3 min) |
 
-**Source**: `src/tools/deep-search/types.ts`
+**Source**: `src/tools/workflow/deep-search/types.ts`
 
 ### 8.2 Early Exit
 

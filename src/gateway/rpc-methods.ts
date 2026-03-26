@@ -51,7 +51,7 @@ import { KnowledgeDocRepository } from "./db/repositories/knowledge-doc-repo.js"
 import type { MemoryIndexer } from "../memory/index.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { loadConfig } from "../core/config.js";
-import { type DpStatus, type DpChecklist, createChecklist, syncChecklistFromStatus, type DpState } from "../tools/dp-tools.js";
+import { type DpStatus, type DpChecklist, createChecklist, syncChecklistFromStatus, type DpState } from "../tools/workflow/dp-tools.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 

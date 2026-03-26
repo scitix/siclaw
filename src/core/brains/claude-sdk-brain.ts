@@ -16,7 +16,7 @@ import type {
 } from "../brain-session.js";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { adaptToolsForSdk } from "../tool-adapter.js";
-import type { DpState } from "../../tools/dp-tools.js";
+import type { DpState } from "../../tools/workflow/dp-tools.js";
 
 /** Lazy-loaded SDK imports (only when claude-sdk brain is actually used) */
 let sdkModule: {
