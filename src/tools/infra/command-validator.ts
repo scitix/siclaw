@@ -26,6 +26,8 @@ export interface ValidateCommandOptions {
   pipelineValidators?: Array<(cmds: string[]) => string | null>;
   /** Patterns that block commands touching sensitive paths. */
   sensitivePathPatterns?: RegExp[];
+  /** Reject pipes (|), chaining (&&, ;) — for contexts where commands are passed as argv, not through a shell. */
+  blockPipeline?: boolean;
 }
 
 // ── extractCommands (moved from restricted-bash.ts) ──────────────────
@@ -350,6 +352,13 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   const commands = pipeline.map(s => s.command);
   if (commands.length === 0) {
     return "Command must not be empty.";
+  }
+
+  // 2b. Block pipelines for contexts where commands are passed as argv
+  if (options?.blockPipeline && pipeline.length > 1) {
+    return JSON.stringify({
+      error: "Pipes (|), chaining (&&, ;) are not supported — only single commands are allowed.",
+    }, null, 2);
   }
 
   // 3. Per-command whitelist check
