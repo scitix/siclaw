@@ -8,7 +8,7 @@
 import { describe, it, expect } from "vitest";
 import { validateCommand } from "./command-validator.js";
 import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
-import { validateExecCommand } from "./kubectl.js";
+import { validateExecCommand } from "./command-sets.js";
 import { createPodExecTool } from "./pod-exec.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 

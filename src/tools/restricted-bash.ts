@@ -8,7 +8,7 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "./tool-render.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
-import { SAFE_SUBCOMMANDS, validateExecCommand, hasAllNamespacesWithoutSelector } from "./kubectl.js";
+import { SAFE_SUBCOMMANDS, validateExecCommand, hasAllNamespacesWithoutSelector } from "./command-sets.js";
 import { detectSensitiveResource, getOutputFormat } from "./kubectl-sanitize.js";
 import { loadConfig } from "../core/config.js";
 import {
