@@ -1,0 +1,886 @@
+import { runSubAgent, llmComplete, llmCompleteWithTool, extractJSON, type SubAgentOptions, type ProgressCallback, type ProgressEvent } from "./sub-agent.js";
+import {
+  contextGatheringPrompt,
+  hypothesisGenerationPrompt,
+  hypothesisValidationPrompt,
+  conclusionPrompt,
+  forceVerdictPrompt,
+  forceContextSummaryPrompt,
+  type PriorKnowledge,
+} from "./prompts.js";
+import { writeFile, mkdir } from "fs/promises";
+import { join } from "path";
+import crypto from "node:crypto";
+import { resolveKubeconfigPath } from "../../infra/kubeconfig-resolver.js";
+import type { MemoryIndexer } from "../../../memory/indexer.js";
+import type { InvestigationPattern, InvestigationRecord } from "../../../memory/types.js";
+import type {
+  ConclusionResult,
+  DeepSearchBudget,
+  HypothesisNode,
+  InvestigationResult,
+  TraceStep,
+} from "./types.js";
+import {
+  NORMAL_BUDGET,
+  EARLY_EXIT_CONFIDENCE,
+  EARLY_EXIT_SKIP_BELOW,
+  TRACE_MAX_OUTPUT,
+  TRACE_HEAD_CHARS,
+  TRACE_TAIL_CHARS,
+} from "./types.js";
+import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA } from "./schemas.js";
+import { validateConclusion } from "./quality-gate.js";
+
+interface RawHypothesis {
+  text: string;
+  confidence: number;
+  suggestedTools: string[];
+  estimatedCalls?: number;
+}
+
+/**
+ * Write a human-readable Markdown trace file for debugging sub-agent behavior.
+ * File is written to ~/.siclaw/traces/deep-search-{timestamp}.md
+ */
+async function writeDebugTrace(
+  question: string,
+  hypotheses: HypothesisNode[],
+  totalCalls: number,
+  durationMs: number,
+): Promise<string> {
+  const traceDir = join(process.cwd(), ".siclaw", "traces");
+  await mkdir(traceDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const filename = `deep-search-${timestamp}.md`;
+  const filepath = join(traceDir, filename);
+
+  const lines: string[] = [];
+  lines.push(`# Deep Search Debug Trace`);
+  lines.push(`\n**Question**: ${question}`);
+  lines.push(`**Timestamp**: ${new Date().toISOString()}`);
+  lines.push(`**Total tool calls**: ${totalCalls} | **Duration**: ${(durationMs / 1000).toFixed(1)}s`);
+  lines.push(`**Hypotheses**: ${hypotheses.length} total, ${hypotheses.filter((h) => h.status === "validated").length} validated`);
+  lines.push(`\n---\n`);
+
+  for (const h of hypotheses) {
+    lines.push(`## ${h.id}: ${h.text}`);
+    lines.push(`**Status**: ${h.status} (${h.confidence}%) | **Tool calls**: ${h.toolCallsUsed}`);
+    lines.push(`**Suggested tools**: ${h.suggestedTools.join(", ") || "(none)"}`);
+    lines.push(`**Reasoning**: ${h.reasoning}`);
+
+    if (h.trace && h.trace.length > 0) {
+      lines.push(`\n### Execution Trace\n`);
+      let stepNum = 0;
+      for (const step of h.trace) {
+        stepNum++;
+        switch (step.type) {
+          case "llm_reasoning":
+            lines.push(`#### Step ${stepNum}: LLM Reasoning`);
+            lines.push(`> ${step.content.replace(/\n/g, "\n> ")}`);
+            lines.push("");
+            break;
+          case "tool_call":
+            lines.push(`#### Step ${stepNum}: Tool Call`);
+            lines.push(`\`\`\`\n${step.tool}: ${step.command}\n\`\`\``);
+            lines.push("");
+            break;
+          case "tool_result":
+            lines.push(`#### Step ${stepNum}: Tool Result`);
+            // Truncate very long outputs in trace
+            const output = step.content.length > TRACE_MAX_OUTPUT
+              ? step.content.slice(0, TRACE_HEAD_CHARS) + "\n...[truncated]...\n" + step.content.slice(-TRACE_TAIL_CHARS)
+              : step.content;
+            lines.push(`\`\`\`\n${output}\n\`\`\``);
+            lines.push("");
+            break;
+        }
+      }
+    } else {
+      lines.push(`\n*No trace data available*\n`);
+    }
+
+    lines.push(`\n---\n`);
+  }
+
+  await writeFile(filepath, lines.join("\n"), "utf-8");
+  return filepath;
+}
+
+/**
+ * Write a concise investigation summary to the memory directory so it gets
+ * indexed and can be retrieved during future hypothesis generation.
+ * Format is designed for chunking: clear headings, concise content, structured verdicts.
+ */
+async function writeInvestigationToMemory(
+  memoryDir: string,
+  question: string,
+  hypotheses: HypothesisNode[],
+  conclusion: string,
+  durationMs: number,
+): Promise<void> {
+  const investigationsDir = join(memoryDir, "investigations");
+  await mkdir(investigationsDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const date = new Date().toISOString().slice(0, 10);
+  const filepath = join(investigationsDir, `${date}-${timestamp.slice(11)}.md`);
+
+  const validated = hypotheses.filter(h => h.status === "validated");
+  const invalidated = hypotheses.filter(h => h.status === "invalidated");
+
+  const lines: string[] = [
+    `# Investigation: ${question}`,
+    ``,
+    `**Date**: ${date}`,
+    `**Duration**: ${(durationMs / 1000).toFixed(0)}s`,
+    `**Hypotheses**: ${hypotheses.length} total, ${validated.length} validated, ${invalidated.length} invalidated`,
+    ``,
+    `## Root Cause`,
+    ``,
+    conclusion.length > 1500 ? conclusion.slice(0, 1500) + "\n...(truncated)" : conclusion,
+    ``,
+    `## Hypothesis Verdicts`,
+    ``,
+  ];
+
+  for (const h of hypotheses) {
+    if (h.status === "skipped") continue;
+    const keyEvidence = h.evidence.slice(0, 2)
+      .map(e => `  - \`${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}\``)
+      .join("\n");
+    lines.push(
+      `### ${h.id}: ${h.text}`,
+      `**Verdict**: ${h.status.toUpperCase()} (${h.confidence}%)`,
+      h.reasoning ? `**Reasoning**: ${h.reasoning.slice(0, 300)}` : "",
+      keyEvidence ? `**Key evidence**:\n${keyEvidence}` : "",
+      ``,
+    );
+  }
+
+  await writeFile(filepath, lines.filter(l => l !== undefined).join("\n"), "utf-8");
+  console.log(`[deep-search] Investigation summary written to memory: ${filepath}`);
+}
+
+/**
+ * Phase 2: Generate hypotheses using LLM function calling (tool_use).
+ * Falls back to extractJSON if the provider doesn't support tool_use.
+ */
+async function generateHypotheses(
+  question: string,
+  contextSummary: string,
+  maxHypotheses: number,
+  options?: SubAgentOptions,
+  onProgress?: ProgressCallback,
+  priorKnowledge?: PriorKnowledge,
+): Promise<RawHypothesis[]> {
+  const prompt = hypothesisGenerationPrompt(question, contextSummary, maxHypotheses, priorKnowledge);
+  const fallback: RawHypothesis[] = [{ text: "Failed to parse hypotheses", confidence: 0, suggestedTools: [] }];
+
+  try {
+    const { toolArgs } = await llmCompleteWithTool<{ hypotheses: RawHypothesis[] }>(
+      undefined,
+      prompt,
+      "submit_hypotheses",
+      "Submit ranked hypotheses for validation",
+      HYPOTHESES_SCHEMA,
+      options,
+      onProgress,
+    );
+
+    if (!toolArgs) return fallback;
+
+    // Accept both { hypotheses: [...] } and bare array [...]
+    const hypotheses: RawHypothesis[] | null = Array.isArray(toolArgs.hypotheses)
+      ? toolArgs.hypotheses
+      : Array.isArray(toolArgs)
+        ? (toolArgs as unknown as RawHypothesis[])
+        : null;
+    if (!hypotheses?.length || !hypotheses[0].text) return fallback;
+    return hypotheses.slice(0, maxHypotheses);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return [{ text: `Hypothesis generation failed: ${msg}`, confidence: 0, suggestedTools: [] }];
+  }
+}
+
+/**
+ * Parse structured extraction block from LLM conclusion output.
+ * Returns { text, structured? } — structured is undefined if parsing fails (graceful degradation).
+ */
+function parseConclusionOutput(raw: string): ConclusionResult {
+  const startMarker = "STRUCTURED_EXTRACTION_START";
+  const endMarker = "STRUCTURED_EXTRACTION_END";
+
+  const startIdx = raw.indexOf(startMarker);
+  const endIdx = raw.indexOf(endMarker);
+
+  if (startIdx < 0 || endIdx < 0 || endIdx <= startIdx) {
+    return { text: raw.trim() };
+  }
+
+  const text = raw.slice(0, startIdx).trim();
+  const jsonBlock = raw.slice(startIdx + startMarker.length, endIdx).trim();
+
+  const jsonStr = extractJSON(jsonBlock);
+  if (!jsonStr) {
+    console.warn(`[deep-search] Failed to extract JSON from structured block, degrading to text-only conclusion`);
+    return { text };
+  }
+
+  try {
+    const parsed = JSON.parse(jsonStr);
+    return {
+      text,
+      structured: {
+        root_cause_category: parsed.root_cause_category ?? "unknown",
+        affected_entities: Array.isArray(parsed.affected_entities) ? parsed.affected_entities : [],
+        environment_tags: Array.isArray(parsed.environment_tags) ? parsed.environment_tags : [],
+        causal_chain: Array.isArray(parsed.causal_chain) ? parsed.causal_chain : [],
+        confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0,
+      },
+    };
+  } catch {
+    console.warn(`[deep-search] Failed to parse structured extraction JSON, degrading to text-only conclusion`);
+    return { text };
+  }
+}
+
+/** TypeScript interface matching CONCLUSION_SCHEMA. */
+interface ConclusionToolArgs {
+  conclusion_text: string;
+  root_cause_category: string;
+  affected_entities?: string[];
+  environment_tags?: string[];
+  causal_chain?: string[];
+  confidence: number;
+  remediation_steps?: string[];
+}
+
+/**
+ * Phase 4: Generate final conclusion using LLM function calling (tool_use).
+ * Returns both human-readable text and optional structured extraction.
+ * Falls back to parseConclusionOutput() for providers without tool_use support.
+ */
+async function generateConclusion(
+  question: string,
+  hypotheses: HypothesisNode[],
+  options?: SubAgentOptions,
+  critique?: string,
+): Promise<ConclusionResult> {
+  const hypothesesSummary = hypotheses
+    .map((h) => {
+      const evidenceText = h.evidence
+        .map((e) => `  - [${e.tool}] ${e.command}\n    Output: ${e.output.slice(0, 200)}`)
+        .join("\n");
+      return `${h.id}: ${h.text}\nStatus: ${h.status} (${h.confidence}%)\nReasoning: ${h.reasoning}\nEvidence:\n${evidenceText}`;
+    })
+    .join("\n\n");
+
+  const prompt = conclusionPrompt(question, hypothesesSummary, critique);
+  // No onProgress here — Phase 4 conclusion text should NOT leak into spinner
+  try {
+    const { toolArgs, textContent } = await llmCompleteWithTool<ConclusionToolArgs>(
+      undefined,
+      prompt,
+      "submit_conclusion",
+      "Submit the final investigation conclusion with structured metadata",
+      CONCLUSION_SCHEMA,
+      options,
+    );
+
+    if (toolArgs) {
+      return {
+        text: toolArgs.conclusion_text,
+        structured: {
+          root_cause_category: toolArgs.root_cause_category ?? "unknown",
+          affected_entities: Array.isArray(toolArgs.affected_entities) ? toolArgs.affected_entities : [],
+          environment_tags: Array.isArray(toolArgs.environment_tags) ? toolArgs.environment_tags : [],
+          causal_chain: Array.isArray(toolArgs.causal_chain) ? toolArgs.causal_chain : [],
+          confidence: typeof toolArgs.confidence === "number" ? toolArgs.confidence : 0,
+          remediation_steps: Array.isArray(toolArgs.remediation_steps) ? toolArgs.remediation_steps : undefined,
+        },
+      };
+    }
+
+    // Fallback: marker-based parsing (for providers that returned text instead of tool_calls)
+    return parseConclusionOutput(textContent);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { text: `Conclusion generation failed: ${msg}` };
+  }
+}
+
+/**
+ * Parse the verdict output from a Phase 3 sub-agent.
+ */
+function parseVerdict(text: string): { status: HypothesisNode["status"]; confidence: number; reasoning: string } {
+  const verdictMatch = text.match(/VERDICT:\s*(validated|invalidated|inconclusive)/i);
+  const confidenceMatch = text.match(/CONFIDENCE:\s*(\d+)/i);
+  const reasoningMatch = text.match(/REASONING:\s*([\s\S]*?)(?:$)/i);
+
+  return {
+    status: (verdictMatch?.[1]?.toLowerCase() as HypothesisNode["status"]) ?? "inconclusive",
+    confidence: confidenceMatch ? parseInt(confidenceMatch[1], 10) : 50,
+    reasoning: reasoningMatch?.[1]?.trim() ?? text.slice(-300),
+  };
+}
+
+/**
+ * Extract context summary from Phase 1 output.
+ * Tries structured markers first, falls back to full text.
+ */
+function parseContextSummary(text: string): string {
+  // Try new structured format
+  const structuredMatch = text.match(/CONTEXT_SUMMARY_START\s*([\s\S]*?)\s*CONTEXT_SUMMARY_END/i);
+  if (structuredMatch) return structuredMatch[1].trim();
+
+  // Fallback: old format
+  const oldMatch = text.match(/CONTEXT_SUMMARY:\s*([\s\S]*?)$/i);
+  if (oldMatch) return oldMatch[1].trim();
+
+  // Last resort: use the entire text (better than empty)
+  return text.trim() || "(No context gathered)";
+}
+
+/**
+ * Pre-gathered hypothesis from PL agent triage.
+ * When provided, Phase 2 (hypothesis generation) is skipped.
+ */
+export interface TriageHypothesis {
+  text: string;
+  confidence: number;
+  suggestedTools: string[];
+}
+
+export interface InvestigateOptions extends SubAgentOptions {
+  budget?: DeepSearchBudget;
+  onProgress?: ProgressCallback;
+  /** Pre-gathered context from PL agent triage. Skips Phase 1 when provided. */
+  triageContext?: string;
+  /** Pre-confirmed hypotheses from PL agent. Skips Phase 2 when provided. */
+  hypotheses?: TriageHypothesis[];
+  /** Memory indexer for retrieving related past investigations during hypothesis generation. */
+  memoryIndexer?: MemoryIndexer;
+  /** Memory directory path for persisting investigation summaries. */
+  memoryDir?: string;
+}
+
+/**
+ * Main investigation engine. Orchestrates up to 4 phases:
+ * 1. Context gathering (sub-agent with tools) — SKIPPED if triageContext provided
+ * 2. Hypothesis generation (single LLM call) — SKIPPED if hypotheses provided
+ * 3. Parallel hypothesis validation (sub-agents with tools)
+ * 4. Conclusion generation (single LLM call)
+ *
+ * When PL agent provides triageContext and/or hypotheses from interactive triage,
+ * the skipped phases' budget is redistributed to Phase 3 validation.
+ */
+export async function investigate(
+  question: string,
+  options?: InvestigateOptions,
+): Promise<InvestigationResult> {
+  const budget = options?.budget ?? NORMAL_BUDGET;
+  const onProgress = options?.onProgress;
+  const kubeconfigPath = resolveKubeconfigPath(options?.kubeconfigRef?.credentialsDir) ?? undefined;
+  const startTime = Date.now();
+  let globalCallsUsed = 0;
+
+  // --- Phase 1: Context Gathering (skip if triageContext provided) ---
+  let contextSummary: string;
+  if (options?.triageContext) {
+    onProgress?.({ type: "phase", phase: "Phase 1/4", detail: "Using pre-gathered triage context (skipped)" });
+    contextSummary = options.triageContext;
+  } else {
+    onProgress?.({ type: "phase", phase: "Phase 1/4", detail: "Gathering context..." });
+    const contextPrompt = contextGatheringPrompt(question, budget.maxContextCalls, kubeconfigPath);
+    try {
+      const contextResult = await runSubAgent(
+        contextPrompt,
+        question,
+        budget.maxContextCalls,
+        options,
+        onProgress,
+        forceContextSummaryPrompt(),
+      );
+      globalCallsUsed += contextResult.callsUsed;
+      contextSummary = parseContextSummary(contextResult.textOutput);
+    } catch (err) {
+      // Phase 1 sub-agent timed out or crashed — fall back to question as context
+      // so Phases 2-4 can still proceed with degraded quality.
+      // Charge the full Phase 1 budget conservatively — the sub-agent may have
+      // consumed calls before throwing, but we can't know the exact count.
+      globalCallsUsed += budget.maxContextCalls;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[deep-search] Phase 1 context gathering failed: ${msg}`);
+      onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Context gathering failed (${msg.slice(0, 120)}), proceeding with question only` });
+      contextSummary = `Context gathering failed. Original question: ${question}`;
+    }
+  }
+
+  // --- Prior Investigation Retrieval (3-layer: patterns + similar + validated hypotheses) ---
+  let priorKnowledge: PriorKnowledge | undefined;
+  let similarInvestigationRecords: InvestigationRecord[] = [];
+  if (options?.memoryIndexer && !(options?.hypotheses && options.hypotheses.length > 0)) {
+    const pk: PriorKnowledge = {};
+
+    // Layer 1: Pattern Table (aggregated from recent history)
+    try {
+      const patterns = options.memoryIndexer.getInvestigationPatterns(8);
+      if (patterns.length > 0) {
+        pk.patterns = formatPatternTable(patterns);
+        onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Loaded ${patterns.length} diagnostic pattern(s) from history` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Pattern aggregation failed:`, err);
+    }
+
+    // Layer 2: Similar Investigations (structured + semantic search)
+    const similarParts: string[] = [];
+
+    // 2a. Structured query (keyword-relevant)
+    try {
+      const structuredResults = options.memoryIndexer.searchInvestigations(question, { topK: 3 });
+      if (structuredResults.length > 0) {
+        similarInvestigationRecords = structuredResults;
+        for (const inv of structuredResults) {
+          const tags = [
+            `root_cause: ${inv.rootCauseCategory}`,
+            `confidence: ${inv.confidence}%`,
+            inv.environmentTags.length > 0 ? `env: ${inv.environmentTags.join(", ")}` : "",
+          ].filter(Boolean).join(", ");
+          const chain = inv.causalChain.length > 0 ? `\nCausal chain: ${inv.causalChain.join(" → ")}` : "";
+          const remediation = inv.remediationSteps?.length
+            ? `\nRemediation: ${inv.remediationSteps.join("; ")}`
+            : "";
+          const hypothesisVerdicts = inv.hypotheses
+            .filter(h => h.status !== "pending" && h.status !== "skipped")
+            .map(h => `  - ${h.text}: ${h.status.toUpperCase()} (${h.confidence}%)`)
+            .join("\n");
+          const hypothesisSection = hypothesisVerdicts ? `\nHypothesis verdicts:\n${hypothesisVerdicts}` : "";
+          similarParts.push(`[Structured] [${tags}] ${inv.question}${chain}${remediation}${hypothesisSection}\nConclusion: ${inv.conclusion.slice(0, 300)}`);
+        }
+        onProgress?.({ type: "phase", phase: "Phase 1/4", detail: `Found ${structuredResults.length} structured prior investigation(s)` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Structured investigation retrieval failed:`, err);
+    }
+
+    // 2b. Semantic search (chunk-based) — also enrich similarInvestigationRecords
+    try {
+      const searchResult = await options.memoryIndexer.search(question, 3, 0.4);
+      const investigationChunks = searchResult.chunks.filter(c => c.file.startsWith("investigations/"));
+      if (investigationChunks.length > 0) {
+        for (const c of investigationChunks) {
+          similarParts.push(`[Semantic] (relevance: ${(c.score ?? 0).toFixed(2)})\n${c.content}`);
+        }
+        // Enrich: look up structured records for semantically matched investigations
+        // so Layer 3 and Phase 3 context can use them too
+        const existingIds = new Set(similarInvestigationRecords.map(r => r.id));
+        const semanticFiles = investigationChunks.map(c => c.file);
+        const semanticRecords = options.memoryIndexer.lookupInvestigationsByFiles(semanticFiles);
+        for (const rec of semanticRecords) {
+          if (!existingIds.has(rec.id)) {
+            similarInvestigationRecords.push(rec);
+            existingIds.add(rec.id);
+          }
+        }
+        onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Found ${investigationChunks.length} semantic match(es) from past investigations` });
+      }
+    } catch (err) {
+      console.warn(`[deep-search] Semantic investigation search failed:`, err);
+    }
+
+    if (similarParts.length > 0) {
+      pk.similarInvestigations = similarParts.join("\n\n---\n\n");
+    }
+
+    // Layer 3: Validated Hypothesis Templates (extracted from ALL similar investigations — structured + semantic)
+    const validatedList = extractValidatedHypotheses(similarInvestigationRecords);
+    if (validatedList.length > 0) {
+      pk.validatedHypotheses = validatedList.join("\n");
+    }
+
+    if (pk.patterns || pk.similarInvestigations || pk.validatedHypotheses) {
+      // Truncate to avoid token explosion — prior knowledge should inform, not dominate the prompt
+      const MAX_CHARS = 4000;
+      if (pk.similarInvestigations && pk.similarInvestigations.length > MAX_CHARS) {
+        pk.similarInvestigations = pk.similarInvestigations.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
+      if (pk.validatedHypotheses && pk.validatedHypotheses.length > MAX_CHARS) {
+        pk.validatedHypotheses = pk.validatedHypotheses.slice(0, MAX_CHARS) + "\n...(truncated)";
+      }
+      priorKnowledge = pk;
+    }
+  }
+
+  const DEFAULT_ESTIMATED_CALLS = 5;
+
+  let hypotheses: HypothesisNode[];
+  if (options?.hypotheses && options.hypotheses.length > 0) {
+    onProgress?.({ type: "phase", phase: "Phase 2/4", detail: `Using ${options.hypotheses.length} pre-confirmed hypotheses (skipped)` });
+    hypotheses = options.hypotheses.map((h, i) => ({
+      id: `H${i + 1}`,
+      text: h.text,
+      confidence: h.confidence,
+      status: "pending" as const,
+      evidence: [],
+      reasoning: "",
+      suggestedTools: h.suggestedTools,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, DEFAULT_ESTIMATED_CALLS)),
+      toolCallsUsed: 0,
+    }));
+  } else {
+    onProgress?.({ type: "phase", phase: "Phase 2/4", detail: "Generating hypotheses..." });
+    const rawHypotheses = await generateHypotheses(
+      question,
+      contextSummary,
+      budget.maxHypotheses,
+      options,
+      onProgress,
+      priorKnowledge,
+    );
+    hypotheses = rawHypotheses.map((h, i) => ({
+      id: `H${i + 1}`,
+      text: h.text,
+      confidence: h.confidence,
+      status: "pending" as const,
+      evidence: [],
+      reasoning: "",
+      suggestedTools: h.suggestedTools,
+      estimatedCalls: Math.max(2, Math.min(budget.maxCallsPerHypothesis, h.estimatedCalls ?? DEFAULT_ESTIMATED_CALLS)),
+      toolCallsUsed: 0,
+    }));
+  }
+
+  for (const h of hypotheses) {
+    onProgress?.({ type: "hypothesis", id: h.id, status: "pending", confidence: h.confidence, text: h.text });
+  }
+
+  // --- Phase 3: Parallel Hypothesis Validation ---
+  // Sort hypotheses by confidence DESC so most likely root cause is validated first
+  hypotheses.sort((a, b) => b.confidence - a.confidence);
+
+  // Pre-compute past diagnostic context from similarInvestigationRecords (avoids N+1 queries)
+  const pastDiagnosticContext = buildPastDiagnosticContext(similarInvestigationRecords);
+
+  // When phases are skipped, their budget is redistributed to validation
+  const validationBudget = budget.maxTotalCalls - globalCallsUsed;
+  onProgress?.({ type: "phase", phase: "Phase 3/4", detail: `Validating ${hypotheses.length} hypotheses (budget: ${validationBudget} calls)...` });
+
+  let rootCauseFound = false;
+  let timedOut = false;
+
+  // Build a summary of completed hypotheses for sub-agent context.
+  // Includes key evidence commands so the next sub-agent can avoid redundant checks.
+  function buildPriorFindings(): string | undefined {
+    const completed = hypotheses.filter(h => h.status !== "pending" && h.status !== "skipped");
+    if (completed.length === 0) return undefined;
+    return completed.map(h => {
+      const reasoning = h.reasoning.length > 100
+        ? h.reasoning.slice(0, 100) + "..."
+        : (h.reasoning || "(no details)");
+      const keyCommands = h.evidence.slice(0, 2)
+        .filter(e => e.command.trim().length > 0)
+        .map(e => `  already ran: ${e.command.length > 80 ? e.command.slice(0, 77) + "..." : e.command}`)
+        .join("\n");
+      return `- ${h.id} (${h.text}): ${h.status.toUpperCase()} (${h.confidence}%) — ${reasoning}${keyCommands ? "\n" + keyCommands : ""}`;
+    }).join("\n");
+  }
+
+  // Validate a single hypothesis via sub-agent, handling verdict parsing and error retry
+  async function runOneHypothesis(
+    hypothesis: HypothesisNode,
+    perBudget: number,
+    isRetry: boolean,
+  ): Promise<void> {
+    const taggedProgress: ProgressCallback | undefined = onProgress
+      ? (event: ProgressEvent) => onProgress({ ...event, hypothesisId: hypothesis.id } as ProgressEvent)
+      : undefined;
+
+    try {
+      const result = await runSubAgent(
+        hypothesisValidationPrompt(
+          hypothesis.text, hypothesis.suggestedTools, contextSummary,
+          perBudget, buildPriorFindings(), kubeconfigPath,
+          pastDiagnosticContext.length > 0 ? pastDiagnosticContext : undefined,
+        ),
+        `Validate hypothesis${isRetry ? " (retry)" : ""}: ${hypothesis.text}`,
+        perBudget, options, taggedProgress, forceVerdictPrompt(),
+      );
+
+      const verdict = parseVerdict(result.textOutput);
+      hypothesis.status = verdict.status;
+      hypothesis.confidence = verdict.confidence;
+      hypothesis.reasoning = verdict.reasoning;
+      hypothesis.evidence = result.evidence;
+      hypothesis.toolCallsUsed = result.callsUsed;
+      hypothesis.trace = result.trace;
+      globalCallsUsed += result.callsUsed;
+
+      onProgress?.({ type: "hypothesis", id: hypothesis.id, status: hypothesis.status, confidence: hypothesis.confidence, text: hypothesis.text });
+    } catch (err) {
+      // Charge minimum 1 call so failed attempts aren't zero-cost —
+      // the sub-agent may have made calls before throwing, but we
+      // can't know the exact count without a partial result.
+      globalCallsUsed += 1;
+      if (!isRetry) {
+        // First failure → queue for retry
+        hypothesis.status = "inconclusive";
+        hypothesis.confidence = 0;
+        hypothesis.reasoning = `Sub-agent error: ${err instanceof Error ? err.message : String(err)}`;
+        onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "inconclusive", confidence: 0, text: hypothesis.text });
+        retryQueue.push(hypothesis);
+      }
+      // Second failure → leave as inconclusive (already marked)
+    }
+  }
+
+  // Concurrency pool: keep maxParallel slots busy, fill freed slots immediately
+  const queue = [...hypotheses];
+  let activeCount = 0;
+  let allocatedNotConsumed = 0; // budget allocated to in-flight sub-agents but not yet counted in globalCallsUsed
+  const retryQueue: HypothesisNode[] = [];
+
+  await new Promise<void>((resolvePool) => {
+    function tryStartNext() {
+      while (activeCount < budget.maxParallel) {
+        // Timeout check
+        if (Date.now() - startTime > budget.maxDurationMs) {
+          timedOut = true;
+          onProgress?.({ type: "phase", phase: "Phase 3/4", detail: `Global timeout (${(budget.maxDurationMs / 1000).toFixed(0)}s) exceeded, skipping remaining hypotheses...` });
+          break;
+        }
+
+        // Budget check — account for budget already allocated to in-flight sub-agents
+        const remaining = budget.maxTotalCalls - globalCallsUsed - allocatedNotConsumed;
+        if (remaining <= 0) break;
+
+        // Pick from retry queue first, then main queue
+        const hypothesis = retryQueue.shift() ?? queue.shift();
+        if (!hypothesis) break;
+
+        // Smart skip: if a high-confidence root cause was found, skip low-confidence
+        // hypotheses to save budget — but still validate reasonably likely ones.
+        if (rootCauseFound && hypothesis.confidence < EARLY_EXIT_SKIP_BELOW) {
+          hypothesis.status = "skipped";
+          onProgress?.({ type: "hypothesis", id: hypothesis.id, status: "skipped", confidence: hypothesis.confidence, text: hypothesis.text });
+          continue;
+        }
+
+        const isRetry = hypothesis.status === "inconclusive";
+
+        // Proportional budget: allocate based on each hypothesis's estimatedCalls
+        // rather than splitting evenly. This lets simple checks finish fast and
+        // complex validations get the budget they need.
+        const pendingHypotheses = [hypothesis, ...queue, ...retryQueue];
+        const totalEstimated = pendingHypotheses.reduce((sum, h) => sum + h.estimatedCalls, 0);
+        const proportionalShare = totalEstimated > 0
+          ? Math.floor(remaining * (hypothesis.estimatedCalls / totalEstimated))
+          : Math.floor(remaining / Math.max(1, pendingHypotheses.length));
+        const perBudget = Math.max(2, Math.min(budget.maxCallsPerHypothesis, proportionalShare));
+        if (perBudget > remaining) break; // not enough remaining budget for minimum allocation
+
+        activeCount++;
+        allocatedNotConsumed += perBudget;
+
+        runOneHypothesis(hypothesis, perBudget, isRetry)
+          .then(() => {
+            // Early exit: validated with high confidence → stop launching new tasks
+            if (hypothesis.status === "validated" && hypothesis.confidence >= EARLY_EXIT_CONFIDENCE) {
+              rootCauseFound = true;
+            }
+          })
+          .catch((err) => {
+            console.error(`[deep-search] Unexpected error for hypothesis "${hypothesis.id}":`, err);
+          })
+          .finally(() => {
+            activeCount--;
+            // Release the pre-allocated budget reservation; actual usage is
+            // already tracked in globalCallsUsed by runOneHypothesis.
+            allocatedNotConsumed = Math.max(0, allocatedNotConsumed - perBudget);
+            tryStartNext();
+            if (activeCount === 0) resolvePool();
+          });
+      }
+
+      // Edge case: nothing was started and nothing is active
+      if (activeCount === 0) resolvePool();
+    }
+
+    tryStartNext();
+  });
+
+  // Mark remaining pending hypotheses as skipped
+  for (const h of hypotheses) {
+    if (h.status === "pending") {
+      h.status = "skipped";
+      onProgress?.({ type: "hypothesis", id: h.id, status: "skipped", confidence: h.confidence, text: h.text });
+    }
+  }
+
+  // --- Phase 4: Conclusion ---
+  onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Generating conclusion..." });
+  let conclusionResult = await generateConclusion(question, hypotheses, options);
+
+  // Quality gate: validate conclusion before storing (skip for text-only fallback conclusions)
+  if (conclusionResult.structured) {
+    const validation = await validateConclusion({
+      question, hypotheses, conclusion: conclusionResult, options,
+    });
+    if (!validation.pass) {
+      onProgress?.({ type: "phase", phase: "Phase 4/4", detail: "Re-generating (quality feedback)..." });
+      conclusionResult = await generateConclusion(question, hypotheses, options, validation.critique);
+    } else if (validation.adjustedConfidence !== undefined && conclusionResult.structured) {
+      // Only apply adjustedConfidence when the gate passed — after retry the new conclusion
+      // has its own confidence from the critique-informed generation
+      conclusionResult.structured.confidence = validation.adjustedConfidence;
+    }
+  }
+
+  const totalDurationMs = Date.now() - startTime;
+
+  // Write structured investigation record to SQLite (best-effort)
+  let investigationId: string | undefined;
+  if (conclusionResult.structured && options?.memoryIndexer) {
+    try {
+      const record: InvestigationRecord = {
+        id: crypto.randomUUID(),
+        question,
+        rootCauseCategory: conclusionResult.structured.root_cause_category,
+        affectedEntities: conclusionResult.structured.affected_entities,
+        environmentTags: conclusionResult.structured.environment_tags,
+        causalChain: conclusionResult.structured.causal_chain,
+        confidence: conclusionResult.structured.confidence,
+        conclusion: conclusionResult.text,
+        remediationSteps: conclusionResult.structured.remediation_steps,
+        durationMs: totalDurationMs,
+        totalToolCalls: globalCallsUsed,
+        hypotheses: hypotheses.map((h) => ({
+          id: h.id,
+          text: h.text,
+          status: h.status,
+          confidence: h.confidence,
+        })),
+        createdAt: Date.now(),
+      };
+      options.memoryIndexer.insertInvestigation(record);
+      investigationId = record.id;
+      console.log(`[deep-search] Structured investigation record saved: ${record.rootCauseCategory} (${record.confidence}%)`);
+    } catch (err) {
+      console.warn(`[deep-search] Failed to save structured investigation record:`, err);
+    }
+  }
+
+  // Write debug trace file (best-effort, don't fail investigation on trace errors)
+  let debugTracePath: string | undefined;
+  try {
+    debugTracePath = await writeDebugTrace(question, hypotheses, globalCallsUsed, totalDurationMs);
+  } catch {
+    // Trace writing is non-critical
+  }
+
+  // Persist investigation summary to memory for future hypothesis retrieval (best-effort)
+  if (options?.memoryDir) {
+    try {
+      await writeInvestigationToMemory(options.memoryDir, question, hypotheses, conclusionResult.text, totalDurationMs);
+    } catch (err) {
+      console.warn(`[deep-search] Failed to write investigation to memory:`, err);
+    }
+  }
+
+  return {
+    question,
+    contextSummary,
+    hypotheses,
+    conclusion: conclusionResult.text,
+    totalToolCalls: globalCallsUsed,
+    totalDurationMs,
+    timedOut,
+    debugTracePath,
+    investigationId,
+  };
+}
+
+/** Format aggregated investigation patterns into a readable table for prompt injection. */
+function formatPatternTable(patterns: InvestigationPattern[]): string {
+  const total = patterns.reduce((sum, p) => sum + p.count, 0);
+  const lines: string[] = [`Based on ${total} past investigations:`];
+  lines.push("| Root Cause | Frequency | Avg Confidence | Common Fix |");
+  lines.push("|------------|-----------|----------------|------------|");
+  for (const p of patterns) {
+    const pct = total > 0 ? Math.round((p.count / total) * 100) : 0;
+    const fix = p.commonRemediations.length > 0
+      ? p.commonRemediations[0].slice(0, 60) + (p.commonRemediations[0].length > 60 ? "..." : "")
+      : "—";
+    lines.push(`| ${p.rootCauseCategory} | ${p.count} (${pct}%) | ${p.avgConfidence}% | ${fix} |`);
+  }
+  lines.push("\nUse these frequencies to calibrate your confidence scores.");
+  return lines.join("\n");
+}
+
+/**
+ * Pre-compute past diagnostic context from similar investigation records.
+ * Returns a single string shared by all Phase 3 sub-agents, avoiding N+1 queries.
+ */
+function buildPastDiagnosticContext(records: InvestigationRecord[]): string {
+  if (records.length === 0) return "";
+  const contextLines: string[] = [];
+  for (const rec of records) {
+    const validatedH = rec.hypotheses.filter(h => h.status === "validated");
+    if (validatedH.length === 0) continue;
+    for (const vh of validatedH) {
+      const parts = [`- "${vh.text}" (validated, ${vh.confidence}%)`];
+      if (rec.causalChain.length > 0) {
+        parts.push(`  Causal chain: ${rec.causalChain.join(" → ")}`);
+      }
+      if (rec.remediationSteps?.length) {
+        parts.push(`  Remediation: ${rec.remediationSteps.join("; ")}`);
+      }
+      contextLines.push(parts.join("\n"));
+    }
+  }
+  return contextLines.join("\n");
+}
+
+/**
+ * Extract validated hypotheses from investigation records, deduplicated and counted.
+ * Uses normalized text (lowercase, collapsed whitespace) for dedup to merge
+ * near-identical hypotheses like "MTU Mismatch" and "mtu mismatch".
+ * NOTE: Semantic dedup (embedding similarity) would catch more variants but
+ * requires async embedding calls — left as a future improvement.
+ */
+function extractValidatedHypotheses(records: InvestigationRecord[]): string[] {
+  // Count occurrences and track max confidence, keyed by normalized text.
+  // Raw count is used for display; weightedScore (feedback-adjusted) is used for sorting.
+  const validated = new Map<string, { displayText: string; rawCount: number; weightedScore: number; maxConfidence: number }>();
+  for (const rec of records) {
+    const feedbackSignal = rec.feedbackSignal ?? 1.0;
+    for (const h of rec.hypotheses) {
+      if (h.status === "validated" && h.text) {
+        const key = normalizeHypothesisText(h.text);
+        const adjustedConfidence = Math.round(h.confidence * feedbackSignal);
+        const existing = validated.get(key);
+        if (existing) {
+          existing.rawCount++;
+          existing.weightedScore += feedbackSignal;
+          existing.maxConfidence = Math.max(existing.maxConfidence, adjustedConfidence);
+        } else {
+          validated.set(key, { displayText: h.text, rawCount: 1, weightedScore: feedbackSignal, maxConfidence: adjustedConfidence });
+        }
+      }
+    }
+  }
+
+  return [...validated.entries()]
+    .sort((a, b) => b[1].weightedScore - a[1].weightedScore)
+    .map(([, { displayText, rawCount, maxConfidence }]) =>
+      `- "${displayText}" (validated ${rawCount} time${rawCount !== 1 ? "s" : ""}, max conf ${maxConfidence}%)`,
+    );
+}
+
+/** Normalize hypothesis text for dedup: lowercase, trim, collapse whitespace. */
+function normalizeHypothesisText(text: string): string {
+  return text.toLowerCase().trim().replace(/\s+/g, " ");
+}

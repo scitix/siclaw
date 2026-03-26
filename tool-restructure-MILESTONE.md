@@ -4,14 +4,14 @@
 
 ## 步骤总览
 
-| # | 名称 | 描述 | 依赖 | 预估文件数 |
-|---|------|------|------|-----------|
-| 1 | 消除 kubectl.ts | 搬移函数到 command-sets.ts，删除死代码 | 无 | ~5 |
-| 2 | 移动 infra 文件 | 创建 infra/ 目录，git mv 基础设施文件，更新内部互引 | #1 | ~15 |
-| 3 | 移动工具文件 | 创建 5 个类型目录，git mv 工具文件，更新工具对 infra 的引用 | #2 | ~25 |
-| 4 | 更新外部 import + agent-factory 分组 | 更新 12 个外部消费者的 import 路径，重排 customTools 数组 | #3 | ~13 |
-| 5 | 撰写 docs/design/tools.md | 工具开发规范文档 + CLAUDE.md 引用 | #4 | ~2 |
-| 6 | 验证 | tsc + 全量测试 | #5 | 0 |
+| # | 名称 | 描述 | 依赖 | 状态 |
+|---|------|------|------|------|
+| 1 | 消除 kubectl.ts | 搬移函数到 command-sets.ts，删除死代码 | 无 | ✅ 完成 |
+| 2 | 移动 infra 文件 | 创建 infra/ 目录，git mv 基础设施文件，更新内部互引 | #1 | ✅ 完成 |
+| 3 | 移动工具文件 | 创建 5 个类型目录，git mv 工具文件，更新工具对 infra 的引用 | #2 | ✅ 完成 |
+| 4 | 更新外部 import + agent-factory 分组 | 更新 12 个外部消费者的 import 路径，重排 customTools 数组 | #3 | ✅ 完成 |
+| 5 | 撰写 docs/design/tools.md | 工具开发规范文档 + CLAUDE.md 引用 | #4 | ✅ 完成 |
+| 6 | 验证 | tsc + 全量测试 | #5 | ✅ 通过 (36 files, 1318 tests) |
 
 ## 详细步骤
 

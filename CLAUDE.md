@@ -120,10 +120,10 @@ Agent Core
   src/core/brains/claude-sdk-brain.ts
 
 Security (read docs/design/security.md before touching)
-  src/tools/command-sets.ts    ALLOWED_COMMANDS + COMMAND_RULES + context categories
-  src/tools/command-validator.ts  6-pass validation pipeline
-  src/tools/restricted-bash.ts Shell tool (sudo sandbox + command validation)
-  src/tools/sanitize-env.ts    Environment variable sanitization
+  src/tools/infra/command-sets.ts    ALLOWED_COMMANDS + COMMAND_RULES + context categories
+  src/tools/infra/command-validator.ts  6-pass validation pipeline
+  src/tools/shell/restricted-bash.ts Shell tool (sudo sandbox + command validation)
+  src/tools/infra/sanitize-env.ts    Environment variable sanitization
   src/gateway/skills/script-evaluator.ts  Skill script security review
 
 Resource Sync (read before touching)
@@ -145,21 +145,29 @@ Database
   src/memory/indexer.ts            Hybrid search engine
   src/memory/schema.ts             Memory DB schema
 
+Tools (read docs/design/tools.md for development guide)
+  src/tools/k8s-exec/             Remote command execution (node-exec, pod-exec, pod-nsenter-exec)
+  src/tools/k8s-script/           Remote script execution (node-script, pod-script, netns-script)
+  src/tools/shell/                Local shell (restricted-bash, run-skill)
+  src/tools/query/                Data queries (memory-search, credential-list, cluster-info, etc.)
+  src/tools/workflow/             User workflows (deep-search, dp-tools, skill CRUD, schedule, feedback)
+  src/tools/infra/                Shared infrastructure (security pipeline, execution helpers, output)
+
 Skills
   src/gateway/skills/skill-bundle.ts  buildSkillBundle() — team + personal only
-  src/tools/run-skill.ts              run_skill tool
-  src/tools/script-resolver.ts        Skill path resolution
+  src/tools/shell/run-skill.ts        run_skill tool
+  src/tools/infra/script-resolver.ts  Skill path resolution
   skills/core/                        Built-in diagnostic skills
 
 Investigation
-  src/tools/deep-search/types.ts    Budget constants (Normal/Quick)
-  src/tools/deep-search/engine.ts   4-phase workflow engine
-  src/tools/deep-search/sub-agent.ts Sub-agent factory (minimal tool set)
-  src/tools/investigation-feedback.ts  User feedback on diagnoses (IM Phase 2, pi-agent only)
+  src/tools/workflow/deep-search/types.ts    Budget constants (Normal/Quick)
+  src/tools/workflow/deep-search/engine.ts   4-phase workflow engine
+  src/tools/workflow/deep-search/sub-agent.ts Sub-agent factory (minimal tool set)
+  src/tools/query/investigation-feedback.ts  User feedback on diagnoses (IM Phase 2, pi-agent only)
 
 Platform Tools
-  src/tools/manage-schedule.ts     Cron job management (language-aware)
-  src/tools/credential-list.ts     Credential discovery for AgentBox
+  src/tools/workflow/manage-schedule.ts   Cron job management (language-aware)
+  src/tools/query/credential-list.ts      Credential discovery for AgentBox
 
 Cron (merged into Gateway)
   src/gateway/cron/cron-service.ts In-process scheduler, DB-based coordination (ADR-008)
@@ -195,6 +203,7 @@ DB (memory):  node:sqlite + FTS5
 1. Check `docs/design/roadmap.md` for current phase priorities
 2. Before touching resource sync or skills: re-read invariants §1-3
 3. Before touching execution tools or container config: re-read `docs/design/security.md`
-4. New architectural decisions should get an ADR in `docs/design/decisions.md`
+4. Before adding or modifying tools: re-read `docs/design/tools.md`
+5. New architectural decisions should get an ADR in `docs/design/decisions.md`
 
 **PR comments are posted via `gh` CLI as the authenticated GitHub user.**
