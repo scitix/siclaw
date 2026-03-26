@@ -241,14 +241,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType, body.systemPromptTemplate);
 
     // Materialize credential files from payload (sent by gateway in prompt body).
     // Always call when credentials payload is present — even with empty files —

@@ -167,7 +167,7 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
-  async getOrCreate(sessionId?: string, mode?: SessionMode, brainType?: BrainType): Promise<ManagedSession> {
+  async getOrCreate(sessionId?: string, mode?: SessionMode, brainType?: BrainType, systemPromptTemplate?: string): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
 
     let managed = this.sessions.get(id);
@@ -216,6 +216,7 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       knowledgeIndexer: this.knowledgeIndexer,
+      systemPromptTemplate,
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session
