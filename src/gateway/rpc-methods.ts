@@ -2516,7 +2516,7 @@ export function createRpcMethods(
     const userId = requireAuth(context);
     const username = context.auth!.username;
 
-    const name = params.name as string;
+    const name = (params.name as string)?.trim();
     const type = params.type as string | undefined;
     const specs = params.specs as string | undefined;
     const rawScripts = params.scripts as
@@ -2525,10 +2525,19 @@ export function createRpcMethods(
 
     if (!name) throw new Error("Missing required param: name");
 
+    // Sync name into specs frontmatter so DB name and frontmatter name stay consistent
+    let syncedSpecs = specs;
+    let fmDescription: string | undefined;
+    if (syncedSpecs) {
+      const fm = skillWriter.parseFrontmatter(syncedSpecs);
+      fmDescription = fm.description || undefined;
+      if (fm.name !== name) {
+        syncedSpecs = skillWriter.setFrontmatterName(syncedSpecs, name);
+      }
+    }
+
     // Auto-extract description from specs frontmatter; fall back to explicit param
-    const description = specs
-      ? skillWriter.parseFrontmatter(specs).description || (params.description as string | undefined)
-      : (params.description as string | undefined);
+    const description = fmDescription || (params.description as string | undefined);
 
     // Resolve scripts: if content is missing, copy from user uploads directory
     let scripts: Array<{ name: string; content: string }> | undefined;
@@ -2545,8 +2554,8 @@ export function createRpcMethods(
       });
     }
 
-    // Generate dirName from skill name
-    const dirName = name
+    // Generate dirName from skill name, auto-deduplicate on collision
+    const baseDirName = name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "");
@@ -2576,24 +2585,36 @@ export function createRpcMethods(
       if (!isMaintainer) throw new Error("Forbidden: only skill space maintainers can create skills");
     }
 
+    // Check display name uniqueness, then auto-deduplicate dirName on collision
+    let dirName = baseDirName;
     if (targetScope === "personal") {
-      // Check for duplicate personal skill with same dirName
       const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
-      const duplicate = existingResult.skills.find(
-        (s: any) => s.dirName === dirName && s.scope === "personal" && s.authorId === userId,
+      const personalSkills = existingResult.skills.filter(
+        (s: any) => s.scope === "personal" && s.authorId === userId,
       );
-      if (duplicate) {
-        throw new Error(
-          `A personal skill named "${name}" already exists (id: ${duplicate.id}). ` +
-          `Delete it first if you want to re-fork.`,
-        );
+      // Block same display name
+      const nameDup = personalSkills.find((s: any) => s.name === name);
+      if (nameDup) {
+        throw new Error(`A personal skill named "${name}" already exists. Rename or delete it first.`);
+      }
+      // Auto-dedup dirName (e.g. after a rename left a stale dirName)
+      const existingDirNames = new Set(personalSkills.map((s: any) => s.dirName));
+      let suffix = 1;
+      while (existingDirNames.has(dirName)) {
+        suffix++;
+        dirName = `${baseDirName}-${suffix}`;
       }
     } else {
-      // Check for duplicate in skill space
       const spaceSkills = await skillRepo.listBySkillSpaceId(skillSpaceId!);
-      const dupInSpace = spaceSkills.find((s: any) => s.dirName === dirName);
-      if (dupInSpace) {
-        throw new Error(`A skill named "${name}" already exists in this skill space`);
+      const nameDup = spaceSkills.find((s: any) => s.name === name);
+      if (nameDup) {
+        throw new Error(`A skill named "${name}" already exists in this skill space.`);
+      }
+      const existingDirNames = new Set(spaceSkills.map((s: any) => s.dirName));
+      let suffix = 1;
+      while (existingDirNames.has(dirName)) {
+        suffix++;
+        dirName = `${baseDirName}-${suffix}`;
       }
     }
 
@@ -2646,9 +2667,9 @@ export function createRpcMethods(
       skillSpaceId: skillSpaceId ?? undefined,
     });
 
-    // Save content to DB
+    // Save content to DB (use syncedSpecs so frontmatter name matches DB name)
     if (skillContentRepo) {
-      await skillContentRepo.save(id, "working", { specs, scripts });
+      await skillContentRepo.save(id, "working", { specs: syncedSpecs, scripts });
     }
 
     // Notify reload
@@ -2969,10 +2990,41 @@ export function createRpcMethods(
     }
 
     // Update files
-    const specs = params.specs as string | undefined;
+    const rawSpecs = params.specs as string | undefined;
     const rawScripts = params.scripts as
       | Array<{ name: string; content?: string }>
       | undefined;
+
+    // Resolve the canonical name: params.name (UI input) is authoritative
+    const newName = (params.name as string | undefined)?.trim() || undefined;
+
+    // Check name uniqueness on rename
+    if (newName !== undefined && newName !== meta.name) {
+      if (meta.scope === "personal") {
+        const existingResult = await skillRepo.listForUser(userId, { scope: "personal" });
+        const nameDup = existingResult.skills.find(
+          (s: any) => s.scope === "personal" && s.authorId === userId && s.name === newName && s.id !== skillId,
+        );
+        if (nameDup) {
+          throw new Error(`A personal skill named "${newName}" already exists. Rename or delete it first.`);
+        }
+      } else if (meta.scope === "skillset" && meta.skillSpaceId) {
+        const spaceSkills = await skillRepo.listBySkillSpaceId(meta.skillSpaceId);
+        const nameDup = spaceSkills.find((s: any) => s.name === newName && s.id !== skillId);
+        if (nameDup) {
+          throw new Error(`A skill named "${newName}" already exists in this skill space.`);
+        }
+      }
+    }
+
+    // Sync name into specs frontmatter so DB name and frontmatter name stay consistent
+    let specs = rawSpecs;
+    if (newName !== undefined && specs) {
+      const fmName = skillWriter.parseFrontmatter(specs).name;
+      if (fmName !== newName) {
+        specs = skillWriter.setFrontmatterName(specs, newName);
+      }
+    }
 
     // Resolve scripts: if content is missing, try DB then uploads dir then existing skill files
     // NOTE: an explicit empty array means "delete all scripts" — do NOT fall back to existing
@@ -3012,15 +3064,29 @@ export function createRpcMethods(
         specs: specs ?? existing?.specs,
         scripts: scripts ?? existing?.scripts,
       };
+      // If name changed but no new specs provided, sync name into existing specs
+      if (newName !== undefined && !specs && mergedFiles.specs) {
+        const fmName = skillWriter.parseFrontmatter(mergedFiles.specs).name;
+        if (fmName !== newName) {
+          mergedFiles.specs = skillWriter.setFrontmatterName(mergedFiles.specs, newName);
+        }
+      }
       await skillContentRepo.save(skillId, "working", mergedFiles);
     }
 
-    // Update DB metadata (name and dirName are immutable after creation)
+    // Update DB metadata (dirName is immutable after creation)
     const updates: Record<string, unknown> = {};
-    // Auto-extract description from specs frontmatter
+    // Name: params.name is authoritative; extract from frontmatter as fallback
+    if (newName !== undefined) {
+      updates.name = newName;
+    } else if (specs) {
+      const extractedName = skillWriter.parseFrontmatter(specs).name;
+      if (extractedName) updates.name = extractedName;
+    }
+    // Description: prefer frontmatter extraction, fall back to explicit param
     if (specs) {
-      const extracted = skillWriter.parseFrontmatter(specs).description;
-      if (extracted) updates.description = extracted;
+      const extractedDesc = skillWriter.parseFrontmatter(specs).description;
+      if (extractedDesc) updates.description = extractedDesc;
     } else if (params.description !== undefined) {
       updates.description = params.description;
     }
