@@ -3,9 +3,10 @@ import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult } from "./tool-render.js";
+import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 import { checkNodeReady } from "./k8s-checks.js";
 import { loadConfig } from "../core/config.js";
-import { parseArgs } from "./command-sets.js";
+import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
 import { validateCommand, extractCommands } from "./command-validator.js";
 import {
   validateNodeName,
@@ -137,7 +138,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command, { context: "node" });
+      const cmdErr = validateCommand(params.command, { context: "node", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -163,10 +164,22 @@ Examples:
       const needsShell = commands.length > 1;
       const cmdArgs = parseArgs(params.command);
 
-      // Build nsenter command
-      const nsenterCmd = needsShell
-        ? ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", params.command]
-        : ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...cmdArgs];
+      // Post-execution output sanitization: use the last command in a pipeline
+      // (pipeline output format is determined by the last command)
+      const lastCmd = commands[commands.length - 1];
+      const lastArgs = parseArgs(lastCmd);
+      const lastBinary = lastArgs[0]?.split("/").pop() ?? "";
+      const action = analyzeOutput(lastBinary, lastArgs.slice(1));
+
+      // Build nsenter command (use rewritten args for single-command case)
+      let nsenterCmd: string[];
+      if (needsShell) {
+        // Shell pipeline — rewrite not supported for pipelines, run as-is
+        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", params.command];
+      } else {
+        const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
+        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...execArgs];
+      }
 
       const execResult = await runInDebugPod(
         { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey },
@@ -181,6 +194,8 @@ Examples:
         };
       }
 
+      // Apply output sanitization before formatting
+      execResult.stdout = applySanitizer(execResult.stdout, action);
       return formatExecOutput(execResult);
     },
   };
