@@ -161,15 +161,30 @@ export class SkillFileWriter {
     return result;
   }
 
+  /** Split specs into { before, yaml, after } around the frontmatter block */
+  private splitFrontmatter(specs: string): { before: string; yaml: string; after: string } | null {
+    const match = specs.match(/^(---\n)([\s\S]*?)(\n---)([\s\S]*)$/);
+    if (!match) return null;
+    return { before: match[1], yaml: match[2], after: match[3] + match[4] };
+  }
+
+  /** Strip YAML quotes from a raw value string */
+  private unquoteYaml(raw: string): string {
+    const v = raw.trim();
+    if (v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1).replace(/''/g, "'");
+    if (v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
+    return v;
+  }
+
   /** Parse YAML frontmatter from SKILL.md content */
   parseFrontmatter(specs: string): { name: string; description: string } {
-    const match = specs.match(/^---\n([\s\S]*?)\n---/);
-    if (!match) return { name: "", description: "" };
-    const yaml = match[1];
+    const fm = this.splitFrontmatter(specs);
+    if (!fm) return { name: "", description: "" };
+    const { yaml } = fm;
 
-    // Extract name (always a simple string)
+    // Extract name (may be quoted with single or double quotes)
     const nameMatch = yaml.match(/^name:\s*(.+)$/m);
-    const name = nameMatch ? nameMatch[1].trim() : "";
+    const name = nameMatch ? this.unquoteYaml(nameMatch[1]) : "";
 
     // Extract description — handles both inline and block scalar (>- / >)
     let description = "";
@@ -192,6 +207,29 @@ export class SkillFileWriter {
     }
 
     return { name, description };
+  }
+
+  /** Replace the `name:` field inside YAML frontmatter, preserving everything else */
+  setFrontmatterName(specs: string, newName: string): string {
+    // Sanitize: strip newlines to prevent YAML injection
+    const safeName = newName.replace(/[\r\n]/g, "").trim();
+    if (!safeName) return specs;
+    // Single-quote to prevent YAML special char issues (: # { } ' etc.)
+    const quoted = `'${safeName.replace(/'/g, "''")}'`;
+    const fm = this.splitFrontmatter(specs);
+    if (!fm) {
+      // No frontmatter — prepend one
+      return `---\nname: ${quoted}\n---\n${specs}`;
+    }
+    const { before, yaml, after } = fm;
+    const nameMatch = yaml.match(/^name:\s*.+$/m);
+    if (nameMatch) {
+      // Replace existing name field
+      const updatedYaml = yaml.replace(/^name:\s*.+$/m, `name: ${quoted}`);
+      return `${before}${updatedYaml}${after}`;
+    }
+    // No name field — add it as the first field
+    return `${before}name: ${quoted}\n${yaml}${after}`;
   }
 
   /** Scan a single directory for skills */
