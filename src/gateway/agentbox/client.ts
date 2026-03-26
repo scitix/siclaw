@@ -34,6 +34,8 @@ export interface PromptOptions {
     manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>;
     files: Array<{ name: string; content: string; mode?: number }>;
   };
+  /** Custom system prompt template from workspace settings */
+  systemPromptTemplate?: string;
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {
     name: string;
