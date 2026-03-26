@@ -70,6 +70,8 @@ export function kubectlExec(
   timeoutMs: number,
   signal?: AbortSignal,
   namespace?: string,
+  /** Optional data to pipe to kubectl's stdin. */
+  stdinData?: string,
 ): Promise<{ stdout: string; stderr: string }> {
   const nsArgs = namespace ? ["-n", namespace] : [];
   return spawnAsync(
@@ -78,6 +80,7 @@ export function kubectlExec(
     timeoutMs,
     env.childEnv,
     signal,
+    stdinData,
   );
 }
 
@@ -393,6 +396,8 @@ export interface DebugPodSpec {
   image?: string;
   /** Cluster identifier for cache isolation (credential name). Defaults to "default". */
   clusterKey?: string;
+  /** Optional data to pipe via stdin (e.g. script content for stdin-based execution). */
+  stdinData?: string;
 }
 
 /**
@@ -530,11 +535,12 @@ export async function runInDebugPod(
 
   try {
     const result = await kubectlExec(
-      ["exec", podName, "--", ...spec.command],
+      ["exec", ...(spec.stdinData !== undefined ? ["-i"] : []), podName, "--", ...spec.command],
       env,
       opts.timeoutMs,
       opts.signal,
       debugNamespace,
+      spec.stdinData,
     );
     stdout = result.stdout;
     stderr = result.stderr;

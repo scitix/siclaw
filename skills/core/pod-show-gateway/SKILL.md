@@ -3,17 +3,23 @@ name: pod-show-gateway
 description: >-
   Show the gateway for a network interface in a Kubernetes pod.
   Reads the routing table via `ip -j route` from the pod's network namespace.
-  Execute via pod_netns_script tool.
+  First resolve_pod_netns, then node_script with netns param.
 ---
 
 # Pod Show Gateway
 
 ## Tool
 
-Use the `pod_netns_script` tool to run this skill:
+This skill runs in the pod's network namespace using host tools. Two steps required:
 
+1. Resolve the pod's network namespace:
 ```
-pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-show-gateway", script="show-gateway.sh", args="<args>"
+resolve_pod_netns: pod="<pod>", namespace="<ns>"
+```
+
+2. Run the script with the returned node and netns:
+```
+node_script: node="<node>", netns="<netns>", skill="pod-show-gateway", script="show-gateway.sh", args="<args>"
 ```
 
 ## Parameters
@@ -26,15 +32,18 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-show-gateway", scrip
 ## Examples
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-show-gateway", script="show-gateway.sh", args="--interface net1"
+resolve_pod_netns: pod="rdma-pod", namespace="rdma-test"
+→ node="worker-1", netns="abc123"
+
+node_script: node="worker-1", netns="abc123", skill="pod-show-gateway", script="show-gateway.sh", args="--interface net1"
 ```
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-show-gateway", script="show-gateway.sh"
+node_script: node="worker-1", netns="abc123", skill="pod-show-gateway", script="show-gateway.sh"
 ```
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-show-gateway", script="show-gateway.sh", args="--json"
+node_script: node="worker-1", netns="abc123", skill="pod-show-gateway", script="show-gateway.sh", args="--json"
 ```
 
 ## Output

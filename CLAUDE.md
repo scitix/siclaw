@@ -83,11 +83,25 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 
 ---
 
+## Development Principles
+
+1. **Understand before building**: Before developing any new feature, thoroughly read existing documentation (`docs/design/`) and related code. Understand the current architecture, existing tools, and design patterns. Never reinvent what already exists.
+2. **Docs and code stay in sync**: Every code change MUST include corresponding documentation updates. Outdated docs are worse than no docs — they actively mislead. If you change a tool, update `docs/design/tools.md`. If you change architecture, update `docs/design/invariants.md`. No exceptions.
+3. **System prompt is protected**: `src/core/prompt.ts` must NEVER be modified without explicit human confirmation. Describe the intended change and wait for approval before editing.
+
 ## PR & Code Review Standards
 
 > Full conventions: `CONTRIBUTING.md`
 
-**Before approving any PR, verify:**
+**Review approach — understand the whole, then judge the diff:**
+
+Reviewing a PR is NOT just reading the diff. Before approving:
+1. Read the relevant design docs (`docs/design/`) to understand the architectural context
+2. Read the existing code around the changed files to understand the full picture
+3. Then evaluate: Is the PR's design sound? Does it fit the architecture? Are there simpler alternatives?
+4. Verify documentation is updated to match the code changes
+
+**Checklist:**
 
 1. **Deployment mode awareness**: Does the change respect local vs K8s isolation? If it touches resource sync, skills materialization, or filesystem writes, re-read `docs/design/invariants.md §1-2`
 2. **Security model intact**: No new shell execution paths that bypass `command-sets.ts`. No weakening of the 6-pass pipeline. OS user isolation preserved (ADR-010). Skill scripts still go through review gate. Read `docs/design/security.md` for full model.
@@ -95,83 +109,14 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 4. **TypeScript conventions**: ESM-only (`.js` imports), strict mode, named exports, no default exports in barrels.
 5. **Both brain types**: Tool changes must work with both pi-agent (TypeBox) and claude-sdk (MCP/Zod) if applicable.
 6. **SQLite DDL parity**: New tables need entries in both `schema-sqlite.ts` and `migrate-sqlite.ts`.
+7. **Documentation parity**: Code changes must be accompanied by corresponding doc updates.
 
 **Common review pitfalls:**
 - Calling `skillsHandler.materialize()` in local mode code paths (ADR-003, ADR-002)
 - Missing `migrate-sqlite.ts` DDL for new tables (breaks SQLite/local deployments)
 - Path traversal in file writes — validate with `resolvePathUnderDir()` pattern, don't roll your own
 - Duplicate helper functions across files — extract to shared utility
-
----
-
-## Key File Map
-
-```
-Entry Points
-  src/cli-main.ts              TUI entry
-  src/gateway-main.ts          Gateway entry (--k8s flag for K8s mode, includes cron scheduler)
-  src/agentbox-main.ts         AgentBox entry (K8s pod)
-
-Agent Core
-  src/core/agent-factory.ts    Session factory — assembles tools + brain + skills
-  src/core/brain-session.ts    BrainSession interface
-  src/core/prompt.ts           SRE system prompt builder
-  src/core/brains/pi-agent-brain.ts
-  src/core/brains/claude-sdk-brain.ts
-
-Security (read docs/design/security.md before touching)
-  src/tools/infra/command-sets.ts    ALLOWED_COMMANDS + COMMAND_RULES + context categories
-  src/tools/infra/command-validator.ts  6-pass validation pipeline
-  src/tools/shell/restricted-bash.ts Shell tool (sudo sandbox + command validation)
-  src/tools/infra/sanitize-env.ts    Environment variable sanitization
-  src/gateway/skills/script-evaluator.ts  Skill script security review
-
-Resource Sync (read before touching)
-  src/shared/resource-sync.ts  Types, contracts, RESOURCE_DESCRIPTORS
-  src/agentbox/resource-handlers.ts  mcpHandler + skillsHandler
-  src/agentbox/resource-sync.ts      syncAllResources() for K8s startup
-  src/gateway/resource-notifier.ts   Gateway → AgentBox reload notifications
-
-Spawner Implementations
-  src/gateway/agentbox/spawner.ts          BoxSpawner interface
-  src/gateway/agentbox/local-spawner.ts    In-process, dev mode (shared filesystem)
-  src/gateway/agentbox/k8s-spawner.ts      K8s pod spawner (production)
-  src/gateway/agentbox/process-spawner.ts  Child process spawner (--process flag)
-
-Database
-  src/gateway/db/index.ts          createDb() — SQLite vs MySQL selection
-  src/gateway/db/schema-sqlite.ts  Drizzle SQLite schema (all tables)
-  src/gateway/db/migrate-sqlite.ts DDL_STATEMENTS (must stay in sync with schema)
-  src/memory/indexer.ts            Hybrid search engine
-  src/memory/schema.ts             Memory DB schema
-
-Tools (read docs/design/tools.md for development guide)
-  src/tools/k8s-exec/             Remote command execution (node-exec, pod-exec, pod-nsenter-exec)
-  src/tools/k8s-script/           Remote script execution (node-script, pod-script, netns-script)
-  src/tools/shell/                Local shell (restricted-bash, run-skill)
-  src/tools/query/                Data queries (memory-search, credential-list, cluster-info, etc.)
-  src/tools/workflow/             User workflows (deep-search, dp-tools, skill CRUD, schedule, feedback)
-  src/tools/infra/                Shared infrastructure (security pipeline, execution helpers, output)
-
-Skills
-  src/gateway/skills/skill-bundle.ts  buildSkillBundle() — team + personal only
-  src/tools/shell/run-skill.ts        local_script tool
-  src/tools/infra/script-resolver.ts  Skill path resolution
-  skills/core/                        Built-in diagnostic skills
-
-Investigation
-  src/tools/workflow/deep-search/types.ts    Budget constants (Normal/Quick)
-  src/tools/workflow/deep-search/engine.ts   4-phase workflow engine
-  src/tools/workflow/deep-search/sub-agent.ts Sub-agent factory (minimal tool set)
-  src/tools/query/investigation-feedback.ts  User feedback on diagnoses (IM Phase 2, pi-agent only)
-
-Platform Tools
-  src/tools/workflow/manage-schedule.ts   Cron job management (language-aware)
-  src/tools/query/credential-list.ts      Credential discovery for AgentBox
-
-Cron (merged into Gateway)
-  src/gateway/cron/cron-service.ts In-process scheduler, DB-based coordination (ADR-008)
-```
+- Docs out of sync with code — check `docs/design/`, `CLAUDE.md`, and skill SKILL.md files
 
 ---
 

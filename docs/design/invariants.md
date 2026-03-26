@@ -101,7 +101,7 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 - Max output: 10 MB combined stdout+stderr
 - Env injected: `SICLAW_DEBUG_IMAGE`, `KUBECONFIG`, `SICLAW_CREDENTIALS_DIR`
 
-**Source**: `src/tools/shell/run-skill.ts`
+**Source**: `src/tools/shell/local-script.ts`
 
 ---
 
@@ -128,7 +128,7 @@ kubectl setgid → kubecred group membership, reads kubeconfig only
 
 ### 3.2 The 6-Pass Validation Pipeline (Secondary Defense)
 
-Every command through `bash`, `node_exec`, `pod_exec`, or `pod_nsenter_exec` passes all 6 passes:
+Every command through `bash`, `node_exec`, or `pod_exec` passes all 6 passes:
 
 ```
 Pass 1 — Shell Operators      Block: $(), backticks, <(), >(), redirections, newlines

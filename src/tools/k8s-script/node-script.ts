@@ -11,6 +11,7 @@ import {
   validateNodeName,
   prepareExecEnv,
   formatExecOutput,
+  stdinExecCmd,
 } from "../infra/exec-utils.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
@@ -20,6 +21,7 @@ interface NodeScriptParams {
   skill?: string;
   script: string;
   args?: string;
+  netns?: string;
   kubeconfig?: string;
   image?: string;
   timeout_seconds?: number;
@@ -58,7 +60,8 @@ Parameters:
 
 Examples:
 - node: "node-1", skill: "node-logs", script: "get-node-logs.sh", args: "--lines 100"
-- node: "node-1", script: "my-check.sh"`,
+- node: "node-1", script: "my-check.sh"
+- node: "node-1", netns: "abc123", skill: "pod-ping-gateway", script: "ping.sh", args: "--interface net1"`,
     parameters: Type.Object({
       node: Type.String({ description: "Kubernetes node name" }),
       skill: Type.Optional(
@@ -69,6 +72,11 @@ Examples:
       script: Type.String({ description: "Script filename" }),
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
+      ),
+      netns: Type.Optional(
+        Type.String({
+          description: 'Network namespace name (from resolve_pod_netns). When set, script runs inside that netns via "ip netns exec".',
+        }),
       ),
       kubeconfig: Type.Optional(
         Type.String({
@@ -137,14 +145,21 @@ Examples:
       // Security: shell-escape each argument to prevent injection via args parameter
       const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
 
-      // Base64 encode script content
-      const b64 = Buffer.from(resolved.content).toString("base64");
+      // Validate netns name if provided (prevent shell injection)
+      const netns = params.netns?.trim();
+      if (netns && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(netns)) {
+        return {
+          content: [{ type: "text", text: `Error: invalid netns name "${netns}". Must be alphanumeric, dashes, underscores (max 64 chars).` }],
+          details: { error: true },
+        };
+      }
 
-      // Build the command that runs inside nsenter
-      const ext = resolved.interpreter === "python3" ? ".py" : ".sh";
-      const innerCmd = escapedArgs
-        ? `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext} ${escapedArgs}`
-        : `echo '${b64}' | base64 -d > /tmp/_s${ext} && ${resolved.interpreter} /tmp/_s${ext}`;
+      // Build the command that runs inside nsenter — pipe script via stdin.
+      // When netns is specified, wrap with "ip netns exec" for pod network namespace.
+      const baseCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
+      const innerCmd = netns
+        ? `ip netns exec ${netns} ${baseCmd}`
+        : baseCmd;
 
       const nsenterCmd = [
         "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
@@ -152,7 +167,7 @@ Examples:
       ];
 
       const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey },
+        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey, stdinData: resolved.content },
         env,
         { timeoutMs: timeout, signal },
       );

@@ -496,6 +496,52 @@ describe("createNodeExecTool", () => {
     expect(tool.label).toBe("Node Exec");
   });
 
+  it("accepts valid netns names", async () => {
+    // Valid netns names should pass validation (will fail at kubectl level, not at netns validation)
+    const result = await tool.execute(
+      "test-id",
+      { node: "node-1", command: "ip addr show", netns: "cni-b82378ee-a3cc-fed8-abfa-16720ebc4d8f", timeout_seconds: 3 },
+      undefined,
+      {} as any
+    );
+    expect((result.details as any).blocked).toBeUndefined();
+    expect((result.details as any).reason).not.toBe("invalid_netns_name");
+  }, 15_000);
+
+  it("blocks netns names with shell injection", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { node: "node-1", command: "ip addr show", netns: "abc; curl evil.com" },
+      undefined,
+      {} as any
+    );
+    expect((result.details as any).blocked).toBe(true);
+    expect((result.details as any).reason).toBe("invalid_netns_name");
+  });
+
+  it("blocks netns names with pipe", async () => {
+    const result = await tool.execute(
+      "test-id",
+      { node: "node-1", command: "ip addr show", netns: "abc|cat /etc/passwd" },
+      undefined,
+      {} as any
+    );
+    expect((result.details as any).blocked).toBe(true);
+    expect((result.details as any).reason).toBe("invalid_netns_name");
+  });
+
+  it("blocks empty netns name", async () => {
+    // Empty after trim should be treated as no netns (not an error)
+    const result = await tool.execute(
+      "test-id",
+      { node: "node-1", command: "ip addr show", netns: "  ", timeout_seconds: 3 },
+      undefined,
+      {} as any
+    );
+    // Should not be blocked by netns validation — empty means "no netns"
+    expect((result.details as any).reason).not.toBe("invalid_netns_name");
+  }, 15_000);
+
   it("blocks invalid node names", async () => {
     const result = await tool.execute(
       "test-id",
