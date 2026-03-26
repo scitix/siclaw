@@ -51,6 +51,7 @@ import { KnowledgeDocRepository } from "./db/repositories/knowledge-doc-repo.js"
 import type { MemoryIndexer } from "../memory/index.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 import { loadConfig } from "../core/config.js";
+import { type DpStatus, type DpChecklist, createChecklist, syncChecklistFromStatus, type DpState } from "../tools/dp-tools.js";
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
@@ -835,6 +836,92 @@ export function createRpcMethods(
     updatedAt: number;
   }>();
 
+  // DP status cache — real-time mirror (NOT source of truth; agentbox dp-state endpoint is authoritative)
+  interface DpStatusCache {
+    dpStatus: DpStatus;
+    checklist: DpChecklist | null;
+    dpQuestion?: string;
+  }
+  const dpStatusCache = new Map<string, DpStatusCache>();
+
+  function transitionDpStatus(streamKey: string, newStatus: DpStatus, question?: string): void {
+    let cache = dpStatusCache.get(streamKey);
+    if (!cache) {
+      cache = { dpStatus: "idle", checklist: null };
+      dpStatusCache.set(streamKey, cache);
+    }
+    cache.dpStatus = newStatus;
+    if (question !== undefined) cache.dpQuestion = question;
+    if (newStatus !== "idle" && !cache.checklist) {
+      cache.checklist = createChecklist(cache.dpQuestion ?? "");
+    }
+    if (cache.checklist) {
+      syncChecklistFromStatus({ checklist: cache.checklist, status: newStatus });
+    }
+    if (newStatus === "completed") {
+      setTimeout(() => {
+        // Only delete if still completed — a new investigation may have started
+        if (dpStatusCache.get(streamKey)?.dpStatus === "completed") {
+          dpStatusCache.delete(streamKey);
+        }
+      }, 10_000);
+    }
+  }
+
+  function emitDpStatus(streamKey: string, userId: string, sessionId: string): void {
+    const cache = dpStatusCache.get(streamKey);
+    if (!cache) return;
+    const payload = {
+      type: "dp_status",
+      userId,
+      sessionId,
+      dpStatus: cache.dpStatus,
+      checklist: cache.checklist?.items ?? null,
+      dpQuestion: cache.dpQuestion,
+    };
+    if (sendToUser) {
+      sendToUser(userId, "agent_event", payload);
+    }
+  }
+
+  /** Detect DP markers in user text → return target status, or null if no transition. */
+  function detectDpMarker(text: string, streamKey: string): { status: DpStatus; question?: string } | null {
+    if (text.startsWith("[Deep Investigation]")) {
+      const cache = dpStatusCache.get(streamKey);
+      const q = text.replace(/^\[Deep Investigation\]\n?/, "").trim() || undefined;
+      if (!cache || cache.dpStatus === "idle") return { status: "investigating", question: q };
+      if (cache.dpStatus === "awaiting_confirmation") return { status: "investigating" }; // implicit adjust
+      return null; // already in DP, no transition
+    }
+    if (text.startsWith("[DP_CONFIRM]")) return { status: "validating" };
+    if (text.startsWith("[DP_ADJUST]")) return { status: "investigating" };
+    if (text.startsWith("[DP_REINVESTIGATE]")) return { status: "investigating" };
+    if (text.startsWith("[DP_SKIP]")) return { status: "concluding" };
+    if (text.startsWith("[DP_EXIT]")) return { status: "idle" };
+    return null;
+  }
+
+  function detectDpControlAction(text: string): "confirm" | "adjust" | "reinvestigate" | "skip" | null {
+    if (text.startsWith("[DP_CONFIRM]")) return "confirm";
+    if (text.startsWith("[DP_ADJUST]")) return "adjust";
+    if (text.startsWith("[DP_REINVESTIGATE]")) return "reinvestigate";
+    if (text.startsWith("[DP_SKIP]")) return "skip";
+    return null;
+  }
+
+  /** Validate DP control markers against authoritative agentbox dp-state. */
+  async function validateDpControl(text: string, endpoint: string, agentboxSessionId: string, sessionId: string): Promise<void> {
+    const action = detectDpControlAction(text);
+    if (!action) return;
+    const agentClient = new AgentBoxClient(endpoint, 5000, agentBoxTlsOptions);
+    const dpState = await agentClient.getDpState(agentboxSessionId);
+    if (dpState?.dpStatus !== "awaiting_confirmation") {
+      const reason = `Cannot ${action} DP hypotheses: session is in "${dpState?.dpStatus ?? "idle"}", expected "awaiting_confirmation".`;
+      console.warn(`[rpc] Rejected DP control marker for session ${sessionId}: ${reason}`);
+      throw new Error(reason);
+    }
+  }
+
   // ─────────────────────────────────────────────────
   // Chat Methods
   // ─────────────────────────────────────────────────
@@ -942,6 +1029,10 @@ export function createRpcMethods(
     });
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
+    if (sessionId) {
+      await validateDpControl(message, handle.endpoint, sessionId, sessionId);
+    }
+
     // === Feedback enrichment (system-level) ===
     let promptText = message;
     if (message.startsWith("[Feedback]") && !chatRepo) {
@@ -964,6 +1055,13 @@ export function createRpcMethods(
       }
     }
 
+    // Track DP status from user markers (before sending prompt)
+    const dpStreamKey = sessionId ? `${userId}:${sessionId}` : `${userId}:pending`;
+    const dpTransition = detectDpMarker(message, dpStreamKey);
+    if (dpTransition) {
+      transitionDpStatus(dpStreamKey, dpTransition.status, dpTransition.question);
+    }
+
     // Send prompt
     const result = await client.prompt({ sessionId, text: promptText, modelProvider, modelId, brainType, modelConfig, credentials });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
@@ -980,6 +1078,17 @@ export function createRpcMethods(
 
     // Cancel previous SSE subscription for this session
     const streamKey = `${userId}:${result.sessionId}`;
+
+    // Fixup dpStatusCache key if sessionId was assigned lazily
+    if (dpStreamKey !== streamKey && dpStatusCache.has(dpStreamKey)) {
+      const dpCache = dpStatusCache.get(dpStreamKey)!;
+      dpStatusCache.set(streamKey, dpCache);
+      dpStatusCache.delete(dpStreamKey);
+    }
+    // Emit dp_status event after prompt is accepted (sessionId now known)
+    if (dpTransition) {
+      emitDpStatus(streamKey, userId, result.sessionId);
+    }
     const existingStream = activeStreams.get(streamKey);
     if (existingStream) {
       existingStream.abort();
@@ -1108,6 +1217,21 @@ export function createRpcMethods(
               }
               snap.events.push(progress);
               snap.updatedAt = Date.now();
+            }
+          }
+
+          // Track DP status from tool events (reads dpStatus from tool result details)
+          if (eventType === "tool_execution_end") {
+            const details = (eventData.result as { details?: { dpStatus?: string } } | undefined)?.details;
+            if (details?.dpStatus) {
+              transitionDpStatus(streamKey, details.dpStatus as DpStatus);
+              emitDpStatus(streamKey, userId, result.sessionId);
+            }
+          } else if (eventType === "agent_end") {
+            const cache = dpStatusCache.get(streamKey);
+            if (cache?.dpStatus === "concluding") {
+              transitionDpStatus(streamKey, "completed");
+              emitDpStatus(streamKey, userId, result.sessionId);
             }
           }
 
@@ -1709,6 +1833,7 @@ export function createRpcMethods(
         id: docId,
         name,
         filePath,
+        content,
         sizeBytes,
         uploadedBy: context.auth?.userId,
       });
@@ -1781,6 +1906,17 @@ export function createRpcMethods(
     const stream = streamKey ? activeStreams.get(streamKey) : undefined;
     if (!stream) throw new Error("No active agent session");
 
+    await validateDpControl(text, stream.endpoint, stream.sessionId, sessionId ?? stream.sessionId);
+
+    // Track DP markers in steer messages (card buttons during active agent)
+    if (streamKey) {
+      const dpTransition = detectDpMarker(text, streamKey);
+      if (dpTransition) {
+        transitionDpStatus(streamKey, dpTransition.status, dpTransition.question);
+        emitDpStatus(streamKey, userId, stream.sessionId);
+      }
+    }
+
     const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
     await client.steerSession(stream.sessionId, text);
     return { status: "steered" };
@@ -1822,18 +1958,10 @@ export function createRpcMethods(
     return { status: "aborted" };
   });
 
-  methods.set("chat.confirmHypotheses", async (params, context: RpcContext) => {
-    const userId = requireAuth(context);
-    const sessionId = params.sessionId as string | undefined;
-
-    // Hypotheses confirmation is handled via steer messages from the frontend.
-    // This RPC is a gate-clear signal — acknowledge it so the frontend knows it was received.
-    const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
-    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
-    if (stream) {
-      const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
-      await client.steerSession(stream.sessionId, "[hypotheses confirmed]");
-    }
+  methods.set("chat.confirmHypotheses", async (_params, context: RpcContext) => {
+    requireAuth(context);
+    // Confirmation is now handled by [DP_CONFIRM] marker in the sendMessage path.
+    // This RPC is kept for frontend compatibility — no steer needed.
     return { status: "confirmed" };
   });
 
@@ -1843,12 +1971,63 @@ export function createRpcMethods(
     const snapKey = sessionId ? `${userId}:${sessionId}` : userId;
     const streamKey = sessionId ? `${userId}:${sessionId}` : undefined;
     const promptActive = streamKey ? activeStreams.has(streamKey) : false;
+
+    // Progress events for hypothesis tree (deep_search engine detail)
     const snap = dpProgressSnapshots.get(snapKey);
-    if (!snap || Date.now() - snap.updatedAt > 600_000) {
+    if (snap && Date.now() - snap.updatedAt > 600_000) {
       dpProgressSnapshots.delete(snapKey);
-      return { events: null, promptActive };
     }
-    return { sessionId: snap.sessionId, events: snap.events, promptActive };
+    const events = snap && Date.now() - snap.updatedAt <= 600_000 ? snap.events : null;
+
+    // DP status: try agentbox (authoritative), fallback to gateway cache
+    let dpStatus: string | undefined;
+    let dpChecklist: DpChecklist | null = null;
+    let dpQuestion: string | undefined;
+    let confirmedHypotheses: Array<{ id: string; text: string; confidence: number }> | undefined;
+
+    // Try agentbox dp-state endpoint (reads live dpStateRef = persisted state mirror).
+    // Use findAgentBoxForSession to locate agentbox independent of activeStreams/cache.
+    const stream = streamKey ? activeStreams.get(streamKey) : undefined;
+    const agentboxSessionId = stream?.sessionId ?? sessionId;
+    try {
+      const handle = await findAgentBoxForSession(userId, sessionId);
+      if (handle && agentboxSessionId) {
+        const agentClient = new AgentBoxClient(handle.endpoint, 5000, agentBoxTlsOptions);
+        const resp = await agentClient.getDpState(agentboxSessionId);
+        if (resp?.dpStatus && resp.dpStatus !== "idle") {
+          dpStatus = resp.dpStatus;
+          dpQuestion = resp.question;
+          confirmedHypotheses = resp.confirmedHypotheses;
+          // Derive checklist from authoritative dpStatus
+          const cl = createChecklist(dpQuestion ?? "");
+          syncChecklistFromStatus({ checklist: cl, status: dpStatus as DpStatus });
+          dpChecklist = cl;
+        }
+      }
+    } catch (err) {
+      console.warn("[rpc] dp-state fetch failed, using cache:", err instanceof Error ? err.message : err);
+    }
+
+    // Fallback: gateway cache
+    if (!dpStatus) {
+      const cache = dpStatusCache.get(snapKey);
+      if (cache && cache.dpStatus !== "idle") {
+        dpStatus = cache.dpStatus;
+        dpChecklist = cache.checklist;
+        dpQuestion = cache.dpQuestion;
+      }
+    }
+
+    const result = {
+      sessionId: snap?.sessionId,
+      events,
+      promptActive,
+      dpStatus: dpStatus ?? null,
+      checklist: dpChecklist?.items ?? null,
+      dpQuestion: dpQuestion ?? null,
+      confirmedHypotheses: confirmedHypotheses ?? null,
+    };
+    return result;
   });
 
   methods.set("chat.history", async (params, context: RpcContext) => {
@@ -2612,10 +2791,16 @@ export function createRpcMethods(
 
       // Save content
       if (skillContentRepo) {
-        await skillContentRepo.save(id, "working", {
+        const forkedFiles = {
           specs: effectiveSpecs,
           scripts: effectiveScripts,
-        });
+        };
+        await skillContentRepo.save(id, "working", forkedFiles);
+        // Persist the fork source as the initial baseline so later diffs show
+        // what changed inside the Skill Space after the fork.
+        await skillContentRepo.save(id, "published", forkedFiles);
+        await skillRepo.update(id, { publishedVersion: inheritVersion });
+        console.log(`[skill.fork] Initialized Skill Space baseline for ${id} from ${sourceId}`);
       }
 
       // Notify all members to reload
@@ -2674,10 +2859,16 @@ export function createRpcMethods(
 
     // ── 6. Save content ──
     if (skillContentRepo) {
-      await skillContentRepo.save(id, "working", {
+      const forkedFiles = {
         specs: effectiveSpecs,
         scripts: effectiveScripts,
-      });
+      };
+      await skillContentRepo.save(id, "working", forkedFiles);
+      // Persist the fork source as the initial baseline so later diffs show
+      // what changed after the fork (same pattern as skillset forks).
+      await skillContentRepo.save(id, "published", forkedFiles);
+      await skillRepo.update(id, { publishedVersion: inheritVersion });
+      console.log(`[skill.fork] Initialized personal baseline for ${id} from ${sourceId}`);
     }
 
     const hasScripts = effectiveScripts && effectiveScripts.length > 0;
@@ -2974,6 +3165,7 @@ export function createRpcMethods(
       oldPrefix: string,
       newPrefix: string,
     ): string {
+      if (!oldFiles && !newFiles) return "Baseline not found — cannot compute diff.";
       const parts: string[] = [];
 
       // SKILL.md diff
@@ -3009,34 +3201,116 @@ export function createRpcMethods(
     }
 
     if (meta.scope === "skillset") {
-      let globalFiles: SkillFiles | null = null;
+      let baselineFiles: SkillFiles | null = null;
+      let baselineLabel = "Skill Space baseline";
+      let baselinePrefix = "skill-space-baseline";
       if (skillContentRepo) {
-        const globalSkill = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
-        if (globalSkill) {
-          globalFiles = await skillContentRepo.read(globalSkill.id, "published");
-        }
+        baselineFiles = await skillContentRepo.read(skillId, "published");
       }
 
-      if (!globalFiles && meta.forkedFromId) {
+      if (!baselineFiles && meta.forkedFromId) {
+        console.warn(`[skill.diff] Missing Skill Space baseline for ${skillId}; falling back to fork source ${meta.forkedFromId}`);
         if (meta.forkedFromId.startsWith("builtin:") || meta.forkedFromId.startsWith("core:") || meta.forkedFromId.startsWith("extension:")) {
-          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":")[1] : meta.forkedFromId;
-          globalFiles = skillWriter.readSkill("builtin", dirName);
+          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":").slice(1).join(":") : meta.forkedFromId;
+          if (dirName.includes("..")) {
+            console.error(`[skill.diff] Refusing path-traversal dirName: ${dirName}`);
+          } else {
+            baselineFiles = skillWriter.readSkill("builtin", dirName);
+          }
+          baselineLabel = "Builtin source";
+          baselinePrefix = "builtin-source";
         } else if (skillContentRepo) {
           const sourceMeta = await skillRepo.getById(meta.forkedFromId);
           if (sourceMeta) {
             const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
-            globalFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            if (sourceMeta.scope === "team") {
+              baselineLabel = "Global published";
+              baselinePrefix = "global-published";
+            } else if (sourceMeta.scope === "skillset") {
+              baselineLabel = "Skill Space source";
+              baselinePrefix = "skill-space-source";
+            } else {
+              baselineLabel = "Fork source";
+              baselinePrefix = "fork-source";
+            }
           }
         }
       }
 
       let stagingFiles: SkillFiles | null = null;
       if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
-      if (!stagingFiles && skillContentRepo) {
-        stagingFiles = await skillContentRepo.read(skillId, "working");
+      let compareFiles = stagingFiles;
+      let compareLabel = "Skill Space staging";
+      let comparePrefix = "skill-space-staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Skill Space draft";
+        comparePrefix = "skill-space-draft";
       }
 
-      return { diff: buildFullDiff(globalFiles, stagingFiles, "global", "skill-space") };
+      return {
+        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        baselineLabel,
+        compareLabel,
+      };
+    }
+
+    // Personal fork diff: fork baseline vs current working/staging
+    if (meta.scope === "personal" && meta.forkedFromId && !teamDiff) {
+      let baselineFiles: SkillFiles | null = null;
+      let baselineLabel = "Fork baseline";
+      let baselinePrefix = "fork-baseline";
+      if (skillContentRepo) {
+        baselineFiles = await skillContentRepo.read(skillId, "published");
+      }
+
+      if (!baselineFiles) {
+        console.warn(`[skill.diff] Missing personal fork baseline for ${skillId}; falling back to fork source ${meta.forkedFromId}`);
+        if (meta.forkedFromId.startsWith("builtin:") || meta.forkedFromId.startsWith("core:") || meta.forkedFromId.startsWith("extension:")) {
+          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":").slice(1).join(":") : meta.forkedFromId;
+          if (dirName.includes("..")) {
+            console.error(`[skill.diff] Refusing path-traversal dirName: ${dirName}`);
+          } else {
+            baselineFiles = skillWriter.readSkill("builtin", dirName);
+          }
+          baselineLabel = "Builtin source";
+          baselinePrefix = "builtin-source";
+        } else if (skillContentRepo) {
+          const sourceMeta = await skillRepo.getById(meta.forkedFromId);
+          if (sourceMeta) {
+            const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
+            baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            if (sourceMeta.scope === "team") {
+              baselineLabel = "Global published";
+              baselinePrefix = "global-published";
+            } else if (sourceMeta.scope === "skillset") {
+              baselineLabel = "Skill Space source";
+              baselinePrefix = "skill-space-source";
+            } else {
+              baselineLabel = "Fork source";
+              baselinePrefix = "fork-source";
+            }
+          }
+        }
+      }
+
+      let stagingFiles: SkillFiles | null = null;
+      if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
+      let compareFiles = stagingFiles;
+      let compareLabel = "Personal staging";
+      let comparePrefix = "personal-staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Personal draft";
+        comparePrefix = "personal-draft";
+      }
+
+      return {
+        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        baselineLabel,
+        compareLabel,
+      };
     }
 
     if (teamDiff) {
@@ -3051,7 +3325,11 @@ export function createRpcMethods(
       let publishedFiles: SkillFiles | null = null;
       if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
 
-      return { diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed") };
+      return {
+        diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed"),
+        baselineLabel: "Global published",
+        compareLabel: "Contributed",
+      };
     } else {
       // Publish review: published vs staging
       let publishedFiles: SkillFiles | null = null;
@@ -3062,8 +3340,18 @@ export function createRpcMethods(
 
       // If no staging, fall back to working copy
       let compareFiles = stagingFiles;
-      if (!compareFiles && skillContentRepo) compareFiles = await skillContentRepo.read(skillId, "working");
-      return { diff: buildFullDiff(publishedFiles, compareFiles, "published", "staging") };
+      let compareLabel = "Staging";
+      let comparePrefix = "staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Draft";
+        comparePrefix = "draft";
+      }
+      return {
+        diff: buildFullDiff(publishedFiles, compareFiles, "published", comparePrefix),
+        baselineLabel: "Published",
+        compareLabel,
+      };
     }
   });
 

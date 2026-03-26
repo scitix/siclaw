@@ -3,9 +3,12 @@ import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { deepSearchEvents, type ProgressEvent } from "../../tools/deep-search/events.js";
 import {
-  type ChecklistItemStatus,
   type DpChecklist,
+  type MutableDpStateRef,
+  type DpStatus,
+  type DpHypothesis,
   createChecklist,
+  syncChecklistFromStatus,
   buildActivationMessage,
 } from "../../tools/dp-tools.js";
 import type { MemoryRef } from "../../tools/deep-search/tool.js";
@@ -30,14 +33,6 @@ import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
  */
 
 const WIDGET_ID = "deep-search-tree";
-
-function markItem(cl: DpChecklist, id: string, status: ChecklistItemStatus, summary?: string): void {
-  const item = cl.items.find((i) => i.id === id);
-  if (item) {
-    item.status = status;
-    if (summary) item.summary = summary;
-  }
-}
 
 // --- Theme safety ---
 
@@ -160,14 +155,40 @@ function formatHypothesesWidget(text: string, theme: any): string[] {
 
 // --- Extension ---
 
-export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?: MemoryRef): void {
-  // --- Mode state ---
+export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?: MemoryRef, dpStateRef?: MutableDpStateRef): void {
+  // --- DP state machine (source of truth) ---
+  // All status transitions happen via setDpStatus() which is driven ONLY by
+  // deterministic system events (tool_call, tool_result, user UI actions, agent_end).
+  // Model text must NEVER drive status changes.
+  let dpStatus: DpStatus = "idle";
+  let dpQuestion: string | undefined;
+  let dpTriageContextDraft: string | undefined;
+  let dpHypothesesDraft: DpHypothesis[] | undefined;
+  let dpConfirmedHypotheses: DpHypothesis[] | undefined;
+  let dpRound = 0;
+  let dpLastUserFeedback: string | undefined;
+
+  function setDpStatus(status: DpStatus): void {
+    dpStatus = status;
+    // Sync the mutable ref so tools and agentbox can see current state
+    if (dpStateRef) {
+      dpStateRef.status = status;
+      dpStateRef.triageContextDraft = dpTriageContextDraft;
+      dpStateRef.confirmedHypotheses = dpConfirmedHypotheses;
+      dpStateRef.question = dpQuestion;
+      dpStateRef.round = dpRound;
+    }
+    // Derive checklist from status (single direction: status → checklist)
+    if (checklist) syncChecklistFromStatus({ checklist, status });
+  }
+
+  // --- Legacy mode state ---
   let checklist: DpChecklist | null = null;
   let pendingActivation = false;
   let pendingFeedbackId: string | null = null;
   let deepSearchRan = false;
+  let dpHadToolCalls = false;
   let feedbackCleanup: (() => void) | null = null;
-  let pendingDpExit = false; // deferred exit: set on deep_search completion, consumed on agent_end
 
   // --- Progress rendering state ---
   let activeUI: ExtensionUIContext | null = null;
@@ -201,16 +222,30 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
   function persistState(): void {
     api.appendEntry("dp-mode", {
-      enabled: checklist !== null,
+      enabled: dpStatus !== "idle",
       checklist,
+      // DP state snapshot — used for frontend sync and session restore
+      dpStatus,
+      dpQuestion,
+      dpRound,
+      dpTriageContextDraft,
+      dpHypothesesDraft,
+      dpConfirmedHypotheses,
+      dpLastUserFeedback,
     });
   }
 
   // --- Toggle ---
 
   function enableDpMode(ctx: ExtensionContext): void {
-    if (checklist) return;
+    if (dpStatus !== "idle") return;
     checklist = createChecklist("");
+    dpRound = 0;
+    dpTriageContextDraft = undefined;
+    dpHypothesesDraft = undefined;
+    dpConfirmedHypotheses = undefined;
+    dpLastUserFeedback = undefined;
+    setDpStatus("investigating");
     updateStatus(ctx);
     persistState();
     if (ctx.hasUI) ctx.ui.notify("\uD83D\uDD0D Deep Investigation ON \u2014 Ctrl+I or /dp to exit");
@@ -257,17 +292,25 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   }
 
   function disableDpMode(ctx: ExtensionContext): void {
-    if (!checklist) return;
+    if (dpStatus === "idle") return;
+    // Clear state before setDpStatus so dpStateRef snapshot is clean on idle
     checklist = null;
+    dpQuestion = undefined;
+    dpTriageContextDraft = undefined;
+    dpHypothesesDraft = undefined;
+    dpConfirmedHypotheses = undefined;
+    dpRound = 0;
+    dpLastUserFeedback = undefined;
+    setDpStatus("idle");
     persistState();
     if (ctx.hasUI) ctx.ui.notify("Deep Investigation OFF");
     pendingActivation = false;
     showFeedbackIfNeeded(ctx);
-    if (!feedbackCleanup) updateStatus(ctx); // only clear status if no feedback hint active
+    if (!feedbackCleanup) updateStatus(ctx);
   }
 
   function toggleDpMode(ctx: ExtensionContext): void {
-    if (checklist) {
+    if (dpStatus !== "idle") {
       disableDpMode(ctx);
     } else {
       enableDpMode(ctx);
@@ -336,10 +379,11 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
         toggleDpMode(ctx);
         return;
       }
-      if (!checklist) {
+      if (dpStatus === "idle") {
         enableDpMode(ctx);
       }
-      checklist!.question = prompt;
+      dpQuestion = prompt;
+      if (checklist) checklist.question = prompt;
       persistState();
       api.sendUserMessage(buildActivationMessage(prompt));
     },
@@ -361,64 +405,87 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!checklist) {
+      if (dpStatus === "idle") {
         return { content: [{ type: "text" as const, text: "No investigation in progress." }], details: {} };
       }
       const { reason } = params as { reason: string };
-      for (const item of checklist.items) {
-        if (item.status === "pending" || item.status === "in_progress") {
-          item.status = "skipped";
-          item.summary = reason;
-        }
-      }
+      // System event: end_investigation tool execute
+      setDpStatus("completed");
       persistState();
       if (ctx.hasUI) updateStatus(ctx);
       disableDpMode(ctx);
       return {
         content: [{ type: "text" as const, text: `Investigation ended: ${reason}` }],
-        details: {},
+        details: { dpStatus: "completed" as const },
       };
     },
   });
 
   // --- propose_hypotheses tool: interactive user review ---
+  // System event: tool execute → status transitions.
+  // User choice (TUI select / web steer) → status transitions.
 
   api.registerTool({
     name: "propose_hypotheses",
     label: "Propose Hypotheses",
     description:
       "Present hypotheses to the user as an interactive review card. " +
-      "The tool BLOCKS until the user makes a decision (proceed / adjust / skip). " +
-      "Use this to align investigation direction before committing to deep_search. " +
-      "Works both inside and outside Deep Investigation mode. " +
-      "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.",
+      "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
+      "You MUST write 2-3 sentences of triage summary BEFORE calling this tool (empty message + card is bad UX).\n" +
+      "In TUI: BLOCKS until user decides (proceed / adjust / skip). " +
+      "In web UI: returns immediately — you MUST wait for the user's next message. " +
+      "Do NOT call deep_search until the user explicitly confirms.",
     parameters: Type.Object({
       hypotheses: Type.String({
         description:
-          "Formatted hypothesis list in markdown. Each hypothesis should include: " +
-          "description, validation method (skill script paths), and confidence percentage.",
+          "Hypothesis list in strict markdown format. Use numbered headings with inline confidence:\n" +
+          "### 1. Specific testable statement (Confidence: 75%)\n" +
+          "Brief explanation of why this is plausible and how to validate it.\n" +
+          "---\n" +
+          "### 2. Another specific statement (Confidence: 60%)\n" +
+          "Brief explanation.\n\n" +
+          "Rules: 2-4 hypotheses max. Each must be a specific, testable claim — not a category or topic. " +
+          "Separate hypotheses with --- on its own line. " +
+          "Keep each hypothesis to 2-3 lines (title + explanation). No sub-lists, no verbose detail.",
+      }),
+      triageContext: Type.String({
+        description:
+          "REQUIRED. Summary of triage findings so far: cluster mode, affected pods/namespaces, " +
+          "key observations, commands run. This is saved and automatically passed to deep_search " +
+          "when the user confirms hypotheses. Must not be empty.",
       }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const isDpMode = checklist !== null;
+      const isDpMode = dpStatus !== "idle";
+      const { hypotheses: hypothesesText, triageContext } = params as { hypotheses: string; triageContext: string };
 
-      const { hypotheses: hypothesesText } = params as { hypotheses: string };
+      // --- Write DP state (system event: tool execute) ---
+      if (isDpMode) {
+        // Save drafts
+        const parsed = parseHypotheses(hypothesesText);
+        dpHypothesesDraft = parsed.map((h, i) => ({
+          id: `H${i + 1}`,
+          text: h.title,
+          confidence: h.confidence ?? 50,
+        }));
+        dpTriageContextDraft = triageContext;
+        dpRound++;
+        // Status transition: investigating → awaiting_confirmation
+        setDpStatus("awaiting_confirmation");
+        persistState();
+        updateStatus(ctx);
+      }
 
       const hasTUI = ctx.hasUI && isThemeUsable(ctx);
 
       if (hasTUI) {
-        // Build a compact text summary of hypotheses for the select title.
-        // We do NOT use setWidget here — the pi-tui framework's spinner
-        // (80ms animation) triggers requestRender() continuously, and having
-        // both a widget and a select dialog active causes duplicated rendering
-        // because they share the sequential container hierarchy.
         const parsed = parseHypotheses(hypothesesText);
         const hypoLines = parsed.slice(0, 5).map((h, i) => {
           const title = h.title.length > 60 ? h.title.slice(0, 57) + "..." : h.title;
           const conf = h.confidence ? ` (${h.confidence}%)` : "";
           return `  ${i + 1}. ${title}${conf}`;
         }).join("\n");
-        const selectTitle = `Review Hypotheses\n\n${hypoLines}\n`;
+        const selectTitle = `Review Hypotheses (round ${dpRound})\n\n${hypoLines}\n`;
 
         // Block until user reviews and decides
         const choice = await ctx.ui.select(
@@ -431,8 +498,6 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
           { signal },
         );
 
-        // Show hypotheses as widget after dialog closes — will be cleared by
-        // tool_call handler when the model proceeds to the next tool.
         const widgetLines = formatHypothesesWidget(hypothesesText, ctx.ui.theme);
         ctx.ui.setWidget("dp-hypotheses", widgetLines);
 
@@ -444,34 +509,60 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
             { signal },
           );
           ctx.ui.setWidget("dp-hypotheses", widgetLines);
+          // System event: user chose "adjust"
+          if (isDpMode) {
+            dpLastUserFeedback = feedback ?? undefined;
+            setDpStatus("investigating");
+            persistState();
+            updateStatus(ctx);
+          }
           return {
             content: [{ type: "text" as const, text: `User wants adjustments: ${feedback ?? "(no details)"}. Revise hypotheses and call propose_hypotheses again.` }],
-            details: { hypotheses: hypothesesText, userChoice: "adjust", feedback },
+            details: { hypotheses: hypothesesText, userChoice: "adjust", feedback, dpStatus: dpStatus },
           };
         }
 
         if (choice === "Skip to conclusion") {
+          // System event: user chose "skip" → concluding (model still needs to output conclusion)
+          if (isDpMode) {
+            setDpStatus("concluding");
+            persistState();
+            updateStatus(ctx);
+          }
           return {
             content: [{ type: "text" as const, text: "User chose to skip deep search. Present conclusion based on current findings." }],
-            details: { hypotheses: hypothesesText, userChoice: "skip" },
+            details: { hypotheses: hypothesesText, userChoice: "skip", dpStatus: dpStatus },
           };
         }
 
-        // "Proceed to deep search" or dismissed (undefined)
+        // "Proceed to deep search" — system event: user confirmed
+        if (isDpMode) {
+          dpConfirmedHypotheses = dpHypothesesDraft;
+          setDpStatus("validating");
+          persistState();
+          updateStatus(ctx);
+        }
         return {
           content: [{ type: "text" as const, text: "User approved hypotheses. Proceed with deep_search to validate them." }],
-          details: { hypotheses: hypothesesText, userChoice: "proceed" },
+          details: { hypotheses: hypothesesText, userChoice: "proceed", dpStatus: dpStatus },
         };
       }
 
-      // Non-TUI mode (web UI, RPC): no interactive dialog
+      // Non-TUI mode (web UI, RPC): no interactive dialog.
+      // Status already set to awaiting_confirmation above.
+      // The tool_call handler blocks ALL tools during awaiting_confirmation,
+      // so the model cannot continue calling tools in this turn.
+      // Do NOT use steer here — it would be processed by our own input handlers
+      // and corrupt the state (treated as implicit adjust from "user input").
       const responseText = isDpMode
-        ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."
+        ? "Hypotheses presented to user. You MUST wait for the user's next message before proceeding. " +
+          "The user will either: (1) confirm to proceed with deep_search, (2) provide feedback to adjust hypotheses, " +
+          "or (3) ask to skip. Do NOT call any tools until the user explicitly responds."
         : "Hypotheses presented to user. Decide whether to proceed based on user engagement.";
 
       return {
         content: [{ type: "text" as const, text: responseText }],
-        details: { hypotheses: hypothesesText },
+        details: { hypotheses: hypothesesText, triageContext, dpStatus: dpStatus },
       };
     },
   });
@@ -481,13 +572,15 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   api.on("input", async (event, _ctx) => {
     if (!pendingActivation) return { action: "continue" as const };
     // Don't intercept if already has DP markers
-    if (event.text.startsWith("[Deep Investigation]") || event.text.startsWith("[DP_EXIT]")) {
+    if (event.text.startsWith("[Deep Investigation]") || event.text.startsWith("[DP_EXIT]")
+        || event.text.startsWith("[DP_CONFIRM]") || event.text.startsWith("[DP_ADJUST]") || event.text.startsWith("[DP_REINVESTIGATE]") || event.text.startsWith("[DP_SKIP]")) {
       return { action: "continue" as const };
     }
     pendingActivation = false;
     // Directly build activation message (don't rely on handler chaining)
     const question = event.text.trim();
     if (!question) return { action: "continue" as const };
+    dpQuestion = question;
     if (checklist) checklist.question = question;
     persistState();
     return {
@@ -497,27 +590,115 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   });
 
   // --- input: detect [Deep Investigation] marker from web UI toggle ---
+  // Frontend always prepends this when DP toggle is on.
+  // Backend decides behavior based on dpStatus:
+  //   idle → activate DP + inject workflow prompt
+  //   non-idle → strip marker, passthrough as normal conversation
 
   api.on("input", async (event, ctx) => {
     const marker = "[Deep Investigation]\n";
     if (!event.text.startsWith(marker)) return { action: "continue" as const };
 
-    // Strip the marker and extract the actual question
-    const question = event.text.slice(marker.length).trim();
-    if (!question) return { action: "continue" as const };
+    const userText = event.text.slice(marker.length).trim();
+    if (!userText) return { action: "continue" as const };
 
-    // Enable DP mode if not already active
-    if (!checklist) {
+    if (dpStatus === "idle") {
+      // First message: activate DP and inject workflow prompt
       enableDpMode(ctx);
+      dpQuestion = userText;
+      if (checklist) checklist.question = userText;
+      persistState();
+      return {
+        action: "transform" as const,
+        text: buildActivationMessage(userText),
+      };
     }
-    checklist!.question = question;
-    persistState();
 
-    // Transform into the format the agent expects (includes workflow from SKILL.md)
+    // Already in DP: strip marker.
+    // If awaiting_confirmation, let the dedicated DP_CONFIRM/DP_ADJUST handler below handle it.
+    if (dpStatus === "awaiting_confirmation") {
+      return { action: "transform" as const, text: userText };
+    }
+    // Pass through the stripped text as normal conversation
     return {
       action: "transform" as const,
-      text: buildActivationMessage(question),
+      text: userText,
     };
+  });
+
+  // --- input: handle [DP_CONFIRM] / [DP_ADJUST] / [DP_SKIP] from web UI ---
+
+  api.on("input", async (event, ctx) => {
+    if (dpStatus !== "awaiting_confirmation") return { action: "continue" as const };
+
+    // --- Confirm: awaiting_confirmation → validating ---
+    if (event.text.startsWith("[DP_CONFIRM]")) {
+      dpConfirmedHypotheses = dpHypothesesDraft;
+      setDpStatus("validating");
+      persistState();
+      updateStatus(ctx);
+      const userText = event.text.replace(/^\[DP_CONFIRM\]\n?/, "").trim();
+      return {
+        action: "transform" as const,
+        text: `The user has confirmed the proposed hypotheses. Proceed with deep_search to validate them.${userText ? `\n\nAdditional context: ${userText}` : ""}`,
+      };
+    }
+
+    // --- Adjust (light): tweak hypotheses without new investigation ---
+    if (event.text.startsWith("[DP_ADJUST]")) {
+      const feedback = event.text.replace(/^\[DP_ADJUST\]\n?/, "").trim();
+      dpLastUserFeedback = feedback || undefined;
+      setDpStatus("investigating");
+      persistState();
+      updateStatus(ctx);
+      return {
+        action: "transform" as const,
+        text: `The user wants to adjust the hypotheses. Their feedback:\n\n${feedback || "(no specific feedback)"}\n\nRevise the hypotheses based on this feedback and call propose_hypotheses again. You do NOT need to run additional commands — just refine the hypotheses.`,
+      };
+    }
+
+    // --- Re-investigate (heavy): go back to Phase 1, run new commands, then re-propose ---
+    if (event.text.startsWith("[DP_REINVESTIGATE]")) {
+      const hint = event.text.replace(/^\[DP_REINVESTIGATE\]\n?/, "").trim();
+      dpLastUserFeedback = hint || undefined;
+      setDpStatus("investigating");
+      persistState();
+      updateStatus(ctx);
+      return {
+        action: "transform" as const,
+        text: `The user wants you to re-investigate from a different angle before proposing new hypotheses.${hint ? ` Their guidance:\n\n${hint}` : ""}\n\nRun additional diagnostic commands to gather new information, then call propose_hypotheses with fresh hypotheses based on your new findings. Do NOT just rephrase the previous hypotheses — investigate first.`,
+      };
+    }
+
+    // --- Skip: awaiting_confirmation → concluding ---
+    if (event.text.startsWith("[DP_SKIP]")) {
+      setDpStatus("concluding");
+      persistState();
+      updateStatus(ctx);
+      const userText = event.text.replace(/^\[DP_SKIP\]\n?/, "").trim();
+      return {
+        action: "transform" as const,
+        text: `The user has chosen to skip deep_search validation. Present your conclusion based on the triage findings so far.${userText ? `\n\n${userText}` : ""}`,
+      };
+    }
+
+    // --- Free-text during awaiting_confirmation → implicit adjust ---
+    // Skip other DP markers (they have their own handlers)
+    if (event.text.startsWith("[Deep Investigation]") || event.text.startsWith("[DP_EXIT]")) {
+      return { action: "continue" as const };
+    }
+    // Any non-marker user input is treated as feedback → back to investigating
+    const feedback = event.text.trim();
+    if (feedback) {
+      dpLastUserFeedback = feedback;
+      setDpStatus("investigating");
+      persistState();
+      updateStatus(ctx);
+      // Pass through as-is — let the model see the user's actual words
+      return { action: "continue" as const };
+    }
+
+    return { action: "continue" as const };
   });
 
   // --- input: detect [DP_EXIT] marker from web UI manual exit ---
@@ -556,65 +737,125 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
 
     // Reset state — each session starts clean (prevents bleed from previous session)
     checklist = null;
+    dpStatus = "idle";
 
     // From CLI flag
     if (api.getFlag("dp") === true) {
       checklist = createChecklist("");
+      setDpStatus("investigating");
     }
 
-    // From persisted entries
+    // From persisted entries — restore from dpStatus snapshot (source of truth)
     const entries = ctx.sessionManager.getEntries();
     const entry = entries
       .filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "dp-mode")
-      .pop() as { data?: { enabled: boolean; checklist?: DpChecklist; phase?: string; question?: string } } | undefined;
+      .pop() as { data?: {
+        enabled: boolean;
+        checklist?: DpChecklist;
+        dpStatus?: DpStatus;
+        dpQuestion?: string;
+        dpRound?: number;
+        dpTriageContextDraft?: string;
+        dpHypothesesDraft?: DpHypothesis[];
+        dpConfirmedHypotheses?: DpHypothesis[];
+        dpLastUserFeedback?: string;
+        // Legacy fields
+        phase?: string;
+        question?: string;
+      } } | undefined;
 
     if (entry?.data) {
-      if (entry.data.checklist) {
-        // New format
+      if (entry.data.dpStatus && entry.data.dpStatus !== "idle") {
+        // New format: restore from dpStatus snapshot
+        checklist = entry.data.checklist ?? createChecklist(entry.data.dpQuestion ?? "");
+        dpQuestion = entry.data.dpQuestion;
+        dpRound = entry.data.dpRound ?? 0;
+        dpTriageContextDraft = entry.data.dpTriageContextDraft;
+        dpHypothesesDraft = entry.data.dpHypothesesDraft;
+        dpConfirmedHypotheses = entry.data.dpConfirmedHypotheses;
+        dpLastUserFeedback = entry.data.dpLastUserFeedback;
+        setDpStatus(entry.data.dpStatus);
+      } else if (entry.data.checklist) {
+        // Legacy format with checklist but no dpStatus
         checklist = entry.data.checklist;
+        setDpStatus("investigating");
       } else if (entry.data.phase && entry.data.phase !== "idle") {
-        // Old format migration
+        // Old phase-based format migration
         checklist = createChecklist(entry.data.question ?? "");
-        const doneMap: Record<string, string[]> = {
-          A: [],
-          B: ["triage"],
-          C: ["triage", "hypotheses"],
-          D: ["triage", "hypotheses", "deep_search", "conclusion"],
-        };
-        for (const id of doneMap[entry.data.phase] ?? []) {
-          markItem(checklist, id, "done", "(migrated from phase state)");
-        }
+        setDpStatus("investigating");
       }
     }
 
     updateStatus(ctx);
   });
 
-  // --- agent_end: consume deferred DP exit ---
-  // deep_search sets pendingDpExit; we wait until agent_end so the model can
-  // present its conclusion before disableDpMode triggers the feedback prompt.
+  // --- agent_end: system event → completed ---
+  // When the model finishes its turn after deep_search, the conclusion has been
+  // produced. This is the deterministic signal to transition concluding → completed.
   api.on("agent_end", (_event, ctx) => {
-    if (pendingDpExit) {
-      pendingDpExit = false;
+    if (dpStatus === "concluding") {
+      setDpStatus("completed");
+      updateStatus(ctx);
+      // "completed" is transient — disableDpMode immediately resets to idle and persists that.
+      // The JSONL never contains a "completed" entry; it goes straight from the last active
+      // status to "idle". This is intentional: "completed" only exists in-memory for the
+      // dp_status event to reach the frontend before teardown.
       disableDpMode(ctx);
+      return;
+    }
+    // Guardrail: model investigated (ran tools) but ended without calling propose_hypotheses.
+    // Only fires when tool calls were made — allows clarifying questions without nudging.
+    if (dpStatus === "investigating" && dpRound === 0 && dpHadToolCalls) {
+      api.sendUserMessage(
+        "You are in Deep Investigation mode but ended without calling propose_hypotheses. " +
+        "In DP mode, you MUST share your findings and hypotheses with the user via propose_hypotheses before concluding. " +
+        "Please review what you've found so far and call propose_hypotheses now.",
+        { deliverAs: "followUp" },
+      );
     }
   });
 
-  // --- tool_call: progress rendering setup (no auto-mark) ---
+  // --- tool_call: system event → status transition + progress rendering ---
 
   api.on("tool_call", (event, ctx) => {
+    dpHadToolCalls = true;
+    // Block all tools during awaiting_confirmation — model must wait for user.
+    if (dpStatus === "awaiting_confirmation" && event.toolName !== "propose_hypotheses") {
+      throw new Error(
+        "Blocked: waiting for user to confirm/adjust/skip hypotheses. " +
+        "Do not call any tools until the user responds."
+      );
+    }
     // Clear hypotheses widget when model proceeds to next tool
     if (event.toolName !== "propose_hypotheses") {
       ctx.ui.setWidget("dp-hypotheses", undefined);
     }
-    // Set up progress rendering for deep_search regardless of DP mode
+    // System event: deep_search tool_call → confirm validating status
     if (event.toolName === "deep_search") {
+      if (dpStatus === "validating") {
+        // Already validating (set by user confirm) — just sync checklist
+        syncChecklistFromStatus({ checklist, status: dpStatus });
+        persistState();
+        updateStatus(ctx);
+      }
       activeUI = ctx.ui;
       resetProgressState();
     }
   });
 
-  // --- tool_result: progress cleanup (no auto-mark) ---
+  // --- tool_result: force-stop after propose_hypotheses in web mode ---
+  // In TUI mode, propose_hypotheses blocks via ctx.ui.select() so the model can't continue.
+  // In web mode, it returns immediately — the model sees the result and may keep generating
+  // text (tool calls are blocked, but text isn't). Abort the turn to prevent premature conclusions.
+
+  api.on("tool_result", (event, ctx) => {
+    if (event.toolName === "propose_hypotheses" && dpStatus === "awaiting_confirmation" && !ctx.hasUI) {
+      console.log("[dp-extension] Aborting turn after propose_hypotheses (web mode — force wait for user)");
+      ctx.abort();
+    }
+  });
+
+  // --- tool_result: system event → concluding + progress cleanup ---
 
   api.on("tool_result", (event, ctx) => {
     if (event.toolName === "deep_search") {
@@ -626,33 +867,31 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
       activeUI = null;
       resetProgressState();
 
-      // Flag that deep_search ran; capture investigationId if available
+      // System event: deep_search tool_result → concluding
+      // Model still needs to present its conclusion before we go to completed.
+      if (dpStatus === "validating") {
+        setDpStatus("concluding");
+        persistState();
+        updateStatus(ctx);
+      }
+
+      // Flag that deep_search ran; capture investigationId for feedback
       deepSearchRan = true;
       const details = event.details as Record<string, unknown> | undefined;
       pendingFeedbackId = (details?.investigationId as string) ?? null;
-
-      // Defer DP exit to agent_end so the agent can present its conclusion first.
-      // disableDpMode triggers showFeedbackIfNeeded — firing it here would flash
-      // the feedback prompt before the conclusion message appears.
-      if (checklist) {
-        pendingDpExit = true;
-      } else {
-        // Standalone deep_search (no DP mode): show feedback immediately since
-        // disableDpMode() won't fire.
-        showFeedbackIfNeeded(ctx);
-      }
     }
   });
 
   // Clean up feedback hint when agent starts processing next message
   api.on("agent_start", () => {
     feedbackCleanup?.();
+    dpHadToolCalls = false;
   });
 
   // --- context: filter UI-only custom messages ---
 
   // Custom types that are UI-only metadata — must never be sent to the LLM.
-  const DP_FILTER_TYPES = new Set(["dp-checklist-sync"]);
+  const DP_FILTER_TYPES = new Set(["dp-mode"]);
 
   api.on("context", async (event) => {
     return {

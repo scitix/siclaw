@@ -1,44 +1,41 @@
 ---
 title: "Deep Investigation"
 sidebarTitle: "Deep Investigation"
-description: "How Siclaw's 4-phase hypothesis-driven investigation engine works."
+description: "How Siclaw's interactive investigation workflow works — triage, hypothesize, confirm, validate."
 ---
 
 ## Overview
 
-Deep Investigation is Siclaw's core diagnostic engine. Instead of running a fixed playbook, it follows a structured investigation process: gather evidence, form hypotheses, test them independently, and synthesize a conclusion.
+Deep Investigation is Siclaw's diagnostic engine for complex issues. It combines **interactive investigation** (you and the agent collaborate on triage and hypothesis formation) with **automated validation** (parallel sub-agents test hypotheses independently).
 
-## The 4-Phase Pipeline
+Deep Investigation is activated **only by explicit user action** — it does not run automatically.
 
-### Phase 1: Context Gathering
+## Workflow
 
-A sub-agent with tool access collects the current state of the environment:
+### Interactive Planning Loop
 
-- Pod status, events, and logs
-- Node conditions and resource utilization
-- Recent deployments and config changes
-- Relevant metrics from Prometheus/monitoring
+When you activate Deep Investigation, the agent enters an interactive triage cycle:
 
-### Phase 2: Hypothesis Generation
+1. **Triage**: The agent runs targeted commands to understand the environment and confirm the problem.
+2. **Propose Hypotheses**: The agent presents 3-5 ranked hypotheses for your review.
+3. **Your Decision**:
+   - **Confirm** → proceeds to parallel validation
+   - **Adjust** → provide feedback, agent re-investigates and proposes again
+   - **Skip** → agent presents a conclusion based on current findings
 
-A single LLM call analyzes the context and generates 3-5 ranked hypotheses:
+This loop can repeat as many times as needed. Each round improves hypothesis quality with your domain knowledge.
 
-```
-H1  OOMKilled — memory limit too low          confidence: 78%
-H2  Config mount failure — missing key         confidence: 45%
-H3  Liveness probe mismatch                    confidence: 32%
-```
+### Parallel Validation
 
-If [Investigation Memory](/features/memory) has data, past investigations with similar patterns are injected here to improve hypothesis quality.
+After you confirm hypotheses, the deep_search engine validates them:
 
-### Phase 3: Parallel Validation
-
-Up to 3 sub-agents run simultaneously, each validating one hypothesis:
-
+- Up to 3 sub-agents run simultaneously, each validating one hypothesis
 - Sub-agents don't share information — this prevents confirmation bias
 - Each agent produces a verdict: `validated`, `invalidated`, or `inconclusive`
 
-### Phase 4: Conclusion
+If [Investigation Memory](/features/memory) has data, past investigations with similar patterns are injected to improve validation.
+
+### Conclusion
 
 All evidence is synthesized into a structured report containing:
 
@@ -50,14 +47,22 @@ All evidence is synthesized into a structured report containing:
 
 ## Triggering Deep Investigation
 
-### Automatic (via triage)
+### Web UI
 
-The main agent decides when a deeper investigation is needed and expands into the full workflow automatically.
+Click the magnifying glass toggle next to the message input.
 
-### Manual
+### Terminal (TUI)
 
 ```
-> /deep "Intermittent 5xx errors on API gateway every 30 minutes"
+> /dp "Intermittent 5xx errors on API gateway every 30 minutes"
+```
+
+Or press `Ctrl+I` to toggle DP mode, then type your question.
+
+### CLI Flag
+
+```bash
+siclaw --dp
 ```
 
 ### Via Alert Webhook

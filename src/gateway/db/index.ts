@@ -80,7 +80,13 @@ export async function createDb(): Promise<Database> {
     console.log(`[db] Connected to SQLite (sql.js): ${sqlitePath}`);
   } else {
     setDialect("mysql");
-    const pool = mysql.createPool({ uri: dbUrl, timezone: "+00:00" });
+    const pool = mysql.createPool({
+      uri: dbUrl,
+      timezone: "+00:00",
+      waitForConnections: true,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 30_000,
+    });
     // Force MySQL session timezone to UTC so timestamp comparisons match
     // the client-side serialization (timezone: '+00:00' above).
     pool.on("connection", (conn) => {
