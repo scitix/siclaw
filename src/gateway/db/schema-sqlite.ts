@@ -431,6 +431,7 @@ export const knowledgeDocs = sqliteTable("knowledge_docs", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   filePath: text("file_path").notNull(),
+  content: text("content"),
   sizeBytes: integer("size_bytes").notNull().default(0),
   chunkCount: integer("chunk_count").notNull().default(0),
   uploadedBy: text("uploaded_by").references(() => users.id, { onDelete: "set null" }),

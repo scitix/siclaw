@@ -1833,6 +1833,7 @@ export function createRpcMethods(
         id: docId,
         name,
         filePath,
+        content,
         sizeBytes,
         uploadedBy: context.auth?.userId,
       });
