@@ -805,7 +805,8 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           }
 
           // 4. Send prompt with credentials and model config
-          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig });
+          const systemPromptTemplate = workspace?.configJson?.systemPrompt || undefined;
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig, systemPromptTemplate });
           sessionId = promptResult.sessionId;
 
           // 4. Wait for completion with cancellable timeout
