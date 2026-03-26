@@ -216,7 +216,7 @@ The agentbox user then uses `sudo` (with its SUID bit) to run child processes as
 
 ### 3.6 Code Changes
 
-In `src/tools/restricted-bash.ts`, the `exec()` call wraps commands with `sudo` in production:
+In `src/tools/shell/restricted-bash.ts`, the `exec()` call wraps commands with `sudo` in production:
 
 ```typescript
 // In production (K8s pods), run child processes as sandbox user.
@@ -238,7 +238,7 @@ file itself is only readable by `kubecred` group members.
 
 ### 4.1 The 6-Pass Validation Pipeline
 
-Every command passes through `validateCommand()` in `src/tools/command-validator.ts`:
+Every command passes through `validateCommand()` in `src/tools/infra/command-validator.ts`:
 
 ```
 Pass 1 — Shell Operators      Block: $(), backticks, <(), >(), file redirections, newlines
@@ -264,7 +264,7 @@ The `local` context is the most restrictive: only text-processing commands (grep
 etc.), flow control (echo, printf), and kubectl. File-reading commands (cat, ls, find) are
 blocked — agents use dedicated file tools instead.
 
-**Source**: `src/tools/command-sets.ts` — `CONTEXT_CATEGORIES`, `COMMAND_CATEGORIES`
+**Source**: `src/tools/infra/command-sets.ts` — `CONTEXT_CATEGORIES`, `COMMAND_CATEGORIES`
 
 ### 4.3 COMMAND_RULES Declarative Engine
 
@@ -295,7 +295,7 @@ grep: { command: "grep", contexts: ["local"], pipeOnly: true, noFilePaths: true,
 This prevents `kubectl get pods | grep -rl "" /app/.siclaw` from reading credential files
 even though `grep` appears after a pipe.
 
-**Source**: `src/tools/command-sets.ts` — `COMMAND_RULES`
+**Source**: `src/tools/infra/command-sets.ts` — `COMMAND_RULES`
 
 ### 4.4 Explicitly Excluded Binaries
 
@@ -433,7 +433,7 @@ Both layers are needed:
 
 ## 7. Layer 5: Environment Sanitization
 
-`sanitizeEnv()` in `src/tools/sanitize-env.ts` strips sensitive variables before
+`sanitizeEnv()` in `src/tools/infra/sanitize-env.ts` strips sensitive variables before
 spawning child processes:
 
 ```
@@ -448,7 +448,7 @@ Stripped patterns:
 `cat /proc/self/environ` in a child process could leak API keys if they were inherited.
 `sanitizeEnv()` prevents this.
 
-**Source**: `src/tools/sanitize-env.ts`
+**Source**: `src/tools/infra/sanitize-env.ts`
 
 ---
 
@@ -474,7 +474,7 @@ passes through the binary allowlist. Only commands in `ALLOWED_COMMANDS` can be 
 `kubectl config view --raw` is explicitly blocked — it outputs kubeconfig with embedded
 certificates and tokens in plaintext.
 
-**Source**: `src/tools/kubectl.ts` — `SAFE_SUBCOMMANDS`, `validateExecCommand()`
+**Source**: `src/tools/infra/command-sets.ts` — `SAFE_SUBCOMMANDS`, `validateExecCommand()`
 
 ---
 
