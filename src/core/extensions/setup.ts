@@ -21,7 +21,7 @@ import {
   removeCredential,
   probeKubeconfig,
   type CredentialType,
-} from "../../tools/credential-manager.js";
+} from "../../tools/infra/credential-manager.js";
 import {
   getConfigPath,
   loadConfig,

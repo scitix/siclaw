@@ -18,7 +18,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { llmCompleteWithTool } from "../tools/deep-search/sub-agent.js";
+import { llmCompleteWithTool } from "../tools/workflow/deep-search/sub-agent.js";
 
 export interface TopicEntry {
   topic: string;
