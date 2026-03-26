@@ -1157,6 +1157,97 @@ export function validateCommandRestrictions(
   return null;
 }
 
+// ── kubectl subcommand validation ────────────────────────────────
+//
+// Moved from kubectl.ts (which held createKubectlTool — dead code,
+// never registered in agent-factory). These functions are consumed
+// by restricted-bash.ts for pipeline-level kubectl validation.
+
+export const SAFE_SUBCOMMANDS = new Set([
+  "get",
+  "describe",
+  "logs",
+  "top",
+  "events",
+  "api-resources",
+  "api-versions",
+  "cluster-info",
+  "config",
+  "version",
+  "explain",
+  "auth",
+  "exec",
+]);
+
+/** Subcommands where -A/--all-namespaces without selectors is blocked. */
+const ALL_NS_RESTRICTED = new Set(["get", "describe", "events", "top"]);
+
+/**
+ * Detect if a kubectl command uses -A/--all-namespaces without any selector
+ * (-l, --selector, --field-selector) on a restricted subcommand.
+ * Pure boolean check — callers decide how to respond.
+ */
+export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
+  if (!ALL_NS_RESTRICTED.has(subcommand)) return false;
+
+  const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
+  if (!hasAllNs) return false;
+
+  const hasSelector = args.some(a =>
+    a === "-l" ||
+    a === "--selector" || a.startsWith("--selector=") ||
+    a === "--field-selector" || a.startsWith("--field-selector="),
+  );
+  return !hasSelector;
+}
+
+/**
+ * Validate the command after `--` in `kubectl exec`.
+ * Returns an error message if blocked, or null if allowed.
+ */
+export function validateExecCommand(args: string[]): string | null {
+  const dashDashIndex = args.indexOf("--");
+  if (dashDashIndex === -1 || dashDashIndex === args.length - 1) {
+    return JSON.stringify({
+      error: 'kubectl exec requires "--" followed by a command.',
+      example: 'exec my-pod -- ip addr show',
+    }, null, 2);
+  }
+
+  // The executable is the first arg after --
+  const execBinary = args[dashDashIndex + 1];
+  // Extract basename (handle /usr/bin/ping -> ping)
+  const baseName = execBinary.split("/").pop()?.toLowerCase() ?? "";
+
+  if (!ALLOWED_COMMANDS.has(baseName)) {
+    return JSON.stringify({
+      error: `Command "${baseName}" is not in the allowed exec command list.`,
+      allowed_categories: {
+        network: "ip, ifconfig, ping, traceroute, ss, netstat, ethtool, ...",
+        rdma: "ibstat, ibv_devinfo, rdma, show_gids, ...",
+        perftest: "ib_write_bw, ib_read_bw, ib_send_bw, ib_write_lat, ib_read_lat, ib_send_lat, ...",
+        gpu: "nvidia-smi, gpustat, nvtopo",
+        system: "cat, ls, ps, top, df, free, dmesg, lspci, ...",
+      },
+    }, null, 2);
+  }
+
+  // Apply command-level restrictions (find -exec, sysctl -w, curl -o, etc.)
+  const execCmd = args.slice(dashDashIndex + 1).join(" ");
+  const restrictionErr = validateCommandRestrictions(execCmd);
+  if (restrictionErr) return restrictionErr;
+
+  // Check sensitive path patterns (validateExecCommand does not go through
+  // Pass 6 of validateCommand, so we check explicitly here)
+  if (CONTAINER_SENSITIVE_PATHS.some((re) => re.test(execCmd))) {
+    return JSON.stringify({
+      error: "Accessing sensitive paths inside containers is not allowed.",
+    }, null, 2);
+  }
+
+  return null;
+}
+
 // ── Container-context sensitive path patterns ────────────────────
 
 /**
