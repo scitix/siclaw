@@ -29,12 +29,128 @@ export interface DpChecklist {
   items: ChecklistItem[];
 }
 
+// --- DP lifecycle status ---
+
+export type DpStatus =
+  | "idle"                    // No investigation active
+  | "investigating"           // Model is triaging / gathering context
+  | "awaiting_confirmation"   // Hypotheses presented, waiting for user decision
+  | "validating"              // User confirmed — deep_search executing Phase 3
+  | "concluding"              // Phase 4 or user skipped validation — model presenting conclusion
+  | "completed";              // Investigation finished
+
+export interface DpHypothesis {
+  id: string;
+  text: string;
+  confidence: number;
+  description?: string;
+}
+
 /**
  * Mutable DP state — shared reference between tools and the session layer.
  * For SDK brain, this lives on ManagedSession so http-server can inspect it.
+ *
+ * This is the explicit state machine for the DP lifecycle.
+ * Status drives checklist rendering, tool gating, and frontend sync.
  */
 export interface DpState {
   checklist: DpChecklist | null;
+  status: DpStatus;
+  /** The investigation question. */
+  question?: string;
+  /** Triage context draft — saved by propose_hypotheses, used by deep_search. */
+  triageContextDraft?: string;
+  /** Hypotheses draft — saved by propose_hypotheses, pending user confirmation. */
+  hypothesesDraft?: DpHypothesis[];
+  /** Confirmed hypotheses — promoted from draft when user approves. Source of truth for deep_search. */
+  confirmedHypotheses?: DpHypothesis[];
+  /** Number of propose_hypotheses rounds completed. */
+  round: number;
+  /** Last user feedback when they requested adjustments. */
+  lastUserFeedback?: string;
+}
+
+/** Create a fresh DpState in idle. */
+export function createDpState(): DpState {
+  return { checklist: null, status: "idle", round: 0 };
+}
+
+/**
+ * Read-only ref for tools that need to inspect DP state without mutating it.
+ * Used by deep_search to gate execution and read confirmed data.
+ */
+export interface DpStateRef {
+  readonly status: DpStatus;
+  readonly triageContextDraft?: string;
+  readonly confirmedHypotheses?: DpHypothesis[];
+  readonly question?: string;
+  readonly round?: number;
+}
+
+/**
+ * Writable version of DpStateRef — held only by the extension (single writer).
+ * Tools and agentbox receive the readonly DpStateRef view of the same object.
+ */
+export interface MutableDpStateRef {
+  status: DpStatus;
+  triageContextDraft?: string;
+  confirmedHypotheses?: DpHypothesis[];
+  question?: string;
+  round?: number;
+}
+
+/**
+ * Unconditionally rebuild checklist item states from dpState.status.
+ * This is a pure state→view derivation: the status enum fully determines
+ * all 4 item states. No forward-only guards — supports regression
+ * (e.g. awaiting_confirmation → investigating when user adjusts).
+ */
+export function syncChecklistFromStatus(state: Pick<DpState, "checklist" | "status">): void {
+  if (!state.checklist) return;
+  const items = state.checklist.items;
+  if (items.length < 4) return;
+  // Map: triage(0), hypotheses(1), deep_search(2), conclusion(3)
+  switch (state.status) {
+    case "idle":
+      items[0].status = "pending";
+      items[1].status = "pending";
+      items[2].status = "pending";
+      items[3].status = "pending";
+      break;
+    case "investigating":
+      items[0].status = "in_progress";
+      items[1].status = "pending";
+      items[2].status = "pending";
+      items[3].status = "pending";
+      break;
+    case "awaiting_confirmation":
+      items[0].status = "done";
+      items[1].status = "in_progress";
+      items[2].status = "pending";
+      items[3].status = "pending";
+      break;
+    case "validating":
+      items[0].status = "done";
+      items[1].status = "done";
+      items[2].status = "in_progress";
+      items[3].status = "pending";
+      break;
+    case "concluding":
+      items[0].status = "done";
+      items[1].status = "done";
+      // deep_search ran → was "in_progress" during validating → mark done
+      // deep_search skipped → was still "pending" → mark skipped
+      items[2].status = (items[2].status === "in_progress" || items[2].status === "done") ? "done" : "skipped";
+      items[3].status = "in_progress";
+      break;
+    case "completed":
+      items[0].status = "done";
+      items[1].status = "done";
+      // Preserve skipped vs done for deep_search (may have been skipped)
+      if (items[2].status !== "skipped") items[2].status = "done";
+      items[3].status = "done";
+      break;
+  }
 }
 
 // --- Shared helpers ---
@@ -86,10 +202,6 @@ try {
   dpWorkflow = raw.replace(/^---[\s\S]*?---\n*/, "").trim();
 } catch { /* SKILL.md not found — workflow injection disabled */ }
 
-export function getDpWorkflow(): string {
-  return dpWorkflow;
-}
-
 export function buildActivationMessage(question: string): string {
   const parts = [`[DEEP_INVESTIGATION] User requested a deep investigation:\n\n${question}`];
   if (dpWorkflow) {
@@ -103,7 +215,10 @@ export function buildActivationMessage(question: string): string {
 
 /**
  * Create the propose_hypotheses tool.
- * Non-blocking: shows hypotheses to user and immediately proceeds to deep_search.
+ *
+ * In DP mode: writes hypothesesDraft + triageContextDraft to dpState,
+ * transitions status to "awaiting_confirmation", and instructs the model
+ * to STOP and wait for the user's decision.
  */
 export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
   return {
@@ -111,9 +226,10 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
     label: "Propose Hypotheses",
     description:
       "Present hypotheses to the user as a structured UI card. " +
-      "Use this to communicate your investigation thinking and align direction before committing to deep_search. " +
-      "Works both inside and outside Deep Investigation mode. " +
-      "Always prefer this tool over plain-text hypotheses — it renders a proper interactive card.",
+      "The card IS your user-facing output — do NOT repeat hypotheses in your text response. " +
+      "You MUST write 2-3 sentences of triage summary BEFORE calling this tool (empty message + card is bad UX).\n" +
+      "In Deep Investigation mode: you MUST wait for the user's response after calling this tool. " +
+      "Do NOT call deep_search until the user explicitly confirms.",
     parameters: Type.Object({
       hypotheses: Type.Array(
         Type.Object({
@@ -122,52 +238,65 @@ export function createProposeHypothesesTool(dpState: DpState): ToolDefinition {
             description:
               "A specific, testable hypothesis statement (one sentence). " +
               "NOT a title, category name, or group heading. " +
-              'Good: "Firewall rules blocking inter-node communication on port 6443". ' +
-              'Bad: "Check cluster demo".',
+              'Good: "Evicted pods exhausted ResourceQuota, blocking new pod creation". ' +
+              'Bad: "Check resource limits".',
           }),
-          confidence: Type.Number({ description: "Prior confidence 0-100" }),
+          confidence: Type.Number({ description: "Prior confidence 0-100 based on evidence strength" }),
           description: Type.Optional(
             Type.String({
               description:
-                "Brief explanation: why this hypothesis is plausible and how to validate it. " +
-                "Include relevant technical context, affected components, and key validation commands.",
+                "1-2 sentence explanation: why this is plausible and how to validate it.",
             })
           ),
         }),
         {
           description:
-            "Each element is one distinct, independent hypothesis. " +
-            "Do NOT include overall titles or summary items — only concrete hypotheses.",
+            "2-4 hypotheses max. Each must be a specific, testable claim — not a category or topic. " +
+            "Quality over quantity: drop low-confidence filler hypotheses.",
         }
+      ),
+      triageContext: Type.Optional(
+        Type.String({
+          description:
+            "Summary of triage findings so far: cluster mode, affected pods/namespaces, " +
+            "key observations, commands run. This is saved and passed to deep_search when user confirms.",
+        })
       ),
     }),
     async execute(_toolCallId, params) {
-      const isDpMode = dpState.checklist !== null;
-      if (!dpState.checklist) {
-        // Outside DP mode — don't create a checklist, just present hypotheses
-      }
+      const isDpMode = dpState.status !== "idle";
 
-      const { hypotheses: rawHypotheses } = params as {
+      const { hypotheses: rawHypotheses, triageContext } = params as {
         hypotheses: Array<{ id: string; text: string; confidence: number; description?: string }>;
+        triageContext?: string;
       };
 
       // Post-validation: filter out non-hypothesis items the model sometimes includes
       const hypotheses = rawHypotheses.filter((h) => {
         const text = h.text.trim();
-        // Markdown table rows / headers
         if (text.startsWith("|")) return false;
-        // Meta-text about the hypotheses themselves (titles, proposal headings)
-        if (/假设提案|(?:revised|proposed|updated)\s*hypothes[ei]s/i.test(text)) return false;
+        if (/(?:hypothesis|hypotheses)\s*(?:proposal|summary|list|overview)|(?:revised|proposed|updated)\s*hypothes[ei]s/i.test(text)) return false;
         return true;
       });
 
+      // Write state in DP mode
+      if (isDpMode) {
+        dpState.hypothesesDraft = hypotheses;
+        if (triageContext) dpState.triageContextDraft = triageContext;
+        dpState.status = "awaiting_confirmation";
+        dpState.round = (dpState.round ?? 0) + 1;
+        syncChecklistFromStatus(dpState);
+      }
+
       const responseText = isDpMode
-        ? "Hypotheses presented. In DP mode — consider waiting for user confirmation before proceeding to deep_search."
+        ? "Hypotheses presented to user. You MUST wait for the user's next message before proceeding. " +
+          "The user will either: (1) confirm to proceed with deep_search, (2) provide feedback to adjust hypotheses, " +
+          "or (3) ask to skip. Do NOT call deep_search until the user explicitly confirms."
         : "Hypotheses presented to user. Decide whether to proceed based on user engagement.";
 
       return {
         content: [{ type: "text" as const, text: responseText }],
-        details: { hypotheses },
+        details: { hypotheses, triageContext },
       };
     },
   };
@@ -192,17 +321,19 @@ export function createEndInvestigationTool(dpState: DpState): ToolDefinition {
       }),
     }),
     async execute(_toolCallId, params) {
-      if (!dpState.checklist) {
+      if (dpState.status === "idle") {
         return { content: [{ type: "text" as const, text: "No investigation in progress." }], details: {} };
       }
       const { reason } = params as { reason: string };
-      for (const item of dpState.checklist.items) {
-        if (item.status === "pending" || item.status === "in_progress") {
-          item.status = "skipped";
-          item.summary = reason;
+      dpState.status = "completed";
+      if (dpState.checklist) {
+        for (const item of dpState.checklist.items) {
+          if (item.status === "pending" || item.status === "in_progress") {
+            item.status = "skipped";
+            item.summary = reason;
+          }
         }
       }
-      dpState.checklist = null;
       return {
         content: [{ type: "text" as const, text: `Investigation ended: ${reason}` }],
         details: {},

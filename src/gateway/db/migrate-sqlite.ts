@@ -361,6 +361,7 @@ const DDL_STATEMENTS = [
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     file_path TEXT NOT NULL,
+    content TEXT,
     size_bytes INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER NOT NULL DEFAULT 0,
     uploaded_by TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -470,6 +471,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE skills ADD COLUMN skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL`,
     // Skill spaces: invite token for share links
     `ALTER TABLE skill_spaces ADD COLUMN invite_token TEXT`,
+    // Knowledge docs: store original content for recovery
+    `ALTER TABLE knowledge_docs ADD COLUMN content TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

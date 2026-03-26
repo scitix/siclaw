@@ -38,6 +38,30 @@ const SAFE_SUBCOMMANDS = new Set([
 export { ALLOWED_COMMANDS as SAFE_EXEC_COMMANDS };
 export { SAFE_SUBCOMMANDS };
 
+// ── Rate-protection helpers ─────────────────────────────────────────
+
+/** Subcommands where -A/--all-namespaces without selectors is blocked. */
+const ALL_NS_RESTRICTED = new Set(["get", "describe", "events", "top"]);
+
+/**
+ * Detect if a kubectl command uses -A/--all-namespaces without any selector
+ * (-l, --selector, --field-selector) on a restricted subcommand.
+ * Pure boolean check — callers decide how to respond.
+ */
+export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
+  if (!ALL_NS_RESTRICTED.has(subcommand)) return false;
+
+  const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
+  if (!hasAllNs) return false;
+
+  const hasSelector = args.some(a =>
+    a === "-l" ||
+    a === "--selector" || a.startsWith("--selector=") ||
+    a === "--field-selector" || a.startsWith("--field-selector="),
+  );
+  return !hasSelector;
+}
+
 interface KubectlParams {
   command: string;
   timeout_seconds?: number;
@@ -134,6 +158,34 @@ Examples:
         };
       }
 
+      // ── Rate protection: logs without --tail ────────────────────────
+      let autoTail = false;
+      if (subcommand === "logs") {
+        const hasTail = args.some(a => a === "--tail" || a.startsWith("--tail="));
+        const hasSince = args.some(a =>
+          a === "--since" || a.startsWith("--since=") ||
+          a === "--since-time" || a.startsWith("--since-time="),
+        );
+        if (!hasTail && !hasSince) {
+          args.push("--tail=1000");
+          autoTail = true;
+        }
+      }
+
+      // ── Rate protection: -A/--all-namespaces without selectors ─────
+      if (hasAllNamespacesWithoutSelector(args, subcommand)) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`,
+              hint: "Use -n <namespace> to target a specific namespace, or add -l <label> / --field-selector <selector> to narrow the query.",
+            }, null, 2),
+          }],
+          details: { blocked: true, subcommand },
+        };
+      }
+
       // Validate exec sub-commands
       if (subcommand === "exec") {
         const execCheck = validateExecCommand(args);
@@ -216,7 +268,7 @@ Examples:
               (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
             return {
               content: [{ type: "text", text: processToolOutput(output) }],
-              details: { exitCode: 0, sanitized: true },
+              details: { exitCode: 0, sanitized: true, ...(autoTail && { autoTail: true }) },
             };
           } catch (err: any) {
             // Sanitize err.stdout too — partial output may contain sensitive data
@@ -245,7 +297,7 @@ Examples:
           (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
-          details: { exitCode: 0 },
+          details: { exitCode: 0, ...(autoTail && { autoTail: true }) },
         };
       } catch (err: any) {
         const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
