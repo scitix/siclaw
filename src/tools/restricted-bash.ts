@@ -251,7 +251,7 @@ This is the primary tool for all kubectl interactions. It runs through a shell, 
 
 Allowed commands: kubectl, grep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column, and other text processing tools.
 kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth, exec.
-Local file access commands (cat, ls, find, stat, env, etc.) are blocked — use the dedicated read/grep/glob tools instead.
+In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
 Examples:
