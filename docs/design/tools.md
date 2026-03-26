@@ -269,3 +269,72 @@ Tools in `PLATFORM_TOOLS` set (`manage_schedule`, `credential_list`,
 `cluster_info`, `save_feedback`, `knowledge_search`) are exempt from workspace
 allow-list filtering — they must always be available regardless of workspace
 configuration.
+
+---
+
+## 8. Roadmap — Planned Refactoring
+
+Remaining work after the Phase 1 directory restructure. Ordered by priority.
+
+### 8.1 Execution Template Extraction (High)
+
+The 3 `k8s-exec/` tools share a 10-step orchestration flow where 6-7 steps are
+identical. The 3 `k8s-script/` tools share the first half of the same flow.
+New contributors must manually replicate these steps — missing any security step
+(command validation, output sanitization) is a silent vulnerability.
+
+**Goal**: Extract a shared execution template so new tools only define variation
+points, not the full pipeline.
+
+- `k8s-exec/` variation points (4): `context`, `validateTarget`, `checkReady`, `buildCommand`
+- `k8s-script/` variation points (4): `validateTarget`, `checkReady`, `buildCommand`, `run`
+- The two types share the front half (kubeconfig → env → name validate → ready check)
+  but diverge in the back half: k8s-exec adds command validation + output sanitization,
+  k8s-script adds script resolution + script transmission.
+
+**Files**: `src/tools/k8s-exec/*.ts`, `src/tools/k8s-script/*.ts`
+
+### 8.2 Security Pipeline Unified Entry (High)
+
+Each execution tool manually assembles: `validateCommand` → `analyzeOutput` →
+execute → `applySanitizer` → `processToolOutput`. A unified facade would:
+- Prevent callers from forgetting a step
+- Decouple tools from infra file structure
+- Serve `restricted-bash` (which doesn't use the template) as well
+
+**Goal**: A small set of functions in `infra/` that encapsulate the full
+pre-exec → post-exec security flow.
+
+**Files**: `src/tools/infra/command-validator.ts`, `src/tools/infra/output-sanitizer.ts`, `src/tools/infra/tool-render.ts`
+
+### 8.3 `debug-pod.ts` Decomposition (Medium)
+
+`src/tools/infra/debug-pod.ts` is 767 lines mixing three concerns:
+- `DebugPodCache` — pod reuse cache with creation lock and idle eviction
+- `runInDebugPod()` — pod creation, command execution, stale-pod detection
+- `DebugPodGC` — background garbage collector for orphaned pods
+
+Does not block tool development (consumers only call `runInDebugPod`), but
+makes the debug pod subsystem itself harder to maintain.
+
+**Goal**: Split into `debug-pod/cache.ts`, `debug-pod/lifecycle.ts`,
+`debug-pod/gc.ts` under `infra/`.
+
+**Files**: `src/tools/infra/debug-pod.ts`
+
+### 8.4 Extract `llmCompleteWithTool` to Shared Location (Medium)
+
+`llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
+utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
+of a specific workflow tool. Two memory module files depend on it:
+- `src/memory/topic-consolidator.ts`
+- `src/memory/knowledge-extractor.ts`
+
+This creates an architectural smell: a foundational module (`memory/`) depends
+on the internals of a higher-level workflow tool.
+
+**Goal**: Move `llmCompleteWithTool` to `src/core/` or `src/shared/`, making
+the dependency direction correct (both `memory/` and `workflow/deep-search/`
+import from `core/`).
+
+**Files**: `src/tools/workflow/deep-search/sub-agent.ts`, `src/memory/topic-consolidator.ts`, `src/memory/knowledge-extractor.ts`
