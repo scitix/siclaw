@@ -89,6 +89,18 @@ export function createMyTool(dep: SomeDependency): ToolDefinition {
 - Mutable refs (`kubeconfigRef`, `llmConfigRef`, `memoryRef`) allow runtime config changes
 - Return format is always `{ content: [{ type: "text", text }], details?: {} }`
 
+**⚠️ Description–Code Consistency Rule:**
+
+The `description` field is **the LLM's only understanding of what a tool does
+and when to use it**. If execution logic changes but the description does not,
+the LLM will operate on a stale mental model — calling the tool at wrong times,
+passing wrong parameters, or misinterpreting results. This produces silent bugs
+that are extremely hard to diagnose.
+
+**Any PR that modifies a tool's `execute()` logic MUST review and update its
+`description` (and parameter descriptions) to stay in sync.** Treat description
+as a contract with the LLM, not a comment for humans.
+
 ---
 
 ## 3. K8s Command Execution Tools (`k8s-exec/`)
