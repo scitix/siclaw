@@ -389,9 +389,20 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
+    // IMPORTANT: append after DP markers, not prepend before them.
+    // Prepending would break marker detection in pi-agent extension input handlers
+    // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
-      promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+      // Find a safe injection point: after DP markers but before the user's actual text
+      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_REINVESTIGATE]\n", "[DP_SKIP]\n"];
+      const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
+      if (matchedMarker) {
+        // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
+        promptText = matchedMarker + `[System: respond in ${detectedLang}]\n` + promptText.slice(matchedMarker.length);
+      } else {
+        promptText = `[System: respond in ${detectedLang}]\n${promptText}`;
+      }
     }
 
     // Programmatically update PROFILE.md Language field (code-level, not model-dependent).
@@ -662,6 +673,49 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
       sendJson(res, 500, { error: "Steer failed" });
     }
+  });
+
+  /**
+   * GET /api/sessions/:sessionId/dp-state - read DP investigation state for recovery
+   *
+   * Returns the current dpStateRef (live mirror of persisted dp-mode entries).
+   * Used by gateway's chat.dpProgress to provide authoritative recovery data.
+   */
+  addRoute("GET", "/api/sessions/:sessionId/dp-state", async (_req, res, params) => {
+    const { sessionId } = params;
+    const managed = sessionManager.get(sessionId);
+
+    if (managed) {
+      // pi-agent brain: read from dpStateRef (updated by extension on every state change)
+      if (managed.dpStateRef) {
+        sendJson(res, 200, {
+          dpStatus: managed.dpStateRef.status,
+          question: managed.dpStateRef.question,
+          round: managed.dpStateRef.round,
+          confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
+        });
+        return;
+      }
+
+      // SDK brain: read from dpState
+      if (managed.dpState) {
+        sendJson(res, 200, {
+          dpStatus: managed.dpState.status,
+          question: managed.dpState.question,
+          round: managed.dpState.round,
+          confirmedHypotheses: managed.dpState.confirmedHypotheses,
+        });
+        return;
+      }
+    }
+
+    const persisted = sessionManager.getPersistedDpState(sessionId);
+    if (persisted) {
+      sendJson(res, 200, persisted);
+      return;
+    }
+
+    sendJson(res, 200, { dpStatus: "idle" });
   });
 
   /**

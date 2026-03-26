@@ -230,7 +230,7 @@ export function SkillSpaceDetailPage() {
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
-                subtitle: 'Global published -> Skill Space staging',
+                subtitle: 'Loading comparison...',
                 diffText: null,
                 isLoading: true,
             });
@@ -238,7 +238,9 @@ export function SkillSpaceDetailPage() {
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
-                subtitle: 'Global published -> Skill Space staging',
+                subtitle: result.baselineLabel && result.compareLabel
+                    ? `${result.baselineLabel} -> ${result.compareLabel}`
+                    : 'Skill Space diff',
                 diffText: result.diff || 'No changes detected.',
                 isLoading: false,
             });
@@ -246,7 +248,7 @@ export function SkillSpaceDetailPage() {
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
-                subtitle: 'Global published -> Skill Space staging',
+                subtitle: 'Skill Space diff',
                 diffText: 'Failed to load diff.',
                 isLoading: false,
             });
@@ -576,11 +578,13 @@ export function SkillSpaceDetailPage() {
                                         </div>
                                         {isMaintainer && (
                                             <div className="flex gap-1 ml-2">
+                                                {(skill.forkedFromId || (skill.publishedVersion && skill.publishedVersion > 0)) && (
                                                 <Tooltip content="Open Diff">
                                                     <button onClick={() => handleViewDiff(skill)} className="p-1 text-gray-300 hover:text-gray-600 rounded">
                                                         <Eye className="w-3.5 h-3.5" />
                                                     </button>
                                                 </Tooltip>
+                                                )}
                                                 <Tooltip content="Delete">
                                                     <button onClick={() => handleDeleteSkill(skill)} className="p-1 text-gray-300 hover:text-red-500 rounded">
                                                         <Trash2 className="w-3.5 h-3.5" />

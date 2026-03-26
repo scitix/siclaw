@@ -3,6 +3,7 @@ import {
   parseArgs,
   createKubectlTool,
   validateExecCommand,
+  hasAllNamespacesWithoutSelector,
   SAFE_SUBCOMMANDS,
   SAFE_EXEC_COMMANDS,
 } from "./kubectl.js";
@@ -349,11 +350,11 @@ describe("createKubectlTool", () => {
       expect((result.details as any).blocked).toBeFalsy();
     });
 
-    // Default table — always allowed
-    it("allows get secret (default table)", async () => {
+    // Default table — allowed with namespace or selector
+    it("allows get secret with namespace (default table)", async () => {
       const result = await tool.execute(
         "test-id",
-        { command: "get secret -A" },
+        { command: "get secret -n default" },
         undefined,
         {} as any,
       );
@@ -404,6 +405,153 @@ describe("createKubectlTool", () => {
       );
       expect(result.content[0].text).not.toContain("sensitive data");
       expect((result.details as any).blocked).toBeFalsy();
+    });
+  });
+
+  describe("rate protection: logs auto-inject --tail", () => {
+    it("blocks logs without --tail (no kubectl available, but should not show 'blocked' for subcommand)", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "logs my-pod" },
+        undefined,
+        {} as any,
+      );
+      // Should not be blocked by subcommand check — it passes through to execution
+      // (which may fail due to no cluster, but that's fine)
+      expect(result.content[0].text).not.toContain("is not allowed in read-only mode");
+    });
+
+    it("does not inject --tail when --tail is already present", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "logs my-pod --tail=500" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("is not allowed");
+      expect((result.details as any).autoTail).toBeFalsy();
+    });
+
+    it("does not inject --tail when --since is present", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "logs my-pod --since=1h" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("is not allowed");
+      expect((result.details as any).autoTail).toBeFalsy();
+    });
+
+    it("does not inject --tail when --since-time is present", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "logs my-pod --since-time=2024-01-01T00:00:00Z" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("is not allowed");
+      expect((result.details as any).autoTail).toBeFalsy();
+    });
+
+    it("does not inject --tail when --tail (space-separated) is present", async () => {
+      const result = await tool.execute(
+        "test-id",
+        { command: "logs my-pod --tail 200" },
+        undefined,
+        {} as any,
+      );
+      expect(result.content[0].text).not.toContain("is not allowed");
+      expect((result.details as any).autoTail).toBeFalsy();
+    });
+  });
+
+  describe("rate protection: -A/--all-namespaces blocking", () => {
+    const blockedCombinations = [
+      "get pods -A",
+      "get pods --all-namespaces",
+      "describe pods -A",
+      "events -A",
+      "events --all-namespaces",
+      "top pods -A",
+      "top pods --all-namespaces",
+    ];
+
+    for (const cmd of blockedCombinations) {
+      it(`blocks: ${cmd}`, async () => {
+        const result = await tool.execute(
+          "test-id",
+          { command: cmd },
+          undefined,
+          {} as any,
+        );
+        expect(result.content[0].text).toContain("overload the API server");
+        expect((result.details as any).blocked).toBe(true);
+      });
+    }
+
+    const allowedCombinations = [
+      { cmd: "get pods -A -l app=web", reason: "has -l selector" },
+      { cmd: "get pods -A --field-selector status.phase=Running", reason: "has --field-selector" },
+      { cmd: "get pods -A --selector=app=web", reason: "has --selector" },
+      { cmd: "get pods -n default", reason: "no -A" },
+      { cmd: "describe pod my-pod -n default", reason: "no -A" },
+      { cmd: "version", reason: "not restricted subcommand" },
+      { cmd: "auth can-i --list -A", reason: "auth not restricted" },
+    ];
+
+    for (const { cmd, reason } of allowedCombinations) {
+      it(`allows: ${cmd} (${reason})`, async () => {
+        const result = await tool.execute(
+          "test-id",
+          { command: cmd },
+          undefined,
+          {} as any,
+        );
+        expect(result.content[0].text).not.toContain("overload the API server");
+      });
+    }
+  });
+
+  describe("hasAllNamespacesWithoutSelector", () => {
+    it("returns true for get -A without selector", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A"], "get")).toBe(true);
+    });
+
+    it("returns true for --all-namespaces", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "--all-namespaces"], "get")).toBe(true);
+    });
+
+    it("returns false when -l is present", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "-l", "app=web"], "get")).toBe(false);
+    });
+
+    it("returns false when --selector= is present", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "--selector=app=web"], "get")).toBe(false);
+    });
+
+    it("returns false when --field-selector= is present", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "--field-selector=status.phase=Running"], "get")).toBe(false);
+    });
+
+    it("returns false for non-restricted subcommands", () => {
+      expect(hasAllNamespacesWithoutSelector(["auth", "can-i", "--list", "-A"], "auth")).toBe(false);
+    });
+
+    it("returns false when no -A", () => {
+      expect(hasAllNamespacesWithoutSelector(["get", "pods", "-n", "default"], "get")).toBe(false);
+    });
+
+    it("applies to describe", () => {
+      expect(hasAllNamespacesWithoutSelector(["describe", "pods", "-A"], "describe")).toBe(true);
+    });
+
+    it("applies to events", () => {
+      expect(hasAllNamespacesWithoutSelector(["events", "-A"], "events")).toBe(true);
+    });
+
+    it("applies to top", () => {
+      expect(hasAllNamespacesWithoutSelector(["top", "pods", "-A"], "top")).toBe(true);
     });
   });
 

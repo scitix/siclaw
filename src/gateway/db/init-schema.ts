@@ -376,6 +376,7 @@ const DDL_STATEMENTS = [
     id VARCHAR(64) PRIMARY KEY,
     name VARCHAR(500) NOT NULL,
     file_path VARCHAR(500) NOT NULL,
+    content MEDIUMTEXT,
     size_bytes INT NOT NULL DEFAULT 0,
     chunk_count INT NOT NULL DEFAULT 0,
     uploaded_by VARCHAR(32),
@@ -507,6 +508,8 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal','global','skillset') NOT NULL DEFAULT 'personal'`,
     `ALTER TABLE skills ADD COLUMN skill_space_id VARCHAR(64) NULL`,
     `ALTER TABLE skills ADD CONSTRAINT fk_skills_skill_space FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE SET NULL`,
+    // Knowledge docs: store original content for recovery
+    `ALTER TABLE knowledge_docs ADD COLUMN content MEDIUMTEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

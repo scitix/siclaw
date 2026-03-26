@@ -73,7 +73,8 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
 
         let fullMessage = '';
 
-        // If deep investigation mode is active, prepend marker
+        // If DP toggle is on, always prepend marker.
+        // Backend extension decides behavior based on dpStatus (idle → activate, else → strip and passthrough).
         if (deepInvestigation) {
             fullMessage += '[Deep Investigation]\n';
         }
