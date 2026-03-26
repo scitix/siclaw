@@ -49,9 +49,9 @@ Allowed commands (ONLY these are permitted):
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo
   general: date, whoami, id, env, printenv, which, echo, printf, sleep
 
-Shell features (pipes, redirects) are NOT supported.
-Some commands have extra restrictions: find blocks -exec/-delete, sysctl blocks -w, mount blocks actual mounting,
-curl blocks -o/-O/-T (file output/upload), env only allows listing (no command execution).
+Shell features (pipes, redirects) are NOT supported — commands are passed as argv, not through a shell.
+The following will be rejected: find with -exec/-delete, sysctl with -w, mount with actual mounting,
+curl with -o/-O/-T (file output/upload), env with command arguments (only listing allowed).
 
 Examples:
 - pod: "my-app-abc", namespace: "production", command: "ip addr show"
@@ -124,7 +124,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command, { context: "pod", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
+      const cmdErr = validateCommand(params.command, { context: "pod", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS, blockPipeline: true });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],

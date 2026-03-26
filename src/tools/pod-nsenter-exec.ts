@@ -50,7 +50,7 @@ Allowed commands (ONLY these are permitted — same whitelist as node_exec):
   kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo
   general: date, whoami, id, env, printenv, which, echo, printf, sleep
 
-Shell features (pipes, redirects) are NOT supported.
+Shell features (pipes, redirects, chaining) are NOT supported — commands are passed as individual arguments, not through a shell.
 
 Examples:
 - pod: "my-app-abc", namespace: "production", command: "ip addr show"
@@ -127,7 +127,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command, { context: "nsenter", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
+      const cmdErr = validateCommand(params.command, { context: "nsenter", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS, blockPipeline: true });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
