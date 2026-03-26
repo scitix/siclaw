@@ -239,7 +239,7 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
     if (name === 'create_skill') {
         return (args.name as string) || '';
     }
-    if (name === 'run_skill') {
+    if (name === 'local_script') {
         const skill = (args.skill as string) || '';
         const script = (args.script as string) || '';
         const skillArgs = (args.args as string) || '';

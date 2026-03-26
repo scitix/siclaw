@@ -182,7 +182,7 @@ For claude-sdk brain: raw server config is passed to the SDK's native MCP suppor
 - **Core behavior** — stay focused, conclusion first, use `bash` for all kubectl, skills-first policy, precise queries, no filler questions
 - **Safety** — read-only by default, warn before destructive operations
 - **Long-term memory** (conditional) — memory directory, search-before-answer rule, writing conventions
-- **Skills reference** (appended dynamically) — lists all available skills with their scripts and which execution tool to use (`run_skill`, `node_script`, or `pod_script`)
+- **Skills reference** (appended dynamically) — lists all available skills with their scripts and which execution tool to use (`local_script`, `node_script`, or `pod_script`)
 - **MEMORY.md** (appended) — user's persistent memory file injected directly into context
 
 ### 3.7 Session Factory
@@ -217,7 +217,7 @@ All tools are TypeBox `ToolDefinition` objects with structured input schemas and
 
 | Tool | File | Description |
 |------|------|-------------|
-| `run_skill` | `run-skill.ts` | Execute a skill script by name. Resolves path via `resolveSkillScript()`. Default timeout 180s |
+| `local_script` | `run-skill.ts` | Execute a skill script by name. Resolves path via `resolveSkillScript()`. Default timeout 180s |
 | `create_skill` | `create-skill.ts` | Create a new skill (web/cli only). Returns structured JSON for UI preview. Scripts require admin approval |
 | `update_skill` | `update-skill.ts` | Update an existing skill (web/cli only). Scripts array is the complete final set — omitted scripts are deleted |
 

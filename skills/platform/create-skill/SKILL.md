@@ -126,7 +126,7 @@ Identify pods terminated due to Out-Of-Memory (OOMKilled) and suggest fixes.
 - "Which pods got OOMKilled recently across all namespaces?"
 ```
 
-### Script-based Skill Example (run_skill)
+### Script-based Skill Example (local_script)
 
 A skill with a helper script. Reference scripts using tool invocation syntax, NOT direct file paths:
 
@@ -140,7 +140,7 @@ description: >-
 # Find Node
 
 ## Tool
-run_skill: skill="find-node", script="find-node.sh", args="<keyword>"
+local_script: skill="find-node", script="find-node.sh", args="<keyword>"
 
 ## Parameters
 
@@ -149,9 +149,9 @@ run_skill: skill="find-node", script="find-node.sh", args="<keyword>"
 | keyword | yes | Search keyword — matches against node name, labels, and IP addresses |
 
 ## Examples
-run_skill: skill="find-node", script="find-node.sh", args="gpu"
-run_skill: skill="find-node", script="find-node.sh", args="192.168.1"
-run_skill: skill="find-node", script="find-node.sh", args="worker-zone-a"
+local_script: skill="find-node", script="find-node.sh", args="gpu"
+local_script: skill="find-node", script="find-node.sh", args="192.168.1"
+local_script: skill="find-node", script="find-node.sh", args="worker-zone-a"
 ```
 
 ### Script-based Skill Example (node_script)
@@ -261,24 +261,24 @@ When a skill includes scripts, choose the correct execution tool based on **wher
 
 | Tool | Runs where | When to use |
 |------|-----------|-------------|
-| `run_skill` | Local (AgentBox) | Scripts that call kubectl from outside the cluster (most common) |
+| `local_script` | Local (AgentBox) | Scripts that call kubectl from outside the cluster (most common) |
 | `node_script` | On a K8s node (host namespaces) | Scripts needing host tools, filesystem, /proc, /sys, devices |
 | `pod_script` | Inside a pod (kubectl exec) | Scripts running diagnostics inside a running pod |
 | `pod_netns_script` | Node + pod's network namespace | Network diagnostics needing host tools + pod's network view |
 
 ### Decision Guide
 
-1. **Does the script just run kubectl commands?** → `run_skill` (default choice)
+1. **Does the script just run kubectl commands?** → `local_script` (default choice)
 2. **Does it need access to a node's filesystem, processes, or hardware?** → `node_script`
 3. **Does it need to run inside a specific pod's container?** → `pod_script`
 4. **Does it need host network tools (tcpdump, ip, ss) scoped to a pod's network?** → `pod_netns_script`
 
 ### Examples for each mode
 
-#### run_skill — local execution (most common)
+#### local_script — local execution (most common)
 ```markdown
 ## Tool
-run_skill: skill="find-node", script="find-node.sh", args="<keyword>"
+local_script: skill="find-node", script="find-node.sh", args="<keyword>"
 ```
 
 #### node_script — execute on a K8s node
