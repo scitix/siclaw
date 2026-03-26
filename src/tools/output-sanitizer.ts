@@ -14,6 +14,8 @@ import {
   detectSensitiveResource,
   getOutputFormat,
   sanitizeJSON,
+  SENSITIVE_ENV_NAME_PATTERNS,
+  SENSITIVE_VALUE_PATTERNS,
   type SensitiveResourceType,
 } from "./kubectl-sanitize.js";
 
@@ -123,5 +125,171 @@ OUTPUT_RULES["kubectl"] = (args) => {
 
   // table / wide / name → safe, no sanitization needed
   // jsonpath / go-template / custom-columns → handled by pre-execution block in kubectl.ts
+  return null;
+};
+
+// ── File-reading command rules ──────────────────────────────────────
+
+const REDACTED = "**REDACTED**";
+
+/**
+ * Redact sensitive content from file-reading command output.
+ * Scans each line for:
+ *   - KEY=VALUE or KEY: VALUE where KEY matches SENSITIVE_ENV_NAME_PATTERNS
+ *   - Values matching SENSITIVE_VALUE_PATTERNS (JWT, PEM, connection strings, etc.)
+ */
+function redactSensitiveContent(output: string): string {
+  const lines = output.split("\n");
+  let redacted = false;
+
+  const result = lines.map((line) => {
+    // Check value patterns first (JWT, PEM, connection string, known prefixes)
+    for (const pattern of SENSITIVE_VALUE_PATTERNS) {
+      if (pattern.test(line)) {
+        redacted = true;
+        return REDACTED;
+      }
+    }
+
+    // Check KEY=VALUE format
+    const eqMatch = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)/);
+    if (eqMatch) {
+      const key = eqMatch[1];
+      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
+        redacted = true;
+        return `${key}=${REDACTED}`;
+      }
+    }
+
+    // Check KEY: VALUE format (YAML-like)
+    const colonMatch = line.match(/^(\s*[A-Za-z_][A-Za-z0-9_.-]*):\s+(.*)/);
+    if (colonMatch) {
+      const key = colonMatch[1].trim();
+      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
+        redacted = true;
+        return `${colonMatch[1]}: ${REDACTED}`;
+      }
+    }
+
+    return line;
+  });
+
+  const sanitized = result.join("\n");
+  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+}
+
+/** Rule for file-reading commands: always sanitize output */
+const fileReadingRule: OutputRuleFn = (_args) => ({
+  type: "sanitize",
+  sanitize: redactSensitiveContent,
+});
+
+for (const cmd of [
+  "cat", "head", "tail", "less", "more",
+  "grep", "egrep", "fgrep", "strings",
+  "zcat", "zgrep",
+]) {
+  OUTPUT_RULES[cmd] = fileReadingRule;
+}
+
+// ── env/printenv rules ──────────────────────────────────────────────
+
+/**
+ * Redact sensitive values from env/printenv output (KEY=VALUE per line).
+ * Matches key names against SENSITIVE_ENV_NAME_PATTERNS.
+ */
+function redactEnvOutput(output: string): string {
+  const lines = output.split("\n");
+  let redacted = false;
+
+  const result = lines.map((line) => {
+    const eqIdx = line.indexOf("=");
+    if (eqIdx <= 0) return line;
+
+    const key = line.slice(0, eqIdx);
+    if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
+      redacted = true;
+      return `${key}=${REDACTED}`;
+    }
+
+    // Also check value patterns (JWT, PEM, etc.)
+    const value = line.slice(eqIdx + 1);
+    if (SENSITIVE_VALUE_PATTERNS.some((p) => p.test(value))) {
+      redacted = true;
+      return `${key}=${REDACTED}`;
+    }
+
+    return line;
+  });
+
+  const sanitized = result.join("\n");
+  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+}
+
+OUTPUT_RULES["env"] = (_args) => ({
+  type: "sanitize",
+  sanitize: redactEnvOutput,
+});
+
+OUTPUT_RULES["printenv"] = (_args) => ({
+  type: "sanitize",
+  sanitize: redactEnvOutput,
+});
+
+// ── crictl inspect rules ────────────────────────────────────────────
+
+/**
+ * Sanitize crictl inspect JSON output by redacting sensitive env vars.
+ * Targets .info.config.envs (containerd) — an array of {key, value} objects.
+ * On JSON parse failure, suppresses raw output (same behavior as sanitizeJSON).
+ */
+function sanitizeCrictlInspect(output: string): string {
+  let obj: any;
+  try {
+    obj = JSON.parse(output);
+  } catch {
+    return JSON.stringify({
+      error: "Failed to parse crictl inspect JSON output for sanitization. Raw output suppressed to prevent potential data leak.",
+    }, null, 2);
+  }
+
+  let redacted = false;
+
+  // containerd: .info.config.envs is an array of "KEY=VALUE" strings
+  const envs = obj?.info?.config?.envs;
+  if (Array.isArray(envs)) {
+    for (let i = 0; i < envs.length; i++) {
+      if (typeof envs[i] !== "string") continue;
+      const eqIdx = envs[i].indexOf("=");
+      if (eqIdx <= 0) continue;
+      const key = envs[i].slice(0, eqIdx);
+      if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(key))) {
+        envs[i] = `${key}=${REDACTED}`;
+        redacted = true;
+      }
+    }
+  }
+
+  // Also check .info.config.envs as array of {key, value} objects (CRI-O style)
+  if (Array.isArray(envs)) {
+    for (const env of envs) {
+      if (env && typeof env === "object" && typeof env.key === "string" && typeof env.value === "string") {
+        if (SENSITIVE_ENV_NAME_PATTERNS.some((p) => p.test(env.key))) {
+          env.value = REDACTED;
+          redacted = true;
+        }
+      }
+    }
+  }
+
+  const sanitized = JSON.stringify(obj, null, 2);
+  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+}
+
+OUTPUT_RULES["crictl"] = (args) => {
+  const sub = args.find((a) => !a.startsWith("-"));
+  if (sub === "inspect" || sub === "inspecti" || sub === "inspectp") {
+    return { type: "sanitize", sanitize: sanitizeCrictlInspect };
+  }
   return null;
 };

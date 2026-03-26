@@ -5,8 +5,9 @@ import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../core/agent-factory.js";
 import { renderTextResult, processToolOutput } from "./tool-render.js";
+import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 import { checkPodRunning } from "./k8s-checks.js";
-import { parseArgs } from "./command-sets.js";
+import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
 import { validateCommand } from "./command-validator.js";
 import { validatePodName, prepareExecEnv } from "./exec-utils.js";
 import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
@@ -123,7 +124,7 @@ Examples:
       }
 
       // Validate command
-      const cmdErr = validateCommand(params.command, { context: "pod" });
+      const cmdErr = validateCommand(params.command, { context: "pod", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
       if (cmdErr) {
         return {
           content: [{ type: "text", text: cmdErr }],
@@ -145,12 +146,18 @@ Examples:
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const cmdArgs = parseArgs(params.command);
 
-      // Build kubectl exec args
+      // Post-execution output sanitization
+      // Convention: binary is separate, args does NOT include binary itself
+      const binary = cmdArgs[0]?.split("/").pop() ?? "";
+      const action = analyzeOutput(binary, cmdArgs.slice(1));
+
+      // Build kubectl exec args (use rewritten args if action requires it)
+      const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
       const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }
-      kubectlArgs.push("--", ...cmdArgs);
+      kubectlArgs.push("--", ...execArgs);
 
       try {
         const { stdout, stderr } = await execFileAsync(
@@ -159,16 +166,18 @@ Examples:
           { timeout, env: env.childEnv },
         );
 
-        const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+        const sanitized = applySanitizer(stdout.trim(), action);
+        const output = sanitized + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const stdout = (err.stdout?.trim() ?? "") as string;
+        const sanitizedStdout = applySanitizer(stdout, action);
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
-        const output = `Exit code: ${exitCode}\n${stdout}${stderr ? `\n${stderr}` : ""}`;
+        const output = `Exit code: ${exitCode}\n${sanitizedStdout}${stderr ? `\n${stderr}` : ""}`;
         return {
           content: [{ type: "text", text: processToolOutput(output) }],
           details: { exitCode, error: true },
