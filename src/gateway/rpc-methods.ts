@@ -2790,10 +2790,16 @@ export function createRpcMethods(
 
       // Save content
       if (skillContentRepo) {
-        await skillContentRepo.save(id, "working", {
+        const forkedFiles = {
           specs: effectiveSpecs,
           scripts: effectiveScripts,
-        });
+        };
+        await skillContentRepo.save(id, "working", forkedFiles);
+        // Persist the fork source as the initial baseline so later diffs show
+        // what changed inside the Skill Space after the fork.
+        await skillContentRepo.save(id, "published", forkedFiles);
+        await skillRepo.update(id, { publishedVersion: inheritVersion });
+        console.log(`[skill.fork] Initialized Skill Space baseline for ${id} from ${sourceId}`);
       }
 
       // Notify all members to reload
@@ -2852,10 +2858,16 @@ export function createRpcMethods(
 
     // ── 6. Save content ──
     if (skillContentRepo) {
-      await skillContentRepo.save(id, "working", {
+      const forkedFiles = {
         specs: effectiveSpecs,
         scripts: effectiveScripts,
-      });
+      };
+      await skillContentRepo.save(id, "working", forkedFiles);
+      // Persist the fork source as the initial baseline so later diffs show
+      // what changed after the fork (same pattern as skillset forks).
+      await skillContentRepo.save(id, "published", forkedFiles);
+      await skillRepo.update(id, { publishedVersion: inheritVersion });
+      console.log(`[skill.fork] Initialized personal baseline for ${id} from ${sourceId}`);
     }
 
     const hasScripts = effectiveScripts && effectiveScripts.length > 0;
@@ -3152,6 +3164,7 @@ export function createRpcMethods(
       oldPrefix: string,
       newPrefix: string,
     ): string {
+      if (!oldFiles && !newFiles) return "Baseline not found — cannot compute diff.";
       const parts: string[] = [];
 
       // SKILL.md diff
@@ -3187,34 +3200,116 @@ export function createRpcMethods(
     }
 
     if (meta.scope === "skillset") {
-      let globalFiles: SkillFiles | null = null;
+      let baselineFiles: SkillFiles | null = null;
+      let baselineLabel = "Skill Space baseline";
+      let baselinePrefix = "skill-space-baseline";
       if (skillContentRepo) {
-        const globalSkill = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
-        if (globalSkill) {
-          globalFiles = await skillContentRepo.read(globalSkill.id, "published");
-        }
+        baselineFiles = await skillContentRepo.read(skillId, "published");
       }
 
-      if (!globalFiles && meta.forkedFromId) {
+      if (!baselineFiles && meta.forkedFromId) {
+        console.warn(`[skill.diff] Missing Skill Space baseline for ${skillId}; falling back to fork source ${meta.forkedFromId}`);
         if (meta.forkedFromId.startsWith("builtin:") || meta.forkedFromId.startsWith("core:") || meta.forkedFromId.startsWith("extension:")) {
-          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":")[1] : meta.forkedFromId;
-          globalFiles = skillWriter.readSkill("builtin", dirName);
+          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":").slice(1).join(":") : meta.forkedFromId;
+          if (dirName.includes("..")) {
+            console.error(`[skill.diff] Refusing path-traversal dirName: ${dirName}`);
+          } else {
+            baselineFiles = skillWriter.readSkill("builtin", dirName);
+          }
+          baselineLabel = "Builtin source";
+          baselinePrefix = "builtin-source";
         } else if (skillContentRepo) {
           const sourceMeta = await skillRepo.getById(meta.forkedFromId);
           if (sourceMeta) {
             const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
-            globalFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            if (sourceMeta.scope === "team") {
+              baselineLabel = "Global published";
+              baselinePrefix = "global-published";
+            } else if (sourceMeta.scope === "skillset") {
+              baselineLabel = "Skill Space source";
+              baselinePrefix = "skill-space-source";
+            } else {
+              baselineLabel = "Fork source";
+              baselinePrefix = "fork-source";
+            }
           }
         }
       }
 
       let stagingFiles: SkillFiles | null = null;
       if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
-      if (!stagingFiles && skillContentRepo) {
-        stagingFiles = await skillContentRepo.read(skillId, "working");
+      let compareFiles = stagingFiles;
+      let compareLabel = "Skill Space staging";
+      let comparePrefix = "skill-space-staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Skill Space draft";
+        comparePrefix = "skill-space-draft";
       }
 
-      return { diff: buildFullDiff(globalFiles, stagingFiles, "global", "skill-space") };
+      return {
+        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        baselineLabel,
+        compareLabel,
+      };
+    }
+
+    // Personal fork diff: fork baseline vs current working/staging
+    if (meta.scope === "personal" && meta.forkedFromId && !teamDiff) {
+      let baselineFiles: SkillFiles | null = null;
+      let baselineLabel = "Fork baseline";
+      let baselinePrefix = "fork-baseline";
+      if (skillContentRepo) {
+        baselineFiles = await skillContentRepo.read(skillId, "published");
+      }
+
+      if (!baselineFiles) {
+        console.warn(`[skill.diff] Missing personal fork baseline for ${skillId}; falling back to fork source ${meta.forkedFromId}`);
+        if (meta.forkedFromId.startsWith("builtin:") || meta.forkedFromId.startsWith("core:") || meta.forkedFromId.startsWith("extension:")) {
+          const dirName = meta.forkedFromId.includes(":") ? meta.forkedFromId.split(":").slice(1).join(":") : meta.forkedFromId;
+          if (dirName.includes("..")) {
+            console.error(`[skill.diff] Refusing path-traversal dirName: ${dirName}`);
+          } else {
+            baselineFiles = skillWriter.readSkill("builtin", dirName);
+          }
+          baselineLabel = "Builtin source";
+          baselinePrefix = "builtin-source";
+        } else if (skillContentRepo) {
+          const sourceMeta = await skillRepo.getById(meta.forkedFromId);
+          if (sourceMeta) {
+            const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
+            baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
+            if (sourceMeta.scope === "team") {
+              baselineLabel = "Global published";
+              baselinePrefix = "global-published";
+            } else if (sourceMeta.scope === "skillset") {
+              baselineLabel = "Skill Space source";
+              baselinePrefix = "skill-space-source";
+            } else {
+              baselineLabel = "Fork source";
+              baselinePrefix = "fork-source";
+            }
+          }
+        }
+      }
+
+      let stagingFiles: SkillFiles | null = null;
+      if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
+      let compareFiles = stagingFiles;
+      let compareLabel = "Personal staging";
+      let comparePrefix = "personal-staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Personal draft";
+        comparePrefix = "personal-draft";
+      }
+
+      return {
+        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        baselineLabel,
+        compareLabel,
+      };
     }
 
     if (teamDiff) {
@@ -3229,7 +3324,11 @@ export function createRpcMethods(
       let publishedFiles: SkillFiles | null = null;
       if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
 
-      return { diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed") };
+      return {
+        diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed"),
+        baselineLabel: "Global published",
+        compareLabel: "Contributed",
+      };
     } else {
       // Publish review: published vs staging
       let publishedFiles: SkillFiles | null = null;
@@ -3240,8 +3339,18 @@ export function createRpcMethods(
 
       // If no staging, fall back to working copy
       let compareFiles = stagingFiles;
-      if (!compareFiles && skillContentRepo) compareFiles = await skillContentRepo.read(skillId, "working");
-      return { diff: buildFullDiff(publishedFiles, compareFiles, "published", "staging") };
+      let compareLabel = "Staging";
+      let comparePrefix = "staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Draft";
+        comparePrefix = "draft";
+      }
+      return {
+        diff: buildFullDiff(publishedFiles, compareFiles, "published", comparePrefix),
+        baselineLabel: "Published",
+        compareLabel,
+      };
     }
   });
 
