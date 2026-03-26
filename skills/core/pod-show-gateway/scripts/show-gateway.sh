@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Show gateway for a network interface in a pod's network namespace.
-# Runs via pod_netns_script tool (nsenter -n into pod's netns).
-# Network namespace = pod's; mount namespace = host's (host tools available).
+# Runs via node_script with netns param (ip netns exec into pod's netns).
+# Network namespace = pod's; host tools available.
 
 DEVICE=""
 JSON_OUTPUT=false

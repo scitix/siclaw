@@ -3,17 +3,23 @@ name: pod-ping-gateway
 description: >-
   Ping a pod's gateway for a given network interface.
   Auto-detects gateway IP from the routing table, then pings it.
-  Execute via pod_netns_script tool.
+  First resolve_pod_netns, then node_script with netns param.
 ---
 
 # Pod Ping Gateway
 
 ## Tool
 
-Use the `pod_netns_script` tool to run this skill:
+This skill runs in the pod's network namespace using host tools. Two steps required:
 
+1. Resolve the pod's network namespace:
 ```
-pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="<args>"
+resolve_pod_netns: pod="<pod>", namespace="<ns>"
+```
+
+2. Run the script with the returned node and netns:
+```
+node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="<args>"
 ```
 
 ## Parameters
@@ -30,15 +36,18 @@ pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", scrip
 ## Examples
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
+resolve_pod_netns: pod="rdma-pod", namespace="rdma-test"
+→ node="worker-1", netns="abc123"
+
+node_script: node="worker-1", netns="abc123", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
 ```
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1 --source-ip"
+node_script: node="worker-1", netns="abc123", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1 --source-ip"
 ```
 
 ```
-pod_netns_script: pod="rdma-pod", namespace="rdma-test", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1 --source-dev"
+node_script: node="worker-1", netns="abc123", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1 --source-dev"
 ```
 
 Node version: see `node-ping-gateway`.

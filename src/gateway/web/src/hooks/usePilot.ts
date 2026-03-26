@@ -212,13 +212,6 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
         const cmdPart = sArgs ? `${scriptPart} ${sArgs}` : scriptPart;
         return target && cmdPart ? `${target} $ ${cmdPart}` : target || cmdPart;
     }
-    if (name === 'pod_nsenter_exec') {
-        const pod = (args.pod as string) || '';
-        const ns = (args.namespace as string) || '';
-        const cmd = (args.command as string) || '';
-        const target = ns ? `${pod} -n ${ns}` : pod;
-        return target && cmd ? `${target} $ ${cmd}` : target || cmd;
-    }
     if (name === 'read' || name === 'readfile') {
         return (args.file_path as string) || (args.path as string) || '';
     }
@@ -239,7 +232,7 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
     if (name === 'create_skill') {
         return (args.name as string) || '';
     }
-    if (name === 'run_skill') {
+    if (name === 'local_script') {
         const skill = (args.skill as string) || '';
         const script = (args.script as string) || '';
         const skillArgs = (args.args as string) || '';
