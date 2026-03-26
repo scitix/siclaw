@@ -12,32 +12,22 @@ describe("analyzeOutput", () => {
       expect(action!.type).toBe("sanitize");
     });
 
-    it("returns rewrite for get secret -o yaml", () => {
+    it("returns sanitize for get secret -o yaml (line-level redaction)", () => {
       const action = analyzeOutput("kubectl", ["get", "secret", "my-secret", "-o", "yaml"]);
       expect(action).not.toBeNull();
-      expect(action!.type).toBe("rewrite");
-      if (action!.type === "rewrite") {
-        expect(action!.newArgs).toContain("json");
-        expect(action!.newArgs).not.toContain("yaml");
-      }
+      expect(action!.type).toBe("sanitize");
     });
 
-    it("returns rewrite for get secret -o=yaml", () => {
+    it("returns sanitize for get secret -o=yaml", () => {
       const action = analyzeOutput("kubectl", ["get", "secret", "my-secret", "-o=yaml"]);
       expect(action).not.toBeNull();
-      expect(action!.type).toBe("rewrite");
-      if (action!.type === "rewrite") {
-        expect(action!.newArgs).toContain("-o=json");
-      }
+      expect(action!.type).toBe("sanitize");
     });
 
-    it("returns rewrite for get secret -oyaml", () => {
+    it("returns sanitize for get secret -oyaml", () => {
       const action = analyzeOutput("kubectl", ["get", "secret", "my-secret", "-oyaml"]);
       expect(action).not.toBeNull();
-      expect(action!.type).toBe("rewrite");
-      if (action!.type === "rewrite") {
-        expect(action!.newArgs).toContain("-ojson");
-      }
+      expect(action!.type).toBe("sanitize");
     });
 
     it("returns null for get secret (default table)", () => {
@@ -52,9 +42,11 @@ describe("analyzeOutput", () => {
       expect(analyzeOutput("kubectl", ["get", "secret", "-o", "name"])).toBeNull();
     });
 
-    // jsonpath/go-template → null (handled by pre-execution block in kubectl.ts)
-    it("returns null for get secret -o jsonpath (block handled elsewhere)", () => {
-      expect(analyzeOutput("kubectl", ["get", "secret", "-o", "jsonpath={.data}"])).toBeNull();
+    // jsonpath/go-template → line-level sanitization
+    it("returns sanitize for get secret -o jsonpath", () => {
+      const action = analyzeOutput("kubectl", ["get", "secret", "-o", "jsonpath={.data}"]);
+      expect(action).not.toBeNull();
+      expect(action!.type).toBe("sanitize");
     });
 
     // ConfigMap
@@ -77,10 +69,10 @@ describe("analyzeOutput", () => {
       expect(action!.type).toBe("sanitize");
     });
 
-    it("returns rewrite for get pods -o yaml", () => {
+    it("returns sanitize for get pods -o yaml (line-level redaction)", () => {
       const action = analyzeOutput("kubectl", ["get", "pods", "-A", "-o", "yaml"]);
       expect(action).not.toBeNull();
-      expect(action!.type).toBe("rewrite");
+      expect(action!.type).toBe("sanitize");
     });
 
     // Non-sensitive resources
@@ -92,13 +84,21 @@ describe("analyzeOutput", () => {
       expect(analyzeOutput("kubectl", ["get", "svc", "-o", "yaml"])).toBeNull();
     });
 
-    // describe → null (block handled by kubectl.ts, describe secret is safe)
-    it("returns null for describe secret", () => {
+    // describe: sanitize configmap/pod, null for secret (shows byte counts only)
+    it("returns null for describe secret (safe — shows byte counts)", () => {
       expect(analyzeOutput("kubectl", ["describe", "secret", "my-secret"])).toBeNull();
     });
 
-    it("returns null for describe configmap", () => {
-      expect(analyzeOutput("kubectl", ["describe", "configmap", "my-cm"])).toBeNull();
+    it("returns sanitize for describe configmap", () => {
+      const action = analyzeOutput("kubectl", ["describe", "configmap", "my-cm"]);
+      expect(action).not.toBeNull();
+      expect(action!.type).toBe("sanitize");
+    });
+
+    it("returns sanitize for describe pod", () => {
+      const action = analyzeOutput("kubectl", ["describe", "pod", "my-pod"]);
+      expect(action).not.toBeNull();
+      expect(action!.type).toBe("sanitize");
     });
 
     // Other subcommands
@@ -200,13 +200,12 @@ describe("applySanitizer", () => {
     expect(applySanitizer("my secret data", action)).toBe("my *** data");
   });
 
-  it("applies sanitize function for rewrite action", () => {
+  it("returns original output when sanitize is identity", () => {
     const action: OutputAction = {
-      type: "rewrite",
-      newArgs: ["arg1"],
-      sanitize: (o) => `sanitized: ${o}`,
+      type: "sanitize",
+      sanitize: (o) => o,
     };
-    expect(applySanitizer("output", action)).toBe("sanitized: output");
+    expect(applySanitizer("output", action)).toBe("output");
   });
 });
 
@@ -246,19 +245,15 @@ describe("kubectl sanitize via framework", () => {
     expect(result).toContain("debug");        // log.level preserved
   });
 
-  it("rewrite yaml→json adds conversion note", () => {
+  it("sanitizes Secret YAML output via line-level redaction", () => {
     const action = analyzeOutput("kubectl", ["get", "secret", "my-secret", "-o", "yaml"]);
     expect(action).not.toBeNull();
-    expect(action!.type).toBe("rewrite");
+    expect(action!.type).toBe("sanitize");
 
-    const secretJson = JSON.stringify({
-      kind: "Secret",
-      data: { key: "dmFsdWU=" },
-    });
-
-    const result = applySanitizer(secretJson, action);
-    expect(result).toContain("**REDACTED**");
-    expect(result).toContain("Note: Output converted from YAML to JSON");
+    const yamlOutput = "apiVersion: v1\nkind: Secret\ndata:\n  password: cGFzc3dvcmQ=\n  username: YWRtaW4=";
+    const result = applySanitizer(yamlOutput, action);
+    expect(result).toContain("**REDACTED**"); // password key matches
+    expect(result).toContain("username"); // username key doesn't match sensitive patterns
   });
 });
 
