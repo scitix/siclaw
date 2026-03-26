@@ -23,11 +23,10 @@ import { createRestrictedBashTool } from "../tools/shell/restricted-bash.js";
 import { createNodeExecTool } from "../tools/k8s-exec/node-exec.js";
 import { createNodeScriptTool } from "../tools/k8s-script/node-script.js";
 import { createPodScriptTool } from "../tools/k8s-script/pod-script.js";
-import { createNetnsScriptTool } from "../tools/k8s-script/netns-script.js";
 import { createPodExecTool } from "../tools/k8s-exec/pod-exec.js";
-import { createPodNsenterExecTool } from "../tools/k8s-exec/pod-nsenter-exec.js";
+import { createResolvePodNetnsTool } from "../tools/query/resolve-pod-netns.js";
 import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
-import { createRunSkillTool } from "../tools/shell/run-skill.js";
+import { createLocalScriptTool } from "../tools/shell/local-script.js";
 import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
 import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
 import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
@@ -297,19 +296,18 @@ export async function createSiclawSession(
     // ── K8s command execution (k8s-exec/) ──
     createNodeExecTool(kubeconfigRef, userId),
     createPodExecTool(kubeconfigRef),
-    createPodNsenterExecTool(kubeconfigRef, userId),
     // ── K8s script execution (k8s-script/) ──
     createNodeScriptTool(kubeconfigRef, userId),
     createPodScriptTool(kubeconfigRef),
-    createNetnsScriptTool(kubeconfigRef, userId),
     // ── Local shell (shell/) ──
     createRestrictedBashTool(kubeconfigRef),
-    createRunSkillTool(kubeconfigRef, sessionIdRef),
+    createLocalScriptTool(kubeconfigRef, sessionIdRef),
     // ── Data query (query/) ──
     createInvestigationFeedbackTool(memoryRef),
     createCredentialListTool(kubeconfigRef),
     createClusterInfoTool(kubeconfigRef),
     createKnowledgeSearchTool(opts?.knowledgeIndexer),
+    createResolvePodNetnsTool(kubeconfigRef, userId),
     // ── Workflow (workflow/) ──
     createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
     createSaveFeedbackTool(sessionIdRef),

@@ -89,7 +89,7 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 - **Static analysis**: 23 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 7) in `ScriptEvaluator`
 - **AI analysis**: LLM semantic review with mandatory rule — "Skills MUST be strictly read-only"
 - **Human gate**: `skill_reviewer` role must approve before `published` status
-- Skills with unapproved scripts **cannot** be executed via `run_skill`
+- Skills with unapproved scripts **cannot** be executed via `local_script`
 
 **Source**: `src/gateway/skills/script-evaluator.ts`
 
@@ -101,7 +101,7 @@ draft → (request review) → pending → (AI + static analysis) → approved/r
 - Max output: 10 MB combined stdout+stderr
 - Env injected: `SICLAW_DEBUG_IMAGE`, `KUBECONFIG`, `SICLAW_CREDENTIALS_DIR`
 
-**Source**: `src/tools/shell/run-skill.ts`
+**Source**: `src/tools/shell/local-script.ts`
 
 ---
 
@@ -128,7 +128,7 @@ kubectl setgid → kubecred group membership, reads kubeconfig only
 
 ### 3.2 The 6-Pass Validation Pipeline (Secondary Defense)
 
-Every command through `bash`, `node_exec`, `pod_exec`, or `pod_nsenter_exec` passes all 6 passes:
+Every command through `bash`, `node_exec`, or `pod_exec` passes all 6 passes:
 
 ```
 Pass 1 — Shell Operators      Block: $(), backticks, <(), >(), redirections, newlines
@@ -168,7 +168,7 @@ cluster-info, config, version, explain, auth, exec
 
 ### 3.5 Skill Script Exemption
 
-Skill scripts (`skills/` directory) are **exempt from the binary allowlist** for `run_skill`. The path is verified via `fs.realpathSync()` to block symlink traversal. This is the only way to run otherwise-blocked binaries in a controlled manner — via the skill review gate.
+Skill scripts (`skills/` directory) are **exempt from the binary allowlist** for `local_script`. The path is verified via `fs.realpathSync()` to block symlink traversal. This is the only way to run otherwise-blocked binaries in a controlled manner — via the skill review gate.
 
 ---
 
@@ -299,7 +299,7 @@ Memory search (`memory_search` tool) is only available when an embedding provide
 Sub-agents get a **minimal tool set** — not the full agent tool inventory:
 - `read`, `restricted-bash`, `node_exec` only
 - No memory tools, no skill management, no scheduling
-- Skills pre-loaded from `skills/core/` and `skills/extension/` as text in prompt (not via `run_skill`)
+- Skills pre-loaded from `skills/core/` and `skills/extension/` as text in prompt (not via `local_script`)
 
 ---
 

@@ -164,7 +164,7 @@ The most complex tool. Handles full shell pipelines with:
 - Production mode: `sudo -E -u sandbox` user isolation
 - Skill script detection bypass (`isSkillScript`)
 
-### `run_skill`
+### `local_script`
 
 Executes skill helper scripts locally via `spawn()`. No command validation
 (scripts are from trusted `skills/` directory). Uses `resolveSkillScript()`

@@ -41,7 +41,7 @@ What problem this skill solves and when to use it.
 
 ## Tool
 <execution tool invocation syntax — required for script-based skills>
-<e.g.: run_skill: skill="<name>", script="<script>", args="<args>">
+<e.g.: local_script: skill="<name>", script="<script>", args="<args>">
 
 ## Parameters
 <table of required and optional parameters with descriptions>
@@ -94,17 +94,17 @@ When a skill includes scripts, you MUST choose the correct execution tool based 
 
 | Tool | Runs where | When to use |
 |------|-----------|-------------|
-| \`run_skill\` | Local (AgentBox) | Scripts that call kubectl from outside the cluster (most common) |
+| \`local_script\` | Local (AgentBox) | Scripts that call kubectl from outside the cluster (most common) |
 | \`node_script\` | On a K8s node (host namespaces) | Scripts needing host tools, filesystem, /proc, /sys, devices |
 | \`pod_script\` | Inside a pod (kubectl exec) | Scripts running diagnostics inside a running pod |
-| \`pod_netns_script\` | Node + pod's network namespace | Network diagnostics needing host tools + pod's network view |
+| \`node_script\` + \`netns\` | Node + pod's network namespace | Network diagnostics needing host tools + pod's network view (use \`resolve_pod_netns\` first) |
 
 In the SKILL.md, document the tool in a "## Tool" section. Examples:
 
-### run_skill (local execution, calls kubectl)
+### local_script (local execution, calls kubectl)
 \`\`\`
 ## Tool
-run_skill: skill="find-node", script="find-node.sh", args="<keyword>"
+local_script: skill="find-node", script="find-node.sh", args="<keyword>"
 \`\`\`
 
 ### node_script (execute on node)
@@ -121,11 +121,12 @@ Use the \`pod_script\` tool:
 pod_script: pod="<pod>", namespace="<ns>", skill="pod-diagnose", script="check.sh"
 \`\`\`
 
-### pod_netns_script (pod network namespace + host tools)
+### node_script + netns (pod network namespace + host tools)
 \`\`\`
 ## Tool
-Use the \`pod_netns_script\` tool:
-pod_netns_script: pod="<pod>", namespace="<ns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
+First resolve the pod's network namespace, then run with netns param:
+resolve_pod_netns: pod="<pod>", namespace="<ns>"
+node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="ping-gateway.sh", args="--interface net1"
 \`\`\``,
     parameters: Type.Object({
       name: Type.String({

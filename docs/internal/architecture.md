@@ -182,7 +182,7 @@ For claude-sdk brain: raw server config is passed to the SDK's native MCP suppor
 - **Core behavior** — stay focused, conclusion first, use `bash` for all kubectl, skills-first policy, precise queries, no filler questions
 - **Safety** — read-only by default, warn before destructive operations
 - **Long-term memory** (conditional) — memory directory, search-before-answer rule, writing conventions
-- **Skills reference** (appended dynamically) — lists all available skills with their scripts and which execution tool to use (`run_skill`, `node_script`, or `pod_script`)
+- **Skills reference** (appended dynamically) — lists all available skills with their scripts and which execution tool to use (`local_script`, `node_script`, or `pod_script`)
 - **MEMORY.md** (appended) — user's persistent memory file injected directly into context
 
 ### 3.7 Session Factory
@@ -210,14 +210,13 @@ All tools are TypeBox `ToolDefinition` objects with structured input schemas and
 | `node_script` | `node-script.ts` | Run a skill script on a K8s node host. Base64-encodes script, pipes via nsenter. Supports .sh and .py. Default timeout 180s |
 | `pod_exec` | `pod-exec.ts` | Run a command inside a pod via `kubectl exec`. Same base allowlist as bash. Default timeout 30s |
 | `pod_script` | `pod-script.ts` | Run a skill script inside a pod via `kubectl exec -i`. Pipes script via stdin. Default timeout 180s |
-| `pod_nsenter_exec` | `pod-nsenter-exec.ts` | Execute a command in a pod's network namespace using HOST tools. Creates debug pod, finds container PID via crictl, nsenter into network ns. Default timeout 30s |
-| `pod_netns_script` | `netns-script.ts` | Script version of pod_nsenter_exec. Double-nsenter: host namespaces + pod's network ns. Default timeout 180s |
+| `resolve_pod_netns` | `resolve-pod-netns.ts` | Resolve a pod's network namespace name and node. Returns netns name for use with `node_exec`/`node_script` `netns` param |
 
 ### 4.2 Skill Management Tools
 
 | Tool | File | Description |
 |------|------|-------------|
-| `run_skill` | `run-skill.ts` | Execute a skill script by name. Resolves path via `resolveSkillScript()`. Default timeout 180s |
+| `local_script` | `local-script.ts` | Execute a skill script by name. Resolves path via `resolveSkillScript()`. Default timeout 180s |
 | `create_skill` | `create-skill.ts` | Create a new skill (web/cli only). Returns structured JSON for UI preview. Scripts require admin approval |
 | `update_skill` | `update-skill.ts` | Update an existing skill (web/cli only). Scripts array is the complete final set — omitted scripts are deleted |
 
@@ -542,7 +541,7 @@ Siclaw enforces **read-only by default** across every execution path. The agent 
 
 ### 11.1 Shell Command Validation (4-Pass Pipeline)
 
-Every command — whether via `bash`, `node_exec`, `pod_exec`, or `pod_nsenter_exec` — passes through the same validation pipeline before execution.
+Every command — whether via `bash`, `node_exec`, or `pod_exec` — passes through the same validation pipeline before execution.
 
 **Pass 1 — Shell Operator Scan** (`validateShellOperators`)
 
@@ -720,7 +719,7 @@ src/
 │   ├── pod-script.ts        # Pod script execution
 │   ├── pod-nsenter-exec.ts  # Pod network namespace execution
 │   ├── netns-script.ts      # Pod network namespace script
-│   ├── run-skill.ts         # Skill script runner
+│   ├── local-script.ts         # Skill script runner
 │   ├── create-skill.ts      # Skill creation
 │   ├── update-skill.ts      # Skill update
 │   ├── memory-search.ts     # Hybrid memory search

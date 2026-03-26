@@ -23,16 +23,16 @@ interface RunSkillParams {
   timeout_seconds?: number;
 }
 
-export function createRunSkillTool(
+export function createLocalScriptTool(
   kubeconfigRef?: KubeconfigRef,
   sessionIdRef?: { current: string },
 ): ToolDefinition {
   return {
-    name: "run_skill",
-    label: "Run Skill",
+    name: "local_script",
+    label: "Local Script",
     renderCall(args: any, theme: any) {
       return new Text(
-        theme.fg("toolTitle", theme.bold("run_skill")) +
+        theme.fg("toolTitle", theme.bold("local_script")) +
           " " + theme.fg("accent", args?.skill || "") +
           "/" + theme.fg("accent", args?.script || "") +
           (args?.args ? " " + theme.fg("muted", args.args) : ""),
@@ -57,7 +57,7 @@ Examples:
 - skill: "roce-check-node-config", script: "check-node-config.py", args: "--node node1 --mode sriov-switchdev"
 
 If the script doesn't exist, the tool returns a list of available scripts for that skill.
-Do NOT use the bash tool to run skill scripts. Always use this tool instead.
+Do NOT use the bash tool to run skill scripts locally. Always use this tool instead.
 Read the skill's SKILL.md first to understand required parameters and usage.`,
     parameters: Type.Object({
       skill: Type.String({
