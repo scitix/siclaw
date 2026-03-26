@@ -251,13 +251,18 @@ This is the primary tool for all kubectl interactions. It runs through a shell, 
 
 Allowed commands: kubectl, grep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column, and other text processing tools.
 kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth, exec.
-Local file access commands (cat, ls, find, stat, env, etc.) are blocked — use the dedicated read/grep/glob tools instead.
+In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
+
+Rate protection rules for kubectl in pipelines:
+- "kubectl logs" requires --tail=<N> or --since=<duration>; bare logs without these will be rejected.
+- -A/--all-namespaces on get/describe/events/top requires a selector (-l, --selector, --field-selector); bare -A will be rejected.
 
 Examples:
 - Simple: "kubectl get pods -n monitoring -o wide"
-- With filter: "kubectl get pods -A --field-selector status.phase!=Running"
-- With pipe: "kubectl get pods -A | grep -i error"
+- With filter: "kubectl get pods -A -l app=web --field-selector status.phase!=Running"
+- With pipe: "kubectl get pods -n default | grep -i error"
+- Logs: "kubectl logs my-pod --tail=500 | grep ERROR"
 - JSON query: "kubectl get pod my-pod -o json | jq '.status.conditions'"
 - Exec into pod: "kubectl exec my-pod -n ns -- ip addr show"
 - Skill scripts: "python3 skills/core/roce-perftest-pod/scripts/run-perftest.py --server-pod pod-a --client-pod pod-b --server-ns ns --client-ns ns"
