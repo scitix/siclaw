@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Ping a pod's gateway for a given network interface.
-# Runs via pod_netns_script tool (nsenter -n into pod's netns).
-# Network namespace = pod's; mount namespace = host's (host tools available).
+# Runs via node_script with netns param (ip netns exec into pod's netns).
+# Network namespace = pod's; host tools available.
 
 IFACE=""
 SRC_MODE=""

@@ -269,7 +269,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         // Filter hidden messages (update_plan, end_investigation) to avoid false lastToolIdx
         const turnMessages = messages.slice(turnStart + 1).filter(m => !m.hidden);
         // Must have at least one diagnostic tool call (excluding deep_search — already the deepest path)
-        const DIAGNOSTIC_TOOLS = new Set(['bash', 'pod_exec', 'pod_nsenter_exec', 'node_exec', 'node_script', 'pod_netns_script', 'local_script']);
+        const DIAGNOSTIC_TOOLS = new Set(['bash', 'pod_exec', 'node_exec', 'node_script', 'pod_script', 'local_script']);
         const hasDiagnostic = turnMessages.some(m => m.role === 'tool' && DIAGNOSTIC_TOOLS.has(m.toolName ?? ''));
         // The conclusion must come AFTER the last tool call — if the agent ran tools
         // but never gave a summary, it didn't conclude (e.g. "let me analyze" + tools + silence)
