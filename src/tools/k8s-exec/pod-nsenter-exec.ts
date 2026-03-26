@@ -154,8 +154,7 @@ Examples:
       const binary = cmdArgs[0]?.split("/").pop() ?? "";
       const action = analyzeOutput(binary, cmdArgs.slice(1));
 
-      // Use rewritten args if action requires it
-      const execArgs = action?.type === "rewrite" ? action.newArgs : cmdArgs;
+      const execArgs = cmdArgs;
 
       // Escape single quotes in command args for embedding in shell script
       const escapedArgs = execArgs.map(a => a.replace(/'/g, "'\\''")).map(a => `'${a}'`).join(" ");
