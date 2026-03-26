@@ -4,10 +4,11 @@
  * Complements the existing 6-pass pre-execution validation pipeline
  * (validateCommand) with post-execution output sanitization.
  *
- * Pre-execution blocking (config view --raw, describe configmap/pod,
- * jsonpath/go-template) stays in the tool-specific code (kubectl.ts,
- * validateKubectlInPipeline). This module only handles sanitize and
- * rewrite actions.
+ * Sensitive resource handling (Secret, ConfigMap, Pod) is done entirely
+ * via post-execution sanitization — no pre-execution blocking.
+ * For -o json: structural sanitization via sanitizeJSON.
+ * For all other formats (yaml, describe, jsonpath, etc.): line-level
+ * pattern matching via redactSensitiveContent.
  */
 
 import {
@@ -21,9 +22,7 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type OutputAction =
-  | { type: "sanitize"; sanitize: (output: string) => string }
-  | { type: "rewrite"; newArgs: string[]; sanitize: (output: string) => string };
+export type OutputAction = { type: "sanitize"; sanitize: (output: string) => string };
 
 /** Rule function: analyze user command args, return action or null */
 export type OutputRuleFn = (args: string[]) => OutputAction | null;
@@ -65,40 +64,28 @@ export function applySanitizer(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-/** Rewrite -o yaml to -o json in kubectl args */
-function rewriteYamlToJson(args: string[]): string[] {
-  return args.map((a, idx) => {
-    const prev = args[idx - 1];
-    if (a === "yaml" && (prev === "-o" || prev === "--output")) return "json";
-    if (a === "-o=yaml") return "-o=json";
-    if (a === "-oyaml") return "-ojson";
-    if (a === "--output=yaml") return "--output=json";
-    return a;
-  });
-}
-
-/** Build sanitize function for a kubectl sensitive resource */
-function makeKubectlSanitizer(
+/** Build sanitize function for kubectl -o json output (structural sanitization) */
+function makeKubectlJsonSanitizer(
   resource: SensitiveResourceType,
-  convertedFromYaml: boolean,
 ): (output: string) => string {
-  return (output: string) => {
-    let sanitized = sanitizeJSON(output, resource);
-    if (convertedFromYaml) {
-      sanitized += "\n\nNote: Output converted from YAML to JSON for reliable sanitization.";
-    }
-    return sanitized;
-  };
+  return (output: string) => sanitizeJSON(output, resource);
 }
 
 // ── kubectl rules ────────────────────────────────────────────────────
 
 OUTPUT_RULES["kubectl"] = (args) => {
-  // Only "get" subcommand needs output sanitization.
-  // "describe" and other subcommands are handled by pre-execution
-  // block logic in kubectl.ts (describe configmap/pod → block,
-  // describe secret → allow as-is).
   const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+
+  // describe: sanitize configmap/pod output; secret describe is safe (shows byte counts only)
+  if (sub === "describe") {
+    const resource = detectSensitiveResource(args);
+    if (resource && resource !== "secret") {
+      return { type: "sanitize", sanitize: redactSensitiveContent };
+    }
+    return null;
+  }
+
+  // get: sanitize sensitive resource output based on format
   if (sub !== "get") return null;
 
   const resource = detectSensitiveResource(args);
@@ -106,26 +93,17 @@ OUTPUT_RULES["kubectl"] = (args) => {
 
   const fmt = getOutputFormat(args);
 
-  // -o json → execute normally, sanitize output
+  // -o json → structural sanitization (precise)
   if (fmt === "json") {
-    return {
-      type: "sanitize",
-      sanitize: makeKubectlSanitizer(resource, false),
-    };
-  }
-
-  // -o yaml → rewrite to -o json, then sanitize
-  if (fmt === "yaml") {
-    return {
-      type: "rewrite",
-      newArgs: rewriteYamlToJson(args),
-      sanitize: makeKubectlSanitizer(resource, true),
-    };
+    return { type: "sanitize", sanitize: makeKubectlJsonSanitizer(resource) };
   }
 
   // table / wide / name → safe, no sanitization needed
-  // jsonpath / go-template / custom-columns → handled by pre-execution block in kubectl.ts
-  return null;
+  const safeFormats = new Set([undefined, null, "wide", "name"]);
+  if (!fmt || safeFormats.has(fmt)) return null;
+
+  // All other formats (yaml, jsonpath, go-template, custom-columns) → line-level sanitization
+  return { type: "sanitize", sanitize: redactSensitiveContent };
 };
 
 // ── File-reading command rules ──────────────────────────────────────
@@ -138,7 +116,8 @@ const REDACTED = "**REDACTED**";
  *   - KEY=VALUE or KEY: VALUE where KEY matches SENSITIVE_ENV_NAME_PATTERNS
  *   - Values matching SENSITIVE_VALUE_PATTERNS (JWT, PEM, connection strings, etc.)
  */
-function redactSensitiveContent(output: string): string {
+/** @public Used by restricted-bash pipeline fallback sanitization */
+export function redactSensitiveContent(output: string): string {
   const lines = output.split("\n");
   let redacted = false;
 

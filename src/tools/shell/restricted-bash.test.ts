@@ -1343,31 +1343,38 @@ describe("createRestrictedBashTool — pipe-only text command enforcement", () =
 
 // ── Sensitive resource pipeline protection ──────────────────────────
 
-describe("validateKubectlInPipeline — sensitive resource protection", () => {
-  // Secret — blocked with structured output
-  it("blocks kubectl get secret -o json", () => {
-    const err = validateKubectlInPipeline(["kubectl get secret my-secret -o json"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("not allowed in a pipeline");
-  });
+describe("validateKubectlInPipeline — sensitive resource (no pre-execution blocking)", () => {
+  // Sensitive resources are now handled by post-execution sanitization,
+  // not pre-execution blocking. All these should pass through.
 
-  it("blocks kubectl get secrets -o yaml", () => {
-    const err = validateKubectlInPipeline(["kubectl get secrets -n default -o yaml"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("not allowed in a pipeline");
-  });
+  const allowedCmds = [
+    "kubectl get secret my-secret -o json",
+    "kubectl get secrets -n default -o yaml",
+    "kubectl get secret my-secret -o jsonpath='{.data.password}'",
+    "kubectl get secret my-secret -o go-template={{.data}}",
+    "kubectl get configmap my-config -o yaml",
+    "kubectl get cm my-config -o json",
+    "kubectl get secret my-secret -ojson",
+    "kubectl get cm my-config -oyaml",
+    "kubectl describe configmap my-config",
+    "kubectl describe secret my-secret",
+    "kubectl describe pod my-pod",
+    "kubectl get pods -o json",
+    "kubectl get pod my-pod -o yaml",
+    "kubectl get secret -o name",
+    "kubectl get secret -o wide",
+    "kubectl get configmap -n default",
+    "kubectl get deployment -o json",
+    "kubectl get svc -o yaml",
+  ];
 
-  it("blocks kubectl get secret -o jsonpath", () => {
-    const err = validateKubectlInPipeline(["kubectl get secret my-secret -o jsonpath='{.data.password}'"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("not allowed in a pipeline");
-  });
+  for (const cmd of allowedCmds) {
+    it(`allows: ${cmd}`, () => {
+      expect(validateKubectlInPipeline([cmd])).toBeNull();
+    });
+  }
 
-  it("blocks kubectl get secret -o go-template", () => {
-    const err = validateKubectlInPipeline(["kubectl get secret my-secret -o go-template={{.data}}"]);
-    expect(err).not.toBeNull();
-  });
-
+  // Rate protection still active
   it("blocks kubectl get secret -A (no selector — rate protection)", () => {
     const err = validateKubectlInPipeline(["kubectl get secret -A"]);
     expect(err).not.toBeNull();
@@ -1376,78 +1383,6 @@ describe("validateKubectlInPipeline — sensitive resource protection", () => {
 
   it("allows kubectl get secret -A -l app=web (has selector)", () => {
     expect(validateKubectlInPipeline(["kubectl get secret -A -l app=web"])).toBeNull();
-  });
-
-  it("allows kubectl get secret -o name", () => {
-    expect(validateKubectlInPipeline(["kubectl get secret -o name"])).toBeNull();
-  });
-
-  it("allows kubectl get secret -o wide", () => {
-    expect(validateKubectlInPipeline(["kubectl get secret -o wide"])).toBeNull();
-  });
-
-  // ConfigMap — blocked with structured output
-  it("blocks kubectl get configmap -o yaml", () => {
-    const err = validateKubectlInPipeline(["kubectl get configmap my-config -o yaml"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("not allowed in a pipeline");
-  });
-
-  it("blocks kubectl get cm -o json", () => {
-    const err = validateKubectlInPipeline(["kubectl get cm my-config -o json"]);
-    expect(err).not.toBeNull();
-  });
-
-  it("allows kubectl get configmap (default table, with namespace)", () => {
-    expect(validateKubectlInPipeline(["kubectl get configmap -n default"])).toBeNull();
-  });
-
-  // ConfigMap describe — blocked (prints full data)
-  it("blocks kubectl describe configmap", () => {
-    const err = validateKubectlInPipeline(["kubectl describe configmap my-config"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("sensitive data");
-  });
-
-  // Secret describe — allowed (safe, only shows byte counts)
-  it("allows kubectl describe secret", () => {
-    expect(validateKubectlInPipeline(["kubectl describe secret my-secret"])).toBeNull();
-  });
-
-  // Pod — NOT blocked in pipelines (too common, env sanitization in kubectl tool only)
-  it("allows kubectl get pods -o json in pipeline (pod not blocked)", () => {
-    expect(validateKubectlInPipeline(["kubectl get pods -o json"])).toBeNull();
-  });
-
-  it("allows kubectl get pod my-pod -o yaml in pipeline", () => {
-    expect(validateKubectlInPipeline(["kubectl get pod my-pod -o yaml"])).toBeNull();
-  });
-
-  // Non-sensitive resources — not affected
-  it("allows kubectl get deployment -o json", () => {
-    expect(validateKubectlInPipeline(["kubectl get deployment -o json"])).toBeNull();
-  });
-
-  it("allows kubectl get svc -o yaml", () => {
-    expect(validateKubectlInPipeline(["kubectl get svc -o yaml"])).toBeNull();
-  });
-
-  // kubectl shorthand -ojson (no space)
-  it("blocks kubectl get secret -ojson (shorthand)", () => {
-    const err = validateKubectlInPipeline(["kubectl get secret my-secret -ojson"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("not allowed in a pipeline");
-  });
-
-  it("blocks kubectl get cm -oyaml (shorthand)", () => {
-    const err = validateKubectlInPipeline(["kubectl get cm my-config -oyaml"]);
-    expect(err).not.toBeNull();
-  });
-
-  // Flags interspersed
-  it("blocks kubectl -n ns get secret -o json", () => {
-    const err = validateKubectlInPipeline(["kubectl -n kube-system get secret -o json"]);
-    expect(err).not.toBeNull();
   });
 });
 
