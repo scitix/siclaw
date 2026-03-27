@@ -820,12 +820,14 @@ export function createRpcMethods(
       name: string;
       description?: string | null;
       type?: string | null;
+      scope?: string | null;
       dirName: string;
       authorId?: string | null;
       labelsJson?: string[] | null;
     },
     publishedVersion: number | null | undefined,
     sourceTag: SkillContentTag,
+    promotedByUserId?: string,
   ): Promise<string> {
     if (!skillRepo) throw new Error("Database not available");
 
@@ -837,15 +839,14 @@ export function createRpcMethods(
     if (existingGlobal) {
       globalSkillId = existingGlobal.id;
       await skillRepo.update(existingGlobal.id, {
+        name: meta.name,
         description: meta.description ?? undefined,
         type: meta.type ?? undefined,
         globalSourceSkillId: meta.id,
         globalPinnedVersion: publishedVersion ?? null,
         reviewStatus: "approved",
-        publishedVersion: publishedVersion ?? null,
         labels: srcLabels ?? undefined,
       });
-      await skillRepo.bumpVersion(existingGlobal.id);
     } else {
       globalSkillId = await skillRepo.create({
         name: meta.name,
@@ -860,13 +861,42 @@ export function createRpcMethods(
         globalSourceSkillId: meta.id,
         globalPinnedVersion: publishedVersion ?? null,
         reviewStatus: "approved",
-        publishedVersion: publishedVersion ?? null,
       });
     }
 
     if (skillContentRepo) {
       await skillContentRepo.copyToSkill(meta.id, globalSkillId, sourceTag, "published");
     }
+
+    if (existingGlobal) {
+      await skillRepo.bumpVersion(globalSkillId);
+    }
+
+    const updatedGlobal = await skillRepo.getById(globalSkillId);
+    const newGlobalVersion = updatedGlobal?.version ?? (existingGlobal ? ((existingGlobal as any).version ?? 1) + 1 : 1);
+
+    if (skillVersionRepo) {
+      const publishedContent = skillContentRepo
+        ? await skillContentRepo.read(globalSkillId, "published")
+        : null;
+      await skillVersionRepo.create({
+        skillId: globalSkillId,
+        version: newGlobalVersion,
+        commitMessage: publishedVersion != null
+          ? `contributed from ${meta.scope ?? "skill"} v${publishedVersion}`
+          : `contributed from ${meta.scope ?? "skill"}`,
+        authorId: promotedByUserId ?? meta.authorId ?? undefined,
+        specs: publishedContent?.specs,
+        scriptsJson: publishedContent?.scripts,
+        files: {
+          metadata: getCurrentPublishableMetadata((updatedGlobal ?? meta) as any),
+        },
+      });
+    }
+
+    await skillRepo.update(globalSkillId, {
+      publishedVersion: newGlobalVersion,
+    });
 
     notifyAllSkillReload();
     return globalSkillId;
@@ -4230,6 +4260,7 @@ export function createRpcMethods(
           meta as any,
           (meta as any).publishedVersion ?? null,
           skillContentRepo ? "staging" : "published",
+          reviewerId,
         );
 
         if (skillContentRepo) {
