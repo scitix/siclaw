@@ -116,13 +116,19 @@ Step 10: formatExecOutput() / processToolOutput() → infra/exec-utils.ts / tool
 
 ### Variation Points
 
-| Point | node\_exec | pod\_exec | pod\_nsenter\_exec |
-|-------|-----------|----------|-------------------|
-| Context | `"node"` | `"pod"` | `"nsenter"` |
-| Target validation | `validateNodeName` | `validatePodName` | `validatePodName` |
-| Ready check | `checkNodeReady` | `checkPodRunning` | `resolveContainerNetns` |
-| Command build | nsenter wrap | kubectl exec args | double nsenter + crictl |
-| Execution | `runInDebugPod` | `execFileAsync("kubectl")` | `runInDebugPod` |
+| Point | node\_exec | pod\_exec |
+|-------|-----------|----------|
+| Context | `"node"` | `"pod"` |
+| Target validation | `validateNodeName` | `validatePodName` |
+| Ready check | `checkNodeReady` | `checkPodRunning` |
+| Command build | nsenter wrap (+ `ip netns exec` when `netns` param set) | kubectl exec args |
+| Pipeline support | Yes (pipes, `&&`, `;`) | No (`blockPipeline: true`) |
+| Execution | `runInDebugPod` | `execFileAsync("kubectl")` |
+
+**Pod network namespace diagnostics**: To run host-level tools in a pod's
+network namespace, use `resolve_pod_netns` (in `query/`) to get the netns name,
+then call `node_exec` with the `netns` parameter. This replaces the former
+`pod_nsenter_exec` tool.
 
 ---
 
@@ -147,9 +153,8 @@ Step 8: formatExecOutput()
 
 | Tool | Method | How |
 |------|--------|-----|
-| `node_script` | base64 inject | Encode script → echo + base64 -d inside nsenter |
+| `node_script` | base64 inject | Encode script → echo + base64 -d inside nsenter. Supports `netns` param for pod network namespace. |
 | `pod_script` | stdin pipe | `kubectl exec -i` with script piped to stdin |
-| `netns_script` | base64 inject | Same as node\_script but with netns nsenter |
 
 ---
 

@@ -256,9 +256,8 @@ Different execution contexts allow different command sets:
 | Context | Used By | Scope |
 |---------|---------|-------|
 | `local` | `restricted-bash.ts` | AgentBox container — text processing + kubectl |
-| `node` | `node-exec.ts` | Remote node (via debug pod) — full diagnostics |
-| `pod` | `pod-exec.ts` | Target pod — full diagnostics |
-| `nsenter` | `pod-nsenter-exec.ts` | Target pod network namespace — full diagnostics |
+| `node` | `node-exec.ts` | Remote node (via debug pod) — full diagnostics. Also handles pod netns when `netns` param is set (via `ip netns exec`). |
+| `pod` | `pod-exec.ts` | Target pod — full diagnostics (single commands only, no pipes) |
 
 The `local` context is the most restrictive: only text-processing commands (grep, jq, sort,
 etc.), flow control (echo, printf), and kubectl. File-reading commands (cat, ls, find) are
