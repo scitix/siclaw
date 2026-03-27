@@ -1174,26 +1174,75 @@ export const SAFE_SUBCOMMANDS = new Set([
   "exec",
 ]);
 
-/** Subcommands where -A/--all-namespaces without selectors is blocked. */
-const ALL_NS_RESTRICTED = new Set(["get", "describe", "events", "top"]);
+/**
+ * Subcommands where -A/--all-namespaces is restricted:
+ * - "get": only blocked when combined with -o yaml/json (bulk serialization)
+ * - "describe", "events", "top": always blocked without selectors
+ */
+const ALL_NS_ALWAYS_NEED_SELECTOR = new Set(["describe", "events", "top"]);
 
 /**
- * Detect if a kubectl command uses -A/--all-namespaces without any selector
- * (-l, --selector, --field-selector) on a restricted subcommand.
- * Pure boolean check — callers decide how to respond.
+ * Detect if a kubectl -A/--all-namespaces usage should be blocked.
+ *
+ * Rules:
+ * - `get -A` is allowed UNLESS combined with `-o yaml` or `-o json`
+ *   (bulk serialization can return GBs of data on large clusters).
+ * - `describe/events/top -A` without a selector (-l, --field-selector) is always blocked.
+ * - Other subcommands (logs, exec, etc.) are not affected.
+ *
+ * Returns a descriptive reason string if blocked, or null if allowed.
  */
-export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
-  if (!ALL_NS_RESTRICTED.has(subcommand)) return false;
-
+export function checkAllNamespacesRestriction(args: string[], subcommand: string): string | null {
   const hasAllNs = args.includes("-A") || args.includes("--all-namespaces");
-  if (!hasAllNs) return false;
+  if (!hasAllNs) return null;
 
   const hasSelector = args.some(a =>
     a === "-l" ||
     a === "--selector" || a.startsWith("--selector=") ||
     a === "--field-selector" || a.startsWith("--field-selector="),
   );
-  return !hasSelector;
+
+  // describe/events/top -A without selector → always blocked
+  if (ALL_NS_ALWAYS_NEED_SELECTOR.has(subcommand)) {
+    if (!hasSelector) {
+      return `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`;
+    }
+    return null;
+  }
+
+  // get -A + -o yaml/json → blocked (even with selector — bulk serialization is the concern)
+  if (subcommand === "get") {
+    const format = getKubectlOutputFormat(args);
+    if (format === "yaml" || format === "json") {
+      return `"kubectl get --all-namespaces -o ${format}" can return excessive data. Use -n <namespace> to target a specific namespace, or use -o wide/name/custom-columns instead.`;
+    }
+  }
+
+  return null;
+}
+
+/** Extract kubectl output format from args. Handles -o yaml, -oyaml, -o=yaml, --output=yaml. */
+function getKubectlOutputFormat(args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === "-o" || a === "--output") && args[i + 1] && !args[i + 1].startsWith("-")) {
+      return extractKubectlFormatName(args[i + 1]);
+    }
+    if (a.startsWith("--output=")) return extractKubectlFormatName(a.slice(9));
+    if (a.startsWith("-o=")) return extractKubectlFormatName(a.slice(3));
+    if (a.startsWith("-o") && a.length > 2 && !a.startsWith("--")) return extractKubectlFormatName(a.slice(2));
+  }
+  return null;
+}
+
+function extractKubectlFormatName(value: string): string {
+  const eq = value.indexOf("=");
+  return eq > 0 ? value.slice(0, eq) : value;
+}
+
+// Keep backward-compatible export for any external callers
+export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
+  return checkAllNamespacesRestriction(args, subcommand) !== null;
 }
 
 /**
@@ -1288,7 +1337,8 @@ export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
   // K8s control plane
   /\/etc\/kubernetes\/pki\//,
   /\/etc\/kubernetes\/admin\.conf/,
-  /\/var\/lib\/kubelet\//,
+  /\/var\/lib\/kubelet\/pki\//,                         // kubelet certificates
+  /\/var\/lib\/kubelet\/pods\/[^/]+\/volumes\/.*secret/, // mounted secrets in pod volumes
   /\/var\/lib\/etcd\//,
   // Shell/DB history
   /\.bash_history/,
