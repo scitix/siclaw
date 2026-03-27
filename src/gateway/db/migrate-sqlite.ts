@@ -83,7 +83,7 @@ const DDL_STATEMENTS = [
     version INTEGER NOT NULL DEFAULT 1,
     published_version INTEGER,
     staging_version INTEGER NOT NULL DEFAULT 0,
-    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
+    scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'global', 'personal', 'skillset')),
     author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
     status TEXT DEFAULT 'installed',
     contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
@@ -92,8 +92,8 @@ const DDL_STATEMENTS = [
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
     s3_key TEXT,
-    team_source_skill_id TEXT,
-    team_pinned_version INTEGER,
+    global_source_skill_id TEXT,
+    global_pinned_version INTEGER,
     forked_from_id TEXT,
     labels_json TEXT,
     skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
@@ -473,6 +473,11 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE skill_spaces ADD COLUMN invite_token TEXT`,
     // Knowledge docs: store original content for recovery
     `ALTER TABLE knowledge_docs ADD COLUMN content TEXT`,
+    // Rename skill scope "team" → "global"
+    `UPDATE skills SET scope='global' WHERE scope='team'`,
+    `ALTER TABLE skills RENAME COLUMN team_source_skill_id TO global_source_skill_id`,
+    `ALTER TABLE skills RENAME COLUMN team_pinned_version TO global_pinned_version`,
+    `UPDATE workspaces SET skill_composer = REPLACE(skill_composer, '"team:', '"global:') WHERE skill_composer LIKE '%"team:%'`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
@@ -524,7 +529,7 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       version INTEGER NOT NULL DEFAULT 1,
       published_version INTEGER,
       staging_version INTEGER NOT NULL DEFAULT 0,
-      scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'team', 'personal', 'global', 'skillset')),
+      scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'global', 'personal', 'skillset')),
       author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
       status TEXT DEFAULT 'installed',
       contribution_status TEXT DEFAULT 'none' CHECK(contribution_status IN ('none', 'pending', 'approved')),
@@ -533,8 +538,8 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
       s3_key TEXT,
-      team_source_skill_id TEXT,
-      team_pinned_version INTEGER,
+      global_source_skill_id TEXT,
+      global_pinned_version INTEGER,
       forked_from_id TEXT,
       labels_json TEXT,
       skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
@@ -542,7 +547,7 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     sdb.run(sql.raw(`INSERT INTO skills (
       id, name, description, type, version, published_version, staging_version,
       scope, author_id, status, contribution_status, review_status, dir_name,
-      created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
+      created_at, updated_at, s3_key, global_source_skill_id, global_pinned_version,
       forked_from_id, labels_json, skill_space_id
     ) SELECT
       id, name, description, type, version, published_version, staging_version,

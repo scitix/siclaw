@@ -219,7 +219,7 @@ export class LocalSpawner implements BoxSpawner {
       const skillsBase = path.resolve(process.cwd(), config.paths.skillsDir);
       const userSkillsDir = path.join(skillsBase, "user", userId);
 
-      // Clear only this user's directory (not other users or core/team)
+      // Clear only this user's directory (not other users or core/global)
       if (fs.existsSync(userSkillsDir)) {
         for (const entry of fs.readdirSync(userSkillsDir)) {
           if (entry.startsWith(".")) continue;

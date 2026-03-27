@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { X, FileCode2, ArrowRightLeft } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import type { SkillDiffMetadataChange } from '../pages/Skills/skillsData';
 
 type DiffLineType = 'context' | 'add' | 'remove' | 'meta';
 
@@ -167,7 +168,16 @@ interface DiffViewerModalProps {
     title: string;
     subtitle?: string;
     diffText: string | null;
+    metadataChanges?: SkillDiffMetadataChange[];
     isLoading?: boolean;
+}
+
+function formatMetadataValue(value: string | string[] | null): string {
+    if (Array.isArray(value)) {
+        return value.length > 0 ? value.join(', ') : 'None';
+    }
+    if (value === null || value === '') return 'None';
+    return value;
 }
 
 export function DiffViewerModal({
@@ -176,9 +186,12 @@ export function DiffViewerModal({
     title,
     subtitle,
     diffText,
+    metadataChanges = [],
     isLoading = false,
 }: DiffViewerModalProps) {
     const files = useMemo(() => parseUnifiedDiff(diffText ?? ''), [diffText]);
+    const hasFileDiff = !!diffText && !!diffText.trim() && diffText !== 'No changes detected.';
+    const hasMetadataChanges = metadataChanges.length > 0;
 
     if (!isOpen) return null;
 
@@ -202,10 +215,28 @@ export function DiffViewerModal({
                 <div className="flex-1 overflow-y-auto px-6 py-6">
                     {isLoading ? (
                         <div className="h-full flex items-center justify-center text-sm text-slate-500">Loading diff...</div>
-                    ) : !diffText || !diffText.trim() || diffText === 'No changes detected.' ? (
+                    ) : !hasFileDiff && !hasMetadataChanges ? (
                         <div className="h-full flex items-center justify-center text-sm text-slate-500">No changes detected.</div>
                     ) : (
-                        <DiffUnifiedView files={files} />
+                        <div className="space-y-6">
+                            {hasMetadataChanges && (
+                                <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden">
+                                    <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 text-sm font-medium text-slate-700">
+                                        Metadata changes
+                                    </div>
+                                    <div className="divide-y divide-slate-100">
+                                        {metadataChanges.map((change) => (
+                                            <div key={`${change.field}-${JSON.stringify(change.before)}-${JSON.stringify(change.after)}`} className="px-4 py-3 text-sm">
+                                                <div className="font-medium text-slate-800 capitalize">{change.field}</div>
+                                                <div className="mt-1 text-slate-500">{formatMetadataValue(change.before)}</div>
+                                                <div className="mt-1 text-slate-800">{formatMetadataValue(change.after)}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {hasFileDiff && <DiffUnifiedView files={files} />}
+                        </div>
                     )}
                 </div>
             </div>

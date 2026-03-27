@@ -8,7 +8,7 @@ import type { Database } from "../index.js";
 import { skills, userDisabledSkills } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
 
-export type SkillScope = "builtin" | "team" | "personal" | "global" | "skillset";
+export type SkillScope = "builtin" | "global" | "personal" | "skillset";
 
 export interface CreateSkillInput {
   name: string;
@@ -34,8 +34,8 @@ export interface UpdateSkillInput {
   dirName?: string;
   publishedVersion?: number | null;
   stagingVersion?: number;
-  teamSourceSkillId?: string | null;
-  teamPinnedVersion?: number | null;
+  globalSourceSkillId?: string | null;
+  globalPinnedVersion?: number | null;
   forkedFromId?: string | null;
   labels?: string[] | null;
   skillSpaceId?: string | null;
@@ -67,7 +67,7 @@ export class SkillRepository {
     const offset = opts?.offset ?? 0;
 
     let conditions = or(
-      eq(skills.scope, "team"),
+      eq(skills.scope, "global"),
       and(eq(skills.scope, "personal"), eq(skills.authorId, userId)),
     );
 
@@ -151,8 +151,8 @@ export class SkillRepository {
     if (updates.dirName !== undefined) setFields.dirName = updates.dirName;
     if (updates.publishedVersion !== undefined) setFields.publishedVersion = updates.publishedVersion;
     if (updates.stagingVersion !== undefined) setFields.stagingVersion = updates.stagingVersion;
-    if (updates.teamSourceSkillId !== undefined) setFields.teamSourceSkillId = updates.teamSourceSkillId;
-    if (updates.teamPinnedVersion !== undefined) setFields.teamPinnedVersion = updates.teamPinnedVersion;
+    if (updates.globalSourceSkillId !== undefined) setFields.globalSourceSkillId = updates.globalSourceSkillId;
+    if (updates.globalPinnedVersion !== undefined) setFields.globalPinnedVersion = updates.globalPinnedVersion;
     if (updates.forkedFromId !== undefined) setFields.forkedFromId = updates.forkedFromId;
     if (updates.labels !== undefined) setFields.labelsJson = updates.labels;
     if (updates.skillSpaceId !== undefined) setFields.skillSpaceId = updates.skillSpaceId;

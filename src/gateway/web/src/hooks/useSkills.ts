@@ -13,7 +13,7 @@ export interface UseSkillsResult {
     loadSkills: (scope?: string, search?: string) => Promise<void>;
     loadMore: () => Promise<void>;
     toggleEnabled: (skill: Skill) => Promise<void>;
-    publishSkill: (skill: Skill, contributeToTeam?: boolean) => Promise<void>;
+    publishSkill: (skill: Skill, contributeToGlobal?: boolean) => Promise<void>;
     requestPublish: (skill: Skill) => Promise<void>;
     approveSkill: (skill: Skill) => Promise<void>;
     rejectSkill: (skill: Skill, reason?: string) => Promise<void>;
@@ -104,8 +104,8 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
         }
     }, [sendRpc]);
 
-    const publishSkill = useCallback(async (skill: Skill, contributeToTeam?: boolean) => {
-        await sendRpc('skill.submit', { id: String(skill.id), contributeToTeam, workspaceId });
+    const publishSkill = useCallback(async (skill: Skill, contributeToGlobal?: boolean) => {
+        await sendRpc('skill.submit', { id: String(skill.id), contributeToGlobal, workspaceId });
         await loadSkills();
     }, [sendRpc, loadSkills, workspaceId]);
 

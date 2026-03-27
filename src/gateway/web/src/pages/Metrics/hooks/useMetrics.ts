@@ -28,7 +28,7 @@ export interface ToolCallStats {
 
 export interface SkillCallStats {
     skillName: string;
-    scope: 'builtin' | 'team' | 'personal';
+    scope: 'builtin' | 'global' | 'personal';
     success: number;
     error: number;
     total: number;

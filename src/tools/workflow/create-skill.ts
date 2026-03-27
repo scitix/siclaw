@@ -63,7 +63,7 @@ Important:
 
 ## Duplicate / Overlap Check — CRITICAL
 
-**Before calling \`create_skill\`, you MUST check whether an existing skill already covers the same functionality.** Check \`<available_skills>\` in your system prompt and compare the user's request against existing builtin, team, and personal skills.
+**Before calling \`create_skill\`, you MUST check whether an existing skill already covers the same functionality.** Check \`<available_skills>\` in your system prompt and compare the user's request against existing builtin, global, and personal skills.
 
 - **Exact name match**: The tool will reject creation if a skill with the same name exists. But functional overlap with a DIFFERENT name is equally problematic.
 - **Functional overlap found**: If an existing skill solves the same problem (even with a different name), DO NOT silently create a new one. Instead:
@@ -71,7 +71,7 @@ Important:
   2. Ask if they want to: (a) use the existing skill as-is, (b) fork it with \`fork_skill\` to make a customized personal copy, or (c) still create a brand-new separate skill.
   3. Only proceed with \`create_skill\` if the user explicitly chooses option (c).
 - **Why this matters**: Duplicate skills with similar functionality confuse the model — it cannot reliably choose between two skills that do the same thing. One well-maintained skill is always better than two overlapping ones.
-- To fork a builtin or team skill into a personal copy, use \`fork_skill\`.
+- To fork a builtin or global skill into a personal copy, use \`fork_skill\`.
 
 ## Environments and Approval Workflow
 
@@ -178,7 +178,7 @@ node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="p
       // Reject if a skill with the same name already exists
       if (skillExistsInBundle(skillName)) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: `A skill named '${skillName}' already exists (personal or team). Use 'update_skill' to modify it, or 'fork_skill' to fork a builtin/team skill.` }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: `A skill named '${skillName}' already exists (personal or global). Use 'update_skill' to modify it, or 'fork_skill' to fork a builtin/global skill.` }) }],
           details: { error: true },
         };
       }

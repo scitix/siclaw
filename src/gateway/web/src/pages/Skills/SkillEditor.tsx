@@ -197,7 +197,7 @@ export function SkillEditor() {
         }
     };
 
-    const canRollback = (formData?.scope === 'personal' && isOwner) || (formData?.scope === 'team' && isAdmin);
+    const canRollback = (formData?.scope === 'personal' && isOwner) || (formData?.scope === 'global' && isAdmin);
 
     useEffect(() => {
         // Reset transient UI states when ID changes
@@ -604,8 +604,7 @@ export function SkillEditor() {
                     <span className="text-sm text-amber-800 font-medium">This skill is pending publish review. Test environment has the latest version.</span>
                 </div>
             )}
-            {formData.reviewStatus === 'approved' && formData.scope === 'personal' && formData.publishedVersion != null
-                && Number(String(formData.version).replace(/^v/, '')) > formData.publishedVersion && (
+            {formData.reviewStatus === 'approved' && formData.scope === 'personal' && formData.hasUnpublishedChanges && (
                 <div className="px-6 py-2.5 bg-blue-50 border-b border-blue-200 flex items-center gap-2 shrink-0">
                     <FileCode className="w-4 h-4 text-blue-500" />
                     <span className="text-sm text-blue-800 font-medium">Modified since published v{formData.publishedVersion}. Submit for review to publish changes to production.</span>
@@ -681,7 +680,7 @@ export function SkillEditor() {
                                         className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 outline-none bg-gray-50 cursor-default"
                                         placeholder="e.g. v1"
                                     />
-                                    {formData.publishedVersion != null && String(formData.publishedVersion) !== formData.version?.replace(/^v/, '') && (
+                                    {formData.publishedVersion != null && formData.hasUnpublishedChanges && (
                                         <span className="text-xs text-green-600 whitespace-nowrap">(published: v{formData.publishedVersion})</span>
                                     )}
                                 </div>

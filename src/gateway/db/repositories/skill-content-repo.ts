@@ -1,7 +1,7 @@
 /**
  * Skill Content Repository — stores skill file contents (SKILL.md + scripts) in DB
  *
- * Replaces filesystem-based storage for team and personal skills.
+ * Replaces filesystem-based storage for global and personal skills.
  * BuiltIn skills are still read from Docker image.
  */
 
@@ -89,7 +89,7 @@ export class SkillContentRepository {
     await this.save(skillId, toTag, source);
   }
 
-  /** Copy content to another skill (team contribution) */
+  /** Copy content to another skill (global contribution) */
   async copyToSkill(
     srcSkillId: string,
     destSkillId: string,

@@ -34,8 +34,8 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 
 **Consequences**:
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
-- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/team/` and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
-- Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (team + personal skills from the bundle are both written into the user's directory)
+- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
+- Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (global + personal skills from the bundle are both written into the user's directory)
 - The sql.js SQLite lockfile prevents multi-process access; local mode is single-process by design
 
 **Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:82-97`
@@ -45,7 +45,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 **Invariant**: Each K8s AgentBox pod is fully isolated: its own emptyDir volume for skills, its own mTLS client certificate, its own process. Skills sync via `skillsHandler.materialize()` is safe here because there is no shared filesystem.
 
 **Consequences**:
-- The `team/` and `user/` skill subdirectories in a pod are managed by resource sync — wiped and rebuilt on every sync. `core/` and `extension/` are baked into the image.
+- The `global/`, `skillset/`, and `user/` skill subdirectories in a pod are managed by resource sync — wiped and rebuilt on every sync. `core/` and `extension/` are baked into the image.
 - Core skills ARE baked into the Docker image (`COPY skills/core/ ./skills/core/` in Dockerfile.agentbox). They are NOT delivered via the skill bundle — see §2.1.
 - Pod self-destructs after 5 minutes of idle (no SSE connections, no sessions)
 
@@ -57,26 +57,27 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 
 ### 2.1 What a Bundle Contains
 
-**Invariant**: `buildSkillBundle()` packages **only team + personal skills** from the database. Core (builtin) skills are NEVER included in bundles.
+**Invariant**: `buildSkillBundle()` packages **only global + skillset (dev only) + personal skills** from the database. When a workspace composer is present, each scope is filtered to the workspace selection. Core (builtin) skills are NEVER included in bundles.
 
 ```
-Bundle = team skills (DB, published tag) + personal skills (DB, approved status)
+Bundle = selected global skills (DB, published tag) + selected skillset skills (DB, dev only) + selected personal skills (DB)
 Bundle ≠ core skills (baked into image/repo checkout)
 ```
 
-**Source**: `src/gateway/skills/skill-bundle.ts:1-10` — explicit comment: "Only includes team + personal skills — builtin skills are baked into the AgentBox Docker image."
+**Source**: `src/gateway/skills/skill-bundle.ts:1-10`
 
 ### 2.2 Skill Directory Tiers
 
 ```
 skills/
-├── core/          ← Built-in, read-only, baked into image. Never overwritten by sync.
-├── team/          ← Admin-managed via WebUI, synced from DB
-├── user/{userId}/ ← Personal skills, synced from DB per user
-└── extension/     ← Optional overlay builds
+├── core/              ← Built-in, read-only, baked into image. Never overwritten by sync.
+├── extension/         ← Builtin overlay (inner projects). Baked into image.
+├── global/            ← Global skills, synced from DB. Supplements/overrides builtin.
+├── skillset/{spaceId}/ ← Skill Space skills, synced from DB. Dev only.
+└── user/{userId}/     ← Personal skills, synced from DB per user.
 ```
 
-**Loading priority** (highest wins): `user/<userId>` > `team` > `core`
+**Loading priority** (highest wins): `personal` > `skillset` > `global` > `builtin`
 
 ### 2.3 Skill Activation Gate
 
@@ -86,7 +87,7 @@ Scripts in a skill follow this workflow before execution is permitted:
 draft → (request review) → pending → (AI + static analysis) → approved/rejected
 ```
 
-- **Static analysis**: 23 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 7) in `ScriptEvaluator`
+- **Static analysis**: 22 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 6) in `ScriptEvaluator`
 - **AI analysis**: LLM semantic review with mandatory rule — "Skills MUST be strictly read-only"
 - **Human gate**: `skill_reviewer` role must approve before `published` status
 - Skills with unapproved scripts **cannot** be executed via `local_script`
@@ -234,7 +235,7 @@ postReload(context)  Notify active sessions to pick up changes
 ```
 
 - `fetch` is network I/O with retry (3 attempts, exponential backoff: 1s, 2s, 4s)
-- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `team/` + `user/` subdirs then rebuilds)
+- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `global/` + `skillset/` + `user/` subdirs then rebuilds)
 - `postReload` calls `brain.reload()` on active sessions
 
 ### 6.2 When to Use Each Handler
@@ -242,9 +243,9 @@ postReload(context)  Notify active sessions to pick up changes
 | Handler | Safe in LocalSpawner? | Safe in K8s pod? | Notes |
 |---------|----------------------|------------------|-------|
 | `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
-| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `team/` + `user/` subdirs (not `core/`) |
+| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `global/` + `skillset/` + `user/` subdirs (not `core/`) |
 
-For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Team and personal skills from the bundle are both placed under the user's directory.
+For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Global and personal skills from the bundle are both placed under the user's directory.
 
 ---
 

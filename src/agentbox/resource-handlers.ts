@@ -63,7 +63,7 @@ interface SkillBundlePayload {
   version: string;
   skills: Array<{
     dirName: string;
-    scope: "team" | "personal" | "skillset";
+    scope: "global" | "personal" | "skillset";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
     skillSpaceId?: string;
@@ -84,10 +84,10 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     const config = loadConfig();
     const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
 
-    // Clear only bundle-managed scope subdirectories (team/, user/, skillset/)
+    // Clear only bundle-managed scope subdirectories (global/, user/, skillset/)
     // Never wipe the entire skillsDir — that would destroy core/ and other dirs
     if (fs.existsSync(skillsDir)) {
-      for (const scopeDir of ["team", "user", "skillset"]) {
+      for (const scopeDir of ["global", "user", "skillset"]) {
         const scopePath = path.join(skillsDir, scopeDir);
         if (fs.existsSync(scopePath)) {
           fs.rmSync(scopePath, { recursive: true });
@@ -108,7 +108,7 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
         }
         skillDir = resolveUnderDir(skillsDir, "skillset", skill.skillSpaceId, skill.dirName);
       } else {
-        skillDir = resolveUnderDir(skillsDir, "team", skill.dirName);
+        skillDir = resolveUnderDir(skillsDir, "global", skill.dirName);
       }
       fs.mkdirSync(skillDir, { recursive: true });
 

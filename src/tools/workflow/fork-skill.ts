@@ -13,23 +13,23 @@ export function createForkSkillTool(): ToolDefinition {
   return {
     name: "fork_skill",
     label: "Fork Skill",
-    description: `Fork an existing builtin or team skill into a personal copy that you can customize.
+    description: `Fork an existing builtin or global skill into a personal copy that you can customize.
 
 Use this tool when the user wants to:
-- Fork / copy / clone a builtin or team skill to make personal modifications
-- Override a team skill with a personal version
+- Fork / copy / clone a builtin or global skill to make personal modifications
+- Override a global skill with a personal version
 - Customize an existing skill's behavior, parameters, or scripts
 
 This tool outputs a structured fork definition that the user can preview and save. It does NOT persist anything — the user must confirm via the UI.
 
 **When to use this tool vs others:**
-- \`fork_skill\`: Fork an existing builtin/team skill to personal (with or without modifications)
+- \`fork_skill\`: Fork an existing builtin/global skill to personal (with or without modifications)
 - \`create_skill\`: Create a brand-new skill from scratch (only when no existing skill covers the same functionality)
 - \`update_skill\`: Update an existing personal skill
 
 **IMPORTANT**: Before calling this tool, check \`<available_skills>\` in your system prompt and read the source skill's SKILL.md to understand its current content. You need the exact skill name.
 
-**Prefer forking over creating**: If a user wants to create a skill that overlaps with an existing builtin or team skill, recommend forking instead. This avoids duplicate skills that confuse the model. Fork lets them customize while keeping a clear lineage.
+**Prefer forking over creating**: If a user wants to create a skill that overlaps with an existing builtin or global skill, recommend forking instead. This avoids duplicate skills that confuse the model. Fork lets them customize while keeping a clear lineage.
 
 ## Environments and Approval Workflow
 
@@ -42,7 +42,7 @@ This tool outputs a structured fork definition that the user can preview and sav
 - In dev/test, the forked copy is available immediately for testing.
 
 Parameters:
-- source: The exact name of the builtin or team skill to fork (e.g. "find-node", "roce-perftest-pod")
+- source: The exact name of the builtin or global skill to fork (e.g. "find-node", "roce-perftest-pod")
 - specs: Optional modified SKILL.md content. If omitted, the source skill's SKILL.md is copied as-is.
 - scripts: Optional modified scripts. If omitted, the source skill's scripts are copied as-is.
   - Changed script: { name: "run.sh", content: "#!/bin/bash\\n..." }
@@ -54,7 +54,7 @@ Examples:
 - Fork with modified script: fork_skill(source="find-node", scripts=[{name: "find-node.sh", content: "..."}])`,
     parameters: Type.Object({
       source: Type.String({
-        description: "Name of the builtin or team skill to fork (e.g. 'find-node')",
+        description: "Name of the builtin or global skill to fork (e.g. 'find-node')",
       }),
       specs: Type.Optional(
         Type.String({
@@ -86,7 +86,7 @@ Examples:
 
       const sourceName = params.source.trim();
 
-      // Verify source skill exists and is a builtin or team skill
+      // Verify source skill exists and is a builtin or global skill
       const existsInBundle = skillExistsInBundle(sourceName);
       const existsAsBuiltin = skillExistsAsBuiltin(sourceName);
 
