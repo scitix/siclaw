@@ -61,6 +61,21 @@ describe("extractCommands", () => {
     ).toEqual(["kubectl get pods -l 'app=web;test'"]);
   });
 
+  it("treats backslash-escaped semicolon as literal (find -exec \\;)", () => {
+    expect(
+      extractCommands("find / -name foo -exec cat {} \\; | head -5")
+    ).toEqual([
+      "find / -name foo -exec cat {} \\;",
+      "head -5",
+    ]);
+  });
+
+  it("treats backslash-escaped pipe as literal", () => {
+    expect(
+      extractCommands("echo 'hello' \\| cat")
+    ).toEqual(["echo 'hello' \\| cat"]);
+  });
+
   it("handles empty input", () => {
     expect(extractCommands("")).toEqual([]);
   });
@@ -132,6 +147,17 @@ describe("extractPipeline", () => {
     expect(result).toEqual([
       { command: "echo error >&2", piped: false },
       { command: "grep error", piped: true },
+    ]);
+  });
+
+  it("treats backslash-escaped semicolon as literal (find -exec \\;)", () => {
+    const result = extractPipeline(
+      "find / -name foo -exec cat {} \\; 2>/dev/null | sort | head -5"
+    );
+    expect(result).toEqual([
+      { command: "find / -name foo -exec cat {} \\; 2>/dev/null", piped: false },
+      { command: "sort", piped: true },
+      { command: "head -5", piped: true },
     ]);
   });
 });

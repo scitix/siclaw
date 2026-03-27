@@ -64,6 +64,17 @@ export function extractCommands(input: string): string[] {
       continue;
     }
 
+    // Handle backslash escape outside quotes (e.g., \; in find -exec ... \;)
+    // Prevents escaped metacharacters from being treated as command separators.
+    if (ch === "\\" && i + 1 < input.length) {
+      const next = input[i + 1];
+      if (next === ";" || next === "|" || next === "&" || next === "\\") {
+        current += ch + next;
+        i++;
+        continue;
+      }
+    }
+
     if (ch === "(") {
       parenDepth++;
       current += ch;
@@ -147,6 +158,16 @@ export function extractPipeline(input: string): PipelineSegment[] {
       inQuote = ch;
       current += ch;
       continue;
+    }
+
+    // Handle backslash escape outside quotes (e.g., \; in find -exec ... \;)
+    if (ch === "\\" && i + 1 < input.length) {
+      const next = input[i + 1];
+      if (next === ";" || next === "|" || next === "&" || next === "\\") {
+        current += ch + next;
+        i++;
+        continue;
+      }
     }
 
     if (ch === "(") { parenDepth++; current += ch; continue; }
