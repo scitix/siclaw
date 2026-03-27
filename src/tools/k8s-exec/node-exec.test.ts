@@ -342,6 +342,24 @@ describe("validateCommand", () => {
       expect(result).not.toBeNull();
       expect(result).toContain("-exec");
     });
+
+    it("blocks find -exec with escaped semicolon and reports -exec (not null)", () => {
+      // \; must not be treated as a command separator — the whole command stays as
+      // one segment so validateFind correctly reports "-exec" as the violation.
+      const result = validateCommand(
+        "find / -maxdepth 2 -type d -exec sh -c 'echo {}' \\; 2>/dev/null | sort | head -5"
+      );
+      expect(result).not.toBeNull();
+      expect(result).toContain("-exec");
+      // Must NOT produce the old bogus "null" violation
+      expect(result).not.toMatch(/"null"/);
+    });
+
+    it("allows find -printf (read-only formatting)", () => {
+      expect(
+        validateCommand("find / -xdev -printf '%h\\n' | sort | uniq -c | sort -rn | head -20")
+      ).toBeNull();
+    });
   });
 
   describe("env restriction", () => {

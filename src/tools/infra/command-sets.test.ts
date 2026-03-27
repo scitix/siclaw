@@ -160,6 +160,10 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("find /tmp -name '*.tmp' -print0")).toBeNull();
     });
 
+    it("allows find -printf (read-only formatting)", () => {
+      expect(validateCommandRestrictions("find / -xdev -printf '%h\\n'")).toBeNull();
+    });
+
     it("blocks find -exec", () => {
       const err = validateCommandRestrictions("find / -name foo -exec cat {}");
       expect(err).not.toBeNull();
