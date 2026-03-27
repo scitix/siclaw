@@ -13,7 +13,7 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type ExecContext = "local" | "node" | "pod" | "nsenter" | "ssh";
+export type ExecContext = "local" | "node" | "pod";
 
 export interface ValidateCommandOptions {
   /** Determines the base whitelist. Default: "node". */
