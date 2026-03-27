@@ -101,7 +101,8 @@ export function SystemSettings() {
     }, [sendRpc]);
 
     useEffect(() => {
-        if (!isConnected || !isAdmin || hasLoadedRef.current) return;
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (!isAdmin || hasLoadedRef.current) return;
         hasLoadedRef.current = true;
         loadConfig();
     }, [isConnected, isAdmin, loadConfig]);

@@ -79,10 +79,10 @@ export function WorkspacesPage() {
     }, [isConnected, sendRpc]);
 
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadWorkspaces();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadWorkspaces();
     }, [isConnected, loadWorkspaces]);
 
     const handleDelete = async (ws: Workspace) => {
