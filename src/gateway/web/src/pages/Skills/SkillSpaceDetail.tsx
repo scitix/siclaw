@@ -145,7 +145,11 @@ export function SkillSpaceDetailPage() {
     }, []);
 
     const handleInvite = async () => {
-        if (!spaceId || !inviteUsername.trim() || !currentWorkspace?.id) return;
+        if (!spaceId || !inviteUsername.trim()) return;
+        if (!currentWorkspace?.id) {
+            setInviteError('Workspace not loaded yet. Please wait and try again.');
+            return;
+        }
         setInviteError(null);
         try {
             await rpcAddSkillSpaceMember(sendRpc, currentWorkspace.id, spaceId, inviteUsername.trim());

@@ -398,6 +398,7 @@ export function createRpcMethods(
     const personalSkills: ComposerSkillOption[] = [];
     if (skillRepo) {
       const teamSkills = await skillRepo.list({ scope: "team" });
+      const teamDirNames = new Set(teamSkills.map((s: any) => s.dirName));
       for (const meta of teamSkills) {
         globalSkills.push({
           id: meta.id,
@@ -409,6 +410,12 @@ export function createRpcMethods(
           scope: "team",
         });
       }
+      // Dedup: team (global) scope overrides builtin for same dirName
+      const deduped = globalSkills.filter(
+        (s) => s.scope !== "builtin" || !teamDirNames.has(s.dirName),
+      );
+      globalSkills.length = 0;
+      globalSkills.push(...deduped);
 
       const personalResult = await skillRepo.listForUser(userId, { scope: "personal", limit: 500 });
       for (const meta of personalResult.skills) {
