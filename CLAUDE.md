@@ -89,23 +89,27 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 
 ### Pre-flight (before code changes)
 
-1. **Locate in matrix** — find the files you'll change
+1. **Locate in matrix** — find the files you'll change in the Change Impact Matrix
 2. **Read required docs** — every doc in the "Must read" column (skim is not enough for security docs)
-3. **List cross-cutting concerns** — write down what else could break
+3. **List cross-cutting concerns** — write them in your plan or task list
 4. **Confirm test strategy** — know which tests cover your change
 
-### Post-flight (after code changes — the verification loop)
+### Post-flight (verification loop)
 
 1. **Run tests** — `npm test`; fix failures before moving on
-2. **Walk the cross-cutting list** — revisit each concern from pre-flight, confirm it's not broken
-3. **Update docs if behavior changed** — code changes without doc updates are incomplete
-4. **If something broke that pre-flight didn't predict** — update the Change Impact Matrix now (compounding engineering: every mistake improves the harness)
+2. **Update docs** — if you changed behavior or design, update the corresponding doc from the Matrix. Code changes without doc updates are incomplete.
+3. **Compounding engineering** — if something broke that pre-flight didn't predict, update the Change Impact Matrix immediately. Every surprise improves the harness for the next session.
+
+Cross-cutting concerns from pre-flight are verified in two ways:
+- **If tests exist** → `npm test` already covers it (our security path tests are comprehensive)
+- **If no tests exist** → flag it for the reviewer in your PR description. Do not silently assume it's fine.
 
 ### Reviewer Protocol
 
 1. Read design docs for the PR's domain (see matrix)
 2. Read existing code around the diff, not just the diff
-3. Verify: docs updated? Cross-cutting concerns addressed? DDL parity? Both brain types?
+3. Check the author's cross-cutting verification — are flagged items actually safe?
+4. Verify: docs updated? DDL parity? Both brain types if applicable?
 
 ---
 
