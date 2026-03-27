@@ -213,6 +213,24 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
         };
     }, [connect, disconnect]);
 
+    // Detect zombie WebSocket when tab becomes visible again.
+    // After laptop sleep/wake, background tab freeze, or network change,
+    // the WS may be dead but onclose never fired — status stuck on "connected".
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            if (document.visibilityState !== 'visible') return;
+            if (intentionalCloseRef.current) return;
+            const ws = wsRef.current;
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                console.log('[ws] Tab visible, WS not open — reconnecting');
+                updateStatus('disconnected');
+                connect();
+            }
+        };
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    }, [connect, updateStatus]);
+
     const value: WebSocketContextValue = {
         status,
         isConnected: status === 'connected',
