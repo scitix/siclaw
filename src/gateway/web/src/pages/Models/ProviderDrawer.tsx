@@ -225,6 +225,7 @@ export function ProviderDrawer({ isOpen, provider, onClose, onSave }: ProviderDr
                                 baseUrl={baseUrl}
                                 apiKey={isEditing && !apiKey && provider.apiKeySet ? '***' : apiKey}
                                 api={api}
+                                provider={isEditing ? provider.name : undefined}
                                 disabled={!baseUrl || (!apiKey && !(isEditing && provider.apiKeySet))}
                             />
 

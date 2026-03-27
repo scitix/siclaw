@@ -1446,9 +1446,18 @@ export function createRpcMethods(
   methods.set("provider.testConnection", async (params, context: RpcContext) => {
     requireAdmin(context);
     const baseUrl = params.baseUrl as string;
-    const apiKey = params.apiKey as string;
+    let apiKey = params.apiKey as string;
     const api = (params.api as string) ?? "openai-completions";
+    const providerName = params.provider as string | undefined;
     if (!baseUrl || !apiKey) throw new Error("Missing required params: baseUrl, apiKey");
+
+    // When editing an existing provider without changing the key, the frontend sends '***'.
+    // Resolve the real key from the database.
+    if (apiKey === "***" && providerName && modelConfigRepo) {
+      const stored = await modelConfigRepo.getProviderWithModels(providerName);
+      if (!stored?.apiKey) throw new Error("Provider not found or API key not set");
+      apiKey = stored.apiKey;
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -1498,13 +1507,35 @@ export function createRpcMethods(
         }
         // 401/403 = bad key — definitive failure
         if (res.status === 401 || res.status === 403) {
-          const body = await res.text().catch(() => "");
           return { ok: false, message: `Authentication failed (HTTP ${res.status})` };
         }
         // 404 = endpoint not found but server responded — try next path
       }
-      // All paths returned 404: server is reachable and didn't reject the key
-      return { ok: true, message: "Connection successful" };
+
+      // All /models paths returned 404 — the server doesn't expose /models.
+      // Probe /chat/completions with a minimal invalid body to verify auth.
+      // 401/403 = bad key; 400/422 = auth passed (bad body); 200 = unlikely but ok.
+      const completionsPaths = [`${base}/chat/completions`, `${base}/v1/chat/completions`];
+      for (const url of completionsPaths) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({ model: "_probe", messages: [] }),
+          signal: controller.signal,
+        });
+        if (res.status === 401 || res.status === 403) {
+          return { ok: false, message: `Authentication failed (HTTP ${res.status})` };
+        }
+        if (res.status !== 404) {
+          // Any non-404 response (200, 400, 422, etc.) means auth passed
+          return { ok: true, message: "Connection successful" };
+        }
+      }
+      // Everything 404 — server is reachable but we cannot verify the key
+      return { ok: true, message: "Connection successful (API key not verified)" };
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       return { ok: false, message: msg.includes("abort") ? "Connection timed out (10s)" : msg };
