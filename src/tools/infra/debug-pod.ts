@@ -24,8 +24,10 @@ export const COMPONENT_DEBUG_POD = "debug-pod";
 export const MANAGED_BY_SICLAW = "siclaw";
 
 // ── Resource limit constants ────────────────────────────────────────
-export const DEBUG_POD_RESOURCE_REQUESTS = { cpu: "1m", memory: "1Mi" };
-export const DEBUG_POD_RESOURCE_LIMITS = { cpu: "500m", memory: "256Mi" };
+// No requests — let the scheduler place the pod freely.
+// Generous limits because nsenter'd processes (lsof, find, etc.) run under
+// the debug pod's cgroup despite operating in host namespaces.
+export const DEBUG_POD_RESOURCE_LIMITS = { cpu: "2", memory: "4Gi" };
 
 // ── Label helpers ────────────────────────────────────────────────────
 
@@ -449,7 +451,6 @@ export async function runInDebugPod(
               securityContext: { privileged: true },
               command: ["sleep", "infinity"],
               resources: {
-                requests: DEBUG_POD_RESOURCE_REQUESTS,
                 limits: DEBUG_POD_RESOURCE_LIMITS,
               },
             }],
