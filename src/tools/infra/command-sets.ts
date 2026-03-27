@@ -1313,7 +1313,7 @@ export const CONTAINER_SENSITIVE_PATHS: RegExp[] = [
   // Process info (anchored to avoid over-matching)
   /\/proc\/[^/]+\/environ$/,
   /\/proc\/[^/]+\/cmdline$/,
-  /\/proc\/[^/]+\/fd\//,
+  /\/proc\/[^/]+\/fd\/\d/,   // block reading specific fd (cat /proc/1/fd/3); allow listing (ls /proc/*/fd/)
   /\/proc\/[^/]+\/mem$/,
   /\/proc\/[^/]+\/maps$/,
   /\/proc\/[^/]+\/smaps$/,
