@@ -318,18 +318,19 @@ Test runner:    vitest
 
 ---
 
-## 10. Brain Type Differences
+## 10. Brain Type Status
 
-| Feature | pi-agent | claude-sdk |
+**pi-agent is the only actively developed brain.** claude-sdk is frozen legacy code (see ADR-007).
+
+| Feature | pi-agent | claude-sdk (frozen) |
 |---------|----------|-----------|
 | Backend | `@mariozechner/pi-coding-agent` | `@anthropic-ai/claude-agent-sdk` |
-| Memory tools | ✅ Available (hybrid search + investigation history) | ❌ Not integrated |
+| Memory tools | ✅ Available | ❌ Not integrated |
 | Tool protocol | TypeBox ToolDefinition | In-process MCP server (Zod) |
 | `steer()` | Native mid-run injection | Queued post-query |
-| Context tracking | ✅ Available | ❌ Not available |
-| Default | ✅ Yes | Optional (`brainType: "claude-sdk"`) |
+| Status | **Active — all new development here** | **Frozen — no new features** |
 
-Memory-dependent features (investigations, `memory_search`) only work with pi-agent brain.
+All new tools and features target pi-agent only. Do not add claude-sdk support for new code.
 
 ---
 

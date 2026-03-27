@@ -178,7 +178,7 @@ Current known cross-cutting concerns:
   parse command output; changing skills can expose unsanitized data
 - **Command whitelist ↔ Skills**: Adding/removing commands affects what skills
   can use (though skill scripts are exempt from the whitelist)
-- **Brain types ↔ Tools**: New tools must work with both pi-agent and claude-sdk
+- **Brain type**: pi-agent is the only active brain; claude-sdk is frozen legacy
 - **Local mode ↔ Resource sync**: Any sync code must respect shared filesystem
 
 ---

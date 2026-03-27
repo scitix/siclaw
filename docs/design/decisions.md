@@ -165,7 +165,7 @@ mTLS for K8s mode only. LocalSpawner mode uses plain HTTP (same machine, in-proc
 
 ## ADR-007: Two Brain Implementations (pi-agent and claude-sdk)
 
-**Status**: Active
+**Status**: Active — **pi-agent only for new development; claude-sdk is frozen legacy**
 
 **Context**:
 The agent runtime needs to support different LLM backends. Should there be one unified brain or multiple implementations?
@@ -175,14 +175,16 @@ Maintain two brain implementations behind the `BrainSession` interface:
 - **pi-agent** (`@mariozechner/pi-coding-agent`): Primary brain, full feature set including memory indexer
 - **claude-sdk** (`@anthropic-ai/claude-agent-sdk`): Secondary brain, uses in-process MCP server for tool exposure, adds LLM proxy for non-Anthropic providers
 
+**Current status (2026-03)**: claude-sdk brain is **frozen** — no new features or tools are added to it. All active development targets pi-agent only. The claude-sdk code remains in the codebase but is not maintained. A future ADR will decide whether to remove it or revive it.
+
 **Consequences**:
 - ✅ Users can switch brain type per-session based on model/provider preference
 - ✅ Anthropic SDK features (Claude-specific) available via claude-sdk brain
 - ⚠️ Feature parity gap: memory tools, context tracking, and `steer()` mid-run injection only work in pi-agent
-- ⚠️ Dual implementation means new features must be considered for both brains
-- ❌ Avoid adding brain-specific features unless they are truly backend-specific — prefer the `BrainSession` interface
+- ~~⚠️ Dual implementation means new features must be considered for both brains~~ → No longer applicable; new features target pi-agent only
+- ❌ ~~Avoid adding brain-specific features unless they are truly backend-specific~~ → No longer applicable
 
-**Note**: When adding new tools, test with both brain types. Tool protocol differs (TypeBox for pi-agent, Zod/MCP for claude-sdk).
+**Note**: New tools and features target pi-agent (TypeBox) only. Do not spend effort on claude-sdk (Zod/MCP) compatibility for new code.
 
 ---
 
