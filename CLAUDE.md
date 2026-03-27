@@ -116,17 +116,6 @@ Cross-cutting concerns from pre-flight are verified in two ways:
 
 ---
 
-## Context Compaction Rules
-
-> When context compacts, preserve:
-
-1. **Modified files** — what was changed and why
-2. **Active invariant domain** — which design docs are relevant
-3. **Cross-cutting concerns** — blast radius items from pre-flight
-4. **Pending verifications** — tests/docs/reviews not yet done
-
----
-
 ## Tech Stack
 
 ```

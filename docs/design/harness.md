@@ -48,7 +48,7 @@ approaches what it *believes* is its context limit, it begins prematurely wrappi
 up work — cutting corners, skipping verification steps, declaring victory early.
 
 Mitigations:
-- **Context compaction rules** (in CLAUDE.md) ensure critical state survives compaction
+- **Structured pre-flight** forces each session to front-load understanding before coding
 - **Pre-flight protocol** forces each session to front-load understanding before coding
 - **Change Impact Matrix** makes blast radius explicit, reducing the temptation to
   "just change it and see"
@@ -77,7 +77,7 @@ consistent code. It has three layers:
                             │
 ┌───────────────────────────┴──────────────────────────────┐
 │ Layer 2: Development Protocol (CLAUDE.md)                 │
-│ Pre-flight, Change Impact Matrix, Compaction Rules        │
+│ Pre-flight, Change Impact Matrix, Post-flight             │
 │ Catches: "I didn't know modifying X would break Y"        │
 └───────────────────────────┬──────────────────────────────┘
                             │
@@ -101,7 +101,7 @@ It contains:
 - **Change Impact Matrix**: "If you change file X → must read doc Y → must
   verify Z → watch out for cross-cutting concern W"
 - **Pre-flight Protocol**: Mandatory steps before any code modification
-- **Compaction Rules**: What to preserve when context is compressed
+- **Post-flight**: Verification loop and compounding engineering
 - **Design Documentation Map**: Which doc covers what
 
 **Layer 3 (Automated Verification)**: The safety net. Currently:
@@ -225,7 +225,7 @@ This is "compounding engineering" — every mistake improves the harness.
 ### Current State (2026-03)
 
 - Layer 1: 7 design docs covering architecture, security, tools, sanitization, skills, decisions, roadmap
-- Layer 2: CLAUDE.md with Change Impact Matrix, Pre-flight Protocol, Compaction Rules
+- Layer 2: CLAUDE.md with Change Impact Matrix, Pre-flight / Post-flight Protocol
 - Layer 3: CI (typecheck + vitest), ~38 test files with heavy security path coverage
 
 ### Near-Term Improvements
@@ -255,7 +255,7 @@ engineering. Key mappings:
 | Anthropic Concept | Our Implementation |
 |---|---|
 | "Every harness component encodes an assumption about what the model can't do" | Change Impact Matrix encodes "Claude can't know X affects Y without being told" |
-| "Context anxiety" → premature task completion | Compaction Rules preserve critical state; Pre-flight front-loads understanding |
+| "Context anxiety" → premature task completion | Pre-flight front-loads understanding; Matrix makes blast radius explicit |
 | "Compounding engineering" → learn from mistakes | After-mistake protocol (§4.4): fix → diagnose harness gap → update layer |
 | "Separate generation from evaluation" | review-maintainer skill; CI as independent evaluator |
 | "Stress-test assumptions regularly" | Periodically review: are these rules still needed? Can any be removed? |
