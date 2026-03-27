@@ -226,8 +226,6 @@ export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = {
   ],
   node: [...ALL_REMOTE_CATEGORIES],
   pod: [...ALL_REMOTE_CATEGORIES],
-  nsenter: [...ALL_REMOTE_CATEGORIES],
-  ssh: [...ALL_REMOTE_CATEGORIES],
 };
 
 // ── Declarative Command Rule Engine ──────────────────────────────
