@@ -1,6 +1,7 @@
 # Siclaw — Operating Manual for Claude
 
 > Auto-loaded at session start. Keep concise — deep reference lives in `docs/design/`.
+> For the harness design philosophy behind this file, see `docs/design/harness.md`.
 
 ---
 
@@ -43,6 +44,8 @@ Primary defense: **OS-level user isolation** — child processes run as `sandbox
 |----------|--------|---------|
 | Gateway DB | sql.js (WASM) | Users, sessions, skills, MCP config. Single-process lock. DDL in both `schema-sqlite.ts` AND `migrate-sqlite.ts`. |
 | Memory DB | node:sqlite | Embeddings, chunks, investigations. pi-agent only. |
+
+Gateway DB is **single-process** (PID lockfile) — do not run multiple Gateway instances against the same SQLite file.
 
 ### 🟡 Brain Type Gap
 
@@ -98,7 +101,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 
 1. **Run tests** — `npm test`; fix failures before moving on
 2. **Update docs** — if you changed behavior or design, update the corresponding doc from the Matrix. Code changes without doc updates are incomplete.
-3. **Compounding engineering** — if something broke that pre-flight didn't predict, update the Change Impact Matrix immediately. Every surprise improves the harness for the next session.
+3. **Compounding engineering** — if something broke that pre-flight didn't predict, update the Change Impact Matrix immediately. Every surprise improves the harness for the next session. New architectural decisions with non-obvious rationale → add an ADR to `docs/design/decisions.md`.
 
 Cross-cutting concerns from pre-flight are verified in two ways:
 - **If tests exist** → `npm test` already covers it (our security path tests are comprehensive)
