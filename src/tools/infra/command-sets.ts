@@ -640,7 +640,7 @@ function validateByRule(
 
 // ─── find ────────────────────────────────────────────────────────
 
-const FIND_SAFE_ACTIONS = new Set(["-print", "-print0", "-ls", "-prune", "-quit"]);
+const FIND_SAFE_ACTIONS = new Set(["-print", "-print0", "-printf", "-ls", "-prune", "-quit"]);
 const FIND_SAFE_TESTS = new Set([
   "-name", "-iname", "-path", "-ipath", "-regex", "-iregex",
   "-type", "-size", "-mtime", "-atime", "-ctime", "-mmin", "-amin", "-cmin",
