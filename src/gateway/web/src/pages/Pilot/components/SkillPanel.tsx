@@ -62,8 +62,8 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
     const isFork = message.toolName === 'fork_skill' || !!parsed?.fork;
 
     // Find existing skill by name from skills list (primary lookup strategy)
-    // Prefer personal scope: when both team and personal "dice-roll" exist,
-    // update should target the personal copy, not the read-only team one.
+    // Prefer personal scope: when both global and personal "dice-roll" exist,
+    // update should target the personal copy, not the read-only global one.
     // For renames (e.g. roll-dice → rock-paper-scissors), also try matching skillId as a name.
     const matchedSkill = skill
         ? skills.find(s => s.name === skill.name && s.scope === 'personal') ??
@@ -74,7 +74,7 @@ export function SkillPanel({ message, sendRpc, skills, onSave, onDismiss, onClos
               : undefined)
         : undefined;
 
-    // For fork_skill: find the source skill (builtin/team) to fork from
+    // For fork_skill: find the source skill (builtin/global) to fork from
     const forkSourceSkill = isFork
         ? skills.find(s => s.name === (parsed?.sourceSkillName ?? skill?.name) && s.scope !== 'personal') ??
           skills.find(s => s.name === (parsed?.sourceSkillName ?? skill?.name))

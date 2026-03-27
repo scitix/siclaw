@@ -168,35 +168,116 @@ The most complex tool. Handles full shell pipelines with:
 - Kubeconfig name resolution via regex (`--kubeconfig=<name>`)
 - Production mode: `sudo -E -u sandbox` user isolation
 - Skill script detection bypass (`isSkillScript`)
+- 3-layer output sanitization (see §6.2)
+
+**kubectl access**: There is no dedicated kubectl tool — all kubectl commands go
+through `restricted_bash` with pipeline validation. `validateKubectlInPipeline()`
+enforces read-only subcommands (`SAFE_SUBCOMMANDS` in `command-sets.ts`), blocks
+`--all-namespaces` on broad queries, and passes exec'd commands through the
+binary allowlist. This is by design: kubectl in pipelines (`kubectl get pods | grep Error`)
+is the natural SRE workflow, and OS-level isolation (ADR-010) is the primary
+credential protection — not a separate tool boundary.
 
 ### `local_script`
 
 Executes skill helper scripts locally via `spawn()`. No command validation
 (scripts are from trusted `skills/` directory). Uses `resolveSkillScript()`
-for path resolution with traversal protection.
+in `infra/script-resolver.ts` for path resolution with traversal protection.
+
+**Output sanitization exemption**: Skill script output is NOT sanitized by
+`output-sanitizer.ts`. This is intentional — skill scripts are pre-reviewed
+(static analysis + AI semantic review + human approval) and operate as trusted
+code. The security boundary is the skill approval gate, not runtime sanitization.
 
 ---
 
 ## 6. Shared Infrastructure (`infra/`)
 
-### Security Pipeline Overview
+### 6.1 Execution Context System
+
+Commands are validated against context-specific whitelists. Different execution
+environments expose different command categories:
+
+| Context | Used by | Unique trait |
+|---------|---------|-------------|
+| `local` | `restricted_bash` | Most restrictive — no `file` category (cat/ls/find blocked, use agent file tools), no `general-env` (env/printenv blocked, redacted via sanitizer), no `inspection`/`compressed` |
+| `node` | `node_exec` | Full remote diagnostic set — file access, env inspection, compression tools all allowed |
+| `pod` | `pod_exec` | Same as node — full diagnostic set inside target pod |
+| `nsenter` | `pod_nsenter_exec` | Same as node — full diagnostic set in pod network namespace |
+| `ssh` | (future `ssh_exec`) | Same as node — full diagnostic set on remote host |
+
+Categories missing from `local` but present in remote contexts:
+
+| Category | Examples | Why blocked locally |
+|----------|----------|-------------------|
+| `file` | cat, ls, find, stat, du | Agent has dedicated file tools (Read, Grep, Glob) with path restrictions |
+| `general-env` | env, printenv | Would expose process environment; handled via output sanitizer in pipelines |
+| `inspection` | strace, ltrace, ldd | Debugging tools not needed in AgentBox container |
+| `compressed` | tar, gzip, zcat | Archive tools not needed locally |
+
+**Source**: `CONTEXT_CATEGORIES` in `src/tools/infra/command-sets.ts:224-234`
+
+### 6.2 Security Strategy: Pre-Execution vs Post-Execution
+
+The security pipeline uses two complementary strategies — understanding which
+strategy applies is essential when adding new commands or modifying sanitization:
 
 ```
-Pre-execution                        Post-execution
-┌─────────────────────┐              ┌──────────────────────┐
-│ command-validator.ts │              │ output-sanitizer.ts  │
-│ 6-pass pipeline:     │              │                      │
-│ 1. Shell operators   │              │ analyzeOutput()      │
-│ 2. Pipeline split    │              │   → detect sensitive │
-│ 3. Whitelist check   │              │     resource type    │
-│ 4. Pipeline validate │              │                      │
-│ 5. Command rules     │              │ applySanitizer()     │
-│ 6. Sensitive paths   │              │   → redact secrets,  │
-└─────────────────────┘              │     sanitize env vars│
-                                      └──────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│ PRE-EXECUTION: Block commands that could LEAK or ESCALATE          │
+│                                                                     │
+│ command-validator.ts — 6-pass pipeline                              │
+│   Pass 1: Shell operators ($(), backticks, redirections)            │
+│   Pass 2: Pipeline extraction (| && || ;)                          │
+│   Pass 3: Binary whitelist (context-based)                         │
+│   Pass 4: Pipeline validators (kubectl subcommands)                │
+│   Pass 5: COMMAND_RULES (pipeOnly, blockedFlags, etc.)             │
+│   Pass 6: Sensitive path patterns (25+ patterns, see security.md)  │
+│                                                                     │
+│ Blocks: unknown binaries, write operations, credential path access  │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                            command executes
+                                  │
+┌─────────────────────────────────────────────────────────────────────┐
+│ POST-EXECUTION: Redact output from commands SAFE TO RUN            │
+│                                                                     │
+│ output-sanitizer.ts — 3-layer sanitization                         │
+│                                                                     │
+│ Layer 1: analyzeOutput(binary, args)                               │
+│   → Pre-analysis: detect if command targets sensitive resource type │
+│   → Returns OutputAction with sanitize function for Layer 2        │
+│                                                                     │
+│ Layer 2: applySanitizer(stdout, action)                            │
+│   → Apply the registered sanitizer from Layer 1                    │
+│   → Redacts: Secret values, ConfigMap data, env vars, credentials  │
+│                                                                     │
+│ Layer 3: Pipeline fallback (restricted-bash.ts only)               │
+│   → If kubectl targets sensitive resource in a MULTI-COMMAND       │
+│     pipeline, apply broad line-level redaction to final output     │
+│   → Safety net: catches cases where pipeline's last command has    │
+│     no registered sanitizer                                        │
+│                                                                     │
+│ Handles: kubectl get secret (runs, output redacted),               │
+│          env/printenv (runs, sensitive vars stripped),              │
+│          crictl inspect (runs, env vars in JSON redacted)          │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### How to Add a New Command to the Whitelist
+**The key distinction**:
+- Sensitive **paths** (credential files, /proc/environ) → **pre-execution blocking** (Pass 6)
+- Sensitive **resource types** (Secret, ConfigMap) → **post-execution redaction** (output sanitizer)
+- Dangerous **operations** (write, exec, redirect) → **pre-execution blocking** (Passes 1-5)
+
+**Cross-cutting concern**: When modifying `output-sanitizer.ts`, verify that
+existing skill scripts are not affected — skill output bypasses sanitization
+(see §5 `local_script`), but ad-hoc commands that skills depend on (e.g.,
+`kubectl get configmap`) go through the sanitizer. See `docs/design/sanitization.md`
+for the full specification.
+
+**Source**: `src/tools/infra/command-validator.ts`, `src/tools/infra/output-sanitizer.ts`
+
+### 6.3 How to Add a New Command to the Whitelist
 
 1. Add the command name to `ALLOWED_COMMANDS` in `command-sets.ts`
 2. Add it to `COMMAND_CATEGORIES` with its functional category
@@ -204,7 +285,7 @@ Pre-execution                        Post-execution
    add an entry to `COMMAND_RULES`
 4. If the category is new, add it to `CONTEXT_CATEGORIES` for each applicable context
 
-### How to Add a COMMAND\_RULE
+### 6.4 How to Add a COMMAND\_RULE
 
 Rules are declarative and JSON-serializable:
 
@@ -224,7 +305,7 @@ COMMAND_RULES["mycommand"] = {
 };
 ```
 
-### How to Add an Output Sanitization Rule
+### 6.5 How to Add an Output Sanitization Rule
 
 Add a new entry to `OUTPUT_RULES` in `output-sanitizer.ts`:
 

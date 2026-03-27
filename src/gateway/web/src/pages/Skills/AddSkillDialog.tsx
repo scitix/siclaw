@@ -71,7 +71,7 @@ export function AddSkillDialog({
             rpcGetSkills(sendRpc, { limit: 200, workspaceId }),
             rpcGetSkillSpace(sendRpc, workspaceId, skillSpaceId),
         ]).then(([result, spaceDetail]) => {
-            setGlobalSkills(result.skills.filter(s => s.scope === 'builtin' || s.scope === 'team'));
+            setGlobalSkills(result.skills.filter(s => s.scope === 'builtin' || s.scope === 'global'));
             setPersonalSkills(result.skills.filter(s => s.scope === 'personal'));
             setExistingNames(new Set((spaceDetail.skills ?? []).map((s: Skill) => s.name)));
             setLoading(false);

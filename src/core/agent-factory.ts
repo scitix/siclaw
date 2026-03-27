@@ -436,7 +436,7 @@ export async function createSiclawSession(
   // Skill directories (three fixed sources):
   // 1. Builtin core: baked into Docker image at /app/skills/core/
   // 2. Builtin extension: baked into Docker image at /app/skills/extension/
-  // 3. Dynamic: team + personal written by bundle API to skillsBase (.siclaw/skills/)
+  // 3. Dynamic: global + personal written by bundle API to skillsBase (.siclaw/skills/)
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
 

@@ -113,8 +113,8 @@ export const skills = sqliteTable("skills", {
   stagingVersion: integer("staging_version").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
-  teamSourceSkillId: text("team_source_skill_id"),
-  teamPinnedVersion: integer("team_pinned_version"),
+  globalSourceSkillId: text("global_source_skill_id"),
+  globalPinnedVersion: integer("global_pinned_version"),
   forkedFromId: text("forked_from_id"),
   labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
   skillSpaceId: text("skill_space_id").references(() => skillSpaces.id, { onDelete: "set null" }),
@@ -144,7 +144,16 @@ export const skillVersions = sqliteTable("skill_versions", {
   version: integer("version").notNull(),
   specs: text("specs"),
   scriptsJson: text("scripts_json", { mode: "json" }).$type<Array<{ name: string; content: string }>>(),
-  files: text("files", { mode: "json" }).$type<{ specs?: string; scripts?: string[] }>(),
+  files: text("files", { mode: "json" }).$type<{
+    specs?: string;
+    scripts?: string[];
+    metadata?: {
+      name?: string | null;
+      description?: string | null;
+      type?: string | null;
+      labels?: string[] | null;
+    };
+  }>(),
   commitMessage: text("commit_message"),
   authorId: text("author_id").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),

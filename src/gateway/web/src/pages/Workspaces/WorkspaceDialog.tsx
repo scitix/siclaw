@@ -26,7 +26,7 @@ type SkillComposerSkillOption = {
     dirName: string;
     description?: string | null;
     labels?: string[];
-    scope: 'builtin' | 'team' | 'personal' | 'skillset';
+    scope: 'builtin' | 'global' | 'personal' | 'skillset';
     skillSpaceId?: string;
 };
 
@@ -126,8 +126,8 @@ function SelectAllBar({ total, selected, onSelectAll, onDeselectAll, disableSele
 
 function sourceLabel(scope: SkillComposerSkillOption['scope']): string {
     switch (scope) {
-        case 'team':
-            return 'team';
+        case 'global':
+            return 'global';
         case 'builtin':
             return 'builtin';
         case 'personal':
@@ -332,7 +332,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         for (const skill of composerOptions.globalSkills) {
             if (!selectedGlobalRefSet.has(skill.ref)) continue;
             const current = sourceEntries.get(skill.dirName) ?? [];
-            current.push({ source: skill.scope === 'team' ? `Global (${skill.name}, team)` : `Global (${skill.name})`, priority: skill.scope === 'team' ? 1 : 0 });
+            current.push({ source: skill.scope === 'global' ? `Global (${skill.name}, global)` : `Global (${skill.name})`, priority: skill.scope === 'global' ? 1 : 0 });
             sourceEntries.set(skill.dirName, current);
         }
         for (const selection of composer.skillSpaces) {
@@ -368,7 +368,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         const winners = new Map<string, number>();
         for (const skill of composerOptions.globalSkills) {
             if (!selectedGlobalRefSet.has(skill.ref)) continue;
-            winners.set(skill.dirName, Math.max(winners.get(skill.dirName) ?? -1, skill.scope === 'team' ? 1 : 0));
+            winners.set(skill.dirName, Math.max(winners.get(skill.dirName) ?? -1, skill.scope === 'global' ? 1 : 0));
         }
         for (const selection of composer.skillSpaces) {
             const space = composerOptions.skillSpaces.find(item => item.id === selection.skillSpaceId);
@@ -769,7 +769,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                         <div className="flex items-center justify-between gap-4 mb-3">
                                             <div>
                                                 <h3 className="text-sm font-semibold text-gray-900">Global Skills</h3>
-                                                <p className="text-xs text-gray-500 mt-1">Pick the builtin and team skills this workspace should load.</p>
+                                                <p className="text-xs text-gray-500 mt-1">Pick the builtin and global skills this workspace should load.</p>
                                             </div>
                                         </div>
                                         <div className="relative mb-2">

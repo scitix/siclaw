@@ -107,7 +107,7 @@ export const skills = mysqlTable("skills", {
   description: text("description"),
   type: varchar("type", { length: 50 }),
   version: int("version").notNull().default(1),
-  scope: mysqlEnum("scope", ["builtin", "team", "personal", "global", "skillset"])
+  scope: mysqlEnum("scope", ["builtin", "global", "personal", "skillset"])
     .notNull()
     .default("personal"),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
@@ -125,8 +125,8 @@ export const skills = mysqlTable("skills", {
   stagingVersion: int("staging_version").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
-  teamSourceSkillId: varchar("team_source_skill_id", { length: 64 }),
-  teamPinnedVersion: int("team_pinned_version"),
+  globalSourceSkillId: varchar("global_source_skill_id", { length: 64 }),
+  globalPinnedVersion: int("global_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
   labelsJson: json("labels_json").$type<string[]>(),
   skillSpaceId: varchar("skill_space_id", { length: 64 }).references(() => skillSpaces.id),
@@ -156,7 +156,16 @@ export const skillVersions = mysqlTable("skill_versions", {
   version: int("version").notNull(),
   specs: text("specs"),
   scriptsJson: json("scripts_json").$type<Array<{ name: string; content: string }>>(),
-  files: json("files").$type<{ specs?: string; scripts?: string[] }>(),
+  files: json("files").$type<{
+    specs?: string;
+    scripts?: string[];
+    metadata?: {
+      name?: string | null;
+      description?: string | null;
+      type?: string | null;
+      labels?: string[] | null;
+    };
+  }>(),
   commitMessage: varchar("commit_message", { length: 500 }),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
