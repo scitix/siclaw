@@ -22,7 +22,7 @@ describe("CONTAINER_SENSITIVE_PATHS pattern matching", () => {
     // Process info
     "cat /proc/1/environ",
     "cat /proc/42/cmdline",
-    "ls /proc/1/fd/",
+    "cat /proc/1/fd/3",
     "strings /proc/1/mem",
     "cat /proc/1/maps",
     "cat /proc/1/smaps",
