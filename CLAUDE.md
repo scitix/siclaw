@@ -49,7 +49,7 @@ Gateway DB is **single-process** (PID lockfile) — do not run multiple Gateway 
 
 ### 🟡 Brain Type Gap
 
-Memory tools are **pi-agent only**. When adding tools, test both brain types.
+Memory tools are **pi-agent only**. When adding tools, ensure the code handles both brain types (TypeBox for pi-agent, Zod/MCP for claude-sdk).
 
 ### 🟡 mTLS Scope
 
@@ -104,7 +104,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 3. **Compounding engineering** — if something broke that pre-flight didn't predict, update the Change Impact Matrix immediately. Every surprise improves the harness for the next session. New architectural decisions with non-obvious rationale → add an ADR to `docs/design/decisions.md`.
 
 Cross-cutting concerns from pre-flight are verified in two ways:
-- **If tests exist** → `npm test` already covers it (our security path tests are comprehensive)
+- **If tests exist** → `npm test` already covers it (security paths have heavy test coverage — command-sets, kubectl-sanitize, sensitive-path-protection)
 - **If no tests exist** → flag it for the reviewer in your PR description. Do not silently assume it's fine.
 
 ### Reviewer Protocol
