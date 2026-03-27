@@ -34,10 +34,10 @@ export function McpServersPage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadServers();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadServers();
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const filtered = useMemo(() => {
