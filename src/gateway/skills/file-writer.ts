@@ -3,7 +3,7 @@
  *
  * Directory layout:
  *   skills/core/{skillName}/SKILL.md           — builtin (baked in Docker image)
- *   .siclaw/skills/team/{skillName}/SKILL.md   — team (from DB)
+ *   .siclaw/skills/global/{skillName}/SKILL.md  — global (from DB)
  *   .siclaw/skills/user/{userId}/{skillName}/   — personal (from DB)
  */
 
@@ -19,7 +19,7 @@ export interface SkillFiles {
   }>;
 }
 
-export type SkillFileScope = "builtin" | "team" | "personal" | "skillset";
+export type SkillFileScope = "builtin" | "global" | "personal" | "skillset";
 
 export interface ScannedSkill {
   dirName: string;
@@ -39,7 +39,7 @@ export class SkillFileWriter {
 
   /** Initialize Skills PV (ensure dirs exist) */
   async init(): Promise<void> {
-    for (const sub of ["core", "extension", "team", "user", "skillset", "platform"]) {
+    for (const sub of ["core", "extension", "global", "user", "skillset", "platform"]) {
       const dir = path.join(this.skillsDir, sub);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -58,8 +58,8 @@ export class SkillFileWriter {
     switch (scope) {
       case "builtin":
         return resolveUnderDir(this.skillsDir, "core", dirName);
-      case "team":
-        return resolveUnderDir(this.skillsDir, "team", dirName);
+      case "global":
+        return resolveUnderDir(this.skillsDir, "global", dirName);
       case "personal":
         if (!userId) throw new Error("userId is required for personal scope");
         return resolveUnderDir(this.skillsDir, "user", userId, dirName);
@@ -272,9 +272,14 @@ export class SkillFileWriter {
   }
 
   /** Scan all skills under a scope directory */
-  scanScope(scope: "builtin" | "team" | "global"): ScannedSkill[] {
-    // "global" is an alias for builtin (builtin + team merged)
-    if (scope === "global") return [...this.scanScope("builtin"), ...this.scanScope("team")];
+  scanScope(scope: "builtin" | "global"): ScannedSkill[] {
+    // "global" merges builtin + global-dir-scoped skills
+    if (scope === "global") {
+      const builtins = this.scanScope("builtin");
+      const globalDir = path.join(this.skillsDir, "global");
+      const globalSkills = this.scanDir(globalDir, "global");
+      return [...builtins, ...globalSkills];
+    }
     if (scope === "builtin") {
       const results: ScannedSkill[] = [];
       const seen = new Set<string>();
@@ -290,9 +295,8 @@ export class SkillFileWriter {
       return results;
     }
 
-    // team scope
-    const scopeDir = path.join(this.skillsDir, "team");
-    return this.scanDir(scopeDir, "team");
+    // Exhaustive — both "global" and "builtin" handled above
+    return [];
   }
 
   /** Delete skill files from disk (including .published/ if present) */
@@ -462,13 +466,13 @@ export class SkillFileWriter {
     }
   }
 
-  /** Copy skill from user dir to team dir (for approve flow) */
-  async copyToTeam(
+  /** Copy skill from user dir to global dir (for approve flow) */
+  async copyToGlobal(
     userId: string,
     dirName: string,
-  ): Promise<{ teamDir: string }> {
+  ): Promise<{ globalDir: string }> {
     const srcDir = this.resolveDir("personal", dirName, userId);
-    const destDir = this.resolveDir("team", dirName);
+    const destDir = this.resolveDir("global", dirName);
 
     if (!fs.existsSync(srcDir)) {
       throw new Error(`Source skill not found: ${srcDir}`);
@@ -477,7 +481,7 @@ export class SkillFileWriter {
     // Copy recursively
     fs.cpSync(srcDir, destDir, { recursive: true });
 
-    return { teamDir: destDir };
+    return { globalDir: destDir };
   }
 
 }

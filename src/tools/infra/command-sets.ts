@@ -1,6 +1,9 @@
 /**
  * Shared command whitelist and command-level validators used by
  * restricted-bash, node-exec, and kubectl-exec tools.
+ *
+ * Cross-reference: src/gateway/skills/script-evaluator.ts (DANGER_PATTERNS).
+ * When modifying either file, verify the other still makes sense.
  */
 
 // ── Utility functions ────────────────────────────────────────────

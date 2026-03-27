@@ -35,6 +35,13 @@ import { SkillFileWriter, type SkillFiles } from "./skills/file-writer.js";
 import { SkillContentRepository, type SkillContentTag } from "./db/repositories/skill-content-repo.js";
 import { ScriptEvaluator } from "./skills/script-evaluator.js";
 import { SkillVersionRepository } from "./db/repositories/skill-version-repo.js";
+import {
+  arePublishableSkillFilesEqual,
+  arePublishableSkillStatesEqual,
+  arePublishableSkillMetadataEqual,
+  normalizeSkillLabels,
+  type PublishableSkillMetadata,
+} from "./skills/publishable-state.js";
 import { createTwoFilesPatch } from "diff";
 import yaml from "js-yaml";
 import type { CronService } from "./cron/cron-service.js";
@@ -270,7 +277,7 @@ export function createRpcMethods(
     dirName: string;
     description?: string | null;
     labels?: string[];
-    scope: "builtin" | "team" | "personal" | "skillset";
+    scope: "builtin" | "global" | "personal" | "skillset";
     skillSpaceId?: string;
   };
 
@@ -304,7 +311,7 @@ export function createRpcMethods(
   }
 
   function mergeSkillLabels(
-    scope: "builtin" | "team" | "personal" | "skillset",
+    scope: "builtin" | "global" | "personal" | "skillset",
     dirName: string,
     dbLabels: string[] | undefined,
     isAdmin: boolean,
@@ -397,18 +404,25 @@ export function createRpcMethods(
 
     const personalSkills: ComposerSkillOption[] = [];
     if (skillRepo) {
-      const teamSkills = await skillRepo.list({ scope: "team" });
-      for (const meta of teamSkills) {
+      const globalScopeSkills = await skillRepo.list({ scope: "global" });
+      const globalDirNames = new Set(globalScopeSkills.map((s: any) => s.dirName));
+      for (const meta of globalScopeSkills) {
         globalSkills.push({
           id: meta.id,
-          ref: `team:${meta.id}`,
+          ref: `global:${meta.id}`,
           name: meta.name,
           dirName: meta.dirName,
           description: meta.description,
-          labels: mergeSkillLabels("team", meta.dirName, (meta as any).labelsJson ?? undefined, isAdmin),
-          scope: "team",
+          labels: mergeSkillLabels("global", meta.dirName, (meta as any).labelsJson ?? undefined, isAdmin),
+          scope: "global",
         });
       }
+      // Dedup: global scope overrides builtin for same dirName
+      const deduped = globalSkills.filter(
+        (s) => s.scope !== "builtin" || !globalDirNames.has(s.dirName),
+      );
+      globalSkills.length = 0;
+      globalSkills.push(...deduped);
 
       const personalResult = await skillRepo.listForUser(userId, { scope: "personal", limit: 500 });
       for (const meta of personalResult.skills) {
@@ -584,7 +598,7 @@ export function createRpcMethods(
     for (const ref of composer.globalSkillRefs) {
       const skill = globalMap.get(ref);
       if (!skill) continue;
-      register(skill.dirName, skill.name, skill.scope === "team" ? 1 : 0);
+      register(skill.dirName, skill.name, skill.scope === "global" ? 1 : 0);
     }
     for (const selection of composer.skillSpaces) {
       const space = skillSpaceMap.get(selection.skillSpaceId);
@@ -607,6 +621,257 @@ export function createRpcMethods(
   const skillsDir = process.env.SICLAW_SKILLS_DIR || "./skills";
   const skillWriter = new SkillFileWriter(skillsDir);
 
+  function getCurrentPublishableMetadata(meta: {
+    name?: string | null;
+    description?: string | null;
+    type?: string | null;
+    labelsJson?: string[] | null;
+  }): PublishableSkillMetadata {
+    return {
+      name: meta.name ?? null,
+      description: meta.description ?? null,
+      type: meta.type ?? null,
+      labels: meta.labelsJson ?? null,
+    };
+  }
+
+  function getVersionSnapshotMetadata(version: {
+    files?: {
+      metadata?: PublishableSkillMetadata | null;
+    } | null;
+  } | null | undefined): PublishableSkillMetadata | null {
+    return version?.files?.metadata ?? null;
+  }
+
+  function getBuiltinPublishableMetadata(dirName: string): PublishableSkillMetadata {
+    const files = skillWriter.readSkill("builtin", dirName);
+    const parsed = skillWriter.parseFrontmatter(files?.specs ?? "");
+    return {
+      name: parsed.name || dirName,
+      description: parsed.description ?? null,
+      type: null,
+      labels: getLabelsForSkill(`builtin:${dirName}`),
+    };
+  }
+
+  function serializePublishableMetadata(metadata: PublishableSkillMetadata | null | undefined): string {
+    return `${JSON.stringify({
+      name: metadata?.name ?? null,
+      description: metadata?.description ?? null,
+      type: metadata?.type ?? null,
+      labels: normalizeSkillLabels(metadata?.labels),
+    }, null, 2)}\n`;
+  }
+
+  function filterVisibleLabels(labels: string[] | undefined, isAdmin: boolean): string[] | undefined {
+    if (!labels || labels.length === 0) return labels;
+    if (isAdmin) return labels;
+    const filtered = labels.filter(l => !ROLE_LABELS.has(l));
+    return filtered.length > 0 ? filtered : undefined;
+  }
+
+  async function hasUnpublishedSkillChanges(meta: {
+    id: string;
+    name?: string | null;
+    description?: string | null;
+    type?: string | null;
+    scope?: string | null;
+    reviewStatus?: string | null;
+    publishedVersion?: number | null;
+    labelsJson?: string[] | null;
+  }): Promise<boolean> {
+    if (meta.publishedVersion == null || !skillContentRepo) {
+      return false;
+    }
+
+    const workingTag: SkillContentTag = meta.scope === "global" ? "published" : "working";
+    const [working, published, publishedVersionRecord] = await Promise.all([
+      skillContentRepo.read(meta.id, workingTag),
+      skillContentRepo.read(meta.id, "published"),
+      skillVersionRepo ? skillVersionRepo.getByVersion(meta.id, meta.publishedVersion) : Promise.resolve(null),
+    ]);
+
+    return !arePublishableSkillStatesEqual(
+      {
+        metadata: getCurrentPublishableMetadata(meta),
+        files: {
+          specs: working?.specs ?? null,
+          scripts: working?.scripts ?? null,
+        },
+      },
+      {
+        metadata: getVersionSnapshotMetadata(publishedVersionRecord) ?? getCurrentPublishableMetadata(meta),
+        files: {
+          specs: published?.specs ?? null,
+          scripts: published?.scripts ?? null,
+        },
+      },
+    );
+  }
+
+  function restoreReviewStatus(meta: { publishedVersion?: number | null }): "approved" | "draft" {
+    return meta.publishedVersion != null ? "approved" : "draft";
+  }
+
+  async function notifySkillScopeReload(meta: {
+    scope?: string | null;
+    authorId?: string | null;
+    skillSpaceId?: string | null;
+  }, fallbackUserId: string): Promise<void> {
+    if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
+      const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
+      for (const member of members) notifySkillReload(member.userId);
+      return;
+    }
+    if (meta.authorId) {
+      notifySkillReload(meta.authorId);
+      return;
+    }
+    notifySkillReload(fallbackUserId);
+  }
+
+  async function resolveRelatedGlobalSkill(meta: {
+    id: string;
+    scope?: string | null;
+    dirName: string;
+    forkedFromId?: string | null;
+  }): Promise<any | null> {
+    if (!skillRepo) return null;
+    if (meta.scope === "global") return meta;
+
+    const seen = new Set<string>();
+    let cursorId = meta.forkedFromId ?? null;
+    while (cursorId && !seen.has(cursorId)) {
+      if (
+        cursorId.startsWith("builtin:") ||
+        cursorId.startsWith("core:") ||
+        cursorId.startsWith("extension:")
+      ) {
+        break;
+      }
+      seen.add(cursorId);
+      const sourceMeta = await skillRepo.getById(cursorId);
+      if (!sourceMeta) break;
+      if (sourceMeta.scope === "global") return sourceMeta;
+
+      const bySourceDir = await skillRepo.getByDirNameAndScope(sourceMeta.dirName, "global");
+      if (bySourceDir) return bySourceDir;
+
+      cursorId = (sourceMeta as any).forkedFromId ?? null;
+    }
+
+    return await skillRepo.getByDirNameAndScope(meta.dirName, "global");
+  }
+
+  async function resolveGlobalContributionBaseline(meta: {
+    id: string;
+    scope?: string | null;
+    dirName: string;
+    forkedFromId?: string | null;
+  }): Promise<{
+    files: SkillFiles | null;
+    metadata: PublishableSkillMetadata | null;
+    label: string;
+    prefix: string;
+  }> {
+    const globalSkill = await resolveRelatedGlobalSkill(meta);
+    if (globalSkill && skillContentRepo) {
+      return {
+        files: await skillContentRepo.read(globalSkill.id, "published"),
+        metadata: getCurrentPublishableMetadata(globalSkill as any),
+        label: "Latest global",
+        prefix: "global-main",
+      };
+    }
+
+    const seen = new Set<string>();
+    let cursorId = meta.forkedFromId ?? null;
+    while (cursorId && !seen.has(cursorId)) {
+      if (
+        cursorId.startsWith("builtin:") ||
+        cursorId.startsWith("core:") ||
+        cursorId.startsWith("extension:")
+      ) {
+        const dirName = cursorId.includes(":") ? cursorId.split(":").slice(1).join(":") : cursorId;
+        return {
+          files: skillWriter.readSkill("builtin", dirName),
+          metadata: getBuiltinPublishableMetadata(dirName),
+          label: "Builtin source",
+          prefix: "builtin-source",
+        };
+      }
+      seen.add(cursorId);
+      const sourceMeta = skillRepo ? await skillRepo.getById(cursorId) : null;
+      if (!sourceMeta) break;
+      cursorId = (sourceMeta as any).forkedFromId ?? null;
+    }
+
+    return {
+      files: null,
+      metadata: null,
+      label: "Latest global",
+      prefix: "global-main",
+    };
+  }
+
+  async function promoteSourceSnapshotToGlobal(
+    meta: {
+      id: string;
+      name: string;
+      description?: string | null;
+      type?: string | null;
+      dirName: string;
+      authorId?: string | null;
+      labelsJson?: string[] | null;
+    },
+    publishedVersion: number | null | undefined,
+    sourceTag: SkillContentTag,
+  ): Promise<string> {
+    if (!skillRepo) throw new Error("Database not available");
+
+    const allGlobal = await skillRepo.list({ scope: "global" });
+    const existingGlobal = allGlobal.find((s: any) => s.dirName === meta.dirName);
+
+    let globalSkillId: string;
+    const srcLabels = meta.labelsJson as string[] | null;
+    if (existingGlobal) {
+      globalSkillId = existingGlobal.id;
+      await skillRepo.update(existingGlobal.id, {
+        description: meta.description ?? undefined,
+        type: meta.type ?? undefined,
+        globalSourceSkillId: meta.id,
+        globalPinnedVersion: publishedVersion ?? null,
+        reviewStatus: "approved",
+        publishedVersion: publishedVersion ?? null,
+        labels: srcLabels ?? undefined,
+      });
+      await skillRepo.bumpVersion(existingGlobal.id);
+    } else {
+      globalSkillId = await skillRepo.create({
+        name: meta.name,
+        description: meta.description ?? undefined,
+        type: meta.type ?? undefined,
+        scope: "global",
+        authorId: meta.authorId ?? undefined,
+        dirName: meta.dirName,
+        labels: srcLabels ?? undefined,
+      });
+      await skillRepo.update(globalSkillId, {
+        globalSourceSkillId: meta.id,
+        globalPinnedVersion: publishedVersion ?? null,
+        reviewStatus: "approved",
+        publishedVersion: publishedVersion ?? null,
+      });
+    }
+
+    if (skillContentRepo) {
+      await skillContentRepo.copyToSkill(meta.id, globalSkillId, sourceTag, "published");
+    }
+
+    notifyAllSkillReload();
+    return globalSkillId;
+  }
+
   /** Notify a user's AgentBox(es) to hot-reload skills (fire-and-forget) */
   function notifySkillReload(userId: string): void {
     if (!resourceNotifier) return;
@@ -615,7 +880,7 @@ export function createRpcMethods(
     });
   }
 
-  /** Notify ALL active AgentBoxes to reload (for team/core skill changes) */
+  /** Notify ALL active AgentBoxes to reload (for global/core skill changes) */
   function notifyAllSkillReload(): void {
     if (!resourceNotifier) return;
     resourceNotifier.notifyAll(RESOURCE_DESCRIPTORS.skills).catch((err) => {
@@ -794,10 +1059,10 @@ export function createRpcMethods(
       ? "contribution_review_requested"
       : "skill_review_requested";
     const title = kind === "contribution"
-      ? `Skill "${skillName}" requests team promotion`
+      ? `Skill "${skillName}" requests global contribution`
       : `New skill "${skillName}" requires review`;
     const message = kind === "contribution"
-      ? `${authorName} wants to contribute this skill to the team.`
+      ? `${authorName} wants to contribute this skill to global.`
       : `Submitted by ${authorName}. Please review the scripts.`;
 
     // Notify each reviewer
@@ -2221,14 +2486,10 @@ export function createRpcMethods(
     const isAdmin = context.auth?.username === "admin";
 
     // Helper: filter role labels for non-admin users
-    const filterLabels = (labels: string[] | undefined): string[] | undefined => {
-      if (!labels || labels.length === 0) return labels;
-      if (isAdmin) return labels;
-      const filtered = labels.filter(l => !ROLE_LABELS.has(l));
-      return filtered.length > 0 ? filtered : undefined;
-    };
+    const filterLabels = (labels: string[] | undefined): string[] | undefined =>
+      filterVisibleLabels(labels, isAdmin);
 
-    // Resolve virtual scopes: "global" → builtin + team, "myskills" → personal + skillset
+    // Resolve virtual scopes: "global" → builtin + global, "myskills" → personal + skillset
     const isGlobalTab = scope === "global";
     const isMySkillsTab = scope === "myskills";
     const effectiveScope = isGlobalTab || isMySkillsTab ? undefined : scope;
@@ -2270,7 +2531,7 @@ export function createRpcMethods(
     const skipDbQuery = effectiveScope === "builtin" || effectiveScope === "skillset";
     if (!skipDbQuery) {
       const repoOpts: any = { limit, offset };
-      if (isGlobalTab) repoOpts.scope = "team";
+      if (isGlobalTab) repoOpts.scope = "global";
       else if (isMySkillsTab) repoOpts.scope = "personal";
       else if (effectiveScope) repoOpts.scope = effectiveScope;
       if (search) repoOpts.search = search;
@@ -2278,18 +2539,18 @@ export function createRpcMethods(
         ? await skillRepo.listForUser(userId, repoOpts)
         : { skills: [], hasMore: false };
 
-      // Enrich team skills with vote data
+      // Enrich global skills with vote data
       if (voteRepo) {
-        const teamSkillIds = dbResult.skills
-          .filter((s: any) => s.scope === "team")
+        const globalSkillIds = dbResult.skills
+          .filter((s: any) => s.scope === "global")
           .map((s: any) => s.id);
-        if (teamSkillIds.length > 0) {
+        if (globalSkillIds.length > 0) {
           const [counts, userVotes] = await Promise.all([
-            voteRepo.getCountsForSkills(teamSkillIds),
-            voteRepo.getUserVotes(teamSkillIds, userId),
+            voteRepo.getCountsForSkills(globalSkillIds),
+            voteRepo.getUserVotes(globalSkillIds, userId),
           ]);
           dbResult.skills = dbResult.skills.map((s: any) => {
-            if (s.scope !== "team") return s;
+            if (s.scope !== "global") return s;
             const c = counts.get(s.id);
             return {
               ...s,
@@ -2301,22 +2562,26 @@ export function createRpcMethods(
         }
       }
 
-      // Attach enabled field and labels to DB skills
-      dbResult.skills = dbResult.skills.map((s: any) => {
-        // Merge DB labels with filesystem labels (e.g. team meta.json)
+      // Attach enabled field, labels, and hasUnpublishedChanges to DB skills
+      dbResult.skills = await Promise.all(dbResult.skills.map(async (s: any) => {
+        // Merge DB labels with filesystem labels (e.g. global meta.json)
         const fsLabels = getLabelsForSkill(`${s.scope}:${s.dirName}`);
         const dbLabels: string[] = s.labelsJson ?? [];
         const merged = [...new Set([...dbLabels, ...fsLabels])];
         const { labelsJson: _, ...rest } = s;
+
+        const hasUnpublishedChanges = await hasUnpublishedSkillChanges(s);
+
         return {
           ...rest,
           labels: filterLabels(merged.length > 0 ? merged : undefined),
           enabled: !disabled.has(s.name),
+          hasUnpublishedChanges,
         };
-      });
+      }));
     }
 
-    // Skill space skills (when scope not filtered to builtin/team/global only, or when filtering by skillSpaceId)
+    // Skill space skills (when scope not filtered to builtin/global only, or when filtering by skillSpaceId)
     let skillSpaceSkills: any[] = [];
     if (skillSpaceId && !skillSpaceEnabled) {
       throw new Error("Skill Space is not available in the current workspace");
@@ -2326,12 +2591,14 @@ export function createRpcMethods(
       if (!isMember) throw new Error("Forbidden: you are not a member of this skill space");
       const spaceSkills = await skillRepo.listBySkillSpaceId(skillSpaceId);
       skillSpaceSkills = await Promise.all(spaceSkills.map(async (s: any) => {
-        const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "team");
+        const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "global");
+        const hasUnpublishedChanges = await hasUnpublishedSkillChanges(s);
         return {
           ...s,
           labels: filterLabels(s.labelsJson ?? undefined),
           enabled: !disabled.has(s.name),
           globalSkillId: globalSkill?.id ?? null,
+          hasUnpublishedChanges,
         };
       }));
       if (search) {
@@ -2346,13 +2613,15 @@ export function createRpcMethods(
       for (const space of userSpaces) {
         const spaceSkills = await skillRepo.listBySkillSpaceId(space.id);
         for (const s of spaceSkills) {
-          const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "team");
+          const globalSkill = await skillRepo.getByDirNameAndScope(s.dirName, "global");
+          const hasUnpublishedChanges = await hasUnpublishedSkillChanges(s);
           const entry: any = {
             ...s,
             labels: filterLabels((s as any).labelsJson ?? undefined),
             enabled: !disabled.has(s.name),
             skillSpaceName: space.name,
             globalSkillId: globalSkill?.id ?? null,
+            hasUnpublishedChanges,
           };
           if (search) {
             const q = search.toLowerCase();
@@ -2363,8 +2632,16 @@ export function createRpcMethods(
       }
     }
 
+    // Dedup: global scope overrides builtin for same dirName
+    const globalDirNames = new Set(
+      dbResult.skills.filter((s: any) => s.scope === "global").map((s: any) => s.dirName),
+    );
+    const dedupedBuiltins = builtinSkills.filter(
+      (s: any) => !globalDirNames.has(s.dirName),
+    );
+
     return {
-      skills: [...builtinSkills, ...dbResult.skills, ...skillSpaceSkills],
+      skills: [...dedupedBuiltins, ...dbResult.skills, ...skillSpaceSkills],
       hasMore: dbResult.hasMore,
     };
   });
@@ -2401,9 +2678,9 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Permission: personal = owner, team = admin, skillset = maintainer
+    // Permission: personal = owner, global = admin, skillset = maintainer
     if (meta.scope === "builtin") throw new Error("Cannot edit builtin skill labels");
-    if (meta.scope === "team") requireAdmin(context);
+    if (meta.scope === "global") requireAdmin(context);
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Forbidden: you can only edit your own skill labels");
     }
@@ -2413,8 +2690,14 @@ export function createRpcMethods(
     }
 
     // Sanitize: trim, dedupe, remove empty
-    const cleaned = [...new Set(labels.map(l => l.trim()).filter(Boolean))];
-    await skillRepo.update(skillId, { labels: cleaned.length > 0 ? cleaned : null });
+    const cleaned = normalizeSkillLabels(labels);
+    const currentLabels = normalizeSkillLabels((meta as any).labelsJson ?? undefined);
+    if (JSON.stringify(currentLabels) === JSON.stringify(cleaned)) {
+      return { id: skillId, labels: cleaned };
+    }
+
+    const nextLabels = cleaned.length > 0 ? cleaned : null;
+    await skillRepo.update(skillId, { labels: nextLabels });
 
     return { id: skillId, labels: cleaned };
   });
@@ -2477,12 +2760,12 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Read files: DB for team/personal, filesystem for builtin
+    // Read files: DB for global/personal, filesystem for builtin
     let files: SkillFiles | null = null;
     if (meta.scope === "builtin") {
       files = skillWriter.readSkill("builtin", meta.dirName);
     } else if (skillContentRepo) {
-      const tag = meta.scope === "team" ? "published" : "working";
+      const tag = meta.scope === "global" ? "published" : "working";
       files = await skillContentRepo.read(meta.id, tag as SkillContentTag);
     }
 
@@ -2524,9 +2807,11 @@ export function createRpcMethods(
 
     let globalSkillId: string | null = null;
     if (meta.scope === "skillset" && skillRepo) {
-      const existingGlobal = await skillRepo.getByDirNameAndScope(meta.dirName, "team");
+      const existingGlobal = await skillRepo.getByDirNameAndScope(meta.dirName, "global");
       globalSkillId = existingGlobal?.id ?? null;
     }
+
+    const hasUnpublishedChanges = await hasUnpublishedSkillChanges(meta as any);
 
     return {
       ...metaRest,
@@ -2535,10 +2820,11 @@ export function createRpcMethods(
       latestReview,
       publishedFiles,
       publishedVersion: (meta as any).publishedVersion ?? null,
-      teamSourceSkillId: (meta as any).teamSourceSkillId ?? null,
-      teamPinnedVersion: (meta as any).teamPinnedVersion ?? null,
+      globalSourceSkillId: (meta as any).globalSourceSkillId ?? null,
+      globalPinnedVersion: (meta as any).globalPinnedVersion ?? null,
       forkedFromId: (meta as any).forkedFromId ?? null,
       globalSkillId,
+      hasUnpublishedChanges,
       ...(skillSpaceName ? { skillSpaceName } : {}),
       ...(meta.scope === "skillset" ? { isSpaceMember, isSpaceMaintainer, isSpaceOwner } : {}),
     };
@@ -2602,7 +2888,7 @@ export function createRpcMethods(
     if (forkedFromId && !forkedFromId.startsWith("builtin:") && !forkedFromId.startsWith("core:") && !forkedFromId.startsWith("extension:")) {
       const source = await skillRepo.getById(forkedFromId);
       if (source && source.scope === "personal") {
-        throw new Error("Cannot copy personal skills. Only builtin and team skills can be forked.");
+        throw new Error("Cannot copy personal skills. Only builtin and global skills can be forked.");
       }
     }
 
@@ -2653,11 +2939,11 @@ export function createRpcMethods(
     // Strict cross-scope duplicate check — only forks are allowed to shadow
     if (!forkedFromId) {
       const builtinMatch = skillWriter.scanScope("builtin").find(s => s.dirName === dirName || s.name === name);
-      const teamRows = await skillRepo.list({ scope: "team" });
-      const teamMatch = teamRows.find((s: any) => s.dirName === dirName || s.name === name);
-      if (builtinMatch || teamMatch) {
+      const globalRows = await skillRepo.list({ scope: "global" });
+      const globalMatch = globalRows.find((s: any) => s.dirName === dirName || s.name === name);
+      if (builtinMatch || globalMatch) {
         throw new Error(
-          `A ${builtinMatch ? "builtin" : "team"} skill named "${name}" already exists. ` +
+          `A ${builtinMatch ? "builtin" : "global"} skill named "${name}" already exists. ` +
           `Use the fork/copy function to create a personal copy.`,
         );
       }
@@ -2755,13 +3041,13 @@ export function createRpcMethods(
       const fsLabels = getLabelsForSkill(`builtin:${sourceDirName}`);
       sourceLabels = fsLabels.length > 0 ? fsLabels : null;
     } else {
-      // DB skill (team or personal)
+      // DB skill (global or personal)
       const sourceMeta = await skillRepo.getById(sourceId);
       if (!sourceMeta) throw new Error(`Source skill not found: ${sourceId}`);
       if (sourceMeta.scope === "personal") {
         // Allow forking own personal skill into a skill space (keeps original)
         if (!targetSkillSpaceId || sourceMeta.authorId !== userId) {
-          throw new Error("Cannot fork personal skills. Only builtin and team skills can be forked.");
+          throw new Error("Cannot fork personal skills. Only builtin and global skills can be forked.");
         }
       }
       sourceName = sourceMeta.name;
@@ -2775,7 +3061,7 @@ export function createRpcMethods(
       sourceLabels = merged.length > 0 ? merged : null;
 
       if (skillContentRepo) {
-        const tag = sourceMeta.scope === "team" ? "published" : "working";
+        const tag = sourceMeta.scope === "global" ? "published" : "working";
         sourceFiles = await skillContentRepo.read(sourceMeta.id, tag as SkillContentTag);
       }
     }
@@ -2853,6 +3139,24 @@ export function createRpcMethods(
         // what changed inside the Skill Space after the fork.
         await skillContentRepo.save(id, "published", forkedFiles);
         await skillRepo.update(id, { publishedVersion: inheritVersion });
+        if (skillVersionRepo) {
+          await skillVersionRepo.create({
+            skillId: id,
+            version: inheritVersion,
+            commitMessage: `fork baseline from ${sourceId}`,
+            authorId: userId,
+            specs: forkedFiles.specs,
+            scriptsJson: forkedFiles.scripts ?? [],
+            files: {
+              metadata: {
+                name: effectiveName,
+                description: effectiveDescription ?? null,
+                type: effectiveType ?? null,
+                labels: cleanedLabels && cleanedLabels.length > 0 ? cleanedLabels : null,
+              },
+            },
+          });
+        }
         console.log(`[skill.fork] Initialized Skill Space baseline for ${id} from ${sourceId}`);
       }
 
@@ -2921,6 +3225,24 @@ export function createRpcMethods(
       // what changed after the fork (same pattern as skillset forks).
       await skillContentRepo.save(id, "published", forkedFiles);
       await skillRepo.update(id, { publishedVersion: inheritVersion });
+      if (skillVersionRepo) {
+        await skillVersionRepo.create({
+          skillId: id,
+          version: inheritVersion,
+          commitMessage: `fork baseline from ${sourceId}`,
+          authorId: userId,
+          specs: forkedFiles.specs,
+          scriptsJson: forkedFiles.scripts ?? [],
+          files: {
+            metadata: {
+              name: effectiveName,
+              description: effectiveDescription ?? null,
+              type: effectiveType ?? null,
+              labels: cleanedLabels && cleanedLabels.length > 0 ? cleanedLabels : null,
+            },
+          },
+        });
+      }
       console.log(`[skill.fork] Initialized personal baseline for ${id} from ${sourceId}`);
     }
 
@@ -3058,6 +3380,10 @@ export function createRpcMethods(
       }
     }
 
+    const existingWorkingFiles = skillContentRepo
+      ? await skillContentRepo.read(skillId, "working")
+      : null;
+
     // Resolve scripts: if content is missing, try DB then uploads dir then existing skill files
     // NOTE: an explicit empty array means "delete all scripts" — do NOT fall back to existing
     let scripts: Array<{ name: string; content: string }> | undefined;
@@ -3066,12 +3392,8 @@ export function createRpcMethods(
         scripts = [];
       } else {
         const uploadsDir = path.join(skillsDir, "user", userId, "uploads");
-        let existingFiles: SkillFiles | null = null;
-        if (skillContentRepo) {
-          existingFiles = await skillContentRepo.read(skillId, "working");
-        }
         const existingScriptsMap = new Map(
-          (existingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
+          (existingWorkingFiles?.scripts ?? []).map((s) => [s.name, s.content]),
         );
         scripts = rawScripts.map((s) => {
           if (s.content) return { name: s.name, content: s.content };
@@ -3088,13 +3410,11 @@ export function createRpcMethods(
       }
     }
 
-    // Save content to DB
+    let mergedFiles: SkillFiles | null = null;
     if (skillContentRepo) {
-      // Merge: only update fields that were provided
-      const existing = await skillContentRepo.read(skillId, "working");
-      const mergedFiles: SkillFiles = {
-        specs: specs ?? existing?.specs,
-        scripts: scripts ?? existing?.scripts,
+      mergedFiles = {
+        specs: specs ?? existingWorkingFiles?.specs,
+        scripts: scripts ?? existingWorkingFiles?.scripts,
       };
       // If name changed but no new specs provided, sync name into existing specs
       if (newName !== undefined && !specs && mergedFiles.specs) {
@@ -3103,7 +3423,6 @@ export function createRpcMethods(
           mergedFiles.specs = skillWriter.setFrontmatterName(mergedFiles.specs, newName);
         }
       }
-      await skillContentRepo.save(skillId, "working", mergedFiles);
     }
 
     // Update DB metadata (dirName is immutable after creation)
@@ -3125,15 +3444,52 @@ export function createRpcMethods(
     if (params.type) updates.type = params.type;
     if (params.labels !== undefined) {
       const cleaned = Array.isArray(params.labels)
-        ? (params.labels as string[]).map(l => l.trim()).filter(Boolean)
+        ? normalizeSkillLabels(params.labels as string[])
         : null;
       updates.labels = cleaned && cleaned.length > 0 ? cleaned : null;
     }
 
     // Staging model: user can freely edit working copy while pending — staging is unaffected
 
-    await skillRepo.update(skillId, updates);
-    await skillRepo.bumpVersion(skillId);
+    const hasOwnUpdate = (key: string): boolean => Object.prototype.hasOwnProperty.call(updates, key);
+    const metadataChanged = !arePublishableSkillMetadataEqual(
+      {
+        name: meta.name,
+        description: meta.description ?? null,
+        type: meta.type ?? null,
+        labels: (meta as any).labelsJson ?? null,
+      },
+      {
+        name: hasOwnUpdate("name") ? (updates.name as string | null | undefined) : meta.name,
+        description: hasOwnUpdate("description") ? (updates.description as string | null | undefined) : (meta.description ?? null),
+        type: hasOwnUpdate("type") ? (updates.type as string | null | undefined) : (meta.type ?? null),
+        labels: hasOwnUpdate("labels") ? (updates.labels as string[] | null | undefined) : ((meta as any).labelsJson ?? null),
+      },
+    );
+    const filesChanged = skillContentRepo
+      ? !arePublishableSkillFilesEqual(
+          {
+            specs: existingWorkingFiles?.specs ?? null,
+            scripts: existingWorkingFiles?.scripts ?? null,
+          },
+          {
+            specs: mergedFiles?.specs ?? null,
+            scripts: mergedFiles?.scripts ?? null,
+          },
+        )
+      : rawSpecs !== undefined || Array.isArray(rawScripts);
+
+    if (!metadataChanged && !filesChanged) {
+      return { status: "updated" };
+    }
+
+    if (filesChanged && skillContentRepo && mergedFiles) {
+      await skillContentRepo.save(skillId, "working", mergedFiles);
+    }
+    if (metadataChanged) {
+      await skillRepo.update(skillId, updates);
+    }
+    // Version is NOT bumped on save — only on approve/rollback.
 
     // Notify reload
     if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
@@ -3159,8 +3515,8 @@ export function createRpcMethods(
 
     // Builtin skills cannot be deleted (filesystem-only, not in DB)
     if (meta.scope === "builtin") throw new Error("Builtin skills cannot be deleted");
-    // Team skills require admin
-    if (meta.scope === "team") requireAdmin(context);
+    // Global skills require admin
+    if (meta.scope === "global") requireAdmin(context);
     // Personal skills require ownership
     if (meta.scope === "personal" && meta.authorId !== userId) {
       throw new Error("Forbidden: you can only delete your own personal skills");
@@ -3189,7 +3545,7 @@ export function createRpcMethods(
     await skillRepo.deleteById(skillId);
 
     // Notify reload
-    if (meta.scope === "team") {
+    if (meta.scope === "global") {
       notifyAllSkillReload();
     } else if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
       const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
@@ -3234,7 +3590,8 @@ export function createRpcMethods(
   methods.set("skill.diff", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillId = params.id as string;
-    const teamDiff = params.teamDiff as boolean | undefined;
+    const globalDiff = (params.globalDiff ?? params.teamDiff) as boolean | undefined;
+    const targetScope = params.targetScope as "global" | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
     if (!skillRepo) throw new Error("Database not available");
@@ -3256,15 +3613,57 @@ export function createRpcMethods(
       if (!isReviewer && !isMember) throw new Error("Skill not found");
     }
 
-    /** Build a unified diff string for specs + all scripts between two SkillFiles */
+    function normalizeMetadataValue(value: string | string[] | null | undefined): string | string[] | null {
+      if (Array.isArray(value)) return normalizeSkillLabels(value);
+      return value ?? null;
+    }
+
+    function buildMetadataChanges(
+      oldState: { metadata?: PublishableSkillMetadata | null; files?: SkillFiles | null } | null,
+      newState: { metadata?: PublishableSkillMetadata | null; files?: SkillFiles | null } | null,
+    ) {
+      const oldMetadata = oldState?.metadata ?? null;
+      const newMetadata = newState?.metadata ?? null;
+      const specsChanged = (oldState?.files?.specs ?? null) !== (newState?.files?.specs ?? null);
+      const changes: Array<{ field: "name" | "description" | "type" | "labels"; before: string | string[] | null; after: string | string[] | null }> = [];
+
+      const maybePush = (
+        field: "name" | "description" | "type" | "labels",
+        before: string | string[] | null | undefined,
+        after: string | string[] | null | undefined,
+      ) => {
+        const normalizedBefore = normalizeMetadataValue(before);
+        const normalizedAfter = normalizeMetadataValue(after);
+        if (JSON.stringify(normalizedBefore) === JSON.stringify(normalizedAfter)) return;
+        changes.push({
+          field,
+          before: normalizedBefore,
+          after: normalizedAfter,
+        });
+      };
+
+      if (!specsChanged) {
+        maybePush("name", oldMetadata?.name, newMetadata?.name);
+        maybePush("description", oldMetadata?.description, newMetadata?.description);
+      }
+      maybePush("type", oldMetadata?.type, newMetadata?.type);
+      maybePush("labels", oldMetadata?.labels, newMetadata?.labels);
+
+      return changes;
+    }
+
+    /** Build a unified diff string for publishable files only */
     function buildFullDiff(
-      oldFiles: SkillFiles | null,
-      newFiles: SkillFiles | null,
+      oldState: { metadata?: PublishableSkillMetadata | null; files?: SkillFiles | null } | null,
+      newState: { metadata?: PublishableSkillMetadata | null; files?: SkillFiles | null } | null,
       oldPrefix: string,
       newPrefix: string,
     ): string {
-      if (!oldFiles && !newFiles) return "Baseline not found — cannot compute diff.";
+      if (!oldState && !newState) return "Baseline not found — cannot compute diff.";
       const parts: string[] = [];
+
+      const oldFiles = oldState?.files ?? null;
+      const newFiles = newState?.files ?? null;
 
       // SKILL.md diff
       const oldSpecs = oldFiles?.specs || "";
@@ -3298,12 +3697,50 @@ export function createRpcMethods(
       return parts.length > 0 ? parts.join("\n") : "No changes detected.";
     }
 
+    if (globalDiff || targetScope === "global") {
+      // Global-target review: latest global main vs the submitted candidate
+      const globalBaseline = await resolveGlobalContributionBaseline(meta as any);
+
+      let stagingFiles: SkillFiles | null = null;
+      if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
+
+      let compareFiles = stagingFiles;
+      let compareLabel = "Candidate staging";
+      let comparePrefix = "candidate-staging";
+      if (!compareFiles && skillContentRepo) {
+        compareFiles = await skillContentRepo.read(skillId, "working");
+        compareLabel = "Candidate draft";
+        comparePrefix = "candidate-draft";
+      }
+
+      return {
+        metadataChanges: buildMetadataChanges(
+          { metadata: globalBaseline.metadata, files: globalBaseline.files },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+        ),
+        diff: buildFullDiff(
+          { metadata: globalBaseline.metadata, files: globalBaseline.files },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+          globalBaseline.prefix,
+          comparePrefix,
+        ),
+        baselineLabel: globalBaseline.label,
+        compareLabel,
+      };
+    }
+
     if (meta.scope === "skillset") {
       let baselineFiles: SkillFiles | null = null;
+      let baselineMetadata: PublishableSkillMetadata | null = null;
       let baselineLabel = "Skill Space baseline";
       let baselinePrefix = "skill-space-baseline";
       if (skillContentRepo) {
         baselineFiles = await skillContentRepo.read(skillId, "published");
+      }
+      if ((meta as any).publishedVersion != null && skillVersionRepo) {
+        baselineMetadata = getVersionSnapshotMetadata(
+          await skillVersionRepo.getByVersion(skillId, (meta as any).publishedVersion),
+        ) ?? getCurrentPublishableMetadata(meta as any);
       }
 
       if (!baselineFiles && meta.forkedFromId) {
@@ -3315,14 +3752,16 @@ export function createRpcMethods(
           } else {
             baselineFiles = skillWriter.readSkill("builtin", dirName);
           }
+          baselineMetadata = getBuiltinPublishableMetadata(dirName);
           baselineLabel = "Builtin source";
           baselinePrefix = "builtin-source";
         } else if (skillContentRepo) {
           const sourceMeta = await skillRepo.getById(meta.forkedFromId);
           if (sourceMeta) {
-            const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
+            const sourceTag = sourceMeta.scope === "global" ? "published" : "working";
             baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
-            if (sourceMeta.scope === "team") {
+            baselineMetadata = getCurrentPublishableMetadata(sourceMeta as any);
+            if (sourceMeta.scope === "global") {
               baselineLabel = "Global published";
               baselinePrefix = "global-published";
             } else if (sourceMeta.scope === "skillset") {
@@ -3348,19 +3787,34 @@ export function createRpcMethods(
       }
 
       return {
-        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        metadataChanges: buildMetadataChanges(
+          { metadata: baselineMetadata, files: baselineFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+        ),
+        diff: buildFullDiff(
+          { metadata: baselineMetadata, files: baselineFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+          baselinePrefix,
+          comparePrefix,
+        ),
         baselineLabel,
         compareLabel,
       };
     }
 
     // Personal fork diff: fork baseline vs current working/staging
-    if (meta.scope === "personal" && meta.forkedFromId && !teamDiff) {
+    if (meta.scope === "personal" && meta.forkedFromId && !globalDiff) {
       let baselineFiles: SkillFiles | null = null;
+      let baselineMetadata: PublishableSkillMetadata | null = null;
       let baselineLabel = "Fork baseline";
       let baselinePrefix = "fork-baseline";
       if (skillContentRepo) {
         baselineFiles = await skillContentRepo.read(skillId, "published");
+      }
+      if ((meta as any).publishedVersion != null && skillVersionRepo) {
+        baselineMetadata = getVersionSnapshotMetadata(
+          await skillVersionRepo.getByVersion(skillId, (meta as any).publishedVersion),
+        ) ?? getCurrentPublishableMetadata(meta as any);
       }
 
       if (!baselineFiles) {
@@ -3372,14 +3826,16 @@ export function createRpcMethods(
           } else {
             baselineFiles = skillWriter.readSkill("builtin", dirName);
           }
+          baselineMetadata = getBuiltinPublishableMetadata(dirName);
           baselineLabel = "Builtin source";
           baselinePrefix = "builtin-source";
         } else if (skillContentRepo) {
           const sourceMeta = await skillRepo.getById(meta.forkedFromId);
           if (sourceMeta) {
-            const sourceTag = sourceMeta.scope === "team" ? "published" : "working";
+            const sourceTag = sourceMeta.scope === "global" ? "published" : "working";
             baselineFiles = await skillContentRepo.read(sourceMeta.id, sourceTag as SkillContentTag);
-            if (sourceMeta.scope === "team") {
+            baselineMetadata = getCurrentPublishableMetadata(sourceMeta as any);
+            if (sourceMeta.scope === "global") {
               baselineLabel = "Global published";
               baselinePrefix = "global-published";
             } else if (sourceMeta.scope === "skillset") {
@@ -3405,33 +3861,31 @@ export function createRpcMethods(
       }
 
       return {
-        diff: buildFullDiff(baselineFiles, compareFiles, baselinePrefix, comparePrefix),
+        metadataChanges: buildMetadataChanges(
+          { metadata: baselineMetadata, files: baselineFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+        ),
+        diff: buildFullDiff(
+          { metadata: baselineMetadata, files: baselineFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+          baselinePrefix,
+          comparePrefix,
+        ),
         baselineLabel,
         compareLabel,
       };
     }
 
-    if (teamDiff) {
-      // Team contribution review: team version vs user's published version
-      let teamFiles: SkillFiles | null = null;
-      if (skillContentRepo) {
-        const allTeam = await skillRepo.list({ scope: "team" });
-        const teamSkill = allTeam.find((s: any) => s.dirName === meta.dirName);
-        if (teamSkill) teamFiles = await skillContentRepo.read(teamSkill.id, "published");
-      }
-
-      let publishedFiles: SkillFiles | null = null;
-      if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
-
-      return {
-        diff: buildFullDiff(teamFiles, publishedFiles, "team", "contributed"),
-        baselineLabel: "Global published",
-        compareLabel: "Contributed",
-      };
-    } else {
+    {
       // Publish review: published vs staging
       let publishedFiles: SkillFiles | null = null;
+      let publishedMetadata: PublishableSkillMetadata | null = null;
       if (skillContentRepo) publishedFiles = await skillContentRepo.read(skillId, "published");
+      if ((meta as any).publishedVersion != null && skillVersionRepo) {
+        publishedMetadata = getVersionSnapshotMetadata(
+          await skillVersionRepo.getByVersion(skillId, (meta as any).publishedVersion),
+        ) ?? getCurrentPublishableMetadata(meta as any);
+      }
 
       let stagingFiles: SkillFiles | null = null;
       if (skillContentRepo) stagingFiles = await skillContentRepo.read(skillId, "staging");
@@ -3446,7 +3900,16 @@ export function createRpcMethods(
         comparePrefix = "draft";
       }
       return {
-        diff: buildFullDiff(publishedFiles, compareFiles, "published", comparePrefix),
+        metadataChanges: buildMetadataChanges(
+          { metadata: publishedMetadata, files: publishedFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+        ),
+        diff: buildFullDiff(
+          { metadata: publishedMetadata, files: publishedFiles },
+          { metadata: getCurrentPublishableMetadata(meta as any), files: compareFiles },
+          "published",
+          comparePrefix,
+        ),
         baselineLabel: "Published",
         compareLabel,
       };
@@ -3468,7 +3931,7 @@ export function createRpcMethods(
     // Permission check
     if (meta.scope === "personal") {
       if (meta.authorId !== userId) throw new Error("Forbidden: can only rollback your own skills");
-    } else if (meta.scope === "team") {
+    } else if (meta.scope === "global") {
       requireAdmin(context);
     } else {
       throw new Error("Cannot rollback builtin skills");
@@ -3497,11 +3960,24 @@ export function createRpcMethods(
 
     if (!rollbackFiles) throw new Error("Cannot restore version content: no inline data in skill_versions");
 
+    const rollbackFrontmatter = skillWriter.parseFrontmatter(rollbackFiles.specs ?? "");
+    const rollbackMetadata = getVersionSnapshotMetadata(targetVer) ?? {
+      ...getCurrentPublishableMetadata(meta as any),
+      name: rollbackFrontmatter.name || meta.name,
+      description: rollbackFrontmatter.description || (meta.description ?? null),
+    };
+
     // Persist rolled-back content to DB (working + published)
     if (skillContentRepo) {
       await skillContentRepo.save(skillId, "working", rollbackFiles);
       await skillContentRepo.save(skillId, "published", rollbackFiles);
     }
+    await skillRepo.update(skillId, {
+      name: rollbackMetadata.name ?? undefined,
+      description: rollbackMetadata.description ?? undefined,
+      type: rollbackMetadata.type ?? undefined,
+      labels: rollbackMetadata.labels,
+    });
 
     // Create new version (rollback creates a new version with old content)
     await skillRepo.bumpVersion(skillId);
@@ -3513,16 +3989,22 @@ export function createRpcMethods(
       version: newVersion,
       specs: rollbackFiles.specs,
       scriptsJson: rollbackFiles.scripts,
+      files: {
+        metadata: rollbackMetadata,
+      },
       commitMessage: `rollback to v${targetVer.version}`,
       authorId: userId,
     });
 
     // Update publishedVersion to new version
-    await skillRepo.update(skillId, { publishedVersion: newVersion });
+    await skillRepo.update(skillId, {
+      publishedVersion: newVersion,
+      contributionStatus: meta.scope === "personal" ? "none" : undefined,
+    });
 
     // Notify reload
     const scope = meta.scope as string;
-    if (scope === "team") {
+    if (scope === "global") {
       notifyAllSkillReload();
     } else {
       notifySkillReload(meta.authorId ?? userId);
@@ -3535,12 +4017,12 @@ export function createRpcMethods(
    * skill.submit — unified submit for publish review (replaces skill.requestPublish + skill.publish)
    *
    * Flow: draft → pending (triggers AI review + reviewer notification)
-   * If contributeToTeam is true, also sets contributionStatus = "pending"
+   * If contributeToGlobal is true, also sets contributionStatus = "pending"
    */
   methods.set("skill.submit", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     const skillId = params.id as string;
-    const contributeToTeam = params.contributeToTeam as boolean | undefined;
+    const contributeToGlobal = (params.contributeToGlobal ?? params.contributeToTeam) as boolean | undefined;
     const workspaceId = params.workspaceId as string | undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
@@ -3560,50 +4042,53 @@ export function createRpcMethods(
       if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
       const isOwner = await skillSpaceRepo.isOwner(meta.skillSpaceId, userId);
       if (!isOwner) {
-        throw new Error("Only the skill space owner can submit a promotion request");
+        throw new Error("Only the skill space owner can submit a merge or contribution request");
       }
     }
 
-    const isPending = (meta as any).reviewStatus === "pending";
-    if (isPending) {
+    const publishedVersion = (meta as any).publishedVersion as number | null;
+    const contributionStatus = (meta as any).contributionStatus as string;
+    const isReviewPending = (meta as any).reviewStatus === "pending";
+    const isContributionPending = contributionStatus === "pending";
+    if (isReviewPending || isContributionPending) {
       throw new Error("This skill is already pending review. Withdraw it before resubmitting.");
     }
-    const publishedVersion = (meta as any).publishedVersion as number | null;
+    const isContributionRequest = !!contributeToGlobal;
+    const hasChanges = publishedVersion != null
+      ? await hasUnpublishedSkillChanges(meta as any)
+      : true;
 
-    // Guard: no changes since last publish — nothing to submit
-    if (publishedVersion != null && meta.version <= publishedVersion) {
+    if (isContributionRequest) {
+      if (publishedVersion == null || (meta as any).reviewStatus !== "approved") {
+        throw new Error("Contribute requires an already merged/published version. Merge or publish it first.");
+      }
+      if (hasChanges) {
+        throw new Error("Contribute only accepts the latest merged/published version. Merge or publish your current changes first.");
+      }
+      if (contributionStatus === "approved") {
+        throw new Error("This version has already been contributed to global. Merge or publish a new version first.");
+      }
+    } else if (publishedVersion != null && !hasChanges) {
       if (meta.scope === "skillset") {
-        throw new Error("No changes since the last promotion snapshot. Edit the skill before resubmitting.");
+        throw new Error("No changes since the last merged snapshot. Edit the skill before resubmitting.");
       }
-      if (contributeToTeam) {
-        // Check if already contributed
-        const contributionStatus = (meta as any).contributionStatus as string;
-        if (contributionStatus === "approved") {
-          throw new Error("This skill has already been contributed to the team. Edit the skill first before re-contributing.");
-        }
-        if (contributionStatus === "pending") {
-          throw new Error("This skill is already pending contribution review.");
-        }
-      } else {
-        throw new Error("No changes since last publish. Edit the skill first before re-submitting.");
-      }
+      throw new Error("No changes since last publish. Edit the skill first before re-submitting.");
     }
 
-    // 1. Snapshot working copy → staging (DB)
+    // 1. Snapshot source copy → staging (DB)
     if (skillContentRepo) {
-      await skillContentRepo.copy(skillId, "working", "staging");
+      await skillContentRepo.copy(skillId, isContributionRequest ? "published" : "working", "staging");
     }
 
     // 2. Bump stagingVersion
     await skillRepo.bumpStagingVersion(skillId);
 
-    // 4. Set reviewStatus + contributionStatus
+    // 4. Set request state
     const updates: Record<string, unknown> = {};
-    if (!isPending) {
-      updates.reviewStatus = "pending";
-    }
-    if (contributeToTeam && meta.scope === "personal") {
+    if (isContributionRequest) {
       updates.contributionStatus = "pending";
+    } else {
+      updates.reviewStatus = "pending";
     }
     if (Object.keys(updates).length > 0) {
       await skillRepo.update(skillId, updates);
@@ -3623,20 +4108,28 @@ export function createRpcMethods(
       triggerScriptReview(skillId, meta.name, stagedFiles?.scripts ?? [], stagedFiles?.specs).catch(console.error);
     }
 
-    // 6. Notify reviewers (only on first submit to avoid flooding)
-    if (!isPending) {
-      const kind = meta.scope === "skillset" || contributeToTeam ? "contribution" : "publish";
-      notifyReviewers(skillId, meta.name, context.auth?.username ?? "unknown", kind).catch(console.error);
-    }
+    // 6. Notify reviewers
+    notifyReviewers(
+      skillId,
+      meta.name,
+      context.auth?.username ?? "unknown",
+      isContributionRequest ? "contribution" : "publish",
+    ).catch(console.error);
 
-    return { status: meta.scope === "skillset" ? "pending_promotion" : "pending" };
+    return {
+      status: isContributionRequest
+        ? "pending_contribution"
+        : meta.scope === "skillset"
+          ? "pending_merge"
+          : "pending",
+    };
   });
 
   /**
    * skill.review — unified review decision (replaces skill.reviewDecision + skill.approve + skill.reject)
    *
    * approve: staging → published, version bump, reviewStatus = "approved"
-   *          if contributeToTeam was pending: auto-promote to team skill
+   *          if contributeToGlobal was pending: auto-promote to global skill
    * reject:  clean staging, reviewStatus = "draft", contributionStatus = "none"
    */
   methods.set("skill.review", async (params, context: RpcContext) => {
@@ -3654,9 +4147,14 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
 
-    // Race protection: ensure skill is still pending review
     const currentReviewStatus = (meta as any).reviewStatus as string;
-    if (currentReviewStatus !== "pending") {
+    const currentContributionStatus = (meta as any).contributionStatus as string;
+    const reviewMode = currentContributionStatus === "pending"
+      ? "contribution"
+      : currentReviewStatus === "pending"
+        ? "publish"
+        : null;
+    if (!reviewMode) {
       throw new Error("This skill is not pending review");
     }
 
@@ -3685,154 +4183,65 @@ export function createRpcMethods(
         throw new Error("STAGING_VERSION_CONFLICT: Content has changed since you reviewed it. Please reload and review again.");
       }
 
-      // 1. Promote staging → published (DB)
-      if (skillContentRepo) {
-        try {
-          await skillContentRepo.copy(skillId, "staging", "published");
-        } catch {
-          // Fallback: copy from working if staging not in DB
-          await skillContentRepo.copy(skillId, "working", "published");
+      if (reviewMode === "publish") {
+        if (skillContentRepo) {
+          try {
+            await skillContentRepo.copy(skillId, "staging", "published");
+          } catch {
+            await skillContentRepo.copy(skillId, "working", "published");
+          }
         }
-      }
 
-      // 2. Bump version
-      await skillRepo.bumpVersion(skillId);
-      const updatedMeta = await skillRepo.getById(skillId);
-      const newVersion = updatedMeta?.version ?? (meta.version + 1);
+        await skillRepo.bumpVersion(skillId);
+        const updatedMeta = await skillRepo.getById(skillId);
+        const newVersion = updatedMeta?.version ?? (meta.version + 1);
 
-      // 3. Clean up staging (DB)
-      if (skillContentRepo) {
-        await skillContentRepo.delete(skillId, "staging");
-      }
+        if (skillContentRepo) {
+          await skillContentRepo.delete(skillId, "staging");
+        }
 
-      // 5. Create version record (with content stored inline)
-      if (skillVersionRepo) {
-        const publishedContent = skillContentRepo
-          ? await skillContentRepo.read(skillId, "published")
-          : null;
-        await skillVersionRepo.create({
-          skillId,
-          version: newVersion,
-          commitMessage: `approved v${newVersion}`,
-          authorId: reviewerId,
-          specs: publishedContent?.specs,
-          scriptsJson: publishedContent?.scripts,
+        if (skillVersionRepo) {
+          const publishedContent = skillContentRepo
+            ? await skillContentRepo.read(skillId, "published")
+            : null;
+          await skillVersionRepo.create({
+            skillId,
+            version: newVersion,
+            commitMessage: `approved v${newVersion}`,
+            authorId: reviewerId,
+            specs: publishedContent?.specs,
+            scriptsJson: publishedContent?.scripts,
+            files: {
+              metadata: getCurrentPublishableMetadata((updatedMeta ?? meta) as any),
+            },
+          });
+        }
+
+        await skillRepo.update(skillId, {
+          reviewStatus: "approved",
+          contributionStatus: "none",
+          publishedVersion: newVersion,
+          stagingVersion: 0,
         });
-      }
 
-      // 6. DB update — reviewStatus = "approved"
-      await skillRepo.update(skillId, {
-        reviewStatus: "approved",
-        publishedVersion: newVersion,
-        stagingVersion: 0,
-      });
-
-      // 7. Promote approved Skill Space and contribution requests to Global/team.
-      if (meta.scope === "skillset") {
-        const publishedVer = newVersion;
-        const allTeam = await skillRepo.list({ scope: "team" });
-        const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
-
-        let teamSkillId: string;
-        const srcLabels = (meta as any).labelsJson as string[] | null;
-        if (existingTeam) {
-          teamSkillId = existingTeam.id;
-          await skillRepo.update(existingTeam.id, {
-            description: meta.description ?? undefined,
-            type: meta.type ?? undefined,
-            teamSourceSkillId: skillId,
-            teamPinnedVersion: publishedVer,
-            reviewStatus: "approved",
-            publishedVersion: publishedVer,
-            labels: srcLabels ?? undefined,
-          });
-          await skillRepo.bumpVersion(existingTeam.id);
-        } else {
-          teamSkillId = await skillRepo.create({
-            name: meta.name,
-            description: meta.description ?? undefined,
-            type: meta.type ?? undefined,
-            scope: "team",
-            authorId: meta.authorId ?? undefined,
-            dirName: meta.dirName,
-            labels: srcLabels ?? undefined,
-          });
-          await skillRepo.update(teamSkillId, {
-            teamSourceSkillId: skillId,
-            teamPinnedVersion: publishedVer,
-            reviewStatus: "approved",
-            publishedVersion: publishedVer,
-          });
-        }
+        await notifySkillScopeReload(updatedMeta ?? meta, reviewerId);
+      } else {
+        await promoteSourceSnapshotToGlobal(
+          meta as any,
+          (meta as any).publishedVersion ?? null,
+          skillContentRepo ? "staging" : "published",
+        );
 
         if (skillContentRepo) {
-          await skillContentRepo.copyToSkill(skillId, teamSkillId, "published", "published");
+          await skillContentRepo.delete(skillId, "staging");
         }
 
-        notifyAllSkillReload();
-      }
+        await skillRepo.update(skillId, {
+          contributionStatus: "approved",
+          stagingVersion: 0,
+        });
 
-      // 8. If contributionStatus === "pending", auto-promote to team
-      const contributionStatus = (meta as any).contributionStatus as string;
-      console.log(`[skill.review] contributionStatus="${contributionStatus}" authorId="${meta.authorId}" — promote=${contributionStatus === "pending" && !!meta.authorId}`);
-      if (meta.scope === "personal" && contributionStatus === "pending" && meta.authorId) {
-        const publishedVer = newVersion;
-
-        // Copy published content → team skill (DB primary)
-        const allTeam = await skillRepo.list({ scope: "team" });
-        const existingTeam = allTeam.find((s: any) => s.dirName === meta.dirName);
-
-        let teamSkillId: string;
-        const srcLabels = (meta as any).labelsJson as string[] | null;
-        if (existingTeam) {
-          teamSkillId = existingTeam.id;
-          console.log(`[skill.review] Updating existing team skill ${teamSkillId} (dirName=${meta.dirName})`);
-          await skillRepo.update(existingTeam.id, {
-            description: meta.description ?? undefined,
-            type: meta.type ?? undefined,
-            teamSourceSkillId: skillId,
-            teamPinnedVersion: publishedVer,
-            reviewStatus: "approved",
-            publishedVersion: publishedVer,
-            labels: srcLabels ?? undefined,
-          });
-          await skillRepo.bumpVersion(existingTeam.id);
-        } else {
-          console.log(`[skill.review] Creating new team skill for dirName=${meta.dirName}`);
-          teamSkillId = await skillRepo.create({
-            name: meta.name,
-            description: meta.description ?? undefined,
-            type: meta.type ?? undefined,
-            scope: "team",
-            authorId: meta.authorId ?? undefined,
-            dirName: meta.dirName,
-            labels: srcLabels ?? undefined,
-          });
-          await skillRepo.update(teamSkillId, {
-            teamSourceSkillId: skillId,
-            teamPinnedVersion: publishedVer,
-            reviewStatus: "approved",
-            publishedVersion: publishedVer,
-          });
-        }
-
-        // Copy published content to team skill in DB
-        if (skillContentRepo) {
-          await skillContentRepo.copyToSkill(skillId, teamSkillId, "published", "published");
-          console.log(`[skill.review] Copied published content from ${skillId} → team skill ${teamSkillId}`);
-        }
-
-        // Mark contribution as approved
-        await skillRepo.update(skillId, { contributionStatus: "approved" });
-
-        // Notify all users (team skill changed)
-        console.log(`[skill.review] Contribution promoted to team successfully. Team skill id=${teamSkillId}`);
-        notifyAllSkillReload();
-      } else if (meta.scope === "personal") {
-        // Notify author's AgentBox
-        if (meta.authorId) {
-          notifySkillReload(meta.authorId);
-        }
+        await notifySkillScopeReload(meta, reviewerId);
       }
     } else {
       // Reject: clean up staging (DB)
@@ -3840,17 +4249,20 @@ export function createRpcMethods(
         await skillContentRepo.delete(skillId, "staging");
       }
 
-      // Revert status: draft + contributionStatus = "none"
-      await skillRepo.update(skillId, {
-        reviewStatus: "draft",
-        contributionStatus: "none",
-        stagingVersion: 0,
-      });
-
-      if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
-        const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
-        for (const member of members) notifySkillReload(member.userId);
+      if (reviewMode === "publish") {
+        await skillRepo.update(skillId, {
+          reviewStatus: restoreReviewStatus(meta as any),
+          contributionStatus: "none",
+          stagingVersion: 0,
+        });
+      } else {
+        await skillRepo.update(skillId, {
+          contributionStatus: "none",
+          stagingVersion: 0,
+        });
       }
+
+      await notifySkillScopeReload(meta, reviewerId);
     }
 
     // Notify skill author
@@ -3861,14 +4273,26 @@ export function createRpcMethods(
       let message: string | undefined;
 
       if (isApproved) {
-        title = meta.scope === "skillset"
-          ? `Your Skill Space change "${meta.name}" has been merged to Global`
-          : `Your skill "${meta.name}" has been approved and is now active in production`;
+        if (reviewMode === "contribution") {
+          title = meta.scope === "skillset"
+            ? `Your Skill Space skill "${meta.name}" has been contributed to Global`
+            : `Your skill "${meta.name}" has been contributed to Global`;
+        } else {
+          title = meta.scope === "skillset"
+            ? `Your Skill Space change "${meta.name}" has been merged`
+            : `Your skill "${meta.name}" has been approved and is now active in production`;
+        }
         message = reason || undefined;
       } else {
-        title = meta.scope === "skillset"
-          ? `Your Skill Space promotion "${meta.name}" was rejected`
-          : `Your skill "${meta.name}" was rejected`;
+        if (reviewMode === "contribution") {
+          title = meta.scope === "skillset"
+            ? `Your Skill Space contribution "${meta.name}" was rejected`
+            : `Your skill contribution "${meta.name}" was rejected`;
+        } else {
+          title = meta.scope === "skillset"
+            ? `Your Skill Space merge "${meta.name}" was rejected`
+            : `Your skill "${meta.name}" was rejected`;
+        }
         const parts: string[] = [
           "You can edit and resubmit.",
         ];
@@ -4055,7 +4479,7 @@ export function createRpcMethods(
     if (skillId && skillRepo) {
       const skill = await skillRepo.getById(skillId);
       if (!skill) throw new Error(`Skill not found: ${skillId}`);
-      // Allow builtin + team skills for everyone; personal skills only for the author
+      // Allow builtin + global skills for everyone; personal skills only for the author
       if (skill.scope === "personal" && skill.authorId !== userId) {
         throw new Error("Forbidden: cannot use another user's personal skill");
       }
@@ -4326,7 +4750,7 @@ export function createRpcMethods(
 
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
-    if (meta.scope !== "team") throw new Error("Can only vote on team skills");
+    if (meta.scope !== "global") throw new Error("Can only vote on global skills");
 
     const { newVote } = await voteRepo.upsert(skillId, userId, vote as 1 | -1);
 
@@ -4368,7 +4792,7 @@ export function createRpcMethods(
   methods.set("skill.revert", async (params, context: RpcContext) => {
     requireAdmin(context);
     const username = context.auth!.username;
-    const skillId = params.id as string;   // This is the TEAM skill's ID
+    const skillId = params.id as string;   // This is the GLOBAL skill's ID
     const reason = (params.reason as string) || undefined;
 
     if (!skillId) throw new Error("Missing required param: id");
@@ -4376,13 +4800,13 @@ export function createRpcMethods(
 
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
-    if (meta.scope !== "team") throw new Error("Can only revert team skills");
+    if (meta.scope !== "global") throw new Error("Can only revert global skills");
 
     // Find the personal source skill (if it still exists)
-    const sourceSkillId = (meta as any).teamSourceSkillId;
+    const sourceSkillId = (meta as any).globalSourceSkillId;
     const sourceSkill = sourceSkillId ? await skillRepo.getById(sourceSkillId) : null;
 
-    // Delete team DB record (CASCADE deletes skill_contents)
+    // Delete global DB record (CASCADE deletes skill_contents)
     await skillRepo.deleteById(skillId);
 
     // Reset contribution status on the personal source skill (if still exists)
@@ -4395,7 +4819,7 @@ export function createRpcMethods(
     // Clean up votes
     if (voteRepo) await voteRepo.deleteForSkill(skillId);
 
-    // Clean up orphaned notifications (approval/contribution requests for deleted team skill)
+    // Clean up orphaned notifications (approval/contribution requests for deleted global skill)
     if (notifRepo) {
       await notifRepo.dismissByTypeAndRelatedId("skill_review_requested", skillId);
       await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
@@ -4410,7 +4834,7 @@ export function createRpcMethods(
       const notifId = await notifRepo.create({
         userId: authorId,
         type: "skill_reverted",
-        title: `Your skill "${meta.name}" has been reverted from team`,
+        title: `Your skill "${meta.name}" has been reverted from global`,
         message,
         relatedId: sourceSkillId ?? skillId,
       });
@@ -4419,7 +4843,7 @@ export function createRpcMethods(
         sendToUser(authorId, "notification", {
           id: notifId,
           type: "skill_reverted",
-          title: `Your skill "${meta.name}" has been reverted from team`,
+          title: `Your skill "${meta.name}" has been reverted from global`,
           message: message ?? null,
           relatedId: sourceSkillId ?? skillId,
           isRead: false,
@@ -4428,7 +4852,7 @@ export function createRpcMethods(
       }
     }
 
-    // Notify all users (team skill removed)
+    // Notify all users (global skill removed)
     notifyAllSkillReload();
     return { status: "reverted" };
   });
@@ -4452,7 +4876,7 @@ export function createRpcMethods(
   // Legacy no-ops for removed methods
   methods.set("skill.publish", async (_params, context: RpcContext) => {
     requireAuth(context);
-    throw new Error("skill.publish is deprecated. Use skill.submit({ contributeToTeam: true }) instead.");
+    throw new Error("skill.publish is deprecated. Use skill.submit({ contributeToGlobal: true }) instead.");
   });
   methods.set("skill.approve", async (_params, context: RpcContext) => {
     requireAuth(context);
@@ -4507,14 +4931,17 @@ export function createRpcMethods(
       if (!skillSpaceRepo || !meta.skillSpaceId) throw new Error("Database not available");
       const isOwner = await skillSpaceRepo.isOwner(meta.skillSpaceId, userId);
       if (!isOwner) {
-        throw new Error("Only the skill space owner can withdraw a promotion request");
+        throw new Error("Only the skill space owner can withdraw a merge or contribution request");
       }
     } else {
       throw new Error("Only personal and skill space submissions can be withdrawn");
     }
 
     const reviewStatus = (meta as any).reviewStatus as string;
-    if (reviewStatus !== "pending") {
+    const contributionStatus = (meta as any).contributionStatus as string;
+    const isReviewPending = reviewStatus === "pending";
+    const isContributionPending = contributionStatus === "pending";
+    if (!isReviewPending && !isContributionPending) {
       throw new Error("Nothing to withdraw: skill is not pending");
     }
 
@@ -4523,12 +4950,18 @@ export function createRpcMethods(
       await skillContentRepo.delete(skillId, "staging");
     }
 
-    // Withdraw: revert to draft, clear contribution status
-    await skillRepo.update(skillId, {
-      reviewStatus: "draft",
-      contributionStatus: "none",
-      stagingVersion: 0,
-    });
+    if (isContributionPending && !isReviewPending) {
+      await skillRepo.update(skillId, {
+        contributionStatus: "none",
+        stagingVersion: 0,
+      });
+    } else {
+      await skillRepo.update(skillId, {
+        reviewStatus: restoreReviewStatus(meta as any),
+        contributionStatus: "none",
+        stagingVersion: 0,
+      });
+    }
 
     // Clean up orphaned notifications (approval/contribution requests)
     if (notifRepo) {
@@ -4536,12 +4969,7 @@ export function createRpcMethods(
       await notifRepo.dismissByTypeAndRelatedId("contribution_review_requested", skillId);
     }
 
-    if (meta.scope === "skillset" && skillSpaceRepo && meta.skillSpaceId) {
-      const members = await skillSpaceRepo.listMembers(meta.skillSpaceId);
-      for (const member of members) notifySkillReload(member.userId);
-    } else {
-      notifySkillReload(userId);
-    }
+    await notifySkillScopeReload(meta, userId);
     return { status: "withdrawn", wasNew: false };
   });
 
@@ -4595,11 +5023,21 @@ export function createRpcMethods(
     const members = await skillSpaceRepo.listMembers(id);
     let spaceSkills = skillRepo ? await skillRepo.listBySkillSpaceId(id) : [];
     if (skillRepo) {
+      const disabled = new Set(await skillRepo.listDisabledSkills(userId));
+      const isAdmin = context.auth?.username === "admin";
       spaceSkills = await Promise.all(spaceSkills.map(async (skill: any) => {
-        const globalSkill = await skillRepo.getByDirNameAndScope(skill.dirName, "team");
+        const globalSkill = await skillRepo.getByDirNameAndScope(skill.dirName, "global");
+        const hasUnpublishedChanges = await hasUnpublishedSkillChanges(skill);
+        const fsLabels = getLabelsForSkill(`${skill.scope}:${skill.dirName}`);
+        const dbLabels: string[] = skill.labelsJson ?? [];
+        const mergedLabels = [...new Set([...dbLabels, ...fsLabels])];
+        const { labelsJson: _, ...rest } = skill;
         return {
-          ...skill,
+          ...rest,
+          labels: filterVisibleLabels(mergedLabels.length > 0 ? mergedLabels : undefined, isAdmin),
+          enabled: !disabled.has(skill.name),
           globalSkillId: globalSkill?.id ?? null,
+          hasUnpublishedChanges,
         };
       }));
     }

@@ -1,7 +1,7 @@
 /**
  * Skill Labels — loaded from skills/{tier}/meta.json at startup.
  *
- * Each tier directory (core, extension, platform, team) may contain a meta.json:
+ * Each tier directory (core, extension, platform, global) may contain a meta.json:
  *   { "labels": { "skill-dir-name": ["label1", "label2", ...] } }
  *
  * Gateway scans all tiers, merges into a single in-memory Map keyed by "scope:dirName".
@@ -11,7 +11,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const TIERS = ["builtin", "team", "platform"];
+const TIERS = ["builtin", "global", "platform"];
 
 /**
  * Mapping from tier name to the filesystem directories to scan.
@@ -19,7 +19,7 @@ const TIERS = ["builtin", "team", "platform"];
  */
 const TIER_DIRS: Record<string, string[]> = {
   builtin: ["core", "extension"],
-  team: ["team"],
+  global: ["global"],
   platform: ["platform"],
 };
 
