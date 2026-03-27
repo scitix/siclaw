@@ -17,10 +17,10 @@ export function ChannelsPage() {
     // Load channels when WebSocket first connects
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadChannels();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadChannels();
     }, [isConnected, loadChannels]);
 
     const channels = mergeChannels(views);

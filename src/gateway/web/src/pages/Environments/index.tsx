@@ -74,10 +74,10 @@ export function CredentialsPage() {
     }, [sendRpc]);
 
     useEffect(() => {
-        if (isConnected && permLoaded && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadClusters();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (!permLoaded || hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadClusters();
     }, [isConnected, permLoaded, loadClusters]);
 
     const filtered = useMemo(() => {

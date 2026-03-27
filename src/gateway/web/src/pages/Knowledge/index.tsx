@@ -36,10 +36,10 @@ export function KnowledgePage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadDocs();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadDocs();
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const filtered = useMemo(() => {

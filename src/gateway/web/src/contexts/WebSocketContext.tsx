@@ -90,14 +90,14 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
 
         connectTimeoutRef.current = setTimeout(() => {
             if (ws.readyState !== WebSocket.OPEN) {
-                console.warn(`[ws] Connection timeout (3s), readyState=${ws.readyState}, retrying...`);
+                console.warn(`[ws] Connection timeout (15s), readyState=${ws.readyState}, retrying...`);
                 ws.onclose = null;
                 ws.close();
                 wsRef.current = null;
                 updateStatus('disconnected');
                 scheduleReconnect();
             }
-        }, 3000);
+        }, 15_000);
 
         ws.onopen = () => {
             clearTimeout(connectTimeoutRef.current);
@@ -135,6 +135,14 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
             clearTimeout(connectTimeoutRef.current);
             console.log(`[ws] Closed: code=${event.code} reason=${event.reason}`);
             wsRef.current = null;
+
+            // Reject all pending RPC callbacks so hooks' loading states can resolve
+            // (otherwise orphaned promises keep loading=true forever)
+            for (const [, callback] of callbacksRef.current) {
+                callback(undefined, { code: 'WS_CLOSED', message: 'WebSocket closed before response' });
+            }
+            callbacksRef.current.clear();
+
             updateStatus('disconnected');
             scheduleReconnect();
         };
