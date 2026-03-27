@@ -10,7 +10,16 @@ import { skillVersions } from "../schema.js";
 export interface CreateSkillVersionInput {
   skillId: string;
   version: number;
-  files?: { specs?: string; scripts?: string[] } | null;
+  files?: {
+    specs?: string;
+    scripts?: string[];
+    metadata?: {
+      name?: string | null;
+      description?: string | null;
+      type?: string | null;
+      labels?: string[] | null;
+    };
+  } | null;
   specs?: string;
   scriptsJson?: Array<{ name: string; content: string }>;
   commitMessage?: string;

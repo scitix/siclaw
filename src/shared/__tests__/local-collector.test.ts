@@ -145,7 +145,7 @@ describe("LocalCollector", () => {
       type: "skill_call",
       skillName: "test-skill",
       scriptName: "run",
-      scope: "team",
+      scope: "global",
       outcome: "success",
       durationMs: 100,
     });
@@ -153,7 +153,7 @@ describe("LocalCollector", () => {
       type: "skill_call",
       skillName: "test-skill",
       scriptName: "run",
-      scope: "team",
+      scope: "global",
       outcome: "error",
       durationMs: 200,
     });
@@ -208,7 +208,7 @@ describe("LocalCollector", () => {
       type: "skill_call",
       skillName: "snapshot-skill",
       scriptName: "run",
-      scope: "team",
+      scope: "global",
       outcome: "success",
       durationMs: 250,
     });

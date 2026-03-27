@@ -6,13 +6,13 @@ interface SkillCallsPanelProps {
 
 const SCOPE_STYLES: Record<string, string> = {
     builtin: 'bg-blue-100 text-blue-800',
-    team: 'bg-amber-100 text-amber-800',
+    global: 'bg-amber-100 text-amber-800',
     personal: 'bg-purple-100 text-purple-800',
 };
 
 const SCOPE_LABELS: Record<string, string> = {
     builtin: 'core',
-    team: 'team',
+    global: 'global',
     personal: 'personal',
 };
 
@@ -31,7 +31,7 @@ export function SkillCallsPanel({ topSkills }: SkillCallsPanelProps) {
     const maxTotal = topSkills.length > 0 ? topSkills[0].total : 0;
 
     // Scope aggregation for distribution bar
-    const byScope = { builtin: 0, team: 0, personal: 0 };
+    const byScope = { builtin: 0, global: 0, personal: 0 };
     for (const s of topSkills) {
         if (s.scope in byScope) byScope[s.scope as keyof typeof byScope] += s.total;
     }
@@ -85,10 +85,10 @@ export function SkillCallsPanel({ topSkills }: SkillCallsPanelProps) {
                                     core <span className="font-medium text-gray-700">{byScope.builtin}</span>
                                 </span>
                             )}
-                            {byScope.team > 0 && (
+                            {byScope.global > 0 && (
                                 <span className="flex items-center gap-1">
                                     <span className="w-2 h-2 rounded-full bg-amber-300" />
-                                    team <span className="font-medium text-gray-700">{byScope.team}</span>
+                                    global <span className="font-medium text-gray-700">{byScope.global}</span>
                                 </span>
                             )}
                             {byScope.personal > 0 && (
@@ -103,8 +103,8 @@ export function SkillCallsPanel({ topSkills }: SkillCallsPanelProps) {
                                 {byScope.builtin > 0 && (
                                     <div className="bg-blue-300" style={{ width: `${(byScope.builtin / totalCalls) * 100}%` }} />
                                 )}
-                                {byScope.team > 0 && (
-                                    <div className="bg-amber-300" style={{ width: `${(byScope.team / totalCalls) * 100}%` }} />
+                                {byScope.global > 0 && (
+                                    <div className="bg-amber-300" style={{ width: `${(byScope.global / totalCalls) * 100}%` }} />
                                 )}
                                 {byScope.personal > 0 && (
                                     <div className="bg-purple-300" style={{ width: `${(byScope.personal / totalCalls) * 100}%` }} />

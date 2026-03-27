@@ -90,7 +90,7 @@ const DDL_STATEMENTS = [
     version INT NOT NULL DEFAULT 1,
     published_version INT NULL,
     staging_version INT NOT NULL DEFAULT 0,
-    scope ENUM('builtin', 'team', 'personal', 'global', 'skillset') NOT NULL DEFAULT 'personal',
+    scope ENUM('builtin', 'global', 'personal', 'skillset') NOT NULL DEFAULT 'personal',
     author_id VARCHAR(32),
     status VARCHAR(50) DEFAULT 'installed',
     contribution_status ENUM('none', 'pending', 'approved') DEFAULT 'none',
@@ -99,8 +99,8 @@ const DDL_STATEMENTS = [
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     s3_key VARCHAR(500),
-    team_source_skill_id VARCHAR(64) NULL,
-    team_pinned_version INT NULL,
+    global_source_skill_id VARCHAR(64) NULL,
+    global_pinned_version INT NULL,
     forked_from_id VARCHAR(64) NULL,
     labels_json JSON NULL,
     skill_space_id VARCHAR(64) NULL,
@@ -510,6 +510,12 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE skills ADD CONSTRAINT fk_skills_skill_space FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE SET NULL`,
     // Knowledge docs: store original content for recovery
     `ALTER TABLE knowledge_docs ADD COLUMN content MEDIUMTEXT`,
+    // Rename skill scope "team" → "global"
+    `UPDATE skills SET scope='global' WHERE scope='team'`,
+    `ALTER TABLE skills CHANGE COLUMN team_source_skill_id global_source_skill_id VARCHAR(64) NULL`,
+    `ALTER TABLE skills CHANGE COLUMN team_pinned_version global_pinned_version INT NULL`,
+    `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','global','personal','skillset') NOT NULL DEFAULT 'personal'`,
+    `UPDATE workspaces SET skill_composer = REPLACE(skill_composer, '"team:', '"global:') WHERE skill_composer LIKE '%"team:%'`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

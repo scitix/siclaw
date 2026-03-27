@@ -2,7 +2,7 @@
  * Skill Bundle Builder
  *
  * Builds a SkillBundle for AgentBox consumption.
- * Only includes team + personal + skill-space skills — builtin skills are baked into the AgentBox Docker image.
+ * Only includes global + personal + skill-space skills — builtin skills are baked into the AgentBox Docker image.
  */
 
 import crypto from "node:crypto";
@@ -14,7 +14,7 @@ import type { WorkspaceSkillComposer } from "../db/repositories/workspace-repo.j
 
 export interface SkillBundleEntry {
   dirName: string;
-  scope: "team" | "personal" | "skillset";
+  scope: "global" | "personal" | "skillset";
   specs: string;
   scripts: Array<{ name: string; content: string }>;
   skillSpaceId?: string;
@@ -31,7 +31,7 @@ export interface SkillBundle {
 /**
  * Build a skill bundle for a given user and environment.
  *
- * - Team: from DB (skill_contents table, published tag)
+ * - Global: from DB (skill_contents table, published tag)
  * - Personal:
  *   - env="dev"  → all personal skills (working copy)
  *   - env="prod" → only approved skills (published copy)
@@ -59,16 +59,16 @@ export async function buildSkillBundle(
       )
     : null;
 
-  // 1. Team skills (from DB)
-  const teamSkills = await skillRepo.list({ scope: "team" });
-  for (const meta of teamSkills) {
+  // 1. Global skills (from DB)
+  const globalSkills = await skillRepo.list({ scope: "global" });
+  for (const meta of globalSkills) {
     if (disabled.has(meta.name)) continue;
-    if (globalSelection && !globalSelection.has(`team:${meta.id}`)) continue;
+    if (globalSelection && !globalSelection.has(`global:${meta.id}`)) continue;
     const files = await skillContentRepo.read(meta.id, "published");
     if (!files) continue;
     skills.push({
       dirName: meta.dirName,
-      scope: "team",
+      scope: "global",
       specs: files.specs ?? "",
       scripts: files.scripts ?? [],
     });
@@ -105,7 +105,7 @@ export async function buildSkillBundle(
 
   // 3. Skill space skills — intentionally dev-only for now.
   //    Skillset skills are working copies that may contain unreviewed changes.
-  //    Production bundles only include published team/personal skills.
+  //    Production bundles only include published global/personal skills.
   //    TODO: Document this constraint in an ADR when skillset→prod promotion is designed.
   if (env === "dev" && skillSpaceRepo) {
     const userSpaces = await skillSpaceRepo.listForUser(userId);

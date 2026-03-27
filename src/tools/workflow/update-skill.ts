@@ -165,7 +165,7 @@ node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="p
 
       const skillName = params.name.trim();
 
-      // Reject if the target skill doesn't exist in the bundle (personal/team)
+      // Reject if the target skill doesn't exist in the bundle (personal/global)
       if (!skillExistsInBundle(skillName)) {
         return {
           content: [
