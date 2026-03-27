@@ -32,6 +32,8 @@ interface PatternRule {
   description: string;
 }
 
+// Cross-reference: src/tools/infra/command-sets.ts (ALLOWED_COMMANDS, COMMAND_RULES).
+// When modifying either file, verify the other still makes sense.
 const DANGER_PATTERNS: PatternRule[] = [
   // Critical
   { category: "destructive_command", severity: "critical", pattern: /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|--recursive)\b/g, description: "Recursive forced file deletion (rm -rf)" },
