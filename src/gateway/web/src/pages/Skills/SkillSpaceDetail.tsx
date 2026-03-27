@@ -107,8 +107,12 @@ export function SkillSpaceDetailPage() {
         () => visibleSkills.filter(skill => selectedSkillIds.has(String(skill.id))),
         [visibleSkills, selectedSkillIds],
     );
-    const selectedPendingCount = selectedSkills.filter(skill => skill.reviewStatus === 'pending').length;
-    const selectedReadyCount = selectedSkills.filter(skill => getSkillSpaceStatus(skill).mergeActionable).length;
+    const selectedMergeReadyCount = selectedSkills.filter(skill => getSkillSpaceStatus(skill).mergeActionable).length;
+    const selectedMergePendingCount = selectedSkills.filter(skill => skill.reviewStatus === 'pending').length;
+    const selectedContributeReadyCount = selectedSkills.filter(skill => getSkillSpaceStatus(skill).canContribute).length;
+    const selectedContributePendingCount = selectedSkills.filter(
+        skill => skill.contributionStatus === 'pending' && skill.reviewStatus !== 'pending',
+    ).length;
 
     useEffect(() => {
         if (!flashMessage) return;
@@ -381,7 +385,7 @@ export function SkillSpaceDetailPage() {
     };
 
     const handleBatchSubmit = async () => {
-        if (!currentWorkspace?.id || selectedReadyCount === 0) return;
+        if (!currentWorkspace?.id || selectedMergeReadyCount === 0) return;
         setBatchBusy(true);
         try {
             let submittedCount = 0;
@@ -400,8 +404,28 @@ export function SkillSpaceDetailPage() {
         }
     };
 
-    const handleBatchWithdraw = async () => {
-        if (!currentWorkspace?.id || selectedPendingCount === 0) return;
+    const handleBatchContribute = async () => {
+        if (!currentWorkspace?.id || selectedContributeReadyCount === 0) return;
+        setBatchBusy(true);
+        try {
+            let contributedCount = 0;
+            for (const skill of selectedSkills) {
+                if (!getSkillSpaceStatus(skill).canContribute) continue;
+                await rpcRequestPublish(sendRpc, String(skill.id), true, currentWorkspace.id);
+                contributedCount += 1;
+            }
+            await reload();
+            exitMergeMode();
+            showFlash('success', `Submitted ${contributedCount} skill${contributedCount === 1 ? '' : 's'} for global contribution review.`);
+        } catch (err: any) {
+            showFlash('error', err.message || 'Failed to contribute selected skills');
+        } finally {
+            setBatchBusy(false);
+        }
+    };
+
+    const handleBatchWithdrawMerge = async () => {
+        if (!currentWorkspace?.id || selectedMergePendingCount === 0) return;
         setBatchBusy(true);
         try {
             let withdrawnCount = 0;
@@ -412,9 +436,29 @@ export function SkillSpaceDetailPage() {
             }
             await reload();
             exitMergeMode();
-            showFlash('success', `Withdrew ${withdrawnCount} review request${withdrawnCount === 1 ? '' : 's'}.`);
+            showFlash('success', `Withdrew ${withdrawnCount} merge request${withdrawnCount === 1 ? '' : 's'}.`);
         } catch (err: any) {
-            showFlash('error', err.message || 'Failed to withdraw selected requests');
+            showFlash('error', err.message || 'Failed to withdraw selected merge requests');
+        } finally {
+            setBatchBusy(false);
+        }
+    };
+
+    const handleBatchWithdrawContribution = async () => {
+        if (!currentWorkspace?.id || selectedContributePendingCount === 0) return;
+        setBatchBusy(true);
+        try {
+            let withdrawnCount = 0;
+            for (const skill of selectedSkills) {
+                if (skill.contributionStatus !== 'pending' || skill.reviewStatus === 'pending') continue;
+                await rpcWithdrawSkill(sendRpc, String(skill.id), currentWorkspace.id);
+                withdrawnCount += 1;
+            }
+            await reload();
+            exitMergeMode();
+            showFlash('success', `Withdrew ${withdrawnCount} contribution request${withdrawnCount === 1 ? '' : 's'}.`);
+        } catch (err: any) {
+            showFlash('error', err.message || 'Failed to withdraw selected contribution requests');
         } finally {
             setBatchBusy(false);
         }
@@ -706,19 +750,35 @@ export function SkillSpaceDetailPage() {
                             <div className="flex items-center gap-2 flex-wrap">
                                 <button
                                     onClick={handleBatchSubmit}
-                                    disabled={batchBusy || selectedReadyCount === 0}
+                                    disabled={batchBusy || selectedMergeReadyCount === 0}
                                     className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-white bg-slate-900 rounded-xl hover:bg-slate-800 disabled:opacity-40"
                                 >
                                     <SendHorizontal className="w-3.5 h-3.5" />
-                                    Submit selected merges
+                                    Submit Merge ({selectedMergeReadyCount})
                                 </button>
                                 <button
-                                    onClick={handleBatchWithdraw}
-                                    disabled={batchBusy || selectedPendingCount === 0}
+                                    onClick={handleBatchWithdrawMerge}
+                                    disabled={batchBusy || selectedMergePendingCount === 0}
                                     className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-xl hover:bg-amber-100 disabled:opacity-40"
                                 >
                                     <RotateCcw className="w-3.5 h-3.5" />
-                                    Withdraw selected
+                                    Withdraw Merge ({selectedMergePendingCount})
+                                </button>
+                                <button
+                                    onClick={handleBatchContribute}
+                                    disabled={batchBusy || selectedContributeReadyCount === 0}
+                                    className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-white bg-blue-600 rounded-xl hover:bg-blue-700 disabled:opacity-40"
+                                >
+                                    <Upload className="w-3.5 h-3.5" />
+                                    Contribute ({selectedContributeReadyCount})
+                                </button>
+                                <button
+                                    onClick={handleBatchWithdrawContribution}
+                                    disabled={batchBusy || selectedContributePendingCount === 0}
+                                    className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-orange-700 bg-orange-50 border border-orange-200 rounded-xl hover:bg-orange-100 disabled:opacity-40"
+                                >
+                                    <RotateCcw className="w-3.5 h-3.5" />
+                                    Withdraw Contribution ({selectedContributePendingCount})
                                 </button>
                                 <button
                                     onClick={exitMergeMode}
