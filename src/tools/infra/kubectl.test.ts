@@ -119,25 +119,28 @@ describe("validateExecCommand", () => {
   });
 });
 
-describe("hasAllNamespacesWithoutSelector", () => {
-  it("returns true for get -A without selector", () => {
-    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A"], "get")).toBe(true);
+describe("hasAllNamespacesWithoutSelector (backward-compat wrapper)", () => {
+  // get -A without -o yaml/json is now ALLOWED (returns false)
+  it("returns false for get -A (table output allowed)", () => {
+    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A"], "get")).toBe(false);
   });
 
-  it("returns true for --all-namespaces", () => {
-    expect(hasAllNamespacesWithoutSelector(["get", "pods", "--all-namespaces"], "get")).toBe(true);
+  // get -A -o yaml → blocked
+  it("returns true for get -A -o yaml (bulk serialization)", () => {
+    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "-o", "yaml"], "get")).toBe(true);
+  });
+
+  it("returns true for get -A -o json", () => {
+    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "-o", "json"], "get")).toBe(true);
+  });
+
+  // describe -A without selector → still blocked
+  it("returns true for describe -A without selector", () => {
+    expect(hasAllNamespacesWithoutSelector(["describe", "pods", "-A"], "describe")).toBe(true);
   });
 
   it("returns false when -l is present", () => {
-    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "-l", "app=web"], "get")).toBe(false);
-  });
-
-  it("returns false when --selector= is present", () => {
-    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "--selector=app=web"], "get")).toBe(false);
-  });
-
-  it("returns false when --field-selector= is present", () => {
-    expect(hasAllNamespacesWithoutSelector(["get", "pods", "-A", "--field-selector=status.phase=Running"], "get")).toBe(false);
+    expect(hasAllNamespacesWithoutSelector(["describe", "pods", "-A", "-l", "app=web"], "describe")).toBe(false);
   });
 
   it("returns false for non-restricted subcommands", () => {

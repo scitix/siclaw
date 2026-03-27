@@ -8,7 +8,7 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
 import { analyzeOutput, applySanitizer, redactSensitiveContent } from "../infra/output-sanitizer.js";
-import { SAFE_SUBCOMMANDS, validateExecCommand, hasAllNamespacesWithoutSelector } from "../infra/command-sets.js";
+import { SAFE_SUBCOMMANDS, validateExecCommand, checkAllNamespacesRestriction } from "../infra/command-sets.js";
 import { detectSensitiveResource } from "../infra/kubectl-sanitize.js";
 import { loadConfig } from "../../core/config.js";
 import {
@@ -47,8 +47,25 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
     // Extract the kubectl arguments from the command string
     const stripped = cmd.trim().replace(/^\S+\s+/, ""); // remove "kubectl" prefix
     const args = parseArgs(stripped);
-    // Skip flags (--xxx / -x) to find the actual subcommand
-    const subcommand = args.find((a) => !a.startsWith("-"))?.toLowerCase();
+    // Skip flags and their values to find the actual subcommand.
+    // Flags like -n, --namespace, --kubeconfig consume the next arg as a value,
+    // so "kubectl -n kube-system get pods" must not treat "kube-system" as subcommand.
+    const KUBECTL_VALUE_FLAGS = new Set([
+      "-n", "--namespace", "--kubeconfig", "--context", "--cluster",
+      "--user", "--server", "-s", "--token", "--certificate-authority",
+      "--client-certificate", "--client-key", "--tls-server-name",
+    ]);
+    let subcommand: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a.startsWith("-")) {
+        // Skip flag + its value if it's a known value-taking flag (without =)
+        if (KUBECTL_VALUE_FLAGS.has(a) && !a.includes("=")) i++;
+        continue;
+      }
+      subcommand = a.toLowerCase();
+      break;
+    }
 
     if (!subcommand || !SAFE_SUBCOMMANDS.has(subcommand)) {
       return JSON.stringify({
@@ -77,10 +94,11 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       }
     }
 
-    // ── Rate protection: -A/--all-namespaces without selectors ───
-    if (hasAllNamespacesWithoutSelector(args, subcommand)) {
+    // ── Rate protection: -A/--all-namespaces ───
+    const allNsErr = checkAllNamespacesRestriction(args, subcommand);
+    if (allNsErr) {
       return JSON.stringify({
-        error: `"kubectl ${subcommand} --all-namespaces" without selectors can overload the API server on large clusters.`,
+        error: allNsErr,
         hint: "Use -n <namespace> to target a specific namespace, or add -l <label> / --field-selector <selector> to narrow the query.",
       }, null, 2);
     }
@@ -225,9 +243,10 @@ kubectl is restricted to read-only subcommands: get, describe, logs, top, events
 In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
-Rate protection rules for kubectl in pipelines:
+Rate protection rules for kubectl:
 - "kubectl logs" requires --tail=<N> or --since=<duration>; bare logs without these will be rejected.
-- -A/--all-namespaces on get/describe/events/top requires a selector (-l, --selector, --field-selector); bare -A will be rejected.
+- "kubectl get -A -o yaml" and "kubectl get -A -o json" are blocked (bulk serialization). Use -o wide, -o name, or -o jsonpath instead.
+- "kubectl describe/events/top -A" requires a selector (-l, --field-selector).
 
 Examples:
 - Simple: "kubectl get pods -n monitoring -o wide"
