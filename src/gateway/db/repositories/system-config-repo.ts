@@ -8,7 +8,6 @@
 import { eq, like } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { systemConfig } from "../schema.js";
-import { isUniqueViolation } from "../dialect-helpers.js";
 
 /** Sensitive keys whose values are masked in getAll() output */
 const SENSITIVE_KEYS = new Set([
@@ -39,17 +38,21 @@ export class SystemConfigRepository {
         .delete(systemConfig)
         .where(eq(systemConfig.configKey, key));
     } else {
-      try {
-        await this.db
-          .insert(systemConfig)
-          .values({ configKey: key, configValue: value });
-      } catch (err) {
-        if (!isUniqueViolation(err)) throw err;
-        // Key already exists — update
+      const existing = await this.db
+        .select({ configKey: systemConfig.configKey })
+        .from(systemConfig)
+        .where(eq(systemConfig.configKey, key))
+        .limit(1);
+
+      if (existing.length > 0) {
         await this.db
           .update(systemConfig)
           .set({ configValue: value, updatedAt: new Date() })
           .where(eq(systemConfig.configKey, key));
+      } else {
+        await this.db
+          .insert(systemConfig)
+          .values({ configKey: key, configValue: value, updatedAt: new Date() });
       }
     }
   }
