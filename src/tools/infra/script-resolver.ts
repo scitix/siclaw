@@ -31,9 +31,9 @@ function loadDisabledBuiltins(): Set<string> {
 
 /**
  * Skill scope directories to search (in priority order, CLI fallback).
- * Higher-specificity scopes first: personal > skillset > team > builtin.
+ * Higher-specificity scopes first: personal > skillset > global > builtin.
  */
-const SKILL_SCOPES = ["user", "skillset", "extension", "team", "core"];
+const SKILL_SCOPES = ["user", "skillset", "extension", "global", "core"];
 
 /** Directory entry with associated scope */
 interface ScopeDir {
@@ -45,17 +45,17 @@ interface ScopeDir {
 const SCOPE_MAP: Record<string, SkillScope> = {
   user: "personal",
   skillset: "skillset",
-  extension: "team",
-  team: "team",
+  extension: "global",
+  global: "global",
   core: "builtin",
 };
 
 /**
  * Build the list of directories to search for a specific skill's scripts.
  *
- * Priority: personal/team (bundle) > builtin (Docker image).
+ * Priority: personal/global (bundle) > builtin (Docker image).
  * 1. Bundle-materialized (skillsBase/<skill>/) — legacy flat layout
- * 2. Scope subdirectories (user > extension > team > core)
+ * 2. Scope subdirectories (user > extension > global > core)
  * 3. Builtin fallback (skills/core/) — unless disabled
  */
 function getSkillScriptDirs(skill: string): ScopeDir[] {
@@ -63,9 +63,9 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
 
   // 1. Legacy flat layout (bundle-materialized without scope subdirs)
   const directPath = path.join(base, skill, "scripts");
-  if (fs.existsSync(directPath)) return [{ dir: directPath, scope: "team" }];
+  if (fs.existsSync(directPath)) return [{ dir: directPath, scope: "global" }];
 
-  // 2. Scope subdirectories (user > skillset > extension > team > core)
+  // 2. Scope subdirectories (user > skillset > extension > global > core)
   const dirs: ScopeDir[] = [];
   for (const scopeName of SKILL_SCOPES) {
     if (scopeName === "skillset") {
@@ -102,7 +102,7 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
 /**
  * Build the list of base directories for enumerating all skills.
  *
- * Priority: personal/team (bundle) > builtin (Docker image).
+ * Priority: personal/global (bundle) > builtin (Docker image).
  * Uses seenSkills dedup in callers so first-wins = highest priority.
  */
 function getSkillBaseDirs(): string[] {
@@ -121,7 +121,7 @@ function getSkillBaseDirs(): string[] {
     return dirs;
   }
 
-  // 2. Scope subdirectories (user > skillset > extension > team > core)
+  // 2. Scope subdirectories (user > skillset > extension > global > core)
   const dirs: string[] = [];
   for (const scope of SKILL_SCOPES) {
     if (scope === "skillset") {
@@ -150,14 +150,14 @@ function getSkillBaseDirs(): string[] {
   return dirs;
 }
 
-/** Check if a skill exists in the materialized bundle (personal/skillset/team) */
+/** Check if a skill exists in the materialized bundle (personal/skillset/global) */
 export function skillExistsInBundle(skillName: string): boolean {
   const base = skillsBase();
   // Legacy flat layout
   const directDir = path.join(base, skillName);
   if (fs.existsSync(directDir) && fs.statSync(directDir).isDirectory()) return true;
   // Scope subdirectory layout
-  for (const scopeDir of ["user", "skillset", "extension", "team"]) {
+  for (const scopeDir of ["user", "skillset", "extension", "global"]) {
     const dir = path.join(base, scopeDir, skillName);
     if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
     // For skillset, check subdirectories (skillset/{setId}/{skillName})
@@ -188,7 +188,7 @@ export function skillExistsAsBuiltin(skillName: string): boolean {
   return false;
 }
 
-export type SkillScope = "builtin" | "team" | "personal" | "global" | "skillset";
+export type SkillScope = "builtin" | "global" | "personal" | "skillset";
 
 export interface ResolvedScript {
   path: string;

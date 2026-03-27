@@ -72,18 +72,19 @@ LocalSpawner runs AgentBox HTTP servers in-process, one per user, on ports 4000+
 The skill bundle API (`/api/internal/skills/bundle`) delivers skills to AgentBox instances. Should it include core (built-in) skills?
 
 Options:
-- **Include all**: Bundle contains core + team + personal. Simple for AgentBox (one source of truth). Expensive: Gateway must serialize all core skill files on every request.
-- **Exclude core**: Bundle contains only team + personal. Core skills are baked into the Docker image / repo checkout. AgentBox reads them from disk directly.
+- **Include all**: Bundle contains core + global + personal. Simple for AgentBox (one source of truth). Expensive: Gateway must serialize all core skill files on every request.
+- **Exclude core**: Bundle contains only global + personal. Core skills are baked into the Docker image / repo checkout. AgentBox reads them from disk directly.
 
 **Decision**:
-Bundles contain **only team + personal skills**. Core skills are baked into the AgentBox Docker image at build time and read from `skills/core/` at runtime.
+Bundles contain **only global + skillset (dev only) + personal skills**. Core skills are baked into the AgentBox Docker image at build time and read from `skills/core/` at runtime. Skillset skills (from Skill Spaces) are included only in dev bundles — they must be promoted to global scope before reaching production.
 
 **Consequences**:
 - ✅ Bundle requests are small and fast (no large static skill content)
 - ✅ Core skills are versioned with the code, not the database
 - ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
-- ⚠️ In local mode, `materialize()` wipes `skills/team/` and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
+- ⚠️ In local mode, `materialize()` wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
 - ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
+- ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
 
 ---
 
@@ -124,7 +125,7 @@ Memory search needs to handle both semantic similarity ("find memories about OOM
 **Decision**:
 Hybrid scoring: `score = vectorWeight × cosineSimilarity + ftsWeight × BM25`
 
-Default: `vectorWeight = 0.85`, `ftsWeight = 0.15` (architecture.md), code defaults may differ — consult `src/memory/indexer.ts` for current values.
+Default: `vectorWeight = 0.70`, `ftsWeight = 0.30` (source: `src/memory/indexer.ts:14-15`). Configurable via `MemorySearchConfig`.
 
 **Consequences**:
 - ✅ Handles both "find semantically similar incidents" and "find the exact error message I saw"

@@ -39,7 +39,7 @@ export type Skill = {
     specs?: string;
     scripts?: Script[];
     labels?: string[];
-    scope: 'builtin' | 'team' | 'personal' | 'global' | 'skillset';
+    scope: 'builtin' | 'global' | 'personal' | 'skillset';
     author?: string;
     authorId?: string;
     contributionStatus?: 'none' | 'pending' | 'approved';
@@ -51,8 +51,8 @@ export type Skill = {
     latestReview?: SkillReview | null;
     publishedFiles?: { specs?: string; scripts?: Array<{ name: string; content: string }> } | null;
     publishedVersion?: number | null;
-    teamSourceSkillId?: string | null;
-    teamPinnedVersion?: number | null;
+    globalSourceSkillId?: string | null;
+    globalPinnedVersion?: number | null;
     stagingVersion?: number;
     skillSpaceId?: string | null;
     skillSpaceName?: string;
@@ -61,11 +61,18 @@ export type Skill = {
     isSpaceOwner?: boolean;
     forkedFromId?: string | null;
     globalSkillId?: string | null;
+    hasUnpublishedChanges?: boolean;
 };
 
 export type SkillSystemCapabilities = {
     isK8sMode: boolean;
     skillSpaceEnabled: boolean;
+};
+
+export type SkillDiffMetadataChange = {
+    field: 'name' | 'description' | 'type' | 'labels';
+    before: string | string[] | null;
+    after: string | string[] | null;
 };
 
 // Icon mapping for skills loaded from backend
@@ -134,6 +141,7 @@ export async function rpcGetSkillById(sendRpc: RpcSendFn, id: string, workspaceI
         })),
         publishedFiles: result.publishedFiles ?? null,
         stagingVersion: result.stagingVersion,
+        hasUnpublishedChanges: result.hasUnpublishedChanges ?? false,
     };
 }
 
@@ -199,10 +207,10 @@ export async function rpcReviewDecision(
 export async function rpcRequestPublish(
     sendRpc: RpcSendFn,
     id: string,
-    contributeToTeam?: boolean,
+    contributeToGlobal?: boolean,
     workspaceId?: string,
 ): Promise<{ status: string }> {
-    return sendRpc('skill.submit', { id, contributeToTeam, workspaceId });
+    return sendRpc('skill.submit', { id, contributeToGlobal, workspaceId });
 }
 
 export async function rpcWithdrawSkill(
@@ -230,10 +238,11 @@ export async function rpcGetSkillHistory(
 export async function rpcGetSkillDiff(
     sendRpc: RpcSendFn,
     id: string,
-    teamDiff?: boolean,
+    globalDiff?: boolean,
     workspaceId?: string,
-): Promise<{ diff: string; baselineLabel?: string; compareLabel?: string }> {
-    return sendRpc('skill.diff', { id, teamDiff, workspaceId });
+    targetScope?: 'global',
+): Promise<{ diff: string; baselineLabel?: string; compareLabel?: string; metadataChanges?: SkillDiffMetadataChange[] }> {
+    return sendRpc('skill.diff', { id, globalDiff, workspaceId, targetScope });
 }
 
 export async function rpcRollbackSkill(
@@ -260,7 +269,7 @@ export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, label
     return sendRpc('skill.updateLabels', { id, labels });
 }
 
-/** Fork a builtin/team skill to personal or skill space scope (server-side content copy) */
+/** Fork a builtin/global skill to personal or skill space scope (server-side content copy) */
 export async function rpcForkSkill(
     sendRpc: RpcSendFn,
     sourceId: string,

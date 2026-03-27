@@ -1,34 +1,38 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Users, Plus, Trash2, LogOut, Pencil, Check, X, Crown, UserPlus, Layers3, SendHorizontal, RotateCcw, Eye } from 'lucide-react';
+import { ArrowLeft, Users, Plus, Trash2, LogOut, Pencil, Check, X, Crown, UserPlus, Layers3, SendHorizontal, RotateCcw, Eye, Settings, GitFork, Upload } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { getCurrentUser } from '../../auth';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
 import { DiffViewerModal } from '../../components/DiffViewerModal';
-import { Tooltip } from '../../components/Tooltip';
 import { AddSkillDialog } from './AddSkillDialog';
 import { useWorkspace } from '../../contexts/WorkspaceContext';
-import type { Skill, SkillSpace, SkillSpaceMember } from './skillsData';
+import type { Skill, SkillSpace, SkillSpaceMember, SkillDiffMetadataChange } from './skillsData';
 import {
     rpcGetSkillSpace, rpcUpdateSkillSpace, rpcDeleteSkillSpace,
     rpcAddSkillSpaceMember, rpcRemoveSkillSpaceMember,
-    rpcForkSkill, rpcDeleteSkill, rpcRequestPublish, rpcWithdrawSkill, rpcGetSkillDiff, rpcGetSkillSystemCapabilities,
+    rpcForkSkill, rpcDeleteSkill, rpcRequestPublish, rpcWithdrawSkill, rpcGetSkillDiff, rpcGetSkillSystemCapabilities, getIconForType,
 } from './skillsData';
+import { DEFAULT_SKILL_LABEL_COLORS, SkillCard, type SkillCardAction, type SkillCardBadge } from './components/SkillCard';
 
-function getSkillSpaceStatus(skill: Skill): { label: string; tone: string; actionable: boolean } {
-    const version = Number(String(skill.version).replace(/^v/, '')) || 0;
-    const publishedVersion = skill.publishedVersion ?? 0;
+function getSkillSpaceStatus(skill: Skill): { label: string; tone: string; mergeActionable: boolean; canContribute: boolean } {
+    if (skill.contributionStatus === 'pending') {
+        return { label: 'Pending Contribution', tone: 'bg-orange-50 text-orange-700 border-orange-200', mergeActionable: false, canContribute: false };
+    }
     if (skill.reviewStatus === 'pending') {
-        return { label: 'Pending Review', tone: 'bg-amber-50 text-amber-700 border-amber-200', actionable: false };
+        return { label: 'Pending Merge', tone: 'bg-amber-50 text-amber-700 border-amber-200', mergeActionable: false, canContribute: false };
     }
-    if (skill.reviewStatus === 'approved' && version <= publishedVersion) {
-        return { label: 'Merged', tone: 'bg-emerald-50 text-emerald-700 border-emerald-200', actionable: false };
+    if (skill.reviewStatus === 'approved' && !skill.hasUnpublishedChanges) {
+        if (skill.contributionStatus === 'approved') {
+            return { label: 'Contributed', tone: 'bg-emerald-50 text-emerald-700 border-emerald-200', mergeActionable: false, canContribute: false };
+        }
+        return { label: 'Ready to Contribute', tone: 'bg-blue-50 text-blue-700 border-blue-200', mergeActionable: false, canContribute: true };
     }
-    if (skill.globalSkillId) {
-        return { label: 'Ready to Update', tone: 'bg-blue-50 text-blue-700 border-blue-200', actionable: true };
+    if (skill.reviewStatus === 'approved') {
+        return { label: 'Ready to Merge Update', tone: 'bg-blue-50 text-blue-700 border-blue-200', mergeActionable: true, canContribute: false };
     }
-    return { label: 'Ready to Submit', tone: 'bg-slate-50 text-slate-700 border-slate-200', actionable: true };
+    return { label: 'Ready to Merge', tone: 'bg-slate-50 text-slate-700 border-slate-200', mergeActionable: true, canContribute: false };
 }
 
 function InlineEdit({ value, onSave, className, placeholder }: {
@@ -87,8 +91,9 @@ export function SkillSpaceDetailPage() {
         title: string;
         subtitle?: string;
         diffText: string | null;
+        metadataChanges: SkillDiffMetadataChange[];
         isLoading: boolean;
-    }>({ isOpen: false, title: '', diffText: null, isLoading: false });
+    }>({ isOpen: false, title: '', diffText: null, metadataChanges: [], isLoading: false });
     const [confirmDialog, setConfirmDialog] = useState<{
         isOpen: boolean; title: string; description: string;
         variant: 'primary' | 'danger' | 'warning'; confirmText: string; onConfirm: () => void;
@@ -103,7 +108,7 @@ export function SkillSpaceDetailPage() {
         [visibleSkills, selectedSkillIds],
     );
     const selectedPendingCount = selectedSkills.filter(skill => skill.reviewStatus === 'pending').length;
-    const selectedReadyCount = selectedSkills.filter(skill => getSkillSpaceStatus(skill).actionable).length;
+    const selectedReadyCount = selectedSkills.filter(skill => getSkillSpaceStatus(skill).mergeActionable).length;
 
     useEffect(() => {
         if (!flashMessage) return;
@@ -121,7 +126,12 @@ export function SkillSpaceDetailPage() {
             setSkillSpaceEnabled(caps.skillSpaceEnabled);
             setSpaceData({
                 ...data,
-                skills: data.skills.map((s: any) => ({ ...s, icon: null, version: `v${s.version || 1}`, enabled: s.enabled ?? true })),
+                skills: data.skills.map((s: any) => ({
+                    ...s,
+                    icon: getIconForType(s.type || 'Custom'),
+                    version: `v${s.version || 1}`,
+                    enabled: s.enabled ?? true,
+                })),
             });
             setSelectedSkillIds(prev => {
                 const next = new Set<string>();
@@ -145,7 +155,11 @@ export function SkillSpaceDetailPage() {
     }, []);
 
     const handleInvite = async () => {
-        if (!spaceId || !inviteUsername.trim() || !currentWorkspace?.id) return;
+        if (!spaceId || !inviteUsername.trim()) return;
+        if (!currentWorkspace?.id) {
+            setInviteError('Workspace not loaded yet. Please wait and try again.');
+            return;
+        }
         setInviteError(null);
         try {
             await rpcAddSkillSpaceMember(sendRpc, currentWorkspace.id, spaceId, inviteUsername.trim());
@@ -226,34 +240,126 @@ export function SkillSpaceDetailPage() {
 
     const handleViewDiff = async (skill: Skill) => {
         if (!currentWorkspace?.id) return;
+        const useGlobalContributionBaseline =
+            skill.contributionStatus === 'pending' ||
+            (skill.reviewStatus === 'approved' && !skill.hasUnpublishedChanges);
         try {
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
                 subtitle: 'Loading comparison...',
                 diffText: null,
+                metadataChanges: [],
                 isLoading: true,
             });
-            const result = await rpcGetSkillDiff(sendRpc, String(skill.id), false, currentWorkspace.id);
+            const result = await rpcGetSkillDiff(
+                sendRpc,
+                String(skill.id),
+                useGlobalContributionBaseline,
+                currentWorkspace.id,
+                useGlobalContributionBaseline ? 'global' : undefined,
+            );
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
                 subtitle: result.baselineLabel && result.compareLabel
                     ? `${result.baselineLabel} -> ${result.compareLabel}`
-                    : 'Skill Space diff',
+                    : useGlobalContributionBaseline
+                        ? 'Latest global -> Contribution candidate'
+                        : 'Skill Space diff',
                 diffText: result.diff || 'No changes detected.',
+                metadataChanges: result.metadataChanges ?? [],
                 isLoading: false,
             });
         } catch (err: any) {
             setDiffModal({
                 isOpen: true,
                 title: `${skill.name} Diff`,
-                subtitle: 'Skill Space diff',
+                subtitle: useGlobalContributionBaseline
+                    ? 'Latest global -> Contribution candidate'
+                    : 'Skill Space diff',
                 diffText: 'Failed to load diff.',
+                metadataChanges: [],
                 isLoading: false,
             });
             showFlash('error', err.message || 'Failed to load diff');
         }
+    };
+
+    const handleToggleEnabled = async (e: React.MouseEvent, skill: Skill) => {
+        e.stopPropagation();
+        try {
+            await sendRpc('skill.setEnabled', { name: skill.name, enabled: !skill.enabled });
+            setSpaceData(prev => prev ? {
+                ...prev,
+                skills: prev.skills.map(s => s.name === skill.name ? { ...s, enabled: !s.enabled } : s),
+            } : prev);
+        } catch (err: any) {
+            showFlash('error', err.message || 'Failed to update skill status');
+        }
+    };
+
+    const handleSubmitSkill = (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        setConfirmDialog({
+            isOpen: true,
+            title: 'Submit Merge',
+            description: `Submit "${skill.name}" from Skill Space for merge review? Once approved, it will become the latest merged version in this Skill Space.`,
+            variant: 'primary',
+            confirmText: 'Submit Merge',
+            onConfirm: async () => {
+                try {
+                    await rpcRequestPublish(sendRpc, String(skill.id), undefined, currentWorkspace.id);
+                    await reload();
+                    showFlash('success', `Submitted ${skill.name} for merge review.`);
+                } catch (err: any) {
+                    showFlash('error', err.message || 'Failed to submit skill');
+                }
+            },
+        });
+    };
+
+    const handleContributeSkill = (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        setConfirmDialog({
+            isOpen: true,
+            title: 'Contribute to Global',
+            description: `Contribute the latest merged version of "${skill.name}" to Global? Local unmerged edits are excluded from this request.`,
+            variant: 'primary',
+            confirmText: 'Contribute',
+            onConfirm: async () => {
+                try {
+                    await rpcRequestPublish(sendRpc, String(skill.id), true, currentWorkspace.id);
+                    await reload();
+                    showFlash('success', `Submitted ${skill.name} for global contribution review.`);
+                } catch (err: any) {
+                    showFlash('error', err.message || 'Failed to contribute skill');
+                }
+            },
+        });
+    };
+
+    const handleWithdrawSkill = (skill: Skill) => {
+        if (!currentWorkspace?.id) return;
+        const isContributionRequest = skill.contributionStatus === 'pending' && skill.reviewStatus !== 'pending';
+        setConfirmDialog({
+            isOpen: true,
+            title: isContributionRequest ? 'Withdraw Contribution Request' : 'Withdraw Merge Request',
+            description: isContributionRequest
+                ? `Withdraw the contribution request for "${skill.name}"? The merged version will stay unchanged in Skill Space.`
+                : `Withdraw the merge request for "${skill.name}"? The working copy will stay in Skill Space.`,
+            variant: 'warning',
+            confirmText: 'Withdraw',
+            onConfirm: async () => {
+                try {
+                    await rpcWithdrawSkill(sendRpc, String(skill.id), currentWorkspace.id);
+                    await reload();
+                    showFlash('success', `Withdrew ${skill.name} review request.`);
+                } catch (err: any) {
+                    showFlash('error', err.message || 'Failed to withdraw skill');
+                }
+            },
+        });
     };
 
     const toggleSkillSelection = (skillId: string) => {
@@ -280,13 +386,13 @@ export function SkillSpaceDetailPage() {
         try {
             let submittedCount = 0;
             for (const skill of selectedSkills) {
-                if (!getSkillSpaceStatus(skill).actionable) continue;
+                if (!getSkillSpaceStatus(skill).mergeActionable) continue;
                 await rpcRequestPublish(sendRpc, String(skill.id), undefined, currentWorkspace.id);
                 submittedCount += 1;
             }
             await reload();
             exitMergeMode();
-            showFlash('success', `Submitted ${submittedCount} skill${submittedCount === 1 ? '' : 's'} to Global review.`);
+            showFlash('success', `Submitted ${submittedCount} skill${submittedCount === 1 ? '' : 's'} for merge review.`);
         } catch (err: any) {
             showFlash('error', err.message || 'Failed to submit selected skills');
         } finally {
@@ -333,6 +439,92 @@ export function SkillSpaceDetailPage() {
         }
     };
 
+    const renderSkillSpaceCard = (skill: Skill) => {
+        const status = getSkillSpaceStatus(skill);
+        const badges: SkillCardBadge[] = [
+            { label: status.label, className: status.tone },
+            ...(skill.globalSkillId ? [{ label: 'Shadows Global', className: 'bg-blue-50 text-blue-700 border-blue-200' }] : []),
+        ];
+        const actions: SkillCardAction[] = [
+            {
+                key: 'withdraw',
+                tooltip: 'Withdraw',
+                icon: RotateCcw,
+                tone: 'orange',
+                hidden: skill.reviewStatus !== 'pending' && skill.contributionStatus !== 'pending',
+                onClick: (e) => { e.stopPropagation(); handleWithdrawSkill(skill); },
+            },
+            {
+                key: 'submit',
+                tooltip: 'Submit Merge',
+                icon: Upload,
+                tone: 'blue',
+                hidden: !status.mergeActionable,
+                onClick: (e) => { e.stopPropagation(); handleSubmitSkill(skill); },
+            },
+            {
+                key: 'contribute',
+                tooltip: 'Contribute to Global',
+                icon: Upload,
+                tone: 'blue',
+                hidden: !status.canContribute,
+                onClick: (e) => { e.stopPropagation(); handleContributeSkill(skill); },
+            },
+            {
+                key: 'fork',
+                tooltip: 'Fork to Personal',
+                icon: GitFork,
+                tone: 'purple',
+                disabled: forkingSkillIds.has(String(skill.id)),
+                onClick: (e) => { e.stopPropagation(); handleForkToPersonal(skill); },
+            },
+            {
+                key: 'diff',
+                tooltip: 'Open Diff',
+                icon: Eye,
+                tone: 'cyan',
+                hidden: !(skill.forkedFromId || (skill.publishedVersion && skill.publishedVersion > 0)),
+                onClick: (e) => { e.stopPropagation(); handleViewDiff(skill); },
+            },
+            {
+                key: 'open',
+                tooltip: 'Configure Skill',
+                icon: Settings,
+                tone: 'primary',
+                onClick: () => navigate(`/skills/${skill.id}`, { state: { fromSkillSpaceId: spaceId } }),
+            },
+            {
+                key: 'delete',
+                tooltip: 'Delete Skill',
+                icon: Trash2,
+                tone: 'red',
+                hidden: !isMaintainer,
+                onClick: (e) => { e.stopPropagation(); handleDeleteSkill(skill); },
+            },
+        ];
+
+        return (
+            <SkillCard
+                key={skill.id}
+                skill={skill}
+                badges={badges}
+                footerScope={{
+                    label: spaceData?.name || 'Skill Space',
+                    className: 'bg-green-50 text-green-600 border border-green-200',
+                }}
+                actions={actions}
+                selectionMode={isOwner && isMergeMode ? {
+                    selected: selectedSkillIds.has(String(skill.id)),
+                    onToggle: () => toggleSkillSelection(String(skill.id)),
+                } : undefined}
+                showToggle
+                onToggleEnabled={(e) => handleToggleEnabled(e, skill)}
+                labelColors={DEFAULT_SKILL_LABEL_COLORS}
+                descriptionFallback="No description"
+            />
+        );
+    };
+
     if (loading) {
         return <div className="flex items-center justify-center h-full"><div className="w-5 h-5 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" /></div>;
     }
@@ -364,6 +556,7 @@ export function SkillSpaceDetailPage() {
                 title={diffModal.title}
                 subtitle={diffModal.subtitle}
                 diffText={diffModal.diffText}
+                metadataChanges={diffModal.metadataChanges}
                 isLoading={diffModal.isLoading}
             />
             <AddSkillDialog isOpen={addDialog} skillSpaceId={spaceId!} skillSpaceName={spaceData.name} workspaceId={currentWorkspace!.id}
@@ -471,7 +664,7 @@ export function SkillSpaceDetailPage() {
                         <div>
                             <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Skills ({spaceData.skills.length})</h2>
                             <p className="text-xs text-gray-400 mt-1">
-                                Browse and edit shared skills here. Start a merge request only when you are ready to promote selected changes to Global.
+                                Browse and edit shared skills here. Merge changes into the accepted Skill Space snapshot first, then contribute clean merged versions to Global.
                             </p>
                         </div>
                         <div className="flex items-center gap-2">
@@ -483,7 +676,7 @@ export function SkillSpaceDetailPage() {
                                     }}
                                     className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors"
                                 >
-                                    <Layers3 className="w-3.5 h-3.5" /> Start Merge Request
+                                    <Layers3 className="w-3.5 h-3.5" /> Start Merge Mode
                                 </button>
                             )}
                             {isMaintainer && (
@@ -517,7 +710,7 @@ export function SkillSpaceDetailPage() {
                                     className="inline-flex items-center gap-2 px-3 py-2 text-xs font-medium text-white bg-slate-900 rounded-xl hover:bg-slate-800 disabled:opacity-40"
                                 >
                                     <SendHorizontal className="w-3.5 h-3.5" />
-                                    Submit selected
+                                    Submit selected merges
                                 </button>
                                 <button
                                     onClick={handleBatchWithdraw}
@@ -542,78 +735,8 @@ export function SkillSpaceDetailPage() {
                             {isMaintainer && <button onClick={() => setAddDialog(true)} className="mt-2 text-sm text-gray-600 hover:text-gray-900 underline">Add your first skill</button>}
                         </div>
                     ) : (
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                            {spaceData.skills.map(skill => (
-                                <div key={skill.id}
-                                    className="group rounded-xl border border-gray-200 p-5 hover:shadow-md hover:border-gray-300 transition-all flex flex-col">
-                                    <div className="flex items-start justify-between mb-2">
-                                        <div className="flex items-start gap-3 min-w-0 flex-1">
-                                            {isOwner && isMergeMode && (
-                                                <button
-                                                    onClick={() => toggleSkillSelection(String(skill.id))}
-                                                    className={cn(
-                                                        'mt-0.5 w-4 h-4 rounded border flex items-center justify-center transition-colors',
-                                                        selectedSkillIds.has(String(skill.id))
-                                                            ? 'bg-slate-900 border-slate-900 text-white'
-                                                            : 'border-slate-300 bg-white text-transparent hover:border-slate-400'
-                                                    )}
-                                                >
-                                                    <Check className="w-3 h-3" />
-                                                </button>
-                                            )}
-                                            <div className="min-w-0 flex-1">
-                                                <h3 className="text-sm font-semibold text-gray-900 group-hover:text-gray-700 truncate">{skill.name}</h3>
-                                                <div className="flex items-center gap-2 mt-2 flex-wrap">
-                                                    <span className={cn('text-[10px] font-medium px-1.5 py-0.5 rounded border', getSkillSpaceStatus(skill).tone)}>
-                                                        {getSkillSpaceStatus(skill).label}
-                                                    </span>
-                                                    {skill.globalSkillId && (
-                                                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-                                                            Shadows Global
-                                                        </span>
-                                                    )}
-                                                    <span className="text-[10px] text-gray-400">{skill.version || 'v1'}</span>
-                                                </div>
-                                            </div>
-                                        </div>
-                                        {isMaintainer && (
-                                            <div className="flex gap-1 ml-2">
-                                                {(skill.forkedFromId || (skill.publishedVersion && skill.publishedVersion > 0)) && (
-                                                <Tooltip content="Open Diff">
-                                                    <button onClick={() => handleViewDiff(skill)} className="p-1 text-gray-300 hover:text-gray-600 rounded">
-                                                        <Eye className="w-3.5 h-3.5" />
-                                                    </button>
-                                                </Tooltip>
-                                                )}
-                                                <Tooltip content="Delete">
-                                                    <button onClick={() => handleDeleteSkill(skill)} className="p-1 text-gray-300 hover:text-red-500 rounded">
-                                                        <Trash2 className="w-3.5 h-3.5" />
-                                                    </button>
-                                                </Tooltip>
-                                            </div>
-                                        )}
-                                    </div>
-                                    <p className="text-xs text-gray-500 line-clamp-2 flex-1">{skill.description || 'No description'}</p>
-                                    <div className="flex items-center gap-2 mt-3 flex-wrap">
-                                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">{spaceData.name}</span>
-                                    </div>
-                                    <div className="mt-3 flex items-center gap-2 flex-wrap">
-                                        <button
-                                            onClick={() => navigate(`/skills/${skill.id}`, { state: { fromSkillSpaceId: spaceId } })}
-                                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 rounded-md hover:bg-slate-50"
-                                        >
-                                            Open Skill
-                                        </button>
-                                        <button
-                                            onClick={() => handleForkToPersonal(skill)}
-                                            disabled={forkingSkillIds.has(String(skill.id))}
-                                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-purple-700 bg-purple-50 border border-purple-200 rounded-md hover:bg-purple-100 disabled:opacity-50"
-                                        >
-                                            {forkingSkillIds.has(String(skill.id)) ? 'Forking...' : 'Fork to Personal'}
-                                        </button>
-                                    </div>
-                                </div>
-                            ))}
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            {spaceData.skills.map(skill => renderSkillSpaceCard(skill))}
                         </div>
                     )}
                 </section>

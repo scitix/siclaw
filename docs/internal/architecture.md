@@ -64,7 +64,7 @@ Terminal ──▶ InteractiveMode (raw terminal TUI) ──▶ Agent Core ─�
   │  │  Agent Runtime   │  │  pi-agent or claude-sdk brain
   │  │  ┌───────────┐  │  │
   │  │  │  Tools     │  │  │  kubectl, bash, node_exec, deep_search, ...
-  │  │  │  Skills    │  │  │  core/ + team/ + personal/
+  │  │  │  Skills    │  │  │  core/ + global/ + personal/
   │  │  │  MCP       │  │  │  external tool servers
   │  │  │  Memory    │  │  │  vector search + markdown
   │  │  └───────────┘  │  │
@@ -335,10 +335,10 @@ Skills are reusable diagnostic playbooks consisting of a `SKILL.md` spec and she
 | Tier | Location | Managed By | Description |
 |------|----------|-----------|-------------|
 | Core | `skills/core/` | Baked into image | Built-in diagnostics (node logs, network, image pull debug, etc.) |
-| Team | `skills/team/` | Admin via WebUI | Shared across all users |
+| Global | `skills/global/` | Contributed from personal, admin-managed | Shared across all users |
 | Personal | `skills/user/{userId}/` | User via WebUI or `create_skill` tool | Per-user custom skills |
 
-Loading priority: personal > team > core (same-name skills override).
+Loading priority: personal > skillset > global > builtin (same-name skills override).
 
 ### 7.2 Skill Structure
 
@@ -382,7 +382,7 @@ Findings are stored in `skill_reviews` and gate activation of the skill.
 |--------|---------------|
 | Agent Runtime | pi-agent or claude-sdk brain |
 | Tools | kubectl, restricted bash, node exec, deep search, create_skill, etc. |
-| Skills | Three-tier overlay: core (read-only) + team (read-only) + personal (read-write) |
+| Skills | Four-tier overlay: builtin (read-only) + global (read-only) + skillset (dev-only) + personal (read-write) |
 | MCP Client | Connect to external Model Context Protocol servers |
 | Memory | Per-user vector + keyword search across sessions |
 
@@ -631,7 +631,7 @@ The LLM receives all script content, the SKILL.md spec, and static findings. It 
 - Each user runs in a separate AgentBox (process or pod)
 - AgentBox holds user's kubeconfig — never shared across users
 - `automountServiceAccountToken: false` — AgentBox pods have no K8s service account; can only access clusters via explicitly provided kubeconfigs
-- Skills directory: core/team are read-only mounts; only personal skills are writable
+- Skills directory: core/global are read-only mounts; only personal skills are writable
 - Credential directory: mounted read-only at `/home/agentbox/.credentials`
 - Node/pod name injection blocked: strict regex validation (`[a-zA-Z0-9][a-zA-Z0-9.\-]*`)
 
@@ -756,7 +756,7 @@ src/
 │   └── s3-backup.ts         # Session JSONL backup
 skills/
 ├── core/                    # Built-in skills
-├── team/                    # Team-shared skills
+├── global/                  # Global shared skills
 └── extension/               # Optional extension skills
 k8s/                         # Kubernetes manifests
 ```
