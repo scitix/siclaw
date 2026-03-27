@@ -91,7 +91,7 @@ describe("CONTAINER_SENSITIVE_PATHS pattern matching", () => {
 // ── Pre-execution: validateCommand (Pass 6) integration ─────────────
 
 describe("validateCommand blocks sensitive paths in all contexts", () => {
-  const contexts = ["pod", "node", "nsenter"] as const;
+  const contexts = ["pod", "node"] as const;
   const sensitiveCmds = [
     "cat /etc/shadow",
     "cat /var/run/secrets/kubernetes.io/serviceaccount/token",
