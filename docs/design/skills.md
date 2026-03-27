@@ -9,7 +9,7 @@ description: "Architecture, lifecycle, approval workflow, and deployment-mode be
 > **Purpose**: Document the full skills architecture — scopes, lifecycle, approval workflow,
 > execution model, and how skills behave across deployment modes.
 >
-> Read this before touching: `src/tools/local-script.ts`, `src/tools/script-resolver.ts`,
+> Read this before touching: `src/tools/shell/local-script.ts`, `src/tools/infra/script-resolver.ts`,
 > `src/gateway/skills/`, `src/agentbox/resource-handlers.ts`, or `src/core/agent-factory.ts`.
 
 ---
@@ -115,7 +115,7 @@ When multiple scopes contain a skill with the same name, the highest-priority sc
 personal > extension > team > core
 ```
 
-Defined in `src/tools/script-resolver.ts` `SKILL_SCOPES`.
+Defined in `src/tools/infra/script-resolver.ts` `SKILL_SCOPES`.
 
 ### Builtin Sub-Tiers: core vs extension
 
@@ -248,7 +248,7 @@ Local mode syncs to per-user directories to maintain filesystem isolation
 
 ### local_script Tool
 
-The `local_script` tool (`src/tools/local-script.ts`) is the primary execution path:
+The `local_script` tool (`src/tools/shell/local-script.ts`) is the primary execution path:
 
 1. **Path resolution**: `resolveSkillScript(skill, script)` searches scope directories
    in priority order (personal > extension > team > core)
@@ -328,10 +328,10 @@ original. The forked copy can later be contributed back to team via the approval
 
 ```
 Execution & Resolution
-  src/tools/local-script.ts              local_script tool (primary execution path)
-  src/tools/script-resolver.ts        Skill path resolution, scope priority
-  src/tools/restricted-bash.ts        Bash whitelist (isSkillScript)
-  src/tools/fork-skill.ts             fork_skill tool
+  src/tools/shell/local-script.ts        local_script tool (primary execution path)
+  src/tools/infra/script-resolver.ts   Skill path resolution, scope priority
+  src/tools/shell/restricted-bash.ts   Bash whitelist (isSkillScript)
+  src/tools/workflow/fork-skill.ts     fork_skill tool
 
 Gateway Skills Management
   src/gateway/skills/file-writer.ts   Disk I/O: read, write, scan, snapshot

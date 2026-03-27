@@ -67,19 +67,37 @@ Memory tools (`memory_search`, investigation history) are **pi-agent only** — 
 
 > Full roadmap: `docs/design/roadmap.md`
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| IM Phase 0 | ✅ Done | Raw memory loop (write + search + inject) |
-| IM Phase 1 | ✅ Done (PR #17) | Structured extraction, SQLite investigations table |
-| **KR0** | 🔄 In Progress | Qdrant + knowledge base ingestion |
-| **IM Phase 2** | 🔄 In Progress | Diagnostic path learning from history |
-| PM1 | ⏳ Next | 4-layer config cascade (System → Team → Personal → Workspace) |
-
-**Open research**: R1 (Contextual vs Late Chunking), R3 (config merge strategy), T1 (KG storage: Kuzu vs SQLite)
+**Active**: KR0 (Qdrant + knowledge ingestion), IM Phase 2 (diagnostic path learning)
+**Next**: PM1 (4-layer config cascade), OB0 (Prometheus metrics query)
+**Consolidation**: Harness hardening — verifying existing features before next roadmap phase
 
 ### 🔴 System Prompt Protection
 
 **`src/core/prompt.ts` (the SRE system prompt) must NEVER be modified without explicit human confirmation.** This file defines the agent's core behavioral rules, safety constraints, and credential handling — unauthorized changes can break security or alter agent behavior in subtle, hard-to-detect ways. Before making any change to this file, describe the intended modification and get approval first.
+
+---
+
+## Change Impact Matrix
+
+> Before modifying any file, find it in this matrix. Read the required docs and verify the cross-cutting concerns **before writing code**.
+
+| If you change... | Must read | Must verify | Cross-cutting concerns |
+|---|---|---|---|
+| `src/tools/infra/command-sets.ts` | security.md §4, tools.md §6 | `npm test` | Existing skill scripts still work; sanitization rules in `output-sanitizer.ts` still align |
+| `src/tools/infra/output-sanitizer.ts` | sanitization.md, tools.md §6.2 | `npm test` | Pipeline fallback in `restricted-bash.ts`; deep-search sub-agent output quality |
+| `src/tools/infra/command-validator.ts` | security.md §4, tools.md §6.2 | `npm test` | All tools calling `validateCommand()` |
+| `src/tools/shell/restricted-bash.ts` | security.md, tools.md §5, sanitization.md | `npm test` | kubectl pipeline validation; skill script bypass (`isSkillScript`); 3-layer sanitization |
+| `src/tools/shell/local-script.ts` | skills.md §6, sanitization.md §5 | `npm test` | Skill execution timeout/limits; output is NOT sanitized (by design) |
+| `src/tools/k8s-exec/*.ts` | tools.md §3 | `npm test` | 10-step pipeline — steps 4/6/9 are mandatory security gates |
+| `src/tools/k8s-script/*.ts` | tools.md §4, skills.md | `npm test` | Script transmission; skill resolution via `script-resolver.ts` |
+| `src/gateway/skills/` | skills.md, invariants.md §1-2 | `npm test` | Bundle contract; `materialize()` NOT safe in local mode |
+| `src/gateway/db/schema-*.ts` | invariants.md §5 | `npm test` | `migrate-sqlite.ts` must also be updated (DDL parity) |
+| `src/core/agent-factory.ts` | tools.md §7, invariants.md §10 | `npm test` | Tool registration order; brain type compatibility (pi-agent vs claude-sdk) |
+| `src/core/prompt.ts` | **⚠️ REQUIRES HUMAN APPROVAL** | — | Agent behavior, safety constraints — describe intent and wait for OK |
+| `src/memory/` | invariants.md §7, decisions.md ADR-005 | `npm test` | Requires embedding config; pi-agent only (not available in claude-sdk brain) |
+| `Dockerfile.agentbox` | security.md §3-5 | `docker build` | Dual-user model (agentbox/sandbox); capability set; setgid kubectl |
+| `k8s/` or `helm/` | security.md §5, invariants.md §11 | `helm template` | mTLS K8s-only; container hardening; `readOnlyRootFilesystem` |
+| `src/agentbox/resource-handlers.ts` | invariants.md §1,6 | `npm test` | `materialize()` wipes team+user dirs — safe in K8s, destructive in local mode |
 
 ---
 
@@ -135,20 +153,56 @@ DB (memory):  node:sqlite + FTS5
 
 ---
 
-## Collaboration Notes
+## Pre-flight Protocol
 
-**When starting a session as reviewer:**
-1. This file is already loaded (you're reading it)
-2. For architecture-sensitive PRs, load `docs/design/invariants.md`
-3. For security-sensitive PRs (execution tools, Dockerfile, K8s manifests), load `docs/design/security.md`
-4. For roadmap/planning work, load `docs/design/roadmap.md`
-5. For "why was X designed this way", load `docs/design/decisions.md`
+> **Mandatory** before any code modification. Do not skip these steps even if
+> the task seems simple — most regressions come from "simple" changes that
+> violated an invariant the developer didn't know about.
 
-**When starting a session as developer:**
-1. Check `docs/design/roadmap.md` for current phase priorities
-2. Before touching resource sync or skills: re-read invariants §1-3
-3. Before touching execution tools or container config: re-read `docs/design/security.md`
-4. Before adding or modifying tools: re-read `docs/design/tools.md`
-5. New architectural decisions should get an ADR in `docs/design/decisions.md`
+### Developer Pre-flight
+
+1. **Locate in matrix**: Find the files you'll change in the Change Impact Matrix above
+2. **Read required docs**: Read every doc listed in the "Must read" column — skim is not enough for security/invariant docs
+3. **List cross-cutting concerns**: Write down (in your plan or task list) what else could break
+4. **Confirm test strategy**: Know which tests cover your change (`npm test` for unit, manual for integration)
+5. **Check current phase**: Verify your work aligns with `docs/design/roadmap.md` priorities
+
+### Reviewer Pre-flight
+
+1. **Load context**: Read the relevant design docs for the PR's domain (see matrix)
+2. **Read existing code**: Understand the code around the diff, not just the diff itself
+3. **Verify docs updated**: Code changes without corresponding doc updates are incomplete
+4. **Check cross-cutting**: Did the author verify the concerns listed in the matrix?
+
+### New Architectural Decisions
+
+Any decision with non-obvious rationale should get an ADR in `docs/design/decisions.md`.
+
+---
+
+## Context Compaction Rules
+
+> When Claude Code compacts context (automatically or via `/compact`), preserve:
+
+1. **Modified files list** — every file changed in this session, with what was changed
+2. **Active invariant domain** — which design docs are relevant to current work
+3. **Cross-cutting concerns** — any blast radius items identified during pre-flight
+4. **Pending verifications** — tests not yet run, docs not yet updated, reviews not yet done
+5. **Task progress** — current task status and what remains
+
+---
+
+## Design Documentation Map
+
+| Document | Covers | Read when |
+|----------|--------|-----------|
+| `docs/design/invariants.md` | Deployment modes, skill bundles, shell security, DB contracts | Touching resource sync, skills, DB schema, security |
+| `docs/design/security.md` | 6-layer defense model, OS isolation, container hardening | Touching execution tools, Dockerfile, K8s manifests |
+| `docs/design/tools.md` | Tool organization, execution pipelines, context system | Adding or modifying tools |
+| `docs/design/sanitization.md` | 3-layer output sanitization, pre/post strategy | Touching output-sanitizer, command-sets, restricted-bash |
+| `docs/design/skills.md` | Skill lifecycle, approval workflow, execution model | Touching skill sync, review, execution |
+| `docs/design/decisions.md` | ADRs with context and consequences | Wondering "why was X designed this way?" |
+| `docs/design/roadmap.md` | Current phase priorities, capability gaps | Planning work, checking priorities |
+| `docs/design/harness.md` | Harness design philosophy, AI development standards | Onboarding, understanding our development framework |
 
 **PR comments are posted via `gh` CLI as the authenticated GitHub user.**
