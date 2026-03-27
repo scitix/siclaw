@@ -249,7 +249,28 @@ Pass 5 — COMMAND_RULES         Per-command: pipeOnly, noFilePaths, blockedFlag
 Pass 6 — Sensitive Paths       Block commands targeting credential/config file paths
 ```
 
-### 4.2 Context-Based Whitelisting
+### 4.2 Pass 6: Sensitive Path Patterns
+
+Pass 6 blocks commands that target known credential or configuration file paths.
+These are paths whose content **cannot be reliably sanitized post-execution**
+(binary data, unstructured secrets, password hashes). Commands that produce
+sanitizable output (env, printenv, crictl inspect) are handled by
+`output-sanitizer.ts` instead — see `docs/design/sanitization.md`.
+
+| Category | Patterns | Examples |
+|----------|----------|---------|
+| K8s SA tokens & mounted secrets | `/run/secrets/`, `/var/run/secrets/` | Service account tokens |
+| Process info | `/proc/*/environ`, `/proc/*/cmdline`, `/proc/*/fd/`, `/proc/*/mem`, `/proc/*/maps`, `/proc/*/smaps`, `/proc/kcore` | Process memory, file descriptors |
+| System credentials | `/etc/shadow`, `/etc/gshadow`, `/etc/master.passwd` | Password hashes |
+| SSH | `/.ssh/`, `id_rsa`, `id_ed25519`, `id_ecdsa` | SSH private keys |
+| TLS key material | `*.key`, `*.p12`, `*.pfx`, `*.jks` | Private keys, keystores (`.pem` excluded — CA certs are public and needed for diagnostics) |
+| Cloud providers | `/.aws/`, `/.gcp/`, `/.azure/`, `/.docker/config.json` | Cloud credentials |
+| K8s control plane | `/etc/kubernetes/pki/`, `/etc/kubernetes/admin.conf`, `/var/lib/kubelet/`, `/var/lib/etcd/` | Cluster PKI, etcd data |
+| Shell/DB history | `.bash_history`, `.zsh_history`, `.mysql_history`, `.psql_history`, `.node_repl_history` | Command history with potential secrets |
+
+**Source**: `CONTAINER_SENSITIVE_PATHS` in `src/tools/infra/command-sets.ts:1262-1304`
+
+### 4.3 Context-Based Whitelisting
 
 Different execution contexts allow different command sets:
 
@@ -265,7 +286,7 @@ blocked — agents use dedicated file tools instead.
 
 **Source**: `src/tools/infra/command-sets.ts` — `CONTEXT_CATEGORIES`, `COMMAND_CATEGORIES`
 
-### 4.3 COMMAND_RULES Declarative Engine
+### 4.4 COMMAND_RULES Declarative Engine
 
 Per-command restrictions are defined declaratively in `COMMAND_RULES`:
 
@@ -296,7 +317,7 @@ even though `grep` appears after a pipe.
 
 **Source**: `src/tools/infra/command-sets.ts` — `COMMAND_RULES`
 
-### 4.4 Explicitly Excluded Binaries
+### 4.5 Explicitly Excluded Binaries
 
 | Command | Reason |
 |---------|--------|
@@ -307,7 +328,7 @@ even though `grep` appears after a pipe.
 | `wget` | File write, recursive crawl |
 | `bash`/`sh` (direct) | Unrestricted shell — `restricted-bash` wraps with validation |
 
-### 4.5 Role After OS Isolation
+### 4.6 Role After OS Isolation
 
 With OS-level user isolation (Layer 1), the application-level command validation becomes a
 **secondary defense layer**. It still provides value:

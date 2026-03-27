@@ -548,20 +548,26 @@ Also allows format strings starting with `+`.
 
 ## kubectl Subcommand Whitelist
 
-The `kubectl` tool has its own subcommand whitelist (source: `src/tools/kubectl.ts`):
+kubectl commands go through `restricted_bash` with pipeline validation
+(`validateKubectlInPipeline` in `src/tools/shell/restricted-bash.ts`).
+There is no dedicated kubectl tool — this is by design (see `docs/design/tools.md` §5).
+
+Allowed subcommands (`SAFE_SUBCOMMANDS` in `src/tools/infra/command-sets.ts`):
 
 ```
-get  describe  logs  top  auth  api-resources
-api-versions  explain  version  config  exec
+get  describe  logs  top  events  api-resources
+api-versions  cluster-info  config  version  explain  auth  exec
 ```
 
-Note: `exec` is allowed as a kubectl subcommand but is handled by dedicated tools (`pod-exec`, `pod-script`) with their own validation.
+Note: `exec` is allowed as a kubectl subcommand, but the exec'd command passes
+through the binary allowlist for the applicable context. `kubectl config view --raw`
+is explicitly blocked (would expose embedded certificates/tokens).
 
 ---
 
 ## Shell Operator Restrictions
 
-The `restricted-bash` tool validates shell operators before command execution (source: `src/tools/restricted-bash.ts`):
+The `restricted-bash` tool validates shell operators before command execution (source: `src/tools/shell/restricted-bash.ts`):
 
 | Operator | Status | Notes |
 |----------|--------|-------|

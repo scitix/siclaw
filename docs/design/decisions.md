@@ -124,7 +124,7 @@ Memory search needs to handle both semantic similarity ("find memories about OOM
 **Decision**:
 Hybrid scoring: `score = vectorWeight × cosineSimilarity + ftsWeight × BM25`
 
-Default: `vectorWeight = 0.85`, `ftsWeight = 0.15` (architecture.md), code defaults may differ — consult `src/memory/indexer.ts` for current values.
+Default: `vectorWeight = 0.70`, `ftsWeight = 0.30` (source: `src/memory/indexer.ts:14-15`). Configurable via `MemorySearchConfig`.
 
 **Consequences**:
 - ✅ Handles both "find semantically similar incidents" and "find the exact error message I saw"

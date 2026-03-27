@@ -86,7 +86,7 @@ Scripts in a skill follow this workflow before execution is permitted:
 draft → (request review) → pending → (AI + static analysis) → approved/rejected
 ```
 
-- **Static analysis**: 23 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 7) in `ScriptEvaluator`
+- **Static analysis**: 22 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 6) in `ScriptEvaluator`
 - **AI analysis**: LLM semantic review with mandatory rule — "Skills MUST be strictly read-only"
 - **Human gate**: `skill_reviewer` role must approve before `published` status
 - Skills with unapproved scripts **cannot** be executed via `local_script`
