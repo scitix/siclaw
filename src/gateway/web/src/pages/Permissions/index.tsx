@@ -38,10 +38,10 @@ export function PermissionsPage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && isAdmin && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadUsers();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (!isAdmin || hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadUsers();
     }, [isConnected]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleToggle = async (user: UserPermission, permission: string) => {

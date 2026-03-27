@@ -92,12 +92,12 @@ export function ModelsPage() {
     }, [sendRpc]);
 
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadProviders();
-            loadModels();
-            loadEmbeddingConfig();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadProviders();
+        loadModels();
+        loadEmbeddingConfig();
     }, [isConnected, loadProviders, loadModels, loadEmbeddingConfig]);
 
     // Parse "provider::modelId" value

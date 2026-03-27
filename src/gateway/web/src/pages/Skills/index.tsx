@@ -242,10 +242,11 @@ export function SkillsPage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && currentWorkspace?.id && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadSkills(activeTab, '');
-            rpcGetSkillSystemCapabilities(sendRpc, currentWorkspace.id).then((caps) => {
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (!currentWorkspace?.id || hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadSkills(activeTab, '');
+        rpcGetSkillSystemCapabilities(sendRpc, currentWorkspace.id).then((caps) => {
                 setSkillSpaceEnabled(caps.skillSpaceEnabled);
                 if (caps.skillSpaceEnabled) {
                     rpcListSkillSpaces(sendRpc, currentWorkspace.id).then(setSkillSpaces).catch(() => {});
@@ -258,7 +259,6 @@ export function SkillsPage() {
                 setSkillSpaces([]);
                 if (myView === 'shared') setMyView('personal');
             });
-        }
     }, [isConnected, currentWorkspace?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
     useEffect(() => {

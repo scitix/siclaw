@@ -22,7 +22,8 @@ export function SettingsPage() {
     // Load SSO status
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (!isConnected || hasLoadedRef.current) return;
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
         hasLoadedRef.current = true;
         sendRpc<{ ssoUser?: boolean }>('permission.mine')
             .then((result) => setIsSsoUser(result.ssoUser ?? false))

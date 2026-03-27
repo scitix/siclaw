@@ -15,10 +15,10 @@ export function TriggersPage() {
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
-        if (isConnected && !hasLoadedRef.current) {
-            hasLoadedRef.current = true;
-            loadTriggers();
-        }
+        if (!isConnected) { hasLoadedRef.current = false; return; }
+        if (hasLoadedRef.current) return;
+        hasLoadedRef.current = true;
+        loadTriggers();
     }, [isConnected, loadTriggers]);
 
     const handleCreate = () => {
