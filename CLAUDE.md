@@ -47,9 +47,9 @@ Primary defense: **OS-level user isolation** — child processes run as `sandbox
 
 Gateway DB is **single-process** (PID lockfile) — do not run multiple Gateway instances against the same SQLite file.
 
-### 🟡 Brain Type Gap
+### 🟡 Brain Type Status
 
-Memory tools are **pi-agent only**. When adding tools, ensure the code handles both brain types (TypeBox for pi-agent, Zod/MCP for claude-sdk).
+**pi-agent is the only actively developed brain.** claude-sdk brain is legacy code (frozen, no new feature support). All new tools and features target pi-agent only.
 
 ### 🟡 mTLS Scope
 
@@ -79,7 +79,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/tools/k8s-script/*.ts` | tools.md §4, skills.md | `npm test` | Script transmission; skill resolution |
 | `src/gateway/skills/` | skills.md, invariants.md §1-2 | `npm test` | Bundle contract; `materialize()` NOT safe in local mode |
 | `src/gateway/db/schema-*.ts` | invariants.md §5 | `npm test` | `migrate-sqlite.ts` must also be updated (DDL parity) |
-| `src/core/agent-factory.ts` | tools.md §7, invariants.md §10 | `npm test` | Tool registration; brain type compatibility |
+| `src/core/agent-factory.ts` | tools.md §7, invariants.md §10 | `npm test` | Tool registration order; pi-agent is the active brain (claude-sdk is frozen legacy) |
 | `src/core/prompt.ts` | **⚠️ REQUIRES HUMAN APPROVAL** | — | Describe intent and wait for OK before editing |
 | `src/memory/` | invariants.md §7, decisions.md ADR-005 | `npm test` | Requires embedding config; pi-agent only |
 | `Dockerfile.agentbox` | security.md §3-5 | `docker build` | Dual-user model; capability set; setgid kubectl |
@@ -112,7 +112,7 @@ Cross-cutting concerns from pre-flight are verified in two ways:
 1. Read design docs for the PR's domain (see matrix)
 2. Read existing code around the diff, not just the diff
 3. Check the author's cross-cutting verification — are flagged items actually safe?
-4. Verify: docs updated? DDL parity? Both brain types if applicable?
+4. Verify: docs updated? DDL parity?
 
 ---
 
@@ -121,8 +121,9 @@ Cross-cutting concerns from pre-flight are verified in two ways:
 ```
 Runtime:    Node.js ≥22.12.0  (ESM-only)     Tests:      vitest (npm test)
 Language:   TypeScript 5.9    (strict, .js)   Type check: npx tsc --noEmit
-Frontend:   React + Vite + Tailwind           Agent:      pi-coding-agent / claude-agent-sdk
+Frontend:   React + Vite + Tailwind
 DB (GW):    Drizzle → sql.js / MySQL          DB (mem):   node:sqlite + FTS5
+Agent:      pi-coding-agent (active)          claude-agent-sdk (frozen legacy)
 ```
 
 **Conventions**: ESM-only, named exports, no default exports. `CONTRIBUTING.md` for PR format. `gh` CLI for PR comments.
