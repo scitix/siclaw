@@ -789,7 +789,13 @@ export function usePilot() {
         if (isLoading) {
             try {
                 await sendRpc('chat.steer', { text, sessionId: currentSessionKeyRef.current });
-                setPendingMessages(prev => [...prev, text]);
+                // Show steer message in chat immediately (same as normal send)
+                setMessages(prev => [...prev, {
+                    id: `user-${Date.now()}`,
+                    role: 'user' as const,
+                    content: text,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                }]);
             } catch (err) {
                 console.error('Failed to steer:', err);
             }
