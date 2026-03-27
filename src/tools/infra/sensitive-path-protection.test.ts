@@ -50,7 +50,8 @@ describe("CONTAINER_SENSITIVE_PATHS pattern matching", () => {
     // K8s control plane
     "cat /etc/kubernetes/pki/ca.crt",
     "cat /etc/kubernetes/admin.conf",
-    "cat /var/lib/kubelet/config.yaml",
+    "cat /var/lib/kubelet/pki/kubelet-client.crt",
+    "cat /var/lib/kubelet/pods/abc/volumes/kubernetes.io~secret/token/ca.crt",
     "cat /var/lib/etcd/member/snap/db",
     // Shell/DB history
     "cat ~/.bash_history",

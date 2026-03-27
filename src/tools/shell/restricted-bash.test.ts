@@ -1400,15 +1400,32 @@ describe("validateKubectlInPipeline — sensitive resource (no pre-execution blo
     });
   }
 
-  // Rate protection still active
-  it("blocks kubectl get secret -A (no selector — rate protection)", () => {
-    const err = validateKubectlInPipeline(["kubectl get secret -A"]);
+  // Rate protection: get -A without -o yaml/json is now allowed
+  it("allows kubectl get secret -A (table output)", () => {
+    expect(validateKubectlInPipeline(["kubectl get secret -A"])).toBeNull();
+  });
+
+  it("blocks kubectl get secret -A -o yaml (bulk serialization)", () => {
+    const err = validateKubectlInPipeline(["kubectl get secret -A -o yaml"]);
     expect(err).not.toBeNull();
-    expect(err).toContain("overload the API server");
+    expect(err).toContain("excessive data");
   });
 
   it("allows kubectl get secret -A -l app=web (has selector)", () => {
     expect(validateKubectlInPipeline(["kubectl get secret -A -l app=web"])).toBeNull();
+  });
+
+  // Fix #4: flag-before-subcommand support
+  it("allows kubectl -n kube-system get pods (flag before subcommand)", () => {
+    expect(validateKubectlInPipeline(["kubectl -n kube-system get pods"])).toBeNull();
+  });
+
+  it("allows kubectl --namespace kube-system get deploy -o wide", () => {
+    expect(validateKubectlInPipeline(["kubectl --namespace kube-system get deploy -o wide"])).toBeNull();
+  });
+
+  it("allows kubectl --context prod -n monitoring get svc", () => {
+    expect(validateKubectlInPipeline(["kubectl --context prod -n monitoring get svc"])).toBeNull();
   });
 });
 
@@ -1436,10 +1453,8 @@ describe("validateKubectlInPipeline — rate protection", () => {
     expect(validateKubectlInPipeline(["kubectl logs my-pod --since-time=2024-01-01T00:00:00Z"])).toBeNull();
   });
 
-  // ── -A/--all-namespaces without selectors ──
-  const blockedCmds = [
-    "kubectl get pods -A",
-    "kubectl get pods --all-namespaces",
+  // ── -A/--all-namespaces: describe/events/top still need selectors ──
+  const blockedAlwaysNeedSelector = [
     "kubectl describe pods -A",
     "kubectl events -A",
     "kubectl events --all-namespaces",
@@ -1447,7 +1462,7 @@ describe("validateKubectlInPipeline — rate protection", () => {
     "kubectl top pods --all-namespaces",
   ];
 
-  for (const cmd of blockedCmds) {
+  for (const cmd of blockedAlwaysNeedSelector) {
     it(`blocks: ${cmd}`, () => {
       const err = validateKubectlInPipeline([cmd]);
       expect(err).not.toBeNull();
@@ -1455,16 +1470,52 @@ describe("validateKubectlInPipeline — rate protection", () => {
     });
   }
 
-  const allowedCmds = [
+  // ── get -A + -o yaml/json → blocked (bulk serialization) ──
+  const blockedGetBulk = [
+    "kubectl get pods -A -o yaml",
+    "kubectl get pods -A -o json",
+    "kubectl get pods --all-namespaces -oyaml",
+    "kubectl get pods -A -o=json",
+    "kubectl get pods -A --output=yaml",
+    "kubectl get deploy -A -o yaml -l app=web",  // even with selector — bulk output concern
+  ];
+
+  for (const cmd of blockedGetBulk) {
+    it(`blocks: ${cmd}`, () => {
+      const err = validateKubectlInPipeline([cmd]);
+      expect(err).not.toBeNull();
+      expect(err).toContain("excessive data");
+    });
+  }
+
+  // ── get -A without -o yaml/json → allowed (table/wide/name output is manageable) ──
+  const allowedGetAllNs = [
+    { cmd: "kubectl get pods -A", reason: "table output (default)" },
+    { cmd: "kubectl get pods --all-namespaces", reason: "table output" },
+    { cmd: "kubectl get deploy -A -o wide", reason: "-o wide" },
+    { cmd: "kubectl get deploy -A -o name", reason: "-o name" },
+    { cmd: "kubectl get pods -A -o custom-columns=NAME:.metadata.name", reason: "-o custom-columns" },
+    { cmd: "kubectl get pods -A -o jsonpath='{.items[*].metadata.name}'", reason: "-o jsonpath" },
+    { cmd: "kubectl get crd", reason: "cluster-scoped, no -A needed" },
+  ];
+
+  for (const { cmd, reason } of allowedGetAllNs) {
+    it(`allows: ${cmd} (${reason})`, () => {
+      expect(validateKubectlInPipeline([cmd])).toBeNull();
+    });
+  }
+
+  const allowedOther = [
     { cmd: "kubectl get pods -A -l app=web", reason: "has -l" },
     { cmd: "kubectl get pods -A --field-selector=status.phase=Running", reason: "has --field-selector" },
     { cmd: "kubectl get pods -A --selector=app=web", reason: "has --selector" },
     { cmd: "kubectl get pods -n default", reason: "no -A" },
     { cmd: "kubectl auth can-i --list -A", reason: "auth not restricted" },
     { cmd: "kubectl version", reason: "not restricted subcommand" },
+    { cmd: "kubectl describe pods -A -l app=web", reason: "describe -A with selector" },
   ];
 
-  for (const { cmd, reason } of allowedCmds) {
+  for (const { cmd, reason } of allowedOther) {
     it(`allows: ${cmd} (${reason})`, () => {
       expect(validateKubectlInPipeline([cmd])).toBeNull();
     });
