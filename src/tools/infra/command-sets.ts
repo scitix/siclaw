@@ -78,411 +78,10 @@ function extractFlag(arg: string): string {
   return eqIdx >= 0 ? arg.slice(0, eqIdx) : arg;
 }
 
-// ── Unified command whitelist ────────────────────────────────────
+// (Legacy ALLOWED_COMMANDS / COMMAND_CATEGORIES / CONTEXT_CATEGORIES
+//  are now derived from COMMANDS + CONTEXT_POLICIES — see end of file)
 
-/**
- * Commands allowed across all three tools (restricted-bash, node-exec, kubectl-exec).
- * restricted-bash additionally allows `kubectl` and skill scripts.
- *
- * NOTE: sed and awk/gawk are intentionally excluded — they are Turing-complete
- * scripting languages with built-in capabilities for command execution (system(),
- * pipe-to-command), file writes, and shell escapes that cannot be reliably
- * whitelisted. Use grep + cut/tr/head/tail/jq for text processing instead.
- */
-export const ALLOWED_COMMANDS = new Set([
-  // text processing (sed, awk intentionally excluded — Turing-complete, unsafe)
-  "grep", "egrep", "fgrep",
-  "sort", "uniq", "wc", "head", "tail", "cut", "tr",
-  "jq", "yq", "column",
-  // network diagnostics
-  "ip", "ifconfig", "ping", "traceroute", "tracepath", "ss", "netstat",
-  "route", "arp", "ethtool", "mtr", "nslookup", "dig", "host",
-  "bridge", "tc", "conntrack", "curl",
-  // RDMA / RoCE
-  "ibstat", "ibstatus", "ibv_devinfo", "ibv_devices", "rdma",
-  "ibaddr", "iblinkinfo", "ibportstate", "ibswitches", "ibroute",
-  "show_gids", "ibdev2netdev",
-  // perftest
-  "ib_write_bw", "ib_write_lat", "ib_read_bw", "ib_read_lat",
-  "ib_send_bw", "ib_send_lat", "ib_atomic_bw", "ib_atomic_lat",
-  "raw_ethernet_bw", "raw_ethernet_lat", "raw_ethernet_burst_lat",
-  // GPU
-  "nvidia-smi", "gpustat", "nvtopo",
-  // hardware info
-  "lspci", "lsusb", "lsblk", "lscpu", "lsmem", "lshw", "dmidecode",
-  // kernel / system
-  "uname", "hostname", "uptime", "dmesg", "sysctl", "lsmod", "modinfo",
-  // process / resource
-  "ps", "pgrep", "top", "free", "vmstat", "iostat", "mpstat",
-  "df", "du", "mount", "findmnt", "nproc",
-  // file inspection (read-only)
-  "cat", "ls", "pwd", "stat", "file", "find",
-  "readlink", "realpath", "basename", "dirname",
-  "diff", "md5sum", "sha256sum",
-  // system logs & services
-  "journalctl", "systemctl", "timedatectl", "hostnamectl",
-  // container runtime
-  "crictl", "ctr",
-  // firewall (read-only via validator)
-  "iptables", "ip6tables",
-  // file / process inspection
-  "lsof", "lsns", "strings",
-  // compressed file reading
-  "zcat", "zgrep", "bzcat", "xzcat",
-  // system activity
-  "sar", "blkid",
-  // stream utility (restricted via validator)
-  "tee",
-  // general
-  "date", "whoami", "id", "env", "printenv", "which",
-  // flow control
-  "echo", "printf", "true", "false", "sleep", "wait", "test",
-  // math (bc removed — !command escapes to shell)
-  "expr", "seq",
-]);
-
-// ── Command categories and context-based whitelists ──────────────
-
-/** Map each command to its functional category. */
-export const COMMAND_CATEGORIES: Record<string, string> = {
-  // text processing
-  grep: "text", egrep: "text", fgrep: "text",
-  sort: "text", uniq: "text", wc: "text", head: "text", tail: "text",
-  cut: "text", tr: "text", jq: "text", yq: "text", column: "text",
-  // network
-  ip: "network", ifconfig: "network", ping: "network", traceroute: "network",
-  tracepath: "network", ss: "network", netstat: "network", route: "network",
-  arp: "network", ethtool: "network", mtr: "network", nslookup: "network",
-  dig: "network", host: "network", bridge: "network", tc: "network",
-  conntrack: "network", curl: "network",
-  // RDMA
-  ibstat: "rdma", ibstatus: "rdma", ibv_devinfo: "rdma", ibv_devices: "rdma",
-  rdma: "rdma", ibaddr: "rdma", iblinkinfo: "rdma", ibportstate: "rdma",
-  ibswitches: "rdma", ibroute: "rdma", show_gids: "rdma", ibdev2netdev: "rdma",
-  // perftest
-  ib_write_bw: "perftest", ib_write_lat: "perftest",
-  ib_read_bw: "perftest", ib_read_lat: "perftest",
-  ib_send_bw: "perftest", ib_send_lat: "perftest",
-  ib_atomic_bw: "perftest", ib_atomic_lat: "perftest",
-  raw_ethernet_bw: "perftest", raw_ethernet_lat: "perftest",
-  raw_ethernet_burst_lat: "perftest",
-  // GPU
-  "nvidia-smi": "gpu", gpustat: "gpu", nvtopo: "gpu",
-  // hardware
-  lspci: "hardware", lsusb: "hardware", lsblk: "hardware",
-  lscpu: "hardware", lsmem: "hardware", lshw: "hardware", dmidecode: "hardware",
-  // kernel
-  uname: "kernel", hostname: "kernel", uptime: "kernel",
-  dmesg: "kernel", sysctl: "kernel", lsmod: "kernel", modinfo: "kernel",
-  // process / resource
-  ps: "process", pgrep: "process", top: "process", free: "process",
-  vmstat: "process", iostat: "process", mpstat: "process",
-  df: "process", du: "process", mount: "process", findmnt: "process", nproc: "process",
-  // file (read-only) — blocked in local context
-  cat: "file", ls: "file", pwd: "file", stat: "file", file: "file",
-  find: "file", readlink: "file", realpath: "file", basename: "file", dirname: "file",
-  diff: "file", md5sum: "file", sha256sum: "file",
-  // diagnostic
-  // services
-  journalctl: "services", systemctl: "services",
-  timedatectl: "services", hostnamectl: "services",
-  // container
-  crictl: "container", ctr: "container",
-  // firewall
-  iptables: "firewall", ip6tables: "firewall",
-  // inspection — blocked in local context
-  lsof: "inspection", lsns: "inspection", strings: "inspection",
-  // compressed — blocked in local context
-  zcat: "compressed", zgrep: "compressed", bzcat: "compressed", xzcat: "compressed",
-  // activity
-  sar: "activity", blkid: "activity",
-  // stream
-  tee: "stream",
-  // general (env/printenv separated — blocked in local context)
-  date: "general", whoami: "general", id: "general", which: "general",
-  env: "general-env", printenv: "general-env",
-  // flow control
-  echo: "flow", printf: "flow", true: "flow", false: "flow",
-  sleep: "flow", wait: "flow", test: "flow", expr: "flow", seq: "flow",
-};
-
-/**
- * Categories allowed per execution context.
- * local:   agentbox / TUI process (no file/env access — use Read/Grep/Glob tools)
- * node:    remote node via debug pod
- * pod:     remote pod via kubectl exec
- * nsenter: remote pod netns via debug pod
- * ssh:     remote host via SSH (future)
- */
-const ALL_REMOTE_CATEGORIES = [
-  "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
-  "process", "file", "diagnostic", "services", "container", "firewall",
-  "inspection", "compressed", "activity", "stream", "general", "general-env",
-  "flow",
-] as const;
-
-export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = {
-  local: [
-    "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
-    "process", "diagnostic", "services", "container", "firewall",
-    "activity", "stream", "general", "flow",
-  ],
-  node: [...ALL_REMOTE_CATEGORIES],
-  pod: [...ALL_REMOTE_CATEGORIES],
-};
-
-// ── Declarative Command Rule Engine ──────────────────────────────
-
-/**
- * Declarative command validation rule.
- * JSON-serializable: no Set, no function, no RegExp.
- * Can be stored in a database, served via API, or edited in an admin UI.
- */
-export interface CommandRule {
-  command: string;
-  category?: string;
-  description?: string;
-
-  /** Execution contexts where this rule applies. Absent → all contexts. */
-  contexts?: string[];
-
-  /** If true, command must appear after a pipe | operator (stdin-only). */
-  pipeOnly?: boolean;
-
-  /** If true, block positional args that look like file paths (/, ./, ../, ~). */
-  noFilePaths?: boolean;
-
-  /** Flags that are explicitly blocked (checked per-character for short flags). */
-  blockedFlags?: string[];
-
-  /** Flag whitelist. Present → check flags; absent → all flags allowed. */
-  allowedFlags?: string[];
-
-  /** Subcommand/action whitelist at a given positional position. */
-  allowedSubcommands?: {
-    position: number;
-    allowed: string[];
-  };
-
-  /** Positional argument policy: "allow" (default), "block", or max count. */
-  positionals?: "allow" | "block" | number;
-
-  /** At least one of these flags must be present (OR semantics). */
-  requiredFlags?: string[];
-
-  /** Delegate to a named custom validator function. */
-  customValidator?: string;
-}
-
-export const COMMAND_RULES: Record<string, CommandRule | CommandRule[]> = {
-
-  // ── Text commands: local-context stdin-only rules ──
-  // In local (agentbox) context, text commands must only process piped stdin.
-  // They cannot read files directly or traverse directories.
-
-  grep:   { command: "grep",   contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
-  egrep:  { command: "egrep",  contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
-  fgrep:  { command: "fgrep",  contexts: ["local"], pipeOnly: true, noFilePaths: true, blockedFlags: ["-r", "-R", "--recursive"] },
-  cut:    { command: "cut",    contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  head:   { command: "head",   contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  tail:   { command: "tail",   contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  wc:     { command: "wc",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  tr:     { command: "tr",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  column: { command: "column", contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  jq:     { command: "jq",     contexts: ["local"], pipeOnly: true, noFilePaths: true },
-
-  // ── Flag whitelist ──
-
-  sort: [
-    {
-      command: "sort", category: "text",
-      allowedFlags: [
-        "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
-        "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
-        "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
-        "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
-      ],
-    },
-    { command: "sort", contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  ],
-
-  yq: [
-    {
-      command: "yq", category: "text",
-      allowedFlags: [
-        "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
-        "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
-        "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
-        "--xml-attribute-prefix", "--xml-content-name",
-        "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
-      ],
-    },
-    { command: "yq", contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  ],
-
-  ethtool: {
-    command: "ethtool", category: "network",
-    allowedFlags: [
-      "-i", "-S", "-T", "-a", "-c", "-g", "-k", "-l", "-P", "-m", "-d", "--phy-statistics",
-    ],
-  },
-
-  arp: {
-    command: "arp", category: "network",
-    allowedFlags: ["-a", "-n", "-e", "-v", "--all", "--numeric", "--verbose"],
-  },
-
-  dmesg: {
-    command: "dmesg", category: "system",
-    allowedFlags: [
-      "-T", "--ctime", "-H", "--human", "-l", "--level", "-f", "--facility",
-      "-k", "--kernel", "-x", "--decode", "-L", "--color", "--time-format",
-      "--nopager",
-      "--since", "--until", "-S", "--syslog", "-t", "--notime", "-P",
-      // NOTE: -w/--follow/-W/--follow-new intentionally excluded — they hang indefinitely
-    ],
-  },
-
-  journalctl: {
-    command: "journalctl", category: "system",
-    allowedFlags: [
-      "-u", "--unit", "-n", "--lines", "--since", "--until",
-      "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
-      "--no-pager", "-o", "--output", "-r", "--reverse",
-      "-x", "--catalog", "--system", "--user",
-      "-t", "--identifier", "-g", "--grep", "--case-sensitive",
-      "-S", "-U", "-e", "--pager-end", "-a", "--all",
-      "-q", "--quiet", "--no-hostname", "--no-full",
-      "-m", "--merge", "-D", "--directory", "--file", "--list-boots",
-    ],
-  },
-
-  iptables: {
-    command: "iptables", category: "network",
-    allowedFlags: [
-      "-L", "--list", "-S", "--list-rules",
-      "-n", "--numeric", "-v", "--verbose",
-      "-x", "--exact", "--line-numbers", "-t", "--table",
-    ],
-  },
-
-  // ── Flag whitelist + requiredFlags ──
-
-  top: {
-    command: "top", category: "process",
-    allowedFlags: [
-      "-b", "--batch", "-n", "-d", "-p", "-H", "-c", "-o", "-O",
-      "-w", "-1", "-e", "-E", "-i", "-S", "-s", "-u", "-U",
-    ],
-    requiredFlags: ["-b", "--batch"],
-  },
-
-  // ── Flag whitelist + positional restrictions ──
-
-  hostname: {
-    command: "hostname", category: "system",
-    allowedFlags: [
-      "-f", "-d", "-s", "-i", "-I", "-A",
-      "--fqdn", "--domain", "--short", "--ip-address", "--all-ip-addresses",
-    ],
-    positionals: "block",
-  },
-
-  route: {
-    command: "route", category: "network",
-    allowedFlags: ["-n", "-e", "-v", "-F", "-C", "--numeric", "--extend", "--verbose"],
-    positionals: "block",
-  },
-
-  ifconfig: {
-    command: "ifconfig", category: "network",
-    allowedFlags: ["-a", "-s", "--all", "--short"],
-    positionals: 1,
-  },
-
-  uniq: [
-    { command: "uniq", category: "text", positionals: 1 },
-    { command: "uniq", contexts: ["local"], pipeOnly: true, noFilePaths: true },
-  ],
-
-  // ── Subcommand whitelist (position: 0) ──
-
-  systemctl: {
-    command: "systemctl", category: "service",
-    allowedSubcommands: {
-      position: 0,
-      allowed: [
-        "status", "show", "list-units", "list-unit-files",
-        "is-active", "is-enabled", "is-failed", "cat",
-        "list-dependencies", "list-sockets", "list-timers",
-      ],
-    },
-  },
-
-  crictl: {
-    command: "crictl", category: "container",
-    allowedSubcommands: {
-      position: 0,
-      allowed: [
-        "ps", "images", "inspect", "inspecti", "inspectp",
-        "logs", "stats", "info", "version", "pods",
-      ],
-    },
-  },
-
-  timedatectl: {
-    command: "timedatectl", category: "system",
-    allowedSubcommands: {
-      position: 0,
-      allowed: ["status", "show", "list-timezones", "timesync-status"],
-    },
-  },
-
-  hostnamectl: {
-    command: "hostnamectl", category: "system",
-    allowedSubcommands: {
-      position: 0,
-      allowed: ["status", "show"],
-    },
-  },
-
-  // ── Action whitelist (position: 1) ──
-
-  tc: {
-    command: "tc", category: "network",
-    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
-  },
-
-  bridge: {
-    command: "bridge", category: "network",
-    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
-  },
-
-  rdma: {
-    command: "rdma", category: "network",
-    allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] },
-  },
-
-  // ── Custom validators ──
-
-  curl:         { command: "curl",         category: "network",   customValidator: "curl" },
-  conntrack:    { command: "conntrack",    category: "network",   customValidator: "conntrack" },
-  find:         { command: "find",         category: "file",      customValidator: "find" },
-  ip:           { command: "ip",           category: "network",   customValidator: "ip" },
-  "nvidia-smi": { command: "nvidia-smi",   category: "gpu",       customValidator: "nvidia-smi" },
-  date:         { command: "date",         category: "system",    customValidator: "date" },
-  ctr:          { command: "ctr",          category: "container", customValidator: "ctr" },
-  ibportstate:  { command: "ibportstate",  category: "rdma",      customValidator: "ibportstate" },
-  env:          { command: "env",          category: "system",    customValidator: "env" },
-  tee:          { command: "tee",          category: "system",    customValidator: "tee" },
-  mount:        { command: "mount",        category: "system",    customValidator: "mount" },
-  sysctl:       { command: "sysctl",       category: "system",    customValidator: "sysctl" },
-};
-
-// ip6tables shares iptables rules
-COMMAND_RULES["ip6tables"] = { ...COMMAND_RULES["iptables"], command: "ip6tables" };
-
-// Perftest: 11 binaries share one flag set
+// Perftest: 11 binaries share one flag set (referenced by COMMANDS entries)
 const PERFTEST_FLAGS = [
   "-s", "--size", "-D", "--duration", "-n", "--iters",
   "-p", "--port", "-d", "--ib-dev", "-i", "--ib-port",
@@ -494,19 +93,24 @@ const PERFTEST_FLAGS = [
   "-l", "--post_list", "--use_cuda", "--use_rocm", "--output_format",
   "-h", "--help", "-V", "--version",
 ];
-for (const bin of [
-  "ib_write_bw", "ib_write_lat", "ib_read_bw", "ib_read_lat",
-  "ib_send_bw", "ib_send_lat", "ib_atomic_bw", "ib_atomic_lat",
-  "raw_ethernet_bw", "raw_ethernet_lat", "raw_ethernet_burst_lat",
-]) {
-  COMMAND_RULES[bin] = { command: bin, category: "perftest", allowedFlags: PERFTEST_FLAGS };
-}
 
 // ── Generic rule engine ──────────────────────────────────────────
 
+/** Internal rule shape consumed by validateByRule. Subset of the old CommandRule. */
+interface InternalRule {
+  command: string;
+  pipeOnly?: boolean;
+  noFilePaths?: boolean;
+  blockedFlags?: string[];
+  allowedFlags?: string[];
+  allowedSubcommands?: { position: number; allowed: string[] };
+  positionals?: "allow" | "block" | number;
+  requiredFlags?: string[];
+}
+
 function validateByRule(
   args: string[],
-  rule: CommandRule,
+  rule: InternalRule,
   options?: { piped?: boolean },
 ): string | null {
   const cmd = rule.command;
@@ -1096,24 +700,101 @@ function validateTee(args: string[]): string | null {
   return null;
 }
 
-// ── Custom validator registry ────────────────────────────────────
-
-const CUSTOM_VALIDATORS: Record<string, (args: string[], baseName: string) => string | null> = {
-  curl:         (args) => validateCurl(args),
-  conntrack:    (args) => validateConntrack(args),
-  find:         (args) => validateFind(args),
-  ip:           (args) => validateIp(args.join(" ")),
-  "nvidia-smi": (args) => validateNvidiaSmi(args),
-  date:         (args) => validateDate(args),
-  ctr:          (args) => validateCtr(args),
-  ibportstate:  (args) => validateIbportstate(args),
-  env:          (args) => validateEnv(args),
-  tee:          (args) => validateTee(args),
-  mount:        (args) => validateMount(args),
-  sysctl:       (args) => validateSysctl(args),
-};
-
 // ── Entry point ──────────────────────────────────────────────────
+
+/**
+ * Apply context policy constraints for a command.
+ * Checks pipeOnly, noFilePaths, and categoryBlockedFlags from CONTEXT_POLICIES.
+ * Skipped when context is undefined (e.g., validateExecCommand path).
+ */
+function applyContextPolicy(
+  baseName: string,
+  args: string[],
+  context: string | undefined,
+  piped: boolean | undefined,
+): string | null {
+  if (!context) return null;
+  const def = COMMANDS[baseName];
+  if (!def) return null;
+  const policy = CONTEXT_POLICIES[context];
+  if (!policy) return null;
+
+  // pipeOnly: text commands in local must be piped (implies noFilePaths)
+  if (policy.pipeOnlyCategories?.includes(def.category)) {
+    if (piped !== undefined && !piped) {
+      return JSON.stringify({
+        error: `"${baseName}" can only be used after a pipe (|). Direct file reading is not allowed — use the dedicated file tools instead.`,
+      }, null, 2);
+    }
+    // noFilePaths (implicit): block positional args that look like paths
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i];
+      if (arg.startsWith("-")) continue;
+      if (arg !== "" && (arg.startsWith("/") || arg.startsWith("./") || arg.startsWith("../") || arg.startsWith("~"))) {
+        return JSON.stringify({
+          error: `${baseName} cannot take file path arguments — it should only process piped input. Use the dedicated file tools instead.`,
+        }, null, 2);
+      }
+    }
+  }
+
+  // categoryBlockedFlags: context-specific flag blocking (e.g., -r/-R for text in local)
+  const ctxBlocked = policy.categoryBlockedFlags?.[def.category];
+  if (ctxBlocked) {
+    for (let i = 1; i < args.length; i++) {
+      const arg = args[i];
+      if (!arg.startsWith("-")) continue;
+      if (arg.startsWith("--")) {
+        if (ctxBlocked.includes(extractFlag(arg))) {
+          return JSON.stringify({
+            error: `${baseName} "${extractFlag(arg)}" is not allowed.`,
+          }, null, 2);
+        }
+      } else if (arg.length > 1) {
+        for (const ch of arg.slice(1)) {
+          if (ctxBlocked.includes(`-${ch}`)) {
+            return JSON.stringify({
+              error: `${baseName} "-${ch}" is not allowed.`,
+            }, null, 2);
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Apply command-intrinsic constraints from CommandDef.
+ * These are global (context-independent): allowedFlags, blockedFlags,
+ * allowedSubcommands, positionals, requiredFlags, validate.
+ */
+function applyCommandConstraints(
+  baseName: string,
+  args: string[],
+  def: CommandDef,
+): string | null {
+  // Custom validator takes priority (escape hatch for complex commands)
+  if (def.validate) {
+    return def.validate(args);
+  }
+
+  // Declarative constraints — reuse the existing validateByRule logic
+  // by constructing a compatible rule object from CommandDef fields.
+  const hasConstraints = def.blockedFlags || def.allowedFlags ||
+    def.allowedSubcommands || def.positionals || def.requiredFlags;
+  if (!hasConstraints) return null;
+
+  return validateByRule(args, {
+    command: baseName,
+    blockedFlags: def.blockedFlags,
+    allowedFlags: def.allowedFlags,
+    allowedSubcommands: def.allowedSubcommands,
+    positionals: def.positionals,
+    requiredFlags: def.requiredFlags,
+  });
+}
 
 /**
  * Apply extra security restrictions to whitelisted commands.
@@ -1130,29 +811,15 @@ export function validateCommandRestrictions(
   if (args.length === 0) return null;
 
   const baseName = args[0].split("/").pop()?.toLowerCase() ?? "";
+  const def = COMMANDS[baseName];
+  if (!def) return null;
 
-  const entry = COMMAND_RULES[baseName];
-  if (!entry) return null;
+  // 1. Context policy constraints (pipeOnly, categoryBlockedFlags)
+  const ctxErr = applyContextPolicy(baseName, args, options?.context, options?.piped);
+  if (ctxErr) return ctxErr;
 
-  const rules = Array.isArray(entry) ? entry : [entry];
-
-  for (const rule of rules) {
-    // Skip rules that don't apply to the current context
-    if (rule.contexts && (!options?.context || !rule.contexts.includes(options.context))) {
-      continue;
-    }
-
-    if (rule.customValidator) {
-      const err = CUSTOM_VALIDATORS[rule.customValidator]?.(args, baseName) ?? null;
-      if (err) return err;
-      continue;
-    }
-
-    const err = validateByRule(args, rule, { piped: options?.piped });
-    if (err) return err;
-  }
-
-  return null;
+  // 2. Command-intrinsic constraints (validate function or declarative rules)
+  return applyCommandConstraints(baseName, args, def);
 }
 
 // ── kubectl subcommand validation ────────────────────────────────
@@ -1294,6 +961,314 @@ export function validateExecCommand(args: string[]): string | null {
 
   return null;
 }
+
+// ══════════════════════════════════════════════════════════════════
+// ── Unified Command Registry (COMMANDS + CONTEXT_POLICIES) ──────
+// ══════════════════════════════════════════════════════════════════
+//
+// Single source of truth for which commands are allowed, what category
+// they belong to, and what constraints apply. Replaces the legacy
+// ALLOWED_COMMANDS + COMMAND_CATEGORIES + COMMAND_RULES + CUSTOM_VALIDATORS.
+
+export type CommandCategory =
+  | "text" | "network" | "rdma" | "perftest" | "gpu"
+  | "hardware" | "kernel" | "process" | "file"
+  | "diagnostic" | "services" | "container" | "firewall"
+  | "inspection" | "compressed" | "activity" | "stream"
+  | "general" | "general-env" | "flow";
+
+/**
+ * A single command's complete security definition.
+ *
+ * - `category`: determines context availability (via CONTEXT_POLICIES)
+ * - Declarative constraints: global, enforced in ALL contexts
+ * - `validate`: escape hatch for commands too complex for declarative rules
+ *
+ * Context-specific constraints (pipeOnly in local, text blockedFlags in local)
+ * are NOT here — they live in CONTEXT_POLICIES.
+ */
+export interface CommandDef {
+  category: CommandCategory;
+  blockedFlags?: string[];
+  allowedFlags?: string[];
+  allowedSubcommands?: { position: number; allowed: string[] };
+  positionals?: "allow" | "block" | number;
+  requiredFlags?: string[];
+  validate?: (args: string[]) => string | null;
+}
+
+/**
+ * Unified command registry.
+ *
+ * NOTE: sed and awk/gawk are intentionally excluded — they are Turing-complete
+ * scripting languages with built-in capabilities for command execution (system(),
+ * pipe-to-command), file writes, and shell escapes that cannot be reliably
+ * whitelisted. Use grep + cut/tr/head/tail/jq for text processing instead.
+ */
+export const COMMANDS: Record<string, CommandDef> = {
+  // ── text processing ──
+  grep:   { category: "text" },
+  egrep:  { category: "text" },
+  fgrep:  { category: "text" },
+  sort:   { category: "text", allowedFlags: [
+    "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
+    "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
+    "--human-numeric-sort", "--version-sort", "--stable", "--ignore-leading-blanks",
+    "--general-numeric-sort", "--month-sort", "--dictionary-order", "--ignore-case",
+  ] },
+  uniq:   { category: "text", positionals: 1 },
+  wc:     { category: "text" },
+  head:   { category: "text" },
+  tail:   { category: "text" },
+  cut:    { category: "text" },
+  tr:     { category: "text" },
+  jq:     { category: "text" },
+  yq:     { category: "text", allowedFlags: [
+    "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
+    "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
+    "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
+    "--xml-attribute-prefix", "--xml-content-name",
+    "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
+  ] },
+  column: { category: "text" },
+
+  // ── network diagnostics ──
+  ip:         { category: "network", validate: (args) => validateIp(args.join(" ")) },
+  ifconfig:   { category: "network", allowedFlags: ["-a", "-s", "--all", "--short"], positionals: 1 },
+  ping:       { category: "network" },
+  traceroute: { category: "network" },
+  tracepath:  { category: "network" },
+  ss:         { category: "network" },
+  netstat:    { category: "network" },
+  route:      { category: "network", allowedFlags: ["-n", "-e", "-v", "-F", "-C", "--numeric", "--extend", "--verbose"], positionals: "block" },
+  arp:        { category: "network", allowedFlags: ["-a", "-n", "-e", "-v", "--all", "--numeric", "--verbose"] },
+  ethtool:    { category: "network", allowedFlags: ["-i", "-S", "-T", "-a", "-c", "-g", "-k", "-l", "-P", "-m", "-d", "--phy-statistics"] },
+  mtr:        { category: "network" },
+  nslookup:   { category: "network" },
+  dig:        { category: "network" },
+  host:       { category: "network" },
+  bridge:     { category: "network", allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] } },
+  tc:         { category: "network", allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] } },
+  conntrack:  { category: "network", validate: validateConntrack },
+  curl:       { category: "network", validate: validateCurl },
+
+  // ── RDMA / RoCE ──
+  ibstat:       { category: "rdma" },
+  ibstatus:     { category: "rdma" },
+  ibv_devinfo:  { category: "rdma" },
+  ibv_devices:  { category: "rdma" },
+  rdma:         { category: "rdma", allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] } },
+  ibaddr:       { category: "rdma" },
+  iblinkinfo:   { category: "rdma" },
+  ibportstate:  { category: "rdma", validate: validateIbportstate },
+  ibswitches:   { category: "rdma" },
+  ibroute:      { category: "rdma" },
+  show_gids:    { category: "rdma" },
+  ibdev2netdev: { category: "rdma" },
+
+  // ── perftest (11 binaries, shared flags) ──
+  ib_write_bw:          { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_write_lat:         { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_read_bw:           { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_read_lat:          { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_send_bw:           { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_send_lat:          { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_atomic_bw:         { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  ib_atomic_lat:        { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  raw_ethernet_bw:      { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  raw_ethernet_lat:     { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+  raw_ethernet_burst_lat: { category: "perftest", allowedFlags: PERFTEST_FLAGS },
+
+  // ── GPU ──
+  "nvidia-smi": { category: "gpu", validate: validateNvidiaSmi },
+  gpustat:      { category: "gpu" },
+  nvtopo:       { category: "gpu" },
+
+  // ── hardware info ──
+  lspci:     { category: "hardware" },
+  lsusb:     { category: "hardware" },
+  lsblk:     { category: "hardware" },
+  lscpu:     { category: "hardware" },
+  lsmem:     { category: "hardware" },
+  lshw:      { category: "hardware" },
+  dmidecode: { category: "hardware" },
+
+  // ── kernel / system ──
+  uname:    { category: "kernel" },
+  hostname: { category: "kernel", allowedFlags: [
+    "-f", "-d", "-s", "-i", "-I", "-A",
+    "--fqdn", "--domain", "--short", "--ip-address", "--all-ip-addresses",
+  ], positionals: "block" },
+  uptime:   { category: "kernel" },
+  dmesg:    { category: "kernel", allowedFlags: [
+    "-T", "--ctime", "-H", "--human", "-l", "--level", "-f", "--facility",
+    "-k", "--kernel", "-x", "--decode", "-L", "--color", "--time-format",
+    "--nopager",
+    "--since", "--until", "-S", "--syslog", "-t", "--notime", "-P",
+  ] },
+  sysctl:   { category: "kernel", validate: validateSysctl },
+  lsmod:    { category: "kernel" },
+  modinfo:  { category: "kernel" },
+
+  // ── process / resource ──
+  ps:      { category: "process" },
+  pgrep:   { category: "process" },
+  top:     { category: "process", allowedFlags: [
+    "-b", "--batch", "-n", "-d", "-p", "-H", "-c", "-o", "-O",
+    "-w", "-1", "-e", "-E", "-i", "-S", "-s", "-u", "-U",
+  ], requiredFlags: ["-b", "--batch"] },
+  free:    { category: "process" },
+  vmstat:  { category: "process" },
+  iostat:  { category: "process" },
+  mpstat:  { category: "process" },
+  df:      { category: "process" },
+  du:      { category: "process" },
+  mount:   { category: "process", validate: validateMount },
+  findmnt: { category: "process" },
+  nproc:   { category: "process" },
+
+  // ── file inspection (read-only) — category blocked in local context ──
+  cat:       { category: "file" },
+  ls:        { category: "file" },
+  pwd:       { category: "file" },
+  stat:      { category: "file" },
+  file:      { category: "file" },
+  find:      { category: "file", validate: validateFind },
+  readlink:  { category: "file" },
+  realpath:  { category: "file" },
+  basename:  { category: "file" },
+  dirname:   { category: "file" },
+  diff:      { category: "file" },
+  md5sum:    { category: "file" },
+  sha256sum: { category: "file" },
+
+
+  // ── system logs & services ──
+  journalctl:  { category: "services", allowedFlags: [
+    "-u", "--unit", "-n", "--lines", "--since", "--until",
+    "-p", "--priority", "-b", "--boot", "-k", "--dmesg",
+    "--no-pager", "-o", "--output", "-r", "--reverse",
+    "-x", "--catalog", "--system", "--user",
+    "-t", "--identifier", "-g", "--grep", "--case-sensitive",
+    "-S", "-U", "-e", "--pager-end", "-a", "--all",
+    "-q", "--quiet", "--no-hostname", "--no-full",
+    "-m", "--merge", "-D", "--directory", "--file", "--list-boots",
+  ] },
+  systemctl:   { category: "services", allowedSubcommands: { position: 0, allowed: [
+    "status", "show", "list-units", "list-unit-files",
+    "is-active", "is-enabled", "is-failed", "cat",
+    "list-dependencies", "list-sockets", "list-timers",
+  ] } },
+  timedatectl: { category: "services", allowedSubcommands: { position: 0, allowed: ["status", "show", "list-timezones", "timesync-status"] } },
+  hostnamectl: { category: "services", allowedSubcommands: { position: 0, allowed: ["status", "show"] } },
+
+  // ── container runtime ──
+  crictl: { category: "container", allowedSubcommands: { position: 0, allowed: [
+    "ps", "images", "inspect", "inspecti", "inspectp",
+    "logs", "stats", "info", "version", "pods",
+  ] } },
+  ctr: { category: "container", validate: validateCtr },
+
+  // ── firewall (read-only via allowedFlags) ──
+  iptables:  { category: "firewall", allowedFlags: [
+    "-L", "--list", "-S", "--list-rules",
+    "-n", "--numeric", "-v", "--verbose",
+    "-x", "--exact", "--line-numbers", "-t", "--table",
+  ] },
+  ip6tables: { category: "firewall", allowedFlags: [
+    "-L", "--list", "-S", "--list-rules",
+    "-n", "--numeric", "-v", "--verbose",
+    "-x", "--exact", "--line-numbers", "-t", "--table",
+  ] },
+
+  // ── file / process inspection — category blocked in local context ──
+  lsof:    { category: "inspection" },
+  lsns:    { category: "inspection" },
+  strings: { category: "inspection" },
+
+  // ── compressed file reading — category blocked in local context ──
+  zcat:  { category: "compressed" },
+  zgrep: { category: "compressed" },
+  bzcat: { category: "compressed" },
+  xzcat: { category: "compressed" },
+
+  // ── system activity ──
+  sar:   { category: "activity" },
+  blkid: { category: "activity" },
+
+  // ── stream utility ──
+  tee: { category: "stream", validate: validateTee },
+
+  // ── general ──
+  date:   { category: "general", validate: validateDate },
+  whoami: { category: "general" },
+  id:     { category: "general" },
+  which:  { category: "general" },
+
+  // ── general-env — category blocked in local context ──
+  env:      { category: "general-env", validate: validateEnv },
+  printenv: { category: "general-env" },
+
+  // ── flow control ──
+  echo:   { category: "flow" },
+  printf: { category: "flow" },
+  true:   { category: "flow" },
+  false:  { category: "flow" },
+  sleep:  { category: "flow" },
+  wait:   { category: "flow" },
+  test:   { category: "flow" },
+  expr:   { category: "flow" },
+  seq:    { category: "flow" },
+};
+
+// ── Context Policies (internal) ─────────────────────────────────
+//
+// Environment-level constraints. Not exported — only consumed by
+// validateCommandRestrictions() internally.
+
+const ALL_COMMAND_CATEGORIES: readonly CommandCategory[] = [
+  "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+  "process", "file", "diagnostic", "services", "container", "firewall",
+  "inspection", "compressed", "activity", "stream", "general", "general-env",
+  "flow",
+];
+
+interface ContextPolicy {
+  available: readonly CommandCategory[];
+  pipeOnlyCategories?: readonly CommandCategory[];
+  categoryBlockedFlags?: Partial<Record<CommandCategory, string[]>>;
+}
+
+const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
+  local: {
+    available: [
+      "text", "network", "rdma", "perftest", "gpu", "hardware", "kernel",
+      "process", "diagnostic", "services", "container", "firewall",
+      "activity", "stream", "general", "flow",
+    ],
+    pipeOnlyCategories: ["text"],
+    categoryBlockedFlags: {
+      text: ["-r", "-R", "--recursive"],
+    },
+  },
+  node: { available: ALL_COMMAND_CATEGORIES },
+  pod:  { available: ALL_COMMAND_CATEGORIES },
+};
+
+// ── Derived exports (backward compatibility) ────────────────────
+// Consumed by command-validator.ts, restricted-bash.ts, node-exec.ts.
+// New code should use COMMANDS directly.
+
+/** @deprecated Use `binary in COMMANDS` instead. */
+export const ALLOWED_COMMANDS = new Set(Object.keys(COMMANDS));
+
+export const COMMAND_CATEGORIES: Record<string, string> = Object.fromEntries(
+  Object.entries(COMMANDS).map(([cmd, def]) => [cmd, def.category]),
+);
+
+export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = Object.fromEntries(
+  Object.entries(CONTEXT_POLICIES).map(([ctx, policy]) => [ctx, policy.available]),
+);
 
 // ── Container-context sensitive path patterns ────────────────────
 

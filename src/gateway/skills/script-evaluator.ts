@@ -32,7 +32,7 @@ interface PatternRule {
   description: string;
 }
 
-// Cross-reference: src/tools/infra/command-sets.ts (ALLOWED_COMMANDS, COMMAND_RULES).
+// Cross-reference: src/tools/infra/command-sets.ts (COMMANDS).
 // When modifying either file, verify the other still makes sense.
 const DANGER_PATTERNS: PatternRule[] = [
   // Critical

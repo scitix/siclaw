@@ -212,11 +212,9 @@ environments expose different command categories:
 
 | Context | Used by | Unique trait |
 |---------|---------|-------------|
-| `local` | `restricted_bash` | Most restrictive — no `file` category (cat/ls/find blocked, use agent file tools), no `general-env` (env/printenv blocked, redacted via sanitizer), no `inspection`/`compressed` |
+| `local` | `restricted_bash` | Most restrictive — no `file` category (cat/ls/find blocked, use agent file tools), no `general-env` (env/printenv blocked, redacted via sanitizer), no `inspection`/`compressed`. Text commands are pipe-only. |
 | `node` | `node_exec` | Full remote diagnostic set — file access, env inspection, compression tools all allowed |
 | `pod` | `pod_exec` | Same as node — full diagnostic set inside target pod |
-| `nsenter` | `pod_nsenter_exec` | Same as node — full diagnostic set in pod network namespace |
-| `ssh` | (future `ssh_exec`) | Same as node — full diagnostic set on remote host |
 
 Categories missing from `local` but present in remote contexts:
 
@@ -224,10 +222,21 @@ Categories missing from `local` but present in remote contexts:
 |----------|----------|-------------------|
 | `file` | cat, ls, find, stat, du | Agent has dedicated file tools (Read, Grep, Glob) with path restrictions |
 | `general-env` | env, printenv | Would expose process environment; handled via output sanitizer in pipelines |
-| `inspection` | strace, ltrace, ldd | Debugging tools not needed in AgentBox container |
-| `compressed` | tar, gzip, zcat | Archive tools not needed locally |
+| `inspection` | lsof, lsns, strings | Inspection tools not needed in AgentBox container |
+| `compressed` | zcat, zgrep, bzcat | Archive tools not needed locally |
 
-**Source**: `CONTEXT_CATEGORIES` in `src/tools/infra/command-sets.ts:224-234`
+The context system has two layers:
+
+1. **`COMMANDS`** — unified command registry (`Record<string, CommandDef>`).
+   Each entry carries the command's category and its intrinsic safety constraints
+   (global, context-independent). This is the single source of truth for which
+   commands exist and how they are constrained.
+
+2. **`CONTEXT_POLICIES`** — per-context environment policies (internal, not exported).
+   Defines which categories are available, which categories are pipe-only, and
+   which categories have context-specific blocked flags.
+
+**Source**: `COMMANDS` and `CONTEXT_POLICIES` in `src/tools/infra/command-sets.ts`
 
 ### 6.2 Security Strategy: Pre-Execution vs Post-Execution
 
@@ -243,7 +252,7 @@ strategy applies is essential when adding new commands or modifying sanitization
 │   Pass 2: Pipeline extraction (| && || ;)                          │
 │   Pass 3: Binary whitelist (context-based)                         │
 │   Pass 4: Pipeline validators (kubectl subcommands)                │
-│   Pass 5: COMMAND_RULES (pipeOnly, blockedFlags, etc.)             │
+│   Pass 5: COMMANDS constraints + CONTEXT_POLICIES             │
 │   Pass 6: Sensitive path patterns (25+ patterns, see security.md)  │
 │                                                                     │
 │ Blocks: unknown binaries, write operations, credential path access  │
@@ -289,33 +298,81 @@ for the full specification.
 
 **Source**: `src/tools/infra/command-validator.ts`, `src/tools/infra/output-sanitizer.ts`
 
-### 6.3 How to Add a New Command to the Whitelist
+### 6.3 How to Add a New Command
 
-1. Add the command name to `ALLOWED_COMMANDS` in `command-sets.ts`
-2. Add it to `COMMAND_CATEGORIES` with its functional category
-3. If the command needs restrictions (blocked flags, subcommand whitelist, etc.),
-   add an entry to `COMMAND_RULES`
-4. If the category is new, add it to `CONTEXT_CATEGORIES` for each applicable context
+**Step 1: Security Assessment**
 
-### 6.4 How to Add a COMMAND\_RULE
+Before adding any command, answer:
+- What does this command do? Can it write files, execute code, or exfiltrate data?
+- What flags/subcommands are dangerous? (e.g., `-w` for write, `-exec` for code execution)
+- Is it safe in all contexts (local + remote), or does it need constraints?
 
-Rules are declarative and JSON-serializable:
+**Step 2: Choose Category**
+
+Pick from existing categories: `text`, `network`, `rdma`, `perftest`, `gpu`,
+`hardware`, `kernel`, `process`, `file`, `diagnostic`, `services`, `container`,
+`firewall`, `inspection`, `compressed`, `activity`, `stream`, `general`,
+`general-env`, `flow`.
+
+If none fit, define a new `CommandCategory` value and add it to
+`CONTEXT_POLICIES[*].available` for each context where it should be available.
+
+**Step 3: Register in COMMANDS**
+
+Add one entry to `COMMANDS` in `command-sets.ts`. This single entry handles
+whitelist membership, category classification, context availability, and safety
+constraints. No other data structures need changing.
 
 ```typescript
-COMMAND_RULES["mycommand"] = {
-  command: "mycommand",
-  category: "network",
-  contexts: ["local"],        // Only apply in local context
-  pipeOnly: true,             // Must appear after a pipe
-  noFilePaths: true,          // Block path-like positional args
-  blockedFlags: ["-w"],       // Explicitly blocked flags
-  allowedFlags: ["-r", "-n"], // Flag whitelist (if present, unlisted flags blocked)
+// No constraints — safe as-is
+mycommand: { category: "network" },
+
+// With declarative constraints
+mycommand: {
+  category: "services",
   allowedSubcommands: { position: 0, allowed: ["status", "show"] },
-  positionals: "block",       // "allow" | "block" | number (max count)
-  requiredFlags: ["-b"],      // At least one must be present
-  customValidator: "mycommand", // Delegate to CUSTOM_VALIDATORS registry
-};
+},
+
+// With custom validator (complex commands only)
+mycommand: {
+  category: "network",
+  validate: validateMyCommand,  // function defined above COMMANDS
+},
 ```
+
+**Step 4: Write Tests**
+
+Add test cases in `command-sets.test.ts`:
+- Positive: legitimate uses that MUST pass
+- Negative: dangerous uses that MUST be blocked
+- Context-specific: if the command's category has pipeOnly rules in local
+  (e.g., text category), test that piped usage passes and standalone usage
+  is blocked in local context
+
+**Step 5: Update Tool Descriptions**
+
+If this command affects what an execution tool (bash, node\_exec, pod\_exec)
+can do, update the tool's `description` field so the LLM knows about it.
+See §2 Description–Code Consistency Rule.
+
+### 6.4 CommandDef Constraints Reference
+
+`CommandDef` fields for declaring constraints (all optional, only add what's
+needed):
+
+| Field | Type | Effect |
+|-------|------|--------|
+| `blockedFlags` | `string[]` | These flags are explicitly rejected (globally, all contexts) |
+| `allowedFlags` | `string[]` | Only these flags are allowed; unlisted flags rejected |
+| `allowedSubcommands` | `{ position, allowed }` | Only these subcommands/actions at the given positional position |
+| `positionals` | `"allow" \| "block" \| number` | Control positional arguments: allow all, block all, or limit count |
+| `requiredFlags` | `string[]` | At least one of these must be present |
+| `validate` | `(args: string[]) => string \| null` | Custom validator for complex commands (return error string or null) |
+
+Context-specific constraints (pipe-only, context-level blocked flags) are in
+`CONTEXT_POLICIES`, not in `CommandDef`. Developers normally don't need to
+modify `CONTEXT_POLICIES` unless adding a new category or a new execution
+context.
 
 ### 6.5 How to Add an Output Sanitization Rule
 
@@ -374,7 +431,7 @@ configuration.
 
 Remaining work after the Phase 1 directory restructure. Ordered by priority.
 
-### 8.1 Unified Command Security Model (High)
+### 8.1 Unified Command Security Model (Done)
 
 The current security model mixes two separate concerns in `COMMAND_RULES`:
 1. **Command safety constraints** — intrinsic to the command (e.g., `grep -r` is
