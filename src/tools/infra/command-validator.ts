@@ -129,7 +129,7 @@ export interface PipelineSegment {
 /**
  * Extract individual commands from a shell pipeline, tracking whether each
  * command follows a pipe (|) operator vs other separators (&&, ||, ;, &).
- * Used by validateCommand to pass pipe position to COMMAND_RULES (pipeOnly).
+ * Used by validateCommand to pass pipe position to COMMANDS + CONTEXT_POLICIES.
  */
 export function extractPipeline(input: string): PipelineSegment[] {
   const segments: PipelineSegment[] = [];
@@ -354,7 +354,7 @@ const FILE_READING_CMDS = new Set([
  *   3. Per-command: context whitelist + extraAllowed + isAllowed
  *   4. pipelineValidators (e.g. validateKubectlInPipeline)
  *   5. validateCommandRestrictions() — includes pipeOnly, noFilePaths,
- *      blockedFlags via COMMAND_RULES (context + pipe-position-aware)
+ *      COMMANDS constraints + CONTEXT_POLICIES
  *   6. sensitivePathPatterns check
  *
  * Returns an error message string if blocked, or null if allowed.
@@ -419,7 +419,7 @@ export function validateCommand(command: string, options?: ValidateCommandOption
   }
 
   // 5. Per-command restrictions (pipeOnly, noFilePaths, blockedFlags,
-  //    allowedFlags, positionals, etc. — all via COMMAND_RULES)
+  //    allowedFlags, positionals, etc. — via COMMANDS + CONTEXT_POLICIES)
   for (const seg of pipeline) {
     const err = validateCommandRestrictions(seg.command, {
       context,
