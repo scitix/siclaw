@@ -374,23 +374,45 @@ configuration.
 
 Remaining work after the Phase 1 directory restructure. Ordered by priority.
 
-### 8.1 Execution Template Extraction (High)
+### 8.1 Unified Command Security Model (High)
 
-The 3 `k8s-exec/` tools share a 10-step orchestration flow where 6-7 steps are
-identical. The 3 `k8s-script/` tools share the first half of the same flow.
-New contributors must manually replicate these steps — missing any security step
-(command validation, output sanitization) is a silent vulnerability.
+The current security model mixes two separate concerns in `COMMAND_RULES`:
+1. **Command safety constraints** — intrinsic to the command (e.g., `grep -r` is
+   dangerous everywhere)
+2. **Environment availability** — which commands are available in which execution
+   context (e.g., `cat` is blocked locally because a dedicated `read` tool exists)
 
-**Goal**: Extract a shared execution template so new tools only define variation
-points, not the full pipeline.
+These are spread across 4 separate data structures (`ALLOWED_COMMANDS`,
+`COMMAND_CATEGORIES`, `COMMAND_RULES`, `CUSTOM_VALIDATORS`) that must be kept in
+sync. Adding a command may require changes to 2-4 places. Per-command rules are
+inconsistent — some use `allowedFlags`, some use `blockedFlags`, some use custom
+validator functions, with no clear principle for when to use which.
 
-- `k8s-exec/` variation points (4): `context`, `validateTarget`, `checkReady`, `buildCommand`
-- `k8s-script/` variation points (4): `validateTarget`, `checkReady`, `buildCommand`, `run`
-- The two types share the front half (kubeconfig → env → name validate → ready check)
-  but diverge in the back half: k8s-exec adds command validation + output sanitization,
-  k8s-script adds script resolution + script transmission.
+**Goal**: Unify into a single `CommandDef` per command that carries all its
+information — category, safety constraints, and custom validator (if needed).
+Separate environment availability into an independent layer.
 
-**Files**: `src/tools/k8s-exec/*.ts`, `src/tools/k8s-script/*.ts`
+```
+COMMANDS: Record<string, CommandDef>     ← one definition = one command's everything
+  ├── category: string                      what kind of command
+  ├── constraints (declarative)             blockedFlags, allowedSubcommands, etc.
+  └── validate? (escape hatch)             custom function for complex commands (curl, etc.)
+
+CONTEXT_AVAILABLE: Record<string, string[]>  ← which categories are available per context
+  ├── local:  [categories minus file/env]      local has dedicated tools for file ops
+  └── remote: [all categories]                 node/pod/nsenter share the same set
+```
+
+Key design decisions to resolve:
+- `pipeOnly` / `noFilePaths` are currently per-command per-context rules. In the
+  new model they become environment-level policies (e.g., "text category commands
+  in local context only accept piped input"), not command-level attributes.
+- The 12 custom validators (especially `curl` at ~120 lines) remain as `validate`
+  escape hatches — their logic is too complex for declarative rules.
+- The `contexts` field in COMMAND_RULES is eliminated — safety constraints apply
+  everywhere, context filtering is a separate layer.
+
+**Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
 
 ### 8.2 Security Pipeline Unified Entry (High)
 
@@ -400,12 +422,31 @@ execute → `applySanitizer` → `processToolOutput`. A unified facade would:
 - Decouple tools from infra file structure
 - Serve `restricted-bash` (which doesn't use the template) as well
 
+Should be done together with or after 8.1 — the unified entry consumes the
+new `CommandDef` model.
+
 **Goal**: A small set of functions in `infra/` that encapsulate the full
 pre-exec → post-exec security flow.
 
 **Files**: `src/tools/infra/command-validator.ts`, `src/tools/infra/output-sanitizer.ts`, `src/tools/infra/tool-render.ts`
 
-### 8.3 `debug-pod.ts` Decomposition (Medium)
+### 8.3 Execution Template Extraction (Low — Deferred)
+
+Originally planned as high priority. After detailed analysis, the 3 `k8s-exec/`
+tools only share ~3 truly identical steps (not 6-7 as initially estimated).
+Variation points (`checkReady` return types, `analyzeOutput` input handling,
+`buildCommand` complexity, `run` + error handling) differ enough that a forced
+template would add abstraction without reducing real complexity.
+
+If 8.1 + 8.2 are done, the security-critical steps are already unified via the
+pipeline facade, eliminating the main risk (step omission). What remains is
+boilerplate (kubeconfig resolution, error formatting) — tolerable duplication.
+
+Revisit if more than 2 new k8s-exec tools are added.
+
+**Files**: `src/tools/k8s-exec/*.ts`, `src/tools/k8s-script/*.ts`
+
+### 8.4 `debug-pod.ts` Decomposition (Medium)
 
 `src/tools/infra/debug-pod.ts` is 767 lines mixing three concerns:
 - `DebugPodCache` — pod reuse cache with creation lock and idle eviction
@@ -420,7 +461,7 @@ makes the debug pod subsystem itself harder to maintain.
 
 **Files**: `src/tools/infra/debug-pod.ts`
 
-### 8.4 Extract `llmCompleteWithTool` to Shared Location (Medium)
+### 8.5 Extract `llmCompleteWithTool` to Shared Location (Medium)
 
 `llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
 utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
