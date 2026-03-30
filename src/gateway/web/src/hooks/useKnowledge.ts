@@ -31,7 +31,7 @@ export function useKnowledge(
 
   const uploadDoc = useCallback(async (data: {
     content: string;
-    fileName?: string;
+    fileName: string;
   }) => {
     const result = await sendRpc<{ id: string; name: string }>('kb.upload', data);
     await loadDocs();
@@ -40,7 +40,7 @@ export function useKnowledge(
 
   const batchUploadDocs = useCallback(async (docs: Array<{
     content: string;
-    fileName?: string;
+    fileName: string;
   }>) => {
     const result = await sendRpc<{
       results: Array<{ id: string; name: string; error?: string }>;

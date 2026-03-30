@@ -23,6 +23,15 @@ export class KnowledgeDocRepository {
     return rows[0] ?? null;
   }
 
+  async getByName(name: string) {
+    const rows = await this.db
+      .select()
+      .from(knowledgeDocs)
+      .where(eq(knowledgeDocs.name, name))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async create(data: {
     id?: string;
     name: string;

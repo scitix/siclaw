@@ -1,18 +1,15 @@
-import { X, Save, Upload, FileText, Trash2, Loader2 } from 'lucide-react';
+import { X, Upload, FileText, Trash2, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState, useEffect, useRef } from 'react';
-import { cn } from '@/lib/utils';
 
 interface KnowledgeUploadDrawerProps {
     isOpen: boolean;
     onClose: () => void;
-    onSave: (data: { content: string; fileName?: string }) => Promise<unknown>;
-    onBatchSave: (docs: Array<{ content: string; fileName?: string }>) => Promise<{
+    onSave: (data: { content: string; fileName: string }) => Promise<unknown>;
+    onBatchSave: (docs: Array<{ content: string; fileName: string }>) => Promise<{
         results: Array<{ id: string; name: string; error?: string }>;
     }>;
 }
-
-type InputMode = 'file' | 'paste';
 
 interface PendingFile {
     key: string;
@@ -24,8 +21,6 @@ interface PendingFile {
 let keyCounter = 0;
 
 export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: KnowledgeUploadDrawerProps) {
-    const [mode, setMode] = useState<InputMode>('file');
-    const [pasteContent, setPasteContent] = useState('');
     const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
     const [error, setError] = useState('');
     const [saving, setSaving] = useState(false);
@@ -34,8 +29,6 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
 
     useEffect(() => {
         if (isOpen) {
-            setMode('file');
-            setPasteContent('');
             setPendingFiles([]);
             setError('');
             setSaving(false);
@@ -43,14 +36,6 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
             if (fileInputRef.current) fileInputRef.current.value = '';
         }
     }, [isOpen]);
-
-    const switchMode = (next: InputMode) => {
-        if (next === mode) return;
-        setMode(next);
-        setPasteContent('');
-        setPendingFiles([]);
-        if (fileInputRef.current) fileInputRef.current.value = '';
-    };
 
     const handleFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const fileList = e.target.files;
@@ -78,21 +63,6 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
         if (saving) return;
         setError('');
 
-        if (mode === 'paste') {
-            if (!pasteContent.trim()) { setError('Content is required'); return; }
-            setSaving(true);
-            try {
-                await onSave({ content: pasteContent });
-                onClose();
-            } catch (err: any) {
-                setError(err?.message || 'Failed to upload');
-            } finally {
-                setSaving(false);
-            }
-            return;
-        }
-
-        // File mode
         if (pendingFiles.length === 0) { setError('No files selected'); return; }
 
         setSaving(true);
@@ -131,9 +101,6 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
     };
 
     const totalSize = pendingFiles.reduce((sum, f) => sum + f.sizeBytes, 0);
-    const canSave = mode === 'paste'
-        ? !!pasteContent.trim()
-        : pendingFiles.length > 0;
 
     return (
         <AnimatePresence>
@@ -151,7 +118,7 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
                         animate={{ x: 0 }}
                         exit={{ x: '100%' }}
                         transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-                        className="fixed right-0 top-0 bottom-0 w-[560px] bg-white shadow-2xl z-50 flex flex-col border-l border-gray-100"
+                        className="fixed right-0 top-0 bottom-0 w-[480px] bg-white shadow-2xl z-50 flex flex-col border-l border-gray-100"
                     >
                         {/* Header */}
                         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 bg-white">
@@ -168,103 +135,52 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
                         </div>
 
                         {/* Content */}
-                        <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                            {/* Mode tabs */}
-                            <div className="space-y-3">
-                                <div className="flex gap-1 p-1 bg-gray-100 rounded-lg">
-                                    <button
-                                        type="button"
-                                        onClick={() => switchMode('file')}
-                                        className={cn(
-                                            "flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors",
-                                            mode === 'file'
-                                                ? "bg-white text-gray-900 shadow-sm"
-                                                : "text-gray-500 hover:text-gray-700"
-                                        )}
-                                    >
-                                        <Upload className="w-3.5 h-3.5" />
-                                        Upload Files
-                                    </button>
-                                    <button
-                                        type="button"
-                                        onClick={() => switchMode('paste')}
-                                        className={cn(
-                                            "flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors",
-                                            mode === 'paste'
-                                                ? "bg-white text-gray-900 shadow-sm"
-                                                : "text-gray-500 hover:text-gray-700"
-                                        )}
-                                    >
-                                        <FileText className="w-3.5 h-3.5" />
-                                        Paste Content
-                                    </button>
-                                </div>
+                        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                            <input
+                                ref={fileInputRef}
+                                type="file"
+                                accept=".md,.markdown,.txt"
+                                multiple
+                                onChange={handleFilesChange}
+                                className="hidden"
+                            />
+                            <button
+                                type="button"
+                                onClick={() => fileInputRef.current?.click()}
+                                className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-primary-50 text-primary-600 hover:bg-primary-100 transition-colors"
+                            >
+                                <Upload className="w-3.5 h-3.5" />
+                                Choose Files
+                            </button>
 
-                                {mode === 'file' ? (
-                                    <div className="space-y-3">
-                                        <input
-                                            ref={fileInputRef}
-                                            type="file"
-                                            accept=".md,.markdown,.txt"
-                                            multiple
-                                            onChange={handleFilesChange}
-                                            className="hidden"
-                                        />
-                                        <button
-                                            type="button"
-                                            onClick={() => fileInputRef.current?.click()}
-                                            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-primary-50 text-primary-600 hover:bg-primary-100 transition-colors"
-                                        >
-                                            <Upload className="w-3.5 h-3.5" />
-                                            Choose Files
-                                        </button>
-
-                                        {pendingFiles.length > 0 && (
-                                            <div className="space-y-2">
-                                                <p className="text-xs text-gray-500">
-                                                    {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected
-                                                    {' \u2014 '}
-                                                    {(totalSize / 1024).toFixed(1)} KB total
-                                                </p>
-                                                <div className="border border-gray-200 rounded-lg divide-y divide-gray-100">
-                                                    {pendingFiles.map((f) => (
-                                                        <div key={f.key} className="flex items-center gap-3 px-3 py-2 group">
-                                                            <FileText className="w-4 h-4 text-gray-400 shrink-0" />
-                                                            <div className="flex-1 min-w-0">
-                                                                <p className="text-sm font-medium text-gray-900 truncate">{f.fileName}</p>
-                                                                <p className="text-[11px] text-gray-400">{(f.sizeBytes / 1024).toFixed(1)} KB</p>
-                                                            </div>
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => removePendingFile(f.key)}
-                                                                className="p-1 text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
-                                                                title="Remove"
-                                                            >
-                                                                <Trash2 className="w-3.5 h-3.5" />
-                                                            </button>
-                                                        </div>
-                                                    ))}
+                            {pendingFiles.length > 0 && (
+                                <div className="space-y-2">
+                                    <p className="text-xs text-gray-500">
+                                        {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected
+                                        {' \u2014 '}
+                                        {(totalSize / 1024).toFixed(1)} KB total
+                                    </p>
+                                    <div className="border border-gray-200 rounded-lg divide-y divide-gray-100">
+                                        {pendingFiles.map((f) => (
+                                            <div key={f.key} className="flex items-center gap-3 px-3 py-2 group">
+                                                <FileText className="w-4 h-4 text-gray-400 shrink-0" />
+                                                <div className="flex-1 min-w-0">
+                                                    <p className="text-sm font-medium text-gray-900 truncate">{f.fileName}</p>
+                                                    <p className="text-[11px] text-gray-400">{(f.sizeBytes / 1024).toFixed(1)} KB</p>
                                                 </div>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => removePendingFile(f.key)}
+                                                    className="p-1 text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                                                    title="Remove"
+                                                >
+                                                    <Trash2 className="w-3.5 h-3.5" />
+                                                </button>
                                             </div>
-                                        )}
+                                        ))}
                                     </div>
-                                ) : (
-                                    <div className="space-y-1.5">
-                                        <textarea
-                                            value={pasteContent}
-                                            onChange={(e) => setPasteContent(e.target.value)}
-                                            placeholder="Paste Markdown content here..."
-                                            rows={18}
-                                            className="w-full px-3 py-2 bg-white border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 resize-none"
-                                        />
-                                        {pasteContent && (
-                                            <p className="text-xs text-gray-400">
-                                                {pasteContent.length.toLocaleString()} characters
-                                            </p>
-                                        )}
-                                    </div>
-                                )}
-                            </div>
+                                </div>
+                            )}
 
                             {error && (
                                 <p className="text-xs text-red-500">{error}</p>
@@ -281,7 +197,7 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
                             </button>
                             <button
                                 onClick={handleSave}
-                                disabled={!canSave || saving}
+                                disabled={pendingFiles.length === 0 || saving}
                                 className="px-4 py-2 text-sm font-medium bg-primary-600 text-white hover:bg-primary-700 rounded-lg shadow-sm flex items-center gap-2 disabled:opacity-50"
                             >
                                 {saving ? (
@@ -293,8 +209,8 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: 
                                     </>
                                 ) : (
                                     <>
-                                        <Save className="w-4 h-4" />
-                                        {mode === 'file' && pendingFiles.length > 1
+                                        <Upload className="w-4 h-4" />
+                                        {pendingFiles.length > 1
                                             ? `Upload ${pendingFiles.length} Files`
                                             : 'Upload'}
                                     </>
