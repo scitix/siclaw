@@ -318,7 +318,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             } else if (fileExists && !doc.content) {
               // File on disk but no content in DB (pre-upgrade doc) — backfill
               const content = fs.readFileSync(fullPath, "utf-8");
-              await knowledgeDocRepo.updateContent(doc.id, content);
+              await knowledgeDocRepo.updateContent(doc.id, content, Buffer.byteLength(content, "utf-8"));
               backfilled++;
             }
           } catch (err) {

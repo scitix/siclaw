@@ -2147,7 +2147,7 @@ export function createRpcMethods(
     if (existing) {
       const fullPath = resolveUnderDir(knowledgeDir, existing.filePath);
       fs.writeFileSync(fullPath, content, "utf-8");
-      await knowledgeDocRepo.updateContent(existing.id, content);
+      await knowledgeDocRepo.updateContent(existing.id, content, sizeBytes);
       return { id: existing.id, name, filePath: existing.filePath, sizeBytes };
     }
 

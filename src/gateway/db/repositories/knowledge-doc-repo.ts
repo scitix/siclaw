@@ -63,10 +63,10 @@ export class KnowledgeDocRepository {
       .where(eq(knowledgeDocs.id, id));
   }
 
-  async updateContent(id: string, content: string): Promise<void> {
+  async updateContent(id: string, content: string, sizeBytes: number): Promise<void> {
     await this.db
       .update(knowledgeDocs)
-      .set({ content })
+      .set({ content, sizeBytes, updatedAt: new Date() })
       .where(eq(knowledgeDocs.id, id));
   }
 
