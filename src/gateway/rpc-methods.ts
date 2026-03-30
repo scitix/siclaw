@@ -2120,48 +2120,38 @@ export function createRpcMethods(
     };
   });
 
-  // Extract a display name from markdown content
-  function extractTitleFromContent(content: string): string {
-    // YAML frontmatter title
-    const fmMatch = content.match(/^---\s*\n[\s\S]*?\ntitle:\s*['"]?(.+?)['"]?\s*\n[\s\S]*?\n---/);
-    if (fmMatch) return fmMatch[1].trim();
-    // ATX heading: # Title (any level)
-    const atxMatch = content.match(/^#{1,6}\s+(.+)$/m);
-    if (atxMatch) return atxMatch[1].trim();
-    // Setext heading: text followed by ===
-    const setextMatch = content.match(/^(.+)\n={3,}\s*$/m);
-    if (setextMatch) return setextMatch[1].trim();
-    // First non-empty, non-frontmatter line
-    const firstLine = content.split("\n").find((l) => l.trim() && !l.startsWith("---"));
-    if (firstLine) return firstLine.trim().slice(0, 100);
-    return "";
-  }
-
-  // Resolve a display name: explicit name > extracted from content > fileName > "Untitled"
-  function resolveDocName(name: string | undefined, content: string, fileName: string | undefined): string {
-    if (name?.trim()) return name.trim();
-    const extracted = extractTitleFromContent(content);
-    if (extracted) return extracted;
-    if (fileName) return fileName.replace(/\.(md|markdown|txt)$/i, "");
-    return "Untitled";
-  }
-
-  // Shared helper: write one knowledge doc to disk + DB (no indexer sync)
-  async function createKnowledgeDoc(
+  // Shared helper: upsert one knowledge doc to disk + DB (no indexer sync).
+  // If a doc with the same name already exists, overwrite its file and DB record.
+  async function upsertKnowledgeDoc(
+    fileName: string,
     content: string,
     uploadedBy: string | undefined,
-    nameHint?: string,
-    fileNameHint?: string,
   ): Promise<{ id: string; name: string; filePath: string; sizeBytes: number }> {
     if (!knowledgeDocRepo) throw new Error("Database not available");
+    if (!fileName) throw new Error("Missing fileName");
 
     const MAX_CONTENT_SIZE = 5 * 1024 * 1024;
     const sizeBytes = Buffer.byteLength(content, "utf-8");
-    const name = resolveDocName(nameHint, content, fileNameHint);
     if (sizeBytes > MAX_CONTENT_SIZE) {
-      throw new Error(`"${name}": content too large (${(sizeBytes / 1024 / 1024).toFixed(1)}MB exceeds 5MB limit)`);
+      throw new Error(`"${fileName}": content too large (${(sizeBytes / 1024 / 1024).toFixed(1)}MB exceeds 5MB limit)`);
     }
 
+    if (!fs.existsSync(knowledgeDir)) {
+      fs.mkdirSync(knowledgeDir, { recursive: true });
+    }
+
+    const name = fileName;
+
+    // Check for existing doc with same name — overwrite if found
+    const existing = await knowledgeDocRepo.getByName(name);
+    if (existing) {
+      const fullPath = resolveUnderDir(knowledgeDir, existing.filePath);
+      fs.writeFileSync(fullPath, content, "utf-8");
+      await knowledgeDocRepo.updateContent(existing.id, content);
+      return { id: existing.id, name, filePath: existing.filePath, sizeBytes };
+    }
+
+    // New doc
     const docId = crypto.randomBytes(12).toString("hex");
     let sanitized = name
       .replace(/[^a-zA-Z0-9_\-. ]/g, "_")
@@ -2172,11 +2162,7 @@ export function createRpcMethods(
     const baseName = sanitized.endsWith(".md") ? sanitized.slice(0, -3) : sanitized;
     const filePath = `${baseName}_${docId.slice(0, 8)}.md`;
 
-    if (!fs.existsSync(knowledgeDir)) {
-      fs.mkdirSync(knowledgeDir, { recursive: true });
-    }
     const fullPath = resolveUnderDir(knowledgeDir, filePath);
-
     fs.writeFileSync(fullPath, content, "utf-8");
 
     try {
@@ -2213,15 +2199,12 @@ export function createRpcMethods(
   methods.set("kb.upload", async (params, context: RpcContext) => {
     requireAdmin(context);
 
+    const fileName = params.fileName as string;
     const content = params.content as string;
+    if (!fileName) throw new Error("Missing required param: fileName");
     if (!content) throw new Error("Missing required param: content");
 
-    const doc = await createKnowledgeDoc(
-      content,
-      context.auth?.userId,
-      params.name as string | undefined,
-      params.fileName as string | undefined,
-    );
+    const doc = await upsertKnowledgeDoc(fileName, content, context.auth?.userId);
     console.log(`[kb-rpc] kb.upload: name=${doc.name}, file=${doc.filePath}, size=${doc.sizeBytes}, by=${context.auth?.username}`);
 
     await syncAndUpdateChunks([doc]);
@@ -2233,7 +2216,7 @@ export function createRpcMethods(
     requireAdmin(context);
     if (!knowledgeDocRepo) throw new Error("Database not available");
 
-    const items = params.docs as Array<{ content: string; name?: string; fileName?: string }>;
+    const items = params.docs as Array<{ content: string; fileName: string }>;
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error("Missing required param: docs (non-empty array)");
     }
@@ -2247,12 +2230,13 @@ export function createRpcMethods(
     for (const item of items) {
       try {
         if (!item.content) throw new Error("Missing content");
-        const doc = await createKnowledgeDoc(item.content, context.auth?.userId, item.name, item.fileName);
+        if (!item.fileName) throw new Error("Missing fileName");
+        const doc = await upsertKnowledgeDoc(item.fileName, item.content, context.auth?.userId);
         results.push({ id: doc.id, name: doc.name });
         created.push({ id: doc.id, filePath: doc.filePath });
         console.log(`[kb-rpc] kb.batchUpload: name=${doc.name}, file=${doc.filePath}, size=${doc.sizeBytes}, by=${context.auth?.username}`);
       } catch (err: any) {
-        results.push({ id: "", name: item.name || item.fileName || "(unnamed)", error: err?.message || "Upload failed" });
+        results.push({ id: "", name: item.fileName || "(unnamed)", error: err?.message || "Upload failed" });
       }
     }
 
