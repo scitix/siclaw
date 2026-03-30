@@ -4,11 +4,10 @@ import { promisify } from "node:util";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
-import { renderTextResult, processToolOutput } from "../infra/tool-render.js";
-import { analyzeOutput, applySanitizer } from "../infra/output-sanitizer.js";
+import { renderTextResult } from "../infra/tool-render.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { validateCommand } from "../infra/command-validator.js";
+import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 
@@ -123,11 +122,15 @@ Examples:
         };
       }
 
-      // Validate command
-      const cmdErr = validateCommand(params.command, { context: "pod", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS, blockPipeline: true });
-      if (cmdErr) {
+      // Pre-exec security: validate command + determine output sanitizer
+      const pre = preExecSecurity(params.command, {
+        context: "pod",
+        sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
+        blockPipeline: true,
+      });
+      if (pre.error) {
         return {
-          content: [{ type: "text", text: cmdErr }],
+          content: [{ type: "text", text: pre.error }],
           details: { blocked: true, reason: "command_blocked" },
         };
       }
@@ -144,14 +147,9 @@ Examples:
       }
 
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
-      const cmdArgs = parseArgs(params.command);
-
-      // Post-execution output sanitization
-      // Convention: binary is separate, args does NOT include binary itself
-      const binary = cmdArgs[0]?.split("/").pop() ?? "";
-      const action = analyzeOutput(binary, cmdArgs.slice(1));
 
       // Build kubectl exec args
+      const cmdArgs = parseArgs(params.command);
       const execArgs = cmdArgs;
       const kubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
       if (params.container?.trim()) {
@@ -166,20 +164,16 @@ Examples:
           { timeout, env: env.childEnv },
         );
 
-        const sanitized = applySanitizer(stdout.trim(), action);
-        const output = sanitized + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const stdout = (err.stdout?.trim() ?? "") as string;
-        const sanitizedStdout = applySanitizer(stdout, action);
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
-        const output = `Exit code: ${exitCode}\n${sanitizedStdout}${stderr ? `\n${stderr}` : ""}`;
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(`Exit code: ${exitCode}\n${stdout}`, pre.action, { stderr: stderr || undefined }) }],
           details: { exitCode, error: true },
         };
       }

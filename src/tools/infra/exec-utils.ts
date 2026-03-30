@@ -8,7 +8,6 @@ import { spawn } from "node:child_process";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
-import { processToolOutput } from "./tool-render.js";
 import { checkNodeReady } from "./k8s-checks.js";
 
 // ── Name validators ──────────────────────────────────────────────────
@@ -155,40 +154,13 @@ export function filterPodNoise(stderr: string): string {
     .trim();
 }
 
-// ── Output formatting ────────────────────────────────────────────────
+// ── Output types ────────────────────────────────────────────────────
 
 export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number | null;
   timedOut?: boolean;
-}
-
-/**
- * Format an ExecResult into a standard tool result shape.
- * Applies filterPodNoise and processToolOutput.
- */
-export function formatExecOutput(result: ExecResult): {
-  content: Array<{ type: "text"; text: string }>;
-  details: { exitCode: number | null; error?: boolean };
-} {
-  const filteredStderr = filterPodNoise(result.stderr);
-  const output =
-    result.stdout.trim() +
-    (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
-
-  if (result.exitCode === 0 || (result.exitCode === null && result.stdout.trim())) {
-    return {
-      content: [{ type: "text", text: processToolOutput(output) }],
-      details: { exitCode: result.exitCode ?? 0 },
-    };
-  } else {
-    const errOutput = `Exit code: ${result.exitCode ?? "unknown"}\n${output}`;
-    return {
-      content: [{ type: "text", text: processToolOutput(errOutput) }],
-      details: { exitCode: result.exitCode, error: true },
-    };
-  }
 }
 
 // ── Container netns resolution ───────────────────────────────────────
