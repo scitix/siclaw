@@ -660,4 +660,28 @@ export class AgentBoxSessionManager {
 
     this._sharedInitialized = false;
   }
+
+  /**
+   * Reset the shared memory indexer.
+   * Called after Gateway has cleared memory files on PVC.
+   * Triggers a sync so the existing indexer detects deleted files and
+   * cleans up its DB records. We keep the same indexer instance alive
+   * because active sessions hold direct references to it via tool closures.
+   */
+  async resetMemory(): Promise<void> {
+    if (!this._sharedMemoryIndexer) {
+      console.log(`[agentbox-session] No memory indexer to reset`);
+      return;
+    }
+
+    try {
+      // sync() detects deleted .md files and cleans up files/chunks tables
+      await this._sharedMemoryIndexer.sync();
+      // investigations table is NOT cleaned by sync — clear it explicitly
+      this._sharedMemoryIndexer.clearInvestigations();
+      console.log(`[agentbox-session] Memory indexer re-synced after PVC cleanup`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Memory indexer sync after reset failed:`, err);
+    }
+  }
 }
