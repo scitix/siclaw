@@ -296,11 +296,10 @@ export async function createSiclawSession(
     // ── Command execution — full security pipeline (cmd-exec/) ──
     createNodeExecTool(kubeconfigRef, userId),
     createPodExecTool(kubeconfigRef),
+    createRestrictedBashTool(kubeconfigRef),
     // ── Script execution — pre-audited scripts (script-exec/) ──
     createNodeScriptTool(kubeconfigRef, userId),
     createPodScriptTool(kubeconfigRef),
-    // ── Local script (script-exec/) ──
-    createRestrictedBashTool(kubeconfigRef),
     createLocalScriptTool(kubeconfigRef, sessionIdRef),
     // ── Data query (query/) ──
     createInvestigationFeedbackTool(memoryRef),
