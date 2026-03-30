@@ -971,6 +971,20 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     sendJson(res, 200, { ok: true });
   });
 
+  /**
+   * POST /api/reset-memory - reset memory indexer after Gateway clears PVC files
+   */
+  addRoute("POST", "/api/reset-memory", async (_req, res) => {
+    console.log(`[agentbox-http] Resetting memory indexer`);
+    try {
+      await sessionManager.resetMemory();
+      sendJson(res, 200, { ok: true });
+    } catch (err: any) {
+      console.error(`[agentbox-http] Memory reset failed: ${err.message}`);
+      sendJson(res, 500, { error: `Memory reset failed: ${err.message}` });
+    }
+  });
+
   // ==================== Server ====================
 
   /** Main request handler shared by HTTP and HTTPS servers */

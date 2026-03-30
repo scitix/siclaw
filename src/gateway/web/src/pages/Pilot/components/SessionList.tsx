@@ -1,7 +1,8 @@
-import { Search, Plus, Trash2 } from 'lucide-react';
+import { Search, Plus, Trash2, Eraser } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useState } from 'react';
 import type { Session } from '@/hooks/usePilot';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 
 interface SessionListProps {
     sessions: Session[];
@@ -9,6 +10,7 @@ interface SessionListProps {
     onSelectSession: (key: string) => void;
     onNewSession: () => void;
     onDeleteSession?: (key: string) => void;
+    onClearMemory?: () => Promise<void>;
 }
 
 export function SessionList({
@@ -17,8 +19,11 @@ export function SessionList({
     onSelectSession,
     onNewSession,
     onDeleteSession,
+    onClearMemory,
 }: SessionListProps) {
     const [search, setSearch] = useState('');
+    const [showClearConfirm, setShowClearConfirm] = useState(false);
+    const [isClearing, setIsClearing] = useState(false);
 
     const filtered = search
         ? sessions.filter(s =>
@@ -70,6 +75,25 @@ export function SessionList({
                     New Session
                 </button>
             </div>
+
+            {/* Clear Memory Confirm Dialog */}
+            <ConfirmDialog
+                isOpen={showClearConfirm}
+                onClose={() => setShowClearConfirm(false)}
+                onConfirm={async () => {
+                    if (!onClearMemory) return;
+                    setIsClearing(true);
+                    try {
+                        await onClearMemory();
+                    } finally {
+                        setIsClearing(false);
+                    }
+                }}
+                title="Clear Memory"
+                description="This will permanently delete all conversation memories for this workspace. This action cannot be undone."
+                confirmText="Clear Memory"
+                variant="danger"
+            />
 
             {/* List */}
             <div className="flex-1 overflow-y-auto px-3 py-3 space-y-1">
@@ -124,6 +148,20 @@ export function SessionList({
                     );
                 })}
             </div>
+
+            {/* Clear Memory */}
+            {onClearMemory && (
+                <div className="p-3 border-t border-gray-200 bg-white">
+                    <button
+                        onClick={() => setShowClearConfirm(true)}
+                        disabled={isClearing}
+                        className="w-full flex items-center justify-center gap-2 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 hover:border-red-300 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        <Eraser className="w-4 h-4" />
+                        {isClearing ? 'Clearing...' : 'Clear Memory'}
+                    </button>
+                </div>
+            )}
         </div>
     );
 }

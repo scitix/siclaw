@@ -226,6 +226,16 @@ export class AgentBoxClient {
   }
 
   /**
+   * Reset memory indexer after Gateway has cleared PVC files.
+   */
+  async resetMemory(): Promise<{ ok: boolean }> {
+    const resp = await this.fetch("/api/reset-memory", {
+      method: "POST",
+    });
+    return resp.json();
+  }
+
+  /**
    * Get DP investigation state for recovery.
    * Returns { dpStatus, question, round } from the session's live dpStateRef.
    */
