@@ -69,7 +69,9 @@ describe("getAverageIntervalMs", () => {
   });
 
   it("weekday 9am+5pm → avg > 12h (includes weekend gaps)", () => {
-    const { avg, min } = getAverageIntervalMs("0 9,17 * * 1-5");
+    // Pin to a Wednesday so 10 samples always span a weekend gap
+    const wed = new Date("2026-01-07T00:00:00Z"); // Wednesday
+    const { avg, min } = getAverageIntervalMs("0 9,17 * * 1-5", 10, wed);
     expect(avg).toBeGreaterThan(12 * HOUR);
     expect(min).toBe(8 * HOUR); // 9→17 same day
   });
