@@ -78,8 +78,7 @@ function extractFlag(arg: string): string {
   return eqIdx >= 0 ? arg.slice(0, eqIdx) : arg;
 }
 
-// (Legacy ALLOWED_COMMANDS / COMMAND_CATEGORIES / CONTEXT_CATEGORIES
-//  are now derived from COMMANDS + CONTEXT_POLICIES — see end of file)
+
 
 // Perftest: 11 binaries share one flag set (referenced by COMMANDS entries)
 const PERFTEST_FLAGS = [
@@ -941,7 +940,7 @@ export function validateExecCommand(args: string[]): string | null {
   // Extract basename (handle /usr/bin/ping -> ping)
   const baseName = execBinary.split("/").pop()?.toLowerCase() ?? "";
 
-  if (!ALLOWED_COMMANDS.has(baseName)) {
+  if (!(baseName in COMMANDS)) {
     return JSON.stringify({
       error: `Command "${baseName}" is not in the allowed exec command list.`,
       allowed_categories: {
@@ -1276,20 +1275,35 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
   pod:  { available: ALL_COMMAND_CATEGORIES },
 };
 
-// ── Derived exports (backward compatibility) ────────────────────
-// Consumed by command-validator.ts, restricted-bash.ts, node-exec.ts.
-// New code should use COMMANDS directly.
+// ── Context-based allowed command set ──────────────────────────
 
-/** @deprecated Use `binary in COMMANDS` instead. */
-export const ALLOWED_COMMANDS = new Set(Object.keys(COMMANDS));
+const contextAllowedCache = new Map<string, ReadonlySet<string>>();
 
-export const COMMAND_CATEGORIES: Record<string, string> = Object.fromEntries(
-  Object.entries(COMMANDS).map(([cmd, def]) => [cmd, def.category]),
-);
+/**
+ * Get the set of command names allowed for a given execution context.
+ * Computed from COMMANDS + CONTEXT_POLICIES; cached after first call.
+ */
+export function getContextAllowedSet(context: string): ReadonlySet<string> {
+  const cached = contextAllowedCache.get(context);
+  if (cached) return cached;
 
-export const CONTEXT_CATEGORIES: Record<string, readonly string[]> = Object.fromEntries(
-  Object.entries(CONTEXT_POLICIES).map(([ctx, policy]) => [ctx, policy.available]),
-);
+  const policy = CONTEXT_POLICIES[context];
+  if (!policy) {
+    // Unknown context → all commands
+    const all = new Set(Object.keys(COMMANDS));
+    contextAllowedCache.set(context, all);
+    return all;
+  }
+
+  const categorySet = new Set<string>(policy.available);
+  const cmds = new Set<string>();
+  for (const [cmd, def] of Object.entries(COMMANDS)) {
+    if (categorySet.has(def.category)) cmds.add(cmd);
+  }
+
+  contextAllowedCache.set(context, cmds);
+  return cmds;
+}
 
 // ── Container-context sensitive path patterns ────────────────────
 

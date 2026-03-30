@@ -10,7 +10,6 @@ import {
   validateFindInPipeline,
   validateIpInPipeline,
   validateKubectlInPipeline,
-  ALLOWED_BINARIES,
 } from "./restricted-bash.js";
 import { extractPipeline } from "../infra/command-validator.js";
 

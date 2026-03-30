@@ -10,9 +10,10 @@ import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import {
   validateNodeName,
   prepareExecEnv,
-  formatExecOutput,
+  filterPodNoise,
   stdinExecCmd,
 } from "../infra/exec-utils.js";
+import { postExecSecurity } from "../infra/security-pipeline.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 
@@ -179,7 +180,16 @@ Examples:
         };
       }
 
-      return formatExecOutput(execResult);
+      const filteredStderr = filterPodNoise(execResult.stderr);
+      const isError = execResult.exitCode !== 0 &&
+        !(execResult.exitCode === null && execResult.stdout.trim());
+      const stdout = isError
+        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
+        : execResult.stdout.trim();
+      return {
+        content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: filteredStderr || undefined }) }],
+        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+      };
     },
   };
 }
