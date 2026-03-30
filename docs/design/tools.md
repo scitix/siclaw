@@ -541,5 +541,3 @@ from `shared/llm-utils.ts`. The reverse dependency `memory/` → `tools/workflow
 is eliminated.
 
 **Files**: `src/shared/llm-utils.ts`, `src/tools/workflow/deep-search/sub-agent.ts`
-
-**Files**: `src/tools/workflow/deep-search/sub-agent.ts`, `src/memory/topic-consolidator.ts`, `src/memory/knowledge-extractor.ts`

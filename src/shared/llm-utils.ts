@@ -8,7 +8,7 @@ import { getDefaultLlm } from "../core/config.js";
 
 // ── Constants ───────────────────────────────────────────────────────
 
-const LLM_COMPLETE_MAX_TOKENS = 16384;
+const LLM_COMPLETE_MAX_TOKENS = 4096;
 
 // ── Public types ────────────────────────────────────────────────────
 
