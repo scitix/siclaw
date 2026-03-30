@@ -527,19 +527,19 @@ makes the debug pod subsystem itself harder to maintain.
 
 **Files**: `src/tools/infra/debug-pod.ts`
 
-### 8.5 Extract `llmCompleteWithTool` to Shared Location (Medium)
+### 8.5 Extract `llmCompleteWithTool` to Shared Location (Done)
 
-`llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
-utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
-of a specific workflow tool. Two memory module files depend on it:
-- `src/memory/topic-consolidator.ts`
-- `src/memory/knowledge-extractor.ts`
+Extracted general-purpose LLM utilities from `workflow/deep-search/sub-agent.ts`
+to `src/shared/llm-utils.ts`:
 
-This creates an architectural smell: a foundational module (`memory/`) depends
-on the internals of a higher-level workflow tool.
+- `llmComplete()` — simple text completion via OpenAI-compatible API
+- `llmCompleteWithTool<T>()` — structured output via function calling + fallback
+- `extractJSON()` — multi-layer JSON extraction (direct parse / code block / brace matching)
 
-**Goal**: Move `llmCompleteWithTool` to `src/core/` or `src/shared/`, making
-the dependency direction correct (both `memory/` and `workflow/deep-search/`
-import from `core/`).
+All consumers (`memory/`, `deep-search/engine.ts`, `quality-gate.ts`) now import
+from `shared/llm-utils.ts`. The reverse dependency `memory/` → `tools/workflow/`
+is eliminated.
+
+**Files**: `src/shared/llm-utils.ts`, `src/tools/workflow/deep-search/sub-agent.ts`
 
 **Files**: `src/tools/workflow/deep-search/sub-agent.ts`, `src/memory/topic-consolidator.ts`, `src/memory/knowledge-extractor.ts`
