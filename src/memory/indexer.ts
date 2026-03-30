@@ -424,6 +424,11 @@ export class MemoryIndexer {
     }
   }
 
+  /** Delete all rows from the investigations table. */
+  clearInvestigations(): void {
+    this.db.exec("DELETE FROM investigations");
+  }
+
   /** Insert a structured investigation record into the investigations table. */
   insertInvestigation(record: InvestigationRecord): void {
     this.db
