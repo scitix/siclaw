@@ -1,12 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
-  ALLOWED_COMMANDS,
+  COMMANDS,
   parseArgs,
   getCommandBinary,
   validateCommandRestrictions,
 } from "./command-sets.js";
 
-describe("ALLOWED_COMMANDS", () => {
+describe("COMMANDS registry", () => {
   const expectedCommands = [
     // text processing (sed removed)
     "grep", "sort", "uniq", "wc", "head", "tail", "jq", "yq",
@@ -36,7 +36,7 @@ describe("ALLOWED_COMMANDS", () => {
 
   for (const cmd of expectedCommands) {
     it(`contains "${cmd}"`, () => {
-      expect(ALLOWED_COMMANDS.has(cmd)).toBe(true);
+      expect(cmd in COMMANDS).toBe(true);
     });
   }
 
@@ -49,28 +49,28 @@ describe("ALLOWED_COMMANDS", () => {
   ];
   for (const cmd of newCommands) {
     it(`contains "${cmd}"`, () => {
-      expect(ALLOWED_COMMANDS.has(cmd)).toBe(true);
+      expect(cmd in COMMANDS).toBe(true);
     });
   }
 
   it("does NOT contain sed (removed for security)", () => {
-    expect(ALLOWED_COMMANDS.has("sed")).toBe(false);
+    expect("sed" in COMMANDS).toBe(false);
   });
 
   it("does NOT contain wget", () => {
-    expect(ALLOWED_COMMANDS.has("wget")).toBe(false);
+    expect("wget" in COMMANDS).toBe(false);
   });
 
   it("does NOT contain bc (! escapes to shell)", () => {
-    expect(ALLOWED_COMMANDS.has("bc")).toBe(false);
+    expect("bc" in COMMANDS).toBe(false);
   });
 
   it("does NOT contain kubectl", () => {
-    expect(ALLOWED_COMMANDS.has("kubectl")).toBe(false);
+    expect("kubectl" in COMMANDS).toBe(false);
   });
 
   it("does NOT contain rm", () => {
-    expect(ALLOWED_COMMANDS.has("rm")).toBe(false);
+    expect("rm" in COMMANDS).toBe(false);
   });
 });
 
@@ -1067,12 +1067,12 @@ describe("validateCommandRestrictions", () => {
   // ─── Existing validators (still working) ────────────────────
 
   describe("awk restrictions (awk removed from whitelist entirely)", () => {
-    it("awk is not in ALLOWED_COMMANDS", () => {
-      expect(ALLOWED_COMMANDS.has("awk")).toBe(false);
+    it("awk is not in COMMANDS", () => {
+      expect("awk" in COMMANDS).toBe(false);
     });
 
-    it("gawk is not in ALLOWED_COMMANDS", () => {
-      expect(ALLOWED_COMMANDS.has("gawk")).toBe(false);
+    it("gawk is not in COMMANDS", () => {
+      expect("gawk" in COMMANDS).toBe(false);
     });
   });
 

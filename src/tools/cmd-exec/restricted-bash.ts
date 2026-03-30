@@ -6,10 +6,8 @@ import * as fs from "node:fs";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
-import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
-import { analyzeOutput, applySanitizer, redactSensitiveContent } from "../infra/output-sanitizer.js";
+import { renderTextResult } from "../infra/tool-render.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand, checkAllNamespacesRestriction } from "../infra/command-sets.js";
-import { detectSensitiveResource } from "../infra/kubectl-sanitize.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -20,17 +18,17 @@ import {
 import { resolveKubeconfigByName, resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import {
-  validateCommand as _validateCommand,
   extractCommands as _extractCommands,
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
+import { preExecSecurity, sanitizeExecOutput, postExecSecurity } from "../infra/security-pipeline.js";
 
 const execAsync = promisify(exec);
 
 // ── Re-exports for backward compatibility ────────────────────────────
 
 export { extractCommands, validateShellOperators } from "../infra/command-validator.js";
-export { getCommandBinary, ALLOWED_COMMANDS as ALLOWED_BINARIES } from "../infra/command-sets.js";
+export { getCommandBinary } from "../infra/command-sets.js";
 
 // ── kubectl pipeline validator ───────────────────────────────────────
 
@@ -280,18 +278,18 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         };
       }
 
-      // Unified validation: context-based whitelist + shell operators +
-      // kubectl subcommands + command restrictions + sensitive paths
-      const cmdErr = _validateCommand(command, {
+      // Pre-exec security: validate command + determine output sanitizer
+      const pre = preExecSecurity(command, {
         context: "local",
         extraAllowed: new Set(["kubectl"]),
         isAllowed: (cmd) => isSkillScript(cmd),
         pipelineValidators: [validateKubectlInPipeline],
         sensitivePathPatterns: SENSITIVE_PATH_RE,
+        analyzeTarget: "auto",
       });
-      if (cmdErr) {
+      if (pre.error) {
         return {
-          content: [{ type: "text", text: cmdErr }],
+          content: [{ type: "text", text: pre.error }],
           details: { blocked: true },
         };
       }
@@ -300,45 +298,6 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       const commands = _extractCommands(command);
       const isSkill = commands.some((c) => isSkillScript(c));
       const defaultTimeout = isSkill ? 180 : 60;
-
-      // Post-execution output sanitization: determine which command's output to sanitize.
-      // For kubectl exec, use the inner command after "--".
-      // For other commands/pipelines, use the last command (determines output format).
-      const outputAction = (() => {
-        // Check for kubectl exec in the pipeline
-        for (const cmd of commands) {
-          const bin = getCommandBinary(cmd);
-          if (bin === "kubectl") {
-            const args = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-            const sub = args.find((a) => !a.startsWith("-"))?.toLowerCase();
-            if (sub === "exec") {
-              const dashIdx = args.indexOf("--");
-              if (dashIdx >= 0 && dashIdx < args.length - 1) {
-                const innerArgs = args.slice(dashIdx + 1);
-                const innerBin = innerArgs[0]?.split("/").pop() ?? "";
-                return analyzeOutput(innerBin, innerArgs.slice(1));
-              }
-            }
-          }
-        }
-        // For non-kubectl-exec commands, use the last command in the pipeline
-        const lastCmd = commands[commands.length - 1];
-        const lastArgs = parseArgs(lastCmd);
-        const lastBin = getCommandBinary(lastCmd);
-        return lastBin ? analyzeOutput(lastBin, lastArgs.slice(1)) : null;
-      })();
-
-      // Pipeline fallback: if a pipeline contains kubectl get/describe on a
-      // sensitive resource, apply line-level redaction on final output as a
-      // safety net (the last command may be jq/grep with no sanitizer).
-      const hasSensitiveKubectlInPipeline = commands.length > 1 && commands.some(cmd => {
-        const bin = getCommandBinary(cmd);
-        if (bin !== "kubectl") return false;
-        const kArgs = parseArgs(cmd.replace(/^\s*kubectl\s+/, ""));
-        const sub = kArgs.find((a) => !a.startsWith("-"))?.toLowerCase();
-        if (sub !== "get" && sub !== "describe") return false;
-        return detectSensitiveResource(kArgs) !== null;
-      });
 
       const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
 
@@ -408,20 +367,19 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         signal?.removeEventListener("abort", onAbort);
 
-        let sanitizedStdout = applySanitizer(stdout.trim(), outputAction);
-        if (hasSensitiveKubectlInPipeline) sanitizedStdout = redactSensitiveContent(sanitizedStdout);
-        const output = sanitizedStdout +
-          (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+        const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
+        const sanitized = sanitizeExecOutput(stdout.trim(), pre.action, postOpts);
+        const combined = sanitized + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(combined, null) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
-        let sanitizedStdout = applySanitizer(err.stdout?.trim() ?? "", outputAction);
-        if (hasSensitiveKubectlInPipeline) sanitizedStdout = redactSensitiveContent(sanitizedStdout);
-        const output = `Exit code: ${err.code ?? "unknown"}\n${sanitizedStdout}\n${err.stderr?.trim() ?? err.message}`;
+        const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
+        const sanitized = sanitizeExecOutput(err.stdout?.trim() ?? "", pre.action, postOpts);
+        const combined = `Exit code: ${err.code ?? "unknown"}\n${sanitized}\n${err.stderr?.trim() ?? err.message}`;
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(combined, null) }],
           details: { exitCode: err.code, error: true },
         };
       }

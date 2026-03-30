@@ -25,8 +25,8 @@ import {
   type AgentSessionEvent,
 } from "@mariozechner/pi-coding-agent";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { createRestrictedBashTool } from "../../shell/restricted-bash.js";
-import { createNodeExecTool } from "../../k8s-exec/node-exec.js";
+import { createRestrictedBashTool } from "../../cmd-exec/restricted-bash.js";
+import { createNodeExecTool } from "../../cmd-exec/node-exec.js";
 import type { KubeconfigRef } from "../../../core/agent-factory.js";
 import { getDefaultLlm, type ProviderModelCompat } from "../../../core/config.js";
 import type { Evidence, TraceStep } from "./types.js";

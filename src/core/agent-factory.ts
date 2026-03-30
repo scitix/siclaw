@@ -19,14 +19,14 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
-import { createRestrictedBashTool } from "../tools/shell/restricted-bash.js";
-import { createNodeExecTool } from "../tools/k8s-exec/node-exec.js";
-import { createNodeScriptTool } from "../tools/k8s-script/node-script.js";
-import { createPodScriptTool } from "../tools/k8s-script/pod-script.js";
-import { createPodExecTool } from "../tools/k8s-exec/pod-exec.js";
+import { createRestrictedBashTool } from "../tools/cmd-exec/restricted-bash.js";
+import { createNodeExecTool } from "../tools/cmd-exec/node-exec.js";
+import { createNodeScriptTool } from "../tools/script-exec/node-script.js";
+import { createPodScriptTool } from "../tools/script-exec/pod-script.js";
+import { createPodExecTool } from "../tools/cmd-exec/pod-exec.js";
 import { createResolvePodNetnsTool } from "../tools/query/resolve-pod-netns.js";
 import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
-import { createLocalScriptTool } from "../tools/shell/local-script.js";
+import { createLocalScriptTool } from "../tools/script-exec/local-script.js";
 import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
 import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
 import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
@@ -293,13 +293,13 @@ export async function createSiclawSession(
   const dpStateRef: DpStateRef = mutableDpStateRef;
 
   const customTools: ToolDefinition[] = [
-    // ── K8s command execution (k8s-exec/) ──
+    // ── Command execution — full security pipeline (cmd-exec/) ──
     createNodeExecTool(kubeconfigRef, userId),
     createPodExecTool(kubeconfigRef),
-    // ── K8s script execution (k8s-script/) ──
+    // ── Script execution — pre-audited scripts (script-exec/) ──
     createNodeScriptTool(kubeconfigRef, userId),
     createPodScriptTool(kubeconfigRef),
-    // ── Local shell (shell/) ──
+    // ── Local script (script-exec/) ──
     createRestrictedBashTool(kubeconfigRef),
     createLocalScriptTool(kubeconfigRef, sessionIdRef),
     // ── Data query (query/) ──

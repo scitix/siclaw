@@ -16,13 +16,12 @@ description: "How to add, modify, and organize tools in the Siclaw agent."
 ## 1. Directory Structure & Classification
 
 Tools are organized into 6 subdirectories under `src/tools/`, classified by
-their `execute()` behavior:
+their **security model** (how they handle user input and output):
 
 ```
 src/tools/
-  ├── k8s-exec/       Remote command execution on K8s targets
-  ├── k8s-script/     Remote script execution on K8s targets
-  ├── shell/          Local process execution
+  ├── cmd-exec/       User-provided commands — full security pipeline
+  ├── script-exec/    Pre-audited scripts — no command validation
   ├── query/          Data queries (memory, DB, filesystem)
   ├── workflow/       User-facing workflow operations
   └── infra/          Shared infrastructure (security, execution, output)
@@ -32,9 +31,8 @@ src/tools/
 
 | Directory | When to use | Key traits |
 |-----------|-------------|------------|
-| `k8s-exec/` | Tool executes a **user-provided command** on a remote K8s target (node, pod, netns) | Requires command validation + output sanitization |
-| `k8s-script/` | Tool executes a **pre-approved script file** on a remote K8s target | No command validation needed (scripts are reviewed); uses `resolveScript()` |
-| `shell/` | Tool spawns a **local process** on the AgentBox | Each tool has unique execution logic |
+| `cmd-exec/` | Tool executes a **user-provided command** (remote or local) | Full security pipeline: `preExecSecurity` → execute → `postExecSecurity` |
+| `script-exec/` | Tool executes a **pre-approved script file** (remote or local) | No command validation needed (scripts are reviewed); uses `resolveScript()` |
 | `query/` | Tool performs **read-only data retrieval** (no process spawn, no K8s interaction) | Pure function over memory indexer, DB, or filesystem |
 | `workflow/` | Tool orchestrates a **user-facing workflow** (investigation, skill management, scheduling) | Business logic, often stateful |
 | `infra/` | **Not a tool** — shared functions consumed by tools | Security pipeline, K8s execution helpers, output processing |
@@ -42,12 +40,10 @@ src/tools/
 ### Decision Tree: Where Does My New Tool Go?
 
 ```
-Does it execute commands on a remote K8s target?
-├─ Yes → Does the user provide the command string?
-│        ├─ Yes → k8s-exec/
-│        └─ No (pre-approved script) → k8s-script/
-├─ No → Does it spawn a local process?
-│        ├─ Yes → shell/
+Does it execute a user-provided command string?
+├─ Yes → cmd-exec/
+├─ No → Does it execute a pre-approved script?
+│        ├─ Yes → script-exec/
 │        └─ No → Does it query data without side effects?
 │                 ├─ Yes → query/
 │                 └─ No → workflow/
@@ -103,7 +99,7 @@ as a contract with the LLM, not a comment for humans.
 
 ---
 
-## 3. K8s Command Execution Tools (`k8s-exec/`)
+## 3. Command Execution Tools (`cmd-exec/`)
 
 These tools execute user-provided commands on remote K8s targets. They **must**
 follow this orchestration flow — skipping any step is a security risk:
@@ -144,7 +140,7 @@ then call `node_exec` with the `netns` parameter. This replaces the former
 
 ---
 
-## 4. K8s Script Execution Tools (`k8s-script/`)
+## 4. Script Execution Tools (`script-exec/`)
 
 These tools execute pre-approved skill scripts. The orchestration flow is
 similar but **omits command validation and output sanitization** (scripts are
@@ -170,7 +166,7 @@ Step 8: formatExecOutput()
 
 ---
 
-## 5. Local Shell Tools (`shell/`)
+## 5. Local Tools (now merged into `cmd-exec/` and `script-exec/`)
 
 ### `restricted_bash`
 
@@ -395,11 +391,9 @@ grouped by category with section comments:
 
 ```typescript
 const customTools: ToolDefinition[] = [
-  // ── K8s command execution (k8s-exec/) ──
+  // ── Command execution — full security pipeline (cmd-exec/) ──
   ...
-  // ── K8s script execution (k8s-script/) ──
-  ...
-  // ── Local shell (shell/) ──
+  // ── Script execution — pre-audited scripts (script-exec/) ──
   ...
   // ── Data query (query/) ──
   ...
@@ -471,25 +465,25 @@ Key design decisions to resolve:
 
 **Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
 
-### 8.2 Security Pipeline Unified Entry (High)
+### 8.2 Security Pipeline Unified Entry (Done)
 
-Each execution tool manually assembles: `validateCommand` → `analyzeOutput` →
-execute → `applySanitizer` → `processToolOutput`. A unified facade would:
-- Prevent callers from forgetting a step
-- Decouple tools from infra file structure
-- Serve `restricted-bash` (which doesn't use the template) as well
+`src/tools/infra/security-pipeline.ts` provides three facade functions:
 
-Should be done together with or after 8.1 — the unified entry consumes the
-new `CommandDef` model.
+- `preExecSecurity(command, opts?)` — validates command + determines output sanitizer
+- `sanitizeExecOutput(stdout, action, opts?)` — sanitization only (for tools with external truncation, e.g., node-exec via `formatExecOutput`)
+- `postExecSecurity(stdout, action, opts?)` — sanitization + truncation (for pod-exec, restricted-bash)
 
-**Goal**: A small set of functions in `infra/` that encapsulate the full
-pre-exec → post-exec security flow.
+Tools call `preExecSecurity` before execution, then `postExecSecurity` or `sanitizeExecOutput` after. The `analyzeTarget` option (`"single"` | `"last-in-pipeline"` | `"auto"`) controls which command in a pipeline determines the output sanitizer.
 
-**Files**: `src/tools/infra/command-validator.ts`, `src/tools/infra/output-sanitizer.ts`, `src/tools/infra/tool-render.ts`
+Also completed in this change:
+- Directory restructure: `k8s-exec/` + `k8s-script/` + `shell/` → `cmd-exec/` + `script-exec/` (classified by security model)
+- Deprecated exports cleanup: removed `ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`, `CONTEXT_CATEGORIES`; replaced with `getContextAllowedSet()` in `command-sets.ts`
+
+**Files**: `src/tools/infra/security-pipeline.ts`, `src/tools/cmd-exec/`, `src/tools/script-exec/`
 
 ### 8.3 Execution Template Extraction (Low — Deferred)
 
-Originally planned as high priority. After detailed analysis, the 3 `k8s-exec/`
+Originally planned as high priority. After detailed analysis, the 3 `cmd-exec/`
 tools only share ~3 truly identical steps (not 6-7 as initially estimated).
 Variation points (`checkReady` return types, `analyzeOutput` input handling,
 `buildCommand` complexity, `run` + error handling) differ enough that a forced
@@ -499,9 +493,9 @@ If 8.1 + 8.2 are done, the security-critical steps are already unified via the
 pipeline facade, eliminating the main risk (step omission). What remains is
 boilerplate (kubeconfig resolution, error formatting) — tolerable duplication.
 
-Revisit if more than 2 new k8s-exec tools are added.
+Revisit if more than 2 new cmd-exec tools are added.
 
-**Files**: `src/tools/k8s-exec/*.ts`, `src/tools/k8s-script/*.ts`
+**Files**: `src/tools/cmd-exec/*.ts`, `src/tools/script-exec/*.ts`
 
 ### 8.4 `debug-pod.ts` Decomposition (Medium)
 
