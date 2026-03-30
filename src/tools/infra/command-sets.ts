@@ -775,16 +775,24 @@ function applyCommandConstraints(
   args: string[],
   def: CommandDef,
 ): string | null {
+  const hasDeclarative = def.blockedFlags || def.allowedFlags ||
+    def.allowedSubcommands || def.positionals || def.requiredFlags;
+
   // Custom validator takes priority (escape hatch for complex commands)
   if (def.validate) {
+    // Dev-time guard: validate and declarative constraints are mutually exclusive
+    if (hasDeclarative) {
+      throw new Error(
+        `CommandDef "${baseName}" has both validate() and declarative constraints. ` +
+        `These are mutually exclusive — validate() takes full responsibility.`,
+      );
+    }
     return def.validate(args);
   }
 
   // Declarative constraints — reuse the existing validateByRule logic
   // by constructing a compatible rule object from CommandDef fields.
-  const hasConstraints = def.blockedFlags || def.allowedFlags ||
-    def.allowedSubcommands || def.positionals || def.requiredFlags;
-  if (!hasConstraints) return null;
+  if (!hasDeclarative) return null;
 
   return validateByRule(args, {
     command: baseName,
@@ -986,6 +994,16 @@ export type CommandCategory =
  *
  * Context-specific constraints (pipeOnly in local, text blockedFlags in local)
  * are NOT here — they live in CONTEXT_POLICIES.
+ *
+ * **Serializability**: Unlike the old `CommandRule`, `CommandDef` is NOT
+ * JSON-serializable when `validate` is set. This is a deliberate trade-off —
+ * direct function references give type safety and refactoring support over
+ * the old string-key-based `customValidator` + runtime registry lookup.
+ *
+ * **Mutual exclusion**: `validate` and declarative constraints (blockedFlags,
+ * allowedFlags, etc.) are mutually exclusive. When `validate` is set, it takes
+ * full responsibility for the command's validation — declarative fields are
+ * ignored. Do not combine both on the same command.
  */
 export interface CommandDef {
   category: CommandCategory;
@@ -994,6 +1012,7 @@ export interface CommandDef {
   allowedSubcommands?: { position: number; allowed: string[] };
   positionals?: "allow" | "block" | number;
   requiredFlags?: string[];
+  /** Custom validator — mutually exclusive with declarative constraint fields above. */
   validate?: (args: string[]) => string | null;
 }
 
