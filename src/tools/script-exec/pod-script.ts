@@ -3,7 +3,8 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { resolveScript } from "../infra/script-resolver.js";
-import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
+import { renderTextResult } from "../infra/tool-render.js";
+import { postExecSecurity } from "../infra/security-pipeline.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validatePodName, prepareExecEnv, spawnAsync, stdinExecCmd } from "../infra/exec-utils.js";
@@ -154,7 +155,7 @@ Examples:
         const output = result.stdout.trim() +
           (result.stderr.trim() ? `\n\nSTDERR:\n${result.stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(output, null) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
@@ -162,7 +163,7 @@ Examples:
         const stderr = err.stderr?.trim() ?? err.message;
         const output = `Exit code: ${err.code ?? "unknown"}\n${stdout}${stderr ? `\n\nSTDERR:\n${stderr}` : ""}`;
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(output, null) }],
           details: { exitCode: err.code ?? null, error: true },
         };
       }

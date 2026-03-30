@@ -7,7 +7,7 @@ import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { preExecSecurity, sanitizeExecOutput, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 
@@ -164,20 +164,18 @@ Examples:
           { timeout, env: env.childEnv },
         );
 
-        const sanitized = sanitizeExecOutput(stdout.trim(), pre.action);
-        const combined = sanitized + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+        const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(combined, null) }],
+          content: [{ type: "text", text: postExecSecurity(output, pre.action) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const stdout = (err.stdout?.trim() ?? "") as string;
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
-        const sanitized = sanitizeExecOutput(stdout, pre.action);
-        const combined = `Exit code: ${exitCode}\n${sanitized}${stderr ? `\n${stderr}` : ""}`;
+        const output = `Exit code: ${exitCode}\n${stdout}${stderr ? `\n${stderr}` : ""}`;
         return {
-          content: [{ type: "text", text: postExecSecurity(combined, null) }],
+          content: [{ type: "text", text: postExecSecurity(output, pre.action) }],
           details: { exitCode, error: true },
         };
       }

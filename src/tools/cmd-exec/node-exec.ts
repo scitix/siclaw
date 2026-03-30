@@ -7,11 +7,11 @@ import { checkNodeReady } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { extractCommands } from "../infra/command-validator.js";
-import { preExecSecurity, sanitizeExecOutput } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import {
   validateNodeName,
   prepareExecEnv,
-  formatExecOutput,
+  filterPodNoise,
 } from "../infra/exec-utils.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
@@ -213,9 +213,19 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
         };
       }
 
-      // Apply output sanitization before formatting (sanitizeExecOutput only — formatExecOutput calls processToolOutput internally)
-      execResult.stdout = sanitizeExecOutput(execResult.stdout, pre.action);
-      return formatExecOutput(execResult);
+      // Assemble output, then sanitize + truncate via unified facade
+      const filteredStderr = filterPodNoise(execResult.stderr);
+      const output = execResult.stdout.trim() +
+        (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
+      const isError = execResult.exitCode !== 0 &&
+        !(execResult.exitCode === null && execResult.stdout.trim());
+      const text = isError
+        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${output}`
+        : output;
+      return {
+        content: [{ type: "text", text: postExecSecurity(text, pre.action) }],
+        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+      };
     },
   };
 }
