@@ -215,15 +215,13 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
 
       // Assemble output, then sanitize + truncate via unified facade
       const filteredStderr = filterPodNoise(execResult.stderr);
-      const output = execResult.stdout.trim() +
-        (filteredStderr ? `\n\nSTDERR:\n${filteredStderr}` : "");
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
-      const text = isError
-        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${output}`
-        : output;
+      const stdout = isError
+        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
+        : execResult.stdout.trim();
       return {
-        content: [{ type: "text", text: postExecSecurity(text, pre.action) }],
+        content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
       };
     },

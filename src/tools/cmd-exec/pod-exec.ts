@@ -164,18 +164,16 @@ Examples:
           { timeout, env: env.childEnv },
         );
 
-        const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(output, pre.action) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const stdout = (err.stdout?.trim() ?? "") as string;
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
-        const output = `Exit code: ${exitCode}\n${stdout}${stderr ? `\n${stderr}` : ""}`;
         return {
-          content: [{ type: "text", text: postExecSecurity(output, pre.action) }],
+          content: [{ type: "text", text: postExecSecurity(`Exit code: ${exitCode}\n${stdout}`, pre.action, { stderr: stderr || undefined }) }],
           details: { exitCode, error: true },
         };
       }

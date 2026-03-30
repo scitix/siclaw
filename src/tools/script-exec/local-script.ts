@@ -188,8 +188,6 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           });
         });
 
-        const output = stdout.trim() +
-          (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         emitDiagnostic({
           type: "skill_call",
           skillName: skill,
@@ -200,11 +198,11 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           sessionId: sessionIdRef?.current,
         });
         return {
-          content: [{ type: "text", text: postExecSecurity(output, null) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), null, { stderr: stderr.trim() || undefined }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+        const errStderr = err.stderr?.trim() ?? err.message;
         emitDiagnostic({
           type: "skill_call",
           skillName: skill,
@@ -215,7 +213,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           sessionId: sessionIdRef?.current,
         });
         return {
-          content: [{ type: "text", text: postExecSecurity(output, null) }],
+          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}`, null, { stderr: errStderr || undefined }) }],
           details: { exitCode: err.code, error: true },
         };
       }
