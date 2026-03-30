@@ -152,18 +152,15 @@ Examples:
 
       try {
         const result = await spawnAsync("kubectl", kubectlArgs, timeout, env.childEnv, signal, resolved.content);
-        const output = result.stdout.trim() +
-          (result.stderr.trim() ? `\n\nSTDERR:\n${result.stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(output, null) }],
+          content: [{ type: "text", text: postExecSecurity(result.stdout.trim(), null, { stderr: result.stderr.trim() || undefined }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const stdout = err.stdout?.trim() ?? "";
         const stderr = err.stderr?.trim() ?? err.message;
-        const output = `Exit code: ${err.code ?? "unknown"}\n${stdout}${stderr ? `\n\nSTDERR:\n${stderr}` : ""}`;
         return {
-          content: [{ type: "text", text: postExecSecurity(output, null) }],
+          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${stdout}`, null, { stderr: stderr || undefined }) }],
           details: { exitCode: err.code ?? null, error: true },
         };
       }

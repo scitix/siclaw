@@ -367,17 +367,14 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
         signal?.removeEventListener("abort", onAbort);
 
-        const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
-        const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(output, pre.action, postOpts) }],
+          content: [{ type: "text", text: postExecSecurity(stdout.trim(), pre.action, { stderr: stderr.trim() || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
-        const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
-        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
+        const errStderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(output, pre.action, postOpts) }],
+          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}`, pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
           details: { exitCode: err.code, error: true },
         };
       }

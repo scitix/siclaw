@@ -61,13 +61,18 @@ export function preExecSecurity(
 // ── Post-exec ───────────────────────────────────────────────────────
 
 export interface PostExecOptions {
+  /** Stderr output — appended after sanitization with "\n\nSTDERR:\n" prefix */
+  stderr?: string;
   /** Apply pipeline fallback redaction for sensitive kubectl output */
   hasSensitiveKubectl?: boolean;
 }
 
 /**
- * Post-execution security: sanitize + truncate output.
- * Combines: applySanitizer → optional redactSensitiveContent → processToolOutput.
+ * Post-execution security: sanitize stdout → combine with stderr → truncate.
+ *
+ * Sanitization (applySanitizer, redactSensitiveContent) applies to stdout ONLY,
+ * not stderr — this preserves JSON validity when kubectl outputs valid JSON to
+ * stdout and deprecation warnings to stderr.
  *
  * This is the ONLY place processToolOutput is called. All tools (cmd-exec and
  * script-exec) must route their final output through this function.
@@ -76,15 +81,18 @@ export interface PostExecOptions {
  * For script-exec tools: pass null (no command sanitization, just truncate).
  */
 export function postExecSecurity(
-  output: string,
+  stdout: string,
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
-  let sanitized = applySanitizer(output, action);
+  let sanitized = applySanitizer(stdout, action);
   if (opts?.hasSensitiveKubectl) {
     sanitized = redactSensitiveContent(sanitized);
   }
-  return processToolOutput(sanitized);
+  const combined = opts?.stderr
+    ? sanitized + `\n\nSTDERR:\n${opts.stderr}`
+    : sanitized;
+  return processToolOutput(combined);
 }
 
 // ── Internal: resolve output action by strategy ─────────────────────
