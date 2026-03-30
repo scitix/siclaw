@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
   preExecSecurity,
-  sanitizeExecOutput,
   postExecSecurity,
 } from "./security-pipeline.js";
 
@@ -134,37 +133,14 @@ describe("preExecSecurity", () => {
   });
 });
 
-// ── sanitizeExecOutput ──────────────────────────────────────────────
-
-describe("sanitizeExecOutput", () => {
-  it("returns output unchanged when action is null", () => {
-    expect(sanitizeExecOutput("hello world", null)).toBe("hello world");
-  });
-
-  it("applies sanitizer when action is provided", () => {
-    const action = {
-      type: "sanitize" as const,
-      sanitize: (s: string) => s.replace(/secret/gi, "[REDACTED]"),
-    };
-    expect(sanitizeExecOutput("my secret value", action)).toBe(
-      "my [REDACTED] value",
-    );
-  });
-
-  it("applies redactSensitiveContent when hasSensitiveKubectl", () => {
-    // A JWT-like token should be redacted
-    const jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
-    const result = sanitizeExecOutput(jwt, null, {
-      hasSensitiveKubectl: true,
-    });
-    expect(result).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
-  });
-});
-
 // ── postExecSecurity ────────────────────────────────────────────────
 
 describe("postExecSecurity", () => {
-  it("sanitizes and truncates output", () => {
+  it("returns output unchanged when action is null and output is short", () => {
+    expect(postExecSecurity("hello world", null)).toBe("hello world");
+  });
+
+  it("truncates long output", () => {
     const output = "x".repeat(200_000);
     const result = postExecSecurity(output, null);
     expect(result.length).toBeLessThan(output.length);
@@ -178,5 +154,13 @@ describe("postExecSecurity", () => {
     const result = postExecSecurity("my TOKEN here", action);
     expect(result).toContain("[REDACTED]");
     expect(result).not.toContain("TOKEN");
+  });
+
+  it("applies redactSensitiveContent when hasSensitiveKubectl", () => {
+    const jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
+    const result = postExecSecurity(jwt, null, {
+      hasSensitiveKubectl: true,
+    });
+    expect(result).not.toContain("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9");
   });
 });

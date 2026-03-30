@@ -3,8 +3,8 @@
  *
  * Replaces the manual 4-step assembly (validateCommand → analyzeOutput →
  * applySanitizer → processToolOutput) with two calls: preExecSecurity() and
- * postExecSecurity() (or sanitizeExecOutput() for tools that handle
- * truncation separately).
+ * postExecSecurity(). processToolOutput is called ONLY inside postExecSecurity —
+ * no other code should call it directly.
  */
 import type { ValidateCommandOptions } from "./command-validator.js";
 import { validateCommand, extractCommands } from "./command-validator.js";
@@ -34,7 +34,7 @@ export interface PreExecOptions extends ValidateCommandOptions {
 export interface PreExecResult {
   /** null if command is allowed */
   error: string | null;
-  /** Output action for post-exec sanitization (pass to postExecSecurity / sanitizeExecOutput) */
+  /** Output action for post-exec sanitization (pass to postExecSecurity) */
   action: OutputAction | null;
   /** Whether pipeline contains kubectl on sensitive resource (for fallback redaction) */
   hasSensitiveKubectl: boolean;
@@ -66,33 +66,25 @@ export interface PostExecOptions {
 }
 
 /**
- * Post-execution sanitization only: applySanitizer → optional redactSensitiveContent.
- * Does NOT truncate. Use when the caller handles truncation separately
- * (e.g., node-exec delegates to formatExecOutput which calls processToolOutput internally).
+ * Post-execution security: sanitize + truncate output.
+ * Combines: applySanitizer → optional redactSensitiveContent → processToolOutput.
+ *
+ * This is the ONLY place processToolOutput is called. All tools (cmd-exec and
+ * script-exec) must route their final output through this function.
+ *
+ * For cmd-exec tools: pass the action from preExecSecurity().
+ * For script-exec tools: pass null (no command sanitization, just truncate).
  */
-export function sanitizeExecOutput(
-  stdout: string,
+export function postExecSecurity(
+  output: string,
   action: OutputAction | null,
   opts?: PostExecOptions,
 ): string {
-  let sanitized = applySanitizer(stdout, action);
+  let sanitized = applySanitizer(output, action);
   if (opts?.hasSensitiveKubectl) {
     sanitized = redactSensitiveContent(sanitized);
   }
-  return sanitized;
-}
-
-/**
- * Full post-execution security: sanitize + truncate output.
- * Combines: sanitizeExecOutput → processToolOutput.
- * Use for tools that assemble their own output (pod-exec, restricted-bash).
- */
-export function postExecSecurity(
-  stdout: string,
-  action: OutputAction | null,
-  opts?: PostExecOptions,
-): string {
-  return processToolOutput(sanitizeExecOutput(stdout, action, opts));
+  return processToolOutput(sanitized);
 }
 
 // ── Internal: resolve output action by strategy ─────────────────────

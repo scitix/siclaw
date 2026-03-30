@@ -21,7 +21,7 @@ import {
   extractCommands as _extractCommands,
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
-import { preExecSecurity, sanitizeExecOutput, postExecSecurity } from "../infra/security-pipeline.js";
+import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 
 const execAsync = promisify(exec);
 
@@ -368,18 +368,16 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         signal?.removeEventListener("abort", onAbort);
 
         const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
-        const sanitized = sanitizeExecOutput(stdout.trim(), pre.action, postOpts);
-        const combined = sanitized + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
+        const output = stdout.trim() + (stderr.trim() ? `\n\nSTDERR:\n${stderr.trim()}` : "");
         return {
-          content: [{ type: "text", text: postExecSecurity(combined, null) }],
+          content: [{ type: "text", text: postExecSecurity(output, pre.action, postOpts) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
         const postOpts = { hasSensitiveKubectl: pre.hasSensitiveKubectl };
-        const sanitized = sanitizeExecOutput(err.stdout?.trim() ?? "", pre.action, postOpts);
-        const combined = `Exit code: ${err.code ?? "unknown"}\n${sanitized}\n${err.stderr?.trim() ?? err.message}`;
+        const output = `Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}\n${err.stderr?.trim() ?? err.message}`;
         return {
-          content: [{ type: "text", text: postExecSecurity(combined, null) }],
+          content: [{ type: "text", text: postExecSecurity(output, pre.action, postOpts) }],
           details: { exitCode: err.code, error: true },
         };
       }

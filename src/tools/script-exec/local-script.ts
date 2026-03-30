@@ -3,7 +3,8 @@ import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
-import { processToolOutput, renderTextResult } from "../infra/tool-render.js";
+import { renderTextResult } from "../infra/tool-render.js";
+import { postExecSecurity } from "../infra/security-pipeline.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
@@ -199,7 +200,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           sessionId: sessionIdRef?.current,
         });
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(output, null) }],
           details: { exitCode: 0 },
         };
       } catch (err: any) {
@@ -214,7 +215,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           sessionId: sessionIdRef?.current,
         });
         return {
-          content: [{ type: "text", text: processToolOutput(output) }],
+          content: [{ type: "text", text: postExecSecurity(output, null) }],
           details: { exitCode: err.code, error: true },
         };
       }
