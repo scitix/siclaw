@@ -152,12 +152,13 @@ export function getNextCronDelay(expr: string, after?: Date): number {
 export function getAverageIntervalMs(
   expr: string,
   sampleCount = 10,
+  after?: Date,
 ): { avg: number; min: number } {
   if (sampleCount < 2) {
     throw new Error("sampleCount must be >= 2");
   }
 
-  const first = getNextCronTime(expr, new Date());
+  const first = getNextCronTime(expr, after ?? new Date());
   let prev = first;
   let minGap = Infinity;
 
