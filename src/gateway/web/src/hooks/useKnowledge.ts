@@ -30,10 +30,21 @@ export function useKnowledge(
   }, [sendRpc]);
 
   const uploadDoc = useCallback(async (data: {
-    name: string;
     content: string;
+    fileName: string;
   }) => {
     const result = await sendRpc<{ id: string; name: string }>('kb.upload', data);
+    await loadDocs();
+    return result;
+  }, [sendRpc, loadDocs]);
+
+  const batchUploadDocs = useCallback(async (docs: Array<{
+    content: string;
+    fileName: string;
+  }>) => {
+    const result = await sendRpc<{
+      results: Array<{ id: string; name: string; error?: string }>;
+    }>('kb.batchUpload', { docs });
     await loadDocs();
     return result;
   }, [sendRpc, loadDocs]);
@@ -47,5 +58,5 @@ export function useKnowledge(
     await loadDocs();
   }, [sendRpc, loadDocs]);
 
-  return { docs, loading, loadDocs, uploadDoc, getDoc, deleteDoc };
+  return { docs, loading, loadDocs, uploadDoc, batchUploadDocs, getDoc, deleteDoc };
 }

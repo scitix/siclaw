@@ -26,7 +26,7 @@ function formatDate(iso?: string): string {
 export function KnowledgePage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { isAdmin } = usePermissions(sendRpc, isConnected);
-    const { docs, loading, loadDocs, uploadDoc, getDoc, deleteDoc } = useKnowledge(sendRpc);
+    const { docs, loading, loadDocs, uploadDoc, batchUploadDocs, getDoc, deleteDoc } = useKnowledge(sendRpc);
 
     const [search, setSearch] = useState('');
     const [drawerOpen, setDrawerOpen] = useState(false);
@@ -138,7 +138,6 @@ export function KnowledgePage() {
                             <table className="w-full">
                                 <thead>
                                     <tr className="border-b border-gray-100 bg-gray-50/50">
-                                        <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Name</th>
                                         <th className="text-left px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">File</th>
                                         <th className="text-right px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Size</th>
                                         <th className="text-right px-6 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wider">Chunks</th>
@@ -154,11 +153,6 @@ export function KnowledgePage() {
                                         >
                                             <td className="px-6 py-4">
                                                 <span className="text-sm font-medium text-gray-900">{doc.name}</span>
-                                            </td>
-                                            <td className="px-6 py-4">
-                                                <span className="text-xs text-gray-500 font-mono truncate block max-w-[200px]">
-                                                    {doc.filePath}
-                                                </span>
                                             </td>
                                             <td className="px-6 py-4 text-right">
                                                 <span className="text-xs text-gray-500">{formatBytes(doc.sizeBytes)}</span>
@@ -243,6 +237,7 @@ export function KnowledgePage() {
                     isOpen={drawerOpen}
                     onClose={() => setDrawerOpen(false)}
                     onSave={uploadDoc}
+                    onBatchSave={batchUploadDocs}
                 />
             )}
         </div>
