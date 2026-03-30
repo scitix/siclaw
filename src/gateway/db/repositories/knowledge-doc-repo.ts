@@ -23,6 +23,15 @@ export class KnowledgeDocRepository {
     return rows[0] ?? null;
   }
 
+  async getByName(name: string) {
+    const rows = await this.db
+      .select()
+      .from(knowledgeDocs)
+      .where(eq(knowledgeDocs.name, name))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async create(data: {
     id?: string;
     name: string;
@@ -54,10 +63,10 @@ export class KnowledgeDocRepository {
       .where(eq(knowledgeDocs.id, id));
   }
 
-  async updateContent(id: string, content: string): Promise<void> {
+  async updateContent(id: string, content: string, sizeBytes: number): Promise<void> {
     await this.db
       .update(knowledgeDocs)
-      .set({ content })
+      .set({ content, sizeBytes, updatedAt: new Date() })
       .where(eq(knowledgeDocs.id, id));
   }
 
