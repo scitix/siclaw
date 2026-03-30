@@ -1,4 +1,4 @@
-import { X, Save, Upload, FileText } from 'lucide-react';
+import { X, Save, Upload, FileText, Trash2, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState, useEffect, useRef } from 'react';
 import { cn } from '@/lib/utils';
@@ -6,28 +6,40 @@ import { cn } from '@/lib/utils';
 interface KnowledgeUploadDrawerProps {
     isOpen: boolean;
     onClose: () => void;
-    onSave: (data: { name: string; content: string }) => Promise<unknown>;
+    onSave: (data: { content: string; fileName?: string }) => Promise<unknown>;
+    onBatchSave: (docs: Array<{ content: string; fileName?: string }>) => Promise<{
+        results: Array<{ id: string; name: string; error?: string }>;
+    }>;
 }
 
 type InputMode = 'file' | 'paste';
 
-export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUploadDrawerProps) {
+interface PendingFile {
+    key: string;
+    fileName: string;
+    content: string;
+    sizeBytes: number;
+}
+
+let keyCounter = 0;
+
+export function KnowledgeUploadDrawer({ isOpen, onClose, onSave, onBatchSave }: KnowledgeUploadDrawerProps) {
     const [mode, setMode] = useState<InputMode>('file');
-    const [name, setName] = useState('');
-    const [content, setContent] = useState('');
-    const [fileName, setFileName] = useState('');
+    const [pasteContent, setPasteContent] = useState('');
+    const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
     const [error, setError] = useState('');
     const [saving, setSaving] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     useEffect(() => {
         if (isOpen) {
             setMode('file');
-            setName('');
-            setContent('');
-            setFileName('');
+            setPasteContent('');
+            setPendingFiles([]);
             setError('');
             setSaving(false);
+            setUploadProgress(null);
             if (fileInputRef.current) fileInputRef.current.value = '';
         }
     }, [isOpen]);
@@ -35,40 +47,93 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
     const switchMode = (next: InputMode) => {
         if (next === mode) return;
         setMode(next);
-        setContent('');
-        setFileName('');
+        setPasteContent('');
+        setPendingFiles([]);
         if (fileInputRef.current) fileInputRef.current.value = '';
     };
 
-    const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
-        if (!file) return;
-        const text = await file.text();
-        setContent(text);
-        setFileName(file.name);
-        if (!name) {
-            setName(file.name.replace(/\.md$/, ''));
+    const handleFilesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const fileList = e.target.files;
+        if (!fileList || fileList.length === 0) return;
+
+        const newFiles: PendingFile[] = [];
+        for (const file of Array.from(fileList)) {
+            const text = await file.text();
+            newFiles.push({
+                key: `file-${++keyCounter}`,
+                fileName: file.name,
+                content: text,
+                sizeBytes: new Blob([text]).size,
+            });
         }
+        setPendingFiles(prev => [...prev, ...newFiles]);
+        if (fileInputRef.current) fileInputRef.current.value = '';
+    };
+
+    const removePendingFile = (key: string) => {
+        setPendingFiles(prev => prev.filter(f => f.key !== key));
     };
 
     const handleSave = async () => {
         if (saving) return;
-        if (!name.trim()) { setError('Name is required'); return; }
-        if (!content.trim()) { setError('Content is required'); return; }
-        setSaving(true);
         setError('');
+
+        if (mode === 'paste') {
+            if (!pasteContent.trim()) { setError('Content is required'); return; }
+            setSaving(true);
+            try {
+                await onSave({ content: pasteContent });
+                onClose();
+            } catch (err: any) {
+                setError(err?.message || 'Failed to upload');
+            } finally {
+                setSaving(false);
+            }
+            return;
+        }
+
+        // File mode
+        if (pendingFiles.length === 0) { setError('No files selected'); return; }
+
+        setSaving(true);
+        if (pendingFiles.length === 1) {
+            try {
+                await onSave({ content: pendingFiles[0].content, fileName: pendingFiles[0].fileName });
+                onClose();
+            } catch (err: any) {
+                setError(err?.message || 'Failed to upload');
+            } finally {
+                setSaving(false);
+            }
+            return;
+        }
+
+        // Batch upload
+        setUploadProgress({ done: 0, total: pendingFiles.length });
         try {
-            await onSave({
-                name: name.trim(),
-                content,
-            });
-            onClose();
+            const result = await onBatchSave(
+                pendingFiles.map(f => ({ content: f.content, fileName: f.fileName })),
+            );
+            const errors = result.results.filter(r => r.error);
+            if (errors.length > 0) {
+                setError(`${errors.length} failed: ${errors.map(e => `${e.name}: ${e.error}`).join('; ')}`);
+                const failedNames = new Set(errors.map(e => e.name));
+                setPendingFiles(prev => prev.filter(f => failedNames.has(f.fileName)));
+            } else {
+                onClose();
+            }
         } catch (err: any) {
-            setError(err?.message || 'Failed to upload');
+            setError(err?.message || 'Batch upload failed');
         } finally {
             setSaving(false);
+            setUploadProgress(null);
         }
     };
+
+    const totalSize = pendingFiles.reduce((sum, f) => sum + f.sizeBytes, 0);
+    const canSave = mode === 'paste'
+        ? !!pasteContent.trim()
+        : pendingFiles.length > 0;
 
     return (
         <AnimatePresence>
@@ -91,8 +156,8 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
                         {/* Header */}
                         <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100 bg-white">
                             <div>
-                                <h2 className="text-lg font-bold text-gray-900">Upload Document</h2>
-                                <p className="text-xs text-gray-400">Add a Markdown document to the knowledge base</p>
+                                <h2 className="text-lg font-bold text-gray-900">Upload Documents</h2>
+                                <p className="text-xs text-gray-400">Add Markdown documents to the knowledge base</p>
                             </div>
                             <button
                                 onClick={onClose}
@@ -104,25 +169,8 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
 
                         {/* Content */}
                         <div className="flex-1 overflow-y-auto p-6 space-y-6">
-                            {/* Name */}
-                            <div className="space-y-1.5">
-                                <label className="text-sm font-medium text-gray-700">
-                                    Name <span className="text-red-500">*</span>
-                                </label>
-                                <input
-                                    type="text"
-                                    value={name}
-                                    onChange={(e) => setName(e.target.value)}
-                                    placeholder="e.g. RoCE Networking Guide"
-                                    className="w-full px-3 py-2 bg-white border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
-                                />
-                            </div>
-
                             {/* Mode tabs */}
                             <div className="space-y-3">
-                                <label className="text-sm font-medium text-gray-700">
-                                    Content <span className="text-red-500">*</span>
-                                </label>
                                 <div className="flex gap-1 p-1 bg-gray-100 rounded-lg">
                                     <button
                                         type="button"
@@ -135,7 +183,7 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
                                         )}
                                     >
                                         <Upload className="w-3.5 h-3.5" />
-                                        Upload File
+                                        Upload Files
                                     </button>
                                     <button
                                         type="button"
@@ -153,12 +201,13 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
                                 </div>
 
                                 {mode === 'file' ? (
-                                    <div className="space-y-2">
+                                    <div className="space-y-3">
                                         <input
                                             ref={fileInputRef}
                                             type="file"
                                             accept=".md,.markdown,.txt"
-                                            onChange={handleFileChange}
+                                            multiple
+                                            onChange={handleFilesChange}
                                             className="hidden"
                                         />
                                         <button
@@ -167,29 +216,50 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
                                             className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-primary-50 text-primary-600 hover:bg-primary-100 transition-colors"
                                         >
                                             <Upload className="w-3.5 h-3.5" />
-                                            Choose File
+                                            Choose Files
                                         </button>
-                                        {fileName && content && (
-                                            <div className="px-3 py-2 bg-gray-50 rounded-lg border border-gray-200">
+
+                                        {pendingFiles.length > 0 && (
+                                            <div className="space-y-2">
                                                 <p className="text-xs text-gray-500">
-                                                    <span className="font-medium text-gray-700">{fileName}</span>
-                                                    {' — '}{content.length.toLocaleString()} characters
+                                                    {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected
+                                                    {' \u2014 '}
+                                                    {(totalSize / 1024).toFixed(1)} KB total
                                                 </p>
+                                                <div className="border border-gray-200 rounded-lg divide-y divide-gray-100">
+                                                    {pendingFiles.map((f) => (
+                                                        <div key={f.key} className="flex items-center gap-3 px-3 py-2 group">
+                                                            <FileText className="w-4 h-4 text-gray-400 shrink-0" />
+                                                            <div className="flex-1 min-w-0">
+                                                                <p className="text-sm font-medium text-gray-900 truncate">{f.fileName}</p>
+                                                                <p className="text-[11px] text-gray-400">{(f.sizeBytes / 1024).toFixed(1)} KB</p>
+                                                            </div>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => removePendingFile(f.key)}
+                                                                className="p-1 text-gray-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-all"
+                                                                title="Remove"
+                                                            >
+                                                                <Trash2 className="w-3.5 h-3.5" />
+                                                            </button>
+                                                        </div>
+                                                    ))}
+                                                </div>
                                             </div>
                                         )}
                                     </div>
                                 ) : (
                                     <div className="space-y-1.5">
                                         <textarea
-                                            value={content}
-                                            onChange={(e) => setContent(e.target.value)}
+                                            value={pasteContent}
+                                            onChange={(e) => setPasteContent(e.target.value)}
                                             placeholder="Paste Markdown content here..."
-                                            rows={16}
+                                            rows={18}
                                             className="w-full px-3 py-2 bg-white border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500 resize-none"
                                         />
-                                        {content && (
+                                        {pasteContent && (
                                             <p className="text-xs text-gray-400">
-                                                {content.length.toLocaleString()} characters
+                                                {pasteContent.length.toLocaleString()} characters
                                             </p>
                                         )}
                                     </div>
@@ -211,11 +281,24 @@ export function KnowledgeUploadDrawer({ isOpen, onClose, onSave }: KnowledgeUplo
                             </button>
                             <button
                                 onClick={handleSave}
-                                disabled={!name.trim() || !content.trim() || saving}
+                                disabled={!canSave || saving}
                                 className="px-4 py-2 text-sm font-medium bg-primary-600 text-white hover:bg-primary-700 rounded-lg shadow-sm flex items-center gap-2 disabled:opacity-50"
                             >
-                                <Save className="w-4 h-4" />
-                                {saving ? 'Uploading...' : 'Upload'}
+                                {saving ? (
+                                    <>
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        {uploadProgress
+                                            ? `Uploading ${uploadProgress.total} files...`
+                                            : 'Uploading...'}
+                                    </>
+                                ) : (
+                                    <>
+                                        <Save className="w-4 h-4" />
+                                        {mode === 'file' && pendingFiles.length > 1
+                                            ? `Upload ${pendingFiles.length} Files`
+                                            : 'Upload'}
+                                    </>
+                                )}
                             </button>
                         </div>
                     </motion.div>

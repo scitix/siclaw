@@ -2120,23 +2120,48 @@ export function createRpcMethods(
     };
   });
 
-  methods.set("kb.upload", async (params, context: RpcContext) => {
-    requireAdmin(context);
+  // Extract a display name from markdown content
+  function extractTitleFromContent(content: string): string {
+    // YAML frontmatter title
+    const fmMatch = content.match(/^---\s*\n[\s\S]*?\ntitle:\s*['"]?(.+?)['"]?\s*\n[\s\S]*?\n---/);
+    if (fmMatch) return fmMatch[1].trim();
+    // ATX heading: # Title (any level)
+    const atxMatch = content.match(/^#{1,6}\s+(.+)$/m);
+    if (atxMatch) return atxMatch[1].trim();
+    // Setext heading: text followed by ===
+    const setextMatch = content.match(/^(.+)\n={3,}\s*$/m);
+    if (setextMatch) return setextMatch[1].trim();
+    // First non-empty, non-frontmatter line
+    const firstLine = content.split("\n").find((l) => l.trim() && !l.startsWith("---"));
+    if (firstLine) return firstLine.trim().slice(0, 100);
+    return "";
+  }
+
+  // Resolve a display name: explicit name > extracted from content > fileName > "Untitled"
+  function resolveDocName(name: string | undefined, content: string, fileName: string | undefined): string {
+    if (name?.trim()) return name.trim();
+    const extracted = extractTitleFromContent(content);
+    if (extracted) return extracted;
+    if (fileName) return fileName.replace(/\.(md|markdown|txt)$/i, "");
+    return "Untitled";
+  }
+
+  // Shared helper: write one knowledge doc to disk + DB (no indexer sync)
+  async function createKnowledgeDoc(
+    content: string,
+    uploadedBy: string | undefined,
+    nameHint?: string,
+    fileNameHint?: string,
+  ): Promise<{ id: string; name: string; filePath: string; sizeBytes: number }> {
     if (!knowledgeDocRepo) throw new Error("Database not available");
 
-    const name = params.name as string;
-    const content = params.content as string;
-    if (!name) throw new Error("Missing required param: name");
-    if (!content) throw new Error("Missing required param: content");
-
-    // Size limit: 5MB
     const MAX_CONTENT_SIZE = 5 * 1024 * 1024;
     const sizeBytes = Buffer.byteLength(content, "utf-8");
+    const name = resolveDocName(nameHint, content, fileNameHint);
     if (sizeBytes > MAX_CONTENT_SIZE) {
-      throw new Error(`Content too large: ${(sizeBytes / 1024 / 1024).toFixed(1)}MB exceeds 5MB limit`);
+      throw new Error(`"${name}": content too large (${(sizeBytes / 1024 / 1024).toFixed(1)}MB exceeds 5MB limit)`);
     }
 
-    // Generate unique ID first, then build filename with ID prefix to avoid TOCTOU races
     const docId = crypto.randomBytes(12).toString("hex");
     let sanitized = name
       .replace(/[^a-zA-Z0-9_\-. ]/g, "_")
@@ -2152,7 +2177,6 @@ export function createRpcMethods(
     }
     const fullPath = resolveUnderDir(knowledgeDir, filePath);
 
-    // Write file, then insert DB record (clean up file on DB failure)
     fs.writeFileSync(fullPath, content, "utf-8");
 
     try {
@@ -2162,28 +2186,82 @@ export function createRpcMethods(
         filePath,
         content,
         sizeBytes,
-        uploadedBy: context.auth?.userId,
+        uploadedBy,
       });
     } catch (err) {
-      // Clean up orphaned file on DB insert failure
       try { fs.unlinkSync(fullPath); } catch { /* best-effort cleanup */ }
       throw err;
     }
 
-    console.log(`[kb-rpc] kb.upload: name=${name}, file=${filePath}, size=${sizeBytes}, by=${context.auth?.username}`);
+    return { id: docId, name, filePath, sizeBytes };
+  }
 
-    // Sync indexer and update chunk count
-    if (knowledgeIndexer) {
+  // Shared helper: sync indexer and update chunk counts for given docs
+  async function syncAndUpdateChunks(docs: Array<{ id: string; filePath: string }>) {
+    if (!knowledgeIndexer || !knowledgeDocRepo) return;
+    try {
+      await knowledgeIndexer.sync();
+      for (const doc of docs) {
+        const chunkCount = knowledgeIndexer.countChunksByFile(doc.filePath);
+        await knowledgeDocRepo.updateChunkCount(doc.id, chunkCount);
+      }
+    } catch (err) {
+      console.warn("[kb-rpc] Knowledge indexer sync failed:", err);
+    }
+  }
+
+  methods.set("kb.upload", async (params, context: RpcContext) => {
+    requireAdmin(context);
+
+    const content = params.content as string;
+    if (!content) throw new Error("Missing required param: content");
+
+    const doc = await createKnowledgeDoc(
+      content,
+      context.auth?.userId,
+      params.name as string | undefined,
+      params.fileName as string | undefined,
+    );
+    console.log(`[kb-rpc] kb.upload: name=${doc.name}, file=${doc.filePath}, size=${doc.sizeBytes}, by=${context.auth?.username}`);
+
+    await syncAndUpdateChunks([doc]);
+
+    return { id: doc.id, name: doc.name };
+  });
+
+  methods.set("kb.batchUpload", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!knowledgeDocRepo) throw new Error("Database not available");
+
+    const items = params.docs as Array<{ content: string; name?: string; fileName?: string }>;
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new Error("Missing required param: docs (non-empty array)");
+    }
+    if (items.length > 20) {
+      throw new Error("Batch limit exceeded: max 20 documents per upload");
+    }
+
+    const results: Array<{ id: string; name: string; error?: string }> = [];
+    const created: Array<{ id: string; filePath: string }> = [];
+
+    for (const item of items) {
       try {
-        await knowledgeIndexer.sync();
-        const chunkCount = knowledgeIndexer.countChunksByFile(filePath);
-        await knowledgeDocRepo.updateChunkCount(docId, chunkCount);
-      } catch (err) {
-        console.warn("[kb-rpc] Knowledge indexer sync failed:", err);
+        if (!item.content) throw new Error("Missing content");
+        const doc = await createKnowledgeDoc(item.content, context.auth?.userId, item.name, item.fileName);
+        results.push({ id: doc.id, name: doc.name });
+        created.push({ id: doc.id, filePath: doc.filePath });
+        console.log(`[kb-rpc] kb.batchUpload: name=${doc.name}, file=${doc.filePath}, size=${doc.sizeBytes}, by=${context.auth?.username}`);
+      } catch (err: any) {
+        results.push({ id: "", name: item.name || item.fileName || "(unnamed)", error: err?.message || "Upload failed" });
       }
     }
 
-    return { id: docId, name };
+    // Single indexer sync for all successfully created docs
+    if (created.length > 0) {
+      await syncAndUpdateChunks(created);
+    }
+
+    return { results };
   });
 
   methods.set("kb.delete", async (params, context: RpcContext) => {

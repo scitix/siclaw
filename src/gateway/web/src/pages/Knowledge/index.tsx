@@ -26,7 +26,7 @@ function formatDate(iso?: string): string {
 export function KnowledgePage() {
     const { sendRpc, isConnected } = useWebSocket();
     const { isAdmin } = usePermissions(sendRpc, isConnected);
-    const { docs, loading, loadDocs, uploadDoc, getDoc, deleteDoc } = useKnowledge(sendRpc);
+    const { docs, loading, loadDocs, uploadDoc, batchUploadDocs, getDoc, deleteDoc } = useKnowledge(sendRpc);
 
     const [search, setSearch] = useState('');
     const [drawerOpen, setDrawerOpen] = useState(false);
@@ -243,6 +243,7 @@ export function KnowledgePage() {
                     isOpen={drawerOpen}
                     onClose={() => setDrawerOpen(false)}
                     onSave={uploadDoc}
+                    onBatchSave={batchUploadDocs}
                 />
             )}
         </div>
