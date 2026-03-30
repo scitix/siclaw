@@ -4,9 +4,7 @@
  * Centralises logic previously duplicated across restricted-bash.ts and node-exec.ts.
  */
 import {
-  ALLOWED_COMMANDS,
-  COMMAND_CATEGORIES,
-  CONTEXT_CATEGORIES,
+  getContextAllowedSet,
   getCommandBinary,
   validateCommandRestrictions,
 } from "./command-sets.js";
@@ -312,27 +310,12 @@ export function validateShellOperators(command: string): string | null {
 
 // ── Context-based command whitelist ──────────────────────────────────
 
-const contextCommandsCache = new Map<string, ReadonlySet<string>>();
-
 /**
  * Get the set of commands allowed for a given execution context.
- * Results are cached for performance.
+ * Delegates to getContextAllowedSet (cached in command-sets.ts).
  */
 export function getContextCommands(context: ExecContext): ReadonlySet<string> {
-  const cached = contextCommandsCache.get(context);
-  if (cached) return cached;
-
-  const categories = CONTEXT_CATEGORIES[context];
-  if (!categories) return ALLOWED_COMMANDS; // fallback
-
-  const categorySet = new Set(categories);
-  const cmds = new Set<string>();
-  for (const [cmd, cat] of Object.entries(COMMAND_CATEGORIES)) {
-    if (categorySet.has(cat)) cmds.add(cmd);
-  }
-
-  contextCommandsCache.set(context, cmds);
-  return cmds;
+  return getContextAllowedSet(context);
 }
 
 // ── Sensitive path patterns (secondary defense) ──────────────────────

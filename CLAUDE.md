@@ -70,10 +70,10 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/tools/infra/command-sets.ts` | security.md §4, tools.md §6 | `npm test` | Skill scripts still work; sanitization rules still align |
 | `src/tools/infra/output-sanitizer.ts` | sanitization.md, tools.md §6.2 | `npm test` | Pipeline fallback in restricted-bash; deep-search sub-agent output |
 | `src/tools/infra/command-validator.ts` | security.md §4, tools.md §6.2 | `npm test` | All tools calling `validateCommand()` |
-| `src/tools/shell/restricted-bash.ts` | security.md, tools.md §5, sanitization.md | `npm test` | kubectl validation; skill bypass (`isSkillScript`); 3-layer sanitization |
-| `src/tools/shell/local-script.ts` | skills.md §6, sanitization.md §5 | `npm test` | Skill timeout/limits; output NOT sanitized (by design) |
-| `src/tools/k8s-exec/*.ts` | tools.md §3 | `npm test` | 10-step pipeline — steps 4/6/9 are mandatory security gates |
-| `src/tools/k8s-script/*.ts` | tools.md §4, skills.md | `npm test` | Script transmission; skill resolution |
+| `src/tools/cmd-exec/restricted-bash.ts` | security.md, tools.md §5, sanitization.md | `npm test` | kubectl validation; skill bypass (`isSkillScript`); 3-layer sanitization |
+| `src/tools/cmd-exec/*.ts` | tools.md §3 | `npm test` | Security pipeline via `preExecSecurity` / `postExecSecurity` |
+| `src/tools/script-exec/*.ts` | tools.md §4, skills.md | `npm test` | Script transmission; skill resolution |
+| `src/tools/infra/security-pipeline.ts` | tools.md §8.2, security.md | `npm test` | Facade for all cmd-exec tools; changes affect all 3 tools |
 | `src/gateway/skills/` | skills.md, invariants.md §1-2 | `npm test` | Bundle contract; `materialize()` NOT safe in local mode |
 | `src/gateway/db/schema-*.ts` | invariants.md §5 | `npm test` | `migrate-sqlite.ts` must also be updated (DDL parity) |
 | `src/core/agent-factory.ts` | tools.md §7, invariants.md §10 | `npm test` | Tool registration; brain type compatibility |

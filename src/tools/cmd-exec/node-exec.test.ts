@@ -3,7 +3,6 @@ import {
   validateNodeName,
   validateCommand,
   createNodeExecTool,
-  ALLOWED_COMMANDS,
 } from "./node-exec.js";
 
 describe("validateNodeName", () => {

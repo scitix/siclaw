@@ -9,7 +9,7 @@ import { describe, it, expect } from "vitest";
 import { validateCommand } from "./command-validator.js";
 import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
 import { validateExecCommand } from "./command-sets.js";
-import { createPodExecTool } from "../k8s-exec/pod-exec.js";
+import { createPodExecTool } from "../cmd-exec/pod-exec.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 
 // ── Pre-execution: CONTAINER_SENSITIVE_PATHS pattern coverage ────────

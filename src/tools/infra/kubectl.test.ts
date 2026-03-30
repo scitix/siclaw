@@ -4,7 +4,6 @@ import {
   validateExecCommand,
   hasAllNamespacesWithoutSelector,
   SAFE_SUBCOMMANDS,
-  ALLOWED_COMMANDS,
 } from "./command-sets.js";
 
 describe("parseArgs", () => {

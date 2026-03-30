@@ -3,21 +3,20 @@ import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/agent-factory.js";
 import { renderTextResult } from "../infra/tool-render.js";
-import { analyzeOutput, applySanitizer } from "../infra/output-sanitizer.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { validateCommand, extractCommands } from "../infra/command-validator.js";
+import { extractCommands } from "../infra/command-validator.js";
+import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import {
   validateNodeName,
   prepareExecEnv,
-  formatExecOutput,
+  filterPodNoise,
 } from "../infra/exec-utils.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
-export { ALLOWED_COMMANDS } from "../infra/command-sets.js";
 export { validateNodeName, validatePodName } from "../infra/exec-utils.js";
 export { validateCommand } from "../infra/command-validator.js";
 
@@ -147,11 +146,15 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
         };
       }
 
-      // Validate command
-      const cmdErr = validateCommand(params.command, { context: "node", sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS });
-      if (cmdErr) {
+      // Pre-exec security: validate command + determine output sanitizer
+      const pre = preExecSecurity(params.command, {
+        context: "node",
+        sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
+        analyzeTarget: "last-in-pipeline",
+      });
+      if (pre.error) {
         return {
-          content: [{ type: "text", text: cmdErr }],
+          content: [{ type: "text", text: pre.error }],
           details: { blocked: true, reason: "command_blocked" },
         };
       }
@@ -183,13 +186,6 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       const needsShell = commands.length > 1;
       const cmdArgs = parseArgs(params.command);
 
-      // Post-execution output sanitization: use the last command in a pipeline
-      // (pipeline output format is determined by the last command)
-      const lastCmd = commands[commands.length - 1];
-      const lastArgs = parseArgs(lastCmd);
-      const lastBinary = lastArgs[0]?.split("/").pop() ?? "";
-      const action = analyzeOutput(lastBinary, lastArgs.slice(1));
-
       // Build nsenter command (use rewritten args for single-command case)
       // When netns is specified, wrap with "ip netns exec <name>" to run
       // in the pod's network namespace using host tools.
@@ -217,9 +213,17 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
         };
       }
 
-      // Apply output sanitization before formatting
-      execResult.stdout = applySanitizer(execResult.stdout, action);
-      return formatExecOutput(execResult);
+      // Assemble output, then sanitize + truncate via unified facade
+      const filteredStderr = filterPodNoise(execResult.stderr);
+      const isError = execResult.exitCode !== 0 &&
+        !(execResult.exitCode === null && execResult.stdout.trim());
+      const stdout = isError
+        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
+        : execResult.stdout.trim();
+      return {
+        content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
+        details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },
+      };
     },
   };
 }
