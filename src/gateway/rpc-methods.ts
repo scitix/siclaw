@@ -62,6 +62,11 @@ import { type DpStatus, type DpChecklist, createChecklist, syncChecklistFromStat
 
 export type SendToUserFn = (userId: string, event: string, payload: Record<string, unknown>) => void;
 
+/** Sanitize a path segment — keep only safe characters for directory names. */
+function sanitizePathSegment(segment: string): string {
+  return segment.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
+}
+
 function requireAuth(context: RpcContext): string {
   const userId = context.auth?.userId;
   if (!userId) throw new Error("Unauthorized: login required");
@@ -5864,6 +5869,70 @@ export function createRpcMethods(
     if (fs.existsSync(wsDir)) fs.rmSync(wsDir, { recursive: true });
 
     return { status: "deleted" };
+  });
+
+  methods.set("workspace.clearMemory", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!workspaceRepo) throw new Error("Database not available");
+
+    const workspaceId = params.workspaceId as string;
+    if (!workspaceId) throw new Error("Missing required param: workspaceId");
+
+    // Verify ownership
+    const ws = await workspaceRepo.getById(workspaceId);
+    if (!ws || ws.userId !== userId) throw new Error("Workspace not found");
+
+    // Compute memory directory path
+    const userDataDir = process.env.SICLAW_USER_DATA_DIR || ".siclaw/user-data";
+    const memoryDir = isK8sMode
+      ? path.resolve("/app/.siclaw/user-data", "users", sanitizePathSegment(userId), sanitizePathSegment(workspaceId), "memory")
+      : path.resolve(userDataDir, "memory");
+
+    // Check if AgentBox is online before deleting files
+    const handle = await agentBoxManager.getAsync(userId, workspaceId);
+
+    // Delete memory files on PVC/filesystem
+    let deletedFiles = 0;
+    if (fs.existsSync(memoryDir)) {
+      // Delete investigations/ subdirectory
+      const investigationsDir = path.join(memoryDir, "investigations");
+      if (fs.existsSync(investigationsDir)) {
+        const invFiles = fs.readdirSync(investigationsDir).filter(f => f.endsWith(".md"));
+        deletedFiles += invFiles.length;
+        fs.rmSync(investigationsDir, { recursive: true });
+      }
+
+      const entries = fs.readdirSync(memoryDir);
+      for (const entry of entries) {
+        if (entry === "PROFILE.md") continue;
+        // If AgentBox is online, keep .memory.db — its indexer holds an open
+        // DB connection; sync() + clearInvestigations() will clean up records.
+        // If AgentBox is offline, delete .memory.db too — no open connection,
+        // and next startup will create a fresh empty DB.
+        if (handle && entry.startsWith(".memory.db")) continue;
+        const fullPath = path.join(memoryDir, entry);
+        const stat = fs.statSync(fullPath);
+        if (stat.isFile()) {
+          fs.unlinkSync(fullPath);
+          if (entry.endsWith(".md")) deletedFiles++;
+        }
+      }
+    }
+
+    console.log(`[rpc] workspace.clearMemory: deleted ${deletedFiles} files in ${memoryDir}`);
+
+    // Notify AgentBox to reset indexer (sync cleans files/chunks, clearInvestigations cleans investigations table)
+    if (handle) {
+      try {
+        const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+        await client.resetMemory();
+        console.log(`[rpc] workspace.clearMemory: AgentBox notified to reset indexer`);
+      } catch (err: any) {
+        console.warn(`[rpc] workspace.clearMemory: failed to notify AgentBox: ${err.message}`);
+      }
+    }
+
+    return { status: "ok", deletedFiles };
   });
 
   methods.set("workspace.getConfig", async (params, context: RpcContext) => {

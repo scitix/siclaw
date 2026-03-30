@@ -143,6 +143,15 @@ export function PilotPage() {
                                         setIsDrawerOpen(false);
                                     }}
                                     onDeleteSession={pilot.deleteSession}
+                                    onClearMemory={async () => {
+                                        if (!currentWorkspace) return;
+                                        try {
+                                            await pilot.sendRpc('workspace.clearMemory', { workspaceId: currentWorkspace.id });
+                                        } catch (err: any) {
+                                            console.error('Failed to clear memory:', err);
+                                            throw err;
+                                        }
+                                    }}
                                 />
                             </div>
                         </motion.div>
