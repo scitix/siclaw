@@ -21,7 +21,7 @@ import {
 } from "./sre-knowledge.js";
 import { formatResult, formatSummary } from "./format.js";
 import { HYPOTHESES_SCHEMA, CONCLUSION_SCHEMA, ROOT_CAUSE_CATEGORIES } from "./schemas.js";
-import { extractJSON } from "./sub-agent.js";
+import { extractJSON } from "../../../shared/llm-utils.js";
 
 // ─── types.ts ───
 
