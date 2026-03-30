@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Plus, Boxes, Trash2, Pencil, Star } from 'lucide-react';
+import { Plus, Boxes, Trash2, Pencil, Star, Eraser } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { WorkspaceDialog } from './WorkspaceDialog';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import type { Workspace } from '@/contexts/WorkspaceContext';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 
@@ -45,6 +46,7 @@ export function WorkspacesPage() {
     const [skillSummaries, setSkillSummaries] = useState<Record<string, WorkspaceSummary>>({});
     const [toolCounts, setToolCounts] = useState<Record<string, number>>({});
     const [clusterCounts, setClusterCounts] = useState<Record<string, number>>({});
+    const [clearMemoryWs, setClearMemoryWs] = useState<Workspace | null>(null);
     const hasLoadedRef = useRef(false);
 
     const loadWorkspaces = useCallback(async () => {
@@ -84,6 +86,14 @@ export function WorkspacesPage() {
         hasLoadedRef.current = true;
         loadWorkspaces();
     }, [isConnected, loadWorkspaces]);
+
+    const handleClearMemory = async (ws: Workspace) => {
+        try {
+            await sendRpc('workspace.clearMemory', { workspaceId: ws.id });
+        } catch (err) {
+            console.error('Failed to clear memory:', err);
+        }
+    };
 
     const handleDelete = async (ws: Workspace) => {
         if (ws.isDefault) return;
@@ -194,6 +204,13 @@ export function WorkspacesPage() {
                                         <Pencil className="w-3.5 h-3.5" />
                                         {ws.isDefault ? 'View' : 'Edit'}
                                     </button>
+                                    <button
+                                        onClick={() => setClearMemoryWs(ws)}
+                                        className="flex items-center px-2 py-1.5 text-sm text-orange-500 bg-orange-50 hover:bg-orange-100 rounded-lg transition-colors"
+                                        title="Clear memory"
+                                    >
+                                        <Eraser className="w-3.5 h-3.5" />
+                                    </button>
                                     {!ws.isDefault && (
                                         <button
                                             onClick={() => handleDelete(ws)}
@@ -218,6 +235,19 @@ export function WorkspacesPage() {
                     </div>
                 )}
             </div>
+
+            {/* Clear Memory confirm dialog */}
+            <ConfirmDialog
+                isOpen={!!clearMemoryWs}
+                onClose={() => setClearMemoryWs(null)}
+                onConfirm={() => {
+                    if (clearMemoryWs) handleClearMemory(clearMemoryWs);
+                }}
+                title="Clear Memory"
+                description="This will permanently delete all conversation memories for this workspace. This action cannot be undone."
+                confirmText="Clear Memory"
+                variant="danger"
+            />
 
             {/* Edit / Create dialog */}
             {(editingWs || isCreating) && (
