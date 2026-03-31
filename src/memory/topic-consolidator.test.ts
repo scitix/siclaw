@@ -5,11 +5,11 @@ import os from "node:os";
 import { shouldConsolidate, consolidateTopicFile, triggerConsolidationIfNeeded } from "./topic-consolidator.js";
 
 // Mock llmCompleteWithTool to avoid real API calls
-vi.mock("../tools/workflow/deep-search/sub-agent.js", () => ({
+vi.mock("../shared/llm-utils.js", () => ({
   llmCompleteWithTool: vi.fn(),
 }));
 
-import { llmCompleteWithTool } from "../tools/workflow/deep-search/sub-agent.js";
+import { llmCompleteWithTool } from "../shared/llm-utils.js";
 
 const mockLlmComplete = vi.mocked(llmCompleteWithTool);
 

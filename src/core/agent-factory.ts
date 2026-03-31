@@ -31,7 +31,7 @@ import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
 import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
 import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/workflow/deep-search/tool.js";
-import { createInvestigationFeedbackTool } from "../tools/query/investigation-feedback.js";
+import { createInvestigationFeedbackTool } from "../tools/workflow/deep-search/investigation-feedback.js";
 import { createSaveFeedbackTool } from "../tools/workflow/save-feedback.js";
 import {
   type DpState,
