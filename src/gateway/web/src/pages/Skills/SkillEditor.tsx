@@ -100,11 +100,12 @@ function clearDraft(id: string) {
 function hasUnsavedChanges(formData: Skill | null, serverData: Skill | null): boolean {
     if (!formData || !serverData) return false;
     return formData.name !== serverData.name
+        || (formData.description ?? '') !== (serverData.description ?? '')
         || formData.specs !== serverData.specs
         || formData.type !== serverData.type
-        || formData.version !== serverData.version
-        || JSON.stringify((formData.scripts || []).map(s => ({ id: s.id, info: s.info, name: s.name, content: s.content })))
-            !== JSON.stringify((serverData.scripts || []).map(s => ({ id: s.id, info: s.info, name: s.name, content: s.content })));
+        || JSON.stringify([...(formData.labels ?? [])].sort()) !== JSON.stringify([...(serverData.labels ?? [])].sort())
+        || JSON.stringify((formData.scripts || []).map(s => ({ name: s.name, content: s.content })))
+            !== JSON.stringify((serverData.scripts || []).map(s => ({ name: s.name, content: s.content })));
 }
 
 function formatTimeAgo(ts: number): string {
@@ -122,7 +123,7 @@ export function SkillEditor() {
     const [searchParams] = useSearchParams();
     const { sendRpc, isConnected } = useWebSocket();
     const { currentWorkspace } = useWorkspace();
-    const [isExpanded, setIsExpanded] = useState(false);
+    const [isExpanded, setIsExpanded] = useState(true);
     const [formData, setFormData] = useState<Skill | null>(null);
     const [activeScriptId, setActiveScriptId] = useState<string | null>(null);
     const [isSaving, setIsSaving] = useState(false);
@@ -134,13 +135,15 @@ export function SkillEditor() {
     const [isCopying, setIsCopying] = useState(false);
     const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
     const [showHistory, setShowHistory] = useState(false);
-    const [versions, setVersions] = useState<Array<{ hash: string; version: number; message: string; author: string; date: string }>>([]);
+    const [versions, setVersions] = useState<Array<{ hash: string; version: number; tag?: string; message: string; author: string; date: string }>>([]);
+    const historyTag = (searchParams.get('tag') as 'published' | 'approved' | null) ?? undefined;
     const [historyLoading, setHistoryLoading] = useState(false);
     const [rollbackConfirm, setRollbackConfirm] = useState<number | null>(null);
     const [serverData, setServerData] = useState<Skill | null>(null);
     const [draftRestored, setDraftRestored] = useState<{ savedAt: number } | null>(null);
     const isNew = id === 'new';
-    const isReadOnly = !!formData && formData.scope !== 'personal' && !(formData.scope === 'skillset' && formData.isSpaceMember);
+    // Personal and skillset skills are editable; global/builtin are read-only
+    const isReadOnly = !!formData && formData.scope !== 'personal' && formData.scope !== 'skillset';
     const currentUser = getCurrentUser();
     const isAdmin = currentUser?.username === 'admin';
     const isOwner = formData?.authorId === currentUser?.id;
@@ -165,7 +168,7 @@ export function SkillEditor() {
         if (showHistory) { setShowHistory(false); return; }
         setHistoryLoading(true);
         try {
-            const result = await rpcGetSkillHistory(sendRpc, id);
+            const result = await rpcGetSkillHistory(sendRpc, id, historyTag);
             setVersions(result.versions);
             setShowHistory(true);
         } catch (err) {
@@ -177,8 +180,9 @@ export function SkillEditor() {
 
     const handleRollback = async (version: number) => {
         if (!id || isNew) return;
+        const target = historyTag === 'published' ? 'dev' : 'prod';
         try {
-            await rpcRollbackSkill(sendRpc, id, version);
+            await rpcRollbackSkill(sendRpc, id, version, target as 'dev' | 'prod');
             const skill = await rpcGetSkillById(sendRpc, id, currentWorkspace?.id);
             if (skill) {
                 const loaded = {
@@ -547,10 +551,10 @@ export function SkillEditor() {
                         </Tooltip>
                     ) : (
                         <>
-                            <Tooltip content={isSaving ? "Saving..." : "Save Changes"}>
+                            <Tooltip content={isSaving ? "Saving..." : !isDirty ? "No changes" : "Save Changes"}>
                                 <button
                                     onClick={handleSave}
-                                    disabled={isSaving}
+                                    disabled={isSaving || !isDirty}
                                     className="p-2 text-primary-600 hover:bg-primary-50 rounded-lg transition-colors disabled:opacity-50"
                                 >
                                     {isSaving ? <Loader2 className="w-5 h-5 animate-spin" /> : <Save className="w-5 h-5" />}
@@ -958,17 +962,7 @@ export function SkillEditor() {
                                     </span>
                                 </div>
                                 <div className="flex items-center gap-2">
-                                    {!isReadOnly && (
-                                        <Tooltip content="Save Script">
-                                            <button
-                                                onClick={handleSave}
-                                                className="p-1.5 text-gray-400 hover:text-white hover:bg-[#333] rounded transition-colors"
-                                            >
-                                                <Save className="w-5 h-5" />
-                                            </button>
-                                        </Tooltip>
-                                    )}
-                                    <Tooltip content="Close Editor">
+                                    <Tooltip content="Done Editing">
                                         <button
                                             onClick={() => setActiveScriptId(null)}
                                             className="p-1.5 text-gray-400 hover:text-white hover:bg-[#333] rounded transition-colors"
@@ -1040,7 +1034,7 @@ export function SkillEditor() {
                 onClose={() => setRollbackConfirm(null)}
                 onConfirm={() => rollbackConfirm !== null && handleRollback(rollbackConfirm)}
                 title="Rollback Version"
-                description={`Are you sure you want to rollback to v${rollbackConfirm}? This will overwrite the current working copy and published snapshot.`}
+                description={`Rollback ${historyTag === 'published' ? 'dev' : 'production'} to v${rollbackConfirm}? This creates a new version with the historical content. Your working draft is not affected.`}
                 confirmText="Rollback"
                 variant="warning"
             />

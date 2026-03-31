@@ -10,21 +10,37 @@ import { eq, and } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { skillContents } from "../schema.js";
 
-export type SkillContentTag = "working" | "staging" | "published";
+export type SkillContentTag = "working" | "staging" | "staging-contribution" | "published" | "approved";
 
 export interface SkillFiles {
   specs?: string;
   scripts?: Array<{ name: string; content: string }>;
 }
 
+/**
+ * Compute a deterministic SHA-256 hash of skill file content.
+ * Scripts are sorted by name to ensure order-independence.
+ */
+export function computeContentHash(files: SkillFiles): string {
+  const hash = crypto.createHash("sha256");
+  hash.update(files.specs ?? "");
+  const sorted = [...(files.scripts ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+  for (const s of sorted) {
+    hash.update(s.name);
+    hash.update(s.content);
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
 export class SkillContentRepository {
   constructor(private db: Database) {}
 
-  /** Save/update skill content (upsert by skill_id + tag) */
-  async save(skillId: string, tag: SkillContentTag, files: SkillFiles): Promise<void> {
+  /** Save/update skill content (upsert by skill_id + tag), auto-computes content_hash */
+  async save(skillId: string, tag: SkillContentTag, files: SkillFiles): Promise<string> {
     const id = crypto.randomUUID();
     const specs = files.specs ?? null;
     const scriptsJson = files.scripts ?? null;
+    const contentHash = computeContentHash(files);
 
     // Try insert, on conflict update
     try {
@@ -34,6 +50,7 @@ export class SkillContentRepository {
         tag,
         specs,
         scriptsJson,
+        contentHash,
       });
     } catch (err: any) {
       // Duplicate key — update instead
@@ -41,12 +58,13 @@ export class SkillContentRepository {
       if (code === "ER_DUP_ENTRY" || code === "SQLITE_CONSTRAINT_UNIQUE" || String(err).includes("UNIQUE constraint")) {
         await this.db
           .update(skillContents)
-          .set({ specs, scriptsJson, updatedAt: new Date() })
+          .set({ specs, scriptsJson, contentHash, updatedAt: new Date() })
           .where(and(eq(skillContents.skillId, skillId), eq(skillContents.tag, tag)));
       } else {
         throw err;
       }
     }
+    return contentHash;
   }
 
   /** Read skill content by skill_id + tag */
@@ -64,6 +82,23 @@ export class SkillContentRepository {
       specs: row.specs ?? undefined,
       scripts: row.scriptsJson ?? undefined,
     };
+  }
+
+  /** Read content hash (fast comparison). Computes on-the-fly if not stored (legacy data). */
+  async readHash(skillId: string, tag: SkillContentTag): Promise<string | null> {
+    const rows = await this.db
+      .select({ contentHash: skillContents.contentHash, specs: skillContents.specs, scriptsJson: skillContents.scriptsJson })
+      .from(skillContents)
+      .where(and(eq(skillContents.skillId, skillId), eq(skillContents.tag, tag)))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    // Return stored hash, or compute from content for legacy rows
+    if (row.contentHash) return row.contentHash as string;
+    return computeContentHash({
+      specs: row.specs ?? undefined,
+      scripts: row.scriptsJson ?? undefined,
+    });
   }
 
   /** Delete skill content (specific tag or all tags) */

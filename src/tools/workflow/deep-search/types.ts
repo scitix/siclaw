@@ -83,6 +83,9 @@ export const QUICK_BUDGET: DeepSearchBudget = {
 
 // --- Sub-agent constants ---
 
+/** Max tokens for Phase 2/4 LLM completions (hypothesis generation, conclusion). */
+export const LLM_COMPLETE_MAX_TOKENS = 4096;
+
 /** Safety timeout (ms) after budget exhausted — force-abort if LLM ignores steer. */
 export const BUDGET_ABORT_TIMEOUT_MS = 10_000;
 

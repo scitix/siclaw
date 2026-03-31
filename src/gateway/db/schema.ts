@@ -45,6 +45,7 @@ export const {
   workspaceClusters,
   workspaceCredentials,
   userDisabledSkills,
+  userDisabledSkillSpaces,
   clusters,
   userClusterConfigs,
   triggers,

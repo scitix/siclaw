@@ -23,7 +23,6 @@ type SkillComposerSkillOption = {
     id: string;
     ref: string;
     name: string;
-    dirName: string;
     description?: string | null;
     labels?: string[];
     scope: 'builtin' | 'global' | 'personal' | 'skillset';
@@ -270,7 +269,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             const matchesSearch = !query
                 || skill.name.toLowerCase().includes(query)
                 || skill.description?.toLowerCase().includes(query)
-                || skill.dirName.toLowerCase().includes(query);
+                || skill.name.toLowerCase().includes(query);
             return matchesLabel && matchesSearch;
         });
     }, [composerOptions.globalSkills, globalLabelFilter, globalSearch]);
@@ -282,7 +281,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             const matchesSearch = !query
                 || skill.name.toLowerCase().includes(query)
                 || skill.description?.toLowerCase().includes(query)
-                || skill.dirName.toLowerCase().includes(query);
+                || skill.name.toLowerCase().includes(query);
             return matchesLabel && matchesSearch;
         });
     }, [composerOptions.personalSkills, personalLabelFilter, personalSearch]);
@@ -295,7 +294,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             if (space.description?.toLowerCase().includes(query)) return true;
             return space.skills.some(skill =>
                 skill.name.toLowerCase().includes(query)
-                || skill.dirName.toLowerCase().includes(query)
+                || skill.name.toLowerCase().includes(query)
                 || skill.description?.toLowerCase().includes(query),
             );
         });
@@ -309,21 +308,21 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
     );
 
     const skillSpaceConflictDetails = useMemo(() => {
-        const dirNameMap = new Map<string, Array<{ spaceName: string; skillName: string }>>();
+        const nameConflictMap = new Map<string, Array<{ spaceName: string; skillName: string }>>();
         for (const selection of composer.skillSpaces) {
             const space = composerOptions.skillSpaces.find(item => item.id === selection.skillSpaceId);
             if (!space) continue;
             const disabledIds = new Set(selection.disabledSkillIds);
             for (const skill of space.skills) {
                 if (disabledIds.has(skill.id)) continue;
-                const list = dirNameMap.get(skill.dirName) ?? [];
+                const list = nameConflictMap.get(skill.name) ?? [];
                 list.push({ spaceName: space.name, skillName: skill.name });
-                dirNameMap.set(skill.dirName, list);
+                nameConflictMap.set(skill.name, list);
             }
         }
-        return [...dirNameMap.entries()]
+        return [...nameConflictMap.entries()]
             .filter(([, entries]) => new Set(entries.map(entry => entry.spaceName)).size > 1)
-            .map(([dirName, entries]) => ({ dirName, entries }));
+            .map(([skillName, entries]) => ({ name: skillName, entries }));
     }, [composer.skillSpaces, composerOptions.skillSpaces]);
     const blockingSkillSpaceConflicts = envType === 'test' ? skillSpaceConflictDetails : [];
 
@@ -331,9 +330,9 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         const sourceEntries = new Map<string, Array<{ source: string; priority: number }>>();
         for (const skill of composerOptions.globalSkills) {
             if (!selectedGlobalRefSet.has(skill.ref)) continue;
-            const current = sourceEntries.get(skill.dirName) ?? [];
+            const current = sourceEntries.get(skill.name) ?? [];
             current.push({ source: skill.scope === 'global' ? `Global (${skill.name}, global)` : `Global (${skill.name})`, priority: skill.scope === 'global' ? 1 : 0 });
-            sourceEntries.set(skill.dirName, current);
+            sourceEntries.set(skill.name, current);
         }
         for (const selection of composer.skillSpaces) {
             const space = composerOptions.skillSpaces.find(item => item.id === selection.skillSpaceId);
@@ -341,16 +340,16 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             const disabledIds = new Set(selection.disabledSkillIds);
             for (const skill of space.skills) {
                 if (disabledIds.has(skill.id)) continue;
-                const current = sourceEntries.get(skill.dirName) ?? [];
+                const current = sourceEntries.get(skill.name) ?? [];
                 current.push({ source: `Skill Space (${space.name})`, priority: 2 });
-                sourceEntries.set(skill.dirName, current);
+                sourceEntries.set(skill.name, current);
             }
         }
         for (const skill of composerOptions.personalSkills) {
             if (!selectedPersonalIdSet.has(skill.id)) continue;
-            const current = sourceEntries.get(skill.dirName) ?? [];
+            const current = sourceEntries.get(skill.name) ?? [];
             current.push({ source: `Personal (${skill.name})`, priority: 3 });
-            sourceEntries.set(skill.dirName, current);
+            sourceEntries.set(skill.name, current);
         }
         return [...sourceEntries.entries()]
             .filter(([, entries]) => entries.length > 1)
@@ -358,9 +357,9 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                 const priorities = new Set(entries.map(entry => entry.priority));
                 return !(priorities.size === 1 && priorities.has(2));
             })
-            .map(([dirName, entries]) => {
+            .map(([skillName, entries]) => {
                 const winner = [...entries].sort((a, b) => b.priority - a.priority)[0];
-                return `${dirName} resolves to ${winner.source}`;
+                return `${skillName} resolves to ${winner.source}`;
             });
     }, [composer.skillSpaces, composerOptions.globalSkills, composerOptions.personalSkills, composerOptions.skillSpaces, selectedGlobalRefSet, selectedPersonalIdSet]);
 
@@ -368,7 +367,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
         const winners = new Map<string, number>();
         for (const skill of composerOptions.globalSkills) {
             if (!selectedGlobalRefSet.has(skill.ref)) continue;
-            winners.set(skill.dirName, Math.max(winners.get(skill.dirName) ?? -1, skill.scope === 'global' ? 1 : 0));
+            winners.set(skill.name, Math.max(winners.get(skill.name) ?? -1, skill.scope === 'global' ? 1 : 0));
         }
         for (const selection of composer.skillSpaces) {
             const space = composerOptions.skillSpaces.find(item => item.id === selection.skillSpaceId);
@@ -376,12 +375,12 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
             const disabledIds = new Set(selection.disabledSkillIds);
             for (const skill of space.skills) {
                 if (disabledIds.has(skill.id)) continue;
-                winners.set(skill.dirName, Math.max(winners.get(skill.dirName) ?? -1, 2));
+                winners.set(skill.name, Math.max(winners.get(skill.name) ?? -1, 2));
             }
         }
         for (const skill of composerOptions.personalSkills) {
             if (!selectedPersonalIdSet.has(skill.id)) continue;
-            winners.set(skill.dirName, 3);
+            winners.set(skill.name, 3);
         }
         return winners.size;
     }, [composer.skillSpaces, composerOptions.globalSkills, composerOptions.personalSkills, composerOptions.skillSpaces, selectedGlobalRefSet, selectedPersonalIdSet]);
@@ -718,8 +717,8 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                         <div className="font-medium mb-1">Resolve Skill Space conflicts before saving.</div>
                                         <div className="space-y-1">
                                             {blockingSkillSpaceConflicts.slice(0, 4).map(conflict => (
-                                                <div key={conflict.dirName}>
-                                                    {conflict.dirName}: {conflict.entries.map(entry => entry.spaceName).join(', ')}
+                                                <div key={conflict.name}>
+                                                    {conflict.name}: {conflict.entries.map(entry => entry.spaceName).join(', ')}
                                                 </div>
                                             ))}
                                         </div>
@@ -828,7 +827,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                                     />
                                                     <div className="min-w-0 flex-1">
                                                         <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                        <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
+                                                        <div className="text-xs text-gray-400 truncate">{skill.description || skill.name}</div>
                                                     </div>
                                                     {skill.labels && skill.labels.length > 0 && (
                                                         <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
@@ -913,7 +912,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                                                             />
                                                                             <div className="min-w-0 flex-1">
                                                                                 <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                                                <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
+                                                                                <div className="text-xs text-gray-400 truncate">{skill.description || skill.name}</div>
                                                                             </div>
                                                                             {skill.labels && skill.labels.length > 0 && (
                                                                                 <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>
@@ -1002,7 +1001,7 @@ export function WorkspaceDialog({ workspace, onClose, onSaved, sendRpc }: Props)
                                                         />
                                                         <div className="min-w-0 flex-1">
                                                             <div className="text-sm text-gray-900 truncate">{skill.name}</div>
-                                                            <div className="text-xs text-gray-400 truncate">{skill.description || skill.dirName}</div>
+                                                            <div className="text-xs text-gray-400 truncate">{skill.description || skill.name}</div>
                                                         </div>
                                                         {skill.labels && skill.labels.length > 0 && (
                                                             <span className="text-xs text-gray-400 truncate max-w-[180px]">{skill.labels.join(', ')}</span>

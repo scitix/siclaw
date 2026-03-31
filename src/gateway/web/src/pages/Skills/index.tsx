@@ -1,19 +1,21 @@
-import { Search, Plus, Settings, Users, Shield, User, LayoutGrid, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Undo2, Trash2, ShieldAlert, ChevronDown, ChevronUp, AlertTriangle, Info, FileCode, Terminal, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Tag, GitFork } from 'lucide-react';
+import { Search, Plus, Pencil, Users, Shield, User, Lock, ClipboardCheck, X, Check, Eye, Loader2, ThumbsUp, ThumbsDown, Trash2, ShieldAlert, ChevronDown, ChevronUp, ChevronRight, AlertTriangle, Info, GitCommitHorizontal, FilePlus2, RotateCcw, SendHorizontal, Upload, Download, Tag, GitFork } from 'lucide-react';
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { cn } from '@/lib/utils';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import type { Skill, SkillReview, SkillSpace, SkillDiffMetadataChange } from './skillsData';
-import { rpcGetSkillById, rpcGetSkillReview, rpcGetSkillDiff, rpcListSkillSpaces, rpcCreateSkillSpace, type SkillSpaceMember } from './skillsData';
+import type { Skill, SkillReview, SkillSpace } from './skillsData';
+import { rpcGetSkillById, rpcGetSkillReview, rpcListSkillSpaces, rpcCreateSkillSpace, rpcSetSkillSpaceEnabled, rpcMoveToSpace, rpcPreviewDiff, downloadSkillExport, type SkillSpaceMember } from './skillsData';
 import { getCurrentUser } from '../../auth';
 import { Tooltip } from '../../components/Tooltip';
 import { ConfirmDialog } from '../../components/ConfirmDialog';
-import { DiffViewerModal } from '../../components/DiffViewerModal';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { useSkills } from '../../hooks/useSkills';
 import { usePermissions } from '../../hooks/usePermissions';
 import { useWorkspace } from '../../contexts/WorkspaceContext';
 import { rpcGetSkillSystemCapabilities } from './skillsData';
 import { DEFAULT_SKILL_LABEL_COLORS, getDefaultSkillBadges, SkillCard, type SkillCardAction } from './components/SkillCard';
+import { SkillLifecycleStatus } from './components/SkillLifecycleStatus';
+import { DiffPreviewDialog, DiffBlock } from './components/DiffPreviewDialog';
+import { VersionHistoryDrawer } from './components/VersionHistoryDrawer';
 
 export function SkillsPage() {
     const navigate = useNavigate();
@@ -22,27 +24,28 @@ export function SkillsPage() {
     const { currentWorkspace } = useWorkspace();
     const {
         skills, isLoading, isLoadingMore, hasMore, loadSkills, loadMore,
-        toggleEnabled, requestPublish, publishSkill, copyToPersonal,
+        toggleEnabled, requestPublish, contributeSkill, copyToPersonal,
         approveSkill: doApprove, rejectSkill: doReject,
-        deleteSkill: doDelete, voteSkill, revertSkill, reviewSkill,
-        withdrawSkill: doWithdraw,
+        deleteSkill: doDelete, voteSkill, reviewSkill,
+        withdrawSubmit, withdrawContribute,
     } = useSkills(sendRpc, currentWorkspace?.id);
 
     const currentUser = getCurrentUser();
     const isAdmin = currentUser?.username === 'admin';
     const { isReviewer } = usePermissions(sendRpc, isConnected);
 
-    const validTabs = new Set(['all', 'global', 'myskills', 'approvals'] as const);
-    type SkillTab = 'all' | 'global' | 'myskills' | 'approvals';
+    const validTabs = new Set(['global', 'myskills', 'approvals'] as const);
+    type SkillTab = 'global' | 'myskills' | 'approvals';
     const tabFromUrl = searchParams.get('tab') as SkillTab | null;
     const savedTab = sessionStorage.getItem('skills_tab') as SkillTab | null;
-    const resolvedTab: SkillTab = (tabFromUrl && validTabs.has(tabFromUrl) ? tabFromUrl : null) || (savedTab && validTabs.has(savedTab) ? savedTab : null) || 'all';
+    const resolvedTab: SkillTab = (tabFromUrl && validTabs.has(tabFromUrl) ? tabFromUrl : null) || (savedTab && validTabs.has(savedTab) ? savedTab : null) || 'global';
     const [activeTab, setActiveTab] = useState<SkillTab>(resolvedTab);
     const [searchInput, setSearchInput] = useState('');
     const [selectedLabels, setSelectedLabels] = useState<Set<string>>(new Set());
     const [labelDropdownOpen, setLabelDropdownOpen] = useState(false);
     const [skillSpaces, setSkillSpaces] = useState<SkillSpace[]>([]);
-    const [myView, setMyView] = useState<'personal' | 'shared'>('personal');
+    const viewFromUrl = searchParams.get('view');
+    const [myView, setMyView] = useState<'personal' | 'shared'>(viewFromUrl === 'shared' ? 'shared' : 'personal');
     const [skillSpaceEnabled, setSkillSpaceEnabled] = useState(false);
     const [skillSpaceDialog, setSkillSpaceDialog] = useState<{
         isOpen: boolean;
@@ -56,64 +59,6 @@ export function SkillsPage() {
     const labelDropdownRef = useRef<HTMLDivElement>(null);
     const searchTimerRef = useRef<ReturnType<typeof setTimeout>>();
     const contentRef = useRef<HTMLDivElement>(null);
-    const [personalDiffModal, setPersonalDiffModal] = useState<{
-        isOpen: boolean;
-        title: string;
-        subtitle: string;
-        diffText: string | null;
-        metadataChanges: SkillDiffMetadataChange[];
-        isLoading: boolean;
-    }>({ isOpen: false, title: '', subtitle: '', diffText: null, metadataChanges: [], isLoading: false });
-
-    const handleSkillDiff = async (skill: Skill) => {
-        const useGlobalContributionBaseline =
-            skill.scope === 'personal' &&
-            skill.reviewStatus === 'approved' &&
-            !skill.hasUnpublishedChanges &&
-            skill.contributionStatus !== 'approved';
-        setPersonalDiffModal({
-            isOpen: true,
-            title: `${skill.name} Diff`,
-            subtitle: 'Loading comparison...',
-            diffText: null,
-            metadataChanges: [],
-            isLoading: true,
-        });
-        try {
-            const result = await rpcGetSkillDiff(
-                sendRpc,
-                String(skill.id),
-                useGlobalContributionBaseline,
-                undefined,
-                useGlobalContributionBaseline ? 'global' : undefined,
-            );
-            setPersonalDiffModal({
-                isOpen: true,
-                title: `${skill.name} Diff`,
-                subtitle: result.baselineLabel && result.compareLabel
-                    ? `${result.baselineLabel} -> ${result.compareLabel}`
-                    : useGlobalContributionBaseline
-                        ? 'Latest global -> Contribution candidate'
-                        : 'Personal diff',
-                diffText: result.diff || 'No changes detected.',
-                metadataChanges: result.metadataChanges ?? [],
-                isLoading: false,
-            });
-        } catch (err: any) {
-            setPersonalDiffModal({
-                isOpen: true,
-                title: `${skill.name} Diff`,
-                subtitle: useGlobalContributionBaseline
-                    ? 'Latest global -> Contribution candidate'
-                    : 'Personal diff',
-                diffText: 'Failed to load diff.',
-                metadataChanges: [],
-                isLoading: false,
-            });
-            console.error('[Skills] Failed to load skill diff:', err);
-        }
-    };
-
     // Label category grouping
     const LABEL_GROUPS: Record<string, string[]> = {
         Environment: ['kubernetes', 'bare-metal', 'switch'],
@@ -195,11 +140,7 @@ export function SkillsPage() {
         setActiveTab(tab as any);
         sessionStorage.setItem('skills_tab', tab);
         setSelectedLabels(new Set()); // Clear label filter on tab change
-        if (tab === 'all') {
-            setSearchParams({});
-        } else {
-            setSearchParams({ tab });
-        }
+        setSearchParams({ tab });
         loadSkills(tab, searchInput);
     };
 
@@ -212,11 +153,6 @@ export function SkillsPage() {
     }, [isLoadingMore, hasMore, loadMore]);
 
     // Revert dialog state (with reason textarea)
-    const [revertDialog, setRevertDialog] = useState<{
-        isOpen: boolean;
-        skill: Skill | null;
-        reason: string;
-    }>({ isOpen: false, skill: null, reason: '' });
 
     // Dialog State
     const [dialogState, setDialogState] = useState<{
@@ -236,6 +172,34 @@ export function SkillsPage() {
     });
 
     const closeDialog = () => setDialogState(prev => ({ ...prev, isOpen: false }));
+
+    // Action preview with diff
+    const [previewAction, setPreviewAction] = useState<{
+        isOpen: boolean; title: string; loading: boolean;
+        diff: import('./skillsData').PreviewDiffResult | null;
+        onConfirm: (message?: string) => Promise<void>;
+    }>({ isOpen: false, title: '', loading: false, diff: null, onConfirm: async () => {} });
+
+    const showActionPreview = async (skill: Skill, action: 'publish' | 'submit' | 'contribute', title: string, onConfirm: (message?: string) => Promise<void>) => {
+        setPreviewAction({ isOpen: true, title, loading: true, diff: null, onConfirm });
+        try {
+            const diff = await rpcPreviewDiff(sendRpc, String(skill.id), action);
+            setPreviewAction(prev => ({ ...prev, diff, loading: false }));
+        } catch (err: any) {
+            setPreviewAction(prev => ({ ...prev, loading: false }));
+            showError(err?.message || 'Failed to load diff');
+        }
+    };
+
+    // Move to Space picker
+    const [moveToSpaceDialog, setMoveToSpaceDialog] = useState<{
+        isOpen: boolean;
+        skill: Skill | null;
+    }>({ isOpen: false, skill: null });
+
+    const [historyDrawer, setHistoryDrawer] = useState<{
+        isOpen: boolean; skillId: string; skillName: string; tag?: 'published' | 'approved'; title?: string;
+    }>({ isOpen: false, skillId: '', skillName: '' });
 
     const hasLoadedRef = useRef(false);
     useEffect(() => {
@@ -336,28 +300,36 @@ export function SkillsPage() {
 
     const handlePublish = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
-        const isSkillSpace = skill.scope === 'skillset';
-        setDialogState({
-            isOpen: true,
-            title: isSkillSpace ? 'Submit Merge' : 'Publish Skill',
-            description: isSkillSpace
-                ? `Submit "${skill.name}" from Skill Space for merge review? Once approved, it will become the latest merged version in this Skill Space.`
-                : `Are you sure you want to publish "${skill.name}"? It will be reviewed by an admin before becoming available in production.`,
-            variant: 'primary',
-            confirmText: isSkillSpace ? 'Submit Merge' : 'Request Publish',
-            onConfirm: () => { requestPublish(skill).catch((err: any) => showError(err?.message || String(err))); }
+        showActionPreview(skill, 'submit', `Submit "${skill.name}" for Production`, async (message) => {
+            await requestPublish(skill, message);
         });
     };
 
     const handleContribute = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
+        showActionPreview(skill, 'contribute', `Contribute "${skill.name}" to Global`, async (message) => {
+            await contributeSkill(skill, message);
+        });
+    };
+
+    const handleMoveToSpace = (e: React.MouseEvent, skill: Skill) => {
+        e.stopPropagation();
+        setMoveToSpaceDialog({ isOpen: true, skill });
+    };
+
+    const doMoveToSpace = (skill: Skill, spaceId: string, spaceName: string) => {
+        setMoveToSpaceDialog({ isOpen: false, skill: null });
         setDialogState({
             isOpen: true,
-            title: 'Contribute to Global',
-            description: `Contribute the latest approved version of "${skill.name}" to global? An admin will review it before it becomes a shared global skill.`,
-            variant: 'primary',
-            confirmText: 'Contribute',
-            onConfirm: () => { publishSkill(skill, true).catch((err: any) => showError(err?.message || String(err))); }
+            title: 'Move to Space',
+            description: `Move "${skill.name}" to "${spaceName}"? It will be removed from your personal skills.`,
+            variant: 'warning',
+            confirmText: 'Move',
+            onConfirm: () => {
+                rpcMoveToSpace(sendRpc, String(skill.id), spaceId, currentWorkspace?.id)
+                    .then(() => loadSkills())
+                    .catch((err: any) => showError(err?.message || String(err)));
+            },
         });
     };
 
@@ -369,7 +341,7 @@ export function SkillsPage() {
             description: `This will fork "${skill.name}" into your personal skills. You can edit and customize the fork, and optionally contribute changes back to global.`,
             variant: 'primary',
             confirmText: 'Fork Skill',
-            onConfirm: () => { copyToPersonal(skill); }
+            onConfirm: () => { copyToPersonal(skill).catch((err: any) => showError(err?.message || 'Fork failed')); }
         });
     };
 
@@ -378,37 +350,27 @@ export function SkillsPage() {
         voteSkill(skill, vote);
     };
 
-    const handleRevert = (e: React.MouseEvent, skill: Skill) => {
+    const handleWithdrawSubmit = (e: React.MouseEvent, skill: Skill) => {
         e.stopPropagation();
-        setRevertDialog({ isOpen: true, skill, reason: '' });
-    };
-
-    const confirmRevert = () => {
-        if (revertDialog.skill) {
-            revertSkill(revertDialog.skill, revertDialog.reason || undefined);
-        }
-        setRevertDialog({ isOpen: false, skill: null, reason: '' });
-    };
-
-    const handleWithdraw = (e: React.MouseEvent, skill: Skill) => {
-        e.stopPropagation();
-        const isSkillSpace = skill.scope === 'skillset';
-        const isContributionRequest = skill.contributionStatus === 'pending' && skill.reviewStatus !== 'pending';
         setDialogState({
             isOpen: true,
-            title: isContributionRequest
-                ? 'Withdraw Contribution Request'
-                : isSkillSpace
-                    ? 'Withdraw Merge Request'
-                    : 'Withdraw Publish Request',
-            description: isContributionRequest
-                ? `Withdraw the contribution request for "${skill.name}"? The latest merged/published version will stay unchanged.`
-                : isSkillSpace
-                    ? `Withdraw the merge request for "${skill.name}"? The working copy will stay in Skill Space.`
-                    : `Withdraw the publish request for "${skill.name}"? The skill will revert to its previous state.`,
+            title: 'Withdraw Review',
+            description: `Withdraw the review request for "${skill.name}"?`,
             variant: 'warning',
             confirmText: 'Withdraw',
-            onConfirm: () => { doWithdraw(skill); }
+            onConfirm: () => { withdrawSubmit(skill).catch((err: any) => showError(err?.message || String(err))); }
+        });
+    };
+
+    const handleWithdrawContribute = (e: React.MouseEvent, skill: Skill) => {
+        e.stopPropagation();
+        setDialogState({
+            isOpen: true,
+            title: 'Withdraw Contribution',
+            description: `Withdraw the contribution request for "${skill.name}"?`,
+            variant: 'warning',
+            confirmText: 'Withdraw',
+            onConfirm: () => { withdrawContribute(skill).catch((err: any) => showError(err?.message || String(err))); }
         });
     };
 
@@ -439,19 +401,27 @@ export function SkillsPage() {
 
         const actions: SkillCardAction[] = [
             {
-                key: 'withdraw',
-                tooltip: 'Withdraw',
+                key: 'withdraw-submit',
+                tooltip: 'Withdraw Review',
                 icon: RotateCcw,
                 tone: 'orange',
-                hidden: !(skill.scope === 'personal' || skill.scope === 'skillset') || (skill.reviewStatus !== 'pending' && skill.contributionStatus !== 'pending'),
-                onClick: (e) => handleWithdraw(e, skill),
+                hidden: skill.scope !== 'personal' || skill.reviewStatus !== 'pending',
+                onClick: (e) => handleWithdrawSubmit(e, skill),
+            },
+            {
+                key: 'withdraw-contribute',
+                tooltip: 'Withdraw Contribution',
+                icon: RotateCcw,
+                tone: 'orange',
+                hidden: skill.scope !== 'personal' || skill.contributionStatus !== 'pending',
+                onClick: (e) => handleWithdrawContribute(e, skill),
             },
             {
                 key: 'publish',
                 tooltip: 'Request Publish',
                 icon: SendHorizontal,
                 tone: 'blue',
-                hidden: skill.scope !== 'personal' || skill.reviewStatus === 'pending',
+                hidden: skill.scope !== 'personal' || !skill.canSubmit,
                 onClick: (e) => handlePublish(e, skill),
             },
             {
@@ -459,20 +429,23 @@ export function SkillsPage() {
                 tooltip: 'Contribute to Global',
                 icon: Upload,
                 tone: 'blue',
-                hidden: !(
-                    (skill.scope === 'personal' || skill.scope === 'skillset') &&
-                    skill.reviewStatus === 'approved' &&
-                    !skill.hasUnpublishedChanges &&
-                    skill.contributionStatus === 'none'
-                ),
+                hidden: skill.scope !== 'personal' || !skill.canContribute,
                 onClick: (e) => handleContribute(e, skill),
+            },
+            {
+                key: 'move-to-space',
+                tooltip: 'Move to Space',
+                icon: Users,
+                tone: 'green',
+                hidden: !(skill.scope === 'personal' && skillSpaces.length > 0),
+                onClick: (e) => handleMoveToSpace(e, skill),
             },
             {
                 key: 'copy',
                 tooltip: 'Fork to Personal',
                 icon: GitFork,
                 tone: 'purple',
-                hidden: skill.scope === 'personal',
+                hidden: skill.scope !== 'builtin' && skill.scope !== 'global',
                 onClick: (e) => handleCopy(e, skill),
             },
             {
@@ -480,39 +453,36 @@ export function SkillsPage() {
                 tooltip: 'Submit Merge',
                 icon: Upload,
                 tone: 'blue',
-                hidden: skill.scope !== 'skillset' || skill.reviewStatus === 'pending' || (skill.reviewStatus === 'approved' && !skill.hasUnpublishedChanges),
+                hidden: true, // Skillset skills are read-only synced snapshots; no merge request
                 onClick: (e) => handlePublish(e, skill),
-            },
-            {
-                key: 'revert',
-                tooltip: 'Revert to Personal',
-                icon: Undo2,
-                tone: 'orange',
-                hidden: !(isAdmin && skill.scope === 'global'),
-                onClick: (e) => handleRevert(e, skill),
             },
             {
                 key: 'history',
                 tooltip: 'Version History',
                 icon: GitCommitHorizontal,
                 tone: 'indigo',
-                hidden: !(skill.scope === 'personal' || (isAdmin && skill.scope === 'global')),
-                onClick: (e) => { e.stopPropagation(); navigate(`/skills/${skill.id}?history=true`); },
-            },
-            {
-                key: 'diff',
-                tooltip: 'View Diff',
-                icon: Eye,
-                tone: 'cyan',
-                hidden: !(skill.scope === 'personal' && (skill.forkedFromId || (skill.publishedVersion && skill.publishedVersion > 0))),
-                onClick: (e) => { e.stopPropagation(); handleSkillDiff(skill); },
+                hidden: !(skill.scope === 'personal' || skill.scope === 'global'),
+                onClick: (e) => {
+                    e.stopPropagation();
+                    const tag = skill.scope === 'global' ? 'published' as const : 'approved' as const;
+                    const title = skill.scope === 'global' ? 'Version History' : 'Prod History';
+                    setHistoryDrawer({ isOpen: true, skillId: String(skill.id), skillName: skill.name, tag, title });
+                },
             },
             {
                 key: 'open',
-                tooltip: skill.scope === 'personal' || skill.scope === 'skillset' ? 'Configure Skill' : 'View Details',
-                icon: skill.scope === 'personal' || skill.scope === 'skillset' ? Settings : Eye,
+                tooltip: skill.scope === 'personal' ? 'Edit' : 'View Details',
+                icon: skill.scope === 'personal' ? Pencil : Eye,
                 tone: 'primary',
                 onClick: () => navigate(`/skills/${skill.id}`),
+            },
+            {
+                key: 'download',
+                tooltip: 'Download',
+                icon: Download,
+                tone: 'default',
+                hidden: skill.scope === 'builtin',
+                onClick: (e) => { e.stopPropagation(); downloadSkillExport(sendRpc, [String(skill.id)]).catch(err => showError(err?.message || 'Download failed')); },
             },
             {
                 key: 'delete',
@@ -551,6 +521,8 @@ export function SkillsPage() {
                     <span>{skill.downvotes || 0}</span>
                 </button>
             </div>
+        ) : skill.scope === 'personal' ? (
+            <SkillLifecycleStatus skill={skill} />
         ) : undefined;
 
         return (
@@ -581,51 +553,67 @@ export function SkillsPage() {
                 confirmText={dialogState.confirmText}
             />
 
-            {/* Revert Dialog with reason textarea */}
-            {revertDialog.isOpen && (
+            {/* Move to Space picker */}
+            {moveToSpaceDialog.isOpen && moveToSpaceDialog.skill && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
                     <div
                         className="absolute inset-0 bg-gray-900/40 backdrop-blur-sm"
-                        onClick={() => setRevertDialog({ isOpen: false, skill: null, reason: '' })}
+                        onClick={() => setMoveToSpaceDialog({ isOpen: false, skill: null })}
                     />
-                    <div className="relative w-full max-w-md bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+                    <div className="relative w-full max-w-sm bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden animate-in fade-in zoom-in-95 duration-200">
                         <div className="p-6">
-                            <div className="flex items-start gap-4">
-                                <div className="p-3 rounded-xl bg-orange-50 flex-shrink-0">
-                                    <Undo2 className="w-6 h-6 text-orange-600" />
-                                </div>
-                                <div className="flex-1 pt-1">
-                                    <h3 className="text-lg font-semibold text-gray-900 mb-2">Revert to Personal</h3>
-                                    <p className="text-sm text-gray-500 mb-4">
-                                        This will move "{revertDialog.skill?.name}" back to the author's personal library.
-                                    </p>
-                                    <textarea
-                                        value={revertDialog.reason}
-                                        onChange={(e) => setRevertDialog(prev => ({ ...prev, reason: e.target.value }))}
-                                        placeholder="Reason for revert (optional)"
-                                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-200 resize-none"
-                                        rows={3}
-                                    />
-                                </div>
+                            <h3 className="text-base font-semibold text-gray-900 mb-1">Move to Space</h3>
+                            <p className="text-sm text-gray-500 mb-4">
+                                Move "{moveToSpaceDialog.skill.name}" to a skill space. It will be removed from your personal skills.
+                            </p>
+                            <div className="space-y-1">
+                                {skillSpaces.map(space => (
+                                    <button
+                                        key={space.id}
+                                        onClick={() => doMoveToSpace(moveToSpaceDialog.skill!, space.id, space.name)}
+                                        className="w-full text-left px-3 py-2.5 rounded-lg hover:bg-green-50 transition-colors flex items-center gap-2 group"
+                                    >
+                                        <Users className="w-4 h-4 text-gray-400 group-hover:text-green-600" />
+                                        <span className="text-sm font-medium text-gray-900">{space.name}</span>
+                                    </button>
+                                ))}
                             </div>
-                            <div className="mt-6 flex items-center justify-end gap-3">
-                                <button
-                                    onClick={() => setRevertDialog({ isOpen: false, skill: null, reason: '' })}
-                                    className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
-                                >
-                                    Cancel
-                                </button>
-                                <button
-                                    onClick={confirmRevert}
-                                    className="px-4 py-2 text-sm font-medium text-white bg-orange-600 hover:bg-orange-700 rounded-lg shadow-sm transition-all"
-                                >
-                                    Revert
-                                </button>
-                            </div>
+                        </div>
+                        <div className="border-t px-6 py-3 flex justify-end">
+                            <button
+                                onClick={() => setMoveToSpaceDialog({ isOpen: false, skill: null })}
+                                className="px-3 py-1.5 text-sm text-gray-500 hover:text-gray-700"
+                            >
+                                Cancel
+                            </button>
                         </div>
                     </div>
                 </div>
             )}
+
+            <DiffPreviewDialog
+                isOpen={previewAction.isOpen}
+                title={previewAction.title}
+                loading={previewAction.loading}
+                diff={previewAction.diff}
+                onClose={() => setPreviewAction(prev => ({ ...prev, isOpen: false }))}
+                onConfirm={async (message) => {
+                    setPreviewAction(prev => ({ ...prev, isOpen: false }));
+                    try { await previewAction.onConfirm(message); }
+                    catch (err: any) { showError(err?.message || String(err)); }
+                }}
+            />
+
+            <VersionHistoryDrawer
+                isOpen={historyDrawer.isOpen}
+                skillId={historyDrawer.skillId}
+                skillName={historyDrawer.skillName}
+                tag={historyDrawer.tag}
+                title={historyDrawer.title}
+                sendRpc={sendRpc}
+                onClose={() => setHistoryDrawer(prev => ({ ...prev, isOpen: false }))}
+                onRollback={() => loadSkills()}
+            />
 
             {/* Header */}
             <header className="h-16 flex items-center justify-between px-6 bg-white sticky top-0 z-10">
@@ -633,7 +621,6 @@ export function SkillsPage() {
                 {/* Tabs */}
                 <div className="flex gap-2">
                     {[
-                        { id: 'all', label: 'All Skills', icon: LayoutGrid },
                         { id: 'global', label: 'Global', icon: Shield },
                         { id: 'myskills', label: 'My Skills', icon: User },
                     ].map((tab) => (
@@ -794,7 +781,7 @@ export function SkillsPage() {
                         <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
                     </div>
                 ) : activeTab === 'approvals' ? (
-                    <div className="max-w-4xl mx-auto space-y-4">
+                    <div className="space-y-4">
                         {displaySkills.map((skill) => {
                             const isContributionReview = skill.contributionStatus === 'pending';
                             const isScriptReview = skill.reviewStatus === 'pending' && !isContributionReview;
@@ -823,7 +810,7 @@ export function SkillsPage() {
                         )}
                     </div>
                 ) : (
-                    <div className="max-w-6xl mx-auto">
+                    <div>
                         {displaySkills.filter(s => activeTab === 'myskills' ? s.scope === 'personal' : true).length === 0 && !isLoading && activeTab !== 'myskills' ? (
                             <div className="flex flex-col items-center justify-center py-20 text-gray-400 text-sm">
                                 <Users className="w-8 h-8 mb-3 opacity-20" />
@@ -845,18 +832,37 @@ export function SkillsPage() {
                         {/* Shared view — skill space cards in grid */}
                         {activeTab === 'myskills' && myView === 'shared' && skillSpaceEnabled ? (
                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                                {skillSpaceGroups.map(({ skillSpace, skills: spaceSkills }) => (
+                                {skillSpaceGroups.map(({ skillSpace, skills: spaceSkills }) => {
+                                    const isEnabled = skillSpace.enabled !== false;
+                                    return (
                                     <div key={skillSpace.id} onClick={() => navigate(`/skills/spaces/${skillSpace.id}`)}
-                                        className="group rounded-xl border p-6 hover:shadow-md transition-all duration-200 flex flex-col cursor-pointer bg-white border-gray-200 hover:border-gray-300">
-                                        {(() => {
-                                            const pendingCount = spaceSkills.filter(skill => skill.reviewStatus === 'pending').length;
-                                            const shadowCount = spaceSkills.filter(skill => skill.globalSkillId).length;
-                                            return (
-                                                <>
+                                        className={cn(
+                                            "group rounded-xl border p-6 hover:shadow-md transition-all duration-200 flex flex-col cursor-pointer",
+                                            isEnabled
+                                                ? "bg-white border-gray-200 hover:border-gray-300"
+                                                : "bg-gray-50/80 border-gray-100 opacity-60"
+                                        )}>
                                         <div className="flex items-start justify-between mb-3">
-                                            <div className="p-2 rounded-lg bg-green-50">
-                                                <Users className="w-5 h-5 text-green-600" />
+                                            <div className={cn("p-2 rounded-lg", isEnabled ? "bg-green-50" : "bg-gray-100")}>
+                                                <Users className={cn("w-5 h-5", isEnabled ? "text-green-600" : "text-gray-400")} />
                                             </div>
+                                            <button
+                                                onClick={async (e) => {
+                                                    e.stopPropagation();
+                                                    await rpcSetSkillSpaceEnabled(sendRpc, skillSpace.id, !isEnabled);
+                                                    rpcListSkillSpaces(sendRpc, currentWorkspace!.id).then(setSkillSpaces).catch(() => {});
+                                                }}
+                                                className={cn(
+                                                    "relative inline-flex h-6 w-11 items-center rounded-full transition-colors shrink-0",
+                                                    isEnabled ? "bg-green-500" : "bg-gray-200"
+                                                )}
+                                                title={isEnabled ? 'Enabled' : 'Disabled'}
+                                            >
+                                                <span className={cn(
+                                                    "inline-block h-4 w-4 transform rounded-full bg-white transition-transform",
+                                                    isEnabled ? "translate-x-6" : "translate-x-1"
+                                                )} />
+                                            </button>
                                         </div>
                                         <h3 className="font-semibold text-sm text-gray-900 mb-1 truncate">{skillSpace.name}</h3>
                                         <p className="text-xs text-gray-500 line-clamp-2 flex-1 mb-3">{skillSpace.description || 'No description'}</p>
@@ -864,23 +870,19 @@ export function SkillsPage() {
                                             <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-green-50 text-green-600 border border-green-200">
                                                 {spaceSkills.length} skills
                                             </span>
-                                            {pendingCount > 0 && (
-                                                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
-                                                    {pendingCount} pending
-                                                </span>
-                                            )}
-                                            {shadowCount > 0 && (
-                                                <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200">
-                                                    {shadowCount} shadowing
-                                                </span>
-                                            )}
+                                            {(() => {
+                                                const pendingCount = spaceSkills.filter(skill => skill.reviewStatus === 'pending').length;
+                                                return pendingCount > 0 ? (
+                                                    <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                                                        {pendingCount} pending
+                                                    </span>
+                                                ) : null;
+                                            })()}
                                             <span className="text-[10px] text-gray-400">{skillSpace.memberRole || 'maintainer'}</span>
                                         </div>
-                                                </>
-                                            );
-                                        })()}
                                     </div>
-                                ))}
+                                    );
+                                })}
                                 <button onClick={() => setSkillSpaceDialog({ isOpen: true, mode: 'create', newName: '', newDescription: '' })}
                                     className="group rounded-xl border-2 border-dashed border-gray-200 p-6 flex flex-col items-center justify-center text-gray-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50/50 transition-all gap-3 min-h-[200px]">
                                     <div className="p-3 rounded-full bg-gray-50 group-hover:bg-white">
@@ -961,15 +963,6 @@ export function SkillsPage() {
                 </div>
             )}
 
-            <DiffViewerModal
-                isOpen={personalDiffModal.isOpen}
-                onClose={() => setPersonalDiffModal(prev => ({ ...prev, isOpen: false }))}
-                title={personalDiffModal.title}
-                subtitle={personalDiffModal.subtitle}
-                diffText={personalDiffModal.diffText}
-                metadataChanges={personalDiffModal.metadataChanges}
-                isLoading={personalDiffModal.isLoading}
-            />
         </div>
     );
 }
@@ -992,6 +985,27 @@ const SEVERITY_ICONS: Record<string, typeof AlertTriangle> = {
 
 // ─── Script Review Approval Card ─────────────────────
 
+function InlineDiffSection({ title, badge, defaultOpen, children }: {
+    title: string; badge: string; defaultOpen?: boolean; children: React.ReactNode;
+}) {
+    const [open, setOpen] = useState(defaultOpen ?? false);
+    const badgeColor = badge === 'added' ? 'text-green-600 bg-green-50' :
+        badge === 'removed' ? 'text-red-600 bg-red-50' :
+        badge.includes('change') ? 'text-gray-500 bg-gray-50' :
+        'text-blue-600 bg-blue-50';
+    return (
+        <div className="border border-gray-200 rounded-lg overflow-hidden">
+            <button onClick={() => setOpen(!open)}
+                className={cn("w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-gray-700 transition-colors", open ? "bg-gray-50" : "hover:bg-gray-50")}>
+                {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" /> : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                <span className="font-mono">{title}</span>
+                <span className={cn("ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded", badgeColor)}>{badge}</span>
+            </button>
+            {open && <div className="border-t border-gray-100 p-3">{children}</div>}
+        </div>
+    );
+}
+
 function ScriptReviewApprovalCard({
     skill, isScriptReview, isContributionReview, isAdmin, sendRpc,
     onApproveContribution, onRejectContribution, onReviewDecision, onNavigate,
@@ -1012,11 +1026,8 @@ function ScriptReviewApprovalCard({
     const [loading, setLoading] = useState(false);
     const [reason, setReason] = useState('');
     const [submitting, setSubmitting] = useState(false);
-    const [expandedScripts, setExpandedScripts] = useState<Set<string>>(new Set());
-    const [diffText, setDiffText] = useState<string | null>(null);
-    const [metadataChanges, setMetadataChanges] = useState<SkillDiffMetadataChange[]>([]);
+    const [diffResult, setDiffResult] = useState<import('./skillsData').PreviewDiffResult | null>(null);
     const [diffLoading, setDiffLoading] = useState(false);
-    const [diffModalOpen, setDiffModalOpen] = useState(false);
     const [confirmDialog, setConfirmDialog] = useState<{
         isOpen: boolean;
         title: string;
@@ -1034,22 +1045,20 @@ function ScriptReviewApprovalCard({
             return;
         }
         setExpanded(true);
-
         setLoading(true);
+        setDiffLoading(true);
         try {
-            const fetches: Promise<any>[] = [
+            const action = isContributionReview ? 'contribute' as const : 'submit' as const;
+            const [skillData, reviewData, diff] = await Promise.all([
                 rpcGetSkillById(sendRpc, String(skill.id)),
                 rpcGetSkillReview(sendRpc, String(skill.id)),
-            ];
-
-            const results = await Promise.all(fetches);
-            setFullSkill(results[0]);
-            if (results[1]) {
-                setReviews(results[1].reviews);
-            }
+                rpcPreviewDiff(sendRpc, String(skill.id), action).catch(() => null),
+            ]);
+            setFullSkill(skillData);
+            if (reviewData) setReviews(reviewData.reviews);
+            setDiffResult(diff);
         } catch (err: any) {
-            const msg = err?.message || String(err);
-            if (msg.includes('Skill not found')) {
+            if (err?.message?.includes('Skill not found')) {
                 setDeleted(true);
                 setExpanded(false);
             } else {
@@ -1057,31 +1066,6 @@ function ScriptReviewApprovalCard({
             }
         } finally {
             setLoading(false);
-        }
-    };
-
-    const handleLoadDiff = async () => {
-        if (diffText !== null) {
-            setDiffModalOpen(true);
-            return;
-        }
-        setDiffLoading(true);
-        setDiffModalOpen(true);
-        try {
-            const diffResult = await rpcGetSkillDiff(
-                sendRpc,
-                String(skill.id),
-                isContributionReview,
-                undefined,
-                isContributionReview ? 'global' : undefined,
-            );
-            setDiffText(diffResult.diff || 'No changes detected.');
-            setMetadataChanges(diffResult.metadataChanges ?? []);
-        } catch (err) {
-            console.error('[Approvals] Failed to load diff:', err);
-            setDiffText('Failed to load diff.');
-            setMetadataChanges([]);
-        } finally {
             setDiffLoading(false);
         }
     };
@@ -1138,15 +1122,6 @@ function ScriptReviewApprovalCard({
                 onConfirm: () => executeDecision('reject'),
             });
         }
-    };
-
-    const toggleScript = (name: string) => {
-        setExpandedScripts(prev => {
-            const next = new Set(prev);
-            if (next.has(name)) next.delete(name);
-            else next.add(name);
-            return next;
-        });
     };
 
     const aiReview = reviews.find(r => r.reviewerType === 'ai');
@@ -1206,17 +1181,6 @@ function ScriptReviewApprovalCard({
                 description={errorDialog.message}
                 variant="danger"
                 confirmText="OK"
-            />
-            <DiffViewerModal
-                isOpen={diffModalOpen}
-                onClose={() => setDiffModalOpen(false)}
-                title={`${skill.name} Diff`}
-                subtitle={skill.scope === 'skillset'
-                    ? (isContributionReview ? 'Latest global -> Contribution staging' : 'Merged snapshot -> Merge staging')
-                    : (isContributionReview ? 'Latest global -> Contribution staging' : 'Published -> Staging')}
-                diffText={diffText}
-                metadataChanges={metadataChanges}
-                isLoading={diffLoading}
             />
             {/* Header row */}
             <div
@@ -1358,70 +1322,61 @@ function ScriptReviewApprovalCard({
                                 </div>
                             )}
 
-                            {/* Diff section */}
-                            {(isScriptReview || isContributionReview) && (
-                                <div className="bg-white rounded-lg border border-gray-200 p-4 flex items-center justify-between gap-4">
-                                    <div>
-                                        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Changes</h4>
-                                        <p className="text-sm text-gray-500">
-                                            Review this diff in a dedicated viewer with file grouping and split/unified modes.
-                                        </p>
-                                    </div>
-                                    <button
-                                        onClick={handleLoadDiff}
-                                        className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg hover:bg-indigo-100 transition-colors"
-                                    >
-                                        {diffLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <GitCommitHorizontal className="w-4 h-4" />}
-                                        Open Diff Viewer
-                                    </button>
+                            {/* Inline diff (loaded with expand) */}
+                            {diffLoading ? (
+                                <div className="bg-white rounded-lg border border-gray-200 p-4 flex items-center justify-center py-8">
+                                    <Loader2 className="w-4 h-4 animate-spin text-gray-400 mr-2" />
+                                    <span className="text-sm text-gray-400">Loading diff...</span>
                                 </div>
-                            )}
-
-                            {/* Scripts */}
-                            {(() => {
-                                const displayScripts = fullSkill?.scripts;
-                                return displayScripts && displayScripts.length > 0 ? (
-                                <div className="bg-white rounded-lg border border-gray-200 p-4">
-                                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">
-                                        Scripts
-                                    </h4>
-                                    <div className="space-y-2">
-                                        {displayScripts.map((script) => (
-                                            <div key={script.id} className="border border-gray-100 rounded-lg overflow-hidden">
-                                                <button
-                                                    onClick={() => toggleScript(script.name)}
-                                                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-gray-50 transition-colors"
-                                                >
-                                                    <div className={cn(
-                                                        "w-6 h-6 rounded flex items-center justify-center shrink-0",
-                                                        script.info === 'python' ? 'bg-blue-50 text-blue-600' : 'bg-green-50 text-green-600'
-                                                    )}>
-                                                        {script.info === 'python' ? <FileCode className="w-3 h-3" /> : <Terminal className="w-3 h-3" />}
+                            ) : diffResult ? (
+                                <div className="bg-white rounded-lg border border-gray-200 p-4 space-y-2">
+                                    <div className="flex items-center gap-3 mb-2">
+                                        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Changes</h4>
+                                        <span className="text-[10px] text-gray-400">{diffResult.fromLabel} → {diffResult.toLabel}</span>
+                                    </div>
+                                    {diffResult.isNew ? (
+                                        <p className="text-sm text-gray-500">New skill — no previous version to compare.</p>
+                                    ) : !diffResult.hasChanges ? (
+                                        <p className="text-sm text-gray-500">No changes detected.</p>
+                                    ) : (() => {
+                                        const sections: Array<{ key: string; title: string; badge: string; content: React.ReactNode }> = [];
+                                        if (diffResult.metadataChanges.length > 0) {
+                                            sections.push({
+                                                key: 'metadata', title: 'Metadata', badge: `${diffResult.metadataChanges.length} change(s)`,
+                                                content: (
+                                                    <div className="space-y-1">
+                                                        {diffResult.metadataChanges.map(c => (
+                                                            <div key={c.field} className="text-xs">
+                                                                <span className="font-medium text-gray-700">{c.field}: </span>
+                                                                {c.from && <span className="text-red-600 line-through">{c.from}</span>}
+                                                                {c.from && c.to && <span className="text-gray-400 mx-1">→</span>}
+                                                                {c.to && <span className="text-green-600">{c.to}</span>}
+                                                            </div>
+                                                        ))}
                                                     </div>
-                                                    <span className="font-medium text-gray-700 flex-1">{script.name}</span>
-                                                    {expandedScripts.has(script.name)
-                                                        ? <ChevronUp className="w-3.5 h-3.5 text-gray-400" />
-                                                        : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
-                                                </button>
-                                                {expandedScripts.has(script.name) && (
-                                                    <pre className="p-3 bg-[#1e1e1e] text-[#d4d4d4] text-xs font-mono overflow-x-auto max-h-64 overflow-y-auto">
-                                                        {script.content}
-                                                    </pre>
-                                                )}
-                                            </div>
-                                        ))}
-                                    </div>
+                                                ),
+                                            });
+                                        }
+                                        if (diffResult.specsDiff) {
+                                            sections.push({
+                                                key: 'specs', title: 'SKILL.md', badge: 'modified',
+                                                content: <DiffBlock content={diffResult.specsDiff} />,
+                                            });
+                                        }
+                                        for (const s of diffResult.scriptDiffs.filter(d => d.status !== 'unchanged')) {
+                                            sections.push({
+                                                key: s.name, title: `scripts/${s.name}`, badge: s.status,
+                                                content: s.diff ? <DiffBlock content={s.diff} /> : <p className="text-xs text-gray-400">No content changes.</p>,
+                                            });
+                                        }
+                                        return sections.map((sec, i) => (
+                                            <InlineDiffSection key={sec.key} title={sec.title} badge={sec.badge} defaultOpen={i === 0}>
+                                                {sec.content}
+                                            </InlineDiffSection>
+                                        ));
+                                    })()}
                                 </div>
-                                ) : null;
-                            })()}
-
-                            {/* SKILL.md preview */}
-                            {fullSkill?.specs && (
-                                <div className="bg-white rounded-lg border border-gray-200 p-4">
-                                    <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">SKILL.md (Specs)</h4>
-                                    <pre className="text-xs text-gray-600 bg-gray-50 rounded-lg p-3 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">{fullSkill.specs}</pre>
-                                </div>
-                            )}
+                            ) : null}
 
                             {/* Admin actions (unified for both publish and contribution reviews) */}
                             {isAdmin && (isScriptReview || isContributionReview) && (

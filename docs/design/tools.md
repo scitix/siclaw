@@ -101,43 +101,37 @@ as a contract with the LLM, not a comment for humans.
 
 ## 3. Command Execution Tools (`cmd-exec/`)
 
-These tools execute user-provided commands. They share a unified security
-pipeline via `security-pipeline.ts`:
+These tools execute user-provided commands on remote K8s targets. They **must**
+follow this orchestration flow — skipping any step is a security risk:
 
 ```
-Step 1: resolveRequiredKubeconfig()            → infra/kubeconfig-resolver.ts
-Step 2: prepareExecEnv()                       → infra/exec-utils.ts
-Step 3: validateTarget() [node or pod name]    → infra/exec-utils.ts
-Step 4: preExecSecurity(cmd, { context, ... }) → infra/security-pipeline.ts  ⚠️ MANDATORY
-          ├── validateCommand (6-pass pipeline)
-          └── resolveOutputAction (determine sanitizer)
-Step 5: checkReady() [node or pod]             → infra/k8s-checks.ts
-Step 6: buildCommand() [tool-specific]
-Step 7: run() [debug pod / kubectl exec / shell]
-Step 8: postExecSecurity(stdout, action, { stderr }) → infra/security-pipeline.ts  ⚠️ MANDATORY
-          ├── applySanitizer (stdout only)
-          ├── redactSensitiveContent (if hasSensitiveKubectl)
-          └── processToolOutput (strip ANSI + truncate)
+Step  1: resolveRequiredKubeconfig()          → infra/kubeconfig-resolver.ts
+Step  2: prepareExecEnv()                     → infra/exec-utils.ts
+Step  3: validateTarget() [node or pod name]  → infra/exec-utils.ts
+Step  4: validateCommand(cmd, { context })    → infra/command-validator.ts  ⚠️ MANDATORY
+Step  5: checkReady() [node or pod]           → infra/k8s-checks.ts
+Step  6: analyzeOutput(binary, args)          → infra/output-sanitizer.ts  ⚠️ MANDATORY
+Step  7: buildCommand() [tool-specific]
+Step  8: run() [debug pod / kubectl exec]
+Step  9: applySanitizer(stdout, action)       → infra/output-sanitizer.ts  ⚠️ MANDATORY
+Step 10: formatExecOutput() / processToolOutput() → infra/exec-utils.ts / tool-render.ts
 ```
 
-**Steps 4 and 8 are non-negotiable security requirements.** `preExecSecurity`
-validates the command and determines the output sanitizer. `postExecSecurity`
-sanitizes stdout, combines with stderr, and truncates. Tools MUST NOT call
-`processToolOutput` directly — it is only called inside `postExecSecurity`.
-
-**Note**: `restricted_bash` skips steps 1-3, 5 (local execution, no K8s target).
+**Steps 4, 6, 9 are non-negotiable security requirements.** They ensure:
+- Only whitelisted commands execute (Step 4)
+- Sensitive data in output is detected pre-execution (Step 6)
+- Output is sanitized post-execution before reaching the LLM (Step 9)
 
 ### Variation Points
 
-| Point | node\_exec | pod\_exec | restricted\_bash |
-|-------|-----------|----------|-----------------|
-| Context | `"node"` | `"pod"` | `"local"` |
-| Target validation | `validateNodeName` | `validatePodName` | None |
-| Ready check | `checkNodeReady` | `checkPodRunning` | None |
-| Command build | nsenter wrap (+ `ip netns exec` when `netns` param set) | kubectl exec args | Shell command (+ sudo in production) |
-| Pipeline support | Yes (`analyzeTarget: "last-in-pipeline"`) | No (`blockPipeline: true`) | Full shell (`analyzeTarget: "auto"`) |
-| Execution | `runInDebugPod` | `execFileAsync("kubectl")` | `exec()` with `/bin/bash` |
-| Post-exec extras | `filterPodNoise(stderr)` | — | `hasSensitiveKubectl` flag |
+| Point | node\_exec | pod\_exec |
+|-------|-----------|----------|
+| Context | `"node"` | `"pod"` |
+| Target validation | `validateNodeName` | `validatePodName` |
+| Ready check | `checkNodeReady` | `checkPodRunning` |
+| Command build | nsenter wrap (+ `ip netns exec` when `netns` param set) | kubectl exec args |
+| Pipeline support | Yes (pipes, `&&`, `;`) | No (`blockPipeline: true`) |
+| Execution | `runInDebugPod` | `execFileAsync("kubectl")` |
 
 **Pod network namespace diagnostics**: To run host-level tools in a pod's
 network namespace, use `resolve_pod_netns` (in `query/`) to get the netns name,
@@ -148,23 +142,20 @@ then call `node_exec` with the `netns` parameter. This replaces the former
 
 ## 4. Script Execution Tools (`script-exec/`)
 
-These tools execute pre-approved skill scripts. The orchestration flow
-**omits pre-exec security** (scripts are reviewed before deployment) but
-still routes output through `postExecSecurity` for truncation:
+These tools execute pre-approved skill scripts. The orchestration flow is
+similar but **omits command validation and output sanitization** (scripts are
+reviewed before deployment):
 
 ```
 Step 1: resolveRequiredKubeconfig()
 Step 2: prepareExecEnv()
 Step 3: validateTarget() [node or pod name]
 Step 4: checkReady()
-Step 5: resolveScript()                            → infra/script-resolver.ts
+Step 5: resolveScript()                       → infra/script-resolver.ts
 Step 6: buildCommand() [base64 inject or stdin pipe]
-Step 7: run() [debug pod / kubectl exec / spawn]
-Step 8: postExecSecurity(stdout, null, { stderr })  → infra/security-pipeline.ts
-          └── processToolOutput (strip ANSI + truncate; no sanitization — action is null)
+Step 7: run() [debug pod / kubectl exec]
+Step 8: formatExecOutput()
 ```
-
-**Note**: `local_script` skips steps 1-4 (local execution, no K8s target).
 
 ### Script Transmission Methods
 
@@ -476,23 +467,17 @@ Key design decisions to resolve:
 
 ### 8.2 Security Pipeline Unified Entry (Done)
 
-`src/tools/infra/security-pipeline.ts` provides two facade functions:
+`src/tools/infra/security-pipeline.ts` provides three facade functions:
 
-- `preExecSecurity(command, opts?)` — validates command + determines output sanitizer (cmd-exec only)
-- `postExecSecurity(stdout, action, { stderr?, hasSensitiveKubectl? })` — sanitize stdout + combine stderr + truncate (ALL tools)
+- `preExecSecurity(command, opts?)` — validates command + determines output sanitizer
+- `sanitizeExecOutput(stdout, action, opts?)` — sanitization only (for tools with external truncation, e.g., node-exec via `formatExecOutput`)
+- `postExecSecurity(stdout, action, opts?)` — sanitization + truncation (for pod-exec, restricted-bash)
 
-`postExecSecurity` is the **single output gate** — `processToolOutput` is called
-only inside it. No tool should call `processToolOutput` directly. Sanitization
-applies to stdout only (not stderr), preserving JSON validity when kubectl
-outputs valid JSON to stdout and warnings to stderr.
-
-The `analyzeTarget` option (`"single"` | `"last-in-pipeline"` | `"auto"`) in
-`preExecSecurity` controls which command in a pipeline determines the sanitizer.
+Tools call `preExecSecurity` before execution, then `postExecSecurity` or `sanitizeExecOutput` after. The `analyzeTarget` option (`"single"` | `"last-in-pipeline"` | `"auto"`) controls which command in a pipeline determines the output sanitizer.
 
 Also completed in this change:
 - Directory restructure: `k8s-exec/` + `k8s-script/` + `shell/` → `cmd-exec/` + `script-exec/` (classified by security model)
 - Deprecated exports cleanup: removed `ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`, `CONTEXT_CATEGORIES`; replaced with `getContextAllowedSet()` in `command-sets.ts`
-- Removed `formatExecOutput` from `exec-utils.ts` (bundled 5 concerns, only 2 callers — inlined)
 
 **Files**: `src/tools/infra/security-pipeline.ts`, `src/tools/cmd-exec/`, `src/tools/script-exec/`
 
@@ -527,17 +512,19 @@ makes the debug pod subsystem itself harder to maintain.
 
 **Files**: `src/tools/infra/debug-pod.ts`
 
-### 8.5 Extract `llmCompleteWithTool` to Shared Location (Done)
+### 8.5 Extract `llmCompleteWithTool` to Shared Location (Medium)
 
-Extracted general-purpose LLM utilities from `workflow/deep-search/sub-agent.ts`
-to `src/shared/llm-utils.ts`:
+`llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
+utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
+of a specific workflow tool. Two memory module files depend on it:
+- `src/memory/topic-consolidator.ts`
+- `src/memory/knowledge-extractor.ts`
 
-- `llmComplete()` — simple text completion via OpenAI-compatible API
-- `llmCompleteWithTool<T>()` — structured output via function calling + fallback
-- `extractJSON()` — multi-layer JSON extraction (direct parse / code block / brace matching)
+This creates an architectural smell: a foundational module (`memory/`) depends
+on the internals of a higher-level workflow tool.
 
-All consumers (`memory/`, `deep-search/engine.ts`, `quality-gate.ts`) now import
-from `shared/llm-utils.ts`. The reverse dependency `memory/` → `tools/workflow/`
-is eliminated.
+**Goal**: Move `llmCompleteWithTool` to `src/core/` or `src/shared/`, making
+the dependency direction correct (both `memory/` and `workflow/deep-search/`
+import from `core/`).
 
-**Files**: `src/shared/llm-utils.ts`, `src/tools/workflow/deep-search/sub-agent.ts`
+**Files**: `src/tools/workflow/deep-search/sub-agent.ts`, `src/memory/topic-consolidator.ts`, `src/memory/knowledge-extractor.ts`

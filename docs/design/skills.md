@@ -1,35 +1,26 @@
----
-title: "Skills System"
-sidebarTitle: "Skills"
-description: "Architecture, lifecycle, approval workflow, and deployment-mode behavior of the skills system."
----
+# Skills Architecture
 
-# Skills System
+## Design Principles
 
-> **Purpose**: Document the full skills architecture — scopes, lifecycle, approval workflow,
-> execution model, and how skills behave across deployment modes.
->
-> Read this before touching: `src/tools/shell/local-script.ts`, `src/tools/infra/script-resolver.ts`,
-> `src/gateway/skills/`, `src/agentbox/resource-handlers.ts`, or `src/core/agent-factory.ts`.
+1. **Management and execution chains are separated**: Gateway API + DB handle skill CRUD, sharing, review, and approval using only `id` + `name`. Disk directories (`dirName`) are generated from `name` at materialize time and are implementation details of the execution chain.
+2. **Skill space is a collaborative development space**: maintainers edit space skills directly, publish to dev, submit + approve for production.
+3. **Builtins are unified in the database**: Gateway startup scans Docker-baked builtin skills and syncs them to DB. After that, everything goes through DB -- no special handling.
+4. **Per-user toggles**: skill enable/disable and skill space enable/disable are per-user, keyed by `skillId` (not `skillName`).
+5. **Submit and Contribute are independent**: two separate approval flows, each with its own staging tag, review handler, and withdraw operation.
+6. **No cross-origin name collisions**: skills with the same name but different `originId` are rejected at all entry points (create, fork, rename, move, contribute). Only fork from the same source is allowed to create a same-name copy.
+7. **Content hash for change detection**: SHA-256 of specs + sorted scripts determines whether content has changed. Used by `canSubmit`, `canContribute`, `hasUnpublishedChanges`, and builtin sync.
+8. **Skill management is UI-only**: conversation tools (`create_skill`, `update_skill`, `fork_skill`) are disabled. Skills are managed via the Skills UI page.
 
----
-
-## 1. Design Intent
-
-Skills are **packaged diagnostic procedures** — each skill is a directory containing a specification
-(`SKILL.md`) and executable scripts (`scripts/`). The agent reads the spec to understand *when* and
-*how* to use a skill, then executes its scripts via the `local_script` tool.
-
-### The Security–Flexibility Trade-off
+### The Security-Flexibility Trade-off
 
 Siclaw's command whitelist (`ALLOWED_COMMANDS` in `command-sets.ts`) restricts the agent to a set of
 safe, read-only binaries (e.g. `kubectl get`, `ip`, `ethtool`). This protects production environments
-from accidental mutations but limits what the agent can do — many real-world SRE tasks require
+from accidental mutations but limits what the agent can do -- many real-world SRE tasks require
 commands that go beyond read-only operations (restarting services, modifying configs, running
 performance tests, etc.).
 
 **Skill scripts are the escape hatch.** The command whitelist does *not* filter commands inside skill
-scripts — a script can use any binary, any flag, any pipeline. This gives users full flexibility to
+scripts -- a script can use any binary, any flag, any pipeline. This gives users full flexibility to
 encode arbitrary operational procedures as skills. The trade-off is managed through the approval
 workflow:
 
@@ -40,24 +31,24 @@ workflow:
   approval. This ensures scripts are safe and intentional before they can run against live
   infrastructure.
 
-In effect, skills should be treated as **read-only at runtime** — they are executed as-is, not
+In effect, skills should be treated as **read-only at runtime** -- they are executed as-is, not
 modified on the fly. The editing and iteration happen in dev; production gets immutable, approved
 snapshots.
 
 ### Why skills instead of ad-hoc commands?
 
-1. **Flexibility** — skill scripts bypass the command whitelist, enabling operations that the
+1. **Flexibility** -- skill scripts bypass the command whitelist, enabling operations that the
    agent cannot perform through ad-hoc commands alone.
-2. **Reliability** — tested scripts avoid the trial-and-error of ad-hoc command generation.
-3. **Safety** — the dev/prod split and approval workflow ensure only reviewed scripts run in
+2. **Reliability** -- tested scripts avoid the trial-and-error of ad-hoc command generation.
+3. **Safety** -- the dev/prod split and approval workflow ensure only reviewed scripts run in
    production, even though the scripts themselves are unrestricted.
-4. **Reusability** — investigation patterns are encoded once, used by all users.
-5. **Governance** — the approval workflow ensures scripts meet the team's quality and security
+4. **Reusability** -- investigation patterns are encoded once, used by all users.
+5. **Governance** -- the approval workflow ensures scripts meet the team's quality and security
    bar before they enter the shared pool.
 
 ---
 
-## 2. Skill Format
+## Skill Format
 
 ```
 {skillName}/
@@ -94,200 +85,391 @@ Each tier directory (`skills/core/`, `skills/extension/`) may contain a `meta.js
 }
 ```
 
-Labels are loaded at startup by `src/gateway/skill-labels.ts` and used for filtering in the UI.
-Core and extension labels are unified under the `builtin` tier key.
+Labels are loaded at startup by `builtin-sync.ts` and stored in the `labelsJson` column of the
+`skills` table. Used for filtering in the UI. Core and extension labels are unified under the
+`builtin` scope.
 
 ---
 
-## 3. Skill Scopes
+## Scope Model
 
-| Scope | Source | Mutability | Visibility | Directory | Bundle |
-|-------|--------|-----------|------------|-----------|--------|
-| **builtin** | Docker image | Immutable at runtime | All users | `skills/core/`, `skills/extension/` | Not in bundle (baked) |
-| **global** | Gateway DB | Admin-editable; contributed from personal | All users | `.siclaw/skills/global/` | prod + dev |
-| **skillset** | Gateway DB | Skill Space maintainers | Space members | `.siclaw/skills/skillset/{spaceId}/` | **dev only** |
-| **personal** | Gateway DB | Author-editable | Author only | `.siclaw/skills/user/{userId}/` | prod + dev |
+| Scope | Owner | Editable by | Storage | How it gets there |
+|-------|-------|-------------|---------|-------------------|
+| **builtin** | Docker image | No (can only be disabled) | DB (synced from disk at startup) | `builtin-sync.ts` scans `skills/core/` + `skills/extension/` and upserts DB |
+| **global** | System (admin) | No | DB | Personal/skillset skill contributed, reviewed, and promoted |
+| **personal** | Individual user | Author | DB | User creates or forks from builtin/global |
+| **skillset** | Skill space (team) | Space maintainers | DB | Fork from global/builtin, or move from personal |
 
-### Resolution Priority
+## Skill Identity
 
-When multiple scopes contain a skill with the same name, the highest-priority scope wins:
+### id
+
+- Builtin skills: `builtin:<dirName>` (deterministic id, backward-compatible with forkedFromId chains and workspace composer refs)
+- DB skills (global/personal/skillset): UUID
+
+### originId
+
+Each skill records an `originId` pointing to the **original source**. All forks inherit this value.
 
 ```
-personal > skillset > global > builtin
+Global g1 (originId: g1)
+  -> fork to personal: p1 (originId: g1)
+  -> fork to skillset: ss1 (originId: g1)
+
+Builtin "cluster-events" (originId: "builtin:cluster-events")
+  -> fork to personal: p2 (originId: "builtin:cluster-events")
 ```
 
-Defined in `src/tools/infra/script-resolver.ts` `SKILL_SCOPES`. The directory-to-scope
-mapping is: `user/` → personal, `skillset/` → skillset, `extension/` → global (builtin overlay),
-`global/` → global, `core/` → builtin.
+Uses:
+- `resolveRelatedGlobalSkill`: query `WHERE originId=x AND scope='global'` to find related global skill
+- `promoteToGlobal`: find existing global skill via originId and update (no duplicates)
+- `rejectCrossOriginNameConflict`: reject same-name skills with different originId at all entry points
+- Rename does not break the chain (originId is immutable)
 
-### Skill Spaces (skillset scope)
+### forkedFromId
 
-A **Skill Space** is a named collaboration group for developing and testing skills before
-promoting them to the global pool. Skills inside have `scope="skillset"` and are:
+Records the **direct parent** (one hop). Used for:
+- Fork conflict detection: reject if target already has skill with same `forkedFromId`
+- UI display "forked from xxx"
+- On delete, chain relay (`relinkForkedFrom`)
 
-- **Dev-only** — included in dev bundles, excluded from prod bundles
-- **Member-controlled** — only Skill Space maintainers can create/edit/delete skills within
-- **Promotable** — when approved via `skill.review`, a skillset skill is auto-promoted to a
-  global skill (creating or updating `scope="global"` with the same `dirName`)
+### Name Conflict Rules
 
-Skill Spaces are managed via the `skillSpaces` and `skillSpaceMembers` tables, with
-`owner` and `maintainer` roles.
+All entry points enforce: **same name + different originId = rejected**.
 
-### Workspace Skill Composer
-
-The Workspace creation dialog organizes skills into three tabs:
-
-| Tab | Contains | Selection mechanism |
-|-----|----------|-------------------|
-| **Global** | `builtin` + `global` combined (deduped by `dirName` — global wins) | `globalSkillRefs[]` with `"builtin:name"` or `"global:id"` prefix |
-| **Skill Spaces** | `skillset` skills grouped by space | `skillSpaces[]` with per-space `disabledSkillIds` |
-| **Personal** | `personal` skills for current user | `personalSkillIds[]` |
-
-### Builtin Sub-Tiers: core vs extension
-
-Both `skills/core/` and `skills/extension/` are **builtin** — they are baked into the Docker image,
-read-only at runtime, and treated identically by the agent. The split is organizational:
-
-- **`skills/core/`** — maintained in the base siclaw repository. General-purpose diagnostic skills
-  (K8s, networking, Volcano, etc.).
-- **`skills/extension/`** — maintained by inner/overlay projects. Domain-specific skills that are
-  `COPY`'d into the Docker image via a thin overlay Dockerfile. This separation ensures inner
-  projects never conflict with base repo upgrades.
-
-### Disabling Builtins
-
-Users can disable individual builtin skills via `skill.setEnabled(name, false)`.
-Disabled skills are stored per-user in `user_disabled_skills` and written to
-`.disabled-builtins.json` at bundle sync time. The agent-factory excludes disabled skills
-from `additionalSkillPaths`.
+| Entry point | Same name, same origin | Same name, different origin |
+|-------------|----------------------|---------------------------|
+| `skill.create` | Allowed (fork) | Rejected |
+| `skill.fork` | Rejected (already exists) | Rejected |
+| `skill.update` (rename) | N/A | Rejected |
+| `skill.moveToSpace` | Rejected (already in space) | Rejected |
+| `skill.contribute` | Update existing global | Rejected |
 
 ---
 
-## 4. Lifecycle & Approval Workflow
+## Skill Lifecycle
 
-### States
+### Create & Edit
 
 ```
-                     ┌───────────────────────────┐
-                     │                           │
-  create ──► draft ──┤── submit ──► pending ──┬──┤── approve ──► approved
-                     │                        │  │
-                     │◄── reject (back to draft)  │
-                     │                           │
-                     └───────────────────────────┘
+User creates skill -> scope: personal, editable
+User edits skill   -> personal or skillset (maintainer)
 ```
 
-The `reviewStatus` field tracks this state machine:
+### Fork (builtin/global only)
 
-| State | Meaning |
-|-------|---------|
-| `draft` | Author is editing. Working copy only. |
-| `pending` | Submitted for review. Staging snapshot created. AI review triggered. |
-| `approved` | Reviewer approved. Published copy available. |
+```
+Fork to personal:   builtin/global -> personal copy (editable, inherits approved state)
+Fork to skill space: builtin/global -> skillset copy (batch supported via sourceIds[])
+```
 
-### Content Tags
+Forks inherit `originId` and set `forkedFromId`. The forked skill starts with:
+- `approvedVersion: 1`, `publishedVersion: 1`, `reviewStatus: "approved"`
+- Content saved to `working`, `published`, and `approved` tags
+- A version record with `tag: "approved"` is created
 
-Each skill has up to three content snapshots stored in `skill_contents`:
+This means forked skills are **immediately available in production** -- no need to re-submit.
 
-| Tag | Purpose |
-|-----|---------|
-| `working` | Author's latest edits. Always exists for personal skills. |
-| `staging` | Snapshot at submission time. Reviewer sees this version. |
-| `published` | Approved version. Included in prod bundles. |
+If the target (personal or skillset) already has a skill from the same source, fork is **rejected** (not updated). User must edit the existing copy directly.
 
-### Dev vs Prod Environments
+### Move to Space (from personal)
 
-| Environment | Personal skills included | Content tag used |
-|-------------|------------------------|------------------|
-| **dev** | All (including draft) | `working` |
-| **prod** | Only approved | `published` |
+```
+Personal skill -> skill.moveToSpace(id, skillSpaceId) -> scope changes to skillset
+```
 
-In dev mode, the agent can access a skill immediately after creation — no approval needed.
-In prod mode, only reviewer-approved skills are visible.
+- Destructive operation: personal copy no longer exists
+- Only skill author + space maintainer can operate
+- Rejected if space already has skill with same originId or same name
+- Rejected if global/builtin has same name with different originId
+- Resets lifecycle: `publishedVersion: null`, `approvedVersion: null`, `reviewStatus: draft`
+- Clears all content tags except `working` (`published`, `approved`, `staging`, `staging-contribution`)
 
-### Global Contribution Flow
+### Edit & Publish in Space
 
-A personal skill can be contributed to the global pool:
+```
+Space skill -> skill.update (edit working) -> skill.publishInSpace (working -> published + version)
+```
 
-1. **Author submits** with `contributeToGlobal=true` → `contributionStatus="pending"`
-2. **AI script review** runs asynchronously (static patterns + LLM analysis)
-3. **Reviewer approves** → auto-promotion:
-   - Creates (or updates) a global skill with the same `dirName`
-   - Copies published content from personal → global
-   - Sets `globalSourceSkillId` + `globalPinnedVersion` for audit trail
-   - All users' bundles are invalidated and re-synced
-4. **Rejection** → reverts to `draft`, `contributionStatus="none"`
+- Maintainer edits directly, saves to working
+- Publish: working -> published, creates version record, no approval needed
+- Publish takes effect in **dev environment** (for all space members)
+- **Production** requires additional `skill.submit` -> admin `skill.approveSubmit`
+- Last-write-wins (sufficient for small teams)
 
-Skill Space skills follow a similar flow: when a skillset skill is approved,
-it is auto-promoted to `scope="global"` (creating or updating the global skill
-with matching `dirName`).
+### Submit (production review)
 
-### Script Security Review
+```
+skill.submit -> reviewStatus: pending -> staging snapshot
+  -> skill.approveSubmit -> approved (prod effective)
+  -> skill.rejectSubmit  -> draft
+  -> skill.withdrawSubmit -> withdraw
+```
+
+- Personal skill: copies working -> `staging`
+- Skillset skill: copies published -> `staging` (must publishInSpace first)
+- While pending, can re-submit to update staging (no need to withdraw first)
+- Batch support: `ids[]`
+
+#### Script Security Review
 
 When a skill is submitted (`skill.submit`), `triggerScriptReview()` performs two-phase analysis:
 
-**Phase 1 — Static pattern matching** (`DANGER_PATTERNS` in `script-evaluator.ts`):
+**Phase 1 -- Static pattern matching** (`DANGER_PATTERNS` in `script-evaluator.ts`):
 - Regex rules categorized by risk: `destructive_command`, `privilege_escalation`,
   `data_exfiltration`, `env_mutation`, etc.
 - Severity levels: `critical`, `high`, `medium`, `low`
-- Examples: `rm -rf` → critical, `kubectl delete` → high, `curl -d` → high
+- Examples: `rm -rf` -> critical, `kubectl delete` -> high, `curl -d` -> high
 
-**Phase 2 — AI semantic analysis**:
+**Phase 2 -- AI semantic analysis**:
 - Calls LLM with script content + Phase 1 findings as context
 - Returns structured risk assessment: `{ riskLevel, findings[], summary }`
 - Falls back to static-only if AI is unavailable
 
-Review results are stored in `skill_reviews` table for audit.
+Review results are stored in the `skill_reviews` table for audit.
+
+### Contribute (promote to Global)
+
+```
+skill.contribute -> contributionStatus: pending -> staging-contribution snapshot
+  -> skill.approveContribute -> promoted to global
+  -> skill.rejectContribute  -> contribution reverted
+  -> skill.withdrawContribute -> withdraw
+```
+
+- Requirement: already approved + no unpublished changes
+- Copies approved -> `staging-contribution` (independent from submit's staging)
+- **Submit and Contribute can be pending simultaneously**, they do not interfere
+- Conflict check: same-name global skill with different originId -> rejected
+- Batch support: `ids[]`
+
+### Diff Preview
+
+Before publish, submit, or contribute, the UI shows a GitHub-style diff dialog:
+
+- **File diffs**: collapsible sections per file (SKILL.md, scripts/*), 3 lines context, hidden unchanged regions
+- **Metadata diff**: type and labels shown as colored tag pills (+green, -red, unchanged gray)
+- **Commit message**: optional text input, stored on skill record for version history
+- **Origin fallback**: for first-time operations on forked skills, diffs against the fork source
+
+### Version History
+
+Each publish/approve creates a version record with:
+- `tag: "published"` for dev versions, `tag: "approved"` for prod versions
+- Inline specs + scriptsJson + metadata snapshot
+- commitMessage from the user
+
+The UI provides a version history drawer with tag filter (Dev / Prod) and rollback button.
+
+### Rollback
+
+```
+skill.rollback(id, version, target: "dev" | "prod")
+```
+
+- Restores content from the selected version to the target content tag (`published` or `approved`)
+- Restores metadata (name, description, type, labels) from the version snapshot
+- Cleans up `staging` and `staging-contribution` content tags
+- Resets `reviewStatus` and `contributionStatus` if they were pending
+- Creates a new version record documenting the rollback
+
+### Export / Download
+
+```
+skill.export(ids[]) -> { filename, data (base64), size }
+```
+
+- Exports selected skills as a tar.gz archive
+- Single skill: `{name}-{timestamp}.tar.gz`
+- Multiple skills: `skills-export-{timestamp}.tar.gz`
+- UI provides a batch picker dialog in skill space (same pattern as submit/contribute)
+
+### Delete
+
+- **Builtin**: cannot delete, only disable (`skill.setEnabled(id, false)`)
+- **Global**: after deletion, builtin skill with same name automatically "surfaces"
+- **Personal/Skillset**: normal deletion. `relinkForkedFrom` ensures child skill chains are not broken.
+
+### Per-user Enable/Disable
+
+All skill and skill space toggles are per-user, effective across all of that user's workspaces:
+
+| Operation | Table | Primary key |
+|-----------|-------|-------------|
+| `skill.setEnabled(id, enabled)` | `user_disabled_skills` | `(userId, skillId)` |
+| `skillSpace.setEnabled(skillSpaceId, enabled)` | `user_disabled_skill_spaces` | `(userId, skillSpaceId)` |
 
 ---
 
-## 5. Skill Bundle & Sync
+## Skill Space
 
-### What Goes Into a Bundle
+A skill space is a **shared collaboration space** for team development:
 
-`buildSkillBundle()` in `src/gateway/skills/skill-bundle.ts` packages:
+- Fork builtin/global skills into the space (batch supported)
+- Move mature personal skills into the space
+- Maintainers directly edit space skills
+- Publish makes changes effective for space members (dev env)
+- Submit + approve gates production deployment
+- Contribute to global for organization-wide sharing
+- Per-user enable/disable (each member independently controls whether to load)
 
-- **Global skills**: all global-scope skills with published content
-- **Skillset skills**: Skill Space skills (dev bundles only, with working content tag)
-- **Personal skills**: author's own skills (dev=all working, prod=approved published)
-- **Disabled builtins list**: names of builtin skills the user has disabled
+### Membership
 
-**Invariant**: The bundle **never** contains core/extension skills. Those are baked into
-the Docker image.
+| Role | Can view | Can fork global to space | Can edit | Can publish | Can submit | Can contribute | Can add members | Can delete skills | Can delete space |
+|------|---------|------------------------|---------|------------|-----------|---------------|----------------|------------------|-----------------|
+| Owner | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes (if empty) |
+| Maintainer | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 
-When a workspace composer is present, the bundle is filtered to the workspace's selected
-global refs, selected personal skills, and enabled Skill Space skills.
+### Typical workflow
 
-### Bundle Version
+```
+Alice creates "pod-health-check" in My Skills
+  -> edits and tests it
+  -> moves to team space "SRE Tools" (skill.moveToSpace)
 
-A SHA256 hash (first 16 chars) computed from all skill content. Used for:
-- AgentBox cache validation (skip reload if hash unchanged)
-- Browser-side caching
+Carol adds 5 global skills to "SRE Tools"
+  -> multi-selects from global list -> batch fork
 
-### Sync by Deployment Mode
+Bob edits "pod-health-check" directly in "SRE Tools"
+  -> changes saved to working copy
+  -> clicks Publish -> effective for all space members in dev
 
-| Mode | When | Target Directory | Scope |
-|------|------|-----------------|-------|
-| **K8s** (AgentBox pod startup) | `syncAllResources()` | `.siclaw/skills/{global,skillset,user}/` | global + skillset + personal |
-| **K8s** (reload event) | Gateway → AgentBox webhook | Same | Affected scopes |
-| **Local** (session spawn) | `local-spawner.syncSkills()` | `.siclaw/skills/user/{userId}/` | bundled global + personal |
-| **Local** (reload event) | `reloadResource("skills", userId)` | Same | Affected user |
-
-Local mode syncs to per-user directories to maintain filesystem isolation.
-Global skills from the bundle are flattened into the user's directory alongside personal skills;
-there is no separate `skills/global/` write in local mode (see `docs/design/invariants.md §1`).
+Space maintainer batch-submits published skills -> admin approves -> production
+Space maintainer batch-contributes approved skills -> admin approves -> Global
+```
 
 ---
 
-## 6. Skill Execution
+## Content Tags
+
+| Tag | Purpose | Written by |
+|-----|---------|-----------|
+| `working` | Author's latest edits | `skill.update` |
+| `published` | Dev published version (skillset); diff baseline (personal) | `skill.publishInSpace`, fork baseline |
+| `approved` | Prod approved version (all scopes) | `skill.approveSubmit`, fork baseline |
+| `staging` | Submit review snapshot | `skill.submit` |
+| `staging-contribution` | Contribute review snapshot | `skill.contribute` |
+
+Personal skills use `published` as a diff baseline (set during fork). Dev bundle uses `working` directly.
+
+## Version Fields
+
+| Field | Purpose | Set by |
+|-------|---------|--------|
+| `publishedVersion` | Dev published version (skillset); fork baseline version (personal) | `skill.publishInSpace`, fork |
+| `approvedVersion` | Prod approved version (all scopes) | `skill.approveSubmit`, fork |
+| `stagingVersion` | Optimistic concurrency for reviews | `skill.submit`, `skill.contribute` |
+
+## Content Hash
+
+SHA-256 of `specs + sorted scripts` (scripts sorted by name for order-independence). Stored in `skill_contents.content_hash`, auto-computed on every save.
+
+Used by:
+- `hasUnpublishedSkillChanges`: working hash vs published/approved hash
+- `computeCanSubmit`: published hash vs approved hash + metadata comparison
+- `computeCanContribute`: approved hash vs global published hash + metadata comparison
+- `builtin-sync.ts`: detect content changes on startup
+
+---
+
+## Two Separate Chains
+
+### Management Chain (Gateway API + DB)
+
+Handles skill CRUD, sharing, and review. **No filesystem directories involved.**
+
+```
+skills table
+  id, name, scope, authorId, skillSpaceId,
+  originId, forkedFromId, contentHash, labelsJson,
+  publishedVersion, approvedVersion, stagingVersion,
+  reviewStatus, contributionStatus, commitMessage, ...
+
+skill_contents table
+  skillId, tag ("working"|"staging"|"staging-contribution"|"published"|"approved"),
+  specs, scriptsJson, contentHash
+  Unique index on (skillId, tag)
+
+user_disabled_skills table
+  userId, skillId (per-user skill enable/disable)
+
+user_disabled_skill_spaces table
+  userId, skillSpaceId (per-user space enable/disable)
+```
+
+### Execution Chain (AgentBox materialize -> disk -> agent)
+
+```
+Gateway (buildSkillBundle)
+  -> reads skill_contents for all scopes from DB (including builtin)
+  -> priority order: personal > skillset > global > builtin
+  -> dedup by dirName (first wins), logs warning on collision
+  -> skips per-user disabled skills and disabled skill spaces
+  -> generates dirName slug from name at runtime
+  -> builds SkillBundlePayload { skills: [{ dirName, scope, specs, scripts }] }
+
+AgentBox (materialize)
+  -> builds resolved/ directory with priority-based merging (first dirName wins):
+      1. Personal skills
+      2. Skillset skills
+      3. Global skills
+      4. Builtin skills
+  -> Agent loads all skills from the single resolved/ directory
+```
+
+### K8s vs Local mode
+
+| Mode | resolved/ location | Written by |
+|------|-------------------|-----------|
+| K8s (single-user pod) | `.siclaw/skills/resolved/` | `resource-handlers.ts materialize()` |
+| Local (multi-user process) | `.siclaw/skills/user/{userId}/resolved/` | `local-spawner.ts syncSkills()` |
+
+---
+
+## Bundle Inclusion Rules
+
+| Scope | Dev bundle | Prod bundle | Content tag |
+|-------|-----------|-------------|-------------|
+| Personal | Yes (working) | Only if `approvedVersion` exists | dev: working, prod: approved |
+| Skillset | Only if `publishedVersion` exists | Only if `approvedVersion` exists | dev: published, prod: approved |
+| Global | Yes | Yes | published |
+| Builtin | Yes (unless disabled) | Yes (unless disabled) | published |
+
+Per-user disabled skills and disabled skill spaces are excluded from all bundles.
+
+---
+
+## Builtin Skill Sync
+
+Gateway startup executes `syncBuiltinSkills()`:
+
+```
+Scans skills/core/ + skills/extension/
+  -> parses SKILL.md + scripts + meta.json labels for each skill
+  -> computes content hash (SHA-256)
+  -> compares with DB:
+    - new -> INSERT (id = "builtin:<dirName>"), creates base version record
+    - content hash changed -> UPDATE, creates version record
+    - unchanged -> skip
+    - in DB but not on disk -> DELETE
+```
+
+Startup fix-ups:
+- Backfills null `originId` on global skills (inherits from forkedFromId chain)
+- Backfills null `tag` on version records (infers from commitMessage)
+- Creates missing version records for builtins and globals
+
+---
+
+## Skill Execution
 
 ### local_script Tool
 
-The `local_script` tool (`src/tools/shell/local-script.ts`) is the primary execution path:
+The `local_script` tool (`src/tools/script-exec/local-script.ts`) is the primary execution path:
 
 1. **Path resolution**: `resolveSkillScript(skill, script)` searches scope directories
    in priority order (personal > skillset > global > builtin)
-2. **Interpreter selection**: `.py` → `python3`, `.sh` → `bash`
+2. **Interpreter selection**: `.py` -> `python3`, `.sh` -> `bash`
 3. **Execution**: `child_process.spawn()` with args array (no shell interpolation)
 4. **Security**: runs as `sandbox` user (OS-level isolation), inherits sanitized environment
 5. **Limits**: 300s max timeout, 10 MB max output
@@ -297,31 +479,37 @@ The `local_script` tool (`src/tools/shell/local-script.ts`) is the primary execu
 The `restricted-bash` tool also allows skill script execution. `isSkillScript()` resolves the
 target path and allows scripts rooted under the repo `skills/` tree or the configured dynamic
 `skillsDir`, including materialized `skillset` scripts.
-This is a secondary path — `local_script` is preferred.
+This is a secondary path -- `local_script` is preferred.
 
 ---
 
-## 7. Skill Discovery by Agent
+## Skill Discovery by Agent
 
 ### How the Agent Sees Skills
 
-`agent-factory.ts` passes skill directories to pi-agent's `DefaultResourceLoader` via
-`additionalSkillPaths`:
+`agent-factory.ts` loads skills from a single `resolved/` directory built by materialize (K8s)
+or syncSkills (local). The directory contains all skills flattened with priority:
+personal > skillset > global > builtin.
 
 ```typescript
-const skillsDirs = [dynamicSkillBase, ...skillsetDirs, ...builtinPaths];
-// dynamicSkillBase = .siclaw/skills/ (K8s) or .siclaw/skills/user/{userId}/ (local)
-// skillsetDirs     = .siclaw/skills/skillset/{spaceId}/ (K8s only)
-// builtinPaths     = skills/core/ + skills/extension/ (minus disabled)
+// Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
+// K8s mode: {skillsBase}/resolved/
+const resolvedSkillsDir = opts?.userId
+  ? path.join(skillsBase, "user", opts.userId, "resolved")
+  : path.join(skillsBase, "resolved");
+
+// Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
+// load builtin directories directly (skills/core/ + skills/extension/)
 ```
 
+The resolved directory is passed to `DefaultResourceLoader` via `additionalSkillPaths`.
 The loader auto-discovers skills by scanning for `SKILL.md` files, parsing frontmatter,
 and injecting descriptions into the system prompt. The agent then knows which skills are
 available and can invoke them via `local_script`.
 
 ### Deep Search Sub-Agents
 
-Sub-agents in `src/tools/deep-search/sub-agent.ts` load skills separately:
+Sub-agents in `src/tools/workflow/deep-search/sub-agent.ts` load skills separately:
 
 ```typescript
 const { skills: coreSkills } = loadSkillsFromDir({ dir: "skills/core" });
@@ -332,64 +520,145 @@ This gives sub-agents access to builtin skills without depending on the bundle.
 
 ---
 
-## 8. Forking
-
-Users can fork builtin or global skills to create personal copies:
-
-- **Source**: builtin or global scope only (cannot fork personal skills)
-- **Result**: personal skill with `forkedFromId` backlink
-- **Content**: copies SKILL.md + scripts from source, with optional overrides
-- **Version**: inherits version number from source
-- **Labels**: copies labels from source
-
-Forking enables users to customize a builtin diagnostic procedure without modifying the
-original. The forked copy can later be contributed back to the global pool via the approval workflow.
-
----
-
-## 9. Database Schema
+## Database Schema
 
 | Table | Purpose |
 |-------|---------|
-| `skills` | Skill metadata: name, scope, status, version, review state, lineage |
-| `skill_contents` | File content (specs + scripts) by tag (working/staging/published) |
-| `skill_versions` | Version history (audit trail for approved versions) |
-| `skill_reviews` | AI + admin review records |
+| `skills` | Skill metadata: name, scope, dirName, authorId, skillSpaceId, originId, forkedFromId, contentHash, labelsJson, publishedVersion, approvedVersion, stagingVersion, reviewStatus, contributionStatus, commitMessage, globalSourceSkillId, globalPinnedVersion |
+| `skill_contents` | File content (specs + scriptsJson + contentHash) by tag (working / staging / staging-contribution / published / approved). Unique index on (skillId, tag). CHECK constraint enforces valid tags. |
+| `skill_versions` | Version history: version number, specs, scriptsJson, tag (published/approved), commitMessage, authorId |
+| `skill_reviews` | AI + admin review records: reviewerType (ai/admin), riskLevel, summary, findings[], decision (approve/reject/info) |
 | `skill_votes` | User upvotes/downvotes on global skills |
-| `user_disabled_skills` | Per-user builtin skill disabling |
+| `skill_spaces` | Skill space metadata: name, description, ownerId |
+| `skill_space_members` | Space membership: userId, skillSpaceId, role (owner/maintainer) |
+| `user_disabled_skills` | Per-user skill disabling: userId, skillId |
+| `user_disabled_skill_spaces` | Per-user skill space disabling: userId, skillSpaceId |
 | `workspace_skills` | Workspace-scoped skill assignments (schema exists, not yet enforced) |
 
 ---
 
-## 10. Key Files
+## API Reference
+
+### Skill CRUD
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.create` | Create personal skill (cross-origin name conflict check) |
+| `skill.update` | Edit personal or skillset skill (cross-origin name conflict on rename) |
+| `skill.delete` | Delete personal or skillset skill (builtin cannot be deleted) |
+| `skill.get` | Get skill details (any scope) |
+| `skill.list` | List skills (with scope/workspace filtering, enriched with canSubmit/canContribute/hasUnpublishedChanges) |
+| `skill.setEnabled` | Per-user enable/disable a skill (by skillId, resolves name to id for backward compat) |
+| `skill.updateLabels` | Update skill labels |
+
+### Fork & Share
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.fork` | Fork builtin/global to personal or skillset. Batch via `sourceIds[]`. Inherits approved state. Rejects if same-source skill already exists. |
+| `skill.moveToSpace` | Move personal skill to skill space (destructive, resets lifecycle, rejects same-origin/name conflicts) |
+| `skill.publishInSpace` | Publish skillset skill: working -> published + version (dev only) |
+| `skill.forkDiff` | Preview diff before forking into a skill space |
+
+### Submit (production review)
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.submit` | Submit for production review. Batch via `ids[]` |
+| `skill.approveSubmit` | Approve submit -> production |
+| `skill.rejectSubmit` | Reject submit -> back to draft |
+| `skill.withdrawSubmit` | Withdraw pending submit |
+
+### Contribute (promote to Global)
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.contribute` | Contribute to global (cross-origin conflict check). Batch via `ids[]` |
+| `skill.approveContribute` | Approve contribution -> promote to global |
+| `skill.rejectContribute` | Reject contribution |
+| `skill.withdrawContribute` | Withdraw pending contribution |
+
+### Diff, History & Rollback
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.previewDiff` | Preview diff before publish/submit/contribute (metadata + file diffs) |
+| `skill.diff` | View diff between versions |
+| `skill.history` | List version history with optional tag filter (published/approved) |
+| `skill.rollback` | Rollback to previous version (restores content + metadata, cleans staging) |
+| `skill.export` | Download skills as tar.gz (batch via `ids[]`) |
+
+### Other
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skill.vote` | Upvote/downvote global skills |
+| `skill.revert` | Revert global skill to builtin version |
+| `skill.getReview` | Get AI/admin review results |
+| `skill.review` | Backward-compat dispatcher -> routes to approveSubmit/rejectSubmit/approveContribute/rejectContribute |
+| `skill.withdraw` | Backward-compat dispatcher -> routes to withdrawSubmit/withdrawContribute |
+
+### Skill Space
+
+| RPC Method | Purpose |
+|-----------|---------|
+| `skillSpace.create` | Create skill space |
+| `skillSpace.get` | Get space with members and skills (enriched with canSubmit/canContribute/hasUnpublishedChanges) |
+| `skillSpace.list` | List all spaces for user |
+| `skillSpace.update` | Update space name/description (owner only) |
+| `skillSpace.delete` | Delete empty space (owner only) |
+| `skillSpace.addMember` | Add maintainer to space |
+| `skillSpace.removeMember` | Remove member (owner) or leave (self) |
+| `skillSpace.listMembers` | List space members |
+| `skillSpace.setEnabled` | Per-user enable/disable a skill space |
+
+---
+
+## Key Files
 
 ```
 Execution & Resolution
-  src/tools/shell/local-script.ts        local_script tool (primary execution path)
-  src/tools/infra/script-resolver.ts   Skill path resolution, scope priority
-  src/tools/shell/restricted-bash.ts   Bash whitelist (isSkillScript)
-  src/tools/workflow/fork-skill.ts     fork_skill tool
+  src/tools/script-exec/local-script.ts      local_script tool (primary execution path)
+  src/tools/script-exec/node-script.ts       node_script tool (K8s node execution)
+  src/tools/script-exec/pod-script.ts        pod_script tool (K8s pod execution)
+  src/tools/infra/script-resolver.ts         Skill path resolution, scope priority
+  src/tools/cmd-exec/restricted-bash.ts      Bash whitelist (isSkillScript)
 
 Gateway Skills Management
-  src/gateway/skills/file-writer.ts   Disk I/O: read, write, scan, snapshot
-  src/gateway/skills/skill-bundle.ts  buildSkillBundle() — global + skillset + personal packaging
-  src/gateway/skills/script-evaluator.ts  Security review (static + AI)
-  src/gateway/skill-labels.ts         Label loading from meta.json
-  src/gateway/rpc-methods.ts          RPC: skill.list/get/create/update/delete/submit/review
+  src/gateway/skills/file-writer.ts          Disk I/O: read, write, scan, snapshot
+  src/gateway/skills/skill-bundle.ts         buildSkillBundle() -- priority-ordered packaging with dedup
+  src/gateway/skills/script-evaluator.ts     Security review (static + AI)
+  src/gateway/skills/builtin-sync.ts         Builtin skill sync + label loading + startup fix-ups
+  src/gateway/rpc-methods.ts                 All skill.* and skillSpace.* RPC handlers
+
+DB Repositories
+  src/gateway/db/repositories/skill-repo.ts          Skill metadata CRUD
+  src/gateway/db/repositories/skill-content-repo.ts  Content by tag, content hash
+  src/gateway/db/repositories/skill-version-repo.ts  Version history
+  src/gateway/db/repositories/skill-space-repo.ts    Space membership, per-user toggles
 
 Agent Integration
-  src/core/agent-factory.ts           Skill directory setup, additionalSkillPaths
-  src/tools/deep-search/sub-agent.ts  Sub-agent skill loading
+  src/core/agent-factory.ts                  Skill directory setup, resolved/ loading, additionalSkillPaths
+  src/tools/workflow/deep-search/sub-agent.ts  Sub-agent skill loading
 
 Sync & Materialization
-  src/agentbox/resource-handlers.ts   skillsHandler.materialize() (K8s)
-  src/gateway/agentbox/local-spawner.ts  syncSkills() (local mode)
-  src/shared/resource-sync.ts         Resource sync contracts
+  src/agentbox/resource-handlers.ts          skillsHandler.materialize() (K8s)
+  src/gateway/agentbox/local-spawner.ts      syncSkills() (local mode)
+
+Frontend
+  src/gateway/web/src/pages/Skills/index.tsx              My Skills + Global tab
+  src/gateway/web/src/pages/Skills/SkillSpaceDetail.tsx   Skill space detail page
+  src/gateway/web/src/pages/Skills/SkillEditor.tsx        Skill editor
+  src/gateway/web/src/pages/Skills/components/DiffPreviewDialog.tsx    GitHub-style diff dialog
+  src/gateway/web/src/pages/Skills/components/SkillLifecycleStatus.tsx Lifecycle indicator
+  src/gateway/web/src/pages/Skills/components/VersionHistoryDrawer.tsx Version history drawer
+
+Tests
+  src/gateway/skills/skill-lifecycle.test.ts  91 comprehensive RPC handler tests
 
 Filesystem Layout
-  skills/core/                        Builtin core skills (Docker-baked)
-  skills/extension/                   Builtin extension skills (inner project overlay)
-  .siclaw/skills/global/              Global skills (from bundle)
-  .siclaw/skills/skillset/{spaceId}/  Skill Space skills (from bundle, dev only)
-  .siclaw/skills/user/{userId}/       Personal skills (from bundle)
+  skills/core/                               Builtin core skills (Docker-baked)
+  skills/extension/                          Builtin extension skills (inner project overlay)
+  .siclaw/skills/resolved/                   Materialized skills -- all scopes merged (K8s)
+  .siclaw/skills/user/{userId}/resolved/     Materialized skills -- per-user (local mode)
 ```

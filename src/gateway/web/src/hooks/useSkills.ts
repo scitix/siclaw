@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import type { Skill } from '../pages/Skills/skillsData';
-import { rpcGetSkills, rpcCopySkillToPersonal, rpcVoteSkill, rpcRevertSkill, rpcReviewDecision, rpcWithdrawSkill, rpcRequestPublish, rpcRollbackSkill } from '../pages/Skills/skillsData';
+import { rpcGetSkills, rpcCopySkillToPersonal, rpcVoteSkill, rpcRevertSkill, rpcReviewDecision, rpcWithdrawSubmit, rpcWithdrawContribute, rpcRequestPublish, rpcContribute, rpcRollbackSkill } from '../pages/Skills/skillsData';
 import type { RpcSendFn } from '../pages/Skills/skillsData';
 
 const PAGE_SIZE = 30;
@@ -13,8 +13,8 @@ export interface UseSkillsResult {
     loadSkills: (scope?: string, search?: string) => Promise<void>;
     loadMore: () => Promise<void>;
     toggleEnabled: (skill: Skill) => Promise<void>;
-    publishSkill: (skill: Skill, contributeToGlobal?: boolean) => Promise<void>;
-    requestPublish: (skill: Skill) => Promise<void>;
+    requestPublish: (skill: Skill, message?: string) => Promise<void>;
+    contributeSkill: (skill: Skill, message?: string) => Promise<void>;
     approveSkill: (skill: Skill) => Promise<void>;
     rejectSkill: (skill: Skill, reason?: string) => Promise<void>;
     deleteSkill: (skill: Skill) => Promise<void>;
@@ -22,7 +22,8 @@ export interface UseSkillsResult {
     voteSkill: (skill: Skill, vote: 1 | -1) => Promise<void>;
     revertSkill: (skill: Skill, reason?: string) => Promise<void>;
     reviewSkill: (skill: Skill, decision: 'approve' | 'reject', reason?: string, stagingVersion?: number) => Promise<void>;
-    withdrawSkill: (skill: Skill) => Promise<void>;
+    withdrawSubmit: (skill: Skill) => Promise<void>;
+    withdrawContribute: (skill: Skill) => Promise<void>;
     rollbackSkill: (skill: Skill, version: number) => Promise<void>;
 }
 
@@ -95,22 +96,22 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
     const toggleEnabled = useCallback(async (skill: Skill) => {
         const newEnabled = !skill.enabled;
         try {
-            await sendRpc('skill.setEnabled', { name: skill.name, enabled: newEnabled });
+            await sendRpc('skill.setEnabled', { id: String(skill.id), enabled: newEnabled });
             setSkills(prev => prev.map(s =>
-                s.name === skill.name ? { ...s, enabled: newEnabled } : s
+                s.id === skill.id ? { ...s, enabled: newEnabled } : s
             ));
         } catch (err) {
             console.error('[useSkills] toggleEnabled failed:', err);
         }
     }, [sendRpc]);
 
-    const publishSkill = useCallback(async (skill: Skill, contributeToGlobal?: boolean) => {
-        await sendRpc('skill.submit', { id: String(skill.id), contributeToGlobal, workspaceId });
+    const requestPublish = useCallback(async (skill: Skill, message?: string) => {
+        await rpcRequestPublish(sendRpc, String(skill.id), workspaceId, message);
         await loadSkills();
     }, [sendRpc, loadSkills, workspaceId]);
 
-    const requestPublish = useCallback(async (skill: Skill) => {
-        await rpcRequestPublish(sendRpc, String(skill.id), undefined, workspaceId);
+    const contributeSkill = useCallback(async (skill: Skill, message?: string) => {
+        await rpcContribute(sendRpc, String(skill.id), workspaceId, message);
         await loadSkills();
     }, [sendRpc, loadSkills, workspaceId]);
 
@@ -143,12 +144,8 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
     }, [sendRpc, workspaceId]);
 
     const copyToPersonal = useCallback(async (skill: Skill) => {
-        try {
-            await rpcCopySkillToPersonal(sendRpc, String(skill.id));
-            await loadSkills();
-        } catch (err) {
-            console.error('[useSkills] copyToPersonal failed:', err);
-        }
+        await rpcCopySkillToPersonal(sendRpc, String(skill.id));
+        await loadSkills();
     }, [sendRpc, loadSkills]);
 
     const voteSkill = useCallback(async (skill: Skill, vote: 1 | -1) => {
@@ -188,19 +185,14 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
         }
     }, [sendRpc, loadSkills]);
 
-    const withdrawSkill = useCallback(async (skill: Skill) => {
-        try {
-            const result = await rpcWithdrawSkill(sendRpc, String(skill.id), workspaceId);
-            if (result.wasNew) {
-                // New skill was deleted entirely — remove from local state
-                setSkills(prev => prev.filter(s => s.id !== skill.id));
-            } else {
-                // Staged update withdrawn — reload to show restored status
-                await loadSkills();
-            }
-        } catch (err) {
-            console.error('[useSkills] withdrawSkill failed:', err);
-        }
+    const withdrawSubmit = useCallback(async (skill: Skill) => {
+        await rpcWithdrawSubmit(sendRpc, String(skill.id), workspaceId);
+        await loadSkills();
+    }, [sendRpc, loadSkills, workspaceId]);
+
+    const withdrawContribute = useCallback(async (skill: Skill) => {
+        await rpcWithdrawContribute(sendRpc, String(skill.id), workspaceId);
+        await loadSkills();
     }, [sendRpc, loadSkills, workspaceId]);
 
     return {
@@ -211,8 +203,8 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
         loadSkills,
         loadMore,
         toggleEnabled,
-        publishSkill,
         requestPublish,
+        contributeSkill,
         approveSkill,
         rejectSkill,
         deleteSkill,
@@ -220,7 +212,8 @@ export function useSkills(sendRpc: RpcSendFn, workspaceId?: string): UseSkillsRe
         voteSkill,
         revertSkill,
         reviewSkill,
-        withdrawSkill,
+        withdrawSubmit,
+        withdrawContribute,
         rollbackSkill,
     };
 }

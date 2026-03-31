@@ -2,12 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { validateConclusion } from "./quality-gate.js";
 import type { HypothesisNode } from "./types.js";
 
-// Mock llmCompleteWithTool from shared/llm-utils
-vi.mock("../../../shared/llm-utils.js", () => ({
+// Mock llmCompleteWithTool from sub-agent
+vi.mock("./sub-agent.js", () => ({
   llmCompleteWithTool: vi.fn(),
 }));
 
-import { llmCompleteWithTool } from "../../../shared/llm-utils.js";
+import { llmCompleteWithTool } from "./sub-agent.js";
 const mockLlmComplete = vi.mocked(llmCompleteWithTool);
 
 function makeHypothesis(overrides: Partial<HypothesisNode> = {}): HypothesisNode {
