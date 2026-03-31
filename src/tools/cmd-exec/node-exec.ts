@@ -1,7 +1,8 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
@@ -227,3 +228,8 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "cmd-exec",
+  create: (refs) => createNodeExecTool(refs.kubeconfigRef, refs.userId),
+};

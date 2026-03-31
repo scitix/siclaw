@@ -10,7 +10,7 @@ import http from "node:http";
 import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
-import type { SessionMode } from "../core/agent-factory.js";
+import type { SessionMode } from "../core/types.js";
 import type { BrainType } from "../core/brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";

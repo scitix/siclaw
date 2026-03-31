@@ -1,7 +1,8 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import {
   validatePodName,
@@ -140,3 +141,8 @@ Parameters:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "query",
+  create: (refs) => createResolvePodNetnsTool(refs.kubeconfigRef, refs.userId),
+};
