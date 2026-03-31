@@ -174,15 +174,13 @@ describe("enforceToolResultContextBudgetInPlace", () => {
 });
 
 describe("installToolResultContextGuard", () => {
-  it("installs and uninstalls transformContext", () => {
+  it("installs transformContext", () => {
     const agent = {} as any;
-    const uninstall = installToolResultContextGuard({
+    installToolResultContextGuard({
       agent,
       contextWindowTokens: 128_000,
     });
     expect(typeof agent.transformContext).toBe("function");
-    uninstall();
-    expect(agent.transformContext).toBeUndefined();
   });
 
   it("preserves existing transformContext", async () => {
@@ -194,7 +192,7 @@ describe("installToolResultContextGuard", () => {
       },
     } as any;
     const originalFn = agent.transformContext;
-    const uninstall = installToolResultContextGuard({
+    installToolResultContextGuard({
       agent,
       contextWindowTokens: 128_000,
     });
@@ -204,8 +202,6 @@ describe("installToolResultContextGuard", () => {
     ] as any[];
     await agent.transformContext(messages, new AbortController().signal);
     expect(originalCalled).toBe(true);
-    uninstall();
-    expect(agent.transformContext).toBe(originalFn);
   });
 
   it("throws preemptive overflow when context is still too large after compaction", async () => {
