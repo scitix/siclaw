@@ -82,6 +82,7 @@ const DDL_STATEMENTS = [
     type TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     published_version INTEGER,
+    approved_version INTEGER,
     staging_version INTEGER NOT NULL DEFAULT 0,
     scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'global', 'personal', 'skillset')),
     author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -95,6 +96,8 @@ const DDL_STATEMENTS = [
     global_source_skill_id TEXT,
     global_pinned_version INTEGER,
     forked_from_id TEXT,
+    origin_id TEXT,
+    content_hash TEXT,
     labels_json TEXT,
     skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
   )`,
@@ -214,7 +217,7 @@ const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS skill_contents (
     id TEXT PRIMARY KEY,
     skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
-    tag TEXT NOT NULL DEFAULT 'working' CHECK(tag IN ('working', 'staging', 'published')),
+    tag TEXT NOT NULL DEFAULT 'working' CHECK(tag IN ('working', 'staging', 'staging-contribution', 'published', 'approved')),
     specs TEXT,
     scripts_json TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -407,6 +410,7 @@ const INDEX_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp)`,
   `CREATE INDEX IF NOT EXISTS idx_skills_scope ON skills(scope)`,
   `CREATE INDEX IF NOT EXISTS idx_skills_author ON skills(author_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_skills_origin ON skills(origin_id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_votes_unique ON skill_votes(skill_id, user_id)`,
   `CREATE INDEX IF NOT EXISTS idx_skill_votes_skill ON skill_votes(skill_id)`,
   `CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read, created_at)`,
@@ -478,6 +482,53 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
     `ALTER TABLE skills RENAME COLUMN team_source_skill_id TO global_source_skill_id`,
     `ALTER TABLE skills RENAME COLUMN team_pinned_version TO global_pinned_version`,
     `UPDATE workspaces SET skill_composer = REPLACE(skill_composer, '"team:', '"global:') WHERE skill_composer LIKE '%"team:%'`,
+    // Add origin_id for stable source tracking across fork/sync chains
+    `ALTER TABLE skills ADD COLUMN origin_id TEXT`,
+    // Add content_hash for builtin skill sync idempotency
+    `ALTER TABLE skills ADD COLUMN content_hash TEXT`,
+    // Add approved_version for tracking prod-approved version separately from dev-published
+    `ALTER TABLE skills ADD COLUMN approved_version INTEGER`,
+    // Per-user skill space enable/disable
+    `CREATE TABLE IF NOT EXISTS user_disabled_skill_spaces (
+      user_id TEXT NOT NULL REFERENCES users(id),
+      skill_space_id TEXT NOT NULL REFERENCES skill_spaces(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, skill_space_id)
+    )`,
+    // Version tag for dev/prod history separation
+    `ALTER TABLE skill_versions ADD COLUMN tag TEXT`,
+    // SQLite doesn't support DROP COLUMN before 3.35 — s3_key stays as harmless dead column
+    // Pending message for submit/contribute (read by approve to create version record)
+    `ALTER TABLE skills ADD COLUMN commit_message TEXT`,
+    // Content hash on skill_contents for fast comparison
+    `ALTER TABLE skill_contents ADD COLUMN content_hash TEXT`,
+    // Widen skill_contents tag CHECK to include approved + staging-contribution
+    // SQLite doesn't support ALTER CHECK, so recreate the table
+    `CREATE TABLE IF NOT EXISTS skill_contents_new (
+      id TEXT PRIMARY KEY,
+      skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+      tag TEXT NOT NULL DEFAULT 'working' CHECK(tag IN ('working', 'staging', 'staging-contribution', 'published', 'approved')),
+      specs TEXT,
+      scripts_json TEXT,
+      content_hash TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      UNIQUE (skill_id, tag)
+    )`,
+    `INSERT OR IGNORE INTO skill_contents_new SELECT id, skill_id, tag, specs, scripts_json, content_hash, created_at, updated_at FROM skill_contents`,
+    `DROP TABLE IF EXISTS skill_contents`,
+    `ALTER TABLE skill_contents_new RENAME TO skill_contents`,
+    // Migrate user_disabled_skills from name-based (skill_name) to id-based (skill_id)
+    `ALTER TABLE user_disabled_skills RENAME TO user_disabled_skills_old`,
+    `CREATE TABLE IF NOT EXISTS user_disabled_skills (
+      user_id TEXT NOT NULL REFERENCES users(id),
+      skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, skill_id)
+    )`,
+    // Migrate existing preferences by resolving skill_name → skill.id
+    `INSERT OR IGNORE INTO user_disabled_skills (user_id, skill_id)
+      SELECT o.user_id, s.id FROM user_disabled_skills_old o
+      JOIN skills s ON s.name = o.skill_name`,
+    `DROP TABLE IF EXISTS user_disabled_skills_old`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
@@ -528,6 +579,7 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       type TEXT,
       version INTEGER NOT NULL DEFAULT 1,
       published_version INTEGER,
+      approved_version INTEGER,
       staging_version INTEGER NOT NULL DEFAULT 0,
       scope TEXT NOT NULL DEFAULT 'personal' CHECK(scope IN ('builtin', 'global', 'personal', 'skillset')),
       author_id TEXT REFERENCES users(id) ON DELETE SET NULL,
@@ -542,18 +594,22 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       global_pinned_version INTEGER,
       forked_from_id TEXT,
       labels_json TEXT,
-      skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL
+      skill_space_id TEXT REFERENCES skill_spaces(id) ON DELETE SET NULL,
+      origin_id TEXT,
+      content_hash TEXT,
+      commit_message TEXT
     )`));
+    // Use COALESCE to handle both old (team_*) and new (global_*) column names
     sdb.run(sql.raw(`INSERT INTO skills (
-      id, name, description, type, version, published_version, staging_version,
+      id, name, description, type, version, published_version, approved_version, staging_version,
       scope, author_id, status, contribution_status, review_status, dir_name,
       created_at, updated_at, s3_key, global_source_skill_id, global_pinned_version,
-      forked_from_id, labels_json, skill_space_id
+      forked_from_id, labels_json, skill_space_id, origin_id, content_hash, commit_message
     ) SELECT
-      id, name, description, type, version, published_version, staging_version,
+      id, name, description, type, version, published_version, approved_version, staging_version,
       scope, author_id, status, contribution_status, review_status, dir_name,
-      created_at, updated_at, s3_key, team_source_skill_id, team_pinned_version,
-      forked_from_id, labels_json, skill_space_id
+      created_at, updated_at, s3_key, global_source_skill_id, global_pinned_version,
+      forked_from_id, labels_json, skill_space_id, origin_id, content_hash, commit_message
     FROM _skills_old`));
     sdb.run(sql.raw(`DROP TABLE _skills_old`));
     sdb.run(sql.raw(`COMMIT`));

@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { llmCompleteWithTool } from "../shared/llm-utils.js";
+import { llmCompleteWithTool } from "../tools/workflow/deep-search/sub-agent.js";
 
 // ---------------------------------------------------------------------------
 // Thresholds

@@ -33,8 +33,7 @@ interface LocalBox {
 /** Function type for fetching a skill bundle for a given user */
 export type SkillBundleProvider = (userId: string, env: "prod" | "dev" | "test") => Promise<{
   version: string;
-  skills: Array<{ dirName: string; specs: string; scripts: Array<{ name: string; content: string }> }>;
-  disabledBuiltins: string[];
+  skills: Array<{ dirName: string; scope: string; specs: string; scripts: Array<{ name: string; content: string }> }>;
 }>;
 
 export class LocalSpawner implements BoxSpawner {
@@ -208,54 +207,55 @@ export class LocalSpawner implements BoxSpawner {
    * this writes to {skillsBase}/user/{userId}/ so multiple users don't
    * overwrite each other's skills in local (shared-process) mode.
    */
+  /**
+   * Build a flat resolved/ directory per user with priority-based merging:
+   *   personal > skillset > global > builtin (symlinked)
+   * Same logic as K8s materialize() but scoped per-user for local mode.
+   */
   private async syncSkills(userId: string): Promise<void> {
     if (!this.skillBundleProvider) {
       console.warn(`[local-spawner] Skills sync skipped: no bundle provider configured`);
       return;
     }
     try {
-      const bundle = await this.skillBundleProvider(userId, "prod");
+      // Local mode is always dev — users need to see their working drafts
+      const bundle = await this.skillBundleProvider(userId, "dev");
       const config = loadConfig();
       const skillsBase = path.resolve(process.cwd(), config.paths.skillsDir);
-      const userSkillsDir = path.join(skillsBase, "user", userId);
+      // Per-user resolved directory (local mode has multiple users sharing one process)
+      const resolvedDir = path.join(skillsBase, "user", userId, "resolved");
 
-      // Clear only this user's directory (not other users or core/global)
-      if (fs.existsSync(userSkillsDir)) {
-        for (const entry of fs.readdirSync(userSkillsDir)) {
-          if (entry.startsWith(".")) continue;
-          fs.rmSync(path.join(userSkillsDir, entry), { recursive: true });
-        }
-      } else {
-        fs.mkdirSync(userSkillsDir, { recursive: true });
+      // Clear and recreate
+      if (fs.existsSync(resolvedDir)) {
+        fs.rmSync(resolvedDir, { recursive: true });
       }
+      fs.mkdirSync(resolvedDir, { recursive: true });
 
-      // Write skills into per-user directory
-      for (const skill of bundle.skills) {
-        const skillDir = resolveUnderDir(userSkillsDir, skill.dirName);
-        fs.mkdirSync(skillDir, { recursive: true });
-        if (skill.specs) {
-          fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
-        }
-        if (skill.scripts.length > 0) {
-          const scriptsDir = path.join(skillDir, "scripts");
-          fs.mkdirSync(scriptsDir, { recursive: true });
-          for (const script of skill.scripts) {
-            const scriptPath = resolveUnderDir(scriptsDir, script.name);
-            fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
+      const seen = new Set<string>();
+
+      // All scopes from bundle, priority: personal > skillset > global > builtin
+      for (const scope of ["personal", "skillset", "global", "builtin"] as const) {
+        for (const skill of bundle.skills.filter(s => s.scope === scope)) {
+          if (seen.has(skill.dirName)) continue;
+          seen.add(skill.dirName);
+          const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
+          fs.mkdirSync(skillDir, { recursive: true });
+          if (skill.specs) {
+            fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
+          }
+          if (skill.scripts.length > 0) {
+            const scriptsDir = path.join(skillDir, "scripts");
+            fs.mkdirSync(scriptsDir, { recursive: true });
+            for (const script of skill.scripts) {
+              const scriptPath = resolveUnderDir(scriptsDir, script.name);
+              fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
+            }
           }
         }
       }
 
-      // Write disabled builtins list into per-user directory
-      const disabledFile = path.join(userSkillsDir, ".disabled-builtins.json");
-      if (bundle.disabledBuiltins?.length) {
-        fs.writeFileSync(disabledFile, JSON.stringify(bundle.disabledBuiltins));
-      } else if (fs.existsSync(disabledFile)) {
-        fs.unlinkSync(disabledFile);
-      }
-
-      if (bundle.skills.length > 0) {
-        console.log(`[local-spawner] Skills sync for ${userId}: ${bundle.skills.length} skills → ${userSkillsDir}`);
+      if (seen.size > 0) {
+        console.log(`[local-spawner] Skills sync for ${userId}: ${seen.size} skills → ${resolvedDir}`);
       }
     } catch (err: any) {
       console.warn(`[local-spawner] Skills sync failed for ${userId}: ${err.message}`);
