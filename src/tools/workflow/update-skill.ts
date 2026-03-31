@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { skillExistsInBundle } from "../infra/script-resolver.js";
@@ -210,3 +211,9 @@ node_script: node="<node>", netns="<netns>", skill="pod-ping-gateway", script="p
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (_refs) => createUpdateSkillTool(),
+  modes: ["web"],
+};

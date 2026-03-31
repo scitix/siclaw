@@ -1,10 +1,11 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import fs from "node:fs";
 import path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { loadConfig } from "../../core/config.js";
 import { probeKubeconfig } from "../infra/credential-manager.js";
 
@@ -143,3 +144,9 @@ Optional filters:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "query",
+  create: (refs) => createCredentialListTool(refs.kubeconfigRef),
+  platform: true,
+};

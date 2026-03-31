@@ -1,8 +1,9 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { loadConfig } from "../../core/config.js";
@@ -220,3 +221,8 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "script-exec",
+  create: (refs) => createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef),
+};
