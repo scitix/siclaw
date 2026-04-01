@@ -229,7 +229,7 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
     if (name === 'glob') {
         return (args.pattern as string) || '';
     }
-    if (name === 'create_skill') {
+    if (name === 'skill_preview') {
         return (args.name as string) || '';
     }
     if (name === 'local_script') {

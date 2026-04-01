@@ -217,8 +217,7 @@ All tools are TypeBox `ToolDefinition` objects with structured input schemas and
 | Tool | File | Description |
 |------|------|-------------|
 | `local_script` | `local-script.ts` | Execute a skill script by name. Resolves path via `resolveSkillScript()`. Default timeout 180s |
-| `create_skill` | `create-skill.ts` | Create a new skill (web/cli only). Returns structured JSON for UI preview. Scripts require admin approval |
-| `update_skill` | `update-skill.ts` | Update an existing skill (web/cli only). Scripts array is the complete final set — omitted scripts are deleted |
+| `skill_preview` | `skill-preview.ts` | Generate structured skill preview (SKILL.md + scripts) as inline card with copy buttons. Does not persist anything |
 
 ### 4.3 Memory Tools
 
@@ -336,7 +335,7 @@ Skills are reusable diagnostic playbooks consisting of a `SKILL.md` spec and she
 |------|----------|-----------|-------------|
 | Core | `skills/core/` | Baked into image | Built-in diagnostics (node logs, network, image pull debug, etc.) |
 | Global | `skills/global/` | Contributed from personal, admin-managed | Shared across all users |
-| Personal | `skills/user/{userId}/` | User via WebUI or `create_skill` tool | Per-user custom skills |
+| Personal | `skills/user/{userId}/` | User via Skills UI | Per-user custom skills |
 
 Loading priority: personal > skillset > global > builtin (same-name skills override).
 
@@ -381,7 +380,7 @@ Findings are stored in `skill_reviews` and gate activation of the skill.
 | Module | Responsibility |
 |--------|---------------|
 | Agent Runtime | pi-agent or claude-sdk brain |
-| Tools | kubectl, restricted bash, node exec, deep search, create_skill, etc. |
+| Tools | kubectl, restricted bash, node exec, deep search, skill_preview, etc. |
 | Skills | Four-tier overlay: builtin (read-only) + global (read-only) + skillset (dev-only) + personal (read-write) |
 | MCP Client | Connect to external Model Context Protocol servers |
 | Memory | Per-user vector + keyword search across sessions |

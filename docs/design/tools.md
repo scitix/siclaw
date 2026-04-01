@@ -418,7 +418,7 @@ Conditions are declared in each tool's `registration`, not in agent-factory:
 | Tool | Field | Value | Reason |
 |------|-------|-------|--------|
 | `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
-| `create_skill`, `update_skill`, `fork_skill` | `modes` | `["web"]` | Frontend preview card rendering |
+| `skill_preview` | — | All modes | Inline preview card with copy buttons |
 | `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 
 ### Platform Tool Exemption

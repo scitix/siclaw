@@ -26,7 +26,7 @@ export function Markdown({ children }: MarkdownProps) {
                 // Code blocks
                 pre({ children }) {
                     return (
-                        <pre className="bg-slate-900 text-slate-100 rounded-lg p-4 overflow-x-auto my-3 text-sm leading-relaxed">
+                        <pre className="bg-slate-800 text-slate-200 rounded-lg p-4 overflow-x-auto my-3 text-sm leading-relaxed">
                             {children}
                         </pre>
                     );

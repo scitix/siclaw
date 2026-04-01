@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import { InputArea } from './InputArea';
 import { ScheduleCard, type ScheduleCardStatus } from './ScheduleCard';
+import { SkillPreviewCard } from './SkillPreviewCard';
 import { InvestigationCard } from './InvestigationCard';
 import { HypothesesCard } from './HypothesesCard';
 
@@ -39,6 +40,7 @@ export interface PilotAreaProps {
     contextUsage?: ContextUsage | null;
     isCompacting?: boolean;
     onOpenSchedulePanel?: (msg: PilotMessage) => void;
+    onOpenSkillPanel?: (msg: PilotMessage) => void;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     pendingMessages?: string[];
     onRemovePending?: (index: number) => void;
@@ -105,7 +107,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, onOpenSchedulePanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, onOpenSchedulePanel, onOpenSkillPanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -447,6 +449,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     sendRpc={sendRpc}
                                     scheduleStatus={scheduleStatuses.get(msg.id)}
                                     onOpenSchedulePanel={onOpenSchedulePanel}
+                                    onOpenSkillPanel={onOpenSkillPanel}
                                     updateMessageMeta={updateMessageMeta}
                                     investigationProgress={investigationProgress}
                                     sendMessage={sendMessage}
@@ -644,11 +647,12 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
-function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
+function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, onOpenSkillPanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
     scheduleStatus?: ScheduleCardStatus;
     onOpenSchedulePanel?: (msg: PilotMessage) => void;
+    onOpenSkillPanel?: (msg: PilotMessage) => void;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     isInPanel?: boolean;
     investigationProgress?: InvestigationProgress | null;
@@ -671,6 +675,9 @@ function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, sendRpc, up
     if (isTool) {
         if (message.toolName === 'manage_schedule' && !message.isStreaming) {
             return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} selectedWorkspaceId={selectedWorkspaceId} />;
+        }
+        if (message.toolName === 'skill_preview' && !message.isStreaming) {
+            return <SkillPreviewCard message={message} onOpenPanel={onOpenSkillPanel} />;
         }
         if (message.toolName === 'deep_search') {
             // In DP mode, DpChecklistCard handles the running display — hide duplicate InvestigationCard.
