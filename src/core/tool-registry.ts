@@ -33,7 +33,12 @@ export interface ToolEntry {
   /** Tool category — documentation only, not used for filtering. */
   category: "cmd-exec" | "script-exec" | "query" | "workflow";
 
-  /** Factory function — receives shared refs, returns a ToolDefinition. */
+  /**
+   * Factory function — receives shared refs, returns a ToolDefinition.
+   * If your tool accesses optional refs (memoryIndexer, memoryDir, knowledgeIndexer),
+   * you MUST provide an `available` guard that checks them. The registry calls
+   * `available` before `create` — the guard is the safety net for `!` assertions.
+   */
   create: (refs: ToolRefs) => ToolDefinition;
 
   /**

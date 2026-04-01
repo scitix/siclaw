@@ -268,6 +268,8 @@ export async function createSiclawSession(
   const memoryDir = path.join(userDataDir, "memory");
 
   // ── Memory indexer init (before resolve — memory tools use `available` guard) ──
+  // TIMING: must run before DefaultResourceLoader construction (L~478) so that
+  // the memoryFlushExtension lambda captures the initialized .current value.
   const memoryIndexerRef: { current: MemoryIndexer | undefined } = { current: undefined };
   let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
   try {
