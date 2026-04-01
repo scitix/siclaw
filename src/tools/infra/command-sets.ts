@@ -313,8 +313,7 @@ function validateConntrack(args: string[]): string | null {
 const CURL_SAFE_FLAGS = new Set([
   "-s", "--silent", "-S", "--show-error", "-k", "--insecure", "-v", "--verbose",
   "-H", "--header", "-m", "--max-time", "--connect-timeout",
-  "-L", "--location", "-I", "--head", "-w", "--write-out",
-  "-d", "--data", "--data-raw", "--data-urlencode", "--compressed",
+  "-L", "--location", "-I", "--head", "-w", "--write-out", "--compressed",
   "-A", "--user-agent", "-b", "--cookie", "-e", "--referer",
   "-u", "--user", "--cacert", "--cert", "-x", "--proxy",
   "--retry", "--retry-delay", "--retry-max-time",
@@ -322,16 +321,15 @@ const CURL_SAFE_FLAGS = new Set([
 ]);
 const CURL_SAFE_PREFIXES = [
   "-H=", "--header=", "-m=", "--max-time=", "--connect-timeout=",
-  "-w=", "--write-out=", "-d=", "--data=", "--data-raw=", "--data-urlencode=",
+  "-w=", "--write-out=",
   "-A=", "--user-agent=", "-b=", "--cookie=", "-e=", "--referer=",
   "-u=", "--user=", "--cacert=", "--cert=", "-x=", "--proxy=",
   "--retry=", "--retry-delay=", "--retry-max-time=",
 ];
-const CURL_DATA_FLAGS = new Set(["-d", "--data", "--data-raw", "--data-urlencode"]);
 const CURL_REQUEST_FLAGS = new Set(["-X", "--request"]);
-const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS", "POST"]);
+const CURL_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const CURL_SAFE_SHORT_CHARS = new Set([
-  "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "d", "A", "b", "e", "u", "x", "f", "N",
+  "s", "S", "k", "v", "H", "X", "m", "L", "I", "w", "A", "b", "e", "u", "x", "f", "N",
   "4", "6",
 ]);
 
@@ -340,13 +338,6 @@ function checkCurlMethod(method: string | undefined): string | null {
     return JSON.stringify({
       error: `curl -X ${method.toUpperCase()} is not allowed. Only safe HTTP methods (${[...CURL_SAFE_METHODS].join(", ")}) are permitted.`,
     }, null, 2);
-  }
-  return null;
-}
-
-function checkCurlDataValue(flag: string, value: string | undefined): string | null {
-  if (value && value.startsWith("@")) {
-    return `curl ${flag} with @file is not allowed. File uploads are blocked.`;
   }
   return null;
 }
@@ -383,17 +374,6 @@ function validateCurl(args: string[]): string | null {
         continue;
       }
 
-      if (CURL_DATA_FLAGS.has(flag)) {
-        if (!hasValue && i + 1 >= args.length) {
-          return JSON.stringify({ error: `curl "${flag}" requires a value` }, null, 2);
-        }
-        const value = hasValue ? inlineValue : args[i + 1];
-        const err = checkCurlDataValue(flag, value);
-        if (err) return err;
-        if (!hasValue) i++;
-        continue;
-      }
-
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
@@ -422,12 +402,6 @@ function validateCurl(args: string[]): string | null {
         continue;
       }
 
-      if (flag === "-d") {
-        const err = checkCurlDataValue("-d", inlineValue);
-        if (err) return err;
-        continue;
-      }
-
       if (!CURL_SAFE_FLAGS.has(flag) && !startsWithAny(arg, CURL_SAFE_PREFIXES)) {
         return JSON.stringify({
           error: `curl "${arg}" is not allowed. Only read-only curl flags are permitted.`,
@@ -447,13 +421,9 @@ function validateCurl(args: string[]): string | null {
     }
 
     const lastChar = chars[chars.length - 1];
-    if (lastChar && "HXmwdAbeuxr".includes(lastChar)) {
+    if (lastChar && "HXmwAbeux".includes(lastChar)) {
       if (lastChar === "X") {
         const err = checkCurlMethod(args[i + 1]);
-        if (err) return err;
-      }
-      if (lastChar === "d") {
-        const err = checkCurlDataValue("-d", args[i + 1]);
         if (err) return err;
       }
       i++;
