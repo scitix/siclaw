@@ -222,6 +222,39 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   await initSchema(db);
   console.log("[gateway] Database initialized");
 
+  // Sync builtin skills from Docker image to DB
+  const { syncBuiltinSkills } = await import("./skills/builtin-sync.js");
+  const builtinCount = await syncBuiltinSkills(db);
+  console.log(`[gateway] Builtin skills synced: ${builtinCount}`);
+
+  // Fix global skills with self-referential or null origin_id (one-time migration)
+  if (db) {
+    const { SkillRepository } = await import("./db/repositories/skill-repo.js");
+    const fixRepo = new SkillRepository(db);
+    const globalSkills = await fixRepo.list({ scope: "global" });
+    let fixed = 0;
+    for (const g of globalSkills) {
+      const gOrigin = (g as any).originId as string | null;
+      const sourceId = (g as any).globalSourceSkillId as string | null;
+      // Skip if origin_id is already correct (not self-referential and not null)
+      if (gOrigin && gOrigin !== g.id) continue;
+      if (!sourceId) continue;
+      // Look up the source skill's origin_id
+      const source = await fixRepo.getById(sourceId);
+      if (!source) continue;
+      const sourceOrigin = (source as any).originId ?? sourceId;
+      if (sourceOrigin !== gOrigin) {
+        await fixRepo.update(g.id, { originId: sourceOrigin });
+        // Also fix source skill's origin_id if it was null
+        if (!(source as any).originId) {
+          await fixRepo.update(sourceId, { originId: sourceOrigin });
+        }
+        fixed++;
+      }
+    }
+    if (fixed > 0) console.log(`[gateway] Fixed origin_id for ${fixed} global skills`);
+  }
+
   // Config repo for webhook route + cron service
   const configRepo = db ? new ConfigRepository(db) : null;
   const notifRepo = db ? new NotificationRepository(db) : null;

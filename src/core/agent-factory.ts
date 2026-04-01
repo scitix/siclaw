@@ -25,13 +25,14 @@ import { createNodeScriptTool } from "../tools/script-exec/node-script.js";
 import { createPodScriptTool } from "../tools/script-exec/pod-script.js";
 import { createPodExecTool } from "../tools/cmd-exec/pod-exec.js";
 import { createResolvePodNetnsTool } from "../tools/query/resolve-pod-netns.js";
-import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
+// Skill management tools disabled — managed via Skills UI
+// import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
 import { createLocalScriptTool } from "../tools/script-exec/local-script.js";
-import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
-import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
+// import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
+// import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
 import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/workflow/deep-search/tool.js";
-import { createInvestigationFeedbackTool } from "../tools/workflow/deep-search/investigation-feedback.js";
+import { createInvestigationFeedbackTool } from "../tools/query/investigation-feedback.js";
 import { createSaveFeedbackTool } from "../tools/workflow/save-feedback.js";
 import {
   type DpState,
@@ -317,13 +318,12 @@ export async function createSiclawSession(
   if (mode !== "cli") {
     customTools.push(createManageScheduleTool(kubeconfigRef));
   }
-  // Skill management tools are web-only: they produce output designed for
-  // frontend preview card rendering that neither TUI nor channel mode supports.
-  if (mode === "web") {
-    customTools.push(createCreateSkillTool());
-    customTools.push(createUpdateSkillTool());
-    customTools.push(createForkSkillTool());
-  }
+  // Skill management tools are disabled — skills are managed via the Skills UI.
+  // if (mode === "web") {
+  //   customTools.push(createCreateSkillTool());
+  //   customTools.push(createUpdateSkillTool());
+  //   customTools.push(createForkSkillTool());
+  // }
   // -- MCP external tools --
   const cwd = process.cwd();
   let mcpManager: McpClientManager | undefined = opts?.mcpManager;
@@ -432,67 +432,29 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directories (three fixed sources):
-  // 1. Builtin core: baked into Docker image at /app/skills/core/
-  // 2. Builtin extension: baked into Docker image at /app/skills/extension/
-  // 3. Dynamic: global + personal written by bundle API to skillsBase (.siclaw/skills/)
+  // Skill directory: single "resolved/" directory built by materialize (K8s)
+  // or syncSkills (local). Contains all skills flattened with priority:
+  //   personal > skillset > global > builtin (symlinked)
+  // Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
+  // K8s mode: {skillsBase}/resolved/
+  const resolvedSkillsDir = opts?.userId
+    ? path.join(skillsBase, "user", opts.userId, "resolved")
+    : path.join(skillsBase, "resolved");
+
+  // Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
+  // use builtin directories directly.
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
 
-  // Read disabled builtins list (written by agentbox-main / local-spawner after bundle fetch)
-  let disabledBuiltins: Set<string> | undefined;
-  // Local mode writes .disabled-builtins.json into per-user dir; K8s mode writes to skillsBase root
-  const disabledFile = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId, ".disabled-builtins.json")
-    : path.join(skillsBase, ".disabled-builtins.json");
-  try {
-    if (fs.existsSync(disabledFile)) {
-      const list: string[] = JSON.parse(fs.readFileSync(disabledFile, "utf-8"));
-      if (list.length > 0) {
-        disabledBuiltins = new Set(list);
-        console.log(`[agent-factory] Disabled builtins: ${list.join(", ")}`);
-      }
-    }
-  } catch { /* ignore malformed file */ }
-
-  // If there are disabled builtins, enumerate individual skill dirs excluding disabled ones;
-  // otherwise pass the whole builtin directory.
-  // Both core/ and extension/ are scanned as builtin sources.
-  let builtinPaths: string[] = [];
-  for (const bDir of [builtinPath, extensionPath]) {
-    if (!fs.existsSync(bDir)) continue;
-    if (disabledBuiltins) {
-      for (const entry of fs.readdirSync(bDir, { withFileTypes: true })) {
-        if (entry.isDirectory() && !disabledBuiltins.has(entry.name)) {
-          builtinPaths.push(path.join(bDir, entry.name));
-        }
-      }
-    } else {
-      builtinPaths.push(bDir);
+  const skillsDirs: string[] = [];
+  if (fs.existsSync(resolvedSkillsDir)) {
+    skillsDirs.push(resolvedSkillsDir);
+  } else {
+    // Pre-materialize fallback: load builtins directly
+    for (const bDir of [builtinPath, extensionPath]) {
+      if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
   }
-
-  // Priority: personal > skillset > builtin — higher-specificity scopes first.
-  // Local mode: scan per-user dir only (avoids loading other users' skills).
-  // K8s mode: scan skillsBase flat (single-user pod).
-  const dynamicSkillBase = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId)
-    : skillsBase;
-
-  // Enumerate skillset directories (skillset/{setId}/) for skill resolution
-  const skillsetBase = path.join(skillsBase, "skillset");
-  const skillsetDirs: string[] = [];
-  if (fs.existsSync(skillsetBase)) {
-    try {
-      for (const entry of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          skillsetDirs.push(path.join(skillsetBase, entry.name));
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  const skillsDirs = [dynamicSkillBase, ...skillsetDirs, ...builtinPaths];
 
   // Mutable ref: populated before createAgentSession, read by extension at runtime
   const memoryIndexerRef: { current?: MemoryIndexer } = {};

@@ -89,6 +89,7 @@ const DDL_STATEMENTS = [
     type VARCHAR(50),
     version INT NOT NULL DEFAULT 1,
     published_version INT NULL,
+    approved_version INT NULL,
     staging_version INT NOT NULL DEFAULT 0,
     scope ENUM('builtin', 'global', 'personal', 'skillset') NOT NULL DEFAULT 'personal',
     author_id VARCHAR(32),
@@ -102,8 +103,11 @@ const DDL_STATEMENTS = [
     global_source_skill_id VARCHAR(64) NULL,
     global_pinned_version INT NULL,
     forked_from_id VARCHAR(64) NULL,
+    origin_id VARCHAR(64) NULL,
+    content_hash VARCHAR(64) NULL,
     labels_json JSON NULL,
     skill_space_id VARCHAR(64) NULL,
+    commit_message VARCHAR(500),
     FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL,
     FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE SET NULL
   )`,
@@ -203,9 +207,10 @@ const DDL_STATEMENTS = [
 
   `CREATE TABLE IF NOT EXISTS user_disabled_skills (
     user_id VARCHAR(32) NOT NULL,
-    skill_name VARCHAR(255) NOT NULL,
-    PRIMARY KEY (user_id, skill_name),
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    skill_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (user_id, skill_id),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
   )`,
 
   `CREATE TABLE IF NOT EXISTS notifications (
@@ -234,9 +239,10 @@ const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS skill_contents (
     id VARCHAR(64) PRIMARY KEY,
     skill_id VARCHAR(64) NOT NULL,
-    tag ENUM('working', 'staging', 'published') NOT NULL DEFAULT 'working',
+    tag ENUM('working', 'staging', 'staging-contribution', 'published', 'approved') NOT NULL DEFAULT 'working',
     specs MEDIUMTEXT,
     scripts_json JSON,
+    content_hash VARCHAR(64),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE,
@@ -247,6 +253,7 @@ const DDL_STATEMENTS = [
     id VARCHAR(64) PRIMARY KEY,
     skill_id VARCHAR(64) NOT NULL,
     version INT NOT NULL,
+    tag VARCHAR(20) NULL,
     s3_key VARCHAR(500) NULL,
     specs MEDIUMTEXT,
     scripts_json JSON,
@@ -443,6 +450,7 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE messages ADD INDEX idx_messages_session (session_id, timestamp)`,
   `ALTER TABLE skills ADD INDEX idx_skills_scope (scope)`,
   `ALTER TABLE skills ADD INDEX idx_skills_author (author_id)`,
+  `ALTER TABLE skills ADD INDEX idx_skills_origin (origin_id)`,
   `ALTER TABLE skill_votes ADD UNIQUE INDEX idx_skill_votes_unique (skill_id, user_id)`,
   `ALTER TABLE skill_votes ADD INDEX idx_skill_votes_skill (skill_id)`,
   `ALTER TABLE notifications ADD INDEX idx_notifications_user (user_id, is_read, created_at)`,
@@ -464,6 +472,7 @@ const INDEX_STATEMENTS = [
   `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_user (user_id, created_at)`,
   `ALTER TABLE feedback_reports ADD INDEX idx_feedback_reports_session (session_id)`,
   `ALTER TABLE skill_space_members ADD INDEX idx_skill_space_members_space (skill_space_id)`,
+  `ALTER TABLE skill_space_members ADD INDEX idx_skill_space_members_user (user_id)`,
   `ALTER TABLE skills ADD INDEX idx_skills_skill_space (skill_space_id)`,
 ];
 
@@ -480,8 +489,9 @@ export async function initSchema(db: Database): Promise<void> {
   const MIGRATIONS = [
     // skill_versions: s3_key NOT NULL → NULL, add specs + scripts_json columns
     `ALTER TABLE skill_versions MODIFY COLUMN s3_key VARCHAR(500) NULL`,
-    `ALTER TABLE skill_versions ADD COLUMN specs MEDIUMTEXT AFTER s3_key`,
-    `ALTER TABLE skill_versions ADD COLUMN scripts_json JSON AFTER specs`,
+    `ALTER TABLE skill_versions ADD COLUMN specs MEDIUMTEXT`,
+    `ALTER TABLE skill_versions ADD COLUMN scripts_json JSON`,
+    `ALTER TABLE skill_versions ADD COLUMN files JSON`,
     // skills: fix enum values from old schema
     `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','team','personal') NOT NULL DEFAULT 'personal'`,
     `ALTER TABLE skills MODIFY COLUMN review_status ENUM('draft','pending','approved') NOT NULL DEFAULT 'draft'`,
@@ -516,6 +526,40 @@ export async function initSchema(db: Database): Promise<void> {
     `ALTER TABLE skills CHANGE COLUMN team_pinned_version global_pinned_version INT NULL`,
     `ALTER TABLE skills MODIFY COLUMN scope ENUM('builtin','global','personal','skillset') NOT NULL DEFAULT 'personal'`,
     `UPDATE workspaces SET skill_composer = REPLACE(skill_composer, '"team:', '"global:') WHERE skill_composer LIKE '%"team:%'`,
+    // Add origin_id for stable source tracking across fork/sync chains
+    `ALTER TABLE skills ADD COLUMN origin_id VARCHAR(64) NULL`,
+    // Add content_hash for builtin skill sync idempotency
+    `ALTER TABLE skills ADD COLUMN content_hash VARCHAR(64) NULL`,
+    // Separate dev/prod versioning for skill spaces
+    `ALTER TABLE skills ADD COLUMN approved_version INT NULL`,
+    // Per-user skill space enable/disable
+    `CREATE TABLE IF NOT EXISTS user_disabled_skill_spaces (
+      user_id VARCHAR(32) NOT NULL,
+      skill_space_id VARCHAR(64) NOT NULL,
+      PRIMARY KEY (user_id, skill_space_id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (skill_space_id) REFERENCES skill_spaces(id) ON DELETE CASCADE
+    )`,
+    // Widen skill_contents tag enum for staging-contribution and approved
+    `ALTER TABLE skill_contents MODIFY COLUMN tag ENUM('working','staging','staging-contribution','published','approved') NOT NULL DEFAULT 'working'`,
+    // Version tag for dev/prod history separation
+    `ALTER TABLE skill_versions ADD COLUMN tag VARCHAR(20)`,
+    // Drop legacy s3_key columns (never used)
+    `ALTER TABLE skills DROP COLUMN s3_key`,
+    `ALTER TABLE skill_versions DROP COLUMN s3_key`,
+    // Pending message for submit/contribute
+    `ALTER TABLE skills ADD COLUMN commit_message VARCHAR(500)`,
+    // Content hash on skill_contents for fast comparison
+    `ALTER TABLE skill_contents ADD COLUMN content_hash VARCHAR(64)`,
+    // Migrate user_disabled_skills from name-based to id-based
+    `DROP TABLE IF EXISTS user_disabled_skills`,
+    `CREATE TABLE IF NOT EXISTS user_disabled_skills (
+      user_id VARCHAR(32) NOT NULL,
+      skill_id VARCHAR(64) NOT NULL,
+      PRIMARY KEY (user_id, skill_id),
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+    )`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

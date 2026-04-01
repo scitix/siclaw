@@ -10,7 +10,7 @@ export type SkillCardBadge = {
     icon?: LucideIcon;
 };
 
-export type SkillCardActionTone = 'default' | 'blue' | 'purple' | 'orange' | 'red' | 'cyan' | 'indigo' | 'primary';
+export type SkillCardActionTone = 'default' | 'blue' | 'purple' | 'orange' | 'red' | 'cyan' | 'indigo' | 'green' | 'primary';
 
 export type SkillCardAction = {
     key: string;
@@ -65,6 +65,8 @@ function getActionClasses(tone: SkillCardActionTone = 'default'): string {
             return 'text-gray-400 hover:text-cyan-600 hover:bg-cyan-50';
         case 'indigo':
             return 'text-gray-400 hover:text-indigo-600 hover:bg-indigo-50';
+        case 'green':
+            return 'text-gray-400 hover:text-green-600 hover:bg-green-50';
         case 'primary':
             return 'text-gray-400 hover:text-primary-600 hover:bg-primary-50';
         default:
@@ -210,12 +212,11 @@ export function SkillCard({
                     <ToggleSwitch
                         enabled={skill.enabled}
                         onToggle={onToggleEnabled}
-                        disabled={skill.reviewStatus === 'pending'}
                     />
                 )}
             </div>
 
-            <div className="mb-4">
+            <div className="flex-1 mb-4">
                 <h3 className={cn("font-bold mb-1", skill.enabled ? "text-gray-900" : "text-gray-400")}>{skill.name}</h3>
                 <div className="flex items-center gap-1.5 flex-wrap mb-2">
                     {badges.map((badge) => {
@@ -269,7 +270,7 @@ export function SkillCard({
 
             {bottomContent}
 
-            <div className={cn("pt-4 border-t border-gray-50 flex items-center justify-between", !bottomContent && "mt-auto")}>
+            <div className="pt-4 border-t border-gray-50 flex items-center justify-between">
                 <div className="flex items-center gap-2 text-xs font-medium text-gray-400">
                     <span className={cn("px-2 py-0.5 rounded flex items-center gap-1", footerScope.className)}>
                         {footerScope.icon && <footerScope.icon className="w-3 h-3" />}

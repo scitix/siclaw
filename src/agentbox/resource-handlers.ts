@@ -54,6 +54,28 @@ export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
   },
 };
 
+// ── Skills helpers ────────────────────────────────────────────────────
+
+/** Write a single skill (specs + scripts) into the resolved directory */
+function writeSkillToDir(
+  resolvedDir: string,
+  skill: { dirName: string; specs: string; scripts: Array<{ name: string; content: string }> },
+): void {
+  const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
+  fs.mkdirSync(skillDir, { recursive: true });
+  if (skill.specs) {
+    fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
+  }
+  if (skill.scripts.length > 0) {
+    const scriptsDir = path.join(skillDir, "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    for (const script of skill.scripts) {
+      const scriptPath = resolveUnderDir(scriptsDir, script.name);
+      fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
+    }
+  }
+}
+
 // ── Skills handler ────────────────────────────────────────────────────
 
 /**
@@ -63,12 +85,11 @@ interface SkillBundlePayload {
   version: string;
   skills: Array<{
     dirName: string;
-    scope: "global" | "personal" | "skillset";
+    scope: "builtin" | "global" | "personal" | "skillset";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
     skillSpaceId?: string;
   }>;
-  disabledBuiltins?: string[];
 }
 
 export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
@@ -84,57 +105,30 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     const config = loadConfig();
     const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
 
-    // Clear only bundle-managed scope subdirectories (global/, user/, skillset/)
-    // Never wipe the entire skillsDir — that would destroy core/ and other dirs
-    if (fs.existsSync(skillsDir)) {
-      for (const scopeDir of ["global", "user", "skillset"]) {
-        const scopePath = path.join(skillsDir, scopeDir);
-        if (fs.existsSync(scopePath)) {
-          fs.rmSync(scopePath, { recursive: true });
-        }
-      }
-    } else {
-      fs.mkdirSync(skillsDir, { recursive: true });
+    // Build a flat unified "resolved/" directory with priority-based merging:
+    //   personal > skillset > global > builtin
+    // First dirName written wins; later duplicates are skipped.
+    // All scopes come from the bundle payload (including builtin, synced to DB at startup).
+    const resolvedDir = path.join(skillsDir, "resolved");
+
+    // Clear and recreate resolved/
+    if (fs.existsSync(resolvedDir)) {
+      fs.rmSync(resolvedDir, { recursive: true });
     }
+    fs.mkdirSync(resolvedDir, { recursive: true });
 
-    for (const skill of payload.skills) {
-      let skillDir: string;
-      if (skill.scope === "personal") {
-        skillDir = resolveUnderDir(skillsDir, "user", skill.dirName);
-      } else if (skill.scope === "skillset") {
-        if (!skill.skillSpaceId) {
-          console.warn(`[resource-handlers] Missing skillSpaceId for skillset skill "${skill.dirName}", skipping`);
-          continue;
-        }
-        skillDir = resolveUnderDir(skillsDir, "skillset", skill.skillSpaceId, skill.dirName);
-      } else {
-        skillDir = resolveUnderDir(skillsDir, "global", skill.dirName);
-      }
-      fs.mkdirSync(skillDir, { recursive: true });
+    const seen = new Set<string>();
 
-      if (skill.specs) {
-        fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
-      }
-
-      if (skill.scripts.length > 0) {
-        const scriptsDir = path.join(skillDir, "scripts");
-        fs.mkdirSync(scriptsDir, { recursive: true });
-        for (const script of skill.scripts) {
-          const scriptPath = resolveUnderDir(scriptsDir, script.name);
-          fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
-        }
+    // Write in priority order: personal > skillset > global > builtin
+    for (const scope of ["personal", "skillset", "global", "builtin"] as const) {
+      for (const skill of payload.skills.filter(s => s.scope === scope)) {
+        if (seen.has(skill.dirName)) continue;
+        seen.add(skill.dirName);
+        writeSkillToDir(resolvedDir, skill);
       }
     }
 
-    // Write disabled builtins list for agent-factory to exclude
-    const disabledFile = path.join(skillsDir, ".disabled-builtins.json");
-    if (payload.disabledBuiltins?.length) {
-      fs.writeFileSync(disabledFile, JSON.stringify(payload.disabledBuiltins));
-    } else if (fs.existsSync(disabledFile)) {
-      fs.unlinkSync(disabledFile);
-    }
-
-    return payload.skills.length;
+    return seen.size;
   },
 
   async postReload(context: ReloadContext): Promise<void> {

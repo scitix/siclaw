@@ -122,12 +122,16 @@ export const skills = mysqlTable("skills", {
     .default("draft"),
   dirName: varchar("dir_name", { length: 255 }).notNull(),
   publishedVersion: int("published_version"),
+  approvedVersion: int("approved_version"),
   stagingVersion: int("staging_version").notNull().default(0),
+  commitMessage: varchar("commit_message", { length: 500 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   globalSourceSkillId: varchar("global_source_skill_id", { length: 64 }),
   globalPinnedVersion: int("global_pinned_version"),
   forkedFromId: varchar("forked_from_id", { length: 64 }),
+  originId: varchar("origin_id", { length: 64 }),
+  contentHash: varchar("content_hash", { length: 64 }),
   labelsJson: json("labels_json").$type<string[]>(),
   skillSpaceId: varchar("skill_space_id", { length: 64 }).references(() => skillSpaces.id),
 });
@@ -138,9 +142,10 @@ export const skillContents = mysqlTable("skill_contents", {
   id: varchar("id", { length: 64 }).primaryKey(),
   skillId: varchar("skill_id", { length: 64 }).notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
-  tag: mysqlEnum("tag", ["working", "staging", "published"]).notNull().default("working"),
+  tag: mysqlEnum("tag", ["working", "staging", "staging-contribution", "published", "approved"]).notNull().default("working"),
   specs: text("specs"),
   scriptsJson: json("scripts_json").$type<Array<{ name: string; content: string }>>(),
+  contentHash: varchar("content_hash", { length: 64 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 }, (table) => ({
@@ -166,6 +171,7 @@ export const skillVersions = mysqlTable("skill_versions", {
       labels?: string[] | null;
     };
   }>(),
+  tag: varchar("tag", { length: 20 }), // "published" (dev) | "approved" (prod)
   commitMessage: varchar("commit_message", { length: 500 }),
   authorId: varchar("author_id", { length: 32 }).references(() => users.id),
   createdAt: timestamp("created_at").notNull().defaultNow(),
@@ -362,9 +368,16 @@ export const workspaceCredentials = mysqlTable("workspace_credentials", {
 
 export const userDisabledSkills = mysqlTable("user_disabled_skills", {
   userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id),
-  skillName: varchar("skill_name", { length: 255 }).notNull(),
+  skillId: varchar("skill_id", { length: 64 }).notNull(),
 }, (table) => ({
-  pk: primaryKey({ columns: [table.userId, table.skillName] }),
+  pk: primaryKey({ columns: [table.userId, table.skillId] }),
+}));
+
+export const userDisabledSkillSpaces = mysqlTable("user_disabled_skill_spaces", {
+  userId: varchar("user_id", { length: 32 }).notNull().references(() => users.id),
+  skillSpaceId: varchar("skill_space_id", { length: 64 }).notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.skillSpaceId] }),
 }));
 
 // ─── Clusters ────────────────────────────────────────
