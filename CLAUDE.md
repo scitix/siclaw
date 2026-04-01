@@ -91,42 +91,11 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 
 ---
 
-## Pre-flight & Post-flight Protocol
+## Development Protocol
 
-### Pre-flight (before code changes)
+**Before modifying code**: find the files in the Change Impact Matrix above, read the required docs, and note cross-cutting concerns. After changes: run `npm test`, update docs if behavior changed. If something broke that the matrix didn't predict, add a new row or cross-cutting concern entry — every surprise improves the harness.
 
-1. **Locate in matrix** — find the files you'll change in the Change Impact Matrix
-2. **Read required docs** — every doc in the "Must read" column (skim is not enough for security docs)
-3. **List cross-cutting concerns** — write them in your plan or task list
-4. **Confirm test strategy** — know which tests cover your change
-
-### Post-flight (verification loop)
-
-1. **Run tests** — `npm test`; fix failures before moving on
-2. **Update docs** — if you changed behavior or design, update the corresponding doc from the Matrix. Code changes without doc updates are incomplete.
-3. **Compounding engineering** — if something broke that pre-flight didn't predict, update the Change Impact Matrix immediately. Every surprise improves the harness for the next session.
-
-Cross-cutting concerns from pre-flight are verified in two ways:
-- **If tests exist** → `npm test` already covers it (our security path tests are comprehensive)
-- **If no tests exist** → flag it for the reviewer in your PR description. Do not silently assume it's fine.
-
-### Reviewer Protocol
-
-1. Read design docs for the PR's domain (see matrix)
-2. Read existing code around the diff, not just the diff
-3. Check the author's cross-cutting verification — are flagged items actually safe?
-4. Verify: docs updated? DDL parity? Both brain types if applicable?
-
----
-
-## Context Compaction Rules
-
-> When context compacts, preserve:
-
-1. **Modified files** — what was changed and why
-2. **Active invariant domain** — which design docs are relevant
-3. **Cross-cutting concerns** — blast radius items from pre-flight
-4. **Pending verifications** — tests/docs/reviews not yet done
+**Documentation rule**: Design docs record **contracts and rationale** (what must hold, why it was decided), not implementation steps (which functions are called in which order). Implementation details belong in code comments. This keeps docs stable across refactors — a renamed function shouldn't require a doc update, but a changed security contract must.
 
 ---
 
