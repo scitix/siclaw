@@ -243,6 +243,54 @@ export class ModelConfigRepository {
     };
   }
 
+  async updateModel(
+    providerName: string,
+    modelId: string,
+    updates: {
+      name?: string;
+      reasoning?: boolean;
+      contextWindow?: number;
+      maxTokens?: number;
+    },
+  ) {
+    const provRows = await this.db
+      .select({ id: modelProviders.id })
+      .from(modelProviders)
+      .where(eq(modelProviders.name, providerName))
+      .limit(1);
+
+    if (provRows.length === 0) {
+      throw new Error(`Provider "${providerName}" not found`);
+    }
+
+    const existing = await this.db
+      .select({ id: modelEntries.id })
+      .from(modelEntries)
+      .where(
+        and(
+          eq(modelEntries.providerId, provRows[0].id),
+          eq(modelEntries.modelId, modelId),
+        ),
+      )
+      .limit(1);
+    if (existing.length === 0) {
+      throw new Error(`Model "${modelId}" not found`);
+    }
+
+    const setFields: Record<string, unknown> = {};
+    if (updates.name !== undefined) setFields.name = updates.name;
+    if (updates.reasoning !== undefined) setFields.reasoning = updates.reasoning;
+    if (updates.contextWindow !== undefined) setFields.contextWindow = updates.contextWindow;
+    if (updates.maxTokens !== undefined) setFields.maxTokens = updates.maxTokens;
+
+    if (Object.keys(setFields).length === 0) return;
+
+    await this.db
+      .update(modelEntries)
+      .set(setFields)
+      .where(eq(modelEntries.id, existing[0].id));
+  }
+
   async removeModel(providerName: string, modelId: string) {
     const provRows = await this.db
       .select({ id: modelProviders.id })
