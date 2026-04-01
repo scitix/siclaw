@@ -23,6 +23,8 @@ import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
+import { consumeAgentSse } from "./sse-consumer.js";
+import { buildRedactionConfig } from "./output-redactor.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { FeedbackRepository } from "./db/repositories/feedback-repo.js";
 import { loadConfig } from "../core/config.js";
@@ -260,8 +262,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   const notifRepo = db ? new NotificationRepository(db) : null;
 
   // In-process cron service (replaces standalone cron process)
-  const cronService = (configRepo && notifRepo)
-    ? new CronService({ configRepo, notifRepo, sendToUser, gatewayPort: config.port })
+  const internalChatRepo = db ? new ChatRepository(db) : null;
+  const cronService = (configRepo && notifRepo && internalChatRepo)
+    ? new CronService({ configRepo, notifRepo, chatRepo: internalChatRepo, sendToUser, gatewayPort: config.port })
     : null;
 
   // System config repo (used by JWT, SSO, cert-manager, metrics cache, etc.)
@@ -785,6 +788,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             userId: string; sessionId: string; text: string;
             timeoutMs?: number; caller?: string;
             workspaceId?: string;
+            persistToDb?: boolean;
           };
           userId = data.userId;
           const timeoutMs = data.timeoutMs || 300_000;
@@ -846,10 +850,37 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           // 4. Wait for completion with cancellable timeout
           const timeout = rejectAfterTimeout(timeoutMs, data.sessionId);
           try {
-            const resultText = await Promise.race([
-              waitForAgentCompletion(client, promptResult.sessionId),
-              timeout.promise,
-            ]);
+            let resultText: string;
+
+            if (data.persistToDb && db) {
+              // Persistent mode: write tool calls + assistant messages to DB
+              const chatRepoLocal = new ChatRepository(db);
+              const sensitiveStrings: string[] = [];
+              if (modelConfig?.apiKey) sensitiveStrings.push(modelConfig.apiKey);
+              if (modelConfig?.baseUrl) sensitiveStrings.push(modelConfig.baseUrl);
+              const redactionCfg = buildRedactionConfig(
+                credentials?.manifest,
+                credentials?.manifest?.length ? path.resolve(process.cwd(), ".siclaw/credentials") : undefined,
+                sensitiveStrings.length > 0 ? sensitiveStrings : undefined,
+              );
+              const sseResult = await Promise.race([
+                consumeAgentSse({
+                  client,
+                  sessionId: promptResult.sessionId,
+                  userId,
+                  chatRepo: chatRepoLocal,
+                  redactionConfig: redactionCfg,
+                }),
+                timeout.promise,
+              ]);
+              resultText = (sseResult as { resultText: string }).resultText;
+            } else {
+              // Legacy mode: text extraction only, no DB persistence
+              resultText = await Promise.race([
+                waitForAgentCompletion(client, promptResult.sessionId),
+                timeout.promise,
+              ]) as string;
+            }
 
             timeout.cancel();
             const durationMs = Date.now() - startTime;

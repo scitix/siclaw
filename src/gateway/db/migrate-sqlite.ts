@@ -39,7 +39,8 @@ const DDL_STATEMENTS = [
     last_active_at INTEGER NOT NULL DEFAULT (unixepoch()),
     message_count INTEGER NOT NULL DEFAULT 0,
     deleted_at INTEGER,
-    s3_key TEXT
+    s3_key TEXT,
+    source TEXT NOT NULL DEFAULT 'pilot'
   )`,
 
   `CREATE TABLE IF NOT EXISTS messages (
@@ -133,6 +134,7 @@ const DDL_STATEMENTS = [
     result_text TEXT,
     error TEXT,
     duration_ms INTEGER,
+    session_id TEXT,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
   )`,
 
@@ -535,6 +537,9 @@ export async function runSqliteMigrations(db: Database): Promise<void> {
       SELECT o.user_id, s.id FROM user_disabled_skills_old o
       JOIN skills s ON s.name = o.skill_name`,
     `DROP TABLE IF EXISTS user_disabled_skills_old`,
+    // ── Cron session reuse ──
+    `ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'pilot'`,
+    `ALTER TABLE cron_job_runs ADD COLUMN session_id TEXT`,
   ];
   for (const stmt of MIGRATIONS) {
     try {
