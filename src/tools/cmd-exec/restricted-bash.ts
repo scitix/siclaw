@@ -66,6 +66,13 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       break;
     }
 
+    if (subcommand === "exec") {
+      return JSON.stringify({
+        error: "kubectl exec is not available through restricted_bash.",
+        hint: "Use the pod_exec tool to run commands inside a pod, or node_exec for host-level diagnostics.",
+      }, null, 2);
+    }
+
     if (!subcommand || !SAFE_SUBCOMMANDS.has(subcommand)) {
       return JSON.stringify({
         error: `kubectl subcommand "${subcommand || "(empty)"}" is not allowed in read-only mode.`,

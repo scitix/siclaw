@@ -126,7 +126,9 @@ function resolveOutputAction(
   }
 
   if (strategy === "auto") {
-    // restricted-bash: check for kubectl exec inner command first
+    // Defense-in-depth: detect kubectl exec inner command for output sanitization.
+    // restricted-bash blocks exec via SAFE_SUBCOMMANDS, but this layer runs
+    // independently (preExecSecurity can be called without pipelineValidators).
     for (const cmd of commands) {
       const bin = getCommandBinary(cmd);
       if (bin === "kubectl") {

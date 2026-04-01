@@ -1366,6 +1366,23 @@ describe("createRestrictedBashTool — pipe-only text command enforcement", () =
   }
 });
 
+// ── kubectl exec rejection ──────────────────────────────────────────
+
+describe("validateKubectlInPipeline — kubectl exec rejected", () => {
+  it("rejects kubectl exec with actionable hint", () => {
+    const err = validateKubectlInPipeline(["kubectl exec my-pod -- ip addr"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("pod_exec");
+    expect(err).toContain("node_exec");
+  });
+
+  it("rejects kubectl exec with namespace flag", () => {
+    const err = validateKubectlInPipeline(["kubectl -n default exec my-pod -- cat /etc/os-release"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("pod_exec");
+  });
+});
+
 // ── Sensitive resource pipeline protection ──────────────────────────
 
 describe("validateKubectlInPipeline — sensitive resource (no pre-execution blocking)", () => {
