@@ -579,10 +579,10 @@ Every `kubectl` invocation is restricted to read-only subcommands:
 
 ```
 get, describe, logs, top, events, api-resources, api-versions,
-cluster-info, config, version, explain, auth, exec
+cluster-info, config, version, explain, auth
 ```
 
-All write operations — `apply`, `delete`, `patch`, `create`, `scale`, `drain`, `cordon`, `edit`, `replace`, `label`, `taint`, `rollout undo` — are rejected. For `kubectl exec`, the command after `--` goes through the same binary allowlist (Pass 2).
+All write operations — `apply`, `delete`, `patch`, `create`, `scale`, `drain`, `cordon`, `edit`, `replace`, `label`, `taint`, `rollout undo` — are rejected. `kubectl exec` is not allowed — use the dedicated `pod_exec` or `node_exec` tools instead.
 
 **Pass 4 — Per-Command Flag Restrictions** (`validateCommandRestrictions`)
 

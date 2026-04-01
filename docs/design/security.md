@@ -478,23 +478,21 @@ Stripped patterns:
 
 ```
 Allowed: get, describe, logs, top, events, api-resources, api-versions,
-         cluster-info, config, version, explain, auth, exec
+         cluster-info, config, version, explain, auth
 ```
 
 **All write operations permanently blocked**: apply, create, delete, patch, scale, drain,
 cordon, edit, replace, label, taint, rollout undo.
 
-### 8.2 kubectl exec Restrictions
+`kubectl exec` is **not** allowed as a subcommand — use the dedicated `pod_exec` or
+`node_exec` tools instead, which provide their own security validation pipeline.
 
-When `kubectl exec` is used (e.g., `kubectl exec my-pod -- ip addr`), the exec'd command
-passes through the binary allowlist. Only commands in `ALLOWED_COMMANDS` can be exec'd.
-
-### 8.3 kubectl config view --raw Blocked
+### 8.2 kubectl config view --raw Blocked
 
 `kubectl config view --raw` is explicitly blocked — it outputs kubeconfig with embedded
 certificates and tokens in plaintext.
 
-**Source**: `src/tools/infra/command-sets.ts` — `SAFE_SUBCOMMANDS`, `validateExecCommand()`
+**Source**: `src/tools/infra/command-sets.ts` — `SAFE_SUBCOMMANDS`
 
 ---
 

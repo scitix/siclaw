@@ -160,12 +160,12 @@ These are **intentionally NOT in the allowlist** despite being common:
 Allowed subcommands (read-only):
 ```
 get, describe, logs, top, events, api-resources, api-versions,
-cluster-info, config, version, explain, auth, exec
+cluster-info, config, version, explain, auth
 ```
 
 **All write operations are permanently blocked**: `apply`, `create`, `delete`, `patch`, `scale`, `drain`, `cordon`, `edit`, `replace`, `label`, `taint`, `rollout undo`.
 
-`kubectl exec` commands pass through the binary allowlist (Pass 3) for the exec'd command.
+`kubectl exec` is not allowed as a subcommand — use the dedicated `pod_exec` or `node_exec` tools instead.
 
 ### 3.5 Skill Script Exemption
 

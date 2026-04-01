@@ -1,6 +1,6 @@
 /**
  * Shared command whitelist and command-level validators used by
- * restricted-bash, node-exec, and kubectl-exec tools.
+ * restricted-bash, pod-exec, and node-exec tools.
  *
  * Cross-reference: src/gateway/skills/script-evaluator.ts (DANGER_PATTERNS).
  * When modifying either file, verify the other still makes sense.
@@ -674,7 +674,7 @@ function validateTee(args: string[]): string | null {
 /**
  * Apply context policy constraints for a command.
  * Checks pipeOnly, noFilePaths, and categoryBlockedFlags from CONTEXT_POLICIES.
- * Skipped when context is undefined (e.g., validateExecCommand path).
+ * Skipped when context is undefined.
  */
 function applyContextPolicy(
   baseName: string,
@@ -818,7 +818,6 @@ export const SAFE_SUBCOMMANDS = new Set([
   "version",
   "explain",
   "auth",
-  "exec",
 ]);
 
 /**
@@ -890,53 +889,6 @@ function extractKubectlFormatName(value: string): string {
 // Keep backward-compatible export for any external callers
 export function hasAllNamespacesWithoutSelector(args: string[], subcommand: string): boolean {
   return checkAllNamespacesRestriction(args, subcommand) !== null;
-}
-
-/**
- * Validate the command after `--` in `kubectl exec`.
- * Returns an error message if blocked, or null if allowed.
- */
-export function validateExecCommand(args: string[]): string | null {
-  const dashDashIndex = args.indexOf("--");
-  if (dashDashIndex === -1 || dashDashIndex === args.length - 1) {
-    return JSON.stringify({
-      error: 'kubectl exec requires "--" followed by a command.',
-      example: 'exec my-pod -- ip addr show',
-    }, null, 2);
-  }
-
-  // The executable is the first arg after --
-  const execBinary = args[dashDashIndex + 1];
-  // Extract basename (handle /usr/bin/ping -> ping)
-  const baseName = execBinary.split("/").pop()?.toLowerCase() ?? "";
-
-  if (!(baseName in COMMANDS)) {
-    return JSON.stringify({
-      error: `Command "${baseName}" is not in the allowed exec command list.`,
-      allowed_categories: {
-        network: "ip, ifconfig, ping, traceroute, ss, netstat, ethtool, ...",
-        rdma: "ibstat, ibv_devinfo, rdma, show_gids, ...",
-        perftest: "ib_write_bw, ib_read_bw, ib_send_bw, ib_write_lat, ib_read_lat, ib_send_lat, ...",
-        gpu: "nvidia-smi, gpustat, nvtopo",
-        system: "cat, ls, ps, top, df, free, dmesg, lspci, ...",
-      },
-    }, null, 2);
-  }
-
-  // Apply command-level restrictions (find -exec, sysctl -w, curl -o, etc.)
-  const execCmd = args.slice(dashDashIndex + 1).join(" ");
-  const restrictionErr = validateCommandRestrictions(execCmd);
-  if (restrictionErr) return restrictionErr;
-
-  // Check sensitive path patterns (validateExecCommand does not go through
-  // Pass 6 of validateCommand, so we check explicitly here)
-  if (CONTAINER_SENSITIVE_PATHS.some((re) => re.test(execCmd))) {
-    return JSON.stringify({
-      error: "Accessing sensitive paths inside containers is not allowed.",
-    }, null, 2);
-  }
-
-  return null;
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -1279,7 +1231,7 @@ export function getContextAllowedSet(context: string): ReadonlySet<string> {
 
 /**
  * Paths that must never be accessed through exec tools.
- * Used by validateCommand (Pass 6) and validateExecCommand.
+ * Used by validateCommand (Pass 6).
  *
  * These are paths whose content cannot be reliably sanitized post-execution
  * (binary data, unstructured secrets, password hashes, etc.).
