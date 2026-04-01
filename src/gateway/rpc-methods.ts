@@ -5062,13 +5062,15 @@ export function createRpcMethods(
     const scheduleChanged = !existingJob || existingJob.schedule !== schedule;
     if (scheduleChanged) {
       const { avg, min } = getAverageIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      // Check the stricter limit first so the user sees the real constraint upfront
+      // (avoids confusing two-step error: "10 min" then "60 min")
+      const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
+        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+      }
       if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
         const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
-        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
-      }
-      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
-        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
-        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes (average interval must be at least ${limitMin} minutes)`);
       }
     }
 
@@ -5167,13 +5169,13 @@ export function createRpcMethods(
     if (status === "active" && job.status !== "active") {
       // Interval check (prevents re-activating a high-frequency job)
       const { avg, min } = getAverageIntervalMs(job.schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
+        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+      }
       if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
         const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
-        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
-      }
-      if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
-        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
-        throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+        throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes (average interval must be at least ${limitMin} minutes)`);
       }
 
       // Active job quota
