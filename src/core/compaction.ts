@@ -226,6 +226,13 @@ export function repairToolUseResultPairing(messages: AgentMessage[]): {
   return { messages: changed ? out : messages, droppedOrphanCount };
 }
 
+/**
+ * InputGuard adapter for repairToolUseResultPairing.
+ * Unwraps the report to return just the messages array.
+ */
+export const repairToolUsePairingGuard = (messages: AgentMessage[]): AgentMessage[] =>
+  repairToolUseResultPairing(messages).messages;
+
 // ── Token estimation ─────────────────────────────────────────────────────
 
 export function estimateMessagesTokens(messages: AgentMessage[]): number {
