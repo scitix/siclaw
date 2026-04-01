@@ -291,12 +291,20 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // Set model if specified in prompt request (ensures model is applied before first prompt)
+    // Always call setModel when the registry model differs from the session model
+    // (covers field changes like reasoning/contextWindow without id/provider change)
     if (body.modelProvider && body.modelId) {
       const found = managed.brain.findModel(body.modelProvider, body.modelId);
       if (found) {
         const currentModel = managed.brain.getModel();
-        if (!currentModel || currentModel.id !== found.id || currentModel.provider !== found.provider) {
-          console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id}`);
+        const needsUpdate = !currentModel
+          || currentModel.id !== found.id
+          || currentModel.provider !== found.provider
+          || currentModel.reasoning !== found.reasoning
+          || currentModel.contextWindow !== found.contextWindow
+          || currentModel.maxTokens !== found.maxTokens;
+        if (needsUpdate) {
+          console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
           await managed.brain.setModel(found);
         }
       }
