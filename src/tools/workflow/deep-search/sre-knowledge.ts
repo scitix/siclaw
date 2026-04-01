@@ -7,7 +7,7 @@
  */
 
 /**
- * Tool semantics — bash vs node_exec vs kubectl exec.
+ * Tool semantics — bash vs pod_exec vs node_exec.
  * Injected into Phase 1 and Phase 3 prompts where tools are used.
  */
 export function toolSemantics(): string {
@@ -17,9 +17,8 @@ export function toolSemantics(): string {
 - Runs in cluster context (same host as SRE agent)
 - Supports pipes (|), && chaining, redirects, shell features
 - Can invoke skill scripts: bash skills/{core,extension}/<name>/scripts/<script> [args]
-- Can run kubectl exec to execute commands INSIDE a pod:
-  bash: kubectl exec <pod> -n <ns> -- <cmd>
 - Allowed commands: kubectl (read-only), grep, sort, jq, yq, head, tail, cut, tr, etc.
+- To execute commands INSIDE a pod, use the pod_exec tool (NOT kubectl exec via bash)
 
 ### node_exec tool
 - Runs on Kubernetes node HOST via privileged debug pod + nsenter
@@ -34,7 +33,7 @@ export function toolSemantics(): string {
 ### Critical Differences
 - Pod-specific interfaces/files exist ONLY in the pod's network namespace, NOT on the host
   node_exec: ip link show <pod-interface> → NOT FOUND (wrong tool!)
-  bash: kubectl exec <pod> -n <ns> -- ip link show <pod-interface> → CORRECT
+  pod_exec: ip link show <pod-interface> → CORRECT
 - node_exec does NOT support pipes:
   node_exec: lsmod | grep <module> → ERROR (pipe not supported!)
   node_exec: lsmod → OK (filter output in your reasoning, not in the command)
@@ -62,7 +61,7 @@ export function commonMistakes(): string {
 
 1. Using node_exec for pod-level diagnostics:
    WRONG: node_exec: cat /sys/class/net/<iface>/mtu  (pod interfaces don't exist on host)
-   RIGHT: bash: kubectl exec <pod> -n <ns> -- cat /sys/class/net/<iface>/mtu
+   RIGHT: pod_exec: cat /sys/class/net/<iface>/mtu
 
 2. Using pipes in node_exec:
    WRONG: node_exec: lsmod | grep <module>

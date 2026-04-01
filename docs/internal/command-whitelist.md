@@ -13,8 +13,8 @@ Commands are validated in two layers:
 
 These validations apply to three tools:
 - `restricted-bash` — sandboxed shell execution (also allows `kubectl` and skill scripts)
+- `pod-exec` — command execution inside Kubernetes pods
 - `node-exec` — command execution on Kubernetes nodes via privileged debug pods
-- `kubectl-exec` — command execution inside Kubernetes pods
 
 Additionally, `restricted-bash` validates **shell operators** (see [Shell Operator Restrictions](#shell-operator-restrictions)).
 
@@ -555,11 +555,11 @@ Allowed subcommands (`SAFE_SUBCOMMANDS` in `src/tools/infra/command-sets.ts`):
 
 ```
 get  describe  logs  top  events  api-resources
-api-versions  cluster-info  config  version  explain  auth  exec
+api-versions  cluster-info  config  version  explain  auth
 ```
 
-Note: `exec` is allowed as a kubectl subcommand, but the exec'd command passes
-through the binary allowlist for the applicable context. `kubectl config view --raw`
+Note: `exec` is **not** allowed as a kubectl subcommand — use the dedicated
+`pod_exec` or `node_exec` tools instead. `kubectl config view --raw`
 is explicitly blocked (would expose embedded certificates/tokens).
 
 ---
