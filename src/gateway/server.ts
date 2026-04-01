@@ -838,8 +838,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           }
 
           // 4. Send prompt with credentials and model config
+          const mode = data.caller === "cron" ? "cron" : undefined;
           const systemPromptTemplate = workspace?.configJson?.systemPrompt || undefined;
-          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig, systemPromptTemplate });
+          const promptResult = await client.prompt({ sessionId: data.sessionId, text: data.text, credentials, modelProvider, modelId, modelConfig, systemPromptTemplate, mode });
           sessionId = promptResult.sessionId;
 
           // 4. Wait for completion with cancellable timeout
@@ -1437,9 +1438,15 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
 /** Consume SSE stream from AgentBox and extract final assistant text */
 async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string): Promise<string> {
   let resultText = "";
+  let taskReportText = "";
   // Accumulate text deltas per message (claude-sdk brain emits text via
   // message_update/text_delta and sends empty content in message_end)
   let currentMsgText = "";
+  // Track last tool name to identify task_report results.
+  // pi-agent emits "tool_execution_start" (toolName field),
+  // claude-sdk emits "tool_start" (name field).
+  let lastToolName = "";
+
   for await (const event of client.streamEvents(sessionId)) {
     const evt = event as Record<string, unknown>;
 
@@ -1452,14 +1459,16 @@ async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string)
     }
 
     if (evt.type === "message_start") {
-      // New message — reset accumulated text
       currentMsgText = "";
+    }
+
+    if (evt.type === "tool_execution_start" || evt.type === "tool_start") {
+      lastToolName = (evt.toolName as string) || (evt.name as string) || "";
     }
 
     if (evt.type === "message_end" || evt.type === "turn_end") {
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "assistant") {
-        // Try to extract from message.content first (pi-agent brain)
         let extracted = "";
         const content = message.content;
         if (typeof content === "string" && content) {
@@ -1470,19 +1479,28 @@ async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string)
             .map((c) => c.text ?? "")
             .join("");
         }
-        // Use extracted content, or fall back to accumulated text deltas
-        // (claude-sdk brain sends empty content in message_end)
         resultText = extracted || currentMsgText || resultText;
+      } else if (message?.role === "toolResult" && lastToolName === "task_report") {
+        const content = message.content;
+        const text = typeof content === "string" ? content
+          : Array.isArray(content)
+            ? (content as Array<{ type: string; text?: string }>)
+                .filter((c) => c.type === "text")
+                .map((c) => c.text ?? "")
+                .join("")
+            : "";
+        if (text) taskReportText = text;
       }
       currentMsgText = "";
+      if (message?.role === "toolResult") lastToolName = "";
     }
     if (evt.type === "agent_end") break;
   }
-  // Final fallback: if no message_end was captured but we have accumulated text
   if (!resultText && currentMsgText) {
     resultText = currentMsgText;
   }
-  return resultText;
+  // task_report takes priority over free text
+  return taskReportText || resultText;
 }
 
 class ExecutionTimeoutError extends Error {
