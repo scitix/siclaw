@@ -64,7 +64,7 @@ Parameters:
 - schedule: standard 5-field cron expression (min hour dom month dow)
 - status: "active" or "paused"
 
-IMPORTANT: Minimum schedule interval is 60 minutes. Schedules more frequent than hourly will be rejected. Do NOT attempt intervals shorter than 60 minutes.
+IMPORTANT: Minimum schedule interval is ${Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000)} minutes. Schedules more frequent than this will be rejected. Do NOT attempt shorter intervals.
 
 Common cron patterns:
 - Every hour: 0 * * * *
