@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 /**
  * save_feedback tool — persists structured session feedback to Gateway DB
  */
@@ -141,3 +142,9 @@ The report includes overall rating, decision point evaluations, strengths, impro
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (refs) => createSaveFeedbackTool(refs.sessionIdRef),
+  platform: true,
+};

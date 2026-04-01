@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { skillExistsInBundle, skillExistsAsBuiltin } from "../infra/script-resolver.js";
@@ -127,3 +128,9 @@ Examples:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (_refs) => createForkSkillTool(),
+  modes: ["web"],
+};

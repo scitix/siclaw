@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -105,3 +106,10 @@ Returns matching memory chunks with file path, heading context, content snippet,
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "query",
+  create: (refs) => createMemorySearchTool(refs.memoryIndexer!),
+  platform: true,
+  available: (refs) => !!refs.memoryIndexer,
+};

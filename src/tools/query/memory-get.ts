@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -111,3 +112,10 @@ Parameters:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "query",
+  create: (refs) => createMemoryGetTool(refs.memoryDir!),
+  platform: true,
+  available: (refs) => !!refs.memoryIndexer && !!refs.memoryDir,
+};

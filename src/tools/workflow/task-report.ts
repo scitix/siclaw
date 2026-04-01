@@ -6,6 +6,7 @@
  * so we capture the report through a tool call instead.
  */
 
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -41,3 +42,10 @@ export function createTaskReportTool(): ToolDefinition {
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (_refs) => createTaskReportTool(),
+  modes: ["cron"],
+  platform: true,
+};

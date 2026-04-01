@@ -1,6 +1,7 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { loadConfig } from "../../core/config.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 import { parseCronExpression, getAverageIntervalMs } from "../../cron/cron-matcher.js";
@@ -250,3 +251,10 @@ Common cron patterns:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (refs) => createManageScheduleTool(refs.kubeconfigRef),
+  modes: ["web", "channel"],
+  platform: true,
+};

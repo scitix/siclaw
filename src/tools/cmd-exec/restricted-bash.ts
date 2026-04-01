@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -5,7 +6,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { SAFE_SUBCOMMANDS, validateExecCommand, checkAllNamespacesRestriction } from "../infra/command-sets.js";
 import { loadConfig } from "../../core/config.js";
@@ -381,3 +382,8 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "cmd-exec",
+  create: (refs) => createRestrictedBashTool(refs.kubeconfigRef),
+};
