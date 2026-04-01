@@ -31,6 +31,7 @@ import { createLocalScriptTool } from "../tools/script-exec/local-script.js";
 // import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
 // import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
 import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
+import { createTaskReportTool } from "../tools/workflow/task-report.js";
 import { createDeepSearchTool, type MemoryRef } from "../tools/workflow/deep-search/tool.js";
 import { createInvestigationFeedbackTool } from "../tools/query/investigation-feedback.js";
 import { createSaveFeedbackTool } from "../tools/workflow/save-feedback.js";
@@ -63,7 +64,7 @@ import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./
 import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
-export type SessionMode = "web" | "channel" | "cli";
+export type SessionMode = "web" | "channel" | "cli" | "cron";
 
 export interface KubeconfigRef {
   credentialsDir?: string; // path to credentials directory (e.g. /home/agentbox/.credentials)
@@ -311,8 +312,13 @@ export async function createSiclawSession(
 
   // ── Workflow: conditional tools ──
   // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
-  if (mode !== "cli") {
+  // Schedule tool: web + channel (not cli, not cron — cron must not manage its own schedules)
+  if (mode !== "cli" && mode !== "cron") {
     customTools.push(createManageScheduleTool(kubeconfigRef));
+  }
+  // task_report: cron-only tool — forces structured output via tool call
+  if (mode === "cron") {
+    customTools.push(createTaskReportTool());
   }
   // Skill management tools are disabled — skills are managed via the Skills UI.
   // if (mode === "web") {
@@ -351,7 +357,7 @@ export async function createSiclawSession(
 
   // Filter custom tools by workspace allow-list
   // Platform tools are exempt — they must always be available regardless of workspace config
-  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback", "knowledge_search"]);
+  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback", "knowledge_search", "task_report"]);
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
   if (Array.isArray(allowedTools)) {
     const allowed = new Set(allowedTools);
