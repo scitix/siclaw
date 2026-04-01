@@ -5,7 +5,7 @@
  * debug pod lifecycle, container netns resolution, and output formatting.
  */
 import { spawn } from "node:child_process";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import { sanitizeEnv } from "./sanitize-env.js";
 import { checkNodeReady } from "./k8s-checks.js";

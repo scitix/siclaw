@@ -15,12 +15,13 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { createSiclawSession, type KubeconfigRef, type LlmConfigRef, type SessionMode } from "../core/agent-factory.js";
+import { createSiclawSession } from "../core/agent-factory.js";
+import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef, DpStatus } from "../core/types.js";
 import type { BrainSession, BrainType } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import type { DpState, DpStateRef, DpStatus } from "../tools/workflow/dp-tools.js";
+import type { DpState } from "../tools/workflow/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 // topic-consolidator import removed — consolidation disabled

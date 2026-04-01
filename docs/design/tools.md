@@ -384,40 +384,57 @@ OUTPUT_RULES["mycommand"] = (args: string[]): OutputAction | null => {
 
 ---
 
-## 7. Registration in `agent-factory.ts`
+## 7. Tool Registry
 
-Tools are registered in the `customTools` array in `src/core/agent-factory.ts`,
-grouped by category with section comments:
+Tools are registered declaratively via the **Tool Registry** pattern.
+Each tool file exports a `registration: ToolEntry` that declares its metadata,
+and `agent-factory.ts` resolves the final tool list in one call.
+
+### Architecture
+
+```
+src/core/tool-registry.ts    ← ToolEntry interface + ToolRegistry class
+src/tools/all-entries.ts      ← ordered list of all tool registrations
+src/tools/<dir>/<tool>.ts     ← each exports `registration: ToolEntry`
+src/core/agent-factory.ts     ← calls registry.resolve({ mode, refs, allowedTools })
+```
+
+### ToolEntry Interface
 
 ```typescript
-const customTools: ToolDefinition[] = [
-  // ── Command execution — full security pipeline (cmd-exec/) ──
-  ...
-  // ── Script execution — pre-audited scripts (script-exec/) ──
-  ...
-  // ── Data query (query/) ──
-  ...
-  // ── Workflow (workflow/) ──
-  ...
-];
+interface ToolEntry {
+  category: "cmd-exec" | "script-exec" | "query" | "workflow";
+  create: (refs: ToolRefs) => ToolDefinition;
+  modes?: SessionMode[];      // omit = all modes
+  platform?: boolean;          // exempt from allowedTools filtering
+  available?: (refs: ToolRefs) => boolean;  // runtime guard
+}
 ```
 
 ### Conditional Registration
 
-Some tools are registered conditionally:
+Conditions are declared in each tool's `registration`, not in agent-factory:
 
-| Tool | Condition | Reason |
-|------|-----------|--------|
-| `manage_schedule` | `mode !== "cli"` | No UI rendering in TUI |
-| `create_skill`, `update_skill`, `fork_skill` | `mode === "web"` | Frontend preview card rendering |
-| `memory_search`, `memory_get` | After `memoryIndexer` init | Depends on indexer instance |
+| Tool | Field | Value | Reason |
+|------|-------|-------|--------|
+| `manage_schedule` | `modes` | `["web", "channel"]` | No UI rendering in TUI |
+| `create_skill`, `update_skill`, `fork_skill` | `modes` | `["web"]` | Frontend preview card rendering |
+| `memory_search`, `memory_get` | `available` | `(refs) => !!refs.memoryIndexer` | Depends on indexer instance |
 
-### PLATFORM\_TOOLS Exemption
+### Platform Tool Exemption
 
-Tools in `PLATFORM_TOOLS` set (`manage_schedule`, `credential_list`,
+Tools with `platform: true` (`manage_schedule`, `credential_list`,
 `cluster_info`, `save_feedback`, `knowledge_search`) are exempt from workspace
 allow-list filtering — they must always be available regardless of workspace
-configuration.
+configuration. This is declared in each tool's registration, not in a central set.
+
+### Tools Not in Registry
+
+- **Extension tools** (`propose_hypotheses`, `end_investigation`): registered
+  via pi-agent extension API, lifecycle managed by extension
+- **MCP tools**: dynamically discovered at runtime, appended after resolve
+- **File I/O tools** (read/edit/write/grep/find/ls): framework tools with
+  path-restricted operations injection, appended after resolve
 
 ---
 

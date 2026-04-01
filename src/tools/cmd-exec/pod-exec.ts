@@ -1,9 +1,10 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
@@ -180,3 +181,8 @@ Examples:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "cmd-exec",
+  create: (refs) => createPodExecTool(refs.kubeconfigRef),
+};

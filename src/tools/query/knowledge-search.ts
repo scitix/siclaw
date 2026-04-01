@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -128,3 +129,9 @@ Returns matching document chunks with file path, heading context, content snippe
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "query",
+  create: (refs) => createKnowledgeSearchTool(refs.knowledgeIndexer),
+  platform: true,
+};

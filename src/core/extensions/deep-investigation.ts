@@ -2,16 +2,13 @@ import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@marioz
 import { Key, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { deepSearchEvents, type ProgressEvent } from "../../tools/workflow/deep-search/events.js";
+import type { MutableDpStateRef, DpStatus, DpHypothesis, MemoryRef } from "../types.js";
 import {
   type DpChecklist,
-  type MutableDpStateRef,
-  type DpStatus,
-  type DpHypothesis,
   createChecklist,
   syncChecklistFromStatus,
   buildActivationMessage,
 } from "../../tools/workflow/dp-tools.js";
-import type { MemoryRef } from "../../tools/workflow/deep-search/tool.js";
 import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
 
 

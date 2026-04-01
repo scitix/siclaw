@@ -1,3 +1,4 @@
+import type { ToolEntry } from "../../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { investigate } from "./engine.js";
@@ -5,15 +6,7 @@ import { formatSummary } from "./format.js";
 import { NORMAL_BUDGET, QUICK_BUDGET } from "./types.js";
 import { Text } from "@mariozechner/pi-tui";
 import { deepSearchEvents } from "./events.js";
-import type { KubeconfigRef, LlmConfigRef } from "../../../core/agent-factory.js";
-import type { MemoryIndexer } from "../../../memory/indexer.js";
-import type { DpStateRef } from "../dp-tools.js";
-
-/** Mutable ref to the shared memory indexer (set after session creation). */
-export interface MemoryRef {
-  indexer?: MemoryIndexer;
-  dir?: string;
-}
+import type { KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef } from "../../../core/types.js";
 
 interface DeepSearchHypothesis {
   text: string;
@@ -298,3 +291,10 @@ Do NOT use for simple queries that can be answered with 1-2 kubectl commands.`,
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "workflow",
+  create: (refs) => createDeepSearchTool(
+    refs.kubeconfigRef, refs.llmConfigRef, refs.memoryRef, refs.dpStateRef,
+  ),
+};

@@ -1,7 +1,8 @@
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
-import type { KubeconfigRef } from "../../core/agent-factory.js";
+import type { KubeconfigRef } from "../../core/types.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { resolveScript } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
@@ -193,3 +194,8 @@ Examples:
     },
   };
 }
+
+export const registration: ToolEntry = {
+  category: "script-exec",
+  create: (refs) => createNodeScriptTool(refs.kubeconfigRef, refs.userId),
+};

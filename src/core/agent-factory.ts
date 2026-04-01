@@ -19,36 +19,15 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
-import { createRestrictedBashTool } from "../tools/cmd-exec/restricted-bash.js";
-import { createNodeExecTool } from "../tools/cmd-exec/node-exec.js";
-import { createNodeScriptTool } from "../tools/script-exec/node-script.js";
-import { createPodScriptTool } from "../tools/script-exec/pod-script.js";
-import { createPodExecTool } from "../tools/cmd-exec/pod-exec.js";
-import { createResolvePodNetnsTool } from "../tools/query/resolve-pod-netns.js";
-// Skill management tools disabled — managed via Skills UI
-// import { createCreateSkillTool } from "../tools/workflow/create-skill.js";
-import { createLocalScriptTool } from "../tools/script-exec/local-script.js";
-// import { createUpdateSkillTool } from "../tools/workflow/update-skill.js";
-// import { createForkSkillTool } from "../tools/workflow/fork-skill.js";
-import { createManageScheduleTool } from "../tools/workflow/manage-schedule.js";
-import { createTaskReportTool } from "../tools/workflow/task-report.js";
-import { createDeepSearchTool, type MemoryRef } from "../tools/workflow/deep-search/tool.js";
-import { createInvestigationFeedbackTool } from "../tools/query/investigation-feedback.js";
-import { createSaveFeedbackTool } from "../tools/workflow/save-feedback.js";
 import {
   type DpState,
-  type DpStateRef,
-  type MutableDpStateRef,
   createDpState,
   createProposeHypothesesTool,
   createEndInvestigationTool,
 } from "../tools/workflow/dp-tools.js";
-import { createMemorySearchTool } from "../tools/query/memory-search.js";
-import { createMemoryGetTool } from "../tools/query/memory-get.js";
-import { createCredentialListTool } from "../tools/query/credential-list.js";
-import { createClusterInfoTool } from "../tools/query/cluster-info.js";
-import { createKnowledgeSearchTool } from "../tools/query/knowledge-search.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
+import { ToolRegistry } from "./tool-registry.js";
+import { allToolEntries } from "../tools/all-entries.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
 import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
@@ -64,19 +43,7 @@ import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./
 import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
-export type SessionMode = "web" | "channel" | "cli" | "cron";
-
-export interface KubeconfigRef {
-  credentialsDir?: string; // path to credentials directory (e.g. /home/agentbox/.credentials)
-}
-
-/** Mutable ref to LLM config for deep_search sub-agents (updated by gateway prompt handler) */
-export interface LlmConfigRef {
-  apiKey?: string;
-  baseUrl?: string;
-  model?: string;
-  api?: string;
-}
+import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
@@ -290,62 +257,77 @@ export async function createSiclawSession(
   const mutableDpStateRef: MutableDpStateRef = { status: "idle" };
   const dpStateRef: DpStateRef = mutableDpStateRef;
 
-  const customTools: ToolDefinition[] = [
-    // ── Command execution — full security pipeline (cmd-exec/) ──
-    createNodeExecTool(kubeconfigRef, userId),
-    createPodExecTool(kubeconfigRef),
-    createRestrictedBashTool(kubeconfigRef),
-    // ── Script execution — pre-audited scripts (script-exec/) ──
-    createNodeScriptTool(kubeconfigRef, userId),
-    createPodScriptTool(kubeconfigRef),
-    createLocalScriptTool(kubeconfigRef, sessionIdRef),
-    // ── Data query (query/) ──
-    createInvestigationFeedbackTool(memoryRef),
-    createCredentialListTool(kubeconfigRef),
-    createClusterInfoTool(kubeconfigRef),
-    createKnowledgeSearchTool(opts?.knowledgeIndexer),
-    createResolvePodNetnsTool(kubeconfigRef, userId),
-    // ── Workflow (workflow/) ──
-    createDeepSearchTool(kubeconfigRef, llmConfigRef, memoryRef, dpStateRef),
-    createSaveFeedbackTool(sessionIdRef),
-  ];
-
-  // ── Workflow: conditional tools ──
-  // Schedule tool works in web + channel (no UI rendering needed, just DB ops).
-  // Schedule tool: web + channel (not cli, not cron — cron must not manage its own schedules)
-  if (mode !== "cli" && mode !== "cron") {
-    customTools.push(createManageScheduleTool(kubeconfigRef));
-  }
-  // task_report: cron-only tool — forces structured output via tool call
-  if (mode === "cron") {
-    customTools.push(createTaskReportTool());
-  }
-  // Skill management tools are disabled — skills are managed via the Skills UI.
-  // if (mode === "web") {
-  //   customTools.push(createCreateSkillTool());
-  //   customTools.push(createUpdateSkillTool());
-  //   customTools.push(createForkSkillTool());
-  // }
-  // -- MCP external tools --
+  // Paths from settings.json (needed early for memoryIndexer init and tool resolution)
   const cwd = process.cwd();
+  const skillsBase = path.resolve(cwd, config.paths.skillsDir);
+  const userDataDir = path.resolve(cwd, config.paths.userDataDir);
+  const memoryDir = path.join(userDataDir, "memory");
+
+  // ── Memory indexer init (before resolve — memory tools use `available` guard) ──
+  // TIMING: must run before DefaultResourceLoader construction (L~478) so that
+  // the memoryFlushExtension lambda captures the initialized .current value.
+  const memoryIndexerRef: { current: MemoryIndexer | undefined } = { current: undefined };
+  let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
+  try {
+    if (memoryIndexer) {
+      memoryIndexerRef.current = memoryIndexer;
+      console.log(`[agent-factory] Reusing shared memory indexer for ${memoryDir}`);
+    } else {
+      const embeddingOpts = resolveEmbeddingConfig();
+      memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+      memoryIndexerRef.current = memoryIndexer;
+      await memoryIndexer.sync();
+      memoryIndexer.startWatching();
+      console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
+    }
+    memoryRef.indexer = memoryIndexer;
+    memoryRef.dir = memoryDir;
+  } catch (err) {
+    console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
+  }
+
+  // ── Tool Registry: declarative resolution ──
+  const registry = new ToolRegistry();
+  registry.register(...allToolEntries);
+
+  const allowedTools = opts?.allowedTools ?? config.allowedTools;
+
+  const customTools = registry.resolve({
+    mode,
+    refs: {
+      kubeconfigRef, userId, sessionIdRef, llmConfigRef,
+      memoryRef, dpStateRef,
+      knowledgeIndexer: opts?.knowledgeIndexer,
+      memoryIndexer,
+      memoryDir,
+    },
+    allowedTools,
+  });
+
+  // Log workspace tool filter result (diagnostic — original behavior from L365-367)
+  if (Array.isArray(allowedTools)) {
+    console.log(`[agent-factory] Workspace tool filter: ${allToolEntries.length} registered → ${customTools.length} resolved`);
+  }
+
+  // -- MCP external tools (dynamic discovery, not in registry) --
   let mcpManager: McpClientManager | undefined = opts?.mcpManager;
   const mcpServers = config.mcpServers;
+  let mcpTools: ToolDefinition[] = [];
   if (mcpManager) {
-    // Shared MCP manager provided — reuse its tools
     const sharedTools = opts?.mcpTools ?? mcpManager.getTools();
     if (sharedTools.length > 0) {
-      customTools.push(...sharedTools);
+      mcpTools = sharedTools;
       console.log(`[agent-factory] Reusing ${sharedTools.length} shared MCP tools`);
     }
   } else if (mcpServers && Object.keys(mcpServers).length > 0) {
     mcpManager = new McpClientManager({ mcpServers } as any);
     try {
       await mcpManager.initialize();
-      const mcpTools = mcpManager.getTools();
-      console.log(`[agent-factory] MCP initialization complete: ${mcpTools.length} tools discovered`);
-      if (mcpTools.length > 0) {
-        customTools.push(...mcpTools);
-        console.log(`[agent-factory] Added ${mcpTools.length} MCP tools: ${mcpTools.map(t => t.name).join(", ")}`);
+      const discovered = mcpManager.getTools();
+      console.log(`[agent-factory] MCP initialization complete: ${discovered.length} tools discovered`);
+      if (discovered.length > 0) {
+        mcpTools = discovered;
+        console.log(`[agent-factory] Added ${discovered.length} MCP tools: ${discovered.map(t => t.name).join(", ")}`);
       }
     } catch (err) {
       console.warn(`[agent-factory] MCP initialization failed:`, err);
@@ -354,26 +336,15 @@ export async function createSiclawSession(
   } else {
     console.log(`[agent-factory] No MCP config found, skipping MCP tools`);
   }
-
-  // Filter custom tools by workspace allow-list
-  // Platform tools are exempt — they must always be available regardless of workspace config
-  const PLATFORM_TOOLS = new Set(["manage_schedule", "credential_list", "cluster_info", "save_feedback", "knowledge_search", "task_report"]);
-  const allowedTools = opts?.allowedTools ?? config.allowedTools;
-  if (Array.isArray(allowedTools)) {
-    const allowed = new Set(allowedTools);
-    const before = customTools.length;
-    const filtered = customTools.filter(t => PLATFORM_TOOLS.has(t.name) || allowed.has(t.name));
-    customTools.length = 0;
-    customTools.push(...filtered);
-    if (before !== customTools.length) {
-      console.log(`[agent-factory] Workspace tool filter: ${before} → ${customTools.length} tools`);
+  // MCP tools subject to allowedTools (original behavior: MCP appended before filter)
+  if (mcpTools.length > 0) {
+    if (Array.isArray(allowedTools)) {
+      const allowed = new Set(allowedTools);
+      customTools.push(...mcpTools.filter(t => allowed.has(t.name)));
+    } else {
+      customTools.push(...mcpTools);
     }
   }
-
-  // Paths from settings.json
-  const skillsBase = path.resolve(cwd, config.paths.skillsDir);
-  const userDataDir = path.resolve(cwd, config.paths.userDataDir);
-  const memoryDir = path.join(userDataDir, "memory");
 
   // -- Path-restricted file I/O tools --
   // Whitelist: only skills directories + user-data + reports + repos + docs (no credentials, no config)
@@ -457,9 +428,6 @@ export async function createSiclawSession(
       if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
   }
-
-  // Mutable ref: populated before createAgentSession, read by extension at runtime
-  const memoryIndexerRef: { current?: MemoryIndexer } = {};
 
   // Resolve credentials directory for tools and /setup extension
   const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
@@ -567,33 +535,6 @@ export async function createSiclawSession(
   }
 
   // -- Pi-agent brain path (default) --
-
-  // ── Data query: memory tools (query/) — require memoryIndexer, pushed after init ──
-  let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
-  try {
-    if (memoryIndexer) {
-      // Shared indexer provided — reuse it, don't startWatching (caller manages lifecycle)
-      memoryIndexerRef.current = memoryIndexer;
-      customTools.push(createMemorySearchTool(memoryIndexer));
-      customTools.push(createMemoryGetTool(memoryDir));
-      console.log(`[agent-factory] Reusing shared memory indexer for ${memoryDir}`);
-    } else {
-      // Create per-session indexer (CLI mode)
-      const embeddingOpts = resolveEmbeddingConfig();
-      memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
-      memoryIndexerRef.current = memoryIndexer;
-      await memoryIndexer.sync();
-      memoryIndexer.startWatching();
-      customTools.push(createMemorySearchTool(memoryIndexer));
-      customTools.push(createMemoryGetTool(memoryDir));
-      console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
-    }
-    // Populate mutable ref so deep_search can access memory for investigation history
-    memoryRef.indexer = memoryIndexer;
-    memoryRef.dir = memoryDir;
-  } catch (err) {
-    console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
-  }
 
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());

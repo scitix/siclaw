@@ -13,7 +13,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-// --- Shared types ---
+import type { DpStatus, DpHypothesis, DpStateRef, MutableDpStateRef } from "../../core/types.js";
+
+// Re-export for consumers that import DP types from this file
+export type { DpStatus, DpHypothesis, DpStateRef, MutableDpStateRef } from "../../core/types.js";
+
+// --- Shared types (DP-specific, not moved to core/types.ts) ---
 
 export type ChecklistItemStatus = "pending" | "in_progress" | "done" | "skipped";
 
@@ -27,23 +32,6 @@ export interface ChecklistItem {
 export interface DpChecklist {
   question: string;
   items: ChecklistItem[];
-}
-
-// --- DP lifecycle status ---
-
-export type DpStatus =
-  | "idle"                    // No investigation active
-  | "investigating"           // Model is triaging / gathering context
-  | "awaiting_confirmation"   // Hypotheses presented, waiting for user decision
-  | "validating"              // User confirmed — deep_search executing Phase 3
-  | "concluding"              // Phase 4 or user skipped validation — model presenting conclusion
-  | "completed";              // Investigation finished
-
-export interface DpHypothesis {
-  id: string;
-  text: string;
-  confidence: number;
-  description?: string;
 }
 
 /**
@@ -73,30 +61,6 @@ export interface DpState {
 /** Create a fresh DpState in idle. */
 export function createDpState(): DpState {
   return { checklist: null, status: "idle", round: 0 };
-}
-
-/**
- * Read-only ref for tools that need to inspect DP state without mutating it.
- * Used by deep_search to gate execution and read confirmed data.
- */
-export interface DpStateRef {
-  readonly status: DpStatus;
-  readonly triageContextDraft?: string;
-  readonly confirmedHypotheses?: DpHypothesis[];
-  readonly question?: string;
-  readonly round?: number;
-}
-
-/**
- * Writable version of DpStateRef — held only by the extension (single writer).
- * Tools and agentbox receive the readonly DpStateRef view of the same object.
- */
-export interface MutableDpStateRef {
-  status: DpStatus;
-  triageContextDraft?: string;
-  confirmedHypotheses?: DpHypothesis[];
-  question?: string;
-  round?: number;
 }
 
 /**
