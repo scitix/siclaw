@@ -8,7 +8,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
-import { SAFE_SUBCOMMANDS, validateExecCommand, checkAllNamespacesRestriction } from "../infra/command-sets.js";
+import { SAFE_SUBCOMMANDS, checkAllNamespacesRestriction } from "../infra/command-sets.js";
 import { loadConfig } from "../../core/config.js";
 import {
   CONTAINER_SENSITIVE_PATHS,
@@ -35,7 +35,7 @@ export { getCommandBinary } from "../infra/command-sets.js";
 
 /**
  * Validate kubectl commands within a pipeline.
- * Checks that subcommands are in the safe whitelist and exec targets are allowed.
+ * Checks that subcommands are in the safe whitelist.
  * Returns an error message if blocked, or null if all kubectl commands are safe.
  */
 export function validateKubectlInPipeline(commands: string[]): string | null {
@@ -66,16 +66,18 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       break;
     }
 
+    if (subcommand === "exec") {
+      return JSON.stringify({
+        error: "kubectl exec is not available through restricted_bash.",
+        hint: "Use the pod_exec tool to run commands inside a pod, or node_exec for host-level diagnostics.",
+      }, null, 2);
+    }
+
     if (!subcommand || !SAFE_SUBCOMMANDS.has(subcommand)) {
       return JSON.stringify({
         error: `kubectl subcommand "${subcommand || "(empty)"}" is not allowed in read-only mode.`,
         allowed: [...SAFE_SUBCOMMANDS],
       }, null, 2);
-    }
-
-    if (subcommand === "exec") {
-      const execCheck = validateExecCommand(args);
-      if (execCheck) return execCheck;
     }
 
     // ── Rate protection: logs without --tail/--since ─────────────
@@ -238,7 +240,7 @@ export function createRestrictedBashTool(kubeconfigRef?: KubeconfigRef): ToolDef
 This is the primary tool for all kubectl interactions. It runs through a shell, so pipes (|), &&, and redirections are fully supported.
 
 Allowed commands: kubectl, grep, sort, uniq, wc, head, tail, cut, tr, jq, yq, column, and other text processing tools.
-kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth, exec.
+kubectl is restricted to read-only subcommands: get, describe, logs, top, events, api-resources, explain, config, version, cluster-info, auth.
 In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
@@ -253,7 +255,6 @@ Examples:
 - With pipe: "kubectl get pods -n default | grep -i error"
 - Logs: "kubectl logs my-pod --tail=500 | grep ERROR"
 - JSON query: "kubectl get pod my-pod -o json | jq '.status.conditions'"
-- Exec into pod: "kubectl exec my-pod -n ns -- ip addr show"
 - Skill scripts: "python3 skills/core/roce-perftest-pod/scripts/run-perftest.py --server-pod pod-a --client-pod pod-b --server-ns ns --client-ns ns"
 
 Prefer kubectl built-in filtering (-l, --field-selector, -o jsonpath, -o custom-columns) over piping to grep when possible.
