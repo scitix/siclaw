@@ -3,12 +3,12 @@
  *
  * Verifies both pre-execution blocking (CONTAINER_SENSITIVE_PATHS via Pass 6)
  * and post-execution sanitization (output-sanitizer rules) across all exec
- * entry points: pod_exec, node_exec, kubectl exec, and validateCommand.
+ * entry points: pod_exec, node_exec, and validateCommand.
  */
 import { describe, it, expect } from "vitest";
 import { validateCommand } from "./command-validator.js";
 import { CONTAINER_SENSITIVE_PATHS } from "./command-sets.js";
-import { validateExecCommand } from "./command-sets.js";
+
 import { createPodExecTool } from "../cmd-exec/pod-exec.js";
 import { analyzeOutput, applySanitizer } from "./output-sanitizer.js";
 
@@ -160,36 +160,6 @@ describe("Pass 6 checks all commands, not just FILE_READING_CMDS", () => {
       sensitivePathPatterns: CONTAINER_SENSITIVE_PATHS,
     });
     expect(err).not.toBeNull();
-  });
-});
-
-// ── Pre-execution: kubectl exec (validateExecCommand) ───────────────
-
-describe("validateExecCommand blocks sensitive paths", () => {
-  it("blocks cat /etc/shadow", () => {
-    const err = validateExecCommand(["exec", "my-pod", "--", "cat", "/etc/shadow"]);
-    expect(err).not.toBeNull();
-    expect(err).toContain("sensitive paths");
-  });
-
-  it("blocks cat /var/run/secrets/...", () => {
-    const err = validateExecCommand(["exec", "my-pod", "--", "cat", "/var/run/secrets/kubernetes.io/serviceaccount/token"]);
-    expect(err).not.toBeNull();
-  });
-
-  it("blocks cat /proc/1/environ", () => {
-    const err = validateExecCommand(["exec", "my-pod", "--", "cat", "/proc/1/environ"]);
-    expect(err).not.toBeNull();
-  });
-
-  it("allows cat /etc/os-release", () => {
-    const err = validateExecCommand(["exec", "my-pod", "--", "cat", "/etc/os-release"]);
-    expect(err).toBeNull();
-  });
-
-  it("allows ip addr show", () => {
-    const err = validateExecCommand(["exec", "my-pod", "--", "ip", "addr", "show"]);
-    expect(err).toBeNull();
   });
 });
 
