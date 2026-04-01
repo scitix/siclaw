@@ -106,7 +106,7 @@ Whitelist-only model with 4-pass validation: binary allowlist → per-command va
 **Consequences**:
 - ✅ New binaries cannot be used until consciously reviewed and added
 - ✅ Defense-in-depth: even if an attacker controls the command string, unknown binaries are blocked
-- ✅ Per-command flag restrictions prevent specific attack vectors (e.g., `curl -d` blocked to prevent POSTing sensitive data)
+- ✅ Per-command flag restrictions prevent specific attack vectors (e.g., `curl` restricted to GET/HEAD/OPTIONS only — POST and data flags blocked)
 - ⚠️ Legitimate diagnostic tools may need to be explicitly added (file an issue explaining the use case)
 - ❌ `sed`, `awk` are intentionally excluded — use `grep`/`jq`/`yq` instead
 - ❌ Skill scripts are exempt from the allowlist — this is intentional (skill review gate is the safety mechanism)

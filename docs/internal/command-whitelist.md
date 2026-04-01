@@ -174,8 +174,7 @@ Blocked actions (via whitelist — anything not listed above is blocked):
 ```
 -s  --silent  -S  --show-error  -k  --insecure  -v  --verbose
 -H  --header  -X  --request  -m  --max-time  --connect-timeout
--L  --location  -I  --head  -w  --write-out
--d  --data  --data-raw  --data-urlencode  --compressed
+-L  --location  -I  --head  -w  --write-out  --compressed
 -A  --user-agent  -b  --cookie  -e  --referer
 -u  --user  --cacert  --cert  -x  --proxy
 --retry  --retry-delay  --retry-max-time
@@ -185,14 +184,14 @@ Blocked actions (via whitelist — anything not listed above is blocked):
 #### curl — allowed HTTP methods (with `-X`/`--request`)
 
 ```
-GET  HEAD  OPTIONS  POST
+GET  HEAD  OPTIONS
 ```
 
-Blocked: `PUT`, `DELETE`, `PATCH`, and any other method.
+Blocked: `POST`, `PUT`, `DELETE`, `PATCH`, and any other method.
 
 #### curl — additional restrictions
 
-- `-d`/`--data` with `@file` (file upload) is blocked
+- `-d`/`--data`/`--data-raw`/`--data-urlencode` are not in the whitelist (removed with POST)
 - `-o`/`--output` (write to file) is not in the whitelist
 
 ---
