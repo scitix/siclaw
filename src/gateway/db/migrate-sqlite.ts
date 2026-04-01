@@ -193,6 +193,12 @@ const DDL_STATEMENTS = [
     PRIMARY KEY (user_id, skill_name)
   )`,
 
+  `CREATE TABLE IF NOT EXISTS user_disabled_skill_spaces (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    skill_space_id TEXT NOT NULL REFERENCES skill_spaces(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, skill_space_id)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
