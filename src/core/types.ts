@@ -49,18 +49,6 @@ export interface DpHypothesis {
 }
 
 /**
- * Read-only ref for tools that need to inspect DP state without mutating it.
- * Used by deep_search to gate execution and read confirmed data.
- */
-export interface DpStateRef {
-  readonly status: DpStatus;
-  readonly triageContextDraft?: string;
-  readonly confirmedHypotheses?: DpHypothesis[];
-  readonly question?: string;
-  readonly round?: number;
-}
-
-/**
  * Writable version of DpStateRef — held only by the extension (single writer).
  * Tools and agentbox receive the readonly DpStateRef view of the same object.
  */
@@ -71,3 +59,9 @@ export interface MutableDpStateRef {
   question?: string;
   round?: number;
 }
+
+/**
+ * Read-only ref for tools that need to inspect DP state without mutating it.
+ * Derived from MutableDpStateRef to guarantee both types stay in sync.
+ */
+export type DpStateRef = Readonly<MutableDpStateRef>;
