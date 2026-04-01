@@ -23,7 +23,6 @@ export function SessionList({
 }: SessionListProps) {
     const [search, setSearch] = useState('');
     const [showClearConfirm, setShowClearConfirm] = useState(false);
-    const [isClearing, setIsClearing] = useState(false);
 
     const filtered = search
         ? sessions.filter(s =>
@@ -82,17 +81,13 @@ export function SessionList({
                 onClose={() => setShowClearConfirm(false)}
                 onConfirm={async () => {
                     if (!onClearMemory) return;
-                    setIsClearing(true);
-                    try {
-                        await onClearMemory();
-                    } finally {
-                        setIsClearing(false);
-                    }
+                    await onClearMemory();
                 }}
                 title="Clear Memory"
                 description="This will permanently delete all conversation memories for this workspace. This action cannot be undone."
                 confirmText="Clear Memory"
                 variant="danger"
+                successMessage="Memory cleared successfully."
             />
 
             {/* List */}
@@ -154,11 +149,10 @@ export function SessionList({
                 <div className="p-3 border-t border-gray-200 bg-white">
                     <button
                         onClick={() => setShowClearConfirm(true)}
-                        disabled={isClearing}
-                        className="w-full flex items-center justify-center gap-2 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 hover:border-red-300 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="w-full flex items-center justify-center gap-2 py-2 text-sm font-medium text-red-600 bg-red-50 border border-red-200 rounded-lg hover:bg-red-100 hover:border-red-300 transition-all"
                     >
                         <Eraser className="w-4 h-4" />
-                        {isClearing ? 'Clearing...' : 'Clear Memory'}
+                        Clear Memory
                     </button>
                 </div>
             )}
