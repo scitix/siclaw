@@ -8,6 +8,9 @@
  * Ported from OpenClaw's src/agents/pi-embedded-runner/run/attempt.ts.
  */
 
+import type { OutputGuard } from "./guard-pipeline.js";
+import { guardLog } from "./guard-log.js";
+
 // ── Tool call block type detection ───────────────────────────────────────
 
 function isToolCallBlockType(type: unknown): boolean {
@@ -396,5 +399,114 @@ export function wrapStreamFnRepairMalformedToolCallArguments(baseFn: any): any {
       );
     }
     return wrapStreamRepairMalformedToolCallArguments(maybeStream);
+  };
+}
+
+// ── OutputGuard implementations for guard-pipeline ──────────────────────
+
+/**
+ * OutputGuard: trim whitespace from tool call names and normalize IDs.
+ * Stateless — reset() is a no-op.
+ */
+export function createTrimToolCallNamesGuard(): OutputGuard {
+  return {
+    processEvent(event: unknown): void {
+      if (!event || typeof event !== "object") return;
+      const e = event as { partial?: unknown; message?: unknown };
+      trimWhitespaceFromToolCallNamesInMessage(e.partial);
+      trimWhitespaceFromToolCallNamesInMessage(e.message);
+    },
+    processResult(message: unknown): void {
+      trimWhitespaceFromToolCallNamesInMessage(message);
+    },
+    reset(): void {
+      // Stateless — nothing to reset
+    },
+  };
+}
+
+/**
+ * OutputGuard: repair malformed JSON in tool call arguments.
+ * Stateful — accumulates partial JSON across toolcall_delta events.
+ */
+export function createRepairMalformedArgsGuard(): OutputGuard {
+  let partialJsonByIndex = new Map<number, string>();
+  let repairedArgsByIndex = new Map<number, Record<string, unknown>>();
+  let disabledIndices = new Set<number>();
+  let loggedRepairIndices = new Set<number>();
+
+  return {
+    processEvent(event: unknown): void {
+      if (!event || typeof event !== "object") return;
+      const e = event as {
+        type?: unknown;
+        contentIndex?: unknown;
+        delta?: unknown;
+        partial?: unknown;
+        message?: unknown;
+        toolCall?: unknown;
+      };
+      if (
+        typeof e.contentIndex === "number" &&
+        Number.isInteger(e.contentIndex) &&
+        e.type === "toolcall_delta" &&
+        typeof e.delta === "string"
+      ) {
+        if (disabledIndices.has(e.contentIndex)) return;
+        const nextPartialJson =
+          (partialJsonByIndex.get(e.contentIndex) ?? "") + e.delta;
+        if (nextPartialJson.length > MAX_TOOLCALL_REPAIR_BUFFER_CHARS) {
+          partialJsonByIndex.delete(e.contentIndex);
+          repairedArgsByIndex.delete(e.contentIndex);
+          disabledIndices.add(e.contentIndex);
+          return;
+        }
+        partialJsonByIndex.set(e.contentIndex, nextPartialJson);
+        if (shouldAttemptMalformedToolCallRepair(nextPartialJson, e.delta)) {
+          const repair = tryParseMalformedToolCallArguments(nextPartialJson);
+          if (repair) {
+            repairedArgsByIndex.set(e.contentIndex, repair.args);
+            repairToolCallArgumentsInMessage(e.partial, e.contentIndex, repair.args);
+            repairToolCallArgumentsInMessage(e.message, e.contentIndex, repair.args);
+            if (!loggedRepairIndices.has(e.contentIndex)) {
+              loggedRepairIndices.add(e.contentIndex);
+              guardLog("repair-malformed-args", "repaired", {
+                trailingChars: repair.trailingSuffix.length,
+              });
+            }
+          } else {
+            repairedArgsByIndex.delete(e.contentIndex);
+            clearToolCallArgumentsInMessage(e.partial, e.contentIndex);
+            clearToolCallArgumentsInMessage(e.message, e.contentIndex);
+          }
+        }
+      }
+      if (
+        typeof e.contentIndex === "number" &&
+        Number.isInteger(e.contentIndex) &&
+        e.type === "toolcall_end"
+      ) {
+        const repairedArgs = repairedArgsByIndex.get(e.contentIndex);
+        if (repairedArgs) {
+          if (e.toolCall && typeof e.toolCall === "object") {
+            (e.toolCall as { arguments?: unknown }).arguments = repairedArgs;
+          }
+          repairToolCallArgumentsInMessage(e.partial, e.contentIndex, repairedArgs);
+          repairToolCallArgumentsInMessage(e.message, e.contentIndex, repairedArgs);
+        }
+        partialJsonByIndex.delete(e.contentIndex);
+        disabledIndices.delete(e.contentIndex);
+        loggedRepairIndices.delete(e.contentIndex);
+      }
+    },
+    processResult(message: unknown): void {
+      repairMalformedToolCallArgumentsInMessage(message, repairedArgsByIndex);
+    },
+    reset(): void {
+      partialJsonByIndex = new Map();
+      repairedArgsByIndex = new Map();
+      disabledIndices = new Set();
+      loggedRepairIndices = new Set();
+    },
   };
 }

@@ -76,7 +76,13 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/tools/infra/security-pipeline.ts` | tools.md §8.2, security.md | `npm test` | Facade for all cmd-exec tools; changes affect all 3 tools |
 | `src/gateway/skills/` | skills.md, invariants.md §1-2 | `npm test` | Bundle contract; `materialize()` NOT safe in local mode |
 | `src/gateway/db/schema-*.ts` | invariants.md §5 | `npm test` | `migrate-sqlite.ts` must also be updated (DDL parity) |
-| `src/core/agent-factory.ts` | tools.md §7, invariants.md §10 | `npm test` | Tool registration; brain type compatibility |
+| `src/core/agent-factory.ts` | tools.md §7, guards.md §4, invariants.md §10 | `npm test` | Tool registration; guard pipeline installation; brain type compatibility |
+| `src/core/guard-pipeline.ts` | guards.md | `npm test` | Guard registry, pipeline installation; all guard stages affected |
+| `src/core/guard-log.ts` | guards.md §7 | `npm test` | Structured logging for all guards |
+| `src/core/session-tool-result-guard.ts` | guards.md §5 | `npm test` | Persist guard; session history write validation |
+| `src/core/tool-result-context-guard.ts` | guards.md §5 | `npm test` | Context guard; context budget enforcement |
+| `src/core/stream-wrappers.ts` | guards.md §5 | `npm test` | Output guards; stream event repair |
+| `src/core/tool-call-repair.ts` | guards.md §5 | `npm test` | Input guard; malformed tool call sanitization |
 | `src/core/prompt.ts` | **⚠️ REQUIRES HUMAN APPROVAL** | — | Describe intent and wait for OK before editing |
 | `src/memory/` | invariants.md §7, decisions.md ADR-005 | `npm test` | Requires embedding config; pi-agent only |
 | `Dockerfile.agentbox` | security.md §3-5 | `docker build` | Dual-user model; capability set; setgid kubectl |

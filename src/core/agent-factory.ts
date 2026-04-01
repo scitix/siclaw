@@ -58,14 +58,10 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
 import type { BrainSession, BrainType } from "./brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "./llm-proxy.js";
-import { sanitizeToolCallInputs } from "./tool-call-repair.js";
-import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
 import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
-import { repairToolUseResultPairing } from "./compaction.js";
-import { installToolResultContextGuard } from "./tool-result-context-guard.js";
-import { wrapStreamFnTrimToolCallNames, wrapStreamFnRepairMalformedToolCallArguments } from "./stream-wrappers.js";
+import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 export type SessionMode = "web" | "channel" | "cli";
 
@@ -596,9 +592,6 @@ export async function createSiclawSession(
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());
 
-  // Install write-time guard: sanitize malformed tool calls and track pending tool results
-  installSessionToolResultGuard(sessionManager);
-
   // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
   const configuredModel = defaultLlm
     ? modelRegistry.find(
@@ -627,50 +620,10 @@ export async function createSiclawSession(
   // then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
-  // ── Input streamFn wrappers (modify context.messages before API call) ──
-
-  // 1. Sanitize malformed tool calls (drop incomplete blocks)
-  {
-    const inner = session.agent.streamFn;
-    session.agent.streamFn = (model: any, context: any, options: any) => {
-      const messages = context?.messages;
-      if (!Array.isArray(messages)) {
-        return inner(model, context, options);
-      }
-      const sanitized = sanitizeToolCallInputs(messages);
-      if (sanitized === messages) {
-        return inner(model, context, options);
-      }
-      console.log("[agent-factory] Repaired malformed tool calls in outbound request");
-      return inner(model, { ...context, messages: sanitized }, options);
-    };
-  }
-
-  // 2. Repair tool use/result pairing (fix orphaned tool results)
-  {
-    const inner = session.agent.streamFn;
-    session.agent.streamFn = (model: any, context: any, options: any) => {
-      const messages = context?.messages;
-      if (!Array.isArray(messages)) return inner(model, context, options);
-      const { messages: repaired } = repairToolUseResultPairing(messages);
-      if (repaired === messages) return inner(model, context, options);
-      return inner(model, { ...context, messages: repaired }, options);
-    };
-  }
-
-  // ── Output streamFn wrappers (modify stream response events) ──
-
-  // 3. Trim whitespace from tool call names + assign fallback IDs
-  session.agent.streamFn = wrapStreamFnTrimToolCallNames(session.agent.streamFn);
-
-  // 4. Repair malformed JSON in tool call arguments
-  session.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(session.agent.streamFn);
-
-  // ── Context transform wrapper ──
-
-  // 5. Tool result context guard (truncate/compact oversized tool results)
+  // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
-  installToolResultContextGuard({ agent: session.agent, contextWindowTokens: contextWindow });
+  const guardRegistry = createGuardRegistry(contextWindow);
+  installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
   return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
