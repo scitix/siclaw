@@ -1,6 +1,6 @@
 import { X, AlertTriangle, CheckCircle2, HelpCircle, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 interface ConfirmDialogProps {
     isOpen: boolean;
@@ -28,6 +28,10 @@ export function ConfirmDialog({
 }: ConfirmDialogProps) {
     const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
     const [errorMsg, setErrorMsg] = useState('');
+    const timerRef = useRef<ReturnType<typeof setTimeout>>();
+
+    // Clean up timer on unmount
+    useEffect(() => () => clearTimeout(timerRef.current), []);
 
     // Reset state when dialog opens/closes
     useEffect(() => {
@@ -62,7 +66,7 @@ export function ConfirmDialog({
 
     const style = variantStyles[variant];
     const Icon = style.icon;
-    const isWorking = status === 'loading';
+    const isWorking = status === 'loading' || status === 'success';
 
     const handleConfirm = async () => {
         setStatus('loading');
@@ -71,13 +75,13 @@ export function ConfirmDialog({
             await onConfirm();
             if (successMessage) {
                 setStatus('success');
-                setTimeout(() => onClose(), 1200);
+                timerRef.current = setTimeout(() => onClose(), 1200);
             } else {
                 onClose();
             }
         } catch (err: any) {
             setStatus('error');
-            setErrorMsg(err?.message || 'Operation failed');
+            setErrorMsg(err instanceof Error ? err.message : String(err));
         }
     };
 
