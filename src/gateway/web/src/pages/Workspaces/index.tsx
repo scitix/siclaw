@@ -88,11 +88,7 @@ export function WorkspacesPage() {
     }, [isConnected, loadWorkspaces]);
 
     const handleClearMemory = async (ws: Workspace) => {
-        try {
-            await sendRpc('workspace.clearMemory', { workspaceId: ws.id });
-        } catch (err) {
-            console.error('Failed to clear memory:', err);
-        }
+        await sendRpc('workspace.clearMemory', { workspaceId: ws.id });
     };
 
     const handleDelete = async (ws: Workspace) => {
@@ -240,13 +236,14 @@ export function WorkspacesPage() {
             <ConfirmDialog
                 isOpen={!!clearMemoryWs}
                 onClose={() => setClearMemoryWs(null)}
-                onConfirm={() => {
-                    if (clearMemoryWs) handleClearMemory(clearMemoryWs);
+                onConfirm={async () => {
+                    if (clearMemoryWs) await handleClearMemory(clearMemoryWs);
                 }}
                 title="Clear Memory"
                 description="This will permanently delete all conversation memories for this workspace. This action cannot be undone."
                 confirmText="Clear Memory"
                 variant="danger"
+                successMessage="Memory cleared successfully."
             />
 
             {/* Edit / Create dialog */}
