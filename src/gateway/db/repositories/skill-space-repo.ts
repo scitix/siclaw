@@ -5,7 +5,7 @@
 import crypto from "node:crypto";
 import { eq, and } from "drizzle-orm";
 import type { Database } from "../index.js";
-import { skillSpaces, skillSpaceMembers, skills } from "../schema.js";
+import { skillSpaces, skillSpaceMembers, skills, userDisabledSkillSpaces } from "../schema.js";
 import { isUniqueViolation } from "../dialect-helpers.js";
 
 export interface CreateSkillSpaceInput {
@@ -187,5 +187,36 @@ export class SkillSpaceRepository {
       .select()
       .from(skills)
       .where(eq(skills.skillSpaceId, skillSpaceId));
+  }
+
+  // ─── Per-user disabled skill spaces ────────────
+
+  async listDisabledSpaces(userId: string): Promise<string[]> {
+    const rows = await this.db
+      .select({ skillSpaceId: userDisabledSkillSpaces.skillSpaceId })
+      .from(userDisabledSkillSpaces)
+      .where(eq(userDisabledSkillSpaces.userId, userId));
+    return rows.map(r => r.skillSpaceId);
+  }
+
+  async disableSpace(userId: string, skillSpaceId: string): Promise<void> {
+    try {
+      await this.db
+        .insert(userDisabledSkillSpaces)
+        .values({ userId, skillSpaceId });
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+    }
+  }
+
+  async enableSpace(userId: string, skillSpaceId: string): Promise<void> {
+    await this.db
+      .delete(userDisabledSkillSpaces)
+      .where(
+        and(
+          eq(userDisabledSkillSpaces.userId, userId),
+          eq(userDisabledSkillSpaces.skillSpaceId, skillSpaceId),
+        ),
+      );
   }
 }

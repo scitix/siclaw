@@ -282,18 +282,9 @@ export class CronService {
 }
 
 function buildCronPrompt(job: CronJobRow): string {
-  const parts = [
-    `[System: You are executing an automated scheduled task in NON-INTERACTIVE mode.
-
-Rules:
-- Perform the task described below directly and report the result.
-- Do NOT ask the user any questions or request confirmations — there is no user to respond.
-- If multiple environments, hosts, or credentials are available, operate on ALL of them unless the task description specifies a particular target.
-- Do NOT create, modify, delete, pause, or manage any schedules.
-- Keep the output concise and structured.
-- Respond in the same language as the task name and description below.]`,
-    `Task: ${job.name}`,
-  ];
+  // Behavioral rules (non-interactive, task_report, fail-fast) are in the
+  // system prompt via CRON_SECTION — user message only carries the task.
+  const parts = [`Task: ${job.name}`];
   if (job.description) {
     parts.push(`Instructions: ${job.description}`);
   }

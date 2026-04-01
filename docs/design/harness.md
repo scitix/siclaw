@@ -47,11 +47,8 @@ Research by Anthropic ("Harness Design for Long-Running Application Development"
 approaches what it *believes* is its context limit, it begins prematurely wrapping
 up work — cutting corners, skipping verification steps, declaring victory early.
 
-Mitigations:
-- **Context compaction rules** (in CLAUDE.md) ensure critical state survives compaction
-- **Pre-flight protocol** forces each session to front-load understanding before coding
-- **Change Impact Matrix** makes blast radius explicit, reducing the temptation to
-  "just change it and see"
+Mitigation: the **Change Impact Matrix** in CLAUDE.md makes blast radius explicit,
+forcing each session to front-load understanding before coding.
 
 ### 1.3 Compounding Errors
 
@@ -97,22 +94,14 @@ is documented. Code and docs must stay in sync — outdated docs actively mislea
 
 **Layer 2 (Development Protocol)**: The operational rules for how to use
 Layer 1 effectively. CLAUDE.md is auto-loaded by Claude Code at session start.
-It contains:
-- **Change Impact Matrix**: "If you change file X → must read doc Y → must
-  verify Z → watch out for cross-cutting concern W"
-- **Pre-flight Protocol**: Mandatory steps before any code modification
-- **Compaction Rules**: What to preserve when context is compressed
-- **Design Documentation Map**: Which doc covers what
+Its core is the **Change Impact Matrix**: "If you change file X → must read
+doc Y → must verify Z → watch out for cross-cutting concern W".
 
 **Layer 3 (Automated Verification)**: The safety net. Currently:
 - TypeScript strict mode + `npx tsc --noEmit` (type errors caught at compile)
 - `vitest` test suite with heavy coverage on security paths
+- DDL parity check (schema-sqlite.ts ↔ migrate-sqlite.ts table sync)
 - CI pipeline (typecheck + test on every PR)
-
-Future additions (see §5):
-- Hooks that block edits to critical files without reading corresponding docs
-- Integration tests for the security pipeline end-to-end
-- DDL parity checks (schema-sqlite.ts ↔ migrate-sqlite.ts)
 
 ---
 
@@ -131,7 +120,7 @@ small (3 people) and sessions are supervised. As the project grows, critical rul
 should migrate from advisory (CLAUDE.md) to mandatory (hooks/CI).
 
 **Migration priority** (rules that should become mandatory first):
-1. DDL parity check (schema vs migration) — automatable, high breakage risk
+1. ~~DDL parity check~~ — ✅ Done (vitest test in `ddl-parity.test.ts`)
 2. `src/core/prompt.ts` edit gate — security-critical, easy to automate
 3. Doc-code sync detection — harder to automate, but high drift risk
 
@@ -183,40 +172,17 @@ Current known cross-cutting concerns:
 
 ---
 
-## 4. How to Work Within This Framework
-
-### 4.1 Starting a Development Session
-
-1. Claude Code loads CLAUDE.md automatically
-2. You describe your task to Claude
-3. Claude should follow the Pre-flight Protocol (identify files → find in matrix → read docs → list concerns)
-4. If Claude skips pre-flight, remind it: "Follow the pre-flight protocol in CLAUDE.md"
-
-### 4.2 During Development
-
-- Each code change should be verified against the Change Impact Matrix's cross-cutting concerns
-- If you discover a new cross-cutting concern, **update the matrix immediately** — don't save it for later
-- If you find a doc-code inconsistency, **fix it now** — outdated docs compound
-
-### 4.3 Reviewing Code (Human or AI)
-
-1. Check the Change Impact Matrix: did the author read the required docs?
-2. Check cross-cutting concerns: are they addressed?
-3. Check documentation parity: are relevant docs updated?
-4. For security changes: does the change maintain all 6 defense layers?
-
-### 4.4 After a Mistake
+## 4. Compounding Engineering
 
 When a Claude session breaks something it shouldn't have:
 1. Fix the immediate issue
 2. Ask: "What did the harness fail to catch?"
 3. Update the appropriate layer:
    - Missing knowledge → Update `docs/design/*.md` (Layer 1)
-   - Knowledge existed but wasn't consulted → Update Change Impact Matrix or
-     Pre-flight Protocol (Layer 2)
+   - Knowledge existed but wasn't consulted → Add row to Change Impact Matrix (Layer 2)
    - Consulted but not enforced → Add CI check or hook (Layer 3)
 
-This is "compounding engineering" — every mistake improves the harness.
+Every mistake should improve the harness for the next session.
 
 ---
 
@@ -224,47 +190,23 @@ This is "compounding engineering" — every mistake improves the harness.
 
 ### Current State (2026-03)
 
-- Layer 1: 7 design docs covering architecture, security, tools, sanitization, skills, decisions, roadmap
-- Layer 2: CLAUDE.md with Change Impact Matrix, Pre-flight Protocol, Compaction Rules
-- Layer 3: CI (typecheck + vitest), ~38 test files with heavy security path coverage
+- Layer 1: 8 design docs covering architecture, security, tools, sanitization, skills, decisions, roadmap, harness
+- Layer 2: CLAUDE.md with Change Impact Matrix and Development Protocol
+- Layer 3: CI (typecheck + vitest + DDL parity check)
 
-### Near-Term Improvements
+### Next Improvements
 
-| Improvement | Layer | Impact | Effort |
-|---|---|---|---|
-| DDL parity CI check | 3 | Prevents silent schema drift | Low |
-| `prompt.ts` edit hook | 3 | Prevents unauthorized system prompt changes | Low |
-| Skill compatibility test | 3 | Detects sanitizer changes that break skills | Medium |
-| Integration test for security pipeline | 3 | E2E: validateCommand → execute → applySanitizer | Medium |
-
-### Long-Term Vision
-
-As the team grows beyond 3 people:
-- Layer 2 rules migrate to Layer 3 (advisory → mandatory)
-- Per-directory CLAUDE.md files for domain-specific rules (monorepo pattern)
-- Automated doc-code sync detection (flag stale docs in CI)
-- Session handoff artifacts for multi-session tasks (Anthropic's `claude-progress.txt` pattern)
+- `src/core/prompt.ts` edit hook — security-critical, easy to automate
+- Skill compatibility test — detect sanitizer changes that break skills
+- Other Layer 3 items deferred until team grows
 
 ---
 
-## 6. Relationship to Anthropic's Research
+## 6. Design Influences
 
-Our harness design is informed by Anthropic's published research on AI agent
-engineering. Key mappings:
-
-| Anthropic Concept | Our Implementation |
-|---|---|
-| "Every harness component encodes an assumption about what the model can't do" | Change Impact Matrix encodes "Claude can't know X affects Y without being told" |
-| "Context anxiety" → premature task completion | Compaction Rules preserve critical state; Pre-flight front-loads understanding |
-| "Compounding engineering" → learn from mistakes | After-mistake protocol (§4.4): fix → diagnose harness gap → update layer |
-| "Separate generation from evaluation" | review-maintainer skill; CI as independent evaluator |
-| "Stress-test assumptions regularly" | Periodically review: are these rules still needed? Can any be removed? |
-| "Start simple, add complexity only when needed" | Advisory rules first; migrate to mandatory only when breakage proves necessary |
-
-**Key insight we apply**: The harness should shrink or shift with model improvements,
-not accumulate indefinitely. If a future Claude model reliably reads design docs
-without being told, we can simplify the Pre-flight Protocol. The *why* behind each
-rule (documented in this file) tells us when it's safe to remove.
+Informed by Anthropic's research on AI agent harness design (2025). Key principle:
+the harness should **shrink** with model improvements, not accumulate indefinitely.
+The *why* behind each rule (documented in this file) tells us when it's safe to remove.
 
 ---
 

@@ -1,15 +1,13 @@
 import { SessionList } from './components/SessionList';
 import { PilotArea } from './components/PilotArea';
-import { SkillPanel } from './components/SkillPanel';
 import { SchedulePanel } from './components/SchedulePanel';
 import { History, X, Plus } from 'lucide-react';
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePilot, type PilotMessage } from '@/hooks/usePilot';
 import { usePermissions } from '@/hooks/usePermissions';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
-import { isSkillTool } from './constants';
 
 
 export function PilotPage() {
@@ -21,39 +19,24 @@ export function PilotPage() {
     const { isAdmin } = usePermissions(pilot.sendRpc, pilot.isConnected);
     const { currentWorkspace } = useWorkspace();
 
-    // Track which tool content we've already auto-opened the panel for
-    // Uses content hash instead of message ID (IDs change when DB ID replaces temp ID)
-    const autoOpenedRef = useRef<Set<string>>(new Set());
-
     // Refresh system status on every navigation to this page (e.g. after adding credentials)
     useEffect(() => {
         pilot.loadSystemStatus();
     }, [location]);
 
-    const handleSkillSaved = useCallback(() => {
-        pilot.clearEditSkill();
-        pilot.loadSkills();
-    }, [pilot]);
-
-    const handlePanelSave = useCallback(async (msg: PilotMessage) => {
-        if (isSkillTool(msg.toolName)) {
-            await pilot.loadSkills();
-        }
+    const handlePanelSave = useCallback(async (_msg: PilotMessage) => {
         setPanelMessage(null);
-    }, [pilot]);
+    }, []);
 
     const handlePanelDismiss = useCallback((_msg: PilotMessage) => {
         setPanelMessage(null);
     }, []);
 
-    const handleOpenSkillPanel = useCallback((msg: PilotMessage) => {
+    const handleOpenSchedulePanel = useCallback((msg: PilotMessage) => {
         setPanelMessage(msg);
     }, []);
 
     // Keep panelMessage in sync with pilot.messages (temp ID → DB ID transition only).
-    // Only sync when panelMessage still has a temporary ID (tool-xxx / msg-xxx).
-    // Once it has a stable DB UUID, stop syncing to avoid matching wrong messages
-    // (e.g. an older saved message with the same content).
     useEffect(() => {
         if (!panelMessage) return;
         const id = panelMessage.id;
@@ -65,43 +48,6 @@ export function PilotPage() {
             setPanelMessage(current);
         }
     }, [pilot.messages, panelMessage]);
-
-    // Auto-open panel when new skill tool messages arrive (non-streaming).
-    // Only auto-open for messages from the LIVE session (no isoTimestamp).
-    // History-loaded messages have isoTimestamp — users can click "View" on the in-chat card instead.
-    // Note: manage_schedule is NOT auto-opened — schedules are auto-executed by the bot.
-    useEffect(() => {
-        const msgs = pilot.messages;
-        if (msgs.length === 0) return;
-
-        for (let i = msgs.length - 1; i >= 0; i--) {
-            const msg = msgs[i];
-            if (msg.role !== 'tool' || msg.isStreaming || !msg.content) continue;
-
-            // Skip messages loaded from history (they have isoTimestamp set by mapMessages)
-            if (msg.isoTimestamp) continue;
-
-            if (!isSkillTool(msg.toolName)) continue;
-
-            // Use content as dedup key (stable across ID changes)
-            const contentKey = `${msg.toolName}:${msg.content.slice(0, 200)}`;
-            if (autoOpenedRef.current.has(contentKey)) continue;
-
-            // Validate content
-            try {
-                const parsed = JSON.parse(msg.content);
-                if (!parsed?.skill) continue;
-            } catch { continue; }
-
-            // Don't auto-open if already saved/dismissed
-            const meta = msg.metadata as Record<string, unknown> | undefined;
-            if (meta?.skillCard === 'saved' || meta?.skillCard === 'dismissed') continue;
-
-            autoOpenedRef.current.add(contentKey);
-            setPanelMessage(msg);
-            break;
-        }
-    }, [pilot.messages]);
 
     return (
         <div className="flex h-full relative bg-white overflow-hidden font-sans">
@@ -205,15 +151,8 @@ export function PilotPage() {
                         sendRpc={pilot.sendRpc}
                         contextUsage={pilot.contextUsage}
                         isCompacting={pilot.isCompacting}
-                        skills={pilot.skills}
-                        editingSkill={pilot.editingSkill}
-                        onEditSkill={pilot.startEditSkill}
-                        onClearEditSkill={pilot.clearEditSkill}
-                        onSkillSaved={handleSkillSaved}
-                        onOpenSkillPanel={handleOpenSkillPanel}
-                        onOpenSchedulePanel={handleOpenSkillPanel}
+                        onOpenSchedulePanel={handleOpenSchedulePanel}
                         selectedWorkspaceId={currentWorkspace?.id ?? null}
-                        panelMessage={panelMessage}
                         updateMessageMeta={pilot.updateMessageMeta}
                         pendingMessages={pilot.pendingMessages}
                         onRemovePending={pilot.removePendingMessage}
@@ -233,36 +172,18 @@ export function PilotPage() {
                 </div>
             </div>
 
-            {/* 3. Panel (Right Side) — Skill or Schedule */}
-            {panelMessage && (() => {
-                if (isSkillTool(panelMessage.toolName)) {
-                    return (
-                        <SkillPanel
-                            message={panelMessage}
-                            sendRpc={pilot.sendRpc}
-                            skills={pilot.skills}
-                            onSave={handlePanelSave}
-                            onDismiss={handlePanelDismiss}
-                            onClose={() => setPanelMessage(null)}
-                            updateMessageMeta={pilot.updateMessageMeta}
-                        />
-                    );
-                }
-                if (panelMessage.toolName === 'manage_schedule') {
-                    return (
-                        <SchedulePanel
-                            message={panelMessage}
-                            sendRpc={pilot.sendRpc}
-                            onSave={handlePanelSave}
-                            onDismiss={handlePanelDismiss}
-                            onClose={() => setPanelMessage(null)}
-                            updateMessageMeta={pilot.updateMessageMeta}
-                            selectedWorkspaceId={currentWorkspace?.id ?? null}
-                        />
-                    );
-                }
-                return null;
-            })()}
+            {/* 3. Panel (Right Side) — Schedule */}
+            {panelMessage && panelMessage.toolName === 'manage_schedule' && (
+                <SchedulePanel
+                    message={panelMessage}
+                    sendRpc={pilot.sendRpc}
+                    onSave={handlePanelSave}
+                    onDismiss={handlePanelDismiss}
+                    onClose={() => setPanelMessage(null)}
+                    updateMessageMeta={pilot.updateMessageMeta}
+                    selectedWorkspaceId={currentWorkspace?.id ?? null}
+                />
+            )}
         </div>
     );
 }

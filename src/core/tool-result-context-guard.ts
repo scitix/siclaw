@@ -10,6 +10,7 @@
  * with inlined char estimation (no separate module).
  */
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { ContextGuard } from "./guard-pipeline.js";
 
 // ── Constants ────────────────────────────────────────────────────────────
 
@@ -305,28 +306,12 @@ export function enforceToolResultContextBudgetInPlace(params: {
  * Wraps `agent.transformContext` (private in pi-coding-agent, accessed via
  * runtime cast) to truncate/compact tool results and trigger preemptive
  * overflow when context is still too large.
- *
- * Returns an uninstall function that restores the original transformContext.
  */
 export function installToolResultContextGuard(params: {
   agent: GuardableAgent;
   contextWindowTokens: number;
-}): () => void {
-  const contextWindowTokens = Math.max(1, Math.floor(params.contextWindowTokens));
-  const contextBudgetChars = Math.max(
-    1_024,
-    Math.floor(contextWindowTokens * CHARS_PER_TOKEN * CONTEXT_INPUT_HEADROOM_RATIO),
-  );
-  const maxSingleToolResultChars = Math.max(
-    1_024,
-    Math.floor(
-      contextWindowTokens * TOOL_RESULT_CHARS_PER_TOKEN * SINGLE_TOOL_RESULT_CONTEXT_SHARE,
-    ),
-  );
-  const preemptiveOverflowChars = Math.max(
-    contextBudgetChars,
-    Math.floor(contextWindowTokens * CHARS_PER_TOKEN * PREEMPTIVE_OVERFLOW_RATIO),
-  );
+}): void {
+  const guard = createContextBudgetGuard(params.contextWindowTokens);
 
   const mutableAgent = params.agent as GuardableAgentRecord;
   const originalTransformContext = mutableAgent.transformContext;
@@ -337,25 +322,46 @@ export function installToolResultContextGuard(params: {
       : messages;
 
     const contextMessages = Array.isArray(transformed) ? transformed : messages;
+    guard(contextMessages);
+
+    return contextMessages;
+  }) as TransformContextFn;
+}
+
+/**
+ * Create a ContextGuard that enforces tool result size budgets.
+ *
+ * Truncates individual oversized results, compacts oldest results when
+ * total context exceeds budget, and throws on preemptive overflow.
+ */
+export function createContextBudgetGuard(contextWindowTokens: number): ContextGuard {
+  const tokens = Math.max(1, Math.floor(contextWindowTokens));
+  const contextBudgetChars = Math.max(
+    1_024,
+    Math.floor(tokens * CHARS_PER_TOKEN * CONTEXT_INPUT_HEADROOM_RATIO),
+  );
+  const maxSingleToolResultChars = Math.max(
+    1_024,
+    Math.floor(tokens * TOOL_RESULT_CHARS_PER_TOKEN * SINGLE_TOOL_RESULT_CONTEXT_SHARE),
+  );
+  const preemptiveOverflowChars = Math.max(
+    contextBudgetChars,
+    Math.floor(tokens * CHARS_PER_TOKEN * PREEMPTIVE_OVERFLOW_RATIO),
+  );
+
+  return (messages: AgentMessage[]): void => {
     enforceToolResultContextBudgetInPlace({
-      messages: contextMessages,
+      messages,
       contextBudgetChars,
       maxSingleToolResultChars,
     });
 
-    // After tool-result compaction, check if context still exceeds the high-water mark.
     const postEnforcementChars = estimateContextChars(
-      contextMessages,
+      messages,
       createMessageCharEstimateCache(),
     );
     if (postEnforcementChars > preemptiveOverflowChars) {
       throw new Error(PREEMPTIVE_CONTEXT_OVERFLOW_MESSAGE);
     }
-
-    return contextMessages;
-  }) as TransformContextFn;
-
-  return () => {
-    mutableAgent.transformContext = originalTransformContext;
   };
 }

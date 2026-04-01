@@ -15,8 +15,8 @@ import { registration as restrictedBash } from "./cmd-exec/restricted-bash.js";
 import { registration as nodeScript } from "./script-exec/node-script.js";
 import { registration as podScript } from "./script-exec/pod-script.js";
 import { registration as localScript } from "./script-exec/local-script.js";
-// query (investigationFeedback physically in workflow/deep-search/, but kept at original position)
-import { registration as investigationFeedback } from "./workflow/deep-search/investigation-feedback.js";
+// query
+import { registration as investigationFeedback } from "./query/investigation-feedback.js";
 import { registration as credentialList } from "./query/credential-list.js";
 import { registration as clusterInfo } from "./query/cluster-info.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
@@ -27,11 +27,10 @@ import { registration as memoryGet } from "./query/memory-get.js";
 import { registration as deepSearch } from "./workflow/deep-search/tool.js";
 import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
-import { registration as createSkill } from "./workflow/create-skill.js";
-import { registration as updateSkill } from "./workflow/update-skill.js";
-import { registration as forkSkill } from "./workflow/fork-skill.js";
+import { registration as taskReport } from "./workflow/task-report.js";
+// Skill management tools disabled — managed via Skills UI
 
-// Total: 19 entries
+// Total: 17 entries
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
   nodeExec, podExec, restrictedBash,
@@ -41,6 +40,5 @@ export const allToolEntries: ToolEntry[] = [
   investigationFeedback, credentialList, clusterInfo,
   knowledgeSearch, resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
-  deepSearch, saveFeedback, manageSchedule,
-  createSkill, updateSkill, forkSkill,
+  deepSearch, saveFeedback, manageSchedule, taskReport,
 ];

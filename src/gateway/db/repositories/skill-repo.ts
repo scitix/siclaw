@@ -16,8 +16,10 @@ export interface CreateSkillInput {
   type?: string;
   scope: SkillScope;
   authorId?: string;
-  dirName: string;
+  dirName?: string;
   forkedFromId?: string;
+  originId?: string;
+  contentHash?: string;
   version?: number;
   labels?: string[];
   skillSpaceId?: string;
@@ -33,10 +35,14 @@ export interface UpdateSkillInput {
   scope?: SkillScope;
   dirName?: string;
   publishedVersion?: number | null;
+  approvedVersion?: number | null;
   stagingVersion?: number;
+  commitMessage?: string | null;
   globalSourceSkillId?: string | null;
   globalPinnedVersion?: number | null;
   forkedFromId?: string | null;
+  originId?: string | null;
+  contentHash?: string | null;
   labels?: string[] | null;
   skillSpaceId?: string | null;
 }
@@ -116,6 +122,28 @@ export class SkillRepository {
     return rows[0] ?? null;
   }
 
+  /** Create with a specific id (used by builtin sync) */
+  async createWithId(id: string, input: CreateSkillInput) {
+    await this.db.insert(skills).values({
+      id,
+      name: input.name,
+      description: input.description ?? null,
+      type: input.type ?? "Custom",
+      version: input.version ?? 1,
+      scope: input.scope,
+      authorId: input.authorId ?? null,
+      dirName: input.dirName ?? input.name,
+      status: "installed",
+      contributionStatus: "none",
+      forkedFromId: input.forkedFromId ?? null,
+      originId: input.originId ?? null,
+      contentHash: input.contentHash ?? null,
+      labelsJson: input.labels ?? null,
+      skillSpaceId: input.skillSpaceId ?? null,
+    });
+    return id;
+  }
+
   async create(input: CreateSkillInput) {
     const id = crypto.randomUUID();
     await this.db.insert(skills).values({
@@ -126,10 +154,12 @@ export class SkillRepository {
       version: input.version ?? 1,
       scope: input.scope,
       authorId: input.authorId ?? null,
-      dirName: input.dirName,
+      dirName: input.dirName ?? input.name,
       status: "installed",
       contributionStatus: "none",
       forkedFromId: input.forkedFromId ?? null,
+      originId: input.originId ?? null,
+      contentHash: input.contentHash ?? null,
       labelsJson: input.labels ?? null,
       skillSpaceId: input.skillSpaceId ?? null,
     });
@@ -150,10 +180,14 @@ export class SkillRepository {
     if (updates.scope !== undefined) setFields.scope = updates.scope;
     if (updates.dirName !== undefined) setFields.dirName = updates.dirName;
     if (updates.publishedVersion !== undefined) setFields.publishedVersion = updates.publishedVersion;
+    if (updates.approvedVersion !== undefined) setFields.approvedVersion = updates.approvedVersion;
     if (updates.stagingVersion !== undefined) setFields.stagingVersion = updates.stagingVersion;
+    if (updates.commitMessage !== undefined) setFields.commitMessage = updates.commitMessage;
     if (updates.globalSourceSkillId !== undefined) setFields.globalSourceSkillId = updates.globalSourceSkillId;
     if (updates.globalPinnedVersion !== undefined) setFields.globalPinnedVersion = updates.globalPinnedVersion;
     if (updates.forkedFromId !== undefined) setFields.forkedFromId = updates.forkedFromId;
+    if (updates.originId !== undefined) setFields.originId = updates.originId;
+    if (updates.contentHash !== undefined) setFields.contentHash = updates.contentHash;
     if (updates.labels !== undefined) setFields.labelsJson = updates.labels;
     if (updates.skillSpaceId !== undefined) setFields.skillSpaceId = updates.skillSpaceId;
 
@@ -210,6 +244,15 @@ export class SkillRepository {
     await this.db.delete(skills).where(eq(skills.id, id));
   }
 
+  /** Re-link forkedFromId chain: all skills forked from `deletedId` get re-pointed to `newParentId` */
+  async relinkForkedFrom(deletedId: string, newParentId: string | null): Promise<number> {
+    const result = await this.db
+      .update(skills)
+      .set({ forkedFromId: newParentId })
+      .where(eq(skills.forkedFromId, deletedId));
+    return (result as any).rowsAffected ?? (result as any).changes ?? 0;
+  }
+
   async getByDirNameAndScope(dirName: string, scope: string) {
     const rows = await this.db
       .select()
@@ -219,34 +262,51 @@ export class SkillRepository {
     return rows[0] ?? null;
   }
 
-  // ─── Per-user disabled skills ───────────────────
-
-  async listDisabledSkills(userId: string): Promise<string[]> {
+  async getByNameAndScope(name: string, scope: string) {
     const rows = await this.db
-      .select({ skillName: userDisabledSkills.skillName })
-      .from(userDisabledSkills)
-      .where(eq(userDisabledSkills.userId, userId));
-    return rows.map((r) => r.skillName);
+      .select()
+      .from(skills)
+      .where(and(eq(skills.name, name), eq(skills.scope, scope as any)))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
-  async disableSkill(userId: string, skillName: string): Promise<void> {
+  async getByOriginIdAndScope(originId: string, scope: string) {
+    const rows = await this.db
+      .select()
+      .from(skills)
+      .where(and(eq(skills.originId, originId), eq(skills.scope, scope as any)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
+  // ─── Per-user disabled skills ───────────────────
+
+  async listDisabledSkillIds(userId: string): Promise<string[]> {
+    const rows = await this.db
+      .select({ skillId: userDisabledSkills.skillId })
+      .from(userDisabledSkills)
+      .where(eq(userDisabledSkills.userId, userId));
+    return rows.map((r) => r.skillId);
+  }
+
+  async disableSkill(userId: string, skillId: string): Promise<void> {
     try {
       await this.db
         .insert(userDisabledSkills)
-        .values({ userId, skillName });
+        .values({ userId, skillId });
     } catch (err) {
       if (!isUniqueViolation(err)) throw err;
-      // Already disabled — idempotent no-op
     }
   }
 
-  async enableSkill(userId: string, skillName: string): Promise<void> {
+  async enableSkill(userId: string, skillId: string): Promise<void> {
     await this.db
       .delete(userDisabledSkills)
       .where(
         and(
           eq(userDisabledSkills.userId, userId),
-          eq(userDisabledSkills.skillName, skillName),
+          eq(userDisabledSkills.skillId, skillId),
         ),
       );
   }

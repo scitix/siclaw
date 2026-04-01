@@ -13,6 +13,8 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { SessionManager } from "@mariozechner/pi-coding-agent";
 import { extractToolCallsFromAssistant, extractToolResultId } from "./message-utils.js";
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
+import type { PersistGuard } from "./guard-pipeline.js";
+import { guardLog } from "./guard-log.js";
 
 // ── Tool result truncation ──────────────────────────────────────────────
 
@@ -99,19 +101,40 @@ function makeSyntheticToolResult(toolCallId: string, toolName?: string): AgentMe
 
 export function installSessionToolResultGuard(sessionManager: SessionManager): void {
   const originalAppend = sessionManager.appendMessage.bind(sessionManager);
-  const pending = new Map<string, string | undefined>(); // tool call id → tool name
-  // IDs of tool calls dropped by sanitization — toolResults referencing these are also dropped
-  const droppedToolCallIds = new Set<string>();
-
-  const flushPending = () => {
-    if (pending.size === 0) return;
-    for (const [id, name] of pending) {
-      originalAppend(makeSyntheticToolResult(id, name) as never);
-    }
-    pending.clear();
-  };
+  const guard = createSessionToolResultGuard();
 
   sessionManager.appendMessage = ((message: AgentMessage) => {
+    const results = guard(message);
+    for (const msg of results) {
+      originalAppend(msg as never);
+    }
+  }) as SessionManager["appendMessage"];
+}
+
+/**
+ * Create a PersistGuard for session tool result validation.
+ *
+ * Returns a function that takes a message and returns an array of messages
+ * to actually persist:
+ * - Empty array: message is dropped (e.g. orphaned toolResult)
+ * - Single element: message passes through (possibly sanitized/truncated)
+ * - Multiple elements: synthetic results flushed before the message
+ */
+export function createSessionToolResultGuard(): PersistGuard {
+  const pending = new Map<string, string | undefined>(); // tool call id → tool name
+  const droppedToolCallIds = new Set<string>();
+
+  const flushPending = (): AgentMessage[] => {
+    if (pending.size === 0) return [];
+    const results: AgentMessage[] = [];
+    for (const [id, name] of pending) {
+      results.push(makeSyntheticToolResult(id, name));
+    }
+    pending.clear();
+    return results;
+  };
+
+  return (message: AgentMessage): AgentMessage[] => {
     const role = (message as { role?: unknown }).role;
 
     if (role === "assistant") {
@@ -129,10 +152,9 @@ export function installSessionToolResultGuard(sessionManager: SessionManager): v
 
       const sanitized = sanitizeToolCallInputs([message]);
       if (sanitized.length === 0) {
-        console.warn(`[session-guard] Dropped entire assistant message (all tool call blocks were malformed)`);
+        guardLog("session-tool-result-guard", "dropped-assistant", { reason: "all tool call blocks malformed" });
         for (const id of idsBefore) droppedToolCallIds.add(id);
-        flushPending();
-        return undefined as never;
+        return flushPending();
       }
       const nextMessage = sanitized[0] as Extract<AgentMessage, { role: "assistant" }>;
 
@@ -154,36 +176,28 @@ export function installSessionToolResultGuard(sessionManager: SessionManager): v
           ? extractToolCallsFromAssistant(nextMessage)
           : [];
 
-      // Flush pending orphans before a new assistant turn (with or without tool calls)
-      if (pending.size > 0) {
-        flushPending();
-      }
-
-      const result = originalAppend(nextMessage as never);
+      // Flush pending orphans before a new assistant turn
+      const flushed = flushPending();
 
       for (const tc of toolCalls) {
         pending.set(tc.id, tc.name);
       }
 
-      return result;
+      return [...flushed, nextMessage];
     }
 
     if (role === "toolResult") {
       const id = extractToolResultId(message as Extract<AgentMessage, { role: "toolResult" }>);
       if (id && droppedToolCallIds.has(id)) {
-        // Drop orphaned toolResult whose tool call was removed by sanitization
-        console.warn(`[session-guard] Dropped orphaned toolResult for sanitized tool call id=${id}`);
+        guardLog("session-tool-result-guard", "dropped-tool-result", { toolCallId: id });
         droppedToolCallIds.delete(id);
-        return undefined as never;
+        return [];
       }
       if (id) pending.delete(id);
-      // Truncate oversized tool results before persistence to prevent context bloat
-      const capped = capToolResultSize(message);
-      return originalAppend(capped as never);
+      return [capToolResultSize(message)];
     }
 
     // User or other messages: flush pending orphans first
-    flushPending();
-    return originalAppend(message as never);
-  }) as SessionManager["appendMessage"];
+    return [...flushPending(), message];
+  };
 }

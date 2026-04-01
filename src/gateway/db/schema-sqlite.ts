@@ -110,12 +110,16 @@ export const skills = sqliteTable("skills", {
   reviewStatus: text("review_status").notNull().default("draft"), // "draft" | "pending" | "approved"
   dirName: text("dir_name").notNull(),
   publishedVersion: integer("published_version"),
+  approvedVersion: integer("approved_version"),
   stagingVersion: integer("staging_version").notNull().default(0),
+  commitMessage: text("commit_message"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   globalSourceSkillId: text("global_source_skill_id"),
   globalPinnedVersion: integer("global_pinned_version"),
   forkedFromId: text("forked_from_id"),
+  originId: text("origin_id"),
+  contentHash: text("content_hash"),
   labelsJson: text("labels_json", { mode: "json" }).$type<string[]>(),
   skillSpaceId: text("skill_space_id").references(() => skillSpaces.id, { onDelete: "set null" }),
 });
@@ -126,9 +130,10 @@ export const skillContents = sqliteTable("skill_contents", {
   id: text("id").primaryKey(),
   skillId: text("skill_id").notNull()
     .references(() => skills.id, { onDelete: "cascade" }),
-  tag: text("tag").notNull().default("working"), // "working" | "staging" | "published"
+  tag: text("tag").notNull().default("working"), // "working" | "staging" | "staging-contribution" | "published" | "approved"
   specs: text("specs"),
   scriptsJson: text("scripts_json", { mode: "json" }).$type<Array<{ name: string; content: string }>>(),
+  contentHash: text("content_hash"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 }, (table) => ({
@@ -154,6 +159,7 @@ export const skillVersions = sqliteTable("skill_versions", {
       labels?: string[] | null;
     };
   }>(),
+  tag: text("tag"), // "published" (dev) | "approved" (prod) — null for legacy records
   commitMessage: text("commit_message"),
   authorId: text("author_id").references(() => users.id),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
@@ -350,9 +356,16 @@ export const workspaceCredentials = sqliteTable("workspace_credentials", {
 
 export const userDisabledSkills = sqliteTable("user_disabled_skills", {
   userId: text("user_id").notNull().references(() => users.id),
-  skillName: text("skill_name").notNull(),
+  skillId: text("skill_id").notNull().references(() => skills.id, { onDelete: "cascade" }),
 }, (table) => ({
-  pk: primaryKey({ columns: [table.userId, table.skillName] }),
+  pk: primaryKey({ columns: [table.userId, table.skillId] }),
+}));
+
+export const userDisabledSkillSpaces = sqliteTable("user_disabled_skill_spaces", {
+  userId: text("user_id").notNull().references(() => users.id),
+  skillSpaceId: text("skill_space_id").notNull().references(() => skillSpaces.id, { onDelete: "cascade" }),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.skillSpaceId] }),
 }));
 
 // ─── Clusters ────────────────────────────────────────

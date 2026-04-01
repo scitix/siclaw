@@ -9,7 +9,7 @@ import type { MemoryIndexer } from "../memory/indexer.js";
 
 // ── Session mode ──
 
-export type SessionMode = "web" | "channel" | "cli";
+export type SessionMode = "web" | "channel" | "cli" | "cron";
 
 // ── Mutable ref types ──
 
