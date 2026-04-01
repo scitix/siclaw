@@ -1804,6 +1804,45 @@ export function createRpcMethods(
     return { ok: true, model: newModel };
   });
 
+  methods.set("provider.updateModel", async (params, context: RpcContext) => {
+    requireAdmin(context);
+    if (!modelConfigRepo) throw new Error("Database not available");
+    const providerName = params.provider as string;
+    const modelId = params.modelId as string;
+    const updates = params.updates as Record<string, unknown>;
+    if (!providerName || !modelId || !updates) {
+      throw new Error("Missing required params: provider, modelId, updates");
+    }
+
+    // Validate field types at the boundary
+    if (updates.name !== undefined) {
+      if (typeof updates.name !== "string" || !updates.name.trim()) {
+        throw new Error("name must be a non-empty string");
+      }
+    }
+    if (updates.reasoning !== undefined && typeof updates.reasoning !== "boolean") {
+      throw new Error("reasoning must be a boolean");
+    }
+    if (updates.contextWindow !== undefined) {
+      if (typeof updates.contextWindow !== "number" || updates.contextWindow <= 0) {
+        throw new Error("contextWindow must be a positive number");
+      }
+    }
+    if (updates.maxTokens !== undefined) {
+      if (typeof updates.maxTokens !== "number" || updates.maxTokens <= 0) {
+        throw new Error("maxTokens must be a positive number");
+      }
+    }
+
+    await modelConfigRepo.updateModel(providerName, modelId, {
+      name: updates.name as string | undefined,
+      reasoning: updates.reasoning as boolean | undefined,
+      contextWindow: updates.contextWindow as number | undefined,
+      maxTokens: updates.maxTokens as number | undefined,
+    });
+    return { ok: true };
+  });
+
   methods.set("provider.removeModel", async (params, context: RpcContext) => {
     requireAdmin(context);
     if (!modelConfigRepo) throw new Error("Database not available");

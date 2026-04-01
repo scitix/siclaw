@@ -148,6 +148,11 @@ export function ModelsPage() {
         await Promise.all([loadProviders(), loadModels()]);
     };
 
+    const handleUpdateModel = async (providerName: string, modelId: string, updates: { name?: string; reasoning?: boolean; contextWindow?: number; maxTokens?: number }) => {
+        await sendRpc('provider.updateModel', { provider: providerName, modelId, updates });
+        await Promise.all([loadProviders(), loadModels()]);
+    };
+
     const handleRemoveModel = async (providerName: string, modelId: string) => {
         await sendRpc('provider.removeModel', { provider: providerName, modelId });
         await Promise.all([loadProviders(), loadModels()]);
@@ -407,6 +412,7 @@ export function ModelsPage() {
                     isAdmin={isAdmin}
                     onClose={() => setModelsProvider(null)}
                     onAdd={(model) => handleAddModel(modelsProvider, model)}
+                    onUpdate={(modelId, updates) => handleUpdateModel(modelsProvider, modelId, updates)}
                     onRemove={(modelId) => handleRemoveModel(modelsProvider, modelId)}
                 />
             )}
