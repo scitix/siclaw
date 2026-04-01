@@ -50,7 +50,7 @@ Allowed commands (ONLY these are permitted):
 
 Shell features (pipes, redirects) are NOT supported — commands are passed as argv, not through a shell.
 The following will be rejected: find with -exec/-delete, sysctl with -w, mount with actual mounting,
-curl with -o/-O/-T (file output/upload), env with command arguments (only listing allowed).
+curl with -o/-O/-T (file output/upload) and all non-read HTTP methods (POST, PUT, DELETE, PATCH) and data flags (-d/--data), env with command arguments (only listing allowed).
 
 Examples:
 - pod: "my-app-abc", namespace: "production", command: "ip addr show"

@@ -65,7 +65,7 @@ Allowed commands (ONLY these are permitted — do NOT use \`which\` to check, ju
 Pipes (|), && and ; are supported — each command in the pipeline must be in the whitelist.
 Output redirection (> file), input redirection (< file), $() and backticks are blocked.
 The following will be rejected: find with -exec/-delete, sysctl with -w, mount with actual mounting,
-curl with -o/-O/-T (file output/upload), env with command arguments (only listing allowed),
+curl with -o/-O/-T (file output/upload) and all non-read HTTP methods (POST, PUT, DELETE, PATCH) and data flags (-d/--data), env with command arguments (only listing allowed),
 systemctl with non-read-only subcommands, iptables with non-list operations.
 
 Examples:

