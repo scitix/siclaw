@@ -113,15 +113,16 @@ export class CronService {
     const workspaceId = current.workspaceId ?? undefined;
     console.log(`[cron-service] Executing job ${job.id} (${job.name}) for user ${job.userId}${workspaceId ? ` ws=${workspaceId}` : ""}`);
 
+    // Fresh session per execution — avoids compaction edge cases and JSONL growth
+    let sessionId: string | undefined;
     try {
-      // Fresh session per execution — avoids compaction edge cases and JSONL growth
       const cronSession = await this.chatRepo.createSession(
         current.userId,
         `Cron: ${current.name}`,
         workspaceId,
         "cron",
       );
-      const sessionId = cronSession.id;
+      sessionId = cronSession.id;
 
       const prompt = buildCronPrompt(current);
 
@@ -171,7 +172,7 @@ export class CronService {
       try { await this.configRepo.updateCronJobRun(job.id, "failure"); } catch (e) {
         console.warn(`[cron-service] updateCronJobRun failed for ${job.id}:`, e instanceof Error ? e.message : e);
       }
-      await this.recordResult(job, "failure", "", err instanceof Error ? err.message : String(err));
+      await this.recordResult(job, "failure", "", err instanceof Error ? err.message : String(err), undefined, sessionId);
     } finally {
       try {
         await this.configRepo.unlockJob(job.id, executionId);

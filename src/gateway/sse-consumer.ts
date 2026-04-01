@@ -50,7 +50,7 @@ export interface SseConsumptionResult {
 
 // ── Implementation ──────────────────────────────────
 
-const EMPTY_REDACTION: RedactionConfig = { patterns: [] } as RedactionConfig;
+const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
 
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
   const { client, sessionId, userId, chatRepo, onEvent, signal } = opts;
@@ -208,10 +208,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     resultText = currentMsgText;
   }
 
+  const durationMs = Date.now() - startTime;
+  console.log(`[sse-consumer] ${userId} session=${sessionId}: ${eventCount} events, ${durationMs}ms`);
+
   return {
     resultText: taskReportText || resultText,
     taskReportText,
     eventCount,
-    durationMs: Date.now() - startTime,
+    durationMs,
   };
 }

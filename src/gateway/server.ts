@@ -863,6 +863,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 credentials?.manifest?.length ? path.resolve(process.cwd(), ".siclaw/credentials") : undefined,
                 sensitiveStrings.length > 0 ? sensitiveStrings : undefined,
               );
+              const abortCtrl = new AbortController();
               const sseResult = await Promise.race([
                 consumeAgentSse({
                   client,
@@ -870,8 +871,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                   userId,
                   chatRepo: chatRepoLocal,
                   redactionConfig: redactionCfg,
+                  signal: abortCtrl.signal,
                 }),
-                timeout.promise,
+                timeout.promise.catch((err) => { abortCtrl.abort(); throw err; }),
               ]);
               resultText = (sseResult as { resultText: string }).resultText;
             } else {
