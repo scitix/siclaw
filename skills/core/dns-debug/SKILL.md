@@ -17,20 +17,20 @@ When pods report DNS resolution failures (service discovery not working, NXDOMAI
 
 If a specific pod is having DNS issues, test DNS resolution from within that pod:
 
-```bash
-kubectl exec <pod> -n <ns> -- nslookup <service-name>
+```
+pod_exec: pod=<pod>, namespace=<ns>, command="nslookup <service-name>"
 ```
 
 For cross-namespace service resolution:
 
-```bash
-kubectl exec <pod> -n <ns> -- nslookup <service-name>.<target-namespace>.svc.cluster.local
+```
+pod_exec: pod=<pod>, namespace=<ns>, command="nslookup <service-name>.<target-namespace>.svc.cluster.local"
 ```
 
 If `nslookup` is not available in the container, try:
 
-```bash
-kubectl exec <pod> -n <ns> -- cat /etc/resolv.conf
+```
+pod_exec: pod=<pod>, namespace=<ns>, command="cat /etc/resolv.conf"
 ```
 
 This shows the DNS server the pod is configured to use and the search domains.
@@ -112,8 +112,8 @@ By default, Kubernetes sets `ndots:5` in pods' `resolv.conf`, causing external d
 
 Check the pod's DNS configuration:
 
-```bash
-kubectl exec <pod> -n <ns> -- cat /etc/resolv.conf
+```
+pod_exec: pod=<pod>, namespace=<ns>, command="cat /etc/resolv.conf"
 ```
 
 If `ndots:5` is set and the pod frequently resolves external domains, advise the user to set `dnsConfig.options` in the pod spec to lower `ndots` or add specific `searches` entries.

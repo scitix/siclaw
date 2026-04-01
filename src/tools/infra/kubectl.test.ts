@@ -57,6 +57,14 @@ describe("SAFE_SUBCOMMANDS excludes exec", () => {
   it("exec is no longer a safe kubectl subcommand (use pod_exec/node_exec tools instead)", () => {
     expect(SAFE_SUBCOMMANDS.has("exec")).toBe(false);
   });
+
+  it("exec is not in SAFE_SUBCOMMANDS so validateKubectlInPipeline will reject it", () => {
+    // Behavioral: any subcommand not in SAFE_SUBCOMMANDS is rejected by
+    // validateKubectlInPipeline (restricted-bash.ts). We verify the set
+    // membership here; the pipeline integration is tested in restricted-bash.test.ts.
+    expect(SAFE_SUBCOMMANDS.has("exec")).toBe(false);
+    expect(SAFE_SUBCOMMANDS.has("delete")).toBe(false); // write ops also excluded
+  });
 });
 
 describe("hasAllNamespacesWithoutSelector (backward-compat wrapper)", () => {
