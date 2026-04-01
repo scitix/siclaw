@@ -425,45 +425,13 @@ configuration.
 
 Remaining work after the Phase 1 directory restructure. Ordered by priority.
 
-### 8.1 Unified Command Security Model (Done)
+### 8.1 Unified Command Security Model — ✅ Done (PR #189, 2026-03-30)
 
-The current security model mixes two separate concerns in `COMMAND_RULES`:
-1. **Command safety constraints** — intrinsic to the command (e.g., `grep -r` is
-   dangerous everywhere)
-2. **Environment availability** — which commands are available in which execution
-   context (e.g., `cat` is blocked locally because a dedicated `read` tool exists)
-
-These are spread across 4 separate data structures (`ALLOWED_COMMANDS`,
-`COMMAND_CATEGORIES`, `COMMAND_RULES`, `CUSTOM_VALIDATORS`) that must be kept in
-sync. Adding a command may require changes to 2-4 places. Per-command rules are
-inconsistent — some use `allowedFlags`, some use `blockedFlags`, some use custom
-validator functions, with no clear principle for when to use which.
-
-**Goal**: Unify into a single `CommandDef` per command that carries all its
-information — category, safety constraints, and custom validator (if needed).
-Separate environment availability into an independent layer.
-
-```
-COMMANDS: Record<string, CommandDef>     ← one definition = one command's everything
-  ├── category: string                      what kind of command
-  ├── constraints (declarative)             blockedFlags, allowedSubcommands, etc.
-  └── validate? (escape hatch)             custom function for complex commands (curl, etc.)
-
-CONTEXT_AVAILABLE: Record<string, string[]>  ← which categories are available per context
-  ├── local:  [categories minus file/env]      local has dedicated tools for file ops
-  └── remote: [all categories]                 node/pod/nsenter share the same set
-```
-
-Key design decisions to resolve:
-- `pipeOnly` / `noFilePaths` are currently per-command per-context rules. In the
-  new model they become environment-level policies (e.g., "text category commands
-  in local context only accept piped input"), not command-level attributes.
-- The 12 custom validators (especially `curl` at ~120 lines) remain as `validate`
-  escape hatches — their logic is too complex for declarative rules.
-- The `contexts` field in COMMAND_RULES is eliminated — safety constraints apply
-  everywhere, context filtering is a separate layer.
-
-**Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
+Unified 4 separate data structures (`ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`,
+`COMMAND_RULES`, `CUSTOM_VALIDATORS`) into `COMMANDS: Record<string, CommandDef>` +
+`CONTEXT_POLICIES`. Each command now has a single definition carrying category,
+constraints, and optional custom validator. Environment availability is a separate
+`CONTEXT_POLICIES` layer. See ADR-012 in `decisions.md` for rationale.
 
 ### 8.2 Security Pipeline Unified Entry (Done)
 
