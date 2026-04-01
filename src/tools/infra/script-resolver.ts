@@ -45,7 +45,7 @@ interface ScopeDir {
 const SCOPE_MAP: Record<string, SkillScope> = {
   user: "personal",
   skillset: "skillset",
-  extension: "global",
+  extension: "builtin",
   global: "global",
   core: "builtin",
 };
@@ -61,7 +61,24 @@ const SCOPE_MAP: Record<string, SkillScope> = {
 function getSkillScriptDirs(skill: string): ScopeDir[] {
   const base = skillsBase();
 
-  // 1. Legacy flat layout (bundle-materialized without scope subdirs)
+  // 1. Unified resolved/ directory (built by materialize with priority merging)
+  // K8s mode: {base}/resolved/{skill}/scripts
+  // Local mode: {base}/user/{userId}/resolved/{skill}/scripts (check all users)
+  const resolvedPath = path.join(base, "resolved", skill, "scripts");
+  if (fs.existsSync(resolvedPath)) return [{ dir: resolvedPath, scope: "personal" }];
+  // Local mode fallback: scan user/*/resolved/
+  const userDir = path.join(base, "user");
+  if (fs.existsSync(userDir)) {
+    try {
+      for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const userResolved = path.join(userDir, entry.name, "resolved", skill, "scripts");
+        if (fs.existsSync(userResolved)) return [{ dir: userResolved, scope: "personal" }];
+      }
+    } catch { /* ignore */ }
+  }
+
+  // 1b. Legacy flat layout (bundle-materialized without scope subdirs)
   const directPath = path.join(base, skill, "scripts");
   if (fs.existsSync(directPath)) return [{ dir: directPath, scope: "global" }];
 

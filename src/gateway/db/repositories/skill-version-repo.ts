@@ -7,9 +7,12 @@ import { eq, and, desc } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { skillVersions } from "../schema.js";
 
+export type SkillVersionTag = "published" | "approved";
+
 export interface CreateSkillVersionInput {
   skillId: string;
   version: number;
+  tag?: SkillVersionTag;
   files?: {
     specs?: string;
     scripts?: string[];
@@ -37,6 +40,7 @@ export class SkillVersionRepository {
       id,
       skillId: input.skillId,
       version: input.version,
+      tag: input.tag ?? null,
       files: input.files ?? null,
       specs: input.specs ?? null,
       scriptsJson: input.scriptsJson ?? null,
@@ -65,11 +69,15 @@ export class SkillVersionRepository {
     return rows[0] ?? null;
   }
 
-  async listForSkill(skillId: string, limit = 50): Promise<SkillVersion[]> {
+  async listForSkill(skillId: string, opts?: { tag?: SkillVersionTag; limit?: number }): Promise<SkillVersion[]> {
+    const limit = opts?.limit ?? 50;
+    const where = opts?.tag
+      ? and(eq(skillVersions.skillId, skillId), eq(skillVersions.tag, opts.tag))
+      : eq(skillVersions.skillId, skillId);
     return this.db
       .select()
       .from(skillVersions)
-      .where(eq(skillVersions.skillId, skillId))
+      .where(where)
       .orderBy(desc(skillVersions.version))
       .limit(limit);
   }

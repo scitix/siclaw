@@ -1,5 +1,4 @@
-import { runSubAgent, type SubAgentOptions, type ProgressCallback, type ProgressEvent } from "./sub-agent.js";
-import { llmComplete, llmCompleteWithTool, extractJSON } from "../../../shared/llm-utils.js";
+import { runSubAgent, llmComplete, llmCompleteWithTool, extractJSON, type SubAgentOptions, type ProgressCallback, type ProgressEvent } from "./sub-agent.js";
 import {
   contextGatheringPrompt,
   hypothesisGenerationPrompt,

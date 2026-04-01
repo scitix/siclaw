@@ -51,6 +51,7 @@ export type Skill = {
     latestReview?: SkillReview | null;
     publishedFiles?: { specs?: string; scripts?: Array<{ name: string; content: string }> } | null;
     publishedVersion?: number | null;
+    approvedVersion?: number | null;
     globalSourceSkillId?: string | null;
     globalPinnedVersion?: number | null;
     stagingVersion?: number;
@@ -62,6 +63,8 @@ export type Skill = {
     forkedFromId?: string | null;
     globalSkillId?: string | null;
     hasUnpublishedChanges?: boolean;
+    canSubmit?: boolean;
+    canContribute?: boolean;
 };
 
 export type SkillSystemCapabilities = {
@@ -193,32 +196,50 @@ export async function rpcRevertSkill(
     return sendRpc('skill.revert', { id, reason });
 }
 
+// ── Submit (for production review) ──
+export async function rpcRequestPublish(sendRpc: RpcSendFn, id: string, workspaceId?: string, message?: string): Promise<{ status: string }> {
+    return sendRpc('skill.submit', { id, workspaceId, message });
+}
+export async function rpcBatchSubmit(sendRpc: RpcSendFn, ids: string[], workspaceId?: string): Promise<{ status: string; results: Array<{ id: string; status: string; error?: string }> }> {
+    return sendRpc('skill.submit', { ids, workspaceId });
+}
+
+// ── Contribute (to global) ──
+export async function rpcContribute(sendRpc: RpcSendFn, id: string, workspaceId?: string, message?: string): Promise<{ status: string }> {
+    return sendRpc('skill.contribute', { id, workspaceId, message });
+}
+export async function rpcBatchContribute(sendRpc: RpcSendFn, ids: string[], workspaceId?: string): Promise<{ status: string; results: Array<{ id: string; status: string; error?: string }> }> {
+    return sendRpc('skill.contribute', { ids, workspaceId });
+}
+
+// ── Review (approve/reject) ──
+export async function rpcApproveSubmit(sendRpc: RpcSendFn, id: string, stagingVersion?: number, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.approveSubmit', { id, stagingVersion, workspaceId });
+}
+export async function rpcRejectSubmit(sendRpc: RpcSendFn, id: string, reason?: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.rejectSubmit', { id, reason, workspaceId });
+}
+export async function rpcApproveContribute(sendRpc: RpcSendFn, id: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.approveContribute', { id, workspaceId });
+}
+export async function rpcRejectContribute(sendRpc: RpcSendFn, id: string, reason?: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.rejectContribute', { id, reason, workspaceId });
+}
+
+// ── Backward-compat review dispatcher (used by ScriptReviewApprovalCard) ──
 export async function rpcReviewDecision(
-    sendRpc: RpcSendFn,
-    id: string,
-    decision: 'approve' | 'reject',
-    reason?: string,
-    stagingVersion?: number,
-    workspaceId?: string,
+    sendRpc: RpcSendFn, id: string, decision: 'approve' | 'reject',
+    reason?: string, stagingVersion?: number, workspaceId?: string,
 ): Promise<{ status: string }> {
     return sendRpc('skill.review', { id, decision, reason, stagingVersion, workspaceId });
 }
 
-export async function rpcRequestPublish(
-    sendRpc: RpcSendFn,
-    id: string,
-    contributeToGlobal?: boolean,
-    workspaceId?: string,
-): Promise<{ status: string }> {
-    return sendRpc('skill.submit', { id, contributeToGlobal, workspaceId });
+// ── Withdraw ──
+export async function rpcWithdrawSubmit(sendRpc: RpcSendFn, id: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.withdrawSubmit', { id, workspaceId });
 }
-
-export async function rpcWithdrawSkill(
-    sendRpc: RpcSendFn,
-    id: string,
-    workspaceId?: string,
-): Promise<{ status: string; wasNew: boolean }> {
-    return sendRpc('skill.withdraw', { id, workspaceId });
+export async function rpcWithdrawContribute(sendRpc: RpcSendFn, id: string, workspaceId?: string): Promise<{ status: string }> {
+    return sendRpc('skill.withdrawContribute', { id, workspaceId });
 }
 
 export async function rpcGetSkillReview(
@@ -231,8 +252,9 @@ export async function rpcGetSkillReview(
 export async function rpcGetSkillHistory(
     sendRpc: RpcSendFn,
     id: string,
-): Promise<{ versions: Array<{ hash: string; version: number; message: string; author: string; date: string }> }> {
-    return sendRpc('skill.history', { id });
+    tag?: 'published' | 'approved',
+): Promise<{ versions: Array<{ hash: string; version: number; tag?: string; message: string; author: string; date: string }> }> {
+    return sendRpc('skill.history', { id, tag });
 }
 
 export async function rpcGetSkillDiff(
@@ -249,8 +271,9 @@ export async function rpcRollbackSkill(
     sendRpc: RpcSendFn,
     id: string,
     version: number,
-): Promise<{ version: number }> {
-    return sendRpc('skill.rollback', { id, version });
+    target?: 'dev' | 'prod',
+): Promise<{ version: number; target: string }> {
+    return sendRpc('skill.rollback', { id, version, target });
 }
 
 // ─── Label RPC ───
@@ -269,13 +292,23 @@ export async function rpcUpdateSkillLabels(sendRpc: RpcSendFn, id: string, label
     return sendRpc('skill.updateLabels', { id, labels });
 }
 
-/** Fork a builtin/global skill to personal or skill space scope (server-side content copy) */
+/** Fork a skill to personal or skill space scope (server-side content copy) */
 export async function rpcForkSkill(
     sendRpc: RpcSendFn,
     sourceId: string,
     overrides?: { name?: string; description?: string; type?: string; specs?: string; scripts?: Array<{ name: string; content?: string }>; targetSkillSpaceId?: string; workspaceId?: string },
 ): Promise<{ id: string; dirName: string; name: string; forkedFromId: string; skillSpaceId?: string }> {
     return sendRpc('skill.fork', { sourceId, ...overrides });
+}
+
+/** Batch fork builtin/global skills to a skill space */
+export async function rpcBatchForkToSkillSpace(
+    sendRpc: RpcSendFn,
+    sourceIds: string[],
+    targetSkillSpaceId: string,
+    workspaceId?: string,
+): Promise<{ status: string; results: Array<{ sourceId: string; id: string; name: string }> }> {
+    return sendRpc('skill.fork', { sourceIds, targetSkillSpaceId, workspaceId });
 }
 
 /** @deprecated Use rpcForkSkill instead */
@@ -290,6 +323,7 @@ export interface SkillSpace {
     name: string;
     description?: string;
     ownerId: string;
+    enabled?: boolean; // may be undefined from old DBs without the column
     memberRole?: string;
     createdAt: string;
     updatedAt: string;
@@ -317,6 +351,10 @@ export async function rpcGetSkillSpace(sendRpc: RpcSendFn, workspaceId: string, 
     return sendRpc('skillSpace.get', { workspaceId, id });
 }
 
+export async function rpcSetSkillSpaceEnabled(sendRpc: RpcSendFn, skillSpaceId: string, enabled: boolean): Promise<{ skillSpaceId: string; enabled: boolean }> {
+    return sendRpc('skillSpace.setEnabled', { skillSpaceId, enabled });
+}
+
 export async function rpcUpdateSkillSpace(sendRpc: RpcSendFn, workspaceId: string, id: string, updates: { name?: string; description?: string }): Promise<{ status: string }> {
     return sendRpc('skillSpace.update', { workspaceId, id, ...updates });
 }
@@ -337,11 +375,60 @@ export async function rpcListSkillSpaceMembers(sendRpc: RpcSendFn, workspaceId: 
     return sendRpc('skillSpace.listMembers', { workspaceId, skillSpaceId });
 }
 
-/** Move a personal skill into a skill space */
-export async function rpcMoveSkillToSpace(sendRpc: RpcSendFn, skillId: string, targetSkillSpaceId: string, workspaceId?: string): Promise<{ status: string }> {
-    return sendRpc('skill.moveToSpace', { skillId, targetSkillSpaceId, workspaceId });
+/** Preview diff before forking a skill into a skill space */
+export async function rpcForkDiff(sendRpc: RpcSendFn, skillId: string, skillSpaceId: string, workspaceId?: string): Promise<{
+    isNew: boolean;
+    sourceName: string;
+    targetName?: string;
+    specsChanged?: boolean;
+    diffText: string | null;
+    addedScripts?: string[];
+    removedScripts?: string[];
+    changedScripts?: string[];
+    unchanged?: boolean;
+}> {
+    return sendRpc('skill.forkDiff', { skillId, skillSpaceId, workspaceId });
 }
 
+
+/** Publish a skillset skill's working copy (no approval needed) */
+export async function rpcPublishInSpace(sendRpc: RpcSendFn, skillId: string, message?: string, workspaceId?: string): Promise<{ status: string; version: number }> {
+    return sendRpc('skill.publishInSpace', { id: skillId, message, workspaceId });
+}
+
+/** Move a personal skill into a skill space (destructive — removes from personal) */
+export async function rpcMoveToSpace(sendRpc: RpcSendFn, skillId: string, skillSpaceId: string, workspaceId?: string): Promise<{ status: string; skillId: string }> {
+    return sendRpc('skill.moveToSpace', { id: skillId, skillSpaceId, workspaceId });
+}
+
+export interface PreviewDiffResult {
+    action: string; fromLabel: string; toLabel: string; hasChanges: boolean; isNew: boolean;
+    specsDiff: string | null;
+    scriptDiffs: Array<{ name: string; status: 'added' | 'removed' | 'changed' | 'unchanged'; diff?: string }>;
+    metadataChanges: Array<{ field: string; from: string | null; to: string | null; fromLabels?: string[]; toLabels?: string[] }>;
+}
+
+export async function rpcPreviewDiff(sendRpc: RpcSendFn, id: string, action: 'publish' | 'submit' | 'contribute'): Promise<PreviewDiffResult> {
+    return sendRpc('skill.previewDiff', { id, action });
+}
+
+export async function rpcExportSkills(sendRpc: RpcSendFn, ids: string[]): Promise<{ filename: string; data: string; size: number }> {
+    return sendRpc('skill.export', { ids });
+}
+
+export async function downloadSkillExport(sendRpc: RpcSendFn, ids: string[]) {
+    const result = await rpcExportSkills(sendRpc, ids);
+    const binary = atob(result.data);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: 'application/gzip' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = result.filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
 
 export async function rpcGetSkillSystemCapabilities(sendRpc: RpcSendFn, workspaceId?: string): Promise<SkillSystemCapabilities> {
     return sendRpc('system.capabilities', workspaceId ? { workspaceId } : {});

@@ -11,8 +11,7 @@
  * The engine retries conclusion generation at most once on failure.
  */
 
-import { llmCompleteWithTool } from "../../../shared/llm-utils.js";
-import type { SubAgentOptions } from "./sub-agent.js";
+import { llmCompleteWithTool, type SubAgentOptions } from "./sub-agent.js";
 import { VALIDATION_SCHEMA } from "./schemas.js";
 import type { ConclusionResult, HypothesisNode } from "./types.js";
 
