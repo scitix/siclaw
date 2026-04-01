@@ -353,7 +353,8 @@ export async function createSiclawSession(
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir];
+  const knowledgeDir = path.resolve(cwd, config.paths.knowledgeDir);
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
