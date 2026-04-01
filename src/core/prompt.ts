@@ -2,6 +2,7 @@ const MODE_LABELS: Record<string, string> = {
   cli: "TUI",
   web: "Web UI",
   channel: "channel",
+  cron: "automated task",
 };
 
 /**
@@ -18,7 +19,7 @@ const MODE_LABELS: Record<string, string> = {
  * Safety and Language sections are hardcoded and always appended — they cannot
  * be overridden by workspace templates.
  */
-export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel", templateOverride?: string): string {
+export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "cron", templateOverride?: string): string {
   const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
 
   const modeLabel = MODE_LABELS[mode ?? "cli"] ?? "Web UI";
@@ -39,11 +40,31 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel", templateO
   // Unwrap the matching mode block (keep content, remove markers)
   prompt = prompt.replace(new RegExp(`<!-- ${keepMode}-only -->([\\s\\S]*?)<!-- /${keepMode}-only -->`, "g"), "$1");
 
+  // Append cron-specific section for automated task mode
+  if (mode === "cron") {
+    prompt += CRON_SECTION;
+  }
+
   // Append hardcoded safety section — NOT overridable by workspace templates
   prompt += SAFETY_SECTION(credentialsPath);
 
   return prompt;
 }
+
+// ---------------------------------------------------------------------------
+// Cron section — appended only in automated task (cron) mode
+// ---------------------------------------------------------------------------
+const CRON_SECTION = `
+
+## Automated Task Mode
+
+This is a NON-INTERACTIVE scheduled task. There is no user present.
+
+- Do NOT ask questions or request confirmations — execute the task directly.
+- If multiple environments or credentials are available, operate on ALL of them unless the task specifies a target.
+- **Fail fast**: If a tool fails with the same error on 2 consecutive attempts, STOP using that tool. Switch approach or report the failure.
+- **Budget awareness**: You have a 5-minute time limit. Prefer lightweight commands (kubectl, bash) over heavy tools (node_exec, node_script) when possible. If a referenced skill does not exist, fall back to simple kubectl commands.
+- After completing your investigation, you MUST call the \`task_report\` tool with a structured summary of your findings. This is the ONLY output recorded and sent to the user. Even if all checks failed, call \`task_report\` to report the failures.`;
 
 // ---------------------------------------------------------------------------
 // Safety section — hardcoded, always appended, cannot be overridden
@@ -78,7 +99,7 @@ const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help 
   4. Ask the user for direction.
   Never pretend you found an answer when you didn't.
 - **Trust your tools**: Definitive tool result? Trust it. Don't retry or switch tools hoping for different output.
-<!-- web-only -->- **Skill management**: Use \`update_skill\` to modify existing skills, \`create_skill\` only for brand-new ones. Before \`update_skill\`, identify the exact target skill name — pass original name as \`id\`. The scripts array must be the COMPLETE set — unlisted scripts are deleted.
+<!-- web-only -->- **Skill management**: Skill creation/editing tools are NOT available in conversations. Skills are managed via the Skills UI page — tell the user to go there.
 <!-- /web-only --><!-- cli-only -->- **Skill management**: Skill creation tools are NOT available in this mode. You may draft skills at \`.siclaw/user-data/skill-drafts/<name>/\` (SKILL.md + scripts/). Make clear: drafts are NOT active and must be manually copied to activate — never to \`skills/core/\`. For full management, use the Web UI.
 <!-- /cli-only -->- **Response discipline**: Be precise (use filters, avoid full dumps), be actionable (every response must call a tool or give a conclusion), be concise (no filler like "anything else?"). When user only asks to list resources, summarize and ask which to investigate further.
 

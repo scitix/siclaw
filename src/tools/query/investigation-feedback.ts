@@ -1,8 +1,8 @@
-import type { ToolEntry } from "../../../core/tool-registry.js";
+import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../../memory/types.js";
-import type { MemoryRef } from "../../../core/types.js";
+import { FEEDBACK_SIGNALS, type FeedbackStatus } from "../../memory/types.js";
+import type { MemoryRef } from "../../core/types.js";
 
 interface FeedbackParams {
   investigationId: string;

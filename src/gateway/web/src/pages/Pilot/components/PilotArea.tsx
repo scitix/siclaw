@@ -1,9 +1,8 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, Pencil, BookOpen, SearchCode, CheckCircle2, XCircle, Ban } from 'lucide-react';
+import { Terminal, User, Cpu, Wifi, WifiOff, Loader2, ChevronRight, FileCode, SearchCode, CheckCircle2, XCircle, Ban } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Markdown } from '@/components/Markdown';
 import { InputArea } from './InputArea';
-import { SkillCard, type SkillRefStatus } from './SkillCard';
 import { ScheduleCard, type ScheduleCardStatus } from './ScheduleCard';
 import { InvestigationCard } from './InvestigationCard';
 import { HypothesesCard } from './HypothesesCard';
@@ -22,8 +21,6 @@ import { DpChecklistCard, type DpChecklistItem } from './DpChecklistCard';
 import { WelcomeArea } from './WelcomeArea';
 import type { PilotMessage, ContextUsage, InvestigationProgress, SystemStatus } from '@/hooks/usePilot';
 import type { WsStatus } from '@/hooks/useWebSocket';
-import type { Skill } from '@/pages/Skills/skillsData';
-import { isSkillTool } from '../constants';
 
 type RpcSendFn = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>;
 
@@ -41,14 +38,7 @@ export interface PilotAreaProps {
     sendRpc?: RpcSendFn;
     contextUsage?: ContextUsage | null;
     isCompacting?: boolean;
-    skills?: Skill[];
-    editingSkill?: { id: string; name: string } | null;
-    onEditSkill?: (id: string, name: string) => void;
-    onClearEditSkill?: () => void;
-    onSkillSaved?: () => void;
-    onOpenSkillPanel?: (msg: PilotMessage) => void;
     onOpenSchedulePanel?: (msg: PilotMessage) => void;
-    panelMessage?: PilotMessage | null;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     pendingMessages?: string[];
     onRemovePending?: (index: number) => void;
@@ -67,57 +57,6 @@ export interface PilotAreaProps {
     /** Current workspace ID for cron job operations */
     selectedWorkspaceId?: string | null;
     isAdmin?: boolean;
-}
-
-/** Compute superseded status for skill messages */
-function computeSkillStatuses(messages: PilotMessage[]): Map<string, SkillRefStatus> {
-    const statuses = new Map<string, SkillRefStatus>();
-
-    // Group skill messages by skill identifier (skillId or skill name)
-    const skillGroups = new Map<string, string[]>(); // skillKey -> [messageId, ...]
-
-    for (const msg of messages) {
-        if (msg.role !== 'tool') continue;
-        if (!isSkillTool(msg.toolName)) continue;
-
-        let parsed: { skill?: { name: string }; skillId?: string } | null = null;
-        try { parsed = JSON.parse(msg.content); } catch { continue; }
-        if (!parsed?.skill) continue;
-
-        const key = parsed.skillId || parsed.skill.name;
-        if (!skillGroups.has(key)) skillGroups.set(key, []);
-        skillGroups.get(key)!.push(msg.id);
-
-        // Determine status from metadata
-        const meta = msg.metadata as Record<string, unknown> | undefined;
-        if (meta?.skillCard === 'saved') {
-            statuses.set(msg.id, 'saved');
-        } else if (meta?.skillCard === 'dismissed') {
-            statuses.set(msg.id, 'dismissed');
-        } else {
-            statuses.set(msg.id, 'pending');
-        }
-    }
-
-    // Mark superseded: in each group, only the latest unsaved/undismissed message is active
-    for (const [, msgIds] of skillGroups) {
-        // Find the latest pending message
-        let latestPendingIdx = -1;
-        for (let i = msgIds.length - 1; i >= 0; i--) {
-            if (statuses.get(msgIds[i]) === 'pending') {
-                latestPendingIdx = i;
-                break;
-            }
-        }
-        // Mark all other pending messages as superseded
-        for (let i = 0; i < msgIds.length; i++) {
-            if (statuses.get(msgIds[i]) === 'pending' && i !== latestPendingIdx) {
-                statuses.set(msgIds[i], 'superseded');
-            }
-        }
-    }
-
-    return statuses;
 }
 
 /** Compute superseded status for schedule messages */
@@ -166,7 +105,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, skills, editingSkill, onEditSkill, onClearEditSkill, onSkillSaved, onOpenSkillPanel, onOpenSchedulePanel, panelMessage, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, onOpenSchedulePanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -231,8 +170,6 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
         });
     }, []);
 
-    // Compute skill/schedule statuses for superseded preprocessing
-    const skillStatuses = useMemo(() => computeSkillStatuses(messages), [messages]);
     const scheduleStatuses = useMemo(() => computeScheduleStatuses(messages), [messages]);
 
     // Find the latest propose_hypotheses message (older ones will be rendered as superseded)
@@ -508,16 +445,9 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     key={msg.id}
                                     message={msg}
                                     sendRpc={sendRpc}
-                                    skills={skills}
-                                    editingSkill={editingSkill}
-                                    onEditSkill={onEditSkill}
-                                    onSkillSaved={onSkillSaved}
-                                    skillStatus={skillStatuses.get(msg.id)}
                                     scheduleStatus={scheduleStatuses.get(msg.id)}
-                                    onOpenSkillPanel={onOpenSkillPanel}
                                     onOpenSchedulePanel={onOpenSchedulePanel}
                                     updateMessageMeta={updateMessageMeta}
-                                    isInPanel={panelMessage?.id === msg.id}
                                     investigationProgress={investigationProgress}
                                     sendMessage={sendMessage}
                                     dpFocus={dpFocus}
@@ -581,7 +511,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     </div>
                 </div>
             )}
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} editingSkill={editingSkill} onClearEditSkill={onClearEditSkill} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
+            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
 }
@@ -714,16 +644,10 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
-function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus, onOpenSkillPanel, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
+function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
-    skills?: Skill[];
-    editingSkill?: { id: string; name: string } | null;
-    onEditSkill?: (id: string, name: string) => void;
-    onSkillSaved?: () => void;
-    skillStatus?: SkillRefStatus;
     scheduleStatus?: ScheduleCardStatus;
-    onOpenSkillPanel?: (msg: PilotMessage) => void;
     onOpenSchedulePanel?: (msg: PilotMessage) => void;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
     isInPanel?: boolean;
@@ -745,15 +669,6 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     const isTool = message.role === 'tool';
 
     if (isTool) {
-        if (isSkillTool(message.toolName) && !message.isStreaming) {
-            return (
-                <SkillCard
-                    message={message}
-                    status={skillStatus ?? 'pending'}
-                    onOpenPanel={onOpenSkillPanel}
-                />
-            );
-        }
         if (message.toolName === 'manage_schedule' && !message.isStreaming) {
             return <ScheduleCard message={message} status={scheduleStatus ?? 'pending'} onOpenPanel={onOpenSchedulePanel} sendRpc={sendRpc} updateMessageMeta={updateMessageMeta} selectedWorkspaceId={selectedWorkspaceId} />;
         }
@@ -769,7 +684,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
         if (message.toolName === 'propose_hypotheses' && !message.isStreaming) {
             return <HypothesesCard message={message} sendMessage={sendMessage} onHypothesesConfirmed={onHypothesesConfirmed} superseded={hypothesesSuperseded} alreadyConfirmed={hypothesesAlreadyConfirmed} />;
         }
-        return <ToolItem message={message} skills={skills} onEditSkill={onEditSkill} />;
+        return <ToolItem message={message} />;
     }
 
     // Parse references from user messages
@@ -840,7 +755,7 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
                         )}
                         {skillName && (
                             <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-indigo-50 border border-indigo-200 text-xs font-medium text-indigo-700">
-                                <BookOpen className="w-3.5 h-3.5 text-indigo-500" />
+                                <FileCode className="w-3.5 h-3.5 text-indigo-500" />
                                 <span>{skillName}</span>
                             </div>
                         )}
@@ -889,20 +804,9 @@ function MessageItem({ message, skills, onEditSkill, skillStatus, scheduleStatus
     );
 }
 
-function ToolItem({ message, skills, onEditSkill }: { message: PilotMessage; skills?: Skill[]; onEditSkill?: (id: string, name: string) => void }) {
+function ToolItem({ message }: { message: PilotMessage }) {
     const [expanded, setExpanded] = useState(false);
-    // Auto-expand while streaming
     const isOpen = message.isStreaming || expanded;
-
-    // Check if this is a local_script call with an editable (personal) skill
-    const editableSkill = (() => {
-        if (message.toolName !== 'local_script' || !skills || !onEditSkill) return null;
-        const skillName = message.toolInput;
-        if (!skillName) return null;
-        return skills.find(s =>
-            s.scope === 'personal' && (s.name === skillName || (s as any).dirName === skillName)
-        ) ?? null;
-    })();
 
     return (
         <div className="pl-12 min-w-0">
@@ -932,18 +836,6 @@ function ToolItem({ message, skills, onEditSkill }: { message: PilotMessage; ski
                     )}
                     {message.toolStatus === 'aborted' && (
                         <Ban className="w-3.5 h-3.5 text-amber-500 ml-auto shrink-0" />
-                    )}
-                    {editableSkill && !message.isStreaming && (
-                        <span
-                            className="ml-auto shrink-0 p-1 rounded hover:bg-indigo-100 text-gray-400 hover:text-indigo-600 transition-colors"
-                            title="Edit this skill"
-                            onClick={(e) => {
-                                e.stopPropagation();
-                                onEditSkill!(String(editableSkill.id), editableSkill.name);
-                            }}
-                        >
-                            <Pencil className="w-3.5 h-3.5" />
-                        </span>
                     )}
                 </button>
                 {isOpen && (

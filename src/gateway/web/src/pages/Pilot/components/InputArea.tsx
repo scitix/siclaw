@@ -1,4 +1,4 @@
-import { ArrowUp, Square, X, Loader2, BookOpen, SearchCode, MessageSquareHeart, Plus, Check } from 'lucide-react';
+import { ArrowUp, Square, X, Loader2, SearchCode, MessageSquareHeart, Plus, Check } from 'lucide-react';
 import type { ContextUsage } from '@/hooks/usePilot';
 import { useState, useCallback, useRef, useEffect, KeyboardEvent } from 'react';
 import { cn } from '@/lib/utils';
@@ -24,8 +24,6 @@ interface InputAreaProps {
     isLoading?: boolean;
     contextUsage?: ContextUsage | null;
     isCompacting?: boolean;
-    editingSkill?: { id: string; name: string } | null;
-    onClearEditSkill?: () => void;
     pendingMessages?: string[];
     onRemovePending?: (index: number) => void;
     dpFocus?: string | null;
@@ -39,7 +37,7 @@ interface InputAreaProps {
     draftSeq?: number;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, editingSkill, onClearEditSkill, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const isComposingRef = useRef(false);
@@ -79,17 +77,11 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
             fullMessage += '[Deep Investigation]\n';
         }
 
-        // If a skill is selected, prepend a compact reference marker
-        if (editingSkill) {
-            fullMessage += `[Skill: ${editingSkill.name}]\n`;
-        }
-
         fullMessage += text;
 
         onSend(fullMessage.trim());
         setValue('');
-        // Don't clear editingSkill here — keep it for SkillCard to know it's an update
-    }, [value, disabled, onSend, editingSkill, deepInvestigation]);
+    }, [value, disabled, onSend, deepInvestigation]);
 
     const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
         if (e.key === 'Enter' && !e.shiftKey && !isComposingRef.current && !e.nativeEvent.isComposing) {
@@ -167,39 +159,20 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                         </div>
 
                         {/* Mode chips */}
-                        {(deepInvestigation || editingSkill) && (
+                        {deepInvestigation && (
                             <div className="flex flex-wrap gap-2 px-4 pb-1">
-                                {deepInvestigation && (
-                                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-blue-50 border-blue-200 text-blue-700">
-                                        <SearchCode className="w-3.5 h-3.5 text-blue-500" />
-                                        <span>Deep Investigation</span>
-                                        {dpFocus && (
-                                            <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 text-[10px] font-semibold uppercase">
-                                                {dpFocus.replace(/_/g, ' ')}
-                                            </span>
-                                        )}
-                                        <button
-                                            type="button"
-                                            className="ml-0.5 p-0.5 rounded hover:bg-blue-200 transition-colors"
-                                            onClick={() => setDeepInvestigation(false)}
-                                        >
-                                            <X className="w-3 h-3" />
-                                        </button>
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
-                        {/* Skill editing chip */}
-                        {editingSkill && (
-                            <div className="flex flex-wrap gap-2 px-4 pb-1">
-                                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-indigo-50 border-indigo-200 text-indigo-700">
-                                    <BookOpen className="w-3.5 h-3.5 text-indigo-500" />
-                                    <span>{editingSkill.name}</span>
+                                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-blue-50 border-blue-200 text-blue-700">
+                                    <SearchCode className="w-3.5 h-3.5 text-blue-500" />
+                                    <span>Deep Investigation</span>
+                                    {dpFocus && (
+                                        <span className="px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 text-[10px] font-semibold uppercase">
+                                            {dpFocus.replace(/_/g, ' ')}
+                                        </span>
+                                    )}
                                     <button
                                         type="button"
-                                        className="ml-0.5 p-0.5 rounded hover:bg-indigo-200 transition-colors"
-                                        onClick={() => onClearEditSkill?.()}
+                                        className="ml-0.5 p-0.5 rounded hover:bg-blue-200 transition-colors"
+                                        onClick={() => setDeepInvestigation(false)}
                                     >
                                         <X className="w-3 h-3" />
                                     </button>

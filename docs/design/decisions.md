@@ -428,3 +428,30 @@ Cron jobs are bound to a workspace (`cronJobs.workspaceId`). The workspace's `en
 - ⚠️ Memory isolation means investigation insights do not transfer across workspace types — acceptable tradeoff for security
 
 **Revisit when**: Non-kubeconfig credential types (SSH, API) need environment-aware governance. At that point, add `envScope` to `credentials` table or extend the environment template model with endpoint validation anchors (similar to apiServer for K8s).
+
+---
+
+## ADR-012: Unified Command Security Model (COMMANDS + CONTEXT_POLICIES)
+
+**Status**: Active (PR #189, 2026-03-30)
+
+**Context**:
+The command security model was spread across 4 separate data structures (`ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`, `COMMAND_RULES`, `CUSTOM_VALIDATORS`). Adding a single command required changes to 2-4 places. Per-command constraints were inconsistent — some used `allowedFlags`, others `blockedFlags`, others custom validators, with no clear principle for when to use which.
+
+**Decision**:
+Unify into two structures:
+- `COMMANDS: Record<string, CommandDef>` — one definition per command carrying category, declarative constraints, and optional custom validator
+- `CONTEXT_POLICIES: Record<string, ContextPolicy>` — which command categories are available per execution context (local, node, pod), plus context-level constraints (e.g., text commands are pipe-only in local context)
+
+Key design choices:
+- `pipeOnly` / `noFilePaths` became context-level policies, not per-command attributes
+- Complex validators (curl, kubectl) remain as `validate` escape hatches — their logic is too intricate for declarative rules
+- Safety constraints apply everywhere; context filtering is a separate layer
+
+**Consequences**:
+- ✅ Adding a command is now a single `CommandDef` entry
+- ✅ Context availability is orthogonal to command safety — no more duplicated constraints
+- ✅ Easier to audit — one place to see everything about a command
+- ⚠️ Complex validators (12 commands) still need per-command escape hatches
+
+**Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`

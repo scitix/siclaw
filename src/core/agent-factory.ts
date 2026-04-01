@@ -38,14 +38,10 @@ import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
 import type { BrainSession, BrainType } from "./brain-session.js";
 import { hasOpenAIProvider, ensureProxy } from "./llm-proxy.js";
-import { sanitizeToolCallInputs } from "./tool-call-repair.js";
-import { installSessionToolResultGuard } from "./session-tool-result-guard.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
 import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
-import { repairToolUseResultPairing } from "./compaction.js";
-import { installToolResultContextGuard } from "./tool-result-context-guard.js";
-import { wrapStreamFnTrimToolCallNames, wrapStreamFnRepairMalformedToolCallArguments } from "./stream-wrappers.js";
+import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
@@ -409,67 +405,29 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directories (three fixed sources):
-  // 1. Builtin core: baked into Docker image at /app/skills/core/
-  // 2. Builtin extension: baked into Docker image at /app/skills/extension/
-  // 3. Dynamic: global + personal written by bundle API to skillsBase (.siclaw/skills/)
+  // Skill directory: single "resolved/" directory built by materialize (K8s)
+  // or syncSkills (local). Contains all skills flattened with priority:
+  //   personal > skillset > global > builtin (symlinked)
+  // Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
+  // K8s mode: {skillsBase}/resolved/
+  const resolvedSkillsDir = opts?.userId
+    ? path.join(skillsBase, "user", opts.userId, "resolved")
+    : path.join(skillsBase, "resolved");
+
+  // Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
+  // use builtin directories directly.
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
 
-  // Read disabled builtins list (written by agentbox-main / local-spawner after bundle fetch)
-  let disabledBuiltins: Set<string> | undefined;
-  // Local mode writes .disabled-builtins.json into per-user dir; K8s mode writes to skillsBase root
-  const disabledFile = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId, ".disabled-builtins.json")
-    : path.join(skillsBase, ".disabled-builtins.json");
-  try {
-    if (fs.existsSync(disabledFile)) {
-      const list: string[] = JSON.parse(fs.readFileSync(disabledFile, "utf-8"));
-      if (list.length > 0) {
-        disabledBuiltins = new Set(list);
-        console.log(`[agent-factory] Disabled builtins: ${list.join(", ")}`);
-      }
-    }
-  } catch { /* ignore malformed file */ }
-
-  // If there are disabled builtins, enumerate individual skill dirs excluding disabled ones;
-  // otherwise pass the whole builtin directory.
-  // Both core/ and extension/ are scanned as builtin sources.
-  let builtinPaths: string[] = [];
-  for (const bDir of [builtinPath, extensionPath]) {
-    if (!fs.existsSync(bDir)) continue;
-    if (disabledBuiltins) {
-      for (const entry of fs.readdirSync(bDir, { withFileTypes: true })) {
-        if (entry.isDirectory() && !disabledBuiltins.has(entry.name)) {
-          builtinPaths.push(path.join(bDir, entry.name));
-        }
-      }
-    } else {
-      builtinPaths.push(bDir);
+  const skillsDirs: string[] = [];
+  if (fs.existsSync(resolvedSkillsDir)) {
+    skillsDirs.push(resolvedSkillsDir);
+  } else {
+    // Pre-materialize fallback: load builtins directly
+    for (const bDir of [builtinPath, extensionPath]) {
+      if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
   }
-
-  // Priority: personal > skillset > builtin — higher-specificity scopes first.
-  // Local mode: scan per-user dir only (avoids loading other users' skills).
-  // K8s mode: scan skillsBase flat (single-user pod).
-  const dynamicSkillBase = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId)
-    : skillsBase;
-
-  // Enumerate skillset directories (skillset/{setId}/) for skill resolution
-  const skillsetBase = path.join(skillsBase, "skillset");
-  const skillsetDirs: string[] = [];
-  if (fs.existsSync(skillsetBase)) {
-    try {
-      for (const entry of fs.readdirSync(skillsetBase, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          skillsetDirs.push(path.join(skillsetBase, entry.name));
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  const skillsDirs = [dynamicSkillBase, ...skillsetDirs, ...builtinPaths];
 
   // Resolve credentials directory for tools and /setup extension
   const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
@@ -581,9 +539,6 @@ export async function createSiclawSession(
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());
 
-  // Install write-time guard: sanitize malformed tool calls and track pending tool results
-  installSessionToolResultGuard(sessionManager);
-
   // Resolve the initial model: prefer the user's configured default over pi-agent's built-in
   const configuredModel = defaultLlm
     ? modelRegistry.find(
@@ -612,50 +567,10 @@ export async function createSiclawSession(
   // then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
-  // ── Input streamFn wrappers (modify context.messages before API call) ──
-
-  // 1. Sanitize malformed tool calls (drop incomplete blocks)
-  {
-    const inner = session.agent.streamFn;
-    session.agent.streamFn = (model: any, context: any, options: any) => {
-      const messages = context?.messages;
-      if (!Array.isArray(messages)) {
-        return inner(model, context, options);
-      }
-      const sanitized = sanitizeToolCallInputs(messages);
-      if (sanitized === messages) {
-        return inner(model, context, options);
-      }
-      console.log("[agent-factory] Repaired malformed tool calls in outbound request");
-      return inner(model, { ...context, messages: sanitized }, options);
-    };
-  }
-
-  // 2. Repair tool use/result pairing (fix orphaned tool results)
-  {
-    const inner = session.agent.streamFn;
-    session.agent.streamFn = (model: any, context: any, options: any) => {
-      const messages = context?.messages;
-      if (!Array.isArray(messages)) return inner(model, context, options);
-      const { messages: repaired } = repairToolUseResultPairing(messages);
-      if (repaired === messages) return inner(model, context, options);
-      return inner(model, { ...context, messages: repaired }, options);
-    };
-  }
-
-  // ── Output streamFn wrappers (modify stream response events) ──
-
-  // 3. Trim whitespace from tool call names + assign fallback IDs
-  session.agent.streamFn = wrapStreamFnTrimToolCallNames(session.agent.streamFn);
-
-  // 4. Repair malformed JSON in tool call arguments
-  session.agent.streamFn = wrapStreamFnRepairMalformedToolCallArguments(session.agent.streamFn);
-
-  // ── Context transform wrapper ──
-
-  // 5. Tool result context guard (truncate/compact oversized tool results)
+  // ── Guard pipeline: unified guard registration and installation ──
   const contextWindow = configuredModel?.contextWindow ?? 128_000;
-  installToolResultContextGuard({ agent: session.agent, contextWindowTokens: contextWindow });
+  const guardRegistry = createGuardRegistry(contextWindow);
+  installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
   return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
