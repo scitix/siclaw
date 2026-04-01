@@ -64,8 +64,9 @@ Parameters:
 - schedule: standard 5-field cron expression (min hour dom month dow)
 - status: "active" or "paused"
 
+IMPORTANT: Minimum schedule interval is 60 minutes. Schedules more frequent than hourly will be rejected. Do NOT attempt intervals shorter than 60 minutes.
+
 Common cron patterns:
-- Every minute: * * * * *
 - Every hour: 0 * * * *
 - Daily at 9am: 0 9 * * *
 - Weekdays at 9am: 0 9 * * 1-5
@@ -215,13 +216,13 @@ Common cron patterns:
       try {
         parseCronExpression(params.schedule.trim());
         const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+        const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
+        if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
+          throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+        }
         if (min < CRON_LIMITS.ABSOLUTE_MIN_GAP_MS) {
           const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
-          throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes`);
-        }
-        if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
-          const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
-          throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
+          throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes (average interval must be at least ${limitMin} minutes)`);
         }
       } catch (err) {
         return {
