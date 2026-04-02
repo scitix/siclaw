@@ -1,6 +1,7 @@
 import { SessionList } from './components/SessionList';
 import { PilotArea } from './components/PilotArea';
 import { SchedulePanel } from './components/SchedulePanel';
+import { SkillPanel } from './components/SkillPanel';
 import { History, X, Plus } from 'lucide-react';
 import { useState, useCallback, useEffect } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
@@ -33,6 +34,10 @@ export function PilotPage() {
     }, []);
 
     const handleOpenSchedulePanel = useCallback((msg: PilotMessage) => {
+        setPanelMessage(msg);
+    }, []);
+
+    const handleOpenSkillPanel = useCallback((msg: PilotMessage) => {
         setPanelMessage(msg);
     }, []);
 
@@ -147,6 +152,7 @@ export function PilotPage() {
                         contextUsage={pilot.contextUsage}
                         isCompacting={pilot.isCompacting}
                         onOpenSchedulePanel={handleOpenSchedulePanel}
+                        onOpenSkillPanel={handleOpenSkillPanel}
                         selectedWorkspaceId={currentWorkspace?.id ?? null}
                         updateMessageMeta={pilot.updateMessageMeta}
                         pendingMessages={pilot.pendingMessages}
@@ -167,7 +173,7 @@ export function PilotPage() {
                 </div>
             </div>
 
-            {/* 3. Panel (Right Side) — Schedule */}
+            {/* 3. Panel (Right Side) — Schedule / Skill Preview */}
             {panelMessage && panelMessage.toolName === 'manage_schedule' && (
                 <SchedulePanel
                     message={panelMessage}
@@ -177,6 +183,12 @@ export function PilotPage() {
                     onClose={() => setPanelMessage(null)}
                     updateMessageMeta={pilot.updateMessageMeta}
                     selectedWorkspaceId={currentWorkspace?.id ?? null}
+                />
+            )}
+            {panelMessage && panelMessage.toolName === 'skill_preview' && (
+                <SkillPanel
+                    message={panelMessage}
+                    onClose={() => setPanelMessage(null)}
                 />
             )}
         </div>
