@@ -123,8 +123,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       pendingToolInputs.delete(toolName);
       pendingToolStartTimes.delete(toolName);
 
-      // task_report detection (tool result in tool_execution_end)
-      if (lastToolName === "task_report" && text) {
+      // task_report detection — use toolName from this event, not lastToolName
+      // (lastToolName tracks the last *started* tool, unreliable with parallel calls)
+      if (toolName === "task_report" && text) {
         taskReportText = text;
       }
     }
