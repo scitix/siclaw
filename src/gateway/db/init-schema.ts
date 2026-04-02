@@ -42,6 +42,7 @@ const DDL_STATEMENTS = [
     message_count INT NOT NULL DEFAULT 0,
     deleted_at TIMESTAMP NULL,
     s3_key VARCHAR(500),
+    source VARCHAR(20) NOT NULL DEFAULT 'pilot',
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   )`,
 
@@ -145,6 +146,7 @@ const DDL_STATEMENTS = [
     result_text TEXT,
     error TEXT,
     duration_ms INT,
+    session_id VARCHAR(64),
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
   )`,
@@ -560,6 +562,9 @@ export async function initSchema(db: Database): Promise<void> {
       FOREIGN KEY (user_id) REFERENCES users(id),
       FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
     )`,
+    // ── Cron session reuse ──
+    `ALTER TABLE sessions ADD COLUMN source VARCHAR(20) NOT NULL DEFAULT 'pilot'`,
+    `ALTER TABLE cron_job_runs ADD COLUMN session_id VARCHAR(64)`,
   ];
   for (const stmt of MIGRATIONS) {
     try {

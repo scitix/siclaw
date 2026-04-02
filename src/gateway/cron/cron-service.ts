@@ -10,6 +10,7 @@ import crypto from "node:crypto";
 import { CronScheduler, type CronJobRow } from "../../cron/cron-scheduler.js";
 import type { ConfigRepository } from "../db/repositories/config-repo.js";
 import type { NotificationRepository } from "../db/repositories/notification-repo.js";
+import type { ChatRepository } from "../db/repositories/chat-repo.js";
 import { CRON_LIMITS } from "../../cron/cron-limits.js";
 
 const EXECUTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -29,6 +30,7 @@ export class CronService {
 
   private configRepo: ConfigRepository;
   private notifRepo: NotificationRepository;
+  private chatRepo: ChatRepository;
   private sendToUser: SendToUserFn;
   private gatewayPort: number;
   private staleLockTimer: NodeJS.Timeout | null = null;
@@ -38,11 +40,13 @@ export class CronService {
   constructor(opts: {
     configRepo: ConfigRepository;
     notifRepo: NotificationRepository;
+    chatRepo: ChatRepository;
     sendToUser: SendToUserFn;
     gatewayPort: number;
   }) {
     this.configRepo = opts.configRepo;
     this.notifRepo = opts.notifRepo;
+    this.chatRepo = opts.chatRepo;
     this.sendToUser = opts.sendToUser;
     this.gatewayPort = opts.gatewayPort;
     this.scheduler = new CronScheduler((job) => this.execute(job));
@@ -109,9 +113,26 @@ export class CronService {
     const workspaceId = current.workspaceId ?? undefined;
     console.log(`[cron-service] Executing job ${job.id} (${job.name}) for user ${job.userId}${workspaceId ? ` ws=${workspaceId}` : ""}`);
 
+    // Fresh session per execution — avoids compaction edge cases and JSONL growth
+    let sessionId: string | undefined;
     try {
-      const sessionId = `cron-${job.id}-${Date.now()}`;
+      const cronSession = await this.chatRepo.createSession(
+        current.userId,
+        `Cron: ${current.name}`,
+        workspaceId,
+        "cron",
+      );
+      sessionId = cronSession.id;
+
       const prompt = buildCronPrompt(current);
+
+      // Persist user message
+      await this.chatRepo.appendMessage({
+        sessionId,
+        role: "user",
+        content: prompt,
+      });
+      await this.chatRepo.incrementMessageCount(sessionId);
 
       const resp = await fetch(`http://localhost:${this.gatewayPort}/api/internal/agent-prompt`, {
         method: "POST",
@@ -123,6 +144,7 @@ export class CronService {
           timeoutMs: EXECUTION_TIMEOUT_MS,
           caller: "cron",
           workspaceId,
+          persistToDb: true,
         }),
         signal: AbortSignal.timeout(EXECUTION_TIMEOUT_MS + 10_000),
       });
@@ -144,13 +166,13 @@ export class CronService {
       console.log(`[cron-service] Job ${job.id} completed in ${data.durationMs}ms, resultText length=${resultText.length}`);
 
       // Write run record + notification
-      await this.recordResult(job, "success", resultText, undefined, data.durationMs);
+      await this.recordResult(job, "success", resultText, undefined, data.durationMs, sessionId);
     } catch (err) {
       console.error(`[cron-service] Job ${job.id} failed:`, err);
       try { await this.configRepo.updateCronJobRun(job.id, "failure"); } catch (e) {
         console.warn(`[cron-service] updateCronJobRun failed for ${job.id}:`, e instanceof Error ? e.message : e);
       }
-      await this.recordResult(job, "failure", "", err instanceof Error ? err.message : String(err));
+      await this.recordResult(job, "failure", "", err instanceof Error ? err.message : String(err), undefined, sessionId);
     } finally {
       try {
         await this.configRepo.unlockJob(job.id, executionId);
@@ -167,6 +189,7 @@ export class CronService {
     resultText: string,
     error?: string,
     durationMs?: number,
+    sessionId?: string,
   ): Promise<void> {
     // Persist run record
     try {
@@ -176,9 +199,10 @@ export class CronService {
         resultText: resultText || undefined,
         error,
         durationMs,
+        sessionId,
       });
     } catch (runErr) {
-      console.warn("[cron-service] Failed to insert cron run:", runErr instanceof Error ? runErr.message : runErr);
+      console.warn(`[cron-service] Failed to insert cron run (sessionId=${sessionId}):`, runErr instanceof Error ? runErr.message : runErr);
     }
 
     // Create notification

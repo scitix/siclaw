@@ -159,6 +159,7 @@ export class ConfigRepository {
     resultText?: string;
     error?: string;
     durationMs?: number;
+    sessionId?: string;
   }): Promise<string> {
     const id = crypto.randomUUID();
     await this.db.insert(cronJobRuns).values({
@@ -168,6 +169,7 @@ export class ConfigRepository {
       resultText: params.resultText ?? null,
       error: params.error ?? null,
       durationMs: params.durationMs ?? null,
+      sessionId: params.sessionId ?? null,
     });
     return id;
   }

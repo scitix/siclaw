@@ -52,6 +52,7 @@ export const sessions = sqliteTable("sessions", {
   lastActiveAt: integer("last_active_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
   messageCount: integer("message_count").notNull().default(0),
   deletedAt: integer("deleted_at", { mode: "timestamp" }),
+  source: text("source").notNull().default("pilot"), // "pilot" | "cron"
 });
 
 // ─── Messages ────────────────────────────────────────
@@ -204,6 +205,7 @@ export const cronJobRuns = sqliteTable("cron_job_runs", {
   resultText: text("result_text"),
   error: text("error"),
   durationMs: integer("duration_ms"),
+  sessionId: text("session_id"),
   createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(unixepoch())`),
 });
 

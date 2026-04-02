@@ -56,6 +56,7 @@ export const sessions = mysqlTable("sessions", {
   lastActiveAt: timestamp("last_active_at").notNull().defaultNow(),
   messageCount: int("message_count").notNull().default(0),
   deletedAt: timestamp("deleted_at"),
+  source: varchar("source", { length: 20 }).notNull().default("pilot"), // "pilot" | "cron"
 });
 
 // ─── Messages ────────────────────────────────────────
@@ -216,6 +217,7 @@ export const cronJobRuns = mysqlTable("cron_job_runs", {
   resultText: text("result_text"),
   error: text("error"),
   durationMs: int("duration_ms"),
+  sessionId: varchar("session_id", { length: 64 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 

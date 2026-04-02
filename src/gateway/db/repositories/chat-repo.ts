@@ -11,7 +11,7 @@ export class ChatRepository {
   constructor(private db: Database) {}
 
   async listSessions(userId: string, limit = 20, workspaceId?: string) {
-    const conditions = [eq(sessions.userId, userId), isNull(sessions.deletedAt)];
+    const conditions = [eq(sessions.userId, userId), isNull(sessions.deletedAt), eq(sessions.source, "pilot")];
     if (workspaceId) {
       conditions.push(eq(sessions.workspaceId, workspaceId));
     }
@@ -32,7 +32,7 @@ export class ChatRepository {
     return rows[0] ?? null;
   }
 
-  async createSession(userId: string, title?: string, workspaceId?: string) {
+  async createSession(userId: string, title?: string, workspaceId?: string, source: "pilot" | "cron" = "pilot") {
     const id = crypto.randomUUID();
     await this.db.insert(sessions).values({
       id,
@@ -41,6 +41,7 @@ export class ChatRepository {
       title: title ?? "New Chat",
       preview: "",
       messageCount: 0,
+      source,
     });
     return { id, title: title ?? "New Chat" };
   }
