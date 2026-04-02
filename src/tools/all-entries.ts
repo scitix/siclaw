@@ -28,9 +28,9 @@ import { registration as deepSearch } from "./workflow/deep-search/tool.js";
 import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
-// Skill management tools disabled — managed via Skills UI
+import { registration as skillPreview } from "./workflow/skill-preview.js";
 
-// Total: 17 entries
+// Total: 18 entries
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
   nodeExec, podExec, restrictedBash,
@@ -40,5 +40,5 @@ export const allToolEntries: ToolEntry[] = [
   investigationFeedback, credentialList, clusterInfo,
   knowledgeSearch, resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
-  deepSearch, saveFeedback, manageSchedule, taskReport,
+  deepSearch, saveFeedback, manageSchedule, taskReport, skillPreview,
 ];

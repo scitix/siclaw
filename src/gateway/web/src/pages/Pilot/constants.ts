@@ -1,5 +1,5 @@
 /** Tool names that produce skill cards / panels in the Pilot UI. */
-export const SKILL_TOOL_NAMES = new Set(['create_skill', 'update_skill', 'fork_skill']);
+export const SKILL_TOOL_NAMES = new Set(['skill_preview']);
 
 /** Check if a toolName is a skill tool. */
 export function isSkillTool(toolName: string | undefined): boolean {
