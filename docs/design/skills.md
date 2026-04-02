@@ -9,7 +9,7 @@
 5. **Submit and Contribute are independent**: two separate approval flows, each with its own staging tag, review handler, and withdraw operation.
 6. **No cross-origin name collisions**: skills with the same name but different `originId` are rejected at all entry points (create, fork, rename, move, contribute). Only fork from the same source is allowed to create a same-name copy.
 7. **Content hash for change detection**: SHA-256 of specs + sorted scripts determines whether content has changed. Used by `canSubmit`, `canContribute`, `hasUnpublishedChanges`, and builtin sync.
-8. **Skill management is UI-only**: conversation tools (`create_skill`, `update_skill`, `fork_skill`) are disabled. Skills are managed via the Skills UI page.
+8. **Skill preview in conversation**: the `skill_preview` tool reads skill draft files from disk and renders a side panel with copy buttons. Agent writes files first via file I/O tools, then calls `skill_preview` with the directory path. Does not persist to DB.
 
 ### The Security-Flexibility Trade-off
 
