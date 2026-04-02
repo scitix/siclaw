@@ -647,6 +647,44 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
     return { replies: [], text: content };
 }
 
+function ThinkingBlock({ thinking, isThinking }: { thinking: string; isThinking?: boolean }) {
+    const [expanded, setExpanded] = useState(true);
+
+    // Auto-collapse when thinking ends and text starts
+    const prevIsThinking = useRef(isThinking);
+    useEffect(() => {
+        if (prevIsThinking.current && !isThinking) {
+            setExpanded(false);
+        }
+        prevIsThinking.current = isThinking;
+    }, [isThinking]);
+
+    return (
+        <div className="max-w-3xl min-w-0">
+            <button
+                type="button"
+                onClick={() => setExpanded(!expanded)}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-600 transition-colors mb-1"
+            >
+                <ChevronRight className={cn("w-3 h-3 transition-transform", expanded && "rotate-90")} />
+                {isThinking ? (
+                    <span className="flex items-center gap-1.5">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Thinking...
+                    </span>
+                ) : (
+                    <span>Thought</span>
+                )}
+            </button>
+            {expanded && (
+                <div className="text-xs text-gray-400 italic leading-relaxed pl-4 border-l-2 border-gray-100 mb-2 max-h-48 overflow-y-auto whitespace-pre-wrap">
+                    {thinking}
+                </div>
+            )}
+        </div>
+    );
+}
+
 function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, onOpenSkillPanel, sendRpc, updateMessageMeta, investigationProgress, sendMessage, dpFocus, dpChecklistActive, onHypothesesConfirmed, hypothesesSuperseded, hypothesesAlreadyConfirmed, selectedWorkspaceId, showSuggestedReplies, onChipClick }: {
     message: PilotMessage;
     sendRpc?: RpcSendFn;
@@ -779,6 +817,10 @@ function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, onOpenSkill
                             </div>
                         ))}
                     </div>
+                )}
+
+                {message.thinking && !isUser && (
+                    <ThinkingBlock thinking={message.thinking} isThinking={message.isThinking} />
                 )}
 
                 {textContent && (

@@ -31,6 +31,10 @@ export interface PilotMessage {
     /** Original ISO timestamp for pagination cursor */
     isoTimestamp?: string;
     isStreaming?: boolean;
+    /** Model reasoning/thinking content (from reasoning models) */
+    thinking?: string;
+    /** Whether thinking content is still being streamed */
+    isThinking?: boolean;
     /** Hidden from chat bubbles (e.g. update_plan tool messages) */
     hidden?: boolean;
 }
@@ -382,13 +386,40 @@ export function usePilot() {
             switch (eventType) {
                 case 'message_update': {
                     const ame = payload.assistantMessageEvent as { type: string; delta?: string } | undefined;
-                    if (ame?.type === 'text_delta' && ame.delta) {
+                    if (ame?.type === 'thinking_delta' && ame.delta) {
                         setMessages(prev => {
                             const last = prev[prev.length - 1];
                             if (last?.isStreaming && last.role === 'assistant') {
                                 return [
                                     ...prev.slice(0, -1),
-                                    { ...last, content: last.content + ame.delta }
+                                    { ...last, thinking: (last.thinking ?? '') + ame.delta, isThinking: true }
+                                ];
+                            }
+                            return [...prev, {
+                                id: `msg-${Date.now()}`,
+                                role: 'assistant' as const,
+                                content: '',
+                                thinking: ame.delta!,
+                                isThinking: true,
+                                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                                isStreaming: true,
+                            }];
+                        });
+                    } else if (ame?.type === 'thinking_end') {
+                        setMessages(prev => {
+                            const last = prev[prev.length - 1];
+                            if (last?.isStreaming && last.role === 'assistant') {
+                                return [...prev.slice(0, -1), { ...last, isThinking: false }];
+                            }
+                            return prev;
+                        });
+                    } else if (ame?.type === 'text_delta' && ame.delta) {
+                        setMessages(prev => {
+                            const last = prev[prev.length - 1];
+                            if (last?.isStreaming && last.role === 'assistant') {
+                                return [
+                                    ...prev.slice(0, -1),
+                                    { ...last, content: last.content + ame.delta, isThinking: false }
                                 ];
                             }
                             return [...prev, {

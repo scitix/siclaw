@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { eq, and, sql, notInArray } from "drizzle-orm";
 import type { Database } from "../index.js";
 import { modelProviders, modelEntries, embeddingConfig } from "../schema.js";
+import { mergeCompat } from "../../../core/model-compat.js";
 
 export class ModelConfigRepository {
   constructor(private db: Database) {}
@@ -448,9 +449,10 @@ export class ModelConfigRepository {
       .where(eq(modelEntries.providerId, prov.id))
       .orderBy(modelEntries.sortOrder);
 
+    const provBaseUrl = prov.baseUrl ?? "";
     return {
       name: prov.name,
-      baseUrl: prov.baseUrl ?? "",
+      baseUrl: provBaseUrl,
       apiKey: prov.apiKey ?? "",
       api: prov.api,
       authHeader: prov.authHeader,
@@ -462,7 +464,11 @@ export class ModelConfigRepository {
         cost: m.costJson ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: m.contextWindow,
         maxTokens: m.maxTokens,
-        compat: (m.compatJson ?? {}) as Record<string, unknown>,
+        compat: mergeCompat(
+          (m.compatJson ?? {}) as Record<string, unknown>,
+          m.modelId,
+          provBaseUrl,
+        ),
       })),
     };
   }
