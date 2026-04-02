@@ -49,6 +49,7 @@ import { CRON_LIMITS } from "../cron/cron-limits.js";
 import { parseCronExpression, getAverageIntervalMs } from "../cron/cron-matcher.js";
 import { buildSkillBundle, type SkillBundle } from "./skills/skill-bundle.js";
 import { buildRedactionConfig, redactText, type RedactionConfig } from "./output-redactor.js";
+import { consumeAgentSse, type SseEvent, type SseEventExtras } from "./sse-consumer.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import type { ResourceNotifier } from "../shared/resource-sync.js";
 import { sql, gte, sum, count } from "drizzle-orm";
@@ -1479,166 +1480,80 @@ export function createRpcMethods(
       ws: context.ws,
     });
 
-    // Async SSE processing
+    // Async SSE processing — DB persistence delegated to shared consumeAgentSse,
+    // pilot-specific logic (WS forwarding, DP tracking) in the onEvent callback.
+    activePromptUsers?.add(userId);
     (async () => {
-      let assistantContent = "";
-      // Map keyed by toolName to handle parallel tool calls correctly
-      const pendingToolInputs = new Map<string, string>();
-      const pendingToolStartTimes = new Map<string, number>();
-      let sseEventCount = 0;
-      const sseStartTime = Date.now();
-      // Mark user as having an active prompt so WS teardown won't kill the pod
-      activePromptUsers?.add(userId);
       try {
-        for await (const event of client.streamEvents(result.sessionId)) {
-          if (abortController.signal.aborted) break;
-
-          const eventData = event as Record<string, unknown>;
-          const eventType = eventData.type as string;
-          sseEventCount++;
-
-          // Only log key lifecycle events to avoid flooding
-          if (eventType === "agent_start" || eventType === "agent_end" || eventType === "message_end" || eventType === "message_start" || eventType.includes("error")) {
-            console.log(`[rpc] SSE event for ${userId}: ${eventType}`, JSON.stringify(event).slice(0, 300));
-          }
-
-          // For tool_execution_end: save to DB first so we can include the real
-          // message ID in the forwarded event (frontend needs it for metadata updates).
-          let dbMessageId: string | undefined;
-          if (chatRepo && eventType === "tool_execution_end") {
-            const toolResult = eventData.result as {
-              content?: Array<{ type: string; text?: string }>;
-              details?: { blocked?: boolean; error?: boolean };
-            } | undefined;
-            const text =
-              toolResult?.content
-                ?.filter((c) => c.type === "text")
-                .map((c) => c.text ?? "")
-                .join("") ?? "";
-            const toolName = (eventData.toolName as string) || "tool";
-
-            // Audit: determine outcome
-            let outcome: "success" | "error" | "blocked" = "success";
-            if (toolResult?.details?.blocked) {
-              outcome = "blocked";
-            } else if (toolResult?.details?.error) {
-              outcome = "error";
-            }
-            const startTime = pendingToolStartTimes.get(toolName);
-            const durationMs = startTime != null
-              ? Date.now() - startTime
-              : undefined;
-            const toolInput = pendingToolInputs.get(toolName) || "";
-
-            dbMessageId = await chatRepo.appendMessage({
-              sessionId: result.sessionId,
-              role: "tool",
-              content: redactText(text, redactionConfig),
-              toolName,
-              toolInput: toolInput ? redactText(toolInput, redactionConfig) : undefined,
+        await consumeAgentSse({
+          client,
+          sessionId: result.sessionId,
+          userId,
+          chatRepo,
+          redactionConfig,
+          signal: abortController.signal,
+          onEvent(evt: SseEvent, eventType: string, extras: SseEventExtras) {
+            // ── Forward event to frontend via WebSocket ──
+            const eventPayload: Record<string, unknown> = {
               userId,
-              outcome,
-              durationMs,
-            });
-            await chatRepo.incrementMessageCount(result.sessionId);
-            pendingToolInputs.delete(toolName);
-            pendingToolStartTimes.delete(toolName);
-          }
-
-          // Forward event to frontend via sendToUser (targets all WS connections
-          // for this user, so reconnected sessions also receive live events)
-          const eventPayload = {
-            userId,
-            sessionId: result.sessionId,
-            ...eventData,
-            ...(dbMessageId ? { dbMessageId } : {}),
-          };
-          // Redact sensitive credential info from outbound WS stream
-          if (redactionConfig.patterns.length > 0) {
-            const ep = eventPayload as Record<string, unknown>;
-            if (eventType === "message_update") {
-              const ame = ep.assistantMessageEvent as { type?: string; delta?: string } | undefined;
-              if (ame?.type === "text_delta" && ame.delta) {
-                ame.delta = redactText(ame.delta, redactionConfig);
-              }
-            } else if (eventType === "tool_execution_end") {
-              const toolResult = ep.result as { content?: Array<{ type: string; text?: string }> } | undefined;
-              if (toolResult?.content) {
-                for (const block of toolResult.content) {
-                  if (block.type === "text" && block.text) {
-                    block.text = redactText(block.text, redactionConfig);
+              sessionId: result.sessionId,
+              ...evt,
+              ...(extras.dbMessageId ? { dbMessageId: extras.dbMessageId } : {}),
+            };
+            // Redact sensitive info in outbound WS stream
+            if (redactionConfig.patterns.length > 0) {
+              if (eventType === "message_update") {
+                const ame = eventPayload.assistantMessageEvent as { type?: string; delta?: string } | undefined;
+                if (ame?.type === "text_delta" && ame.delta) {
+                  ame.delta = redactText(ame.delta, redactionConfig);
+                }
+              } else if (eventType === "tool_execution_end") {
+                const toolResult = eventPayload.result as { content?: Array<{ type: string; text?: string }> } | undefined;
+                if (toolResult?.content) {
+                  for (const block of toolResult.content) {
+                    if (block.type === "text" && block.text) {
+                      block.text = redactText(block.text, redactionConfig);
+                    }
                   }
                 }
               }
             }
-          }
+            if (sendToUser) {
+              sendToUser(userId, "agent_event", eventPayload);
+            } else {
+              context.sendEvent("agent_event", eventPayload);
+            }
 
-          if (sendToUser) {
-            sendToUser(userId, "agent_event", eventPayload);
-          } else {
-            context.sendEvent("agent_event", eventPayload);
-          }
-
-          // Cache deep_search tool_progress events for WS reconnect recovery
-          if (eventType === "tool_progress" && eventData.toolName === "deep_search") {
-            const progress = eventData.progress as Record<string, unknown> | undefined;
-            if (progress) {
-              let snap = dpProgressSnapshots.get(streamKey);
-              if (!snap) {
-                snap = { sessionId: result.sessionId, events: [], updatedAt: Date.now() };
-                dpProgressSnapshots.set(streamKey, snap);
+            // ── Cache deep_search progress for WS reconnect recovery ──
+            if (eventType === "tool_progress" && evt.toolName === "deep_search") {
+              const progress = evt.progress as Record<string, unknown> | undefined;
+              if (progress) {
+                let snap = dpProgressSnapshots.get(streamKey);
+                if (!snap) {
+                  snap = { sessionId: result.sessionId, events: [], updatedAt: Date.now() };
+                  dpProgressSnapshots.set(streamKey, snap);
+                }
+                snap.events.push(progress);
+                snap.updatedAt = Date.now();
               }
-              snap.events.push(progress);
-              snap.updatedAt = Date.now();
             }
-          }
 
-          // Track DP status from tool events (reads dpStatus from tool result details)
-          if (eventType === "tool_execution_end") {
-            const details = (eventData.result as { details?: { dpStatus?: string } } | undefined)?.details;
-            if (details?.dpStatus) {
-              transitionDpStatus(streamKey, details.dpStatus as DpStatus);
-              emitDpStatus(streamKey, userId, result.sessionId);
-            }
-          } else if (eventType === "agent_end") {
-            const cache = dpStatusCache.get(streamKey);
-            if (cache?.dpStatus === "concluding") {
-              transitionDpStatus(streamKey, "completed");
-              emitDpStatus(streamKey, userId, result.sessionId);
-            }
-          }
-
-          // DB persistence for other event types
-          if (chatRepo) {
-            if (eventType === "message_update") {
-              const ame = eventData.assistantMessageEvent as {
-                type: string;
-                delta?: string;
-              } | undefined;
-              if (ame?.type === "text_delta" && ame.delta) {
-                assistantContent += ame.delta;
+            // ── Track DP status from tool events ──
+            if (eventType === "tool_execution_end") {
+              const details = (evt.result as { details?: { dpStatus?: string } } | undefined)?.details;
+              if (details?.dpStatus) {
+                transitionDpStatus(streamKey, details.dpStatus as DpStatus);
+                emitDpStatus(streamKey, userId, result.sessionId);
               }
-            } else if (eventType === "message_end") {
-              // Save complete assistant message (redacted)
-              if (assistantContent) {
-                await chatRepo.appendMessage({
-                  sessionId: result.sessionId,
-                  role: "assistant",
-                  content: redactText(assistantContent, redactionConfig),
-                });
-                await chatRepo.incrementMessageCount(result.sessionId);
-                assistantContent = "";
+            } else if (eventType === "agent_end") {
+              const cache = dpStatusCache.get(streamKey);
+              if (cache?.dpStatus === "concluding") {
+                transitionDpStatus(streamKey, "completed");
+                emitDpStatus(streamKey, userId, result.sessionId);
               }
-            } else if (eventType === "tool_execution_start") {
-              // Capture tool input and start time for DB persistence (keyed by toolName for parallel calls)
-              const startToolName = (eventData.toolName as string) || "tool";
-              const args = eventData.args as Record<string, unknown> | undefined;
-              pendingToolInputs.set(startToolName, args ? JSON.stringify(args) : "");
-              pendingToolStartTimes.set(startToolName, Date.now());
             }
-            // tool_execution_end already handled above
-          }
-        }
+          },
+        });
       } catch (err) {
         if (!abortController.signal.aborted) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -1646,8 +1561,6 @@ export function createRpcMethods(
           broadcast("error", { userId, message: msg });
         }
       } finally {
-        const sseDurationMs = Date.now() - sseStartTime;
-        console.log(`[rpc] SSE stream ended for userId=${userId} sessionId=${result.sessionId} (${sseEventCount} events, ${sseDurationMs}ms)`);
         activeStreams.delete(streamKey);
         activePromptUsers?.delete(userId);
         // Signal frontend that agent prompt is truly done

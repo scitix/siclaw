@@ -23,6 +23,8 @@ import { UserRepository } from "./db/repositories/user-repo.js";
 import { ModelConfigRepository } from "./db/repositories/model-config-repo.js";
 import { SystemConfigRepository } from "./db/repositories/system-config-repo.js";
 import { WorkspaceRepository } from "./db/repositories/workspace-repo.js";
+import { consumeAgentSse } from "./sse-consumer.js";
+import { buildRedactionConfig } from "./output-redactor.js";
 import { McpServerRepository } from "./db/repositories/mcp-server-repo.js";
 import { FeedbackRepository } from "./db/repositories/feedback-repo.js";
 import { loadConfig } from "../core/config.js";
@@ -260,8 +262,9 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   const notifRepo = db ? new NotificationRepository(db) : null;
 
   // In-process cron service (replaces standalone cron process)
-  const cronService = (configRepo && notifRepo)
-    ? new CronService({ configRepo, notifRepo, sendToUser, gatewayPort: config.port })
+  const internalChatRepo = db ? new ChatRepository(db) : null;
+  const cronService = (configRepo && notifRepo && internalChatRepo)
+    ? new CronService({ configRepo, notifRepo, chatRepo: internalChatRepo, sendToUser, gatewayPort: config.port })
     : null;
 
   // System config repo (used by JWT, SSO, cert-manager, metrics cache, etc.)
@@ -785,6 +788,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
             userId: string; sessionId: string; text: string;
             timeoutMs?: number; caller?: string;
             workspaceId?: string;
+            persistToDb?: boolean;
           };
           userId = data.userId;
           const timeoutMs = data.timeoutMs || 300_000;
@@ -846,10 +850,40 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
           // 4. Wait for completion with cancellable timeout
           const timeout = rejectAfterTimeout(timeoutMs, data.sessionId);
           try {
-            const resultText = await Promise.race([
-              waitForAgentCompletion(client, promptResult.sessionId),
-              timeout.promise,
-            ]);
+            let resultText: string;
+
+            // Both persistent and non-persistent paths use consumeAgentSse.
+            // When persistToDb=true, tool calls + assistant messages are written to DB.
+            // When false (or no DB), only text extraction happens (chatRepo: null).
+            const chatRepoForRun = (data.persistToDb && db) ? new ChatRepository(db) : null;
+            let redactionCfg = undefined;
+            if (chatRepoForRun) {
+              const sensitiveStrings: string[] = [];
+              if (modelConfig?.apiKey) sensitiveStrings.push(modelConfig.apiKey);
+              if (modelConfig?.baseUrl) sensitiveStrings.push(modelConfig.baseUrl);
+              redactionCfg = buildRedactionConfig(
+                credentials?.manifest,
+                credentials?.manifest?.length ? path.resolve(process.cwd(), ".siclaw/credentials") : undefined,
+                sensitiveStrings.length > 0 ? sensitiveStrings : undefined,
+              );
+            }
+            const abortCtrl = new AbortController();
+            try {
+              const sseResult = await Promise.race([
+                consumeAgentSse({
+                  client,
+                  sessionId: promptResult.sessionId,
+                  userId,
+                  chatRepo: chatRepoForRun,
+                  redactionConfig: redactionCfg,
+                  signal: abortCtrl.signal,
+                }),
+                timeout.promise,
+              ]);
+              resultText = sseResult.resultText;
+            } finally {
+              abortCtrl.abort();
+            }
 
             timeout.cancel();
             const durationMs = Date.now() - startTime;
@@ -1435,73 +1469,7 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
   return gatewayServer;
 }
 
-/** Consume SSE stream from AgentBox and extract final assistant text */
-async function waitForAgentCompletion(client: AgentBoxClient, sessionId: string): Promise<string> {
-  let resultText = "";
-  let taskReportText = "";
-  // Accumulate text deltas per message (claude-sdk brain emits text via
-  // message_update/text_delta and sends empty content in message_end)
-  let currentMsgText = "";
-  // Track last tool name to identify task_report results.
-  // pi-agent emits "tool_execution_start" (toolName field),
-  // claude-sdk emits "tool_start" (name field).
-  let lastToolName = "";
 
-  for await (const event of client.streamEvents(sessionId)) {
-    const evt = event as Record<string, unknown>;
-
-    // Accumulate streaming text deltas
-    if (evt.type === "message_update") {
-      const ame = evt.assistantMessageEvent as Record<string, unknown> | undefined;
-      if (ame?.type === "text_delta" && typeof ame.delta === "string") {
-        currentMsgText += ame.delta;
-      }
-    }
-
-    if (evt.type === "message_start") {
-      currentMsgText = "";
-    }
-
-    if (evt.type === "tool_execution_start" || evt.type === "tool_start") {
-      lastToolName = (evt.toolName as string) || (evt.name as string) || "";
-    }
-
-    if (evt.type === "message_end" || evt.type === "turn_end") {
-      const message = evt.message as Record<string, unknown> | undefined;
-      if (message?.role === "assistant") {
-        let extracted = "";
-        const content = message.content;
-        if (typeof content === "string" && content) {
-          extracted = content;
-        } else if (Array.isArray(content)) {
-          extracted = (content as Array<{ type: string; text?: string }>)
-            .filter((c) => c.type === "text")
-            .map((c) => c.text ?? "")
-            .join("");
-        }
-        resultText = extracted || currentMsgText || resultText;
-      } else if (message?.role === "toolResult" && lastToolName === "task_report") {
-        const content = message.content;
-        const text = typeof content === "string" ? content
-          : Array.isArray(content)
-            ? (content as Array<{ type: string; text?: string }>)
-                .filter((c) => c.type === "text")
-                .map((c) => c.text ?? "")
-                .join("")
-            : "";
-        if (text) taskReportText = text;
-      }
-      currentMsgText = "";
-      if (message?.role === "toolResult") lastToolName = "";
-    }
-    if (evt.type === "agent_end") break;
-  }
-  if (!resultText && currentMsgText) {
-    resultText = currentMsgText;
-  }
-  // task_report takes priority over free text
-  return taskReportText || resultText;
-}
 
 class ExecutionTimeoutError extends Error {
   constructor(sessionId: string, ms: number) {
