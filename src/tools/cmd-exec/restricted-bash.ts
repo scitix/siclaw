@@ -244,6 +244,8 @@ kubectl is restricted to read-only subcommands: get, describe, logs, top, events
 In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
+Multi-cluster: when multiple kubeconfigs are available, pass --kubeconfig=<name> (credential name, NOT file path) to select a cluster. Use credential_list to discover available names. Never use full file paths in --kubeconfig — they will be blocked.
+
 Rate protection rules for kubectl:
 - "kubectl logs" requires --tail=<N> or --since=<duration>; bare logs without these will be rejected.
 - "kubectl get -A -o yaml" and "kubectl get -A -o json" are blocked (bulk serialization). Use -o wide, -o name, or -o jsonpath instead.
