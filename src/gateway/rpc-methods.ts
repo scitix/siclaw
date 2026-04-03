@@ -4573,6 +4573,10 @@ export function createRpcMethods(
       }
     }
 
+    // Early name conflict check — reject before creating staging snapshot
+    const submitOriginId = (meta as any).originId ?? meta.id;
+    await rejectCrossOriginNameConflict(meta.name, submitOriginId);
+
     // Snapshot → staging
     const sourceTag = meta.scope === "skillset" ? "published" : "working";
     const message = (params.message as string | undefined)?.trim() || null;
@@ -4622,6 +4626,12 @@ export function createRpcMethods(
         if (metaSame) throw new Error("No changes to contribute. Content and metadata are identical.");
       }
     }
+
+    // Early name conflict check — reject before creating staging snapshot.
+    // Always check, even when existingGlobal is found by originId, because
+    // the skill may have been renamed to collide with a different global.
+    const contributeOriginId = (meta as any).originId ?? meta.id;
+    await rejectCrossOriginNameConflict(meta.name, contributeOriginId);
 
     // Snapshot → staging-contribution (separate from submit staging, no stagingVersion bump)
     const message = (params.message as string | undefined)?.trim() || null;
@@ -4699,6 +4709,10 @@ export function createRpcMethods(
     if (clientStagingVersion !== undefined && clientStagingVersion !== currentStagingVersion) {
       throw new Error("STAGING_VERSION_CONFLICT: Content has changed since you reviewed it. Please reload and review again.");
     }
+
+    // Safety-net name conflict check (name may have been taken since submit)
+    const approveOriginId = (meta as any).originId ?? meta.id;
+    await rejectCrossOriginNameConflict(meta.name, approveOriginId);
 
     await recordReviewDecision(skillId, meta, reviewerId, "approve", reason);
 
@@ -4780,6 +4794,10 @@ export function createRpcMethods(
     const meta = await skillRepo.getById(skillId);
     if (!meta) throw new Error("Skill not found");
     if ((meta as any).contributionStatus !== "pending") throw new Error("Skill has no pending contribution");
+
+    // Safety-net name conflict check (name may have been taken since contribute)
+    const contributeApproveOriginId = (meta as any).originId ?? meta.id;
+    await rejectCrossOriginNameConflict(meta.name, contributeApproveOriginId);
 
     await recordReviewDecision(skillId, meta, reviewerId, "approve", reason);
 
