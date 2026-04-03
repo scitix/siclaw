@@ -40,6 +40,7 @@ interface InputAreaProps {
 export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
+    const [isAborting, setIsAborting] = useState(false);
     const isComposingRef = useRef(false);
     const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -57,6 +58,11 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [draft, draftSeq]);
+
+    // Reset aborting state when loading finishes
+    useEffect(() => {
+        if (!isLoading) setIsAborting(false);
+    }, [isLoading]);
 
     // Deep investigation toggle — controlled by parent (usePilot manages state)
     const deepInvestigation = dpActive ?? false;
@@ -236,11 +242,14 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                             </button>
                         ) : isLoading ? (
                             <button
-                                onClick={onAbort}
-                                className="absolute right-3 bottom-3 p-2 rounded-lg bg-red-500 text-white shadow-md hover:bg-red-600 transition-all"
-                                title="Stop generating"
+                                onClick={() => { setIsAborting(true); onAbort?.(); }}
+                                className={cn(
+                                    "absolute right-3 bottom-3 p-2 rounded-lg text-white shadow-md transition-all",
+                                    isAborting ? "bg-red-400 hover:bg-red-500" : "bg-red-500 hover:bg-red-600",
+                                )}
+                                title={isAborting ? "Stopping..." : "Stop generating"}
                             >
-                                <Square className="w-5 h-5" />
+                                {isAborting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Square className="w-5 h-5" />}
                             </button>
                         ) : (
                             <button
