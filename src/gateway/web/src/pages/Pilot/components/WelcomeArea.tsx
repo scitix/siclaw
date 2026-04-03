@@ -32,11 +32,11 @@ const CAPABILITIES = [
     },
 ];
 
-/** Prompts shown to every user on every empty session */
-const SUGGESTED_PROMPTS = [
-    'Check my cluster health',
-    'List available skills',
-    'What happened since my last session?',
+const TAGLINES = [
+    'From symptom to root cause \u2014 one conversation.',
+    'Siclaw runs real commands and reads real logs \u2014 no guessing.',
+    'Tip: Include namespace and pod name \u2014 faster results.',
+    'Solved a case? Turn it into a skill your team can reuse.',
 ];
 
 /** Extra onboarding prompt shown only for first-time users (no PROFILE.md) */
@@ -154,30 +154,20 @@ export function WelcomeArea({ systemStatus, onSendPrompt, onNavigateModels, onNa
                 <CredentialsSummary credentials={credentials} />
             )}
 
-            {/* ── Suggested Prompts: shown on every empty session ── */}
+            {/* ── Tagline + onboarding ── */}
             {systemStatus && (
                 <div className="w-full space-y-3">
-                    <p className="text-xs text-center text-gray-400">Try asking</p>
-                    <div className="flex flex-wrap gap-2 justify-center">
-                        {/* Onboarding CTA — only for first-time users */}
-                        {isFirstTime && (
+                    <p className="text-sm text-center text-gray-400">{TAGLINES[Math.floor(Math.random() * TAGLINES.length)]}</p>
+                    {isFirstTime && (
+                        <div className="flex justify-center">
                             <button
                                 onClick={() => handlePromptClick(ONBOARDING_PROMPT)}
                                 className="rounded-full px-4 py-2 bg-blue-50 hover:bg-blue-100 border border-blue-200 text-sm text-blue-700 transition-colors"
                             >
                                 {ONBOARDING_PROMPT}
                             </button>
-                        )}
-                        {SUGGESTED_PROMPTS.map((prompt) => (
-                            <button
-                                key={prompt}
-                                onClick={() => handlePromptClick(prompt)}
-                                className="rounded-full px-4 py-2 bg-gray-50 hover:bg-gray-100 border border-gray-200 text-sm text-gray-700 transition-colors"
-                            >
-                                {prompt}
-                            </button>
-                        ))}
-                    </div>
+                        </div>
+                    )}
                     {!hasModels && (
                         <p className="text-xs text-center text-amber-600">
                             {isAdmin
