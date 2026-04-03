@@ -139,6 +139,21 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     // Suggested reply draft — chip click populates input instead of sending immediately
     const [chipSeq, setChipSeq] = useState(0);
     const [chipDraft, setChipDraft] = useState<string | null>(null);
+
+    // Track last user message so abort can restore it to the input box
+    const lastSentRef = useRef<string | null>(null);
+    const wrappedSendMessage = useCallback((text: string) => {
+        lastSentRef.current = text;
+        sendMessage(text);
+    }, [sendMessage]);
+    const wrappedAbort = useCallback(() => {
+        abortResponse?.();
+        if (lastSentRef.current) {
+            setChipSeq(s => s + 1);
+            setChipDraft(lastSentRef.current);
+            lastSentRef.current = null;
+        }
+    }, [abortResponse]);
     const [showHypothesesLocator, setShowHypothesesLocator] = useState(false);
 
     // Feedback hint: show once per session after agent finishes first response
@@ -423,7 +438,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     ) : messages.length === 0 ? (
                         <WelcomeArea
                             systemStatus={systemStatus ?? null}
-                            onSendPrompt={sendMessage}
+                            onSendPrompt={wrappedSendMessage}
                             onNavigateModels={onNavigateModels ?? (() => {})}
                             onNavigateCredentials={onNavigateCredentials ?? (() => {})}
                             isAdmin={isAdmin}
@@ -452,7 +467,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     onOpenSkillPanel={onOpenSkillPanel}
                                     updateMessageMeta={updateMessageMeta}
                                     investigationProgress={investigationProgress}
-                                    sendMessage={sendMessage}
+                                    sendMessage={wrappedSendMessage}
                                     dpFocus={dpFocus}
                                     dpChecklistActive={dpChecklist != null && dpChecklist.length > 0}
                                     onHypothesesConfirmed={onHypothesesConfirmed}
@@ -470,7 +485,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                     <button
                                         type="button"
                                         disabled={isLoading}
-                                        onClick={() => sendMessage('Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.')}
+                                        onClick={() => wrappedSendMessage('Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.')}
                                         className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-primary-500 to-primary-600 hover:from-primary-600 hover:to-primary-700 text-white text-sm font-medium shadow-sm hover:shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         <SearchCode className="w-4 h-4" />
@@ -514,7 +529,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     </div>
                 </div>
             )}
-            <InputArea onSend={sendMessage} onAbort={abortResponse} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
+            <InputArea onSend={wrappedSendMessage} onAbort={wrappedAbort} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
 }
