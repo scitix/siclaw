@@ -47,6 +47,9 @@ export async function buildSkillBundle(
 ): Promise<SkillBundle> {
   const skills: SkillBundleEntry[] = [];
   const disabled = disabledSkills ?? new Set<string>();
+  // Collect originIds from all higher-priority scopes to shadow builtin skills.
+  // A personal/skillset/global fork of a builtin should hide the original builtin.
+  const overrideOriginIds = new Set<string>();
   // Empty array = no filter (include all), only non-empty array = whitelist
   const globalRefs = workspaceSkillComposer?.globalSkillRefs;
   const globalSelection = globalRefs && globalRefs.length > 0 ? new Set(globalRefs) : null;
@@ -69,6 +72,9 @@ export async function buildSkillBundle(
   for (const meta of userSkills.skills) {
     if (disabled.has(meta.id)) continue;
     if (personalSelection && !personalSelection.has(meta.id)) continue;
+
+    const personalOriginId = (meta as any).originId as string | null;
+    if (personalOriginId) overrideOriginIds.add(personalOriginId);
 
     if (env === "dev") {
       const files = await skillContentRepo.read(meta.id, "working");
@@ -106,6 +112,9 @@ export async function buildSkillBundle(
         if (disabled.has(meta.id)) continue;
         if (disabledSkillIds.has(meta.id)) continue;
 
+        const spaceOriginId = (meta as any).originId as string | null;
+        if (spaceOriginId) overrideOriginIds.add(spaceOriginId);
+
         if (env === "prod") {
           const approvedVersion = (meta as any).approvedVersion as number | null;
           if (approvedVersion == null) continue;
@@ -137,8 +146,11 @@ export async function buildSkillBundle(
 
   // 3. Global skills
   const globalSkills = await skillRepo.list({ scope: "global" });
-  const globalOriginIds = new Set(globalSkills.map((m: any) => m.originId as string | null).filter(Boolean));
   const globalNames = new Set(globalSkills.map((m: any) => m.name as string));
+  for (const m of globalSkills) {
+    const gOriginId = (m as any).originId as string | null;
+    if (gOriginId) overrideOriginIds.add(gOriginId);
+  }
   for (const meta of globalSkills) {
     if (disabled.has(meta.id)) continue;
     if (globalSelection && !globalSelection.has(`global:${meta.id}`)) continue;
@@ -152,11 +164,11 @@ export async function buildSkillBundle(
     });
   }
 
-  // 4. Builtin skills (lowest priority — skip if overridden by global via originId or name)
+  // 4. Builtin skills (lowest priority — skip if overridden by any higher-priority scope via originId or name)
   const builtinSkills = await skillRepo.list({ scope: "builtin" });
   for (const meta of builtinSkills) {
     if (disabled.has(meta.id)) continue;
-    if (globalOriginIds.has(meta.id) || globalNames.has(meta.name)) continue;
+    if (overrideOriginIds.has(meta.id) || globalNames.has(meta.name)) continue;
     if (globalSelection && !globalSelection.has(`builtin:${meta.dirName}`)) continue;
     const files = await skillContentRepo.read(meta.id, "published");
     if (!files) continue;
