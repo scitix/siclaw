@@ -140,12 +140,13 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     const [chipSeq, setChipSeq] = useState(0);
     const [chipDraft, setChipDraft] = useState<string | null>(null);
 
-    // Track last user message so abort can restore it to the input box
+    // Track last user-initiated message so abort can restore it to the input box.
+    // Only record when not already loading (skips steer messages and system-generated prompts).
     const lastSentRef = useRef<string | null>(null);
     const wrappedSendMessage = useCallback((text: string) => {
-        lastSentRef.current = text;
+        if (!isLoading) lastSentRef.current = text;
         sendMessage(text);
-    }, [sendMessage]);
+    }, [sendMessage, isLoading]);
     const wrappedAbort = useCallback(() => {
         abortResponse?.();
         if (lastSentRef.current) {
