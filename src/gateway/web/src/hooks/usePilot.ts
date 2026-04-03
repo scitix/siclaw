@@ -3,6 +3,7 @@ import { useWebSocket, type WsMessage } from './useWebSocket';
 import { rpcGetSkills, type Skill } from '@/pages/Skills/skillsData';
 import { useWorkspace } from '@/contexts/WorkspaceContext';
 import { parseHypotheses as parseHypothesesText } from '@/pages/Pilot/components/HypothesesCard';
+import { findPendingSteerIndex, removePendingAt, extractUserMessageText } from './steer-pending';
 
 export interface ModelInfo {
     id: string;
@@ -513,19 +514,16 @@ export function usePilot() {
                 }
 
                 case 'message_start': {
-                    const msg = payload.message as { role?: string; customType?: string; details?: Record<string, unknown>; content?: Array<{ type: string; text?: string }> } | undefined;
+                    const msg = payload.message as { role?: string; customType?: string; details?: Record<string, unknown>; content?: string | Array<{ type: string; text?: string }> } | undefined;
 
                     // Show steer (user) messages injected mid-conversation.
                     // The initial prompt's user message is already displayed by sendMessage,
                     // so only create a PilotMessage if the text is in pendingMessages (= steer).
                     if (msg?.role === 'user') {
-                        const text = msg.content
-                            ?.filter(c => c.type === 'text')
-                            .map(c => c.text ?? '')
-                            .join('') ?? '';
+                        const text = extractUserMessageText(msg.content);
                         if (text) {
                             setPendingMessages(prev => {
-                                const idx = prev.indexOf(text);
+                                const idx = findPendingSteerIndex(prev, text);
                                 if (idx < 0) return prev; // not a steer — already displayed
                                 // Steer message: add to chat and remove from pending
                                 setMessages(msgs => [...msgs, {
@@ -534,7 +532,7 @@ export function usePilot() {
                                     content: text,
                                     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                                 }]);
-                                return [...prev.slice(0, idx), ...prev.slice(idx + 1)];
+                                return removePendingAt(prev, idx);
                             });
                         }
                     }
@@ -582,8 +580,8 @@ export function usePilot() {
                     setMessages(prev => prev.map(m =>
                         m.isStreaming ? { ...m, isStreaming: false } : m
                     ));
-                    // A steer message was consumed — pop the first pending
-                    setPendingMessages(prev => prev.length > 0 ? prev.slice(1) : prev);
+                    // Steer messages are removed from pending via message_start text matching
+                    // (not here — turn_end fires for normal tool-call turns too).
                     break;
 
                 case 'prompt_done':
@@ -845,6 +843,8 @@ export function usePilot() {
                 : m
         ));
         try {
+            // Clear backend steer queue before abort to prevent residual messages
+            await sendRpc('chat.clearQueue', { sessionId: currentSessionKeyRef.current }).catch(() => {});
             await sendRpc('chat.abort', { sessionId: currentSessionKeyRef.current });
         } catch (err) {
             console.error('Failed to abort:', err);
@@ -865,22 +865,21 @@ export function usePilot() {
     }, [isConnected, sendRpc]);
 
     const removePendingMessage = useCallback(async (index: number) => {
+        // Capture remaining messages after removal
+        let remaining: string[] = [];
         setPendingMessages(prev => {
             const next = [...prev];
             next.splice(index, 1);
+            remaining = next;
             return next;
         });
-        // Clear server queue and re-steer remaining messages
+        // Clear server queue and re-steer remaining messages in order
         if (!isConnected) return;
         try {
             await sendRpc('chat.clearQueue', { sessionId: currentSessionKeyRef.current });
-            // Re-steer remaining messages (get fresh state after splice)
-            setPendingMessages(prev => {
-                for (const msg of prev) {
-                    sendRpc('chat.steer', { text: msg, sessionId: currentSessionKeyRef.current }).catch(() => {});
-                }
-                return prev;
-            });
+            for (const msg of remaining) {
+                await sendRpc('chat.steer', { text: msg, sessionId: currentSessionKeyRef.current });
+            }
         } catch (err) {
             console.error('Failed to remove pending message:', err);
         }
