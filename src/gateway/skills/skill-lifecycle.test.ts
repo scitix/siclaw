@@ -2358,12 +2358,53 @@ describe("Skill Lifecycle RPC — Contribute Guards", () => {
     });
     await contentRepo.save(globalId, "published", { specs: "# Global" });
 
-    // Contribute itself succeeds (queues for review)
-    await h.call("skill.contribute", { id });
-
-    // Approve fails — same name, different origin in global
+    // Contribute rejects early — same name, different origin in global
     await expect(
-      h.callAsAdmin("skill.approveContribute", { id }),
+      h.call("skill.contribute", { id }),
+    ).rejects.toThrow(/already exists/);
+  });
+
+  it("submit rejects when global has same name from different origin", async () => {
+    await h.grantReviewer("admin1");
+    const { SkillRepository } = await import("../db/repositories/skill-repo.js");
+    const { SkillContentRepository } = await import("../db/repositories/skill-content-repo.js");
+    const skillRepo = new SkillRepository(h.db);
+    const contentRepo = new SkillContentRepository(h.db);
+
+    const { id } = await h.call("skill.create", { name: "conflict-submit", specs: "# V1" }) as any;
+
+    // Create a global skill with the same name but different originId
+    const globalId = await skillRepo.create({
+      name: "conflict-submit", scope: "global", authorId: "admin1", originId: "other-origin",
+    });
+    await contentRepo.save(globalId, "published", { specs: "# Global" });
+
+    // Submit rejects early
+    await expect(
+      h.call("skill.submit", { id }),
+    ).rejects.toThrow(/already exists/);
+  });
+
+  it("approveSubmit rejects when name conflict arose after submit", async () => {
+    await h.grantReviewer("admin1");
+    const { SkillRepository } = await import("../db/repositories/skill-repo.js");
+    const { SkillContentRepository } = await import("../db/repositories/skill-content-repo.js");
+    const skillRepo = new SkillRepository(h.db);
+    const contentRepo = new SkillContentRepository(h.db);
+
+    // Create and submit a personal skill (no conflict yet)
+    const { id } = await h.call("skill.create", { name: "conflict-approve", specs: "# V1" }) as any;
+    await h.call("skill.submit", { id });
+
+    // Simulate a race: another global skill with the same name appears after submit
+    const globalId = await skillRepo.create({
+      name: "conflict-approve", scope: "global", authorId: "admin1", originId: "other-origin",
+    });
+    await contentRepo.save(globalId, "published", { specs: "# Global" });
+
+    // Approve rejects — safety net catches the race
+    await expect(
+      h.callAsAdmin("skill.approveSubmit", { id }),
     ).rejects.toThrow(/already exists/);
   });
 });
