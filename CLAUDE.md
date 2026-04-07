@@ -54,13 +54,6 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 
 ---
 
-## Current Phase
-
-**Active**: KR0 (Qdrant), IM Phase 2 (diagnostic path learning)  |  **Next**: OB0 (Prometheus), PM1 (config cascade)
-**Consolidation**: Harness hardening — verifying existing features before next roadmap. Full roadmap: `docs/design/roadmap.md`
-
----
-
 ## Change Impact Matrix
 
 > Before modifying any file, find it here. Read the required docs and verify cross-cutting concerns **before writing code**.
