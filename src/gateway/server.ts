@@ -881,6 +881,17 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
                 timeout.promise,
               ]);
               resultText = sseResult.resultText;
+
+              // Model-level error (e.g. API 404, rate-limit) — surface as failure
+              if (sseResult.errorMessage) {
+                abortCtrl.abort();
+                timeout.cancel();
+                const durationMs = Date.now() - startTime;
+                console.error(`[gateway] agent-prompt model error user=${userId} duration=${durationMs}ms: ${sseResult.errorMessage}`);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: "error", error: sseResult.errorMessage, resultText, durationMs }));
+                return;
+              }
             } finally {
               abortCtrl.abort();
             }
