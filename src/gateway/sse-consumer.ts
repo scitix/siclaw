@@ -44,6 +44,8 @@ export interface SseConsumptionResult {
   resultText: string;
   /** Raw task_report output, empty string if task_report was not called. */
   taskReportText: string;
+  /** Model-level error (e.g. API 404, rate-limit). Empty string if no error. */
+  errorMessage: string;
   eventCount: number;
   durationMs: number;
 }
@@ -60,6 +62,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let currentMsgText = "";
   let resultText = "";
   let taskReportText = "";
+  let errorMessage = "";
   let lastToolName = "";
 
   // Keyed by toolName to handle parallel tool calls
@@ -158,6 +161,11 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "message_end" || eventType === "turn_end") {
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "assistant") {
+        // Capture model-level errors (e.g. API 404, rate-limit)
+        if (message.stopReason === "error" && message.errorMessage) {
+          errorMessage = String(message.errorMessage);
+        }
+
         // Extract text for resultText
         let extracted = "";
         const content = message.content;
@@ -216,6 +224,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   return {
     resultText: taskReportText || resultText,
     taskReportText,
+    errorMessage,
     eventCount,
     durationMs,
   };
