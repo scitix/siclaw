@@ -5246,7 +5246,46 @@ export function createRpcMethods(
         resultText: r.resultText,
         error: r.error,
         durationMs: r.durationMs,
+        sessionId: r.sessionId ?? null,
         createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt ? new Date(Number(r.createdAt) * 1000).toISOString() : null,
+      })),
+    };
+  });
+
+  // ── cron.runMessages — read-only message trace for a cron execution ──
+  // Verifies ownership via the cron job (NOT the session.userId), so this RPC
+  // is dedicated to cron contexts. Returns user/assistant/tool messages with
+  // tool name + input + output for trace inspection.
+  methods.set("cron.runMessages", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!configRepo || !chatRepo) throw new Error("Database not available");
+
+    const runId = params.runId as string;
+    if (!runId) throw new Error("Missing required param: runId");
+
+    // Look up the run, then its job, then verify ownership
+    const run = await configRepo.getCronJobRunById(runId);
+    if (!run) throw new Error("Run not found");
+    const job = await configRepo.getCronJobById(run.jobId);
+    if (!job) throw new Error("Job not found");
+    if (job.userId !== userId) throw new Error("Forbidden");
+
+    if (!run.sessionId) {
+      return { messages: [], sessionId: null };
+    }
+
+    const msgs = await chatRepo.getMessages(run.sessionId, { limit: 200 });
+    return {
+      sessionId: run.sessionId,
+      messages: msgs.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        toolName: m.toolName,
+        toolInput: m.toolInput,
+        outcome: m.outcome,
+        durationMs: m.durationMs,
+        timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : null,
       })),
     };
   });
