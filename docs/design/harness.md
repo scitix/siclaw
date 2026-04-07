@@ -186,23 +186,7 @@ Every mistake should improve the harness for the next session.
 
 ---
 
-## 5. Evolution Roadmap
-
-### Current State (2026-03)
-
-- Layer 1: 8 design docs covering architecture, security, tools, sanitization, skills, decisions, roadmap, harness
-- Layer 2: CLAUDE.md with Change Impact Matrix and Development Protocol
-- Layer 3: CI (typecheck + vitest + DDL parity check)
-
-### Next Improvements
-
-- `src/core/prompt.ts` edit hook — security-critical, easy to automate
-- Skill compatibility test — detect sanitizer changes that break skills
-- Other Layer 3 items deferred until team grows
-
----
-
-## 6. Design Influences
+## 5. Design Influences
 
 Informed by Anthropic's research on AI agent harness design (2025). Key principle:
 the harness should **shrink** with model improvements, not accumulate indefinitely.
@@ -210,7 +194,7 @@ The *why* behind each rule (documented in this file) tells us when it's safe to 
 
 ---
 
-## 7. Quick Reference: Design Doc Inventory
+## 6. Quick Reference: Design Doc Inventory
 
 ```
 docs/design/
@@ -220,6 +204,6 @@ docs/design/
 ├── sanitization.md   ← 3-layer output sanitization (pre/post strategy, skill exemption)
 ├── tools.md          ← Tool organization, execution pipelines, context system
 ├── skills.md         ← Skill lifecycle, approval workflow, execution model
-├── decisions.md      ← ADRs (sql.js, LocalSpawner, whitelist, memory, mTLS, brain types)
-└── roadmap.md        ← IM/KR/OB/PM/CS phases with current status
+├── guards.md         ← Guard pipeline (input/output/persist/context interceptors)
+└── decisions.md      ← ADRs (sql.js, LocalSpawner, whitelist, memory, mTLS, brain types)
 ```
