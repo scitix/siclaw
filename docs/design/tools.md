@@ -438,53 +438,13 @@ configuration. This is declared in each tool's registration, not in a central se
 
 ---
 
-## 8. Roadmap — Planned Refactoring
+## 8. Deferred Refactoring
 
-Remaining work after the Phase 1 directory restructure. Ordered by priority.
+Known structural improvements that are not blocking but worth tracking.
 
-### 8.1 Unified Command Security Model — ✅ Done (PR #189, 2026-03-30)
+### 8.1 `debug-pod.ts` Decomposition
 
-Unified 4 separate data structures (`ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`,
-`COMMAND_RULES`, `CUSTOM_VALIDATORS`) into `COMMANDS: Record<string, CommandDef>` +
-`CONTEXT_POLICIES`. Each command now has a single definition carrying category,
-constraints, and optional custom validator. Environment availability is a separate
-`CONTEXT_POLICIES` layer. See ADR-012 in `decisions.md` for rationale.
-
-### 8.2 Security Pipeline Unified Entry (Done)
-
-`src/tools/infra/security-pipeline.ts` provides three facade functions:
-
-- `preExecSecurity(command, opts?)` — validates command + determines output sanitizer
-- `sanitizeExecOutput(stdout, action, opts?)` — sanitization only (for tools with external truncation, e.g., node-exec via `formatExecOutput`)
-- `postExecSecurity(stdout, action, opts?)` — sanitization + truncation (for pod-exec, restricted-bash)
-
-Tools call `preExecSecurity` before execution, then `postExecSecurity` or `sanitizeExecOutput` after. The `analyzeTarget` option (`"single"` | `"last-in-pipeline"` | `"auto"`) controls which command in a pipeline determines the output sanitizer.
-
-Also completed in this change:
-- Directory restructure: `k8s-exec/` + `k8s-script/` + `shell/` → `cmd-exec/` + `script-exec/` (classified by security model)
-- Deprecated exports cleanup: removed `ALLOWED_COMMANDS`, `COMMAND_CATEGORIES`, `CONTEXT_CATEGORIES`; replaced with `getContextAllowedSet()` in `command-sets.ts`
-
-**Files**: `src/tools/infra/security-pipeline.ts`, `src/tools/cmd-exec/`, `src/tools/script-exec/`
-
-### 8.3 Execution Template Extraction (Low — Deferred)
-
-Originally planned as high priority. After detailed analysis, the 3 `cmd-exec/`
-tools only share ~3 truly identical steps (not 6-7 as initially estimated).
-Variation points (`checkReady` return types, `analyzeOutput` input handling,
-`buildCommand` complexity, `run` + error handling) differ enough that a forced
-template would add abstraction without reducing real complexity.
-
-If 8.1 + 8.2 are done, the security-critical steps are already unified via the
-pipeline facade, eliminating the main risk (step omission). What remains is
-boilerplate (kubeconfig resolution, error formatting) — tolerable duplication.
-
-Revisit if more than 2 new cmd-exec tools are added.
-
-**Files**: `src/tools/cmd-exec/*.ts`, `src/tools/script-exec/*.ts`
-
-### 8.4 `debug-pod.ts` Decomposition (Medium)
-
-`src/tools/infra/debug-pod.ts` is 767 lines mixing three concerns:
+`src/tools/infra/debug-pod.ts` mixes three concerns:
 - `DebugPodCache` — pod reuse cache with creation lock and idle eviction
 - `runInDebugPod()` — pod creation, command execution, stale-pod detection
 - `DebugPodGC` — background garbage collector for orphaned pods
@@ -495,9 +455,7 @@ makes the debug pod subsystem itself harder to maintain.
 **Goal**: Split into `debug-pod/cache.ts`, `debug-pod/lifecycle.ts`,
 `debug-pod/gc.ts` under `infra/`.
 
-**Files**: `src/tools/infra/debug-pod.ts`
-
-### 8.5 Extract `llmCompleteWithTool` to Shared Location (Medium)
+### 8.2 Extract `llmCompleteWithTool` to Shared Location
 
 `llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
 utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
@@ -512,4 +470,11 @@ on the internals of a higher-level workflow tool.
 the dependency direction correct (both `memory/` and `workflow/deep-search/`
 import from `core/`).
 
-**Files**: `src/tools/workflow/deep-search/sub-agent.ts`, `src/memory/topic-consolidator.ts`, `src/memory/knowledge-extractor.ts`
+### 8.3 Execution Template Extraction (Low — Revisit Conditionally)
+
+The 3 `cmd-exec/` tools share ~3 truly identical steps. Variation points
+(`checkReady` return types, `analyzeOutput` input handling, `buildCommand`
+complexity, `run` + error handling) differ enough that a forced template would
+add abstraction without reducing real complexity. The security-critical steps
+are already unified via the `security-pipeline.ts` facade. Revisit only if more
+than 2 new cmd-exec tools are added.
