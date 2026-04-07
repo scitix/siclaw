@@ -63,6 +63,7 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
     // Trace view state
     const [showTrace, setShowTrace] = useState(false);
     const [traceMessages, setTraceMessages] = useState<CronTraceMessage[]>([]);
+    const [traceTruncated, setTraceTruncated] = useState(false);
     const [traceLoading, setTraceLoading] = useState(false);
     const [traceError, setTraceError] = useState<string | null>(null);
 
@@ -80,6 +81,7 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
         if (!selectedRun) {
             setShowTrace(false);
             setTraceMessages([]);
+            setTraceTruncated(false);
             setTraceError(null);
         }
     }, [selectedRun]);
@@ -100,11 +102,13 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
         setTraceLoading(true);
         setTraceError(null);
         try {
-            const result = await sendRpc<{ messages: CronTraceMessage[]; sessionId: string | null }>(
-                'cron.runMessages',
-                { runId },
-            );
+            const result = await sendRpc<{
+                messages: CronTraceMessage[];
+                sessionId: string | null;
+                truncated?: boolean;
+            }>('cron.runMessages', { runId });
             setTraceMessages(result.messages ?? []);
+            setTraceTruncated(Boolean(result.truncated));
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             console.error('[CronRunHistory] Failed to load trace:', msg);
@@ -206,6 +210,7 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
                                                 loading={traceLoading}
                                                 error={traceError}
                                                 messages={traceMessages}
+                                                truncated={traceTruncated}
                                             />
                                         ) : (
                                             <div className="px-6 py-4">
@@ -274,10 +279,11 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
 
 // ─── Trace view: read-only message list for a cron run ───────────────
 
-function TraceView({ loading, error, messages }: {
+function TraceView({ loading, error, messages, truncated }: {
     loading: boolean;
     error: string | null;
     messages: CronTraceMessage[];
+    truncated: boolean;
 }) {
     if (loading) {
         return (
@@ -306,6 +312,12 @@ function TraceView({ loading, error, messages }: {
     }
     return (
         <div className="px-4 py-3 space-y-2">
+            {truncated && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-100 text-[11px] text-amber-700">
+                    <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                    Showing the most recent {messages.length} messages — older messages were omitted.
+                </div>
+            )}
             {messages.map((m) => (
                 <TraceMessage key={m.id} message={m} />
             ))}
