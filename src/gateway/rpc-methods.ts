@@ -5231,10 +5231,10 @@ export function createRpcMethods(
     const jobId = params.jobId as string;
     if (!jobId) throw new Error("Missing required param: jobId");
 
-    // Verify ownership
+    // Verify ownership — collapse missing-job and ownership-mismatch into one
+    // error so we don't leak the existence of other users' cron jobs.
     const job = await configRepo.getCronJobById(jobId);
-    if (!job) throw new Error("Job not found");
-    if (job.userId !== userId) throw new Error("Forbidden");
+    if (!job || job.userId !== userId) throw new Error("Job not found");
 
     const limit = Math.min(Number(params.limit) || 20, 100);
     const runs = await configRepo.listCronJobRuns(jobId, limit);
@@ -5256,6 +5256,7 @@ export function createRpcMethods(
   // Verifies ownership via the cron job (NOT the session.userId), so this RPC
   // is dedicated to cron contexts. Returns user/assistant/tool messages with
   // tool name + input + output for trace inspection.
+  const CRON_TRACE_MESSAGE_LIMIT = 200;
   methods.set("cron.runMessages", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     if (!configRepo || !chatRepo) throw new Error("Database not available");
@@ -5263,20 +5264,24 @@ export function createRpcMethods(
     const runId = params.runId as string;
     if (!runId) throw new Error("Missing required param: runId");
 
-    // Look up the run, then its job, then verify ownership
+    // Look up the run, then its job, then verify ownership.
+    // Collapse all "cannot return this run to you" cases into a single error
+    // so we don't leak whether a runId or its job exists for another user.
     const run = await configRepo.getCronJobRunById(runId);
     if (!run) throw new Error("Run not found");
     const job = await configRepo.getCronJobById(run.jobId);
-    if (!job) throw new Error("Job not found");
-    if (job.userId !== userId) throw new Error("Forbidden");
+    if (!job || job.userId !== userId) throw new Error("Run not found");
 
     if (!run.sessionId) {
-      return { messages: [], sessionId: null };
+      return { messages: [], sessionId: null, truncated: false };
     }
 
-    const msgs = await chatRepo.getMessages(run.sessionId, { limit: 200 });
+    const msgs = await chatRepo.getMessages(run.sessionId, { limit: CRON_TRACE_MESSAGE_LIMIT });
     return {
       sessionId: run.sessionId,
+      // getMessages returns newest-N then reverses, so when length === limit
+      // we know older messages were dropped. The frontend renders a banner.
+      truncated: msgs.length === CRON_TRACE_MESSAGE_LIMIT,
       messages: msgs.map((m) => ({
         id: m.id,
         role: m.role,
@@ -5285,7 +5290,7 @@ export function createRpcMethods(
         toolInput: m.toolInput,
         outcome: m.outcome,
         durationMs: m.durationMs,
-        timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : null,
+        timestamp: m.timestamp?.toISOString() ?? null,
       })),
     };
   });
