@@ -286,6 +286,7 @@ export function usePilot() {
     const [isLoadingMore, setIsLoadingMore] = useState(false);
     const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
     const [isCompacting, setIsCompacting] = useState(false);
+    const [isRetrying, setIsRetrying] = useState(false);
     const isAbortingRef = useRef(false);
     const [skills, setSkills] = useState<Skill[]>([]);
     const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
@@ -574,6 +575,14 @@ export function usePilot() {
                     fetchContextRef.current();
                     break;
 
+                case 'auto_retry_start':
+                    setIsRetrying(true);
+                    break;
+
+                case 'auto_retry_end':
+                    setIsRetrying(false);
+                    break;
+
                 case 'turn_end':
                     // Mark streaming messages as complete after each agentic turn,
                     // but do NOT set isLoading=false — the agent may have more turns.
@@ -793,8 +802,6 @@ export function usePilot() {
             }
             return;
         }
-
-        // DP checklist init now handled by dp_status "investigating" event from gateway.
 
         const userMsg: PilotMessage = {
             id: `user-${Date.now()}`,
@@ -1240,6 +1247,7 @@ export function usePilot() {
         isLoadingMore,
         contextUsage,
         isCompacting,
+        isRetrying,
         skills,
         systemStatus,
         editingSkill,

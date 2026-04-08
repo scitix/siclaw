@@ -114,13 +114,51 @@ export class ClaudeSdkBrain implements BrainSession {
     try {
       await this.runQuery(sdk, text);
 
-      // Empty response guard: Kimi-K2.5 sometimes returns a completely empty
-      // response (0 content blocks) on the final turn after tool results.
-      // Pi-agent handles this via the streamFn wrapper in agent-factory.ts;
-      // SDK brain needs its own retry here.
-      if (!this.lastMsgHadContent) {
-        console.log("[claude-sdk-brain] Last message was empty, requesting conclusion");
-        await this.runQuery(sdk, "Based on the tool execution results above, please provide a summary and conclusion.");
+      // Empty response guard: some models (e.g. Kimi-K2.5) occasionally return
+      // a completely empty response (0 content blocks) on the final turn after
+      // tool results. Both brain types implement this guard independently:
+      // pi-agent-brain checks message_end events, SDK brain checks here.
+      {
+        const MAX_EMPTY_RETRIES = 2;
+        const RETRY_DELAY_MS = 2000;
+        let retries = 0;
+        while (!this.lastMsgHadContent && retries < MAX_EMPTY_RETRIES) {
+          retries++;
+          const delayMs = RETRY_DELAY_MS * retries;
+          console.warn(
+            `[claude-sdk-brain] Empty response detected (attempt ${retries}/${MAX_EMPTY_RETRIES}), retrying in ${delayMs}ms`,
+          );
+          this.emit({
+            type: "auto_retry_start",
+            attempt: retries,
+            maxAttempts: MAX_EMPTY_RETRIES,
+            delayMs,
+            errorMessage: "Model returned empty response",
+          });
+          try {
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, delayMs);
+              this.abortController?.signal.addEventListener("abort", () => {
+                clearTimeout(timer);
+                resolve();
+              }, { once: true });
+            });
+            if (this.abortController?.signal.aborted) break;
+            await this.runQuery(sdk, text);
+          } finally {
+            this.emit({
+              type: "auto_retry_end",
+              attempt: retries,
+              success: this.lastMsgHadContent,
+              finalError: this.lastMsgHadContent ? undefined : "Model returned empty response",
+            });
+          }
+        }
+        if (!this.lastMsgHadContent) {
+          console.error(
+            `[claude-sdk-brain] Empty response persisted after ${MAX_EMPTY_RETRIES} retries`,
+          );
+        }
       }
 
       // Process queued steer messages (e.g. hypothesis confirmation arriving mid-run)
