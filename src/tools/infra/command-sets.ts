@@ -947,9 +947,9 @@ export interface CommandDef {
  */
 export const COMMANDS: Record<string, CommandDef> = {
   // ── text processing ──
-  grep:   { category: "text" },
-  egrep:  { category: "text" },
-  fgrep:  { category: "text" },
+  grep:   { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
+  egrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
+  fgrep:  { category: "text", blockedFlags: ["-r", "-R", "--recursive"] },
   sort:   { category: "text", allowedFlags: [
     "-r", "-n", "-k", "-t", "-u", "-f", "-h", "-V", "-s", "-b", "-g", "-M", "-d", "-i",
     "--reverse", "--numeric-sort", "--key", "--field-separator", "--unique",
@@ -1189,9 +1189,7 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
       "activity", "stream", "general", "flow",
     ],
     pipeOnlyCategories: ["text"],
-    categoryBlockedFlags: {
-      text: ["-r", "-R", "--recursive"],
-    },
+    categoryBlockedFlags: {},
   },
   node: { available: ALL_COMMAND_CATEGORIES },
   pod:  { available: ALL_COMMAND_CATEGORIES },
