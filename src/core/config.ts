@@ -82,7 +82,7 @@ const DEFAULTS: SiclawConfig = {
   },
   server: { port: 3000, gatewayUrl: "" },
   debugImage: "busybox:1.36",
-  debugNamespace: "siclaw",
+  debugNamespace: "default",
   debugPodTTL: 600,
   debugPodIdleTimeout: 60,
   allowedTools: null,
