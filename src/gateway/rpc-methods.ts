@@ -5256,7 +5256,6 @@ export function createRpcMethods(
   // Verifies ownership via the cron job (NOT the session.userId), so this RPC
   // is dedicated to cron contexts. Returns user/assistant/tool messages with
   // tool name + input + output for trace inspection.
-  const CRON_TRACE_MESSAGE_LIMIT = 200;
   methods.set("cron.runMessages", async (params, context: RpcContext) => {
     const userId = requireAuth(context);
     if (!configRepo || !chatRepo) throw new Error("Database not available");
@@ -5278,11 +5277,12 @@ export function createRpcMethods(
 
     // Fetch LIMIT + 1 to distinguish "exactly LIMIT messages" from "truncated".
     // If we get back more than LIMIT, drop the oldest and mark as truncated.
-    const fetched = await chatRepo.getMessages(run.sessionId, { limit: CRON_TRACE_MESSAGE_LIMIT + 1 });
-    const truncated = fetched.length > CRON_TRACE_MESSAGE_LIMIT;
+    const limit = CRON_LIMITS.MAX_TRACE_MESSAGES;
+    const fetched = await chatRepo.getMessages(run.sessionId, { limit: limit + 1 });
+    const truncated = fetched.length > limit;
     // getMessages returns newest-N reversed to chronological order, so the
     // oldest messages are at the front — drop from the front when truncating.
-    const msgs = truncated ? fetched.slice(fetched.length - CRON_TRACE_MESSAGE_LIMIT) : fetched;
+    const msgs = truncated ? fetched.slice(fetched.length - limit) : fetched;
     return {
       sessionId: run.sessionId,
       truncated,

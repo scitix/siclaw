@@ -359,11 +359,13 @@ function TraceMessage({ message }: { message: CronTraceMessage }) {
             </div>
         );
     }
-    // Tool call
+    // Tool call — only colorize when outcome is known (null/undefined stays neutral
+    // so we don't imply success for tools that didn't report an outcome)
     const outcomeColor =
         message.outcome === 'error' ? 'text-red-600' :
         message.outcome === 'blocked' ? 'text-orange-600' :
-        'text-green-600';
+        message.outcome === 'success' ? 'text-green-600' :
+        'text-gray-400';
     return (
         <div className="rounded-lg border border-gray-100 overflow-hidden">
             <button

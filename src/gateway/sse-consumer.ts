@@ -221,10 +221,17 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const durationMs = Date.now() - startTime;
   console.log(`[sse-consumer] ${userId} session=${sessionId}: ${eventCount} events, ${durationMs}ms`);
 
+  // Redact secrets from returned text. Tool results and assistant messages
+  // are already redacted before being written to chatRepo above, but the
+  // return values (resultText / taskReportText / errorMessage) are used by
+  // cron-service to populate cron_job_runs.result_text and notifications,
+  // both of which bypass the message persistence redaction. Match the
+  // per-message redaction to keep the run summary and trace view consistent.
+  const finalResultText = redactText(taskReportText || resultText, redactionConfig);
   return {
-    resultText: taskReportText || resultText,
-    taskReportText,
-    errorMessage,
+    resultText: finalResultText,
+    taskReportText: redactText(taskReportText, redactionConfig),
+    errorMessage: redactText(errorMessage, redactionConfig),
     eventCount,
     durationMs,
   };
