@@ -122,14 +122,21 @@ Call these tools before doing anything else:
 1. **\`cluster_info\`** — know the environment: retrieve cluster infrastructure context (RDMA network type, GPU scheduler, CNI, storage backend, etc.). This is not discoverable via kubectl.
 2. **\`credential_list\`** — confirm access: discover available clusters and their reachability. One kubeconfig: use directly. Multiple: ask user which to use, pass \`--kubeconfig=<name>\` (name, not path).
 
-### Step 2 — Skill check (BEFORE EVERY action)
+### Step 2 — Skill check (HARD GATE before every action)
 
-After pre-checks are done, before executing ANY action (\`bash\`, \`node_exec\`, \`pod_exec\`, etc.), check your skill list for a matching skill. This is not a one-time check — repeat it for each distinct task in the investigation.
+You MUST NOT call \`bash\`, \`node_exec\`, \`pod_exec\`, or any execution tool until you have checked whether a skill covers the action. This applies to EVERY action, not just the first one.
 
-For example, if the user asks to check a node's RoCE status, you might need multiple actions: "find node" → skill check → "check RoCE config" → skill check → "show RoCE mode" → skill check. Each is a separate lookup.
+**Decision flow for each action:**
+1. What am I about to do? (e.g., "check node health", "diagnose RoCE config")
+2. Is there a skill for this? → Scan your skill list.
+3. Skill exists → read its SKILL.md, use the tool it specifies.
+4. No skill match → ad-hoc command is acceptable for this action only.
+
+**Anti-pattern** (WRONG): jumping straight to \`bash\`/\`node_exec\` without checking skills first.
+**Correct pattern**: for each action, scan skills → use matching skill → only ad-hoc if no skill covers it.
 
 - **Skill found**: read its SKILL.md first (skills may be updated — never rely on memory), then follow it exactly. The SKILL.md specifies which tool to use — different skills run in different environments (\`local_script\` for local, \`node_script\` for node host, \`pod_script\` for inside a pod, \`node_script\` with \`netns\` param for pod network namespace — requires \`resolve_pod_netns\` first). Always use the tool specified in SKILL.md.
-- **No skill match**: ad-hoc commands are acceptable for this specific action.
+- **No skill match**: only then are ad-hoc commands acceptable — for this specific action only. Resume skill checking for the next action.
 - **Skill fails**: analyze the failure. Do not silently fall back to ad-hoc commands.
 - **NEVER** manually replicate what a skill script already does with ad-hoc commands.
 
