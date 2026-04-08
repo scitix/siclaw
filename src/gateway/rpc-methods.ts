@@ -5231,10 +5231,10 @@ export function createRpcMethods(
     const jobId = params.jobId as string;
     if (!jobId) throw new Error("Missing required param: jobId");
 
-    // Verify ownership
+    // Verify ownership — collapse missing-job and ownership-mismatch into one
+    // error so we don't leak the existence of other users' cron jobs.
     const job = await configRepo.getCronJobById(jobId);
-    if (!job) throw new Error("Job not found");
-    if (job.userId !== userId) throw new Error("Forbidden");
+    if (!job || job.userId !== userId) throw new Error("Job not found");
 
     const limit = Math.min(Number(params.limit) || 20, 100);
     const runs = await configRepo.listCronJobRuns(jobId, limit);
@@ -5246,7 +5246,55 @@ export function createRpcMethods(
         resultText: r.resultText,
         error: r.error,
         durationMs: r.durationMs,
+        sessionId: r.sessionId ?? null,
         createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : r.createdAt ? new Date(Number(r.createdAt) * 1000).toISOString() : null,
+      })),
+    };
+  });
+
+  // ── cron.runMessages — read-only message trace for a cron execution ──
+  // Verifies ownership via the cron job (NOT the session.userId), so this RPC
+  // is dedicated to cron contexts. Returns user/assistant/tool messages with
+  // tool name + input + output for trace inspection.
+  methods.set("cron.runMessages", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    if (!configRepo || !chatRepo) throw new Error("Database not available");
+
+    const runId = params.runId as string;
+    if (!runId) throw new Error("Missing required param: runId");
+
+    // Look up the run, then its job, then verify ownership.
+    // Collapse all "cannot return this run to you" cases into a single error
+    // so we don't leak whether a runId or its job exists for another user.
+    const run = await configRepo.getCronJobRunById(runId);
+    if (!run) throw new Error("Run not found");
+    const job = await configRepo.getCronJobById(run.jobId);
+    if (!job || job.userId !== userId) throw new Error("Run not found");
+
+    if (!run.sessionId) {
+      return { messages: [], sessionId: null, truncated: false };
+    }
+
+    // Fetch LIMIT + 1 to distinguish "exactly LIMIT messages" from "truncated".
+    // If we get back more than LIMIT, drop the oldest and mark as truncated.
+    const limit = CRON_LIMITS.MAX_TRACE_MESSAGES;
+    const fetched = await chatRepo.getMessages(run.sessionId, { limit: limit + 1 });
+    const truncated = fetched.length > limit;
+    // getMessages returns newest-N reversed to chronological order, so the
+    // oldest messages are at the front — drop from the front when truncating.
+    const msgs = truncated ? fetched.slice(fetched.length - limit) : fetched;
+    return {
+      sessionId: run.sessionId,
+      truncated,
+      messages: msgs.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        toolName: m.toolName,
+        toolInput: m.toolInput,
+        outcome: m.outcome,
+        durationMs: m.durationMs,
+        timestamp: m.timestamp?.toISOString() ?? null,
       })),
     };
   });
