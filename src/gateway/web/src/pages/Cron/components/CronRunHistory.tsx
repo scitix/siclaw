@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { X, CheckCircle2, AlertTriangle, Loader2, Clock, FileText, Activity, ChevronDown, ChevronRight, Wrench } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from '@/lib/utils';
@@ -66,6 +66,8 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
     const [traceTruncated, setTraceTruncated] = useState(false);
     const [traceLoading, setTraceLoading] = useState(false);
     const [traceError, setTraceError] = useState<string | null>(null);
+    // Race guard: only the latest loadTrace() may write state
+    const traceRequestIdRef = useRef(0);
 
     useEffect(() => {
         if (isOpen) {
@@ -76,13 +78,16 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, job.id]);
 
-    // Reset trace state when leaving detail view
+    // Reset trace state when leaving detail view.
+    // Bump requestId so any in-flight loadTrace is discarded on resolve.
     useEffect(() => {
         if (!selectedRun) {
+            traceRequestIdRef.current++;
             setShowTrace(false);
             setTraceMessages([]);
             setTraceTruncated(false);
             setTraceError(null);
+            setTraceLoading(false);
         }
     }, [selectedRun]);
 
@@ -99,22 +104,30 @@ export function CronRunHistory({ job, isOpen, onClose, sendRpc }: CronRunHistory
     };
 
     const loadTrace = async (runId: string) => {
+        const requestId = ++traceRequestIdRef.current;
         setTraceLoading(true);
         setTraceError(null);
+        setTraceMessages([]);
+        setTraceTruncated(false);
         try {
             const result = await sendRpc<{
                 messages: CronTraceMessage[];
                 sessionId: string | null;
                 truncated?: boolean;
             }>('cron.runMessages', { runId });
+            // Drop stale responses — a newer loadTrace (or a reset) has superseded this one
+            if (requestId !== traceRequestIdRef.current) return;
             setTraceMessages(result.messages ?? []);
             setTraceTruncated(Boolean(result.truncated));
         } catch (err) {
+            if (requestId !== traceRequestIdRef.current) return;
             const msg = err instanceof Error ? err.message : String(err);
             console.error('[CronRunHistory] Failed to load trace:', msg);
             setTraceError(msg);
         } finally {
-            setTraceLoading(false);
+            if (requestId === traceRequestIdRef.current) {
+                setTraceLoading(false);
+            }
         }
     };
 

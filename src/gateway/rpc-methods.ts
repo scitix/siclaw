@@ -5276,12 +5276,16 @@ export function createRpcMethods(
       return { messages: [], sessionId: null, truncated: false };
     }
 
-    const msgs = await chatRepo.getMessages(run.sessionId, { limit: CRON_TRACE_MESSAGE_LIMIT });
+    // Fetch LIMIT + 1 to distinguish "exactly LIMIT messages" from "truncated".
+    // If we get back more than LIMIT, drop the oldest and mark as truncated.
+    const fetched = await chatRepo.getMessages(run.sessionId, { limit: CRON_TRACE_MESSAGE_LIMIT + 1 });
+    const truncated = fetched.length > CRON_TRACE_MESSAGE_LIMIT;
+    // getMessages returns newest-N reversed to chronological order, so the
+    // oldest messages are at the front — drop from the front when truncating.
+    const msgs = truncated ? fetched.slice(fetched.length - CRON_TRACE_MESSAGE_LIMIT) : fetched;
     return {
       sessionId: run.sessionId,
-      // getMessages returns newest-N then reverses, so when length === limit
-      // we know older messages were dropped. The frontend renders a banner.
-      truncated: msgs.length === CRON_TRACE_MESSAGE_LIMIT,
+      truncated,
       messages: msgs.map((m) => ({
         id: m.id,
         role: m.role,
