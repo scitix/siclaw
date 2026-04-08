@@ -39,6 +39,7 @@ export interface PilotAreaProps {
     sendRpc?: RpcSendFn;
     contextUsage?: ContextUsage | null;
     isCompacting?: boolean;
+    isRetrying?: boolean;
     onOpenSchedulePanel?: (msg: PilotMessage) => void;
     onOpenSkillPanel?: (msg: PilotMessage) => void;
     updateMessageMeta?: (messageId: string, meta: Record<string, unknown>) => Promise<void>;
@@ -107,7 +108,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, onOpenSchedulePanel, onOpenSkillPanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, isRetrying, onOpenSchedulePanel, onOpenSkillPanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -530,7 +531,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                     </div>
                 </div>
             )}
-            <InputArea onSend={wrappedSendMessage} onAbort={wrappedAbort} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
+            <InputArea onSend={wrappedSendMessage} onAbort={wrappedAbort} disabled={!isConnected} isLoading={isLoading} contextUsage={contextUsage} isCompacting={isCompacting} isRetrying={isRetrying} pendingMessages={pendingMessages} onRemovePending={onRemovePending} dpFocus={dpFocus} dpActive={dpActive} onSetDpActive={onSetDpActive} hasMessages={messages.length > 0} draft={chipDraft} draftSeq={chipSeq} />
         </div>
     );
 }

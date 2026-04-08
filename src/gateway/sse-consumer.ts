@@ -210,7 +210,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       onEvent(evt, eventType, { dbMessageId });
     }
 
-    if (eventType === "agent_end") break;
+    // Do NOT break on agent_end — the brain may retry (empty-response guard)
+    // which emits another agent_start/agent_end cycle. The loop ends naturally
+    // when the agentbox closes the SSE stream after prompt() fully resolves.
   }
 
   // Fallback: if no message_end arrived but we have accumulated text

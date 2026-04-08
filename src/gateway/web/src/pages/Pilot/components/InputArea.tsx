@@ -24,6 +24,7 @@ interface InputAreaProps {
     isLoading?: boolean;
     contextUsage?: ContextUsage | null;
     isCompacting?: boolean;
+    isRetrying?: boolean;
     pendingMessages?: string[];
     onRemovePending?: (index: number) => void;
     dpFocus?: string | null;
@@ -37,7 +38,7 @@ interface InputAreaProps {
     draftSeq?: number;
 }
 
-export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
+export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, isCompacting, isRetrying, pendingMessages, onRemovePending, dpFocus, dpActive, onSetDpActive, hasMessages, draft, draftSeq }: InputAreaProps) {
     const [value, setValue] = useState('');
     const [isFocused, setIsFocused] = useState(false);
     const [isAborting, setIsAborting] = useState(false);
@@ -271,7 +272,12 @@ export function InputArea({ onSend, onAbort, disabled, isLoading, contextUsage, 
                         <p className="text-xs text-gray-400">
                             AI may make mistakes. Please verify important information.
                         </p>
-                        {isCompacting ? (
+                        {isRetrying ? (
+                            <div className="flex items-center gap-1.5 text-xs text-amber-500">
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                <span>Retrying...</span>
+                            </div>
+                        ) : isCompacting ? (
                             <div className="flex items-center gap-1.5 text-xs text-amber-500">
                                 <Loader2 className="w-3 h-3 animate-spin" />
                                 <span>Compacting...</span>
