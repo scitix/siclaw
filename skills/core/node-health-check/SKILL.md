@@ -143,6 +143,10 @@ kubectl describe node <node> | grep -A 20 "Allocated resources"
 
 Compare the total requests against allocatable resources. If CPU or memory requests exceed 90% of allocatable, new pods may fail to schedule on this node.
 
+### 6. Node hardware / resource diagnostics
+
+After general health checks, search your skill list for node-level hardware or resource diagnostic skills (e.g., RDMA/RoCE config checks, GPU diagnostics, storage checks). Run any that match this node's characteristics. Each skill auto-detects whether it applies to the node — no pre-check needed on your part.
+
 ## Notes
 
 - `kubectl top` requires the Metrics Server to be installed in the cluster. If it returns an error, the metrics server may not be available.
