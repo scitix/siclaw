@@ -151,6 +151,7 @@ export function PilotPage() {
                         sendRpc={pilot.sendRpc}
                         contextUsage={pilot.contextUsage}
                         isCompacting={pilot.isCompacting}
+                        isRetrying={pilot.isRetrying}
                         onOpenSchedulePanel={handleOpenSchedulePanel}
                         onOpenSkillPanel={handleOpenSkillPanel}
                         selectedWorkspaceId={currentWorkspace?.id ?? null}
