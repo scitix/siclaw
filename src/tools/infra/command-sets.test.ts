@@ -1381,4 +1381,47 @@ describe("validateCommandRestrictions", () => {
       expect(validateCommandRestrictions("")).toBeNull();
     });
   });
+
+  describe("grep -r blocked per-command, not per-category (#218)", () => {
+    const local = { context: "local", piped: true };
+    const node  = { context: "node" };
+    const pod   = { context: "pod" };
+
+    it("blocks grep -r in all contexts", () => {
+      for (const opts of [local, node, pod]) {
+        const err = validateCommandRestrictions("grep -r pattern .", opts);
+        expect(err).not.toBeNull();
+      }
+    });
+
+    it("blocks grep -R and --recursive", () => {
+      expect(validateCommandRestrictions("grep -R pattern .", local)).not.toBeNull();
+      expect(validateCommandRestrictions("grep --recursive pattern .", local)).not.toBeNull();
+    });
+
+    it("blocks egrep/fgrep -r", () => {
+      expect(validateCommandRestrictions("egrep -r pattern .", local)).not.toBeNull();
+      expect(validateCommandRestrictions("fgrep -r pattern .", local)).not.toBeNull();
+    });
+
+    it("allows jq -r in local context", () => {
+      expect(validateCommandRestrictions("jq -r .name", local)).toBeNull();
+    });
+
+    it("allows sort -r in local context", () => {
+      expect(validateCommandRestrictions("sort -r", local)).toBeNull();
+    });
+
+    it("allows sort -rn (combined short flags) in local context", () => {
+      expect(validateCommandRestrictions("sort -rn", local)).toBeNull();
+    });
+
+    it("allows yq -r in local context", () => {
+      expect(validateCommandRestrictions("yq -r .name", local)).toBeNull();
+    });
+
+    it("allows grep without -r in local context", () => {
+      expect(validateCommandRestrictions("grep pattern", local)).toBeNull();
+    });
+  });
 });
