@@ -2335,6 +2335,17 @@ export function createRpcMethods(
       }
     }
 
+    // Save steer message to DB (like chat.send saves the initial user message)
+    if (chatRepo) {
+      const effectiveSessionId = sessionId ?? stream.sessionId;
+      await chatRepo.appendMessage({
+        sessionId: effectiveSessionId,
+        role: "user",
+        content: text,
+      });
+      await chatRepo.incrementMessageCount(effectiveSessionId);
+    }
+
     const client = new AgentBoxClient(stream.endpoint, 30000, agentBoxTlsOptions);
     await client.steerSession(stream.sessionId, text);
     return { status: "steered" };
