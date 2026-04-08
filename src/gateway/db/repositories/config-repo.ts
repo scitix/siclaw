@@ -183,6 +183,15 @@ export class ConfigRepository {
       .limit(limit);
   }
 
+  async getCronJobRunById(runId: string) {
+    const rows = await this.db
+      .select()
+      .from(cronJobRuns)
+      .where(eq(cronJobRuns.id, runId))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async assignCronJob(jobId: string, instanceId: string) {
     await this.db
       .update(cronJobs)

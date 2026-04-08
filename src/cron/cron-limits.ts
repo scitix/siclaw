@@ -14,4 +14,6 @@ export const CRON_LIMITS = {
   ABSOLUTE_MIN_GAP_MS: 10 * 60 * 1000,
   /** How many consecutive fires to sample when computing average interval */
   INTERVAL_SAMPLE_COUNT: 10,
+  /** Max messages returned by cron.runMessages (trace view); older are dropped */
+  MAX_TRACE_MESSAGES: 200,
 } as const;
