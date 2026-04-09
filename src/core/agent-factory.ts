@@ -1,5 +1,5 @@
 import fs from "node:fs";
-
+import os from "node:os";
 import path from "node:path";
 import { buildKnowledgeOverview } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
@@ -354,7 +354,7 @@ export async function createSiclawSession(
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
   const knowledgeDir = path.resolve(cwd, config.paths.knowledgeDir);
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir];
+  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir, os.tmpdir()];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
