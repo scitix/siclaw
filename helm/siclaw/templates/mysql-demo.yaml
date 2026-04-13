@@ -1,0 +1,93 @@
+{{- if .Values.mysql.enabled }}
+# Demo MySQL — for testing only, NOT for production.
+# Data is stored on emptyDir and will be lost when pod restarts.
+# For production, use a managed database service or a proper MySQL Helm chart.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "siclaw.fullname" . }}-mysql
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "mysql") | nindent 4 }}
+type: Opaque
+data:
+  password: {{ .Values.mysql.password | b64enc | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.fullname" . }}-mysql
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "mysql") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "mysql") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "mysql") | nindent 8 }}
+    spec:
+      containers:
+        - name: mysql
+          image: {{ .Values.mysql.image }}
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_DATABASE
+              value: {{ .Values.mysql.database }}
+            - name: MYSQL_USER
+              value: {{ .Values.mysql.username }}
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-mysql
+                  key: password
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-mysql
+                  key: password
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", {{ .Values.mysql.username | quote }}, "--password=$(MYSQL_PASSWORD)"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", {{ .Values.mysql.username | quote }}, "--password=$(MYSQL_PASSWORD)"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siclaw.fullname" . }}-mysql
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "mysql") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3306
+      targetPort: 3306
+      protocol: TCP
+      name: mysql
+  selector:
+    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "mysql") | nindent 4 }}
+{{- end }}
