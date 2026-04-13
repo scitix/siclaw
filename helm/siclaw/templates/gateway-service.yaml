@@ -1,23 +1,20 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "siclaw.fullname" . }}-gateway
-  namespace: {{ .Values.namespace }}
+  name: {{ include "siclaw.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    {{- include "siclaw.labels" (dict "ctx" . "component" "runtime") | nindent 4 }}
 spec:
-  type: {{ .Values.gateway.service.type }}
+  type: ClusterIP
   ports:
-    - port: {{ .Values.gateway.service.port }}
+    - port: 3001
       targetPort: http
       protocol: TCP
       name: http
-      {{- if and (eq .Values.gateway.service.type "NodePort") .Values.gateway.service.nodePort }}
-      nodePort: {{ .Values.gateway.service.nodePort }}
-      {{- end }}
-    - port: {{ .Values.gateway.service.internalPort | default 3002 }}
+    - port: 3002
       targetPort: https-internal
       protocol: TCP
       name: https-internal
   selector:
-    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 4 }}

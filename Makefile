@@ -3,7 +3,7 @@
 # Usage:
 #   make help                                    — Show all targets
 #   make docker push REGISTRY=myregistry.com     — Build & push all images
-#   make docker-agentbox push-agentbox           — Build & push agentbox only
+#   make docker-portal push-portal               — Build & push portal only
 #
 # Deploy via Helm:
 #   helm upgrade --install siclaw ./helm/siclaw -f helm/siclaw/values-local.yaml
@@ -15,13 +15,14 @@ GIT_DIRTY  := $(shell test -n "$$(git status --porcelain)" && echo "-dirty" || e
 VERSION    := $(shell node -p "require('./package.json').version" 2>/dev/null || echo "0.0.0")
 
 # ── Configurable variables ──
-REGISTRY  ?= siclaw
+REGISTRY  ?= scitix
 NAMESPACE ?= siclaw
 TAG       ?= $(if $(GIT_TAG),$(GIT_TAG),$(VERSION)-$(GIT_COMMIT)$(GIT_DIRTY))
 
 # ── Image names ──
-GATEWAY_IMAGE  = $(REGISTRY)/siclaw-gateway:$(TAG)
+RUNTIME_IMAGE  = $(REGISTRY)/siclaw-runtime:$(TAG)
 AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
+PORTAL_IMAGE   = $(REGISTRY)/siclaw-portal:$(TAG)
 
 # ── OCI labels injected into every image ──
 DOCKER_LABELS = \
@@ -42,40 +43,55 @@ help: ## Show this help
 tui: ## Run TUI agent (interactive terminal)
 	npx tsx src/cli-main.ts
 
-gateway: build-web ## Run Gateway server (multi-user, local spawner)
+runtime: ## Run Agent Runtime (multi-user, local spawner)
 	npx tsx src/gateway-main.ts
 
+portal: ## Run Portal server (standalone web UI + management)
+	npx tsx src/portal-main.ts
+
+portal-web: ## Run Portal frontend dev server
+	cd portal-web && npm run dev
+
 dev: tui ## Alias for tui
+
+dev-all: ## Run Runtime + Portal together (use in two terminals)
+	@echo "Terminal 1: make runtime"
+	@echo "Terminal 2: make portal"
+	@echo "Terminal 3: make portal-web (optional, for frontend dev)"
 
 # ==================== Build ====================
 ##@ Build
 
-build: build-ts build-web ## Compile TypeScript + Web frontend
-
-build-ts: ## Compile TypeScript
+build: ## Compile TypeScript
 	npx tsc --project tsconfig.json
 
-build-web: ## Compile Web frontend (Vite)
-	cd src/gateway/web && npm install && npm run build
+build-portal-web: ## Compile Portal frontend (Vite)
+	cd portal-web && npm install && npm run build
 
 # ==================== Docker ====================
 ##@ Docker
 
-docker: docker-gateway docker-agentbox ## Build all Docker images (parallel with make -j2)
+docker: docker-runtime docker-agentbox docker-portal ## Build all Docker images
 
-docker-gateway: ## Build gateway image
-	docker build -f Dockerfile.gateway $(DOCKER_LABELS) -t $(GATEWAY_IMAGE) .
+docker-runtime: ## Build runtime image
+	docker build -f Dockerfile.gateway $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
 
 docker-agentbox: ## Build agentbox image
 	docker build -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
 
-push: push-gateway push-agentbox ## Push all images to registry
+docker-portal: ## Build portal image
+	docker build -f Dockerfile.portal $(DOCKER_LABELS) -t $(PORTAL_IMAGE) .
 
-push-gateway: ## Push gateway image
-	docker push $(GATEWAY_IMAGE)
+push: push-runtime push-agentbox push-portal ## Push all images to registry
+
+push-runtime: ## Push runtime image
+	docker push $(RUNTIME_IMAGE)
 
 push-agentbox: ## Push agentbox image
 	docker push $(AGENTBOX_IMAGE)
+
+push-portal: ## Push portal image
+	docker push $(PORTAL_IMAGE)
 
 # ==================== Test ====================
 ##@ Test
@@ -97,20 +113,26 @@ info: ## Print build variables
 	@echo "GIT_TAG:     $(or $(GIT_TAG),(none))"
 	@echo "TAG:         $(TAG)"
 	@echo "REGISTRY:    $(REGISTRY)"
-	@echo "GATEWAY:     $(GATEWAY_IMAGE)"
+	@echo "RUNTIME:     $(RUNTIME_IMAGE)"
 	@echo "AGENTBOX:    $(AGENTBOX_IMAGE)"
+	@echo "PORTAL:      $(PORTAL_IMAGE)"
 
 logs: ## View recent logs (all components)
-	@echo "=== Gateway ===" && \
-	kubectl -n $(NAMESPACE) logs --tail=50 -l app=siclaw-gateway 2>/dev/null; \
+	@echo "=== Runtime ===" && \
+	kubectl -n $(NAMESPACE) logs --tail=50 -l app.kubernetes.io/component=runtime 2>/dev/null; \
+	echo "\n=== Portal ===" && \
+	kubectl -n $(NAMESPACE) logs --tail=50 -l app.kubernetes.io/component=portal 2>/dev/null; \
 	echo "\n=== AgentBox ===" && \
 	for pod in $$(kubectl -n $(NAMESPACE) get pods -l siclaw.io/app=agentbox --no-headers -o name 2>/dev/null); do \
 		echo "--- $$pod ---"; \
 		kubectl -n $(NAMESPACE) logs --tail=30 $$pod; \
 	done
 
-logs-gateway: ## Follow gateway logs
-	kubectl -n $(NAMESPACE) logs -f deployment/siclaw-gateway
+logs-runtime: ## Follow runtime logs
+	kubectl -n $(NAMESPACE) logs -f -l app.kubernetes.io/component=runtime
+
+logs-portal: ## Follow portal logs
+	kubectl -n $(NAMESPACE) logs -f -l app.kubernetes.io/component=portal
 
 logs-agentbox: ## Follow latest agentbox logs
 	kubectl -n $(NAMESPACE) logs -f $$(kubectl -n $(NAMESPACE) get pods -l siclaw.io/app=agentbox --sort-by=.metadata.creationTimestamp --no-headers -o name | tail -1)
@@ -119,17 +141,18 @@ status: ## Show K8s deployment status
 	@echo "=== Pods ==="
 	@kubectl -n $(NAMESPACE) get pods -o wide
 	@echo "\n=== Images ==="
-	@kubectl -n $(NAMESPACE) get deployment siclaw-gateway -o jsonpath='gateway:  {.spec.template.spec.containers[0].image}{"\n"}' 2>/dev/null || true
+	@kubectl -n $(NAMESPACE) get deployment -o custom-columns='NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image' 2>/dev/null || true
 
 # ==================== Clean ====================
 ##@ Clean
 
 clean: ## Remove build artifacts
-	rm -rf dist *.tsbuildinfo src/gateway/web/dist
+	rm -rf dist *.tsbuildinfo portal-web/dist
 
 # ── All targets are phony (no file outputs) ──
-.PHONY: help tui gateway dev build build-ts build-web \
-	docker docker-gateway docker-agentbox \
-	push push-gateway push-agentbox \
+.PHONY: help tui runtime portal portal-web dev dev-all \
+	build build-portal-web \
+	docker docker-runtime docker-agentbox docker-portal \
+	push push-runtime push-agentbox push-portal \
 	test typecheck unit \
-	info logs logs-gateway logs-agentbox status clean
+	info logs logs-runtime logs-portal logs-agentbox status clean

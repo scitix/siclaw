@@ -1,28 +1,28 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "siclaw.fullname" . }}-gateway
-  namespace: {{ .Values.namespace }}
+  name: {{ include "siclaw.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
+    {{- include "siclaw.labels" (dict "ctx" . "component" "runtime") | nindent 4 }}
 spec:
-  replicas: {{ .Values.gateway.replicas }}
+  replicas: {{ .Values.runtime.replicas }}
   selector:
     matchLabels:
-      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 6 }}
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "gateway") | nindent 8 }}
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 8 }}
     spec:
       serviceAccountName: {{ include "siclaw.fullname" . }}-gateway
       containers:
-        - name: gateway
-          image: {{ include "siclaw.image" (dict "component" "gateway" "ctx" .) }}
+        - name: runtime
+          image: {{ include "siclaw.image" (dict "component" "runtime" "ctx" .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 3000
+              containerPort: 3001
               protocol: TCP
             - name: https-internal
               containerPort: 3002
@@ -30,9 +30,11 @@ spec:
           env:
             - name: NODE_ENV
               value: "production"
-            - name: PORT
-              value: "3000"
-            - name: HOST
+            - name: SICLAW_PORT
+              value: "3001"
+            - name: SICLAW_INTERNAL_PORT
+              value: "3002"
+            - name: SICLAW_HOST
               value: "0.0.0.0"
             - name: SICLAW_K8S_NAMESPACE
               valueFrom:
@@ -40,6 +42,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: SICLAW_AGENTBOX_IMAGE
               value: {{ include "siclaw.agentboxImage" . }}
+            - name: SICLAW_GATEWAY_HOSTNAME
+              value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
             {{- if .Values.agentbox.persistence.enabled }}
             - name: SICLAW_PERSISTENCE_ENABLED
               value: "true"
@@ -50,29 +54,43 @@ spec:
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
             {{- end }}
+            # Database + JWT (shared with Portal/Upstream)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-runtime
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-runtime
+                  key: jwt-secret
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
-            - name: SICLAW_GATEWAY_HOSTNAME
-              value: "{{ include "siclaw.fullname" . }}-gateway.{{ .Values.namespace }}.svc.cluster.local"
-            {{- if .Values.database.existingSecret.name }}
-            - name: SICLAW_DATABASE_URL
+            # Trusted Proxy secret
+            - name: SICLAW_RUNTIME_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.database.existingSecret.name }}
-                  key: {{ .Values.database.existingSecret.key }}
-            {{- else if .Values.database.url }}
-            - name: SICLAW_DATABASE_URL
+                  name: {{ include "siclaw.fullname" . }}-runtime
+                  key: runtime-secret
+            # Adapter API — auto-discover Portal if enabled, else use configured URL
+            - name: SICLAW_SERVER_URL
+              {{- if .Values.portal.enabled }}
+              value: "http://{{ include "siclaw.fullname" . }}-portal:{{ .Values.portal.service.port }}"
+              {{- else }}
+              value: {{ .Values.runtime.serverUrl | quote }}
+              {{- end }}
+            - name: SICLAW_PORTAL_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "siclaw.fullname" . }}
-                  key: database-url
-            {{- end }}
-            {{- range $key, $value := .Values.gateway.env }}
+                  name: {{ include "siclaw.fullname" . }}-runtime
+                  key: portal-secret
+            {{- range $key, $value := .Values.runtime.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
           resources:
-            {{- toYaml .Values.gateway.resources | nindent 12 }}
+            {{- toYaml .Values.runtime.resources | nindent 12 }}
           volumeMounts:
             - name: skills
               mountPath: /app/.siclaw/skills
