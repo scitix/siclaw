@@ -48,10 +48,10 @@ spec:
     - name: PI_CODING_AGENT_DIR
       value: ".siclaw/user-data/agent"
     - name: SICLAW_GATEWAY_URL
-      value: "https://siclaw-gateway.${NAMESPACE}.svc.cluster.local:3002"
-    - name: SICLAW_WORKSPACE_ID
-      value: "${WORKSPACE_ID}"
-    # LLM config + settings.json are injected dynamically by gateway via RPC
+      value: "https://siclaw-runtime.${NAMESPACE}.svc.cluster.local:3002"
+    - name: SICLAW_AGENT_ID
+      value: "${AGENT_ID}"
+    # LLM config + settings.json are injected dynamically by Runtime via RPC
 
     # Resource limits
     resources:

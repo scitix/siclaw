@@ -3,7 +3,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: {{ include "siclaw.fullname" . }}-agentbox
-  namespace: {{ .Values.metrics.podMonitor.namespace | default .Values.namespace }}
+  namespace: {{ .Values.metrics.podMonitor.namespace | default .Release.Namespace }}
   labels:
     {{- include "siclaw.labels" (dict "ctx" . "component" "agentbox") | nindent 4 }}
     {{- with .Values.metrics.podMonitor.additionalLabels }}

@@ -1,0 +1,74 @@
+{{- if .Values.portal.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.fullname" . }}-portal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "portal") | nindent 4 }}
+spec:
+  replicas: {{ .Values.portal.replicas }}
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "portal") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "portal") | nindent 8 }}
+    spec:
+      containers:
+        - name: portal
+          image: {{ include "siclaw.image" (dict "component" "portal" "ctx" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3003
+              protocol: TCP
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORTAL_PORT
+              value: "3003"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: jwt-secret
+            - name: SICLAW_RUNTIME_URL
+              value: "http://{{ include "siclaw.fullname" . }}-runtime:3001"
+            - name: SICLAW_RUNTIME_WS_URL
+              value: "ws://{{ include "siclaw.fullname" . }}-runtime:3001"
+            - name: SICLAW_RUNTIME_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: runtime-secret
+            - name: SICLAW_PORTAL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "siclaw.fullname" . }}-portal
+                  key: portal-secret
+            {{- range $key, $value := .Values.portal.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.portal.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+{{- end }}

@@ -1,0 +1,53 @@
+# Siclaw Portal — Docker Image
+# Three-stage build: frontend (Vite) + backend (tsc) → production runtime
+
+# ── Frontend build ──────────────────────────────────────────
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /app/portal-web
+
+COPY portal-web/package*.json ./
+RUN npm ci
+
+COPY portal-web/ ./
+RUN npm run build
+
+# ── Backend build ───────────────────────────────────────────
+FROM node:22-slim AS backend-builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npx tsc
+
+# ── Production ──────────────────────────────────────────────
+FROM node:22-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+# Backend JS
+COPY --from=backend-builder /app/dist/ ./dist/
+
+# Frontend static files → served by Portal server
+COPY --from=frontend-builder /app/portal-web/dist/ ./portal-web/dist/
+
+ENV NODE_ENV=production
+ENV PORTAL_PORT=3003
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3003/api/health || exit 1
+
+EXPOSE 3003
+
+CMD ["node", "dist/portal-main.js"]

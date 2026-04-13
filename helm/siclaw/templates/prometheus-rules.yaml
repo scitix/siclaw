@@ -3,7 +3,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: {{ include "siclaw.fullname" . }}
-  namespace: {{ .Values.metrics.prometheusRule.namespace | default .Values.namespace }}
+  namespace: {{ .Values.metrics.prometheusRule.namespace | default .Release.Namespace }}
   labels:
     {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
     {{- with .Values.metrics.prometheusRule.additionalLabels }}
