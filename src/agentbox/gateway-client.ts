@@ -23,7 +23,7 @@ export interface CronJob {
   description?: string | null;
   lastRunAt?: string | null;
   lastResult?: string | null;
-  workspaceId?: string | null;
+  agentId?: string | null;
 }
 
 export class GatewayClient {
@@ -64,10 +64,10 @@ export class GatewayClient {
   /**
    * List cron jobs for a user
    */
-  async listCronJobs(userId: string, workspaceId?: string): Promise<CronJob[]> {
+  async listCronJobs(userId: string, agentId?: string): Promise<CronJob[]> {
     let url = `/api/internal/cron-list?userId=${encodeURIComponent(userId)}`;
-    if (workspaceId) {
-      url += `&workspaceId=${encodeURIComponent(workspaceId)}`;
+    if (agentId) {
+      url += `&agentId=${encodeURIComponent(agentId)}`;
     }
     const data = await this.request(url, "GET");
     return data.jobs || [];

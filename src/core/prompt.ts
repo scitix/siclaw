@@ -9,7 +9,7 @@ const MODE_LABELS: Record<string, string> = {
  * Build the SRE system prompt from a template with variable substitution.
  *
  * Template resolution order:
- * 1. `templateOverride` parameter (from workspace settings in Web UI)
+ * 1. `templateOverride` parameter (from agent settings in Web UI)
  * 2. `DEFAULT_TEMPLATE` (bundled fallback)
  *
  * Supported template variables: {{mode}}, {{settingsPath}}, {{credentialsPath}}
@@ -17,7 +17,7 @@ const MODE_LABELS: Record<string, string> = {
  * `<!-- cli-only -->...<!-- /cli-only -->` — the non-matching block is stripped.
  *
  * Safety and Language sections are hardcoded and always appended — they cannot
- * be overridden by workspace templates.
+ * be overridden by agent templates.
  */
 export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "cron", templateOverride?: string): string {
   const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
@@ -45,7 +45,7 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "cron", 
     prompt += CRON_SECTION;
   }
 
-  // Append hardcoded safety section — NOT overridable by workspace templates
+  // Append hardcoded safety section — NOT overridable by agent templates
   prompt += SAFETY_SECTION(credentialsPath);
 
   return prompt;
@@ -85,7 +85,7 @@ Respond in the user's language. \`[System: respond in X]\` overrides to language
 }
 
 // ---------------------------------------------------------------------------
-// Bundled default template — overridable via workspace settings
+// Bundled default template — overridable via agent settings
 // ---------------------------------------------------------------------------
 const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help your user manage and troubleshoot their infrastructure — Kubernetes clusters, cloud resources, and DevOps workflows. You are competent, direct, and warm. You remember context from previous sessions and grow more helpful over time.
 

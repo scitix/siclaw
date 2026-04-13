@@ -13,7 +13,7 @@ export interface OverviewOpts {
 }
 
 /**
- * Build a concise knowledge overview from workspace directories.
+ * Build a concise knowledge overview from content directories.
  * Scans repos/, docs/, and investigations/ (topic files no longer injected).
  * Pure sync filesystem scan — no DB dependency.
  * Returns empty string if no knowledge files exist.
@@ -103,8 +103,8 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   }
 
   // --- Footer ---
-  const hasWorkspace = repoEntries.length > 0 || docEntries.length > 0;
-  const footer = hasWorkspace
+  const hasContent = repoEntries.length > 0 || docEntries.length > 0;
+  const footer = hasContent
     ? '\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.'
     : '\n\nUse `memory_search` to find specific facts from past sessions or investigations.';
   parts.push(footer);

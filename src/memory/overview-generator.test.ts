@@ -294,7 +294,7 @@ describe("buildKnowledgeOverview", () => {
     expect(result).toContain("Pod CrashLoopBackOff");
   });
 
-  it("uses workspace-aware footer when repos or docs present", () => {
+  it("uses content-aware footer when repos or docs present", () => {
     fs.mkdirSync(reposDir);
     const repo = path.join(reposDir, "svc");
     fs.mkdirSync(repo);

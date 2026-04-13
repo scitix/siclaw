@@ -92,6 +92,9 @@ export class AgentBoxSessionManager {
   /** Optional knowledge base indexer — set by LocalSpawner for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
 
+  /** Optional credential broker — set by http-server for on-demand credential acquisition */
+  credentialBroker?: import("./credential-broker.js").CredentialBroker;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -206,6 +209,7 @@ export class AgentBoxSessionManager {
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
       credentialsDir: path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
     };
     const effectiveMode = mode ?? "web";
     const effectiveBrainType = brainType ?? "pi-agent";

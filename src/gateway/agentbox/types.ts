@@ -8,9 +8,11 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 /** AgentBox configuration */
 export interface AgentBoxConfig {
   userId: string;
-  /** Workspace ID (composite cache key with userId) */
-  workspaceId?: string;
-  /** Allowed tools list for this workspace (null = all) */
+  /** Agent ID — each AgentBox serves one agent (composite cache key with userId) */
+  agentId?: string;
+  /** Organization ID — for RBAC scoping in Upstream Adapter */
+  orgId?: string;
+  /** Allowed tools list for this agent (null = all) */
   allowedTools?: string[] | null;
   /** Environment variables */
   env?: Record<string, string>;
@@ -27,8 +29,8 @@ export interface AgentBoxConfig {
 export interface AgentBoxInfo {
   boxId: string;
   userId: string;
-  /** Workspace ID this box serves (from K8s label or cache key) */
-  workspaceId?: string;
+  /** Agent ID this box serves (from K8s label or cache key) */
+  agentId?: string;
   status: AgentBoxStatus;
   endpoint: string;
   createdAt: Date;
@@ -40,6 +42,6 @@ export interface AgentBoxHandle {
   boxId: string;
   userId: string;
   endpoint: string;
-  /** Workspace ID this box serves (used for credential push) */
-  workspaceId?: string;
+  /** Agent ID this box serves */
+  agentId?: string;
 }
