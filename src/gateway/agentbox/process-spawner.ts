@@ -34,8 +34,8 @@ export class ProcessSpawner implements BoxSpawner {
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { userId } = config;
-    const workspaceId = config.workspaceId || "default";
-    const boxId = `proc-${userId}-${workspaceId}`;
+    const agentId = config.agentId || "default";
+    const boxId = `proc-${userId}-${agentId}`;
 
     const existing = this.boxes.get(boxId);
     if (existing) {
@@ -64,7 +64,7 @@ export class ProcessSpawner implements BoxSpawner {
       USER_ID: userId,
     };
 
-    // Forward workspace-specific env vars
+    // Forward agent-specific env vars
     if (config.env) {
       Object.assign(env, config.env);
     }

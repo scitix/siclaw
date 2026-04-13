@@ -6,7 +6,7 @@
  * infinite agent loops (the OOM crash root cause).
  *
  * Ported from OpenClaw's src/agents/pi-extensions/compaction-safeguard.ts,
- * simplified for Siclaw (no runtime registry, no workspace context injection,
+ * simplified for Siclaw (no runtime registry, no agent context injection,
  * no language-preservation instructions).
  */
 import type { AgentMessage } from "@mariozechner/pi-agent-core";

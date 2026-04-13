@@ -16,8 +16,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Copy backend source only (exclude src/gateway/web — frontend not needed)
-COPY tsconfig.json ./
+# Copy backend source only (AgentBox + core + tools + minimal gateway modules)
+COPY tsconfig.json tsconfig.agentbox.json ./
 COPY src/agentbox-main.ts ./src/
 COPY src/agentbox/ ./src/agentbox/
 COPY src/core/ ./src/core/
@@ -25,18 +25,13 @@ COPY src/cron/ ./src/cron/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
 COPY src/tools/ ./src/tools/
-COPY src/gateway/*.ts ./src/gateway/
+COPY src/gateway/config.ts src/gateway/db.ts src/gateway/jwt.ts \
+     src/gateway/metrics-aggregator.ts src/gateway/ws-protocol.ts ./src/gateway/
 COPY src/gateway/agentbox/ ./src/gateway/agentbox/
-COPY src/gateway/auth/ ./src/gateway/auth/
-COPY src/gateway/channels/ ./src/gateway/channels/
-COPY src/gateway/cron/ ./src/gateway/cron/
-COPY src/gateway/db/ ./src/gateway/db/
-COPY src/gateway/plugins/ ./src/gateway/plugins/
 COPY src/gateway/security/ ./src/gateway/security/
-COPY src/gateway/skills/ ./src/gateway/skills/
 
-# Backend build (tsc)
-RUN npx tsc
+# Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
+RUN npx tsc -p tsconfig.agentbox.json
 
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22-slim

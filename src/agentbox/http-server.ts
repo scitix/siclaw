@@ -22,7 +22,6 @@ import { GatewayClient } from "./gateway-client.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
-import { resolveUnderDir } from "../shared/path-utils.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -95,6 +94,19 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
  * Create HTTP or HTTPS server (auto-detects certificates)
  */
 export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server | https.Server {
+  // Initialize credential broker if SICLAW_GATEWAY_URL is configured (K8s mode)
+  {
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (gatewayUrl && !sessionManager.credentialBroker) {
+      // Dynamic import is deferred — broker is available before first prompt
+      import("./credential-broker.js").then(({ CredentialBroker }) => {
+        const client = new GatewayClient({ gatewayUrl });
+        sessionManager.credentialBroker = new CredentialBroker(client);
+        console.log("[agentbox-http] Credential broker initialized");
+      }).catch(err => console.warn("[agentbox-http] Credential broker init failed:", err));
+    }
+  }
+
   // Pre-start LLM proxy (fire-and-forget, ready before first prompt)
   if (hasOpenAIProvider()) {
     ensureProxy().catch(err => console.warn("[agentbox] LLM proxy pre-start failed:", err));
@@ -150,45 +162,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     });
   }
 
-  // ── Credential materialization helper (shared by prompt and reload-credentials) ──
-  // Writes new files with .new suffix first, then atomically renames them into place.
-  // This prevents data loss if the process crashes between delete and write.
-  function materializeCredentials(
-    payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
-    kubeconfigRef: { credentialsDir?: string },
-  ): number {
-    const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-    fs.mkdirSync(credDir, { recursive: true });
-
-    // Phase 1: Write new files with .new suffix (staging)
-    const stagedFiles: string[] = [];
-    for (const file of payload.files) {
-      const resolved = resolveUnderDir(credDir, file.name);
-      const staged = resolved + ".new";
-      fs.writeFileSync(staged, file.content, file.mode ? { mode: file.mode } : undefined);
-      stagedFiles.push(file.name);
-    }
-    // Stage manifest
-    const manifestPath = path.join(credDir, "manifest.json");
-    fs.writeFileSync(manifestPath + ".new", JSON.stringify(payload.manifest, null, 2));
-
-    // Phase 2: Remove old files
-    for (const entry of fs.readdirSync(credDir)) {
-      if (entry.endsWith(".new")) continue; // skip staged files
-      fs.rmSync(path.join(credDir, entry), { recursive: true });
-    }
-
-    // Phase 3: Rename staged files into place (atomic per-file on same filesystem)
-    for (const file of payload.files) {
-      const resolved = resolveUnderDir(credDir, file.name);
-      fs.renameSync(resolved + ".new", resolved);
-    }
-    fs.renameSync(manifestPath + ".new", manifestPath);
-
-    kubeconfigRef.credentialsDir = credDir;
-    return payload.files.length;
-  }
-
   // ==================== Routes ====================
 
   /**
@@ -241,7 +214,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -249,22 +222,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType, body.systemPromptTemplate);
-
-    // Materialize credential files from payload (sent by gateway in prompt body).
-    // Always call when credentials payload is present — even with empty files —
-    // so stale credential files from prior sessions are cleaned up.
-    if (body.credentials) {
-      try {
-        const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
-        if (count > 0) {
-          console.log(`[agentbox-http] Materialized ${count} credential files`);
-        }
-      } catch (err) {
-        console.error(`[agentbox-http] Failed to materialize credentials for session ${managed.id}:`, err);
-        sendJson(res, 500, { error: "Failed to materialize credentials" });
-        return;
-      }
-    }
 
     // Dynamically register provider config from gateway DB (before findModel)
     if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
@@ -824,57 +781,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   /**
-   * POST /api/reload-credentials — push-based credential update from Gateway
-   *
-   * Accepts the same {manifest, files} payload as the prompt body's credentials
-   * field and re-materializes credential files on disk. This allows the Gateway
-   * to push credential changes (kubeconfig upload/delete, credential CRUD)
-   * without waiting for the next prompt.
-   */
-  addRoute("POST", "/api/reload-credentials", async (req, res) => {
-    const body = (await parseJsonBody(req)) as {
-      manifest?: Array<Record<string, unknown>>;
-      files?: Array<{ name: string; content: string; mode?: number }>;
-    };
-
-    if (!body.manifest) {
-      sendJson(res, 400, { error: "Missing 'manifest' field" });
-      return;
-    }
-
-    // Each AgentBox pod serves exactly one user (one-pod-per-workspace in K8s mode,
-    // one in-process instance per user in local mode). All sessions within this
-    // AgentBox belong to the same user, so updating any session's kubeconfigRef is correct.
-    const sessions = sessionManager.list();
-    const kubeconfigRef = sessions.length > 0
-      ? sessions[0].kubeconfigRef
-      : { credentialsDir: undefined as string | undefined };
-
-    const payload = { manifest: body.manifest, files: body.files ?? [] };
-
-    try {
-      // Use atomic materializeCredentials for both populate and clear paths
-      const count = materializeCredentials(payload, kubeconfigRef);
-      if (count > 0) {
-        console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
-      } else {
-        console.log("[agentbox-http] Credentials cleared (empty payload)");
-      }
-    } catch (err) {
-      console.error("[agentbox-http] Failed to reload credentials:", err);
-      sendJson(res, 500, { error: "Failed to materialize credentials" });
-      return;
-    }
-
-    // Update kubeconfigRef on all active sessions
-    for (const session of sessions) {
-      session.kubeconfigRef.credentialsDir = kubeconfigRef.credentialsDir;
-    }
-
-    sendJson(res, 200, { ok: true, count: payload.files.length });
-  });
-
-  /**
    * GET /api/models - list available models (read from settings.json)
    */
   addRoute("GET", "/api/models", async (_req, res) => {
@@ -915,9 +821,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
-   * POST /api/sessions/:sessionId/model - switch model
+   * PUT /api/sessions/:sessionId/model - switch model
    */
-  addRoute("POST", "/api/sessions/:sessionId/model", async (req, res, params) => {
+  addRoute("PUT", "/api/sessions/:sessionId/model", async (req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
 
@@ -971,18 +877,18 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
-   * POST /api/sessions/:sessionId/close - close session
+   * DELETE /api/sessions/:sessionId - close session
    */
-  addRoute("POST", "/api/sessions/:sessionId/close", async (_req, res, params) => {
+  addRoute("DELETE", "/api/sessions/:sessionId", async (_req, res, params) => {
     const { sessionId } = params;
     await sessionManager.close(sessionId);
     sendJson(res, 200, { ok: true });
   });
 
   /**
-   * POST /api/reset-memory - reset memory indexer after Gateway clears PVC files
+   * DELETE /api/memory - reset memory indexer after Gateway clears PVC files
    */
-  addRoute("POST", "/api/reset-memory", async (_req, res) => {
+  addRoute("DELETE", "/api/memory", async (_req, res) => {
     console.log(`[agentbox-http] Resetting memory indexer`);
     try {
       await sessionManager.resetMemory();
@@ -1005,7 +911,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     if (method === "OPTIONS") {
       res.writeHead(200, {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
       });
       res.end();

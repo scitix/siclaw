@@ -24,8 +24,8 @@ export function createManageScheduleTool(kubeconfigRef?: KubeconfigRef): ToolDef
     description: `Create, update, delete, pause, resume, rename, or list cron schedules for automated task execution.
 This tool outputs a structured schedule definition. ALL actions are AUTO-EXECUTED immediately — no user confirmation needed.
 
-NOTE: The "list" action returns schedules scoped to the current workspace.
-For mutation actions (create, update, delete, pause, resume, rename), the frontend handles workspace binding automatically.
+NOTE: The "list" action returns schedules scoped to the current agent.
+For mutation actions (create, update, delete, pause, resume, rename), the frontend handles agent binding automatically.
 
 CRITICAL — LANGUAGE: The "name" and "description" fields MUST be written in the SAME language the user is speaking.
 If the user speaks Korean, write in Korean. If Japanese, write in Japanese. Match the user's language exactly. This directly controls the language of the scheduled task's output.
@@ -111,11 +111,11 @@ Common cron patterns:
         const cfg = loadConfig();
         const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
         const userId = cfg.userId;
-        const workspaceId = process.env.SICLAW_WORKSPACE_ID;
+        const agentId = process.env.SICLAW_AGENT_ID;
         try {
           // Use GatewayClient with mTLS authentication
           const gatewayClient = new GatewayClient({ gatewayUrl });
-          const jobs = await gatewayClient.listCronJobs(userId, workspaceId);
+          const jobs = await gatewayClient.listCronJobs(userId, agentId);
           if (jobs.length === 0) {
             return {
               content: [{ type: "text" as const, text: "No scheduled tasks currently." }],

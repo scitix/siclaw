@@ -50,11 +50,11 @@ export interface CreateSiclawSessionOpts {
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
   brainType?: BrainType;
-  /** Workspace tool allow-list: null = all tools, string[] = only these tools */
+  /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
-  /** Extra system prompt content appended for workspace customization */
+  /** Extra system prompt content appended for agent customization */
   systemPromptAppend?: string;
-  /** Custom system prompt template from workspace settings (overrides DEFAULT_TEMPLATE) */
+  /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
@@ -304,9 +304,9 @@ export async function createSiclawSession(
     allowedTools,
   });
 
-  // Log workspace tool filter result (diagnostic — original behavior from L365-367)
+  // Log agent tool filter result (diagnostic — original behavior from L365-367)
   if (Array.isArray(allowedTools)) {
-    console.log(`[agent-factory] Workspace tool filter: ${allToolEntries.length} registered → ${customTools.length} resolved`);
+    console.log(`[agent-factory] Agent tool filter: ${allToolEntries.length} registered → ${customTools.length} resolved`);
   }
 
   // -- MCP external tools (dynamic discovery, not in registry) --
@@ -433,16 +433,16 @@ export async function createSiclawSession(
   // Resolve credentials directory for tools and /setup extension
   const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
 
-  // Workspace system prompt append (shared between pi-agent and SDK brain)
-  const workspaceSystemPromptAppend = opts?.systemPromptAppend;
+  // Agent system prompt append (shared between pi-agent and SDK brain)
+  const agentSystemPromptAppend = opts?.systemPromptAppend;
 
   const loader = new DefaultResourceLoader({
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
       const parts = buildAppendSystemPrompt(memoryDir, memoryIndexerRef);
-      if (workspaceSystemPromptAppend) {
-        parts.push("\n\n" + workspaceSystemPromptAppend);
+      if (agentSystemPromptAppend) {
+        parts.push("\n\n" + agentSystemPromptAppend);
       }
       return parts;
     },
@@ -495,7 +495,7 @@ export async function createSiclawSession(
     // The workflow instructions are injected via buildActivationMessage() when
     // the user explicitly triggers DP mode.
 
-    // Append workspace custom prompt
+    // Append agent custom prompt
     if (opts?.systemPromptAppend) {
       systemPromptAppend = (systemPromptAppend ?? "") + "\n\n" + opts.systemPromptAppend;
     }

@@ -43,7 +43,7 @@ export function createCredentialListTool(kubeconfigRef: KubeconfigRef): ToolDefi
       );
     },
     renderResult: renderTextResult,
-    description: `List available credentials in the current workspace.
+    description: `List available credentials in the current agent.
 Returns credential names, types, descriptions, and connectivity status.
 For kubeconfig credentials, a connectivity probe is included.
 Use this to discover which credentials are available before running kubectl commands.
@@ -69,7 +69,7 @@ Optional filters:
       const manifestPath = path.join(credentialsDir, "manifest.json");
       if (!fs.existsSync(manifestPath)) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ credentials: [], message: "No credentials configured for this workspace" }) }],
+          content: [{ type: "text", text: JSON.stringify({ credentials: [], message: "No credentials configured for this agent" }) }],
           details: {},
         };
       }

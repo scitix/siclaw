@@ -27,14 +27,9 @@ export interface PromptOptions {
   modelId?: string;
   /** Brain type — "pi-agent" | "claude-sdk" */
   brainType?: string;
-  /** Workspace ID (for logging/context) */
-  workspaceId?: string;
-  /** Credential payload — agentbox materializes files locally from this data */
-  credentials?: {
-    manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>;
-    files: Array<{ name: string; content: string; mode?: number }>;
-  };
-  /** Custom system prompt template from workspace settings */
+  /** Agent ID (for logging/context) */
+  agentId?: string;
+  /** Custom system prompt template from agent settings */
   systemPromptTemplate?: string;
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {
@@ -166,18 +161,6 @@ export class AgentBoxClient {
   }
 
   /**
-   * Push updated credentials to AgentBox (re-materializes credential files)
-   */
-  async reloadCredentials(payload: PromptOptions["credentials"]): Promise<{ ok: boolean; count: number }> {
-    const resp = await this.fetch("/api/reload-credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    return resp.json();
-  }
-
-  /**
    * Get context usage
    */
   async getContextUsage(sessionId: string): Promise<ContextUsageResponse> {
@@ -220,8 +203,8 @@ export class AgentBoxClient {
    * Close a session
    */
   async closeSession(sessionId: string): Promise<void> {
-    await this.fetch(`/api/sessions/${sessionId}/close`, {
-      method: "POST",
+    await this.fetch(`/api/sessions/${sessionId}`, {
+      method: "DELETE",
     });
   }
 
@@ -229,8 +212,8 @@ export class AgentBoxClient {
    * Reset memory indexer after Gateway has cleared PVC files.
    */
   async resetMemory(): Promise<{ ok: boolean }> {
-    const resp = await this.fetch("/api/reset-memory", {
-      method: "POST",
+    const resp = await this.fetch("/api/memory", {
+      method: "DELETE",
     });
     return resp.json();
   }
@@ -265,7 +248,7 @@ export class AgentBoxClient {
    */
   async setModel(sessionId: string, provider: string, modelId: string): Promise<{ ok: boolean; model: ModelInfo }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/model`, {
-      method: "POST",
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, modelId }),
     });

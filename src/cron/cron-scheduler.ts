@@ -21,7 +21,7 @@ export interface CronJobRow {
   assignedTo: string | null;
   lockedBy: string | null;
   lockedAt: Date | null;
-  workspaceId: string | null;
+  agentId: string | null;
 }
 
 export type OnFireFn = (job: CronJobRow) => Promise<void>;

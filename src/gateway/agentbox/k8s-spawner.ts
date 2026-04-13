@@ -62,13 +62,12 @@ export class K8sSpawner implements BoxSpawner {
   /**
    * Generate Pod name
    */
-  private podName(userId: string, workspaceId?: string): string {
-    // Sanitize userId — keep only lowercase letters, digits, and hyphens
+  private podName(userId: string, agentId?: string): string {
     const sanitizedUser = userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-    const wsSuffix = workspaceId
-      ? workspaceId.replace(/[^a-z0-9]/g, "").slice(0, 8)
+    const agentSuffix = agentId
+      ? agentId.replace(/[^a-z0-9]/g, "").slice(0, 8)
       : "default";
-    return `agentbox-${sanitizedUser}-${wsSuffix}`;
+    return `agentbox-${sanitizedUser}-${agentSuffix}`;
   }
 
   /**
@@ -76,9 +75,10 @@ export class K8sSpawner implements BoxSpawner {
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { namespace, image, imagePullPolicy, labelPrefix } = this.config;
-    const podName = this.podName(boxConfig.userId, boxConfig.workspaceId);
+    const podName = this.podName(boxConfig.userId, boxConfig.agentId);
     const userId = boxConfig.userId;
-    const workspaceId = boxConfig.workspaceId || "default";
+    const agentId = boxConfig.agentId || "default";
+    const orgId = boxConfig.orgId || "";
 
     console.log(`[k8s-spawner] Creating pod: ${podName} for user: ${userId}`);
 
@@ -107,7 +107,7 @@ export class K8sSpawner implements BoxSpawner {
     // Issue client certificate for mTLS authentication (env encoded in cert)
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
     const podEnv: "prod" | "dev" | "test" = boxConfig.podEnv ?? "prod";
-    const certBundle = this.certManager.issueAgentBoxCertificate(userId, workspaceId, podName, podEnv);
+    const certBundle = this.certManager.issueAgentBoxCertificate(userId, agentId, orgId, podName, podEnv);
     const certSecretName = `${podName}-cert`;
 
     // Create certificate Secret
@@ -166,8 +166,8 @@ export class K8sSpawner implements BoxSpawner {
     // Environment variables — only bootstrap deps that cannot come from settings.json
     const env: k8s.V1EnvVar[] = [
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
-      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-gateway.${namespace}.svc.cluster.local:3002` },
-      { name: "SICLAW_WORKSPACE_ID", value: workspaceId },
+      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-runtime.${namespace}.svc.cluster.local:3002` },
+      { name: "SICLAW_AGENT_ID", value: agentId },
     ];
 
     // Add custom environment variables
@@ -179,11 +179,11 @@ export class K8sSpawner implements BoxSpawner {
 
     // Ensure per-user subdirectory on shared PVC
     const safeUserId = this.sanitizePathSegment(userId);
-    const safeWorkspaceId = this.sanitizePathSegment(workspaceId);
+    const safeAgentId = this.sanitizePathSegment(agentId);
     if (this.config.persistence?.enabled) {
-      const subDir = `users/${safeUserId}/${safeWorkspaceId}`;
+      const subDir = `users/${safeUserId}/${safeAgentId}`;
       console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
-      this.ensureUserDir(safeUserId, safeWorkspaceId);
+      this.ensureUserDir(safeUserId, safeAgentId);
     }
 
     // Pod definition
@@ -196,7 +196,7 @@ export class K8sSpawner implements BoxSpawner {
         labels: {
           [`${labelPrefix}/app`]: "agentbox",
           [`${labelPrefix}/user`]: boxConfig.userId,
-          [`${labelPrefix}/workspace`]: boxConfig.workspaceId || "default",
+          [`${labelPrefix}/agent`]: boxConfig.agentId || "default",
         },
       },
       spec: {
@@ -278,7 +278,7 @@ export class K8sSpawner implements BoxSpawner {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
                 ...(this.config.persistence?.enabled
-                  ? { subPath: `users/${safeUserId}/${safeWorkspaceId}` }
+                  ? { subPath: `users/${safeUserId}/${safeAgentId}` }
                   : {}),
               },
               {
@@ -345,11 +345,11 @@ export class K8sSpawner implements BoxSpawner {
   /**
    * Ensure per-user subdirectory exists on the shared PVC (synchronous, idempotent).
    * Expects already-sanitized path segments.
-   * Directory layout: `/app/.siclaw/user-data/users/{safeUserId}/{safeWorkspaceId}/`
+   * Directory layout: `/app/.siclaw/user-data/users/{safeUserId}/{safeAgentId}/`
    */
-  private ensureUserDir(safeUserId: string, safeWorkspaceId: string): void {
+  private ensureUserDir(safeUserId: string, safeAgentId: string): void {
     const base = path.resolve("/app/.siclaw/user-data");
-    const userDir = path.join(base, "users", safeUserId, safeWorkspaceId);
+    const userDir = path.join(base, "users", safeUserId, safeAgentId);
     if (!userDir.startsWith(base)) {
       throw new Error(`[k8s-spawner] Path traversal detected: ${userDir}`);
     }
@@ -451,14 +451,14 @@ export class K8sSpawner implements BoxSpawner {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
       const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`];
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId,
         userId,
-        workspaceId,
+        agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
@@ -487,14 +487,14 @@ export class K8sSpawner implements BoxSpawner {
 
     return podList.items.map((pod: k8s.V1Pod) => {
       const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`];
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId: pod.metadata?.name || "",
         userId,
-        workspaceId,
+        agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
