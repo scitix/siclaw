@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X } from "lucide-react"
+import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { useConfirm } from "./confirm-dialog"
@@ -57,7 +57,7 @@ function SessionSidebar({
   }
 
   return (
-    <div className="w-[220px] border-r border-border flex flex-col bg-card/50">
+    <div className="flex-1 flex flex-col overflow-hidden">
       <div className="px-3 py-2 border-b border-border space-y-2">
         <button
           onClick={onNew}
@@ -137,6 +137,7 @@ interface AgentChatProps {
 export function AgentChat({ agentId }: AgentChatProps) {
   const toast = useToast()
   const confirmDialog = useConfirm()
+  const [showSessions, setShowSessions] = useState(false)
 
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
@@ -271,19 +272,52 @@ export function AgentChat({ agentId }: AgentChatProps) {
   }
 
   return (
-    <div className="flex h-full overflow-hidden">
-      {/* Session list */}
-      <SessionSidebar
-        sessions={sessions}
-        activeSessionId={activeSessionId}
-        agentId={agentId}
-        onSelect={setActiveSessionId}
-        onNew={handleNewSession}
-        onDelete={handleDeleteSession}
-        onRenamed={(sid, title) => setSessions(prev => prev.map(s => s.id === sid ? { ...s, title } : s))}
-      />
+    <div className="relative flex flex-col h-full overflow-hidden">
+      {/* Session drawer — slides in from left */}
+      {showSessions && (
+        <>
+          <div className="absolute inset-0 z-10" onClick={() => setShowSessions(false)} />
+          <div className="absolute top-0 left-0 bottom-0 z-20 w-[280px] bg-card border-r border-border shadow-lg shadow-black/20 flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+              <span className="text-sm font-medium">Recent Sessions</span>
+              <button onClick={() => setShowSessions(false)} className="p-1 rounded-md text-muted-foreground hover:text-foreground">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <SessionSidebar
+              sessions={sessions}
+              activeSessionId={activeSessionId}
+              agentId={agentId}
+              onSelect={(id) => { setActiveSessionId(id); setShowSessions(false) }}
+              onNew={() => { handleNewSession(); setShowSessions(false) }}
+              onDelete={handleDeleteSession}
+              onRenamed={(sid, title) => setSessions(prev => prev.map(s => s.id === sid ? { ...s, title } : s))}
+            />
+          </div>
+        </>
+      )}
 
-      {/* Main chat area — Pilot-style rendering + side panels */}
+      {/* Top bar — session title (clickable) + action buttons */}
+      <div className="flex items-center px-3 py-2 shrink-0">
+        <button
+          onClick={() => setShowSessions(!showSessions)}
+          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
+          title="Session history"
+        >
+          <History className="h-4 w-4" />
+        </button>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={handleNewSession}
+            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+            title="New session"
+          >
+            <Plus className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Chat content */}
       <div className="flex flex-1 overflow-hidden">
         {activeSessionId ? (
           <>

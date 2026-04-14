@@ -1,4 +1,4 @@
-import { ArrowUp, Square, X, Loader2, SearchCode, Plus, Check } from "lucide-react"
+import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check } from "lucide-react"
 import type { ContextUsage } from "./types"
 import { useState, useCallback, useRef, useEffect } from "react"
 import type { KeyboardEvent } from "react"
@@ -266,11 +266,11 @@ export function InputArea({
             <p className="text-xs text-muted-foreground/70">AI may make mistakes. Please verify important information.</p>
             {contextUsage && contextUsage.percent > 0 ? (
               <div className="flex items-center gap-3 text-xs text-muted-foreground/70 font-mono cursor-default">
-                <span title={`Input: ${contextUsage.inputTokens.toLocaleString()} tokens`}>
-                  up {formatTokens(contextUsage.inputTokens)}
+                <span className="flex items-center gap-0.5" title={`Input: ${contextUsage.inputTokens.toLocaleString()} tokens`}>
+                  <ArrowUp className="h-3 w-3" />{formatTokens(contextUsage.inputTokens)}
                 </span>
-                <span title={`Output: ${contextUsage.outputTokens.toLocaleString()} tokens`}>
-                  dn {formatTokens(contextUsage.outputTokens)}
+                <span className="flex items-center gap-0.5" title={`Output: ${contextUsage.outputTokens.toLocaleString()} tokens`}>
+                  <ArrowDown className="h-3 w-3" />{formatTokens(contextUsage.outputTokens)}
                 </span>
                 {contextUsage.cost > 0 && <span title="API cost this session">{formatCost(contextUsage.cost)}</span>}
                 <span
