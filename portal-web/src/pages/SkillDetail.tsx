@@ -1,10 +1,15 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { useParams, useNavigate } from "react-router-dom"
-import { ArrowLeft, Loader2, Save, Send, Undo2, CheckCircle, XCircle, Plus, Trash2, RotateCcw, Terminal, FileCode, X, History, ShieldAlert, Code2 } from "lucide-react"
+import { ArrowLeft, Loader2, Save, Send, Undo2, Plus, Trash2, RotateCcw, Terminal, FileCode, X, History, ShieldAlert, Code2, FileUp } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { SkillDiffView } from "../components/SimpleDiff"
 import { useConfirm } from "../components/confirm-dialog"
+import Editor from "react-simple-code-editor"
+import Prism from "prismjs"
+import "prismjs/components/prism-python"
+import "prismjs/components/prism-bash"
+import "prismjs/themes/prism-dark.css"
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -17,7 +22,8 @@ interface Skill {
 }
 
 interface SkillVersion {
-  id: string; version: number; commit_message: string; author_id: string
+  id: string; version: number; specs: string; scripts: string
+  commit_message: string; author_id: string
   is_approved: number; created_at: string
 }
 
@@ -94,11 +100,9 @@ export function SkillDetail() {
   // Active script editor
   const [activeScriptIdx, setActiveScriptIdx] = useState<number | null>(null)
 
-  // Review & versions
-  const [review, setReview] = useState<SkillReview | null>(null)
+  // Versions
   const [versions, setVersions] = useState<SkillVersion[]>([])
   const [showHistory, setShowHistory] = useState(false)
-  const [rejectReason, setRejectReason] = useState("")
 
   // Label input
   const labelInputRef = useRef<HTMLInputElement>(null)
@@ -113,18 +117,19 @@ export function SkillDetail() {
       setName(s.name)
       setDescription(s.description || "")
       setLabels(Array.isArray(s.labels) ? s.labels : [])
-      setSpecs(typeof s.specs === "string" ? s.specs : JSON.stringify(s.specs || ""))
+      // specs may be double-JSON-encoded (JSON.stringify was called on the string before DB insert)
+      let specsVal = s.specs || ""
+      if (typeof specsVal === "string" && specsVal.startsWith('"')) {
+        try { specsVal = JSON.parse(specsVal) } catch { /* keep as-is */ }
+      }
+      setSpecs(specsVal)
       setScripts(parseScripts(s.scripts))
+      setEditing(false)
     } catch (err: any) { toast.error(err.message) }
     finally { setLoading(false) }
   }, [id, isCreate])
 
   useEffect(() => { loadSkill() }, [loadSkill])
-
-  useEffect(() => {
-    if (isCreate || !id) return
-    api<SkillReview>(`/siclaw/skills/${id}/review`).then(setReview).catch(() => setReview(null))
-  }, [id, skill?.status])
 
   useEffect(() => {
     if (isCreate || !id) return
@@ -174,12 +179,60 @@ export function SkillDetail() {
     finally { setSaving(false) }
   }
 
-  const handleSubmit = async () => {
+  // Submit with diff preview
+  const [showSubmitDialog, setShowSubmitDialog] = useState(false)
+  const [submitDiff, setSubmitDiff] = useState<any>(null)
+  const [submitLoading, setSubmitLoading] = useState(false)
+
+  const handleSubmitClick = async () => {
+    setSubmitLoading(true)
     try {
-      await api(`/siclaw/skills/${id}/submit`, { method: "POST" })
-      await loadSkill()
+      const versionsRes = await api<{ data: SkillVersion[] }>(`/siclaw/skills/${id}/versions`)
+      const approvedVersions = (versionsRes.data || []).filter(v => v.is_approved)
+      const lastApproved = approvedVersions.length > 0 ? approvedVersions[0] : null
+
+      // Decode baseline — may be double-encoded from old DB data
+      let baselineSpecs = ""
+      let baselineScripts: { name: string; content: string }[] = []
+      if (lastApproved) {
+        const vDetail = await api<SkillVersion>(`/siclaw/skills/${id}/versions/${lastApproved.version}`)
+        baselineSpecs = vDetail.specs || ""
+        if (baselineSpecs.startsWith('"')) { try { baselineSpecs = JSON.parse(baselineSpecs) } catch {} }
+        try {
+          const raw = vDetail.scripts || "[]"
+          baselineScripts = typeof raw === "string" ? JSON.parse(raw) : raw
+        } catch { baselineScripts = [] }
+      }
+
+      setSubmitDiff({
+        specs_diff: { old: baselineSpecs || null, new: specs },
+        scripts_diff: { old: JSON.stringify(baselineScripts), new: JSON.stringify(scripts) },
+      })
+      setShowSubmitDialog(true)
+    } catch {
+      setSubmitDiff(null)
+      setShowSubmitDialog(true)
+    } finally {
+      setSubmitLoading(false)
+    }
+  }
+
+  const [submitConfirming, setSubmitConfirming] = useState(false)
+
+  const handleSubmitConfirm = async () => {
+    setSubmitConfirming(true)
+    try {
+      await api(`/siclaw/skills/${id}/submit`, { method: "POST", body: { comment: commitMessage || undefined } })
+      setShowSubmitDialog(false)
+      setCommitMessage("")
       toast.success("Submitted for review")
-    } catch (err: any) { toast.error(err.message) }
+      await loadSkill()
+    } catch (err: any) {
+      toast.error(err.message)
+      setShowSubmitDialog(false)
+    } finally {
+      setSubmitConfirming(false)
+    }
   }
 
   const handleWithdraw = async () => {
@@ -187,23 +240,6 @@ export function SkillDetail() {
       await api(`/siclaw/skills/${id}/withdraw`, { method: "POST" })
       await loadSkill()
       toast.success("Withdrawn")
-    } catch (err: any) { toast.error(err.message) }
-  }
-
-  const handleApprove = async () => {
-    try {
-      await api(`/siclaw/skills/${id}/approve`, { method: "POST" })
-      await loadSkill()
-      toast.success("Approved")
-    } catch (err: any) { toast.error(err.message) }
-  }
-
-  const handleReject = async () => {
-    try {
-      await api(`/siclaw/skills/${id}/reject`, { method: "POST", body: { reason: rejectReason || undefined } })
-      await loadSkill()
-      setRejectReason("")
-      toast.success("Rejected")
     } catch (err: any) { toast.error(err.message) }
   }
 
@@ -219,12 +255,48 @@ export function SkillDetail() {
 
   // ── Script management ─────────────────────────────────────────
 
-  const addScript = (type: "shell" | "python") => {
-    const ext = type === "python" ? ".py" : ".sh"
-    const template = type === "python" ? '#!/usr/bin/env python3\n\nprint("Hello")' : '#!/bin/bash\n\necho "Hello"'
-    const newScript = { name: `script${ext}`, content: template }
-    setScripts([...scripts, newScript])
+  const [showAddMenu, setShowAddMenu] = useState(false)
+  const [showNameDialog, setShowNameDialog] = useState(false)
+  const [newScriptType, setNewScriptType] = useState<"shell" | "python">("shell")
+  const [newScriptName, setNewScriptName] = useState("")
+  const fileInputRef2 = useRef<HTMLInputElement>(null)
+
+  const initiateAddScript = (type: "shell" | "python") => {
+    setNewScriptType(type)
+    setNewScriptName(type === "python" ? "script.py" : "script.sh")
+    setShowAddMenu(false)
+    setShowNameDialog(true)
+  }
+
+  const confirmAddScript = () => {
+    const trimmed = newScriptName.trim()
+    if (!trimmed) return
+    if (scripts.some(s => s.name === trimmed)) {
+      toast.error(`Script "${trimmed}" already exists`)
+      return
+    }
+    const template = newScriptType === "python" ? '#!/usr/bin/env python3\n\nprint("Hello")' : '#!/bin/bash\n\necho "Hello"'
+    setScripts([...scripts, { name: trimmed, content: template }])
     setActiveScriptIdx(scripts.length)
+    setShowNameDialog(false)
+  }
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    if (scripts.some(s => s.name === file.name)) {
+      toast.error(`Script "${file.name}" already exists`)
+      e.target.value = ""
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = (event) => {
+      const content = event.target?.result as string
+      setScripts([...scripts, { name: file.name, content }])
+      setActiveScriptIdx(scripts.length)
+    }
+    reader.readAsText(file)
+    e.target.value = ""
   }
 
   const removeScript = (i: number) => {
@@ -233,9 +305,9 @@ export function SkillDetail() {
     else if (activeScriptIdx !== null && activeScriptIdx > i) setActiveScriptIdx(activeScriptIdx - 1)
   }
 
-  const updateScript = (i: number, field: "name" | "content", value: string) => {
+  const updateScriptContent = (i: number, content: string) => {
     const next = [...scripts]
-    next[i] = { ...next[i], [field]: value }
+    next[i] = { ...next[i], content }
     setScripts(next)
   }
 
@@ -302,37 +374,29 @@ export function SkillDetail() {
               {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />} Create
             </button>
           )}
-          {!isCreate && skill?.status === "draft" && !editing && (
+          {!isCreate && !editing && (skill?.status === "draft" || skill?.status === "installed") && (
             <>
               <button onClick={() => setEditing(true)} className="h-8 px-3 text-sm rounded-md border border-border hover:bg-secondary">Edit</button>
-              <button onClick={handleSubmit} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground">
-                <Send className="h-3.5 w-3.5" /> Submit
-              </button>
+              {skill?.status === "draft" && (
+                <button onClick={handleSubmitClick} disabled={submitLoading}
+                  className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">
+                  {submitLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />} Submit for Review
+                </button>
+              )}
             </>
           )}
-          {!isCreate && skill?.status === "draft" && editing && (
+          {!isCreate && editing && (
             <>
-              <button onClick={() => { setEditing(false); loadSkill() }} className="h-8 px-3 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+              <button onClick={() => { setEditing(false); loadSkill() }} className="h-8 px-3 text-sm rounded-md border border-border text-muted-foreground">Discard</button>
               <button onClick={handleSave} disabled={saving || !isDirty} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">
                 {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />} Save
               </button>
             </>
           )}
           {!isCreate && skill?.status === "pending_review" && (
-            <>
-              <button onClick={handleWithdraw} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border hover:bg-secondary">
-                <Undo2 className="h-3.5 w-3.5" /> Withdraw
-              </button>
-              <button onClick={handleApprove} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-green-600 text-white hover:opacity-90">
-                <CheckCircle className="h-3.5 w-3.5" /> Approve
-              </button>
-              <button onClick={handleReject} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-red-600 text-white hover:opacity-90">
-                <XCircle className="h-3.5 w-3.5" /> Reject
-              </button>
-            </>
-          )}
-          {!isCreate && skill?.status === "installed" && (
-            <button onClick={() => setEditing(true)} className="h-8 px-3 text-sm rounded-md border border-border hover:bg-secondary">Edit</button>
+            <button onClick={handleWithdraw} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border hover:bg-secondary">
+              <Undo2 className="h-3.5 w-3.5" /> Withdraw
+            </button>
           )}
         </div>
       </header>
@@ -344,34 +408,16 @@ export function SkillDetail() {
           <span className="text-[12px] text-amber-300">Pending review — editing is locked until approved or withdrawn.</span>
         </div>
       )}
-      {review?.decision === "rejected" && review.reject_reason && skill?.status === "draft" && (
-        <div className="px-6 py-2 bg-red-500/10 border-b border-red-500/20 flex items-center gap-2 shrink-0">
-          <XCircle className="h-4 w-4 text-red-400" />
-          <span className="text-[12px] text-red-300">Rejected: {review.reject_reason}</span>
-        </div>
-      )}
 
       {/* ── Main content: split layout ──────────────────────── */}
       <div className="flex flex-1 overflow-hidden min-h-0">
 
         {/* LEFT PANEL: metadata + specs */}
         <div className={`flex flex-col border-r border-border ${scripts.length > 0 || editing || isCreate ? "w-[65%]" : "w-full"}`}>
-          <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-5">
-
-            {/* Description */}
-            <div>
-              <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">Description</label>
-              {editing || isCreate ? (
-                <textarea value={description} onChange={e => setDescription(e.target.value)} rows={2}
-                  className="w-full px-3 py-2 text-[13px] rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
-              ) : (
-                <p className="text-[13px] text-muted-foreground px-1">{description || "No description"}</p>
-              )}
-            </div>
-
-            {/* Labels */}
-            <div>
-              <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">Labels</label>
+          <div className="flex-1 overflow-y-auto flex flex-col">
+            {/* Metadata bar: labels + description (compact, always visible) */}
+            <div className="px-6 py-3 border-b border-border/50 space-y-2.5 shrink-0">
+              {/* Labels row */}
               <div className="flex flex-wrap gap-1.5 items-center">
                 {labels.map(lbl => (
                   <span key={lbl} className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium border border-border bg-secondary text-secondary-foreground">
@@ -388,25 +434,19 @@ export function SkillDetail() {
                     className="text-[11px] px-1.5 py-0.5 border border-transparent rounded bg-transparent text-muted-foreground outline-none w-20 focus:border-border focus:bg-background placeholder:text-muted-foreground/40" />
                 )}
                 {labels.length === 0 && !editing && !isCreate && (
-                  <span className="text-[11px] text-muted-foreground/50">No labels</span>
+                  <span className="text-[11px] text-muted-foreground/40">No labels</span>
                 )}
               </div>
+
+              {/* Commit message: only in edit mode (not create) */}
+              {editing && !isCreate && (
+                <input value={commitMessage} onChange={e => setCommitMessage(e.target.value)} placeholder="Commit message (optional)..."
+                  className="w-full h-7 px-2 text-[12px] rounded border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring" />
+              )}
             </div>
 
-            {/* Commit message (when editing) */}
-            {editing && !isCreate && (
-              <div>
-                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">Commit Message</label>
-                <input value={commitMessage} onChange={e => setCommitMessage(e.target.value)} placeholder="Describe your changes..."
-                  className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring" />
-              </div>
-            )}
-
-            {/* Specs (SKILL.md) */}
-            <div className="flex-1 flex flex-col min-h-[300px]">
-              <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
-                Skill Specification (SKILL.md)
-              </label>
+            {/* Specs (SKILL.md) — fills remaining space */}
+            <div className="flex-1 flex flex-col min-h-0">
               <textarea
                 value={specs} onChange={e => {
                   if (disabled) return
@@ -416,10 +456,13 @@ export function SkillDetail() {
                   const fmMatch = newSpecs.match(/^---\n([\s\S]*?)\n---/)
                   const nameMatch = fmMatch?.[1]?.match(/^name:\s*(.+)$/m)
                   if (nameMatch) setName(nameMatch[1].trim())
+                  // Sync frontmatter description
+                  const descMatch = fmMatch?.[1]?.match(/^description:\s*(.+)$/m)
+                  if (descMatch) setDescription(descMatch[1].trim())
                 }}
                 readOnly={disabled} spellCheck={false}
-                className={`flex-1 px-4 py-3 text-[12px] font-mono leading-relaxed rounded-md border border-border resize-none transition-colors ${
-                  disabled ? "bg-secondary/30 text-foreground" : "bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+                className={`flex-1 px-5 py-4 text-[12px] font-mono leading-relaxed resize-none border-none outline-none ${
+                  disabled ? "bg-transparent text-foreground" : "bg-background focus:ring-0"
                 }`}
               />
             </div>
@@ -428,7 +471,7 @@ export function SkillDetail() {
 
         {/* RIGHT PANEL: scripts */}
         {(scripts.length > 0 || editing || isCreate) && (
-          <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex-1 flex flex-col min-w-0 relative">
             {/* Scripts header */}
             <div className="px-4 py-3 flex items-center justify-between border-b border-border shrink-0">
               <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
@@ -436,70 +479,65 @@ export function SkillDetail() {
               </span>
               {(editing || isCreate) && (
                 <div className="flex items-center gap-1">
-                  <button onClick={() => addScript("shell")} title="Add Shell Script"
-                    className="flex items-center gap-1 px-2 py-1 text-[11px] rounded hover:bg-secondary text-muted-foreground">
-                    <Terminal className="h-3 w-3 text-green-400" /> .sh
+                  <button onClick={() => fileInputRef2.current?.click()} title="Upload Script"
+                    className="p-1.5 rounded hover:bg-secondary text-muted-foreground">
+                    <FileUp className="h-3.5 w-3.5" />
                   </button>
-                  <button onClick={() => addScript("python")} title="Add Python Script"
-                    className="flex items-center gap-1 px-2 py-1 text-[11px] rounded hover:bg-secondary text-muted-foreground">
-                    <FileCode className="h-3 w-3 text-blue-400" /> .py
-                  </button>
+                  <input type="file" ref={fileInputRef2} className="hidden" accept=".sh,.py,.txt" onChange={handleFileUpload} />
+                  <div className="relative">
+                    <button onClick={() => setShowAddMenu(!showAddMenu)} title="New Script"
+                      className="p-1.5 rounded hover:bg-secondary text-muted-foreground hover:text-foreground">
+                      <Plus className="h-3.5 w-3.5" />
+                    </button>
+                    {showAddMenu && (
+                      <>
+                        <div className="fixed inset-0 z-10" onClick={() => setShowAddMenu(false)} />
+                        <div className="absolute right-0 top-full mt-1 w-36 bg-card border border-border rounded-lg shadow-lg z-20 py-1">
+                          <button onClick={() => initiateAddScript("shell")}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-[12px] hover:bg-secondary/50 transition-colors">
+                            <Terminal className="h-3.5 w-3.5 text-green-400" /> Shell Script
+                          </button>
+                          <button onClick={() => initiateAddScript("python")}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-[12px] hover:bg-secondary/50 transition-colors">
+                            <FileCode className="h-3.5 w-3.5 text-blue-400" /> Python Script
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
 
-            {/* Script list / editor */}
+            {/* Script list */}
             <div className="flex-1 overflow-y-auto">
               {scripts.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center">
-                  <Code2 className="h-8 w-8 text-muted-foreground/20 mb-2" />
-                  <p className="text-[12px] text-muted-foreground/50">No scripts yet</p>
-                </div>
-              ) : activeScriptIdx !== null && scripts[activeScriptIdx] ? (
-                /* Script editor view */
-                <div className="flex flex-col h-full">
-                  <div className="flex items-center gap-2 px-4 py-2 border-b border-border/50 shrink-0">
-                    <button onClick={() => setActiveScriptIdx(null)} className="text-[11px] text-muted-foreground hover:text-foreground">
-                      ← Back
-                    </button>
-                    <span className="text-[11px] text-muted-foreground">·</span>
-                    {editing || isCreate ? (
-                      <input value={scripts[activeScriptIdx].name}
-                        onChange={e => updateScript(activeScriptIdx, "name", e.target.value)}
-                        className="text-[12px] font-mono bg-transparent border-none outline-none flex-1" />
-                    ) : (
-                      <span className="text-[12px] font-mono">{scripts[activeScriptIdx].name}</span>
-                    )}
+                  <div className="p-3 bg-secondary/30 rounded-full mb-3">
+                    <Code2 className="h-6 w-6 text-muted-foreground/30" />
                   </div>
-                  <textarea
-                    value={scripts[activeScriptIdx].content}
-                    onChange={e => updateScript(activeScriptIdx, "content", e.target.value)}
-                    readOnly={disabled} spellCheck={false}
-                    className={`flex-1 px-4 py-3 text-[12px] font-mono leading-relaxed resize-none ${
-                      disabled ? "bg-secondary/30" : "bg-background focus:outline-none"
-                    }`}
-                  />
+                  <p className="text-[12px] text-muted-foreground/50">No scripts yet</p>
+                  <p className="text-[10px] text-muted-foreground/30 mt-1">Add or upload a script to get started</p>
                 </div>
               ) : (
-                /* Script list view */
                 <div className="p-3 space-y-1.5">
                   {scripts.map((s, i) => {
                     const isPy = s.name.endsWith(".py")
                     return (
                       <div key={i} onClick={() => setActiveScriptIdx(i)}
-                        className="flex items-center justify-between p-2.5 rounded-md border border-border/50 hover:border-border hover:bg-secondary/20 cursor-pointer group transition-colors">
-                        <div className="flex items-center gap-2.5">
-                          <div className={`w-7 h-7 rounded flex items-center justify-center shrink-0 ${isPy ? "bg-blue-500/10 text-blue-400" : "bg-green-500/10 text-green-400"}`}>
-                            {isPy ? <FileCode className="h-3.5 w-3.5" /> : <Terminal className="h-3.5 w-3.5" />}
+                        className="flex items-center justify-between p-3 rounded-md border border-border/50 hover:border-border hover:bg-secondary/20 cursor-pointer group transition-colors">
+                        <div className="flex items-center gap-3">
+                          <div className={`w-8 h-8 rounded-md flex items-center justify-center shrink-0 ${isPy ? "bg-blue-500/10 text-blue-400" : "bg-green-500/10 text-green-400"}`}>
+                            {isPy ? <FileCode className="h-4 w-4" /> : <Terminal className="h-4 w-4" />}
                           </div>
                           <div>
-                            <p className="text-[12px] font-medium font-mono">{s.name}</p>
-                            <p className="text-[10px] text-muted-foreground">{isPy ? "Python" : "Bash"} · {s.content.length}B</p>
+                            <p className="text-[13px] font-medium font-mono group-hover:text-foreground transition-colors">{s.name}</p>
+                            <p className="text-[10px] text-muted-foreground font-mono">{isPy ? "Python" : "Bash"} · {s.content.length}B</p>
                           </div>
                         </div>
                         {(editing || isCreate) && (
                           <button onClick={e => { e.stopPropagation(); removeScript(i) }} title="Delete"
-                            className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-all">
+                            className="p-1.5 rounded opacity-0 group-hover:opacity-100 hover:bg-red-500/10 text-muted-foreground hover:text-red-400 transition-all">
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
                         )}
@@ -509,6 +547,57 @@ export function SkillDetail() {
                 </div>
               )}
             </div>
+
+            {/* OVERLAY EDITOR — full-screen dark editor when a script is active */}
+            {activeScriptIdx !== null && scripts[activeScriptIdx] && (
+              <div className="absolute inset-0 z-40 bg-[#1e1e1e] flex flex-col">
+                {/* Editor header */}
+                <div className="flex items-center justify-between px-4 py-3 bg-[#252526] border-b border-[#1e1e1e]">
+                  <div className="flex items-center gap-3">
+                    <div className={`w-8 h-8 rounded flex items-center justify-center ${
+                      scripts[activeScriptIdx].name.endsWith(".py") ? "bg-[#37373d] text-yellow-400" : "bg-[#37373d] text-green-400"
+                    }`}>
+                      {scripts[activeScriptIdx].name.endsWith(".py") ? <FileCode className="h-4 w-4" /> : <Terminal className="h-4 w-4" />}
+                    </div>
+                    <span className="text-sm font-medium text-gray-200 font-mono">
+                      {scripts[activeScriptIdx].name}
+                    </span>
+                  </div>
+                  <button onClick={() => setActiveScriptIdx(null)} title="Close Editor"
+                    className="p-1.5 text-gray-400 hover:text-white hover:bg-[#333] rounded transition-colors">
+                    <X className="h-5 w-5" />
+                  </button>
+                </div>
+
+                {/* Editor content with syntax highlighting */}
+                <div className="flex-1 overflow-auto">
+                  <Editor
+                    value={scripts[activeScriptIdx].content}
+                    onValueChange={code => {
+                      if (disabled) return
+                      updateScriptContent(activeScriptIdx, code)
+                    }}
+                    highlight={code => {
+                      const isPy = scripts[activeScriptIdx].name.endsWith(".py")
+                      const grammar = isPy ? Prism.languages.python : Prism.languages.bash
+                      if (!grammar) return code
+                      return Prism.highlight(code, grammar, isPy ? "python" : "bash")
+                    }}
+                    readOnly={disabled}
+                    padding={24}
+                    style={{
+                      fontFamily: '"JetBrains Mono", "Fira Code", "SF Mono", monospace',
+                      fontSize: 13,
+                      lineHeight: 1.6,
+                      backgroundColor: "#1e1e1e",
+                      color: "#d4d4d4",
+                      minHeight: "100%",
+                    }}
+                    textareaClassName="outline-none"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -551,64 +640,62 @@ export function SkillDetail() {
         )}
       </div>
 
-      {/* ── Review panel (below main content when pending) ──── */}
-      {review && review.security_assessment && (
-        <div className="border-t border-border shrink-0 max-h-[40%] overflow-y-auto">
-          <div className="px-6 py-4 space-y-4">
-            <div className="flex items-center gap-3">
-              <span className="text-[12px] font-medium text-muted-foreground">Security Assessment</span>
-              {(() => {
-                const rs = RISK_STYLES[review.security_assessment.risk_level] || RISK_STYLES.safe
-                return <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${rs.bg} ${rs.text}`}>{review.security_assessment.risk_level}</span>
-              })()}
-              <span className="text-[11px] text-muted-foreground">{review.security_assessment.summary}</span>
+      {/* ── New Script Name Dialog ────────────────────────────── */}
+      {showNameDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowNameDialog(false)} />
+          <div className="relative bg-card rounded-xl shadow-xl border border-border p-5 w-80 space-y-4">
+            <div>
+              <h3 className="text-sm font-semibold">New {newScriptType === "python" ? "Python" : "Shell"} Script</h3>
+              <p className="text-[11px] text-muted-foreground mt-1">Enter a filename for your script.</p>
             </div>
+            <input autoFocus type="text" value={newScriptName}
+              onChange={e => setNewScriptName(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && confirmAddScript()}
+              placeholder={newScriptType === "python" ? "script.py" : "script.sh"}
+              className="w-full h-9 px-3 text-sm rounded-md border border-border bg-background font-mono focus:outline-none focus:ring-1 focus:ring-ring" />
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowNameDialog(false)}
+                className="h-8 px-3 text-[12px] text-muted-foreground hover:text-foreground rounded-md">Cancel</button>
+              <button onClick={confirmAddScript} disabled={!newScriptName.trim()}
+                className="h-8 px-3 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50">Create Script</button>
+            </div>
+          </div>
+        </div>
+      )}
 
-            {review.security_assessment.findings.length > 0 && (
-              <div className="border border-border rounded-md overflow-hidden">
-                <table className="w-full text-[11px]">
-                  <thead className="bg-secondary/50">
-                    <tr>
-                      <th className="px-2 py-1 text-left font-medium text-muted-foreground">Severity</th>
-                      <th className="px-2 py-1 text-left font-medium text-muted-foreground">Category</th>
-                      <th className="px-2 py-1 text-left font-medium text-muted-foreground">Pattern</th>
-                      <th className="px-2 py-1 text-left font-medium text-muted-foreground">File</th>
-                      <th className="px-2 py-1 text-left font-medium text-muted-foreground">Line</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {review.security_assessment.findings.map((f, i) => (
-                      <tr key={i} className="border-t border-border/50">
-                        <td className="px-2 py-1">
-                          <span className={`px-1 py-0.5 rounded text-[9px] ${(RISK_STYLES[f.severity] || RISK_STYLES.low).bg} ${(RISK_STYLES[f.severity] || RISK_STYLES.low).text}`}>{f.severity}</span>
-                        </td>
-                        <td className="px-2 py-1 text-muted-foreground">{f.category}</td>
-                        <td className="px-2 py-1 font-mono">{f.match}</td>
-                        <td className="px-2 py-1 font-mono">{f.scriptName}</td>
-                        <td className="px-2 py-1">{f.line}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+      {/* ── Submit Diff Preview Dialog ──────────────────────── */}
+      {showSubmitDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowSubmitDialog(false)} />
+          <div className="relative w-full max-w-2xl bg-card rounded-xl shadow-xl border border-border overflow-hidden flex flex-col max-h-[80vh]">
+            <div className="px-6 py-4 border-b border-border">
+              <h3 className="text-[14px] font-semibold">Submit for Review</h3>
+              <p className="text-[12px] text-muted-foreground mt-1">Review your changes before submitting.</p>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-4 min-h-0">
+              {submitDiff ? (
+                <SkillDiffView diff={submitDiff} />
+              ) : (
+                <p className="text-[12px] text-muted-foreground">First submission — all content will be reviewed.</p>
+              )}
+            </div>
+            <div className="border-t border-border px-6 py-3 space-y-2">
+              <input
+                value={commitMessage} onChange={e => setCommitMessage(e.target.value)}
+                placeholder="Comment (optional) — describe what changed and why"
+                className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+              />
+              <div className="flex items-center justify-end gap-2">
+                <button onClick={() => setShowSubmitDialog(false)} disabled={submitConfirming}
+                  className="h-8 px-3 text-sm text-muted-foreground hover:text-foreground disabled:opacity-50">Cancel</button>
+                <button onClick={handleSubmitConfirm} disabled={submitConfirming}
+                  className="flex items-center gap-1.5 h-8 px-4 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50">
+                  {submitConfirming ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                  {submitConfirming ? "Submitting..." : "Confirm Submit"}
+                </button>
               </div>
-            )}
-
-            {/* Diff */}
-            {review.diff && (
-              <div className="space-y-2">
-                <span className="text-[12px] font-medium text-muted-foreground">Changes</span>
-                <SkillDiffView diff={review.diff} />
-              </div>
-            )}
-
-            {/* Reject reason input (for reviewers) */}
-            {skill?.status === "pending_review" && (
-              <div>
-                <label className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider mb-1 block">Reject Reason</label>
-                <input value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="Optional reason..."
-                  className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring" />
-              </div>
-            )}
+            </div>
           </div>
         </div>
       )}
