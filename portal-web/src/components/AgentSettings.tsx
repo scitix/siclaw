@@ -7,11 +7,9 @@ interface Agent {
   id: string
   name: string
   description: string
-  group_name: string
   status: string
   model_provider: string
   model_id: string
-  brain_type: string
   system_prompt: string
   is_production: boolean
   icon: string
@@ -59,7 +57,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   // Editable fields
   const [name, setName] = useState(agent.name)
   const [description, setDescription] = useState(agent.description || "")
-  const [groupName, setGroupName] = useState(agent.group_name || "")
   const [modelProvider, setModelProvider] = useState(agent.model_provider || "")
   const [modelId, setModelId] = useState(agent.model_id || "")
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
@@ -84,7 +81,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   useEffect(() => {
     setName(agent.name)
     setDescription(agent.description || "")
-    setGroupName(agent.group_name || "")
     setModelProvider(agent.model_provider || "")
     setModelId(agent.model_id || "")
     setSystemPrompt(agent.system_prompt || "")
@@ -151,7 +147,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
         body: {
           name: name.trim(),
           description: description.trim(),
-          group_name: groupName.trim(),
           model_provider: modelProvider.trim(),
           model_id: modelId.trim(),
           system_prompt: systemPrompt.trim(),
@@ -217,14 +212,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 onChange={(e) => setDescription(e.target.value)}
                 rows={2}
                 className="w-full px-3 py-2 text-[13px] rounded-md border border-border bg-background resize-none focus:outline-none focus:ring-1 focus:ring-ring"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-[12px] text-muted-foreground">Group</label>
-              <input
-                value={groupName}
-                onChange={(e) => setGroupName(e.target.value)}
-                className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>
             <label className="flex items-center gap-2 text-[13px] text-muted-foreground">

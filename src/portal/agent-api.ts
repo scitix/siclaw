@@ -42,7 +42,7 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     const total: number = Number(countRows[0].total);
 
     const listParams = [...params, pageSize, offset];
-    const listSql = `SELECT id, name, description, group_name, status, model_provider, model_id, icon, color, created_by, created_at, updated_at
+    const listSql = `SELECT id, name, description, status, model_provider, model_id, icon, color, created_by, created_at, updated_at
       FROM agents ${whereClause}
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?`;
@@ -63,13 +63,12 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     const db = getDb();
 
     await db.query(
-      `INSERT INTO agents (id, name, description, group_name, status, model_provider, model_id, system_prompt, is_production, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, system_prompt, is_production, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
         body.description ?? null,
-        body.group_name ?? null,
         body.status ?? "active",
         body.model_provider ?? null,
         body.model_id ?? null,
@@ -111,7 +110,7 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
 
     // Build dynamic SET clause
     const fields = [
-      "name", "description", "group_name", "status", "model_provider",
+      "name", "description", "status", "model_provider",
       "model_id", "system_prompt", "is_production", "icon", "color",
     ];
     const setClauses: string[] = [];

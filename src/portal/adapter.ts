@@ -39,7 +39,6 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       id: agent.id,
       name: agent.name,
       description: agent.description,
-      group_name: agent.group_name,
       status: agent.status,
       model_provider: agent.model_provider,
       model_id: agent.model_id,
