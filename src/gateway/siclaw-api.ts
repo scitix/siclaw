@@ -1717,6 +1717,39 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     sendJson(res, 201, rows[0]);
   });
 
+  // Update model entry
+  router.put(`${P}/admin/models/providers/:pid/models/:mid`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT me.id FROM model_entries me JOIN model_providers mp ON me.provider_id = mp.id WHERE me.id = ? AND me.provider_id = ? AND (mp.org_id = ? OR mp.org_id IS NULL)",
+      [params.mid, params.pid, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Model entry not found" });
+      return;
+    }
+
+    const body = await parseBody<Record<string, unknown>>(req);
+    const fields = ["model_id", "name", "reasoning", "context_window", "max_tokens", "is_default", "sort_order"];
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    for (const f of fields) {
+      if (f in body) { sets.push(`${f} = ?`); values.push(body[f]); }
+    }
+    if (sets.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
+
+    values.push(params.mid);
+    await db.query(`UPDATE model_entries SET ${sets.join(", ")} WHERE id = ?`, values);
+
+    const [rows] = await db.query("SELECT * FROM model_entries WHERE id = ?", [params.mid]) as any;
+    sendJson(res, 200, rows[0]);
+  });
+
   // Delete model entry
   router.delete(`${P}/admin/models/providers/:pid/models/:mid`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
