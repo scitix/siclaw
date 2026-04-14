@@ -121,7 +121,7 @@ describe("LocalCollector", () => {
       type: "skill_call",
       skillName: "my-custom-skill",
       scriptName: "run",
-      scope: "personal",
+      scope: "global",
       outcome: "success",
       durationMs: 300,
     });
@@ -136,7 +136,7 @@ describe("LocalCollector", () => {
 
     const custom = skills.find((s) => s.skillName === "my-custom-skill");
     expect(custom).toBeDefined();
-    expect(custom!.scope).toBe("personal");
+    expect(custom!.scope).toBe("global");
     expect(custom!.total).toBeGreaterThanOrEqual(1);
   });
 
