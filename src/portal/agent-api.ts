@@ -41,18 +41,24 @@ export function registerAgentRoutes(
     const params: unknown[] = [];
 
     if (search) {
-      whereClause = "WHERE name LIKE ? OR description LIKE ?";
+      whereClause = "WHERE a.name LIKE ? OR a.description LIKE ?";
       params.push(`%${search}%`, `%${search}%`);
     }
 
-    const countSql = `SELECT COUNT(*) AS total FROM agents ${whereClause}`;
+    const countSql = `SELECT COUNT(*) AS total FROM agents a ${whereClause}`;
     const [countRows] = await db.query(countSql, params) as any;
     const total: number = Number(countRows[0].total);
 
     const listParams = [...params, pageSize, offset];
-    const listSql = `SELECT id, name, description, status, model_provider, model_id, icon, color, created_by, created_at, updated_at
-      FROM agents ${whereClause}
-      ORDER BY created_at DESC
+    const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id,
+        a.is_production, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
+        (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
+        (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
+        (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
+        (SELECT COUNT(*) FROM agent_hosts ah WHERE ah.agent_id = a.id) AS hosts_count,
+        (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count
+      FROM agents a ${whereClause}
+      ORDER BY a.created_at DESC
       LIMIT ? OFFSET ?`;
 
     const [listRows] = await db.query(listSql, listParams) as any;
