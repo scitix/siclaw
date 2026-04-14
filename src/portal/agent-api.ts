@@ -80,6 +80,22 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
       ],
     );
 
+    // Auto-bind builtin skills to new agent
+    try {
+      const [builtinSkills] = await db.query(
+        "SELECT id FROM skills WHERE created_by = 'system' AND status = 'installed'",
+      ) as any;
+      for (const skill of builtinSkills) {
+        await db.query(
+          "INSERT IGNORE INTO agent_skills (agent_id, skill_id) VALUES (?, ?)",
+          [id, skill.id],
+        );
+      }
+    } catch (err) {
+      console.warn("[agent-api] Failed to auto-bind builtin skills:", err);
+      // Non-fatal — agent is still created successfully
+    }
+
     const [rows] = await db.query("SELECT * FROM agents WHERE id = ?", [id]) as any;
     sendJson(res, 201, rows[0]);
   });
