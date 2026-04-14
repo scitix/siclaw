@@ -33,8 +33,8 @@ interface ChatMessage {
   content: string
   tool_name?: string
   tool_input?: string
-  tool_status?: string
-  tool_details?: Record<string, unknown>
+  outcome?: string
+  duration_ms?: number
   metadata?: Record<string, unknown>
   hidden?: boolean
   created_at: string
@@ -224,6 +224,10 @@ function timeNow(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
+function tryParseJson(s: string): Record<string, unknown> | undefined {
+  try { return JSON.parse(s) } catch { return undefined }
+}
+
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
   const [streaming, setStreaming] = useState(false)
@@ -278,9 +282,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           role: m.role,
           content: m.content,
           toolName: m.tool_name,
-          toolInput: m.tool_input,
-          toolStatus: m.tool_status as PilotMessage["toolStatus"],
-          toolDetails: m.tool_details,
+          toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
+          toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
           metadata: m.metadata,
           hidden: m.hidden,
           timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -599,9 +602,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         role: m.role,
         content: m.content,
         toolName: m.tool_name,
-        toolInput: m.tool_input,
-        toolStatus: m.tool_status as PilotMessage["toolStatus"],
-        toolDetails: m.tool_details,
+        toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
+        toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
         metadata: m.metadata,
         hidden: m.hidden,
         timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),

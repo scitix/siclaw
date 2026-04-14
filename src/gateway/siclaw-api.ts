@@ -1073,10 +1073,15 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     const [[countRows], [listRows]] = await Promise.all([
       db.query("SELECT COUNT(*) AS count FROM chat_messages WHERE session_id = ?", [params.sid]),
       db.query(
-        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
+        // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
+        // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
+        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
     ]) as [any, any];
+
+    // Reverse to chronological order (oldest first) for the frontend
+    (listRows as any[]).reverse();
 
     sendJson(res, 200, {
       data: listRows,

@@ -146,6 +146,8 @@ export function registerChatRoutes(
     let assistantText = "";
     let closed = false;
     let historySaved = false;
+    const toolRecords: ToolRecord[] = [];
+    let currentTool: ToolRecord | null = null;
 
     function cleanup(): void {
       if (closed) return;
@@ -215,11 +217,30 @@ export function registerChatRoutes(
               }
             }
 
+            // Track tool executions
+            if (evt.type === "tool_execution_start") {
+              const toolName = (evt.toolName as string) ?? "tool";
+              const args = evt.args as Record<string, unknown> | undefined;
+              const input = args ? JSON.stringify(args) : "";
+              currentTool = { toolName, toolInput: input, content: "", outcome: null, durationMs: null };
+            }
+            if (evt.type === "tool_execution_end" && currentTool) {
+              const result = evt.result as { content?: Array<{ type: string; text?: string }> } | undefined;
+              currentTool.content = result?.content
+                ?.filter((c) => c.type === "text")
+                .map((c) => c.text ?? "")
+                .join("") ?? "";
+              currentTool.outcome = (evt.isError ? "error" : "success") as "success" | "error";
+              currentTool.durationMs = typeof evt.durationMs === "number" ? evt.durationMs : null;
+              toolRecords.push(currentTool);
+              currentTool = null;
+            }
+
             // Stream complete
             if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
               if (!historySaved && body.text) {
                 historySaved = true;
-                saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText).catch(
+                saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText, toolRecords).catch(
                   (err) => console.error("[chat-gateway] Failed to save history:", err),
                 );
               }
@@ -250,7 +271,7 @@ export function registerChatRoutes(
         // Save history on WS close as fallback
         if (!historySaved && assistantText && body.text) {
           historySaved = true;
-          saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText).catch(
+          saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText, toolRecords).catch(
             (err) => console.error("[chat-gateway] Failed to save history on close:", err),
           );
         }
@@ -355,6 +376,8 @@ export function registerChatRoutes(
 
     let assistantText = "";
     let resolved = false;
+    const toolRecords2: ToolRecord[] = [];
+    let currentTool2: ToolRecord | null = null;
 
     const timeout = setTimeout(() => {
       if (!resolved) {
@@ -408,14 +431,33 @@ export function registerChatRoutes(
             if (evt.type === "agent_message" && typeof evt.text === "string") {
               assistantText += evt.text;
             }
+            if (evt.type === "message_update") {
+              const ame = (evt as any).assistantMessageEvent;
+              if (ame?.type === "text_delta" && ame.delta) {
+                assistantText += ame.delta;
+              }
+            }
+            if (evt.type === "tool_execution_start") {
+              const toolName = (evt.toolName as string) ?? "tool";
+              const args = evt.args as Record<string, unknown> | undefined;
+              currentTool2 = { toolName, toolInput: args ? JSON.stringify(args) : "", content: "", outcome: null, durationMs: null };
+            }
+            if (evt.type === "tool_execution_end" && currentTool2) {
+              const result = evt.result as { content?: Array<{ type: string; text?: string }> } | undefined;
+              currentTool2.content = result?.content?.filter((c) => c.type === "text").map((c) => c.text ?? "").join("") ?? "";
+              currentTool2.outcome = (evt.isError ? "error" : "success") as "success" | "error";
+              currentTool2.durationMs = typeof evt.durationMs === "number" ? evt.durationMs : null;
+              toolRecords2.push(currentTool2);
+              currentTool2 = null;
+            }
 
-            if (evt.type === "turn_complete" || evt.type === "done") {
+            if (evt.type === "turn_complete" || evt.type === "done" || evt.type === "agent_end" || evt.type === "prompt_done") {
               if (!resolved) {
                 resolved = true;
                 clearTimeout(timeout);
                 ws.close();
 
-                saveChatHistory(agentId, auth.userId, sessionId, body.text!, assistantText).catch(
+                saveChatHistory(agentId, auth.userId, sessionId, body.text!, assistantText, toolRecords2).catch(
                   (err) => console.error("[chat-gateway] Failed to save history:", err),
                 );
 
@@ -530,35 +572,62 @@ export async function runtimeRpc(
 
 // ── Chat history persistence ────────────────────────────────
 
+interface ToolRecord {
+  toolName: string
+  toolInput: string
+  content: string
+  outcome: "success" | "error" | "blocked" | null
+  durationMs: number | null
+}
+
 async function saveChatHistory(
   agentId: string,
   userId: string,
   sessionId: string,
   userText: string,
   assistantText: string,
+  toolRecords: ToolRecord[],
 ): Promise<void> {
   const db = getDb();
+  const totalMessages = 2 + toolRecords.length; // user + tools + assistant
 
-  // Upsert session — MySQL uses ON DUPLICATE KEY UPDATE instead of ON CONFLICT
+  // Upsert session
   await db.query(
     `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, last_active_at)
-     VALUES (?, ?, ?, ?, ?, 2, NOW(3))
+     VALUES (?, ?, ?, ?, ?, ?, NOW(3))
      ON DUPLICATE KEY UPDATE
-       message_count = chat_sessions.message_count + 2,
+       message_count = chat_sessions.message_count + ?,
        preview = VALUES(preview),
        last_active_at = NOW(3)`,
-    [sessionId, agentId, userId, userText.slice(0, 100), assistantText.slice(0, 200)],
+    [sessionId, agentId, userId, userText.slice(0, 100), assistantText.slice(0, 200), totalMessages, totalMessages],
   );
 
-  // Insert user message
+  // Insert messages in chronological order with 1ms spacing to guarantee ordering
+  const baseTime = Date.now();
+  let offset = 0;
+
+  // 1. User message
   await db.query(
-    `INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'user', ?, NOW(3))`,
-    [crypto.randomUUID(), sessionId, userText],
+    `INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'user', ?, ?)`,
+    [crypto.randomUUID(), sessionId, userText, new Date(baseTime + offset++)],
   );
 
-  // Insert assistant message
+  // 2. Tool messages
+  for (const tool of toolRecords) {
+    await db.query(
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, outcome, duration_ms, created_at)
+       VALUES (?, ?, 'tool', ?, ?, ?, ?, ?, ?)`,
+      [
+        crypto.randomUUID(), sessionId, tool.content,
+        tool.toolName, tool.toolInput, tool.outcome, tool.durationMs,
+        new Date(baseTime + offset++),
+      ],
+    );
+  }
+
+  // 3. Assistant message
   await db.query(
-    `INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, NOW(3))`,
-    [crypto.randomUUID(), sessionId, assistantText],
+    `INSERT INTO chat_messages (id, session_id, role, content, created_at) VALUES (?, ?, 'assistant', ?, ?)`,
+    [crypto.randomUUID(), sessionId, assistantText, new Date(baseTime + offset++)],
   );
 }

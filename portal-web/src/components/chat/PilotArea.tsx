@@ -11,6 +11,8 @@ import {
   XCircle,
   Ban,
   MessageSquare,
+  Copy,
+  Check,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
@@ -140,36 +142,6 @@ export function PilotArea({
     return null
   }, [messages])
 
-  // Show "Dig deeper" button
-  const showTraceButton = useMemo(() => {
-    if (isLoading) return false
-    if (dpActive || (dpChecklist && dpChecklist.length > 0)) return false
-    let turnStart = -1
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        turnStart = i
-        break
-      }
-    }
-    if (turnStart < 0) return false
-    const turnMessages = messages.slice(turnStart + 1).filter((m) => !m.hidden)
-    const DIAGNOSTIC_TOOLS = new Set(["bash", "pod_exec", "node_exec", "node_script", "pod_script", "local_script"])
-    const hasDiagnostic = turnMessages.some((m) => m.role === "tool" && DIAGNOSTIC_TOOLS.has(m.toolName ?? ""))
-    let lastAssistantIdx = -1
-    let lastToolIdx = -1
-    for (let i = turnMessages.length - 1; i >= 0; i--) {
-      if (lastAssistantIdx < 0 && turnMessages[i].role === "assistant") lastAssistantIdx = i
-      if (lastToolIdx < 0 && turnMessages[i].role === "tool") lastToolIdx = i
-      if (lastAssistantIdx >= 0 && lastToolIdx >= 0) break
-    }
-    const hasConclusion =
-      lastAssistantIdx > lastToolIdx &&
-      lastToolIdx >= 0 &&
-      (turnMessages[lastAssistantIdx]?.content?.trim().length ?? 0) > 0
-    const stillStreaming = turnMessages.some((m) => m.isStreaming)
-    return hasDiagnostic && hasConclusion && !stillStreaming
-  }, [messages, isLoading, dpActive, dpChecklist])
-
   // Check if latest hypotheses were already confirmed
   const latestHypothesesConfirmed = useMemo(() => {
     if (!latestHypothesesId) return false
@@ -238,7 +210,7 @@ export function PilotArea({
                     type="button"
                     onClick={onLoadMore}
                     disabled={loadingMore}
-                    className="flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-medium text-muted-foreground bg-secondary hover:bg-gray-200 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-medium text-muted-foreground bg-secondary hover:bg-secondary/80 transition-colors disabled:opacity-50"
                   >
                     {loadingMore ? (
                       <>
@@ -276,25 +248,6 @@ export function PilotArea({
                     onOpenSchedulePanel={onOpenSchedulePanel}
                   />
                 ))}
-
-              {/* Trace root cause button */}
-              {showTraceButton && (
-                <div className="flex justify-start pl-12 my-2">
-                  <button
-                    type="button"
-                    disabled={isLoading}
-                    onClick={() =>
-                      wrappedSendMessage(
-                        "Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.",
-                      )
-                    }
-                    className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white text-sm font-medium shadow-sm shadow-black/10 hover:shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <SearchCode className="w-4 h-4" />
-                    Dig deeper
-                  </button>
-                </div>
-              )}
 
               {/* DP Checklist Card */}
               {dpChecklist && dpChecklist.length > 0 && (
@@ -593,16 +546,7 @@ function MessageItem({
         )}
 
         {textContent && (
-          <div
-            className={cn(
-              "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 max-w-3xl min-w-0 overflow-hidden",
-              isUser
-                ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
-                : "bg-card border border-border text-foreground rounded-tl-sm",
-            )}
-          >
-            <Markdown>{textContent}</Markdown>
-          </div>
+          <CopyableMessage isUser={isUser} content={textContent} />
         )}
 
         {suggestedReplies.length > 0 && onChipClick && (
@@ -620,6 +564,41 @@ function MessageItem({
           </div>
         )}
       </div>
+    </div>
+  )
+}
+
+function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(content).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
+  return (
+    <div className="group relative">
+      <div
+        className={cn(
+          "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 max-w-3xl min-w-0 overflow-hidden",
+          isUser
+            ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
+            : "bg-card border border-border text-foreground rounded-tl-sm",
+        )}
+      >
+        <Markdown>{content}</Markdown>
+      </div>
+      {!isUser && (
+        <button
+          onClick={handleCopy}
+          className="absolute -bottom-3 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md bg-secondary border border-border text-muted-foreground hover:text-foreground"
+          title="Copy markdown"
+        >
+          {copied ? <Check className="h-3.5 w-3.5 text-green-400" /> : <Copy className="h-3.5 w-3.5" />}
+        </button>
+      )}
     </div>
   )
 }
@@ -654,16 +633,16 @@ function ToolItem({ message }: { message: PilotMessage }) {
           {message.toolStatus === "aborted" && <Ban className="w-3.5 h-3.5 text-amber-500 ml-auto shrink-0" />}
         </button>
         {isOpen && (
-          <div className="overflow-x-auto bg-slate-50 max-h-80 overflow-y-auto">
+          <div className="overflow-x-auto bg-secondary/30 max-h-80 overflow-y-auto">
             {message.toolInput && (
-              <div className="px-4 pt-3 pb-2 border-b border-slate-200">
+              <div className="px-4 pt-3 pb-2 border-b border-border/50">
                 <pre className="text-xs font-mono leading-relaxed text-foreground whitespace-pre-wrap break-all">
                   {message.toolInput}
                 </pre>
               </div>
             )}
             <div className="p-4">
-              <pre className="text-xs font-mono leading-relaxed text-slate-600 whitespace-pre-wrap">
+              <pre className="text-xs font-mono leading-relaxed text-muted-foreground whitespace-pre-wrap">
                 {message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running...")}
               </pre>
             </div>
