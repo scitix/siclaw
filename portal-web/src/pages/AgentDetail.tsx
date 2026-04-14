@@ -8,8 +8,8 @@ import { AgentApiKeys } from "../components/AgentApiKeys"
 import { AgentSettings } from "../components/AgentSettings"
 
 interface Agent {
-  id: string; name: string; description: string; group_name: string; status: string
-  model_provider: string; model_id: string; brain_type: string; is_production: boolean
+  id: string; name: string; description: string; status: string
+  model_provider: string; model_id: string; is_production: boolean
   system_prompt: string; icon: string; color: string; created_at: string
 }
 
@@ -88,7 +88,7 @@ export function AgentDetail() {
               <span className={`h-2 w-2 rounded-full ${statusColors[agent.status] || statusColors.inactive}`} />
             </div>
             <p className="text-[11px] text-muted-foreground mt-0.5">
-              {agent.group_name ? `${agent.group_name} · ` : ""}{agent.model_id || "No model"}
+              {agent.model_id || "No model"}
               {agent.model_provider ? ` · ${agent.model_provider}` : ""}
             </p>
           </div>

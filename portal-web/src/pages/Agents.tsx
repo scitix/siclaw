@@ -6,7 +6,7 @@ import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
 
 interface Agent {
-  id: string; name: string; description: string; group_name: string; status: string
+  id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; is_production: boolean; created_at: string
 }
 
