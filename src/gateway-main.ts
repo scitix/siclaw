@@ -10,6 +10,7 @@ import { startRuntime } from "./gateway/server.js";
 import { AgentBoxManager, K8sSpawner, ProcessSpawner, LocalSpawner } from "./gateway/agentbox/index.js";
 import { initDb, closeDb } from "./gateway/db.js";
 import { runMigrations } from "./gateway/migrate.js";
+import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { ChannelManager } from "./gateway/channel-manager.js";
 import { CronCoordinator } from "./gateway/cron-coordinator.js";
 
@@ -31,6 +32,8 @@ if (!config.runtimeSecret) {
 if (config.databaseUrl) {
   initDb(config.databaseUrl);
   await runMigrations();
+  // TODO: use config.orgId if available; defaulting to "default" for now
+  await syncBuiltinSkills("default");
   console.log("[runtime] Database ready");
 }
 
