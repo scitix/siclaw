@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
-import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, ClipboardList, Key, Eraser } from "lucide-react"
+import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, ClipboardList } from "lucide-react"
 import { api, clearAgentMemory } from "../api"
 import { useToast } from "../components/toast"
 import { Tooltip } from "../components/tooltip"
@@ -9,6 +9,7 @@ import { useConfirm } from "../components/confirm-dialog"
 interface Agent {
   id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; is_production: boolean; created_at: string
+  skills_count?: number; mcp_count?: number; clusters_count?: number; hosts_count?: number; tasks_count?: number
 }
 
 interface ModelEntry {
@@ -140,30 +141,46 @@ export function Agents() {
         ) : (
           <div className="px-6 py-4 space-y-2">
             {agents.map((a) => (
-              <div key={a.id} className="flex items-center justify-between p-3 rounded-lg border border-border/50 hover:bg-secondary/30 cursor-pointer" onClick={() => navigate(`/chat?agent=${a.id}`)}>
-                <div className="flex items-center gap-3">
-                  <Bot className="h-5 w-5 text-muted-foreground" />
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-sm font-medium font-mono">{a.name}</p>
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${a.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>
-                        {a.is_production ? "PROD" : "DEV"}
-                      </span>
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      {getModelDisplay(a)}
-                      {a.model_provider && ` · ${a.model_provider}`}
-                      {a.description ? ` · ${a.description}` : ""}
-                    </p>
+              <div key={a.id} className="flex items-center gap-4 p-4 rounded-lg border border-border/50 hover:bg-secondary/20 cursor-pointer transition-colors" onClick={() => navigate(`/chat?agent=${a.id}`)}>
+                {/* Icon */}
+                <div className="h-10 w-10 rounded-lg flex items-center justify-center shrink-0 bg-secondary text-muted-foreground">
+                  <Bot className="h-5 w-5" />
+                </div>
+
+                {/* Info */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <p className="text-[13px] font-semibold font-mono truncate">{a.name}</p>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] shrink-0 ${a.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>
+                      {a.is_production ? "PROD" : "DEV"}
+                    </span>
+                    <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${a.status === "active" ? "bg-green-500" : "bg-gray-500"}`} />
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
+                    {getModelDisplay(a)}{a.model_provider && ` · ${a.model_provider}`}{a.description ? ` · ${a.description}` : ""}
+                  </p>
+                  {/* Resource badges */}
+                  <div className="flex items-center gap-1.5 mt-1.5">
+                    <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=skills`) }} className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                      <Zap className="h-2.5 w-2.5" />{a.skills_count ?? 0} skills
+                    </button>
+                    <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=mcp`) }} className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                      <Plug className="h-2.5 w-2.5" />{a.mcp_count ?? 0} mcp
+                    </button>
+                    <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=resources`) }} className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                      <Server className="h-2.5 w-2.5" />{(a.clusters_count ?? 0) + (a.hosts_count ?? 0)} resources
+                    </button>
+                    <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=tasks`) }} className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                      <ClipboardList className="h-2.5 w-2.5" />{a.tasks_count ?? 0} tasks
+                    </button>
                   </div>
                 </div>
-                <div className="flex items-center gap-0.5">
-                  <span className={`h-2 w-2 rounded-full mr-2 ${a.status === "active" ? "bg-green-500" : "bg-gray-500"}`} />
+
+                {/* Actions */}
+                <div className="flex items-center gap-0.5 shrink-0">
                   <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
-                  <Tooltip content="Tasks"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=tasks`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><ClipboardList className="h-4 w-4" /></button></Tooltip>
-                  <Tooltip content="API Keys"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=api-keys`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Key className="h-4 w-4" /></button></Tooltip>
-                  <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=settings`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Clear Memory"><button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=basic`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Delete"><button onClick={(e) => { e.stopPropagation(); handleDelete(a.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-4 w-4" /></button></Tooltip>
                 </div>
               </div>
