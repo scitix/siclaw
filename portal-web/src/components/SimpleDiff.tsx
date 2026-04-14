@@ -230,6 +230,15 @@ function parseScriptsList(raw: string | null): { name: string; content: string }
   }
 }
 
+/** Decode a string that may have been double-JSON-encoded */
+function decodeStr(raw: string | null): string {
+  if (!raw) return ""
+  let s = raw
+  // Unwrap double-encoding: "\"---\\nname:...\"" → "---\nname:..."
+  if (s.startsWith('"')) { try { s = JSON.parse(s) } catch {} }
+  return s
+}
+
 export function SkillDiffView({ diff: rawDiff }: SkillDiffViewProps) {
   if (!rawDiff) return null
 
@@ -262,9 +271,9 @@ export function SkillDiffView({ diff: rawDiff }: SkillDiffViewProps) {
     return { name, badge, oldContent, newContent, additions, removals }
   }).filter(s => s.badge !== "unchanged")
 
-  // Specs diff stats
-  const specsOld = typeof specsDiff?.old === "string" ? specsDiff.old : specsDiff?.old ? JSON.stringify(specsDiff.old, null, 2) : ""
-  const specsNew = typeof specsDiff?.new === "string" ? specsDiff.new : specsDiff?.new ? JSON.stringify(specsDiff.new, null, 2) : ""
+  // Specs diff stats — decode double-encoded strings
+  const specsOld = decodeStr(specsDiff?.old)
+  const specsNew = decodeStr(specsDiff?.new)
   const specsLines = hasSpecs ? computeDiff(specsOld, specsNew) : []
   const specsAdded = specsLines.filter(l => l.type === "add").length
   const specsRemoved = specsLines.filter(l => l.type === "remove").length
