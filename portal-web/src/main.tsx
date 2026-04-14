@@ -11,6 +11,8 @@ import { AgentDetail } from "./pages/AgentDetail"
 import { Clusters } from "./pages/Clusters"
 import { Hosts } from "./pages/Hosts"
 import { Skills } from "./pages/Skills"
+import { SkillDetail } from "./pages/SkillDetail"
+import { PendingReviews } from "./pages/PendingReviews"
 import { MCP } from "./pages/MCP"
 import { Models } from "./pages/Models"
 import { Chat } from "./pages/Chat"
@@ -33,6 +35,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="agents/:id" element={<AgentDetail />} />
         <Route path="chat" element={<Chat />} />
         <Route path="skills" element={<Skills />} />
+        <Route path="skills/new" element={<SkillDetail />} />
+        <Route path="skills/:id" element={<SkillDetail />} />
+        <Route path="reviews" element={<PendingReviews />} />
         <Route path="mcp" element={<MCP />} />
         <Route path="settings/clusters" element={<Clusters />} />
         <Route path="settings/hosts" element={<Hosts />} />

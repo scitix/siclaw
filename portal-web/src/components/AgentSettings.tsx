@@ -75,6 +75,11 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   const [selectedClusterIds, setSelectedClusterIds] = useState<Set<string>>(new Set())
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set())
 
+  // Skill binding
+  const [allSkills, setAllSkills] = useState<{ id: string; name: string; description: string; status: string; labels: string[] | null }[]>([])
+  const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set())
+  const [skillLabelFilter, setSkillLabelFilter] = useState("")
+
   const [saving, setSaving] = useState(false)
 
   // Sync form state when agent prop changes
@@ -108,6 +113,13 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
       .catch(() => setAllHosts([]))
   }, [])
 
+  // Load available skills
+  useEffect(() => {
+    api<{ data: { id: string; name: string; description: string; status: string; labels: string[] | null }[] }>("/siclaw/skills?page_size=500")
+      .then(r => setAllSkills(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setAllSkills([]))
+  }, [])
+
   // Load resources
   useEffect(() => {
     let cancelled = false
@@ -126,11 +138,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
     return () => { cancelled = true }
   }, [agent.id])
 
-  // Pre-select currently bound clusters/hosts when resources load
+  // Pre-select currently bound clusters/hosts/skills when resources load
   useEffect(() => {
     if (resources) {
       setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
       setSelectedHostIds(new Set(resources.hosts?.sample?.map(h => h.id) || []))
+      setSelectedSkillIds(new Set(resources.skill_ids || []))
     }
   }, [resources])
 
@@ -160,8 +173,7 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
         body: {
           cluster_ids: Array.from(selectedClusterIds),
           host_ids: Array.from(selectedHostIds),
-          // Keep existing skill/mcp bindings unchanged
-          skill_ids: resources?.skill_ids || [],
+          skill_ids: Array.from(selectedSkillIds),
           mcp_server_ids: resources?.mcp_server_ids || [],
         },
       })
@@ -350,19 +362,52 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 )}
               </div>
 
-              {/* Skills (read-only) */}
-              {resources && resources.skill_ids?.length > 0 && (
-                <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground font-medium">Bound Skills</label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {resources.skill_ids.map((sid) => (
-                      <span key={sid} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground font-mono">
-                        {sid}
-                      </span>
+              {/* Skills Binding */}
+              <div className="space-y-1.5">
+                <label className="text-[12px] text-muted-foreground font-medium">
+                  Bound Skills ({selectedSkillIds.size})
+                </label>
+                <input
+                  value={skillLabelFilter}
+                  onChange={e => setSkillLabelFilter(e.target.value)}
+                  placeholder="Filter by label..."
+                  className="w-full h-7 px-2 text-[12px] rounded border border-border bg-background"
+                />
+                <div className="max-h-48 overflow-auto border border-border rounded-md">
+                  {allSkills
+                    .filter(s => {
+                      if (!skillLabelFilter) return true
+                      const labels = Array.isArray(s.labels) ? s.labels : []
+                      return labels.some(l => l.toLowerCase().includes(skillLabelFilter.toLowerCase()))
+                    })
+                    .map(s => (
+                      <label key={s.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-secondary/30 cursor-pointer text-[12px]">
+                        <input
+                          type="checkbox"
+                          checked={selectedSkillIds.has(s.id)}
+                          onChange={e => {
+                            const next = new Set(selectedSkillIds)
+                            if (e.target.checked) next.add(s.id)
+                            else next.delete(s.id)
+                            setSelectedSkillIds(next)
+                          }}
+                          className="rounded"
+                        />
+                        <span className="font-mono">{s.name}</span>
+                        <span className={`px-1 py-0.5 rounded text-[9px] ${
+                          s.status === "installed" ? "bg-green-500/20 text-green-400" :
+                          s.status === "pending_review" ? "bg-blue-500/20 text-blue-400" :
+                          "bg-yellow-500/20 text-yellow-400"
+                        }`}>
+                          {s.status === "installed" ? "Installed" : s.status === "pending_review" ? "Pending" : "Draft"}
+                        </span>
+                      </label>
                     ))}
-                  </div>
+                  {allSkills.length === 0 && (
+                    <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">No skills available</p>
+                  )}
                 </div>
-              )}
+              </div>
 
               {/* MCP Servers (read-only) */}
               {resources && resources.mcp_server_ids?.length > 0 && (

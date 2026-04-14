@@ -1,12 +1,13 @@
 import { useState } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, ShieldCheck } from "lucide-react"
 import { clearToken } from "../api"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
   { path: "/agents", label: "Agents", icon: Bot },
   { path: "/skills", label: "Skills", icon: Zap },
+  { path: "/reviews", label: "Reviews", icon: ShieldCheck },
   { path: "/mcp", label: "MCP", icon: Plug },
 ]
 
