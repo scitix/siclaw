@@ -17,7 +17,8 @@ import { registration as podScript } from "./script-exec/pod-script.js";
 import { registration as localScript } from "./script-exec/local-script.js";
 // query
 import { registration as investigationFeedback } from "./query/investigation-feedback.js";
-import { registration as credentialList } from "./query/credential-list.js";
+import { registration as clusterList } from "./query/cluster-list.js";
+import { registration as clusterProbe } from "./query/cluster-probe.js";
 import { registration as clusterInfo } from "./query/cluster-info.js";
 import { registration as knowledgeSearch } from "./query/knowledge-search.js";
 import { registration as resolvePodNetns } from "./query/resolve-pod-netns.js";
@@ -30,14 +31,14 @@ import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
 
-// Total: 18 entries
+// Total: 19 entries
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
   nodeExec, podExec, restrictedBash,
   // ── script-exec ──
   nodeScript, podScript, localScript,
   // ── query ──
-  investigationFeedback, credentialList, clusterInfo,
+  investigationFeedback, clusterList, clusterProbe, clusterInfo,
   knowledgeSearch, resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
   deepSearch, saveFeedback, manageSchedule, taskReport, skillPreview,

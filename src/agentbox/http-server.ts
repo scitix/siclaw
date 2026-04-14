@@ -16,6 +16,8 @@ import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
+import { CredentialBroker } from "./credential-broker.js";
+import { HttpMtlsTransport } from "./credential-transport.js";
 import { getResourceHandler } from "./resource-handlers.js";
 import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
@@ -91,16 +93,27 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
  * Create HTTP or HTTPS server (auto-detects certificates)
  */
 export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server | https.Server {
-  // Initialize credential broker if SICLAW_GATEWAY_URL is configured (K8s mode)
-  {
-    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
-    if (gatewayUrl && !sessionManager.credentialBroker) {
-      // Dynamic import is deferred — broker is available before first prompt
-      import("./credential-broker.js").then(({ CredentialBroker }) => {
+  // Initialize credential broker synchronously before any session is created.
+  // The broker reference is captured by value into each session's KubeconfigRef,
+  // so we cannot defer initialization — a late-arriving broker would never be
+  // seen by sessions created before it landed.
+  // Transport selection:
+  //   1. sessionManager.credentialTransport already set → Local mode (LocalSpawner
+  //      injected a DirectCallTransport bound to a session identity).
+  //   2. SICLAW_GATEWAY_URL set → K8s mode (build HttpMtlsTransport from env).
+  //   3. Otherwise → no broker; tools that need credentials will fail fast.
+  if (!sessionManager.credentialBroker) {
+    const credentialsDir = sessionManager.credentialsDir;
+    if (sessionManager.credentialTransport) {
+      sessionManager.credentialBroker = new CredentialBroker(sessionManager.credentialTransport, credentialsDir);
+      console.log("[agentbox-http] Credential broker initialized (local/direct transport)");
+    } else {
+      const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+      if (gatewayUrl) {
         const client = new GatewayClient({ gatewayUrl });
-        sessionManager.credentialBroker = new CredentialBroker(client);
-        console.log("[agentbox-http] Credential broker initialized");
-      }).catch(err => console.warn("[agentbox-http] Credential broker init failed:", err));
+        sessionManager.credentialBroker = new CredentialBroker(new HttpMtlsTransport(client), credentialsDir);
+        console.log("[agentbox-http] Credential broker initialized (mTLS transport)");
+      }
     }
   }
 

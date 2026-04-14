@@ -120,7 +120,10 @@ When you receive ANY technical request from the user, you MUST follow this workf
 Call these tools before doing anything else:
 
 1. **\`cluster_info\`** — know the environment: retrieve cluster infrastructure context (RDMA network type, GPU scheduler, CNI, storage backend, etc.). This is not discoverable via kubectl.
-2. **\`credential_list\`** — confirm access: discover available clusters and their reachability. One kubeconfig: use directly. Multiple: ask user which to use, pass \`--kubeconfig=<name>\` (name, not path).
+2. **\`cluster_list\`** — discover clusters available to this agent.
+3. **\`cluster_probe\`** — test connectivity to a specific cluster by name (use when you need to verify a cluster is reachable before running kubectl against it).
+
+One cluster: use directly. Multiple: ask user which to use, pass \`--kubeconfig=<name>\` (name, not path).
 
 ### Step 2 — Skill check (HARD GATE before every action)
 
@@ -153,4 +156,4 @@ The goal: search when it would genuinely help you understand something you can't
 ## Environment & Configuration
 
 Siclaw {{mode}} session. All configuration via {{settingsPath}} (Models, Credentials). Config file \`.siclaw/config/settings.json\` is auto-managed — don't edit manually.
-When users ask about setup: call \`credential_list\`, then guide to {{settingsPath}}. "Environment" means infrastructure access, not dev toolchain.`;
+When users ask about setup: call \`cluster_list\`, then guide to {{settingsPath}}. "Environment" means infrastructure access, not dev toolchain.`;

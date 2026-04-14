@@ -13,6 +13,7 @@ import { runMigrations } from "./gateway/migrate.js";
 import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { ChannelManager } from "./gateway/channel-manager.js";
 import { CronCoordinator } from "./gateway/cron-coordinator.js";
+import { createCredentialService } from "./gateway/credential-service.js";
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -37,6 +38,11 @@ if (config.databaseUrl) {
   console.log("[runtime] Database ready");
 }
 
+// Credential service — shared by startRuntime (for mTLS handlers) and
+// LocalSpawner (for in-process DirectCallTransport). Must exist before spawner
+// accepts any spawn calls.
+const credentialService = createCredentialService(config);
+
 // Create Spawner
 const spawner = useK8s
   ? new K8sSpawner({
@@ -51,7 +57,7 @@ const spawner = useK8s
     })
   : useProcess
     ? new ProcessSpawner()
-    : new LocalSpawner(4000);
+    : new LocalSpawner(credentialService, 4000);
 
 console.log(`[runtime] Using spawner: ${spawner.name}`);
 
@@ -66,6 +72,7 @@ const runtime = await startRuntime({
   config,
   agentBoxManager,
   spawner,
+  credentialService,
 });
 
 // Boot channel integrations (Lark, etc.) from DB

@@ -1,24 +1,17 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
-import fs from "node:fs";
-import path from "node:path";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { KubeconfigRef } from "../../core/types.js";
-import { loadConfig } from "../../core/config.js";
-
-interface ManifestEntry {
-  name: string;
-  type: string;
-  description?: string | null;
-}
 
 /**
- * Tool to retrieve cluster infrastructure descriptions.
- * Returns cluster names and their admin-provided descriptions containing
- * infrastructure context (network type, scheduler, CNI, etc.) that is
- * not discoverable via kubectl.
+ * cluster_info — return admin-provided infrastructure descriptions for the
+ * clusters bound to the current agent.
+ *
+ * Data source: CredentialBroker's in-memory registry (populated by the
+ * gateway's CredentialService). The description field typically carries
+ * context that is not discoverable via kubectl — RDMA/CNI/scheduler etc.
  */
 export function createClusterInfoTool(kubeconfigRef: KubeconfigRef): ToolDefinition {
   return {
@@ -31,7 +24,7 @@ export function createClusterInfoTool(kubeconfigRef: KubeconfigRef): ToolDefinit
       );
     },
     renderResult: renderTextResult,
-    description: `Get infrastructure descriptions for available Kubernetes clusters.
+    description: `Get infrastructure descriptions for Kubernetes clusters bound to this agent.
 Returns cluster names and their admin-provided descriptions containing critical
 infrastructure context — e.g. RDMA network type (SR-IOV/macvlan/ipvlan), GPU
 scheduler (volcano/kueue), CNI plugin (calico/cilium), storage backend, etc.
@@ -44,48 +37,39 @@ the cluster administrator.`,
     }),
     async execute(_toolCallId, rawParams) {
       const params = rawParams as { name?: string };
-      const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-
-      if (!credentialsDir) {
+      const broker = kubeconfigRef.credentialBroker;
+      if (!broker) {
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Credentials directory not configured" }) }],
-          details: {},
-        };
-      }
-
-      const manifestPath = path.join(credentialsDir, "manifest.json");
-      if (!fs.existsSync(manifestPath)) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ clusters: [], message: "No clusters configured" }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: "Credential broker not initialized for this session" }) }],
           details: {},
         };
       }
 
       try {
-        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as ManifestEntry[];
-        let clusters = manifest.filter((c) => c.type === "kubeconfig");
-
-        if (params.name) {
-          const needle = params.name.toLowerCase();
-          clusters = clusters.filter((c) => c.name.toLowerCase().includes(needle));
-        }
-
-        const result = clusters.map((c) => ({
-          name: c.name,
-          infra_context: c.description ?? null,
-        }));
-
-        return {
-          content: [{ type: "text", text: JSON.stringify({ clusters: result }, null, 2) }],
-          details: {},
-        };
+        await broker.list();
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: JSON.stringify({ error: message }) }],
+          content: [{ type: "text", text: JSON.stringify({ error: `Failed to list clusters: ${message}` }) }],
           details: {},
         };
       }
+
+      let clusters = broker.listLocalInfo();
+      if (params.name) {
+        const needle = params.name.toLowerCase();
+        clusters = clusters.filter((c) => c.name.toLowerCase().includes(needle));
+      }
+
+      const result = clusters.map((c) => ({
+        name: c.name,
+        infra_context: c.description ?? null,
+      }));
+
+      return {
+        content: [{ type: "text", text: JSON.stringify({ clusters: result }, null, 2) }],
+        details: {},
+      };
     },
   };
 }

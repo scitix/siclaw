@@ -1,24 +1,39 @@
 /**
- * Credential Broker — on-demand credential acquisition for AgentBox tools.
+ * CredentialBroker — AgentBox-side cache + local materialization for cluster
+ * credentials. Sits between tools and the gateway's CredentialService.
  *
- * Flow (integration spec §5.4):
- *   Tool needs credential (e.g., kubectl needs kubeconfig)
- *   → broker.acquire("cluster", "c-001", "kubectl get nodes")
- *     → mTLS POST to Runtime /api/internal/credential-request
- *       → Runtime forwards to Upstream Adapter (with cert identity)
- *         → RBAC check → decrypt → audit → return
- *     → Write credential files to disk
- *     → Cache in memory (TTL-based)
- *   → Tool uses credential files
- *   → TTL expires → files cleaned up
+ * Responsibilities:
+ *   1. list()    — fetch all clusters bound to this agent and populate the
+ *                  in-memory registry with metadata.
+ *   2. acquire() — fetch a single cluster's kubeconfig, atomically write it
+ *                  to disk, and record the file path in the registry.
+ *   3. ensure()  — async entry point used by cmd-exec tools. Guarantees that
+ *                  a cluster has been acquired (triggers acquire() if missing).
+ *   4. probe()   — bypass the cache, force a fresh acquire, and run
+ *                  `kubectl version` for a connectivity check.
+ *   5. getLocalInfo() / listLocalInfo() — synchronous readers used by
+ *                  kubeconfig-resolver. They MUST return populated entries
+ *                  only; callers that read before ensure() will see undefined.
  *
- * Identity is embedded in the mTLS certificate (cannot be spoofed).
- * The broker only controls WHAT to request (source, source_id, purpose).
+ * The registry is a plain Map. The broker is a per-AgentBox singleton, so
+ * the map is scoped to one session/user; no cross-user leakage.
+ *
+ * IMPORTANT: when a cached credential TTL expires we unlink the file on disk
+ * and clear the `path` in the registry, but we keep the metadata. That way
+ * list-style readers still see the cluster; a subsequent acquire will
+ * refresh the path without losing contextual info.
  */
 
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import type { GatewayClient } from "./gateway-client.js";
+import type {
+  CredentialTransport,
+  ClusterMeta,
+  CredentialPayload,
+} from "./credential-transport.js";
+
+export type { ClusterMeta, CredentialPayload };
 
 export interface CredentialFile {
   name: string;
@@ -26,129 +41,357 @@ export interface CredentialFile {
   mode?: number;
 }
 
-export interface CredentialResponse {
-  credential: {
-    name: string;
-    type: string;
-    files: CredentialFile[];
-    metadata?: Record<string, unknown>;
-    ttl_seconds?: number;
-  };
-  audit_id?: string;
+export interface CredentialResponse extends CredentialPayload {}
+
+export interface ClusterLocalInfo extends ClusterMeta {
+  /** Absolute path to the materialized kubeconfig (undefined if not acquired). */
+  path?: string;
+  /** File paths tied to this credential; cleaned on evict. */
+  filePaths?: string[];
+  /** When the cached credential expires; undefined if metadata-only. */
+  expiresAt?: number;
 }
 
-interface CachedCredential {
-  response: CredentialResponse;
-  filePaths: string[];
-  expiresAt: number;
+export interface ProbeResult {
+  name: string;
+  reachable: boolean;
+  server_version?: string;
+  probe_error?: string;
 }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export class CredentialBroker {
-  private cache = new Map<string, CachedCredential>();
-  private cleanupTimer: ReturnType<typeof setInterval>;
-  private credentialsDir: string;
+  private readonly registry = new Map<string, ClusterLocalInfo>();
+  private readonly cleanupTimer: ReturnType<typeof setInterval>;
+  private readonly credentialsDir: string;
 
   constructor(
-    private client: GatewayClient,
+    private readonly transport: CredentialTransport,
     credentialsDir?: string,
   ) {
     this.credentialsDir = credentialsDir || path.resolve(process.cwd(), ".siclaw/credentials");
     fs.mkdirSync(this.credentialsDir, { recursive: true });
-
-    // Periodic cleanup of expired credentials
     this.cleanupTimer = setInterval(() => this.evictExpired(), 60_000);
   }
 
-  /**
-   * Acquire a credential. Returns cached version if still valid,
-   * otherwise fetches from Runtime → Upstream Adapter.
-   */
-  async acquire(
-    source: "cluster" | "host" | "credential",
-    sourceId: string,
-    purpose: string,
-  ): Promise<CredentialResponse> {
-    const cacheKey = `${source}:${sourceId}`;
+  // ──────────────────────────────────────────────────────────
+  // Async API
+  // ──────────────────────────────────────────────────────────
 
-    // Check cache
-    const cached = this.cache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.response;
+  /**
+   * Fetch metadata for all clusters bound to this agent and sync the registry
+   * authoritatively: upsert anything the gateway still returns, and drop
+   * anything it no longer does (so unbinding a cluster in the Portal
+   * disappears from cluster_list on the next call). Dropped entries have
+   * their materialized files unlinked. Does NOT eagerly acquire kubeconfigs.
+   */
+  async list(): Promise<ClusterMeta[]> {
+    const clusters = await this.transport.listClusters();
+    const keep = new Set(clusters.map((c) => c.name));
+
+    // Drop anything the gateway no longer lists.
+    for (const [name, entry] of this.registry) {
+      if (keep.has(name)) continue;
+      if (entry.filePaths) {
+        for (const fp of entry.filePaths) {
+          try { fs.unlinkSync(fp); } catch { /* already gone */ }
+        }
+      }
+      this.registry.delete(name);
     }
 
-    // Fetch from Runtime (which proxies to Upstream Adapter)
-    const response = await this.client.toClientLike().request(
-      "/api/internal/credential-request",
-      "POST",
-      { source, source_id: sourceId, purpose },
-    ) as CredentialResponse;
+    // Upsert the current set, preserving already-acquired paths.
+    for (const meta of clusters) {
+      const existing = this.registry.get(meta.name);
+      this.registry.set(meta.name, {
+        ...meta,
+        path: existing?.path,
+        filePaths: existing?.filePaths,
+        expiresAt: existing?.expiresAt,
+      });
+    }
+    return clusters;
+  }
 
-    // Write credential files to disk
+  /**
+   * Fetch a single cluster's kubeconfig and materialize it to disk.
+   * Returns cached entry if still valid (unless bypassCache).
+   */
+  async acquire(
+    source: "cluster",
+    sourceId: string,
+    purpose: string,
+    options: { bypassCache?: boolean } = {},
+  ): Promise<CredentialResponse> {
+    if (source !== "cluster") {
+      throw new Error(`Only "cluster" source is supported; got "${source}"`);
+    }
+
+    const cached = this.registry.get(sourceId);
+    if (
+      !options.bypassCache &&
+      cached?.path &&
+      cached.expiresAt !== undefined &&
+      cached.expiresAt > Date.now()
+    ) {
+      return this.reconstructResponse(cached);
+    }
+
+    const response = await this.transport.getClusterCredential(sourceId, purpose);
     const filePaths = this.materializeFiles(response.credential.name, response.credential.files);
+    const mainKubeconfig = filePaths.find((p) => p.endsWith(".kubeconfig")) ?? filePaths[0];
 
-    // Cache with TTL
+    // Preserve metadata from a prior list() call (description, contexts, etc.)
+    // that an acquire-shaped response may not carry.
+    const fromResponse = inferMetaFromResponse(response);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
-    this.cache.set(cacheKey, {
-      response,
+    this.registry.set(response.credential.name, {
+      ...fromResponse,
+      ...(cached ?? {}),
+      name: response.credential.name,
+      path: mainKubeconfig,
       filePaths,
       expiresAt: Date.now() + ttlMs,
     });
 
-    console.log(`[credential-broker] Acquired credential "${response.credential.name}" (type=${response.credential.type}, ttl=${ttlMs / 1000}s, files=${filePaths.length})`);
+    console.log(
+      `[credential-broker] acquired "${response.credential.name}" ` +
+      `(ttl=${ttlMs / 1000}s, files=${filePaths.length})`,
+    );
 
     return response;
   }
 
   /**
-   * Get the path where a credential file was written.
-   * Returns undefined if the credential hasn't been acquired.
+   * Ensure a cluster has been acquired at least once (path available).
+   * Triggers acquire() if missing or expired. Called by the central
+   * ensureKubeconfigsForCommand helper before a synchronous resolve.
    */
-  getFilePath(credentialName: string, fileName: string): string {
-    return path.join(this.credentialsDir, `${credentialName}.${fileName}`);
+  async ensure(clusterName: string, purpose = "ensure"): Promise<ClusterLocalInfo> {
+    const existing = this.registry.get(clusterName);
+    if (
+      existing?.path &&
+      existing.expiresAt !== undefined &&
+      existing.expiresAt > Date.now() &&
+      fs.existsSync(existing.path)
+    ) {
+      return existing;
+    }
+    await this.acquire("cluster", clusterName, purpose);
+    const refreshed = this.registry.get(clusterName);
+    if (!refreshed?.path) {
+      throw new Error(`Broker.ensure(${clusterName}) completed but path is missing`);
+    }
+    return refreshed;
   }
 
-  /** Write credential files to disk atomically (.new → rename). */
+  /**
+   * Force a cache-bypassing acquire and probe the cluster connectivity with
+   * `kubectl version`. Used by the cluster_probe tool.
+   */
+  async probe(clusterName: string): Promise<ProbeResult> {
+    try {
+      await this.acquire("cluster", clusterName, "cluster_probe", { bypassCache: true });
+    } catch (err) {
+      return {
+        name: clusterName,
+        reachable: false,
+        probe_error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    const info = this.registry.get(clusterName);
+    if (!info?.path) {
+      return {
+        name: clusterName,
+        reachable: false,
+        probe_error: "kubeconfig path missing after acquire",
+      };
+    }
+    return probeKubeconfig(clusterName, info.path);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Sync API (for kubeconfig-resolver)
+  // ──────────────────────────────────────────────────────────
+
+  getLocalInfo(clusterName: string): ClusterLocalInfo | undefined {
+    return this.registry.get(clusterName);
+  }
+
+  listLocalInfo(): ClusterLocalInfo[] {
+    return Array.from(this.registry.values());
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Housekeeping
+  // ──────────────────────────────────────────────────────────
+
+  /** Remove expired file paths from the registry and disk. Metadata is kept. */
+  private evictExpired(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.registry) {
+      if (!entry.expiresAt || entry.expiresAt > now) continue;
+      if (entry.filePaths) {
+        for (const fp of entry.filePaths) {
+          try { fs.unlinkSync(fp); } catch { /* already gone */ }
+        }
+      }
+      this.registry.set(key, {
+        ...entry,
+        path: undefined,
+        filePaths: undefined,
+        expiresAt: undefined,
+      });
+    }
+  }
+
+  dispose(): void {
+    clearInterval(this.cleanupTimer);
+    for (const entry of this.registry.values()) {
+      if (entry.filePaths) {
+        for (const fp of entry.filePaths) {
+          try { fs.unlinkSync(fp); } catch { /* best-effort */ }
+        }
+      }
+    }
+    this.registry.clear();
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Internals
+  // ──────────────────────────────────────────────────────────
+
   private materializeFiles(credentialName: string, files: CredentialFile[]): string[] {
+    // Sanitize the credential name before it becomes part of a file path.
+    // `path.basename` alone is not enough — ".." or slashes inside would still
+    // land in `<dir>/<..>.xxx`. Strip anything that isn't a safe name char.
+    const safeName = path.basename(credentialName).replace(/[^A-Za-z0-9._-]/g, "_");
+    if (!safeName || safeName === "." || safeName === "..") {
+      console.warn(`[credential-broker] unsafe credential name blocked: "${credentialName}"`);
+      return [];
+    }
+    const sharedGid = resolveSharedGroupGid();
     const paths: string[] = [];
     for (const file of files) {
-      const filePath = path.join(this.credentialsDir, file.name);
-      const dir = path.dirname(filePath);
-      if (!dir.startsWith(this.credentialsDir)) {
-        console.warn(`[credential-broker] Path traversal blocked: ${filePath}`);
+      const safeFile = path.basename(file.name);
+      const filePath = path.join(this.credentialsDir, `${safeName}.${safeFile}`);
+      // Defense-in-depth: ensure the resolved path is still under credentialsDir.
+      const rel = path.relative(this.credentialsDir, filePath);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        console.warn(`[credential-broker] path traversal blocked: ${filePath}`);
         continue;
       }
-      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
       const tmpPath = filePath + ".new";
-      fs.writeFileSync(tmpPath, file.content, { mode: file.mode ?? 0o600 });
+      // In K8s mode the AgentBox runs as `agentbox` (uid 1000) and kubectl runs
+      // as `sandbox` (uid 1001) with setgid `kubecred`. For kubectl to read the
+      // kubeconfig we must give the kubecred group read access. The Dockerfile
+      // already sets the credentials dir to group kubecred with mode 0750, but
+      // newly-created files default to the creator's primary group (agentbox),
+      // so we explicitly chgrp to kubecred and use mode 0640.
+      const desiredMode = sharedGid !== null ? 0o640 : (file.mode ?? 0o600);
+      fs.writeFileSync(tmpPath, file.content, { mode: desiredMode });
+      if (sharedGid !== null) {
+        try {
+          fs.chownSync(tmpPath, -1, sharedGid);
+        } catch (err) {
+          console.warn(`[credential-broker] chgrp failed for ${tmpPath}:`, err);
+        }
+      }
       fs.renameSync(tmpPath, filePath);
       paths.push(filePath);
     }
     return paths;
   }
 
-  /** Remove expired credentials from cache and disk. */
-  private evictExpired(): void {
-    const now = Date.now();
-    for (const [key, cached] of this.cache) {
-      if (cached.expiresAt <= now) {
-        for (const fp of cached.filePaths) {
-          try { fs.unlinkSync(fp); } catch { /* already gone */ }
-        }
-        this.cache.delete(key);
-      }
+  private reconstructResponse(cached: ClusterLocalInfo): CredentialResponse {
+    if (!cached.filePaths || cached.filePaths.length === 0) {
+      throw new Error(`Cache hit for "${cached.name}" has no file paths`);
     }
+    const files: CredentialFile[] = cached.filePaths.map((fp) => ({
+      name: path.basename(fp),
+      content: fs.readFileSync(fp, "utf-8"),
+      mode: 0o600,
+    }));
+    return {
+      credential: {
+        name: cached.name,
+        type: "kubeconfig",
+        files,
+        ttl_seconds: cached.expiresAt ? Math.max(0, Math.floor((cached.expiresAt - Date.now()) / 1000)) : 300,
+      },
+    };
   }
+}
 
-  /** Clean up all credentials and stop the cleanup timer. */
-  dispose(): void {
-    clearInterval(this.cleanupTimer);
-    for (const cached of this.cache.values()) {
-      for (const fp of cached.filePaths) {
-        try { fs.unlinkSync(fp); } catch { /* best-effort */ }
+/**
+ * Resolve the numeric gid of the shared credential group (`kubecred` by
+ * default). kubectl is setgid'd to this group in Dockerfile.agentbox so that
+ * the sandbox uid can read credential files via group permission. Returns
+ * null in environments where the group doesn't exist (Local mode, TUI).
+ *
+ * Result is cached across calls — /etc/group is read at most once per group.
+ */
+const groupGidCache = new Map<string, number | null>();
+
+function resolveSharedGroupGid(): number | null {
+  const groupName = process.env.SICLAW_CREDENTIAL_GROUP || "kubecred";
+  if (groupGidCache.has(groupName)) return groupGidCache.get(groupName) ?? null;
+  let gid: number | null = null;
+  try {
+    const content = fs.readFileSync("/etc/group", "utf-8");
+    for (const line of content.split("\n")) {
+      const [name, , gidStr] = line.split(":");
+      if (name === groupName) {
+        const parsed = Number.parseInt(gidStr, 10);
+        if (Number.isFinite(parsed)) gid = parsed;
+        break;
       }
     }
-    this.cache.clear();
+  } catch {
+    gid = null;
   }
+  groupGidCache.set(groupName, gid);
+  return gid;
+}
+
+function inferMetaFromResponse(response: CredentialResponse): ClusterMeta {
+  const metadata = (response.credential.metadata ?? {}) as Record<string, unknown>;
+  const meta: ClusterMeta = {
+    name: response.credential.name,
+    is_production: !!(metadata.is_production ?? false),
+  };
+  if (typeof metadata.description === "string") meta.description = metadata.description;
+  if (typeof metadata.api_server === "string") meta.api_server = metadata.api_server;
+  if (typeof metadata.debug_image === "string") meta.debug_image = metadata.debug_image;
+  if (Array.isArray(metadata.contexts)) meta.contexts = metadata.contexts as ClusterMeta["contexts"];
+  if (typeof metadata.current_context === "string") meta.current_context = metadata.current_context;
+  return meta;
+}
+
+function probeKubeconfig(name: string, kubeconfigPath: string): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    execFile(
+      "kubectl",
+      ["version", "--output=json", `--kubeconfig=${kubeconfigPath}`, "--request-timeout=3s"],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) {
+          const msg = err.message?.includes("timed out")
+            ? "connection timeout"
+            : err.message?.split("\n")[0] ?? "unknown error";
+          resolve({ name, reachable: false, probe_error: msg });
+          return;
+        }
+        try {
+          const info = JSON.parse(stdout);
+          const ver = info.serverVersion?.gitVersion ?? "unknown";
+          resolve({ name, reachable: true, server_version: ver });
+        } catch {
+          resolve({ name, reachable: true, server_version: "unknown" });
+        }
+      },
+    );
+  });
 }

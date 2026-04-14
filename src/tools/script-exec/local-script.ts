@@ -8,6 +8,7 @@ import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import { parseArgs } from "../infra/command-sets.js";
 import {
@@ -50,7 +51,7 @@ Parameters:
 - skill: Skill name (e.g. "find-node", "roce-perftest-pod")
 - script: Script filename (e.g. "find-node.sh", "run-perftest.py")
 - args: Optional command-line arguments
-- kubeconfig: Credential name of the target cluster (use credential_list to discover). Omit to use the default kubeconfig.
+- kubeconfig: Credential name of the target cluster (use cluster_list to discover). Omit to use the default kubeconfig.
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
@@ -75,7 +76,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       ),
       kubeconfig: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
         })
       ),
       timeout_seconds: Type.Optional(
@@ -124,8 +125,17 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         };
       }
 
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "local_script");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
       // Resolve kubeconfig — requires explicit selection when multiple clusters exist
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],

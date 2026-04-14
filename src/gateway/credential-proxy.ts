@@ -1,90 +1,119 @@
 /**
- * Credential Proxy: forwards AgentBox credential requests to Upstream Adapter.
+ * HTTP handlers for AgentBox credential APIs (mTLS server, port 3002).
  *
- * Flow (from integration spec §5.3):
- *   AgentBox ──mTLS──→ Runtime (verify cert, extract identity)
- *     → HTTP POST → Upstream Adapter /api/internal/siclaw/adapter/credential-request
+ * Both handlers delegate to CredentialService, which — depending on config —
+ * either queries the local clusters/agent_clusters DB or forwards to an
+ * external credential provider. Identity is extracted from the mTLS client
+ * certificate and cannot be spoofed.
  *
- * Identity comes from the mTLS certificate (cannot be spoofed):
- *   CN = userId, OU = agentId, O = orgId
- *
- * The request body (source, source_id, purpose) comes from AgentBox —
- * it controls WHAT to request but not WHO is requesting.
+ *   POST /api/internal/credential-request  → one cluster's kubeconfig
+ *   POST /api/internal/credential-list     → metadata for all bound clusters
  */
 
 import http from "node:http";
-import https from "node:https";
-import type { RuntimeConfig } from "./config.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
+import type { CredentialService, Identity } from "./credential-service.js";
+import { CredentialNotFoundError } from "./credential-service.js";
 
-/** Proxy a credential request from AgentBox to Upstream Adapter. */
-export function handleCredentialRequest(
+interface CredentialRequestBody {
+  source?: string;
+  source_id?: string;
+  purpose?: string;
+}
+
+// Keep identity fields to a safe charset before they land in SQL params or
+// outbound HTTP headers. Node will reject CRLF in headers anyway, but we
+// narrow further to prevent surprises (e.g. a non-UUID agentId slipping
+// through and causing an unbounded DB scan).
+const IDENTITY_CHARS = /^[A-Za-z0-9._\-@]{1,128}$/;
+
+function assertSafeIdField(value: string, field: string): void {
+  if (!IDENTITY_CHARS.test(value)) {
+    throw new Error(`Invalid ${field} in client certificate`);
+  }
+}
+
+function toIdentity(cert: CertificateIdentity): Identity {
+  assertSafeIdField(cert.userId, "userId");
+  assertSafeIdField(cert.agentId, "agentId");
+  if (cert.orgId) assertSafeIdField(cert.orgId, "orgId");
+  if (cert.boxId) assertSafeIdField(cert.boxId, "boxId");
+  return {
+    userId: cert.userId,
+    agentId: cert.agentId,
+    orgId: cert.orgId,
+    boxId: cert.boxId,
+  };
+}
+
+async function readBody(req: http.IncomingMessage): Promise<string> {
+  let body = "";
+  for await (const chunk of req) body += chunk.toString();
+  return body;
+}
+
+function sendError(res: http.ServerResponse, status: number, message: string): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: message }));
+}
+
+function sendJson(res: http.ServerResponse, status: number, payload: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload));
+}
+
+export async function handleCredentialRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
-): void {
-  let body = "";
-  req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
-  req.on("end", async () => {
-    try {
-      const result = await forwardToAdapter(
-        `${config.serverUrl}/api/internal/siclaw/adapter/credential-request`,
-        body,
-        identity,
-        config.portalSecret,
-      );
-      res.writeHead(result.status, { "Content-Type": "application/json" });
-      res.end(result.body);
-    } catch (err) {
-      console.error("[credential-proxy] forward error:", err);
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Failed to proxy credential request to Upstream" }));
+  service: CredentialService,
+): Promise<void> {
+  const raw = await readBody(req);
+  let body: CredentialRequestBody;
+  try {
+    body = raw ? (JSON.parse(raw) as CredentialRequestBody) : {};
+  } catch {
+    sendError(res, 400, "Invalid JSON body");
+    return;
+  }
+
+  if (body.source !== "cluster") {
+    sendError(res, 400, `Unsupported source: ${body.source ?? "(missing)"}`);
+    return;
+  }
+  if (!body.source_id) {
+    sendError(res, 400, "source_id is required");
+    return;
+  }
+
+  try {
+    const payload = await service.getClusterCredential(
+      toIdentity(identity),
+      body.source_id,
+      body.purpose ?? "",
+    );
+    sendJson(res, 200, payload);
+  } catch (err) {
+    if (err instanceof CredentialNotFoundError) {
+      sendError(res, 404, err.message);
+      return;
     }
-  });
+    console.error("[credential-proxy] getClusterCredential failed:", err);
+    sendError(res, 502, err instanceof Error ? err.message : "Unknown error");
+  }
 }
 
-interface ForwardResult {
-  status: number;
-  body: string;
-}
-
-async function forwardToAdapter(
-  url: string,
-  body: string,
+export async function handleCredentialList(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
   identity: CertificateIdentity,
-  secret: string,
-): Promise<ForwardResult> {
-  const parsed = new URL(url);
-  const transport = parsed.protocol === "https:" ? https : http;
-  const options: http.RequestOptions = {
-    hostname: parsed.hostname,
-    port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
-    path: parsed.pathname,
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Auth-Token": secret,
-      // Verified identity from mTLS certificate — Upstream trusts these headers
-      "X-Cert-User-Id": identity.userId,
-      "X-Cert-Agent-Id": identity.agentId,
-      "X-Cert-Org-Id": identity.orgId || "",
-      "X-Cert-Box-Id": identity.boxId,
-    },
-    timeout: 10_000,
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = transport.request(options, (resp) => {
-      let data = "";
-      resp.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-      resp.on("end", () => {
-        resolve({ status: resp.statusCode ?? 502, body: data });
-      });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(new Error("Timeout")); });
-    req.write(body);
-    req.end();
-  });
+  service: CredentialService,
+): Promise<void> {
+  try {
+    const clusters = await service.listClusters(toIdentity(identity));
+    sendJson(res, 200, { clusters });
+  } catch (err) {
+    console.error("[credential-proxy] listClusters failed:", err);
+    sendError(res, 502, err instanceof Error ? err.message : "Unknown error");
+  }
 }
