@@ -30,7 +30,7 @@ async function fetchAgentResources(
   config: RuntimeConfig,
   orgId: string,
   agentId: string,
-): Promise<{ skillIds: string[]; mcpServerIds: string[] }> {
+): Promise<{ skillIds: string[]; mcpServerIds: string[]; isProduction: boolean }> {
   try {
     const url = `${config.serverUrl}/api/internal/siclaw/adapter/agent/${agentId}/resources`;
     const resp = await fetch(url, {
@@ -41,16 +41,17 @@ async function fetchAgentResources(
     });
     if (!resp.ok) {
       console.warn(`[internal-api] Failed to fetch agent resources: ${resp.status}`);
-      return { skillIds: [], mcpServerIds: [] };
+      return { skillIds: [], mcpServerIds: [], isProduction: true };
     }
-    const data = await resp.json() as { skill_ids?: string[]; mcp_server_ids?: string[] };
+    const data = await resp.json() as { skill_ids?: string[]; mcp_server_ids?: string[]; is_production?: boolean };
     return {
       skillIds: data.skill_ids ?? [],
       mcpServerIds: data.mcp_server_ids ?? [],
+      isProduction: data.is_production ?? true, // default to prod for safety
     };
   } catch (err) {
     console.warn("[internal-api] Error fetching agent resources:", err);
-    return { skillIds: [], mcpServerIds: [] };
+    return { skillIds: [], mcpServerIds: [], isProduction: true };
   }
 }
 
@@ -201,28 +202,39 @@ export async function handleSkillsBundle(
 ): Promise<void> {
   try {
     const db = getDb();
-    const { skillIds } = await fetchAgentResources(config, identity.orgId, identity.agentId);
+    const { skillIds, isProduction } = await fetchAgentResources(config, identity.orgId, identity.agentId);
 
-    // Always include builtin skills (scope = 'builtin'), plus agent-bound skills
     let rows: any[];
-    if (skillIds.length > 0) {
+    if (skillIds.length === 0) {
+      rows = [];
+    } else if (isProduction) {
+      // Prod: only the latest approved version of each bound skill
       const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT id, name, scope, specs, scripts
-         FROM skills WHERE id IN (${placeholders}) OR scope = 'builtin'`,
+        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts
+         FROM skills s
+         JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
+         WHERE s.id IN (${placeholders})
+           AND sv.version = (
+             SELECT MAX(sv2.version) FROM skill_versions sv2
+             WHERE sv2.skill_id = s.id AND sv2.is_approved = 1
+           )`,
         skillIds,
       ) as any;
       rows = result;
     } else {
+      // Dev: latest content from skills table (all statuses)
+      const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT id, name, scope, specs, scripts FROM skills WHERE scope = 'builtin'`,
+        `SELECT id, name, labels, specs, scripts FROM skills WHERE id IN (${placeholders})`,
+        skillIds,
       ) as any;
       rows = result;
     }
 
     const skills = rows.map((row: any) => ({
       dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
-      scope: row.scope || "global",
+      scope: "global",
       specs: row.specs || "",
       scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
     }));
