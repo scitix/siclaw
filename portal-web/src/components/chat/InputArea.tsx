@@ -1,4 +1,4 @@
-import { ArrowUp, Square, X, Loader2, SearchCode, MessageSquareHeart, Plus, Check } from "lucide-react"
+import { ArrowUp, Square, X, Loader2, SearchCode, Plus, Check } from "lucide-react"
 import type { ContextUsage } from "./types"
 import { useState, useCallback, useRef, useEffect } from "react"
 import type { KeyboardEvent } from "react"
@@ -150,20 +150,6 @@ export function InputArea({
                           {deepInvestigation && <Check className="w-4 h-4 text-blue-500 shrink-0" />}
                         </button>
 
-                        {/* Session Feedback */}
-                        {!isLoading && hasMessages && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              onSend("[Feedback]")
-                              setShowActionMenu(false)
-                            }}
-                            className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-secondary transition-colors"
-                          >
-                            <MessageSquareHeart className="w-4 h-4 text-emerald-500 shrink-0" />
-                            <span className="flex-1 text-sm text-foreground">Session Feedback</span>
-                          </button>
-                        )}
                       </div>
                     </div>
                   </>
