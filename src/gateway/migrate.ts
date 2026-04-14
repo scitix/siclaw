@@ -219,25 +219,63 @@ const SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_aksa_api_key FOREIGN KEY (api_key_id) REFERENCES agent_api_keys(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
-  // Migration ALTERs for existing databases — each is wrapped in its own
-  // statement so a failure on one (e.g. column already dropped/added) does
-  // not block the rest. New installs skip these because the CREATE TABLE
-  // statements above already reflect the target schema.
-  `ALTER TABLE skills DROP COLUMN IF EXISTS scope`,
-  `ALTER TABLE skills ADD COLUMN IF NOT EXISTS labels JSON AFTER description`,
-  `ALTER TABLE skills MODIFY COLUMN status VARCHAR(20) NOT NULL DEFAULT 'draft'`,
-  `ALTER TABLE skills MODIFY COLUMN author_id CHAR(36) NOT NULL`,
-  `ALTER TABLE skill_versions ADD COLUMN IF NOT EXISTS diff JSON AFTER scripts`,
-  `ALTER TABLE skill_versions ADD COLUMN IF NOT EXISTS is_approved TINYINT(1) NOT NULL DEFAULT 0 AFTER author_id`,
-  `ALTER TABLE skill_versions MODIFY COLUMN author_id CHAR(36) NOT NULL`,
+];
+
+/**
+ * Migration ALTERs for existing databases.
+ * MySQL 8.0 doesn't support IF EXISTS / IF NOT EXISTS for ALTER TABLE columns,
+ * so we check column existence via INFORMATION_SCHEMA before altering.
+ */
+interface ConditionalAlter {
+  table: string;
+  column: string;
+  action: "drop" | "add" | "modify";
+  sql: string;
+}
+
+const CONDITIONAL_ALTERS: ConditionalAlter[] = [
+  { table: "skills", column: "scope", action: "drop",
+    sql: "ALTER TABLE skills DROP COLUMN scope" },
+  { table: "skills", column: "labels", action: "add",
+    sql: "ALTER TABLE skills ADD COLUMN labels JSON AFTER description" },
+  { table: "skills", column: "status", action: "modify",
+    sql: "ALTER TABLE skills MODIFY COLUMN status VARCHAR(20) NOT NULL DEFAULT 'draft'" },
+  { table: "skills", column: "author_id", action: "modify",
+    sql: "ALTER TABLE skills MODIFY COLUMN author_id CHAR(36) NOT NULL" },
+  { table: "skill_versions", column: "diff", action: "add",
+    sql: "ALTER TABLE skill_versions ADD COLUMN diff JSON AFTER scripts" },
+  { table: "skill_versions", column: "is_approved", action: "add",
+    sql: "ALTER TABLE skill_versions ADD COLUMN is_approved TINYINT(1) NOT NULL DEFAULT 0 AFTER author_id" },
+  { table: "skill_versions", column: "author_id", action: "modify",
+    sql: "ALTER TABLE skill_versions MODIFY COLUMN author_id CHAR(36) NOT NULL" },
 ];
 
 export async function runMigrations(): Promise<void> {
   const db = getDb();
 
-  // MySQL DDL is auto-committed, no transaction needed
+  // Phase 1: CREATE TABLE statements (idempotent via IF NOT EXISTS)
   for (const sql of SCHEMA_SQLS) {
     await db.query(sql);
   }
+
+  // Phase 2: conditional ALTERs for existing databases
+  for (const alter of CONDITIONAL_ALTERS) {
+    const [rows] = await db.query(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+      [alter.table, alter.column],
+    ) as any;
+    const columnExists = rows.length > 0;
+
+    if (alter.action === "drop" && !columnExists) continue;  // already gone
+    if (alter.action === "add" && columnExists) continue;     // already present
+
+    try {
+      await db.query(alter.sql);
+    } catch (err: any) {
+      console.warn(`[migrate] ALTER skipped (${alter.sql}): ${err.message}`);
+    }
+  }
+
   console.log("[migrate] Siclaw tables ready");
 }
