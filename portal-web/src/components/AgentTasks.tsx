@@ -4,7 +4,7 @@ import { Plus, Trash2, Play, Pause, Pencil, X, ClipboardList, Loader2, Clock } f
 import { api } from "../api"
 import { useToast } from "./toast"
 import { useConfirm } from "./confirm-dialog"
-import { nextFireHint } from "../lib/cronPreview"
+import { nextFireHint } from "../lib/taskSchedule"
 
 interface AgentTask {
   id: string

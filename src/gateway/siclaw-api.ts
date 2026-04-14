@@ -962,20 +962,20 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
-    // origin='cron' sessions are scheduled-task execution traces — they live
+    // origin='task' sessions are scheduled-task execution traces — they live
     // in the same table so FK + sse-consumer keep working, but the user-facing
-    // Chat list should hide them (entry point is My Schedules / the run page).
+    // Chat list should hide them (entry point is the task runs page).
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
         `SELECT COUNT(*) AS count FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'cron')`,
+           AND (origin IS NULL OR origin <> 'task')`,
         [params.id, auth.userId],
       ),
       db.query(
         `SELECT * FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'cron')
+           AND (origin IS NULL OR origin <> 'task')
          ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),

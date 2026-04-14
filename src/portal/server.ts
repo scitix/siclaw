@@ -102,7 +102,6 @@ export function startPortal(config: PortalConfig): http.Server {
       // Admin-only routes (all methods)
       const adminOnly =
         url.startsWith("/api/v1/siclaw/admin") ||
-        url.startsWith("/api/v1/siclaw/cron") ||
         url.includes("/channels") ||
         url.includes("/diagnostics") ||
         url.includes("/api-keys");

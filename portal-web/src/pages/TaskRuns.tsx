@@ -2,7 +2,7 @@ import { useEffect, useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
 import { ArrowLeft, Clock, Loader2, AlertCircle, CheckCircle2, ChevronRight, ClipboardList } from "lucide-react"
 import { api } from "../api"
-import { nextFireFull } from "../lib/cronPreview"
+import { nextFireFull } from "../lib/taskSchedule"
 
 interface AgentTask {
   id: string

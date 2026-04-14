@@ -19,7 +19,7 @@ const MODE_LABELS: Record<string, string> = {
  * Safety and Language sections are hardcoded and always appended — they cannot
  * be overridden by agent templates.
  */
-export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "cron", templateOverride?: string): string {
+export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", templateOverride?: string): string {
   const template = templateOverride?.trim() || DEFAULT_TEMPLATE;
 
   const modeLabel = MODE_LABELS[mode ?? "cli"] ?? "Web UI";
@@ -40,8 +40,8 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "cron", 
   // Unwrap the matching mode block (keep content, remove markers)
   prompt = prompt.replace(new RegExp(`<!-- ${keepMode}-only -->([\\s\\S]*?)<!-- /${keepMode}-only -->`, "g"), "$1");
 
-  // Append cron-specific section for automated task mode
-  if (mode === "cron") {
+  // Append task-specific section for automated task mode
+  if (mode === "task") {
     prompt += CRON_SECTION;
   }
 
