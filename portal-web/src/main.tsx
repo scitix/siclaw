@@ -15,6 +15,9 @@ import { SkillDetail } from "./pages/SkillDetail"
 import { MCP } from "./pages/MCP"
 import { Models } from "./pages/Models"
 import { Chat } from "./pages/Chat"
+import { MyTasks } from "./pages/MyTasks"
+import { TaskRuns } from "./pages/TaskRuns"
+import { TaskRunDetail } from "./pages/TaskRunDetail"
 import { Users } from "./pages/Users"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -38,6 +41,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="skills/new" element={<SkillDetail />} />
         <Route path="skills/:id" element={<SkillDetail />} />
         <Route path="mcp" element={<MCP />} />
+        <Route path="my-tasks" element={<MyTasks />} />
+        <Route path="agents/:agentId/tasks/:taskId" element={<TaskRuns />} />
+        <Route path="agents/:agentId/tasks/:taskId/runs/:runId" element={<TaskRunDetail />} />
         <Route path="settings/users" element={<Users />} />
         <Route path="settings/clusters" element={<Clusters />} />
         <Route path="settings/hosts" element={<Hosts />} />

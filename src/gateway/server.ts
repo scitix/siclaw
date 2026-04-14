@@ -12,10 +12,11 @@
  *   GET  /api/internal/settings            — model providers (from DB)
  *   GET  /api/internal/mcp-servers         — MCP config (from DB + Upstream binding)
  *   GET  /api/internal/skills/bundle       — skill bundle (from DB + Upstream binding)
- *   GET  /api/internal/cron-list           — cron jobs (from DB)
+ *   *    /api/internal/agent-tasks[/:id]   — CRUD scheduled tasks (from DB)
  *   POST /api/internal/feedback            — AgentBox feedback
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -41,9 +42,21 @@ import { CertificateManager, type CertificateIdentity } from "./security/cert-ma
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
-import { handleSettings, handleMcpServers, handleSkillsBundle, handleCronList } from "./internal-api.js";
+import {
+  handleSettings,
+  handleMcpServers,
+  handleSkillsBundle,
+  handleAgentTasksList,
+  handleAgentTasksCreate,
+  handleAgentTasksUpdate,
+  handleAgentTasksDelete,
+} from "./internal-api.js";
 import { createRestRouter } from "./rest-router.js";
 import { registerSiclawRoutes, type SiclawApiContext } from "./siclaw-api.js";
+import { getDb } from "./db.js";
+import { appendMessage, incrementMessageCount } from "./chat-repo.js";
+import { consumeAgentSse } from "./sse-consumer.js";
+import { buildRedactionConfig } from "./output-redactor.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -100,7 +113,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const userId = params.userId as string;
     const orgId = params.orgId as string | undefined;
     const text = params.text as string;
-    const sessionId = params.sessionId as string | undefined;
+    const incomingSessionId = params.sessionId as string | undefined;
 
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
@@ -110,7 +123,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const handle = await agentBoxManager.getOrCreate(userId, agentId);
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
+    // Pre-generate a UUID so the AgentBox doesn't fall back to the literal
+    // "default" session id (LocalSpawner behaviour), which would merge every
+    // caller's trace into one chat_sessions row.
+    const sessionId = incomingSessionId ?? crypto.randomUUID();
+
     // Build prompt options from params (Upstream sends full context)
+    const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const promptOpts: PromptOptions = {
       sessionId,
       text,
@@ -119,26 +138,46 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelId: params.modelId as string | undefined,
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
-      modelConfig: params.modelConfig as PromptOptions["modelConfig"],
+      modelConfig,
     };
 
     const promptResult = await client.prompt(promptOpts);
 
-    // Stream SSE events back to Upstream via WS events
+    // Ensure chat_sessions exists + persist the user message BEFORE the SSE
+    // consumer starts writing assistant/tool rows (FK on chat_messages).
+    await ensureChatSession(promptResult.sessionId, agentId, userId, text);
+    await appendMessage({ sessionId: promptResult.sessionId, role: "user", content: text });
+    await incrementMessageCount(promptResult.sessionId);
+
+    // Minimal redaction: scrub the apiKey + baseUrl from any captured tool
+    // output. Credential-manifest redaction is follow-up work.
+    const redactionConfig = buildRedactionConfig(undefined, undefined, [
+      modelConfig?.apiKey ?? "",
+      modelConfig?.baseUrl ?? "",
+    ].filter(Boolean));
+
+    // Stream + persist events back to the WS client.
     if (context.ws) {
       const abortCtrl = new AbortController();
       activeStreams.set(context.ws, abortCtrl);
 
-      // Non-blocking: stream events in background
+      // Non-blocking: consume events in background
       (async () => {
         try {
-          for await (const event of client.streamEvents(promptResult.sessionId)) {
-            if (abortCtrl.signal.aborted) break;
-            if (context.ws && context.ws.readyState === WebSocket.OPEN) {
-              if (context.ws.bufferedAmount > MAX_BUFFERED_BYTES) continue;
-              context.ws.send(buildEvent("chat.event", { sessionId: promptResult.sessionId, event }));
-            }
-          }
+          await consumeAgentSse({
+            client,
+            sessionId: promptResult.sessionId,
+            userId,
+            persistMessages: true,
+            redactionConfig,
+            signal: abortCtrl.signal,
+            onEvent: (evt) => {
+              if (context.ws && context.ws.readyState === WebSocket.OPEN) {
+                if (context.ws.bufferedAmount > MAX_BUFFERED_BYTES) return;
+                context.ws.send(buildEvent("chat.event", { sessionId: promptResult.sessionId, event: evt }));
+              }
+            },
+          });
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
@@ -533,10 +572,29 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
-          // Cron job list — from Runtime DB, filtered by agent
-          if ((url.startsWith("/api/internal/cron-list")) && method === "GET") {
+          // Agent tasks — CRUD from Runtime DB, scoped by mTLS identity.agentId
+          if (url.startsWith("/api/internal/agent-tasks")) {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            handleCronList(req, res, identity);
+            const pathOnly = url.split("?")[0];
+            const idMatch = pathOnly.match(/^\/api\/internal\/agent-tasks\/([^/]+)$/);
+            if (pathOnly === "/api/internal/agent-tasks" && method === "GET") {
+              handleAgentTasksList(req, res, identity);
+              return;
+            }
+            if (pathOnly === "/api/internal/agent-tasks" && method === "POST") {
+              handleAgentTasksCreate(req, res, identity);
+              return;
+            }
+            if (idMatch && method === "PUT") {
+              handleAgentTasksUpdate(req, res, identity, idMatch[1]);
+              return;
+            }
+            if (idMatch && method === "DELETE") {
+              handleAgentTasksDelete(req, res, identity, idMatch[1]);
+              return;
+            }
+            res.writeHead(405, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Method not allowed" }));
             return;
           }
 
@@ -581,4 +639,22 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   };
 
   return runtimeServer;
+}
+
+/**
+ * Ensure a chat_sessions row exists for this session so chat_messages inserts
+ * don't violate the FK. Idempotent via INSERT IGNORE.
+ */
+async function ensureChatSession(
+  sessionId: string,
+  agentId: string,
+  userId: string,
+  firstUserText: string,
+): Promise<void> {
+  const db = getDb();
+  await db.query(
+    `INSERT IGNORE INTO chat_sessions (id, agent_id, user_id, title, preview)
+     VALUES (?, ?, ?, ?, ?)`,
+    [sessionId, agentId, userId, firstUserText.slice(0, 100), firstUserText.slice(0, 500)],
+  );
 }

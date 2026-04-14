@@ -86,11 +86,13 @@ const SCHEMA_SQLS: string[] = [
     title VARCHAR(255),
     preview VARCHAR(500),
     message_count INT NOT NULL DEFAULT 0,
+    origin VARCHAR(20) DEFAULT NULL,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     last_active_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     deleted_at TIMESTAMP(3) NULL DEFAULT NULL,
     INDEX idx_chat_sessions_user (user_id, last_active_at),
-    INDEX idx_chat_sessions_agent (agent_id)
+    INDEX idx_chat_sessions_agent (agent_id),
+    INDEX idx_chat_sessions_origin (origin)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
   `CREATE TABLE IF NOT EXISTS chat_messages (
@@ -152,36 +154,6 @@ const SCHEMA_SQLS: string[] = [
     INDEX idx_agent_channels_agent (agent_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
-  // Cron Jobs
-  `CREATE TABLE IF NOT EXISTS cron_jobs (
-    id CHAR(36) PRIMARY KEY,
-    org_id CHAR(36) NOT NULL,
-    agent_id CHAR(36) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    schedule VARCHAR(100) NOT NULL,
-    prompt TEXT NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'active',
-    last_run_at TIMESTAMP(3) NULL DEFAULT NULL,
-    last_result VARCHAR(50),
-    created_by CHAR(36) NOT NULL,
-    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-
-  `CREATE TABLE IF NOT EXISTS cron_job_runs (
-    id CHAR(36) PRIMARY KEY,
-    job_id CHAR(36) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    result_text TEXT,
-    error TEXT,
-    duration_ms INT,
-    session_id CHAR(36),
-    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-    INDEX idx_cron_runs_job (job_id, created_at),
-    CONSTRAINT fk_cron_job_runs_job FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
-
   // Diagnostics
   `CREATE TABLE IF NOT EXISTS agent_diagnostics (
     id CHAR(36) PRIMARY KEY,
@@ -221,11 +193,37 @@ const SCHEMA_SQLS: string[] = [
 
 ];
 
+/**
+ * Idempotently add a column to an existing table. No-op if the column exists.
+ * SELECT + ALTER is racy across concurrent runners so we also swallow MySQL's
+ * duplicate-column error (errno 1060) for safety.
+ */
+async function safeAlterTable(
+  db: ReturnType<typeof getDb>,
+  table: string,
+  column: string,
+  definition: string,
+): Promise<void> {
+  const [rows] = await db.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [table, column],
+  ) as [Array<{ COLUMN_NAME: string }>, unknown];
+  if (rows.length > 0) return;
+  try {
+    await db.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+  } catch (err: any) {
+    if (err?.errno !== 1060) throw err;
+  }
+}
+
 export async function runMigrations(): Promise<void> {
   const db = getDb();
 
   for (const sql of SCHEMA_SQLS) {
     await db.query(sql);
   }
+  // Evolve pre-existing chat_sessions rows to carry an origin column.
+  await safeAlterTable(db, "chat_sessions", "origin", "VARCHAR(20) DEFAULT NULL");
   console.log("[migrate] Siclaw tables ready");
 }

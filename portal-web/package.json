@@ -8,6 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "cron-parser": "^5.5.0",
     "lucide-react": "^0.460.0",
     "prismjs": "^1.30.0",
     "react": "^18.3.1",

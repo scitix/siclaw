@@ -12,7 +12,7 @@ import { initDb, closeDb } from "./gateway/db.js";
 import { runMigrations } from "./gateway/migrate.js";
 import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { ChannelManager } from "./gateway/channel-manager.js";
-import { CronCoordinator } from "./gateway/cron-coordinator.js";
+import { TaskCoordinator } from "./gateway/task-coordinator.js";
 import { createCredentialService } from "./gateway/credential-service.js";
 
 // Parse arguments
@@ -83,19 +83,60 @@ const channelManager = new ChannelManager(
 );
 await channelManager.bootFromDb();
 
-// Boot cron coordinator — schedules active jobs and syncs with DB
-const cronCoordinator = new CronCoordinator({
+// Scheduled-task coordinator — owns agent_tasks scheduler + execution.
+// Config writes from any source (UI REST, chat manage_schedule tool) land in
+// agent_tasks; this coordinator syncs from DB every 60s and fires runs via
+// AgentBoxClient directly. Task completion events are forwarded to the
+// upstream notification endpoint (Portal stand-in today, upstream eventually)
+// via POST to /api/internal/task-notify.
+const notifyUrl = config.serverUrl
+  ? `${config.serverUrl.replace(/\/$/, "")}/api/internal/task-notify`
+  : "";
+const portalSecret = config.portalSecret;
+
+const retentionDays = Math.max(0, parseInt(process.env.SICLAW_RUN_RETENTION_DAYS ?? "90", 10) || 0);
+const taskCoordinator = new TaskCoordinator({
   agentBoxManager,
   agentBoxTlsOptions: runtime.agentBoxTlsOptions,
+  retentionDays,
+  // Best-effort fire-and-forget: if Portal is down or rejects, this fire's
+  // notification is lost. Acceptable for a low-frequency cron alert channel
+  // — the run record is already durable in agent_task_runs so users can
+  // still find the result through the UI. If notifications ever become
+  // load-bearing (SLA / paging) switch this to a retry queue.
+  onTaskCompleted: notifyUrl && portalSecret
+    ? (evt) => {
+        const displayName = evt.taskName || evt.taskId.slice(0, 8);
+        const title = evt.status === "success"
+          ? `Task "${displayName}" completed`
+          : `Task "${displayName}" failed`;
+        const message = evt.error ?? evt.resultText?.slice(0, 500) ?? null;
+        fetch(notifyUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Auth-Token": portalSecret },
+          body: JSON.stringify({
+            userId: evt.userId,
+            agentId: evt.agentId,
+            taskId: evt.taskId,
+            runId: evt.runId,
+            status: evt.status,
+            title,
+            message,
+          }),
+        }).catch((err) => {
+          console.warn(`[runtime] task-notify post failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+    : undefined,
 });
 if (config.databaseUrl) {
-  await cronCoordinator.start();
+  await taskCoordinator.start();
 }
 
 // Graceful shutdown
 async function shutdown() {
   console.log("\n[runtime] Shutting down...");
-  cronCoordinator.stop();
+  taskCoordinator.stop();
   await channelManager.stopAll();
   await runtime.close();
   await closeDb();
