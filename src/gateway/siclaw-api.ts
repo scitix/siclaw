@@ -18,6 +18,8 @@ import {
   type AuthContext,
 } from "./rest-router.js";
 import { getDb } from "./db.js";
+import { evaluateScriptsStatic, buildAssessment } from "./skills/script-evaluator.js";
+import { evaluateScriptsAI } from "./skills/ai-security-reviewer.js";
 
 // ── Permission check helper ───────────────────────────────────
 
@@ -31,7 +33,7 @@ async function checkAccess(
   config: RuntimeConfig,
   userId: string,
   orgId: string,
-  action: "read" | "write",
+  action: "read" | "write" | "review",
 ): Promise<AccessResult> {
   const url = `${config.serverUrl}/api/internal/siclaw/adapter/check-access`;
   const resp = await fetch(url, {
@@ -63,7 +65,7 @@ async function guardAccess(
   res: import("node:http").ServerResponse,
   config: RuntimeConfig,
   auth: AuthContext,
-  action: "read" | "write",
+  action: "read" | "write" | "review",
 ): Promise<boolean> {
   if (!auth.orgId) {
     sendJson(res, 403, { error: "Organization context required" });
@@ -120,6 +122,16 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       params.push(`%${search}%`, `%${search}%`);
     }
 
+    if (query.labels) {
+      const labelList = (query.labels as string).split(",").map(l => l.trim());
+      for (const label of labelList) {
+        const clause = " AND JSON_CONTAINS(labels, ?)";
+        countSql += clause;
+        listSql += clause;
+        params.push(JSON.stringify(label));
+      }
+    }
+
     listSql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
 
     const [[countRows], [listRows]] = await Promise.all([
@@ -148,11 +160,12 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     const db = getDb();
 
     await db.query(
-      `INSERT INTO skills (id, org_id, name, description, scope, author_id, status, version, specs, scripts, created_by)
+      `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, auth.orgId, body.name, body.description || null, body.scope || "personal",
-        auth.userId, body.status || "draft", version,
+        id, auth.orgId, body.name, body.description || null,
+        JSON.stringify(body.labels || []),
+        auth.userId, "draft", version,
         JSON.stringify(body.specs || {}), JSON.stringify(body.scripts || {}),
         auth.userId,
       ],
@@ -211,34 +224,67 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     }
 
     const skill = existing[0];
-    const newVersion = (skill.version || 0) + 1;
 
-    await db.query(
-      `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
-       scope = COALESCE(?, scope), status = COALESCE(?, status),
-       version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
-       WHERE id = ?`,
-      [
-        body.name ?? null, body.description ?? null, body.scope ?? null,
-        body.status ?? null, newVersion,
-        body.specs ? JSON.stringify(body.specs) : null,
-        body.scripts ? JSON.stringify(body.scripts) : null,
-        params.id,
-      ],
-    );
+    // Status-aware edit behavior
+    if (skill.status === "pending_review") {
+      sendJson(res, 409, { error: "Cannot edit while pending review. Withdraw first." });
+      return;
+    }
 
-    // Insert version record
-    await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        crypto.randomUUID(), params.id, newVersion,
-        JSON.stringify(body.specs ?? skill.specs),
-        JSON.stringify(body.scripts ?? skill.scripts),
-        body.commit_message || `Version ${newVersion}`,
-        auth.userId,
-      ],
-    );
+    if (skill.status === "installed") {
+      // Bump version, create version record, reset to draft
+      const newVersion = (skill.version || 0) + 1;
+      const newSpecs = body.specs ? JSON.stringify(body.specs) : (typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs));
+      const newScripts = body.scripts ? JSON.stringify(body.scripts) : (typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts));
+      const oldSpecs = typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs);
+      const oldScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts);
+
+      // Create version record with diff between old and new
+      await db.query(
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        [
+          crypto.randomUUID(), params.id, newVersion,
+          newSpecs, newScripts,
+          JSON.stringify({
+            specs_diff: { old: oldSpecs, new: newSpecs },
+            scripts_diff: { old: oldScripts, new: newScripts },
+          }),
+          body.commit_message || `Version ${newVersion}`,
+          auth.userId,
+        ],
+      );
+
+      await db.query(
+        `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
+         labels = COALESCE(?, labels), status = 'draft',
+         version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
+         WHERE id = ?`,
+        [
+          body.name ?? null, body.description ?? null,
+          body.labels ? JSON.stringify(body.labels) : null,
+          newVersion,
+          body.specs ? JSON.stringify(body.specs) : null,
+          body.scripts ? JSON.stringify(body.scripts) : null,
+          params.id,
+        ],
+      );
+    } else {
+      // Draft: in-place update, no version bump
+      await db.query(
+        `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
+         labels = COALESCE(?, labels),
+         specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
+         WHERE id = ?`,
+        [
+          body.name ?? null, body.description ?? null,
+          body.labels ? JSON.stringify(body.labels) : null,
+          body.specs ? JSON.stringify(body.specs) : null,
+          body.scripts ? JSON.stringify(body.scripts) : null,
+          params.id,
+        ],
+      );
+    }
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);
@@ -261,6 +307,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       return;
     }
 
+    await db.query("DELETE FROM skill_reviews WHERE skill_id = ?", [params.id]);
     await db.query("DELETE FROM skill_versions WHERE skill_id = ?", [params.id]);
     await db.query("DELETE FROM skills WHERE id = ?", [params.id]);
 
@@ -289,6 +336,369 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       [params.id],
     ) as any;
     sendJson(res, 200, { data: rows });
+  });
+
+  // Get specific version detail
+  router.get(`${P}/skills/:id/versions/:version`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+
+    // Verify skill belongs to org
+    const [skill] = await db.query(
+      "SELECT id FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (skill.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const [rows] = await db.query(
+      "SELECT * FROM skill_versions WHERE skill_id = ? AND version = ?",
+      [params.id, Number(params.version)],
+    ) as any;
+    if (rows.length === 0) {
+      sendJson(res, 404, { error: "Version not found" });
+      return;
+    }
+    sendJson(res, 200, rows[0]);
+  });
+
+  // ================================================================
+  // Skill Reviews & Governance
+  // ================================================================
+
+  // Submit skill for review
+  router.post(`${P}/skills/:id/submit`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const skill = existing[0];
+
+    // Verify author or admin
+    if (skill.author_id !== auth.userId) {
+      if (await guardAccess(res, config, auth, "write")) return;
+    }
+
+    if (skill.status !== "draft") {
+      sendJson(res, 409, { error: "Only draft skills can be submitted for review" });
+      return;
+    }
+
+    // Find last approved version for diff baseline
+    const [baselineRows] = await db.query(
+      "SELECT specs, scripts FROM skill_versions WHERE skill_id = ? AND is_approved = 1 ORDER BY version DESC LIMIT 1",
+      [params.id],
+    ) as any;
+    const baseline = baselineRows.length > 0 ? baselineRows[0] : null;
+
+    const diff = JSON.stringify({
+      specs_diff: { old: baseline?.specs || null, new: skill.specs },
+      scripts_diff: { old: baseline?.scripts || null, new: skill.scripts },
+    });
+
+    // Two-phase security assessment
+    const scriptsArr: { name: string; content: string }[] = skill.scripts
+      ? (typeof skill.scripts === "string" ? JSON.parse(skill.scripts) : skill.scripts)
+      : [];
+    // Phase 1: static pattern matching
+    const staticFindings = evaluateScriptsStatic(scriptsArr);
+    const staticAssessment = buildAssessment(staticFindings);
+    // Phase 2: AI semantic analysis (non-blocking — falls back to static-only)
+    const aiAssessment = await evaluateScriptsAI(scriptsArr, staticFindings);
+    const securityAssessment = JSON.stringify(aiAssessment || staticAssessment);
+
+    const reviewId = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO skill_reviews (id, skill_id, version, diff, security_assessment, submitted_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [reviewId, params.id, skill.version, diff, securityAssessment, auth.userId],
+    );
+
+    await db.query(
+      "UPDATE skills SET status = 'pending_review' WHERE id = ?",
+      [params.id],
+    );
+
+    sendJson(res, 200, { review_id: reviewId, status: "pending_review" });
+  });
+
+  // Withdraw review
+  router.post(`${P}/skills/:id/withdraw`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const skill = existing[0];
+
+    // Verify author or admin
+    if (skill.author_id !== auth.userId) {
+      if (await guardAccess(res, config, auth, "write")) return;
+    }
+
+    if (skill.status !== "pending_review") {
+      sendJson(res, 409, { error: "Only skills pending review can be withdrawn" });
+      return;
+    }
+
+    await db.query(
+      "UPDATE skills SET status = 'draft' WHERE id = ?",
+      [params.id],
+    );
+
+    sendJson(res, 200, { status: "draft" });
+  });
+
+  // Approve skill
+  router.post(`${P}/skills/:id/approve`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "review")) return;
+
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const skill = existing[0];
+
+    if (skill.status !== "pending_review") {
+      sendJson(res, 409, { error: "Only skills pending review can be approved" });
+      return;
+    }
+
+    // Check if a skill_versions record exists for current version
+    const [versionRows] = await db.query(
+      "SELECT id FROM skill_versions WHERE skill_id = ? AND version = ?",
+      [params.id, skill.version],
+    ) as any;
+
+    if (versionRows.length === 0) {
+      // Create one with current skill content, is_approved=1
+      await db.query(
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+        [
+          crypto.randomUUID(), params.id, skill.version,
+          typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs),
+          typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts),
+          `Approved version ${skill.version}`,
+          skill.author_id,
+        ],
+      );
+    } else {
+      // Mark existing version as approved
+      await db.query(
+        "UPDATE skill_versions SET is_approved = 1 WHERE skill_id = ? AND version = ?",
+        [params.id, skill.version],
+      );
+    }
+
+    // Update skill status to installed
+    await db.query(
+      "UPDATE skills SET status = 'installed' WHERE id = ?",
+      [params.id],
+    );
+
+    // Update the review record
+    await db.query(
+      `UPDATE skill_reviews SET decision = 'approved', reviewed_by = ?, reviewed_at = NOW(3)
+       WHERE skill_id = ? AND decision IS NULL ORDER BY submitted_at DESC LIMIT 1`,
+      [auth.userId, params.id],
+    );
+
+    sendJson(res, 200, { status: "installed" });
+  });
+
+  // Reject skill
+  router.post(`${P}/skills/:id/reject`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "review")) return;
+
+    const body = await parseBody<{ reason?: string }>(req);
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const skill = existing[0];
+
+    if (skill.status !== "pending_review") {
+      sendJson(res, 409, { error: "Only skills pending review can be rejected" });
+      return;
+    }
+
+    // Reset skill back to draft
+    await db.query(
+      "UPDATE skills SET status = 'draft' WHERE id = ?",
+      [params.id],
+    );
+
+    // Update the review record
+    await db.query(
+      `UPDATE skill_reviews SET decision = 'rejected', reject_reason = ?, reviewed_by = ?, reviewed_at = NOW(3)
+       WHERE skill_id = ? AND decision IS NULL ORDER BY submitted_at DESC LIMIT 1`,
+      [body.reason || null, auth.userId, params.id],
+    );
+
+    sendJson(res, 200, { status: "draft" });
+  });
+
+  // Get current review for a skill
+  router.get(`${P}/skills/:id/review`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+
+    // Verify skill belongs to org
+    const [skill] = await db.query(
+      "SELECT id FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (skill.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const [rows] = await db.query(
+      "SELECT * FROM skill_reviews WHERE skill_id = ? ORDER BY submitted_at DESC LIMIT 1",
+      [params.id],
+    ) as any;
+
+    if (rows.length === 0) {
+      sendJson(res, 404, { error: "No review found for this skill" });
+      return;
+    }
+
+    sendJson(res, 200, rows[0]);
+  });
+
+  // List pending reviews (reviewer dashboard)
+  router.get(`${P}/reviews/pending`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+
+    const [rows] = await db.query(
+      `SELECT sr.*, s.name AS skill_name, s.description AS skill_description, s.author_id AS skill_author_id
+       FROM skill_reviews sr
+       JOIN skills s ON sr.skill_id = s.id
+       WHERE sr.decision IS NULL AND s.org_id = ?
+       ORDER BY sr.submitted_at DESC`,
+      [auth.orgId],
+    ) as any;
+
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Rollback skill to a previous version
+  router.post(`${P}/skills/:id/rollback`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const body = await parseBody<{ version: number }>(req);
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
+      [params.id, auth.orgId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Skill not found" });
+      return;
+    }
+
+    const skill = existing[0];
+
+    if (skill.status === "pending_review") {
+      sendJson(res, 409, { error: "Cannot rollback while pending review. Withdraw first." });
+      return;
+    }
+
+    // Get target version
+    const [targetRows] = await db.query(
+      "SELECT * FROM skill_versions WHERE skill_id = ? AND version = ?",
+      [params.id, body.version],
+    ) as any;
+    if (targetRows.length === 0) {
+      sendJson(res, 404, { error: "Target version not found" });
+      return;
+    }
+
+    const target = targetRows[0];
+    const newVersion = (skill.version || 0) + 1;
+
+    const currentSpecs = typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs);
+    const currentScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts);
+    const targetSpecs = typeof target.specs === "string" ? target.specs : JSON.stringify(target.specs);
+    const targetScripts = typeof target.scripts === "string" ? target.scripts : JSON.stringify(target.scripts);
+
+    // Create new version record with target's content and diff vs current
+    await db.query(
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [
+        crypto.randomUUID(), params.id, newVersion,
+        targetSpecs, targetScripts,
+        JSON.stringify({
+          specs_diff: { old: currentSpecs, new: targetSpecs },
+          scripts_diff: { old: currentScripts, new: targetScripts },
+        }),
+        `Rollback to version ${body.version}`,
+        auth.userId,
+      ],
+    );
+
+    // Update skills table with target content
+    await db.query(
+      `UPDATE skills SET specs = ?, scripts = ?, version = ?, status = 'draft' WHERE id = ?`,
+      [targetSpecs, targetScripts, newVersion, params.id],
+    );
+
+    const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
+    sendJson(res, 200, rows[0]);
   });
 
   // ================================================================
