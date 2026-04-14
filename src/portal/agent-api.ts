@@ -56,7 +56,8 @@ export function registerAgentRoutes(
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
         (SELECT COUNT(*) FROM agent_hosts ah WHERE ah.agent_id = a.id) AS hosts_count,
-        (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count
+        (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count,
+        (SELECT COUNT(*) FROM agent_channel_auth ach WHERE ach.agent_id = a.id) AS channels_count
       FROM agents a ${whereClause}
       ORDER BY a.created_at DESC
       LIMIT ? OFFSET ?`;
@@ -220,6 +221,7 @@ export function registerAgentRoutes(
       host_ids?: string[];
       skill_ids?: string[];
       mcp_server_ids?: string[];
+      channel_ids?: string[];
     }>(req);
 
     const db = getDb();
@@ -261,6 +263,12 @@ export function registerAgentRoutes(
           await conn.query("INSERT INTO agent_mcp_servers (agent_id, mcp_server_id) VALUES (?, ?)", [agentId, mid]);
         }
       }
+      if (body.channel_ids !== undefined) {
+        await conn.query("DELETE FROM agent_channel_auth WHERE agent_id = ?", [agentId]);
+        for (const cid of body.channel_ids) {
+          await conn.query("INSERT INTO agent_channel_auth (agent_id, channel_id) VALUES (?, ?)", [agentId, cid]);
+        }
+      }
 
       await conn.commit();
     } catch (err) {
@@ -284,7 +292,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const agentId = params.id;
 
-    const [[clusters], [hosts], [skills], [mcpServers]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [channels]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -305,6 +313,11 @@ export function registerAgentRoutes(
          JOIN mcp_servers m ON ams.mcp_server_id = m.id WHERE ams.agent_id = ?`,
         [agentId],
       ),
+      db.query(
+        `SELECT ch.id, ch.name, ch.type FROM agent_channel_auth ach
+         JOIN channels ch ON ach.channel_id = ch.id WHERE ach.agent_id = ?`,
+        [agentId],
+      ),
     ]) as any;
 
     sendJson(res, 200, {
@@ -312,6 +325,7 @@ export function registerAgentRoutes(
       hosts,
       skills,
       mcp_servers: mcpServers,
+      channels,
     });
   });
 }

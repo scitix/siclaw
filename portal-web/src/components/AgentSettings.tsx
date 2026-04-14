@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Loader2, Save } from "lucide-react"
+import { Loader2, Save, Trash2 } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
@@ -16,6 +16,7 @@ interface AgentResources {
   hosts: { total: number; sample: { id: string; name: string; ip: string }[] }
   skill_ids: string[]
   mcp_server_ids: string[]
+  channels: { id: string; name: string; type: string }[]
 }
 
 interface AvailableCluster { id: string; name: string; api_server: string; is_production: boolean }
@@ -29,6 +30,7 @@ const TABS = [
   { key: "skills", label: "Skills" },
   { key: "mcp", label: "MCP" },
   { key: "resources", label: "Resources" },
+  { key: "channels", label: "Channels" },
   { key: "tasks", label: "Tasks" },
   { key: "api-keys", label: "API Keys" },
 ] as const
@@ -65,6 +67,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set())
   const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set())
   const [selectedMcpIds, setSelectedMcpIds] = useState<Set<string>>(new Set())
+  const [selectedChannelIds, setSelectedChannelIds] = useState<Set<string>>(new Set())
   const [skillLabelFilter, setSkillLabelFilter] = useState("")
   const [saving, setSaving] = useState(false)
 
@@ -100,6 +103,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       setSelectedHostIds(new Set(resources.hosts?.sample?.map(h => h.id) || []))
       setSelectedSkillIds(new Set(resources.skill_ids || []))
       setSelectedMcpIds(new Set(resources.mcp_server_ids || []))
+      setSelectedChannelIds(new Set(resources.channels?.map((c: any) => c.id) || []))
     }
   }, [resources])
 
@@ -116,7 +120,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
-        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds) },
+        body: { cluster_ids: Array.from(selectedClusterIds), host_ids: Array.from(selectedHostIds), skill_ids: Array.from(selectedSkillIds), mcp_server_ids: Array.from(selectedMcpIds), channel_ids: Array.from(selectedChannelIds) },
       })
       onUpdate(updated)
       toast.success("Saved — agent will reload automatically")
@@ -126,7 +130,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   }
 
   // Tabs that need the Save button
-  const saveTabs: TabKey[] = ["basic", "model", "skills", "mcp", "resources"]
+  const saveTabs: TabKey[] = ["basic", "model", "skills", "mcp", "resources", "channels"]
   const showSave = saveTabs.includes(activeTab)
 
   return (
@@ -167,6 +171,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} />}
         {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} />}
+        {activeTab === "channels" && <ChannelsTab agentId={agent.id} selectedChannelIds={selectedChannelIds} setSelectedChannelIds={setSelectedChannelIds} />}
         {activeTab === "tasks" && <AgentTasks agentId={agent.id} />}
         {activeTab === "api-keys" && <AgentApiKeys agentId={agent.id} />}
       </div>
@@ -372,6 +377,127 @@ function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedCl
                 <span className={`px-1.5 py-0.5 rounded text-[10px] ${h.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>{h.is_production ? "PROD" : "DEV"}</span>
                 {h.ip && <span className="text-[10px] text-muted-foreground/50">{h.ip}</span>}
               </label>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ChannelsTab({ agentId, selectedChannelIds, setSelectedChannelIds }: {
+  agentId: string; selectedChannelIds: Set<string>; setSelectedChannelIds: (v: Set<string>) => void
+}) {
+  const toast = useToast()
+  const [bindings, setBindings] = useState<{ id: string; channel_id: string; channel_name: string; channel_type: string; route_key: string; route_type: string }[]>([])
+  const [allChannels, setAllChannels] = useState<{ id: string; name: string; type: string }[]>([])
+  const [loading, setLoading] = useState(true)
+  const [pairingCode, setPairingCode] = useState<string | null>(null)
+  const [pairingChannel, setPairingChannel] = useState("")
+  const [generating, setGenerating] = useState(false)
+
+  useEffect(() => {
+    Promise.all([
+      api<{ data: typeof bindings }>(`/siclaw/agents/${agentId}/channel-bindings`),
+      api<{ data: typeof allChannels }>("/channels"),
+    ]).then(([b, c]) => {
+      setBindings(Array.isArray(b.data) ? b.data : [])
+      setAllChannels(Array.isArray(c.data) ? c.data : [])
+    }).catch(() => {}).finally(() => setLoading(false))
+  }, [agentId])
+
+  const handlePair = async () => {
+    if (!pairingChannel) return
+    setGenerating(true)
+    try {
+      const res = await api<{ code: string; expires_at: string }>(`/siclaw/agents/${agentId}/channel-bindings/pair`, {
+        method: "POST", body: { channel_id: pairingChannel },
+      })
+      setPairingCode(res.code)
+    } catch (err: any) { toast.error(err.message) } finally { setGenerating(false) }
+  }
+
+  const handleUnbind = async (bindingId: string) => {
+    try {
+      await api(`/siclaw/agents/${agentId}/channel-bindings/${bindingId}`, { method: "DELETE" })
+      setBindings(prev => prev.filter(b => b.id !== bindingId))
+      toast.success("Binding removed")
+    } catch (err: any) { toast.error(err.message) }
+  }
+
+  // Channels authorized for this agent (from selectedChannelIds managed by parent Save)
+  const authorizedChannels = allChannels.filter(c => selectedChannelIds.has(c.id))
+
+  if (loading) return <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+
+  return (
+    <div className="px-6 py-6 space-y-6">
+      {/* Section 1: Admin — authorize which channels this agent can use */}
+      <div className="space-y-3">
+        <h4 className="text-[12px] font-medium text-muted-foreground">Authorized Channels (admin)</h4>
+        <p className="text-[11px] text-muted-foreground/70">Select which channels this agent can use. Users can only pair within authorized channels.</p>
+        {allChannels.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60">No channels configured. Add channels in Settings → Channels.</p>
+        ) : (
+          <div className="max-h-48 overflow-auto border border-border rounded-md">
+            {allChannels.map(c => (
+              <label key={c.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-secondary/30 cursor-pointer text-[12px]">
+                <input type="checkbox" checked={selectedChannelIds.has(c.id)} onChange={e => {
+                  const next = new Set(selectedChannelIds)
+                  e.target.checked ? next.add(c.id) : next.delete(c.id)
+                  setSelectedChannelIds(next)
+                }} className="rounded" />
+                <span className="font-mono flex-1">{c.name}</span>
+                <span className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">{c.type}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Section 2: Pair a chat group (using authorized channels only) */}
+      <div className="space-y-3 border-t border-border pt-5">
+        <h4 className="text-[12px] font-medium text-muted-foreground">Pair a Chat Group</h4>
+        <div className="flex items-center gap-2">
+          <select value={pairingChannel} onChange={e => { setPairingChannel(e.target.value); setPairingCode(null) }} className="flex-1 h-8 px-3 text-[13px] rounded-md border border-border bg-background">
+            <option value="">Select authorized channel...</option>
+            {authorizedChannels.map(c => <option key={c.id} value={c.id}>{c.name} ({c.type})</option>)}
+          </select>
+          <button onClick={handlePair} disabled={!pairingChannel || generating} className="h-8 px-4 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50">
+            {generating ? "..." : "Generate Code"}
+          </button>
+        </div>
+        {pairingCode && (
+          <div className="p-4 rounded-lg border border-border bg-secondary/30 space-y-2">
+            <p className="text-[12px] text-muted-foreground">Send this message in the target chat group:</p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 px-3 py-2 rounded-md bg-background border border-border font-mono text-lg font-bold text-foreground text-center tracking-widest">
+                PAIR {pairingCode}
+              </code>
+              <button onClick={() => { navigator.clipboard.writeText(`PAIR ${pairingCode}`); toast.success("Copied") }} className="h-9 px-3 text-[12px] rounded-md border border-border text-muted-foreground hover:text-foreground">Copy</button>
+            </div>
+            <p className="text-[10px] text-muted-foreground">Code expires in 5 minutes.</p>
+          </div>
+        )}
+      </div>
+
+      {/* Section 3: Active bindings */}
+      <div className="space-y-3 border-t border-border pt-5">
+        <h4 className="text-[12px] font-medium text-muted-foreground">My Bindings ({bindings.length})</h4>
+        {bindings.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60">No bindings yet. Use pairing to connect chat groups.</p>
+        ) : (
+          <div className="space-y-1.5">
+            {bindings.map(b => (
+              <div key={b.id} className="flex items-center justify-between px-3 py-2 rounded-md border border-border/50">
+                <div>
+                  <p className="text-[12px] font-mono">{b.channel_name || b.channel_id}</p>
+                  <p className="text-[10px] text-muted-foreground">{b.route_type}: {b.route_key}</p>
+                </div>
+                <button onClick={() => handleUnbind(b.id)} title="Unbind" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
             ))}
           </div>
         )}

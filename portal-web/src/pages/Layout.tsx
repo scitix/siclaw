@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 
@@ -15,6 +15,7 @@ const settingsItems = [
   { path: "/settings/users", label: "Users", icon: Users },
   { path: "/settings/clusters", label: "Clusters", icon: Server },
   { path: "/settings/hosts", label: "Hosts", icon: Monitor },
+  { path: "/settings/channels", label: "Channels", icon: Radio },
   { path: "/settings/models", label: "Models", icon: Cpu },
 ]
 

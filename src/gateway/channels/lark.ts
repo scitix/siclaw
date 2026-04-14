@@ -1,18 +1,18 @@
 /**
  * Lark (飞书) channel handler.
  *
- * Connects to Lark via WebSocket-based event subscription using
- * @larksuiteoapi/node-sdk (optionalDependency — loaded dynamically).
- *
- * Flow:
- *   Lark message -> resolve userId -> getOrCreate AgentBox -> prompt -> reply
+ * Connects to Lark via WebSocket-based event subscription.
+ * Routes messages dynamically via channel_bindings (not hardcoded agent).
+ * Supports PAIR command for binding chat groups to agents.
  */
 
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
+import { resolveBinding, handlePairingCode } from "../channel-manager.js";
 
 export interface LarkChannelConfig {
+  domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
   app_id: string;
   app_secret: string;
   verification_token?: string;
@@ -20,22 +20,19 @@ export interface LarkChannelConfig {
 }
 
 /**
- * Create a Lark channel handler for one agent_channels row.
+ * Create a Lark channel handler for one global channel record.
  */
 export function createLarkHandler(
   channel: Record<string, any>,
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
 ): ChannelHandler {
-  const agentId: string = channel.agent_id;
-  const authMode: string = channel.auth_mode || "open";
-  const serviceAccountId: string | undefined = channel.service_account_id;
+  const channelId: string = channel.id;
   const config: LarkChannelConfig =
     typeof channel.config === "string"
       ? JSON.parse(channel.config)
       : channel.config;
 
-  // Hold a reference so stop() can shut down the socket.
   let wsClient: { close(params?: { force?: boolean }): void } | null = null;
 
   return {
@@ -44,15 +41,16 @@ export function createLarkHandler(
       try {
         lark = await import("@larksuiteoapi/node-sdk");
       } catch {
-        console.error(
-          `[lark] @larksuiteoapi/node-sdk is not installed — skipping channel for agent=${agentId}`,
-        );
+        console.error(`[lark] @larksuiteoapi/node-sdk not installed — skipping channel ${channelId}`);
         return;
       }
 
+      // domain: "lark" → open.larksuite.com (global), default → open.feishu.cn (China)
+      const domain = config.domain === "lark" ? lark.Domain.Lark : lark.Domain.Feishu;
       const larkClient = new lark.Client({
         appId: config.app_id,
         appSecret: config.app_secret,
+        domain,
       });
 
       const dispatcher = new lark.EventDispatcher({
@@ -63,20 +61,9 @@ export function createLarkHandler(
       dispatcher.register({
         "im.message.receive_v1": async (data: any) => {
           try {
-            await handleLarkMessage(
-              data,
-              larkClient,
-              agentId,
-              authMode,
-              serviceAccountId,
-              agentBoxManager,
-              tlsOptions,
-            );
+            await handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions);
           } catch (err) {
-            console.error(
-              `[lark] Error handling message for agent=${agentId}:`,
-              err,
-            );
+            console.error(`[lark] Error handling message for channel=${channelId}:`, err);
           }
         },
       });
@@ -89,23 +76,16 @@ export function createLarkHandler(
       try {
         await ws.start({ eventDispatcher: dispatcher });
         wsClient = ws;
-        console.log(
-          `[lark] Channel started for agent=${agentId} app=${config.app_id}`,
-        );
+        console.log(`[lark] Channel started id=${channelId} app=${config.app_id}`);
       } catch (err) {
-        console.error(
-          `[lark] Failed to start channel for agent=${agentId}:`,
-          err,
-        );
+        console.error(`[lark] Failed to start channel ${channelId}:`, err);
       }
     },
 
     async stop() {
-      if (wsClient) {
-        wsClient.close({ force: true });
-      }
+      if (wsClient) wsClient.close({ force: true });
       wsClient = null;
-      console.log(`[lark] Channel stopped for agent=${agentId}`);
+      console.log(`[lark] Channel stopped id=${channelId}`);
     },
   };
 }
@@ -115,121 +95,94 @@ export function createLarkHandler(
 async function handleLarkMessage(
   data: any,
   larkClient: any,
-  agentId: string,
-  authMode: string,
-  serviceAccountId: string | undefined,
+  channelId: string,
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
 ): Promise<void> {
-  // 1. Extract text from the incoming message event
   const message = data?.event?.message;
-  if (!message) {
-    console.warn("[lark] Received event with no message payload");
-    return;
-  }
+  if (!message) return;
 
   const messageId: string = message.message_id;
   const chatId: string = message.chat_id;
   const msgType: string = message.message_type;
 
-  // Only handle text messages for now
-  if (msgType !== "text") {
-    console.log(`[lark] Ignoring non-text message type=${msgType} in chat=${chatId}`);
-    return;
-  }
+  if (msgType !== "text") return;
 
   let text: string;
   try {
     const content = JSON.parse(message.content);
     text = content.text;
-  } catch {
-    console.warn(`[lark] Failed to parse message content for messageId=${messageId}`);
-    return;
-  }
+  } catch { return; }
 
   if (!text || text.trim().length === 0) return;
-
-  // Strip @mention tags that Lark wraps around bot mentions
   text = text.replace(/@_user_\d+/g, "").trim();
   if (text.length === 0) return;
 
-  // 2. Resolve userId based on auth_mode
-  let userId: string;
-  if (authMode === "mapped") {
-    // Future: look up a Lark user → Upstream user mapping.
-    // For now, fall back to service account.
-    userId = serviceAccountId ?? "lark-default";
-  } else {
-    // "open" or "service_account" → use the service account
-    userId = serviceAccountId ?? "lark-default";
+  // Check for PAIR command
+  const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
+  if (pairMatch) {
+    const code = pairMatch[1].toUpperCase();
+    const result = await handlePairingCode(code, channelId, chatId, "group");
+
+    const replyText = result.success
+      ? `✅ Paired! This group is now connected to agent "${result.agentName}".`
+      : `❌ Pairing failed: ${result.error}`;
+
+    await replyToLark(larkClient, messageId, replyText);
+    return;
   }
 
-  console.log(
-    `[lark] Message from chat=${chatId} resolved userId=${userId} agent=${agentId}: "${text.slice(0, 80)}"`,
-  );
+  // Look up binding for this chat
+  const binding = await resolveBinding(channelId, chatId);
+  if (!binding) {
+    console.log(`[lark] No binding for channel=${channelId} chat=${chatId} — ignoring`);
+    // Don't spam the group with "not paired" for every message.
+    // Only reply if the message looks like it's directed at the bot (@mention).
+    return;
+  }
 
-  // 3. Get or create AgentBox
+  const agentId = binding.agentId;
+  // Use a deterministic userId scoped to channel + chat for session isolation
+  const userId = `lark-${chatId.slice(0, 12)}`;
+
+  console.log(`[lark] Message channel=${channelId} chat=${chatId} → agent=${agentId}: "${text.slice(0, 80)}"`);
+
+  // Get or create AgentBox
   const handle = await agentBoxManager.getOrCreate(userId, agentId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
-  // 4. Send prompt with mode="channel"
-  const promptOpts: PromptOptions = {
-    text,
-    agentId,
-    mode: "channel",
-  };
-
+  const promptOpts: PromptOptions = { text, agentId, mode: "channel" };
   const promptResult = await client.prompt(promptOpts);
-
-  // 5. Drain SSE events and collect the final text
   const resultText = await collectResponse(client, promptResult.sessionId);
 
-  // 6. Reply to Lark
   if (resultText) {
-    try {
-      await larkClient.im.message.reply({
-        path: { message_id: messageId },
-        data: {
-          content: JSON.stringify({ text: resultText }),
-          msg_type: "text",
-        },
-      });
-    } catch (err) {
-      console.error(
-        `[lark] Failed to reply to messageId=${messageId}:`,
-        err,
-      );
-    }
+    await replyToLark(larkClient, messageId, resultText);
+  }
+}
+
+async function replyToLark(larkClient: any, messageId: string, text: string): Promise<void> {
+  try {
+    await larkClient.im.message.reply({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify({ text }), msg_type: "text" },
+    });
+  } catch (err) {
+    console.error(`[lark] Failed to reply to messageId=${messageId}:`, err);
   }
 }
 
 // ── SSE response collector ─────────────────────────────────────
 
-async function collectResponse(
-  client: AgentBoxClient,
-  sessionId: string,
-): Promise<string> {
+async function collectResponse(client: AgentBoxClient, sessionId: string): Promise<string> {
   const parts: string[] = [];
-
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
-
-      // Collect assistant text events
-      if (ev.type === "content_block_delta" && ev.delta?.text) {
-        parts.push(ev.delta.text);
-      }
-      // Also handle the simple "text" wrapper some brains emit
-      if (ev.type === "text" && typeof ev.text === "string") {
-        parts.push(ev.text);
-      }
+      if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
+      if (ev.type === "text" && typeof ev.text === "string") parts.push(ev.text);
     }
   } catch (err) {
-    console.error(
-      `[lark] SSE collect error for sessionId=${sessionId}:`,
-      err,
-    );
+    console.error(`[lark] SSE collect error for session=${sessionId}:`, err);
   }
-
   return parts.join("");
 }

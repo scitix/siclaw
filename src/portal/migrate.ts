@@ -149,6 +149,27 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // Channels (global — shared across agents)
+  `CREATE TABLE IF NOT EXISTS channels (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    config JSON NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Agent <-> Channel junction (admin binds which channels an agent can use)
+  `CREATE TABLE IF NOT EXISTS agent_channel_auth (
+    agent_id CHAR(36) NOT NULL,
+    channel_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, channel_id),
+    CONSTRAINT fk_ach_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_ach_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
 ];
 
 /**
