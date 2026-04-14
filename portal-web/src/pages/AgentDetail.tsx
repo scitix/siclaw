@@ -97,7 +97,7 @@ export function AgentDetail() {
       </div>
 
       {/* Content — directly render based on ?tab= param */}
-      <div className="flex-1 overflow-hidden">
+      <div className="flex-1 overflow-auto">
         {view === "tasks" && <AgentTasks agentId={agent.id} />}
         {view === "api-keys" && <AgentApiKeys agentId={agent.id} />}
         {view === "settings" && <AgentSettings agent={agent} onUpdate={(updated) => setAgent(updated)} />}

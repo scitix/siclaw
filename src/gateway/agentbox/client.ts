@@ -25,8 +25,6 @@ export interface PromptOptions {
   modelProvider?: string;
   /** Model ID to use for this prompt */
   modelId?: string;
-  /** Brain type — "pi-agent" | "claude-sdk" */
-  brainType?: string;
   /** Agent ID (for logging/context) */
   agentId?: string;
   /** Custom system prompt template from agent settings */
@@ -54,7 +52,6 @@ export interface PromptOptions {
 export interface PromptResponse {
   ok: boolean;
   sessionId: string;
-  brainType?: string;
 }
 
 export interface SessionInfo {
@@ -238,7 +235,7 @@ export class AgentBoxClient {
   /**
    * Get the current model
    */
-  async getModel(sessionId: string): Promise<{ model: ModelInfo | null; brainType?: string }> {
+  async getModel(sessionId: string): Promise<{ model: ModelInfo | null }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/model`);
     return resp.json();
   }

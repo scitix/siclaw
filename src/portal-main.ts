@@ -8,6 +8,7 @@ import { initDb, closeDb } from "./gateway/db.js";
 import { runMigrations } from "./gateway/migrate.js";
 import { runPortalMigrations } from "./portal/migrate.js";
 import { startPortal } from "./portal/server.js";
+import { PortalTaskService } from "./portal/task-service.js";
 
 const config = {
   port: parseInt(process.env.PORTAL_PORT || "3003", 10),
@@ -35,9 +36,19 @@ console.log("[portal] Database ready");
 // Start server
 const server = startPortal(config);
 
+// Start task scheduler
+const taskService = new PortalTaskService({
+  portalPort: config.port,
+  portalSecret: config.jwtSecret,
+});
+taskService.start().catch((err) => {
+  console.warn("[portal] Task service start failed:", err);
+});
+
 // Graceful shutdown
 async function shutdown(): Promise<void> {
   console.log("\n[portal] Shutting down...");
+  taskService.stop();
   server.close();
   await closeDb();
   process.exit(0);

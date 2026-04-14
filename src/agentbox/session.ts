@@ -17,11 +17,10 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef, DpStatus } from "../core/types.js";
-import type { BrainSession, BrainType } from "../core/brain-session.js";
+import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import type { DpState } from "../tools/workflow/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 // topic-consolidator import removed — consolidation disabled
@@ -56,14 +55,10 @@ export interface ManagedSession {
   skillsDirs: string[];
   /** Session mode — determines which system skills are loaded */
   mode: SessionMode;
-  /** Brain type used by this session */
-  brainType: BrainType;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
-  /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
-  dpState?: DpState;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
@@ -171,7 +166,7 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
-  async getOrCreate(sessionId?: string, mode?: SessionMode, brainType?: BrainType, systemPromptTemplate?: string): Promise<ManagedSession> {
+  async getOrCreate(sessionId?: string, mode?: SessionMode, systemPromptTemplate?: string): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
 
     let managed = this.sessions.get(id);
@@ -212,12 +207,10 @@ export class AgentBoxSessionManager {
       credentialBroker: this.credentialBroker,
     };
     const effectiveMode = mode ?? "web";
-    const effectiveBrainType = brainType ?? "pi-agent";
     const result = await createSiclawSession({
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
-      brainType: effectiveBrainType,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       knowledgeIndexer: this.knowledgeIndexer,
@@ -253,11 +246,9 @@ export class AgentBoxSessionManager {
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
-      brainType: effectiveBrainType,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
-      dpState: result.dpState,
       dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,

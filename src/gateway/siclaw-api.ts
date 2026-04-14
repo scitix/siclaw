@@ -144,29 +144,28 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
     const version = 1;
-    const now = new Date().toISOString();
 
     const db = getDb();
 
     await db.query(
-      `INSERT INTO skills (id, org_id, name, description, scope, author_id, status, version, specs, scripts, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skills (id, org_id, name, description, scope, author_id, status, version, specs, scripts, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, body.name, body.description || null, body.scope || "personal",
         auth.userId, body.status || "draft", version,
         JSON.stringify(body.specs || {}), JSON.stringify(body.scripts || {}),
-        auth.userId, now, now,
+        auth.userId,
       ],
     );
 
     // Insert initial version
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         crypto.randomUUID(), id, version,
         JSON.stringify(body.specs || {}), JSON.stringify(body.scripts || {}),
-        body.commit_message || "Initial version", auth.userId, now,
+        body.commit_message || "Initial version", auth.userId,
       ],
     );
 
@@ -213,33 +212,31 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const skill = existing[0];
     const newVersion = (skill.version || 0) + 1;
-    const now = new Date().toISOString();
 
     await db.query(
       `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
        scope = COALESCE(?, scope), status = COALESCE(?, status),
-       version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts),
-       updated_at = ?
+       version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
        WHERE id = ?`,
       [
         body.name ?? null, body.description ?? null, body.scope ?? null,
         body.status ?? null, newVersion,
         body.specs ? JSON.stringify(body.specs) : null,
         body.scripts ? JSON.stringify(body.scripts) : null,
-        now, params.id,
+        params.id,
       ],
     );
 
     // Insert version record
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         crypto.randomUUID(), params.id, newVersion,
         JSON.stringify(body.specs ?? skill.specs),
         JSON.stringify(body.scripts ?? skill.scripts),
         body.commit_message || `Version ${newVersion}`,
-        auth.userId, now,
+        auth.userId,
       ],
     );
 
@@ -319,18 +316,17 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
 
     const db = getDb();
     await db.query(
-      `INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, body.name, body.transport || "sse",
         body.url || null, body.command || null,
         JSON.stringify(body.args || null), JSON.stringify(body.env || null),
         JSON.stringify(body.headers || null), body.enabled !== false ? 1 : 0,
-        body.description || null, auth.userId, now, now,
+        body.description || null, auth.userId,
       ],
     );
 
@@ -378,8 +374,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
        name = COALESCE(?, name), transport = COALESCE(?, transport),
        url = COALESCE(?, url), command = COALESCE(?, command),
        args = COALESCE(?, args), env = COALESCE(?, env),
-       headers = COALESCE(?, headers), description = COALESCE(?, description),
-       updated_at = ?
+       headers = COALESCE(?, headers), description = COALESCE(?, description)
        WHERE id = ?`,
       [
         body.name ?? null, body.transport ?? null,
@@ -388,7 +383,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
         body.env ? JSON.stringify(body.env) : null,
         body.headers ? JSON.stringify(body.headers) : null,
         body.description ?? null,
-        new Date().toISOString(), params.id,
+        params.id,
       ],
     );
 
@@ -435,8 +430,8 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     }
 
     await db.query(
-      "UPDATE mcp_servers SET enabled = ?, updated_at = ? WHERE id = ?",
-      [body.enabled ? 1 : 0, new Date().toISOString(), params.id],
+      "UPDATE mcp_servers SET enabled = ? WHERE id = ?",
+      [body.enabled ? 1 : 0, params.id],
     );
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [params.id]) as any;
@@ -483,20 +478,48 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
     const db = getDb();
 
     await db.query(
-      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, created_at, last_active_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, last_active_at)
+       VALUES (?, ?, ?, ?, ?, ?, NOW(3))`,
       [
         id, params.id, auth.userId,
-        body.title || "New Session", body.preview || null, 0, now, now,
+        body.title || "New Session", body.preview || null, 0,
       ],
     );
 
     const [rows] = await db.query("SELECT * FROM chat_sessions WHERE id = ?", [id]) as any;
     sendJson(res, 201, rows[0]);
+  });
+
+  // Update chat session (rename)
+  router.put(`${P}/agents/:id/chat/sessions/:sid`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const body = await parseBody<Record<string, unknown>>(req);
+    const db = getDb();
+
+    const [existing] = await db.query(
+      "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+      [params.sid, params.id, auth.userId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    const fields: string[] = [];
+    const values: unknown[] = [];
+    if ("title" in body) { fields.push("title = ?"); values.push(body.title); }
+    if (fields.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
+
+    values.push(params.sid);
+    await db.query(`UPDATE chat_sessions SET ${fields.join(", ")} WHERE id = ?`, values);
+
+    const [rows] = await db.query("SELECT * FROM chat_sessions WHERE id = ?", [params.sid]) as any;
+    sendJson(res, 200, rows[0]);
   });
 
   // Soft-delete chat session
@@ -603,16 +626,15 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
     const db = getDb();
 
     await db.query(
-      `INSERT INTO cron_jobs (id, org_id, agent_id, name, description, schedule, prompt, status, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO cron_jobs (id, org_id, agent_id, name, description, schedule, prompt, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, body.agent_id, body.name, body.description || null,
         body.schedule, body.prompt, body.status || "active",
-        auth.userId, now, now,
+        auth.userId,
       ],
     );
 
@@ -659,12 +681,12 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       `UPDATE cron_jobs SET
        name = COALESCE(?, name), description = COALESCE(?, description),
        schedule = COALESCE(?, schedule), prompt = COALESCE(?, prompt),
-       agent_id = COALESCE(?, agent_id), updated_at = ?
+       agent_id = COALESCE(?, agent_id)
        WHERE id = ?`,
       [
         body.name ?? null, body.description ?? null,
         body.schedule ?? null, body.prompt ?? null,
-        body.agent_id ?? null, new Date().toISOString(), params.id,
+        body.agent_id ?? null, params.id,
       ],
     );
 
@@ -712,8 +734,8 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     }
 
     await db.query(
-      "UPDATE cron_jobs SET status = ?, updated_at = ? WHERE id = ?",
-      [body.status, new Date().toISOString(), params.id],
+      "UPDATE cron_jobs SET status = ? WHERE id = ?",
+      [body.status, params.id],
     );
 
     const [rows] = await db.query("SELECT * FROM cron_jobs WHERE id = ?", [params.id]) as any;
@@ -780,17 +802,16 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
     const db = getDb();
 
     await db.query(
-      `INSERT INTO agent_channels (id, agent_id, name, type, config, auth_mode, service_account_id, status, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_channels (id, agent_id, name, type, config, auth_mode, service_account_id, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, body.name, body.type,
         JSON.stringify(body.config || {}), body.auth_mode || null,
         body.service_account_id || null, body.status || "active",
-        auth.userId, now, now,
+        auth.userId,
       ],
     );
 
@@ -821,13 +842,13 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
        name = COALESCE(?, name), type = COALESCE(?, type),
        config = COALESCE(?, config), auth_mode = COALESCE(?, auth_mode),
        service_account_id = COALESCE(?, service_account_id),
-       status = COALESCE(?, status), updated_at = ?
+       status = COALESCE(?, status)
        WHERE id = ?`,
       [
         body.name ?? null, body.type ?? null,
         body.config ? JSON.stringify(body.config) : null,
         body.auth_mode ?? null, body.service_account_id ?? null,
-        body.status ?? null, new Date().toISOString(), params.cid,
+        body.status ?? null, params.cid,
       ],
     );
 
@@ -881,16 +902,15 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
     const db = getDb();
 
     await db.query(
-      `INSERT INTO agent_diagnostics (id, agent_id, name, description, prompt_template, params, sort_order, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agent_diagnostics (id, agent_id, name, description, prompt_template, params, sort_order, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, body.name, body.description || null,
         body.prompt_template, JSON.stringify(body.params || {}),
-        body.sort_order ?? 0, auth.userId, now, now,
+        body.sort_order ?? 0, auth.userId,
       ],
     );
 
@@ -920,14 +940,13 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       `UPDATE agent_diagnostics SET
        name = COALESCE(?, name), description = COALESCE(?, description),
        prompt_template = COALESCE(?, prompt_template),
-       params = COALESCE(?, params), sort_order = COALESCE(?, sort_order),
-       updated_at = ?
+       params = COALESCE(?, params), sort_order = COALESCE(?, sort_order)
        WHERE id = ?`,
       [
         body.name ?? null, body.description ?? null,
         body.prompt_template ?? null,
         body.params ? JSON.stringify(body.params) : null,
-        body.sort_order ?? null, new Date().toISOString(), params.did,
+        body.sort_order ?? null, params.did,
       ],
     );
 
@@ -960,14 +979,14 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
   // API Keys (Agent sub-resource)
   // ================================================================
 
-  // List API keys (never return key_hash)
+  // List API keys (return key_plain for copy support)
   router.get(`${P}/agents/:id/api-keys`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
     const db = getDb();
     const [rows] = await db.query(
-      `SELECT id, agent_id, name, key_prefix, last_used_at, expires_at, created_by, created_at
+      `SELECT id, agent_id, name, key_plain, key_prefix, last_used_at, expires_at, created_by, created_at
        FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC`,
       [params.id],
     ) as any;
@@ -982,8 +1001,6 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
-
     // Generate key: "sk-" + 32 random hex bytes
     const rawKey = crypto.randomBytes(32).toString("hex");
     const plaintext = `sk-${rawKey}`;
@@ -992,26 +1009,21 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const db = getDb();
     await db.query(
-      `INSERT INTO agent_api_keys (id, agent_id, name, key_hash, key_prefix, expires_at, created_by, created_at)
+      `INSERT INTO agent_api_keys (id, agent_id, name, key_hash, key_plain, key_prefix, expires_at, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, body.name || "API Key",
-        keyHash, keyPrefix,
-        body.expires_at || null, auth.userId, now,
+        keyHash, plaintext, keyPrefix,
+        body.expires_at || null, auth.userId,
       ],
     );
 
-    // Return the plaintext key only on creation
-    sendJson(res, 201, {
-      id,
-      agent_id: params.id,
-      name: body.name || "API Key",
-      key: plaintext,
-      key_prefix: keyPrefix,
-      expires_at: body.expires_at || null,
-      created_by: auth.userId,
-      created_at: now,
-    });
+    // Return the plaintext key only on creation (query back to get DB-generated created_at)
+    const [rows] = await db.query(
+      "SELECT id, agent_id, name, key_prefix, expires_at, created_by, created_at FROM agent_api_keys WHERE id = ?",
+      [id],
+    ) as any;
+    sendJson(res, 201, { ...rows[0], key: plaintext });
   });
 
   // Delete API key
@@ -1104,16 +1116,15 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
     const db = getDb();
 
     await db.query(
-      `INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         id, auth.orgId, body.name, body.base_url,
         body.api_key || null, body.api_type || "openai",
-        body.sort_order ?? 0, now, now,
+        body.sort_order ?? 0,
       ],
     );
 
@@ -1143,12 +1154,12 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       `UPDATE model_providers SET
        name = COALESCE(?, name), base_url = COALESCE(?, base_url),
        api_key = COALESCE(?, api_key), api_type = COALESCE(?, api_type),
-       sort_order = COALESCE(?, sort_order), updated_at = ?
+       sort_order = COALESCE(?, sort_order)
        WHERE id = ?`,
       [
         body.name ?? null, body.base_url ?? null,
         body.api_key ?? null, body.api_type ?? null,
-        body.sort_order ?? null, new Date().toISOString(), params.id,
+        body.sort_order ?? null, params.id,
       ],
     );
 
@@ -1198,16 +1209,15 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     }
 
     const id = crypto.randomUUID();
-    const now = new Date().toISOString();
 
     await db.query(
-      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id, params.id, body.model_id, body.name || body.model_id,
         body.reasoning ? 1 : 0, body.context_window ?? null,
         body.max_tokens ?? null, body.is_default ? 1 : 0,
-        body.sort_order ?? 0, now,
+        body.sort_order ?? 0,
       ],
     );
 

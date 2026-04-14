@@ -62,6 +62,7 @@ export function registerChatRoutes(
 
     let assistantText = "";
     let closed = false;
+    let historySaved = false;
 
     function cleanup(): void {
       if (closed) return;
@@ -120,11 +121,22 @@ export function registerChatRoutes(
               assistantText += evt.text;
             }
 
+            // Accumulate text from message_update (pi-agent text delta)
+            if (evt.type === "message_update") {
+              const ame = (evt as any).assistantMessageEvent;
+              if (ame?.type === "text_delta" && ame.delta) {
+                assistantText += ame.delta;
+              }
+            }
+
             // Stream complete
-            if (evt.type === "turn_complete" || evt.type === "done") {
-              saveChatHistory(agentId, auth.userId, sessionId, body.text!, assistantText).catch(
-                (err) => console.error("[chat-gateway] Failed to save history:", err),
-              );
+            if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
+              if (!historySaved && body.text) {
+                historySaved = true;
+                saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText).catch(
+                  (err) => console.error("[chat-gateway] Failed to save history:", err),
+                );
+              }
               sseWrite(res, "done", {});
               res.end();
               cleanup();
@@ -149,11 +161,83 @@ export function registerChatRoutes(
 
     ws.on("close", () => {
       if (!closed) {
+        // Save history on WS close as fallback
+        if (!historySaved && assistantText && body.text) {
+          historySaved = true;
+          saveChatHistory(agentId, auth.userId, sessionId, body.text, assistantText).catch(
+            (err) => console.error("[chat-gateway] Failed to save history on close:", err),
+          );
+        }
         sseWrite(res, "done", {});
         res.end();
         cleanup();
       }
     });
+  });
+
+  // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message
+  router.post("/api/v1/siclaw/agents/:id/chat/steer", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const body = await parseBody<{ session_id?: string; text?: string }>(req);
+    if (!body.session_id || !body.text) { sendJson(res, 400, { error: "session_id and text are required" }); return; }
+
+    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.steer", {
+      agentId: params.id,
+      userId: auth.userId,
+      sessionId: body.session_id,
+      text: body.text,
+    });
+
+    sendJson(res, result.ok ? 200 : 502, result);
+  });
+
+  // POST /api/v1/siclaw/agents/:id/chat/abort — abort current execution
+  router.post("/api/v1/siclaw/agents/:id/chat/abort", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const body = await parseBody<{ session_id?: string }>(req);
+    if (!body.session_id) { sendJson(res, 400, { error: "session_id is required" }); return; }
+
+    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.abort", {
+      agentId: params.id,
+      userId: auth.userId,
+      sessionId: body.session_id,
+    });
+
+    sendJson(res, result.ok ? 200 : 502, result);
+  });
+
+  // POST /api/v1/siclaw/agents/:id/chat/clear-queue — clear queued steer/followUp messages
+  router.post("/api/v1/siclaw/agents/:id/chat/clear-queue", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const body = await parseBody<{ session_id?: string }>(req);
+    if (!body.session_id) { sendJson(res, 400, { error: "session_id is required" }); return; }
+
+    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.clearQueue", {
+      agentId: params.id,
+      userId: auth.userId,
+      sessionId: body.session_id,
+    });
+
+    sendJson(res, result.ok ? 200 : 502, result);
+  });
+
+  // POST /api/v1/siclaw/agents/:id/clear-memory — clear agent memory
+  router.post("/api/v1/siclaw/agents/:id/clear-memory", async (req, res, params) => {
+    const auth = requireAuth(req, jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "agent.clearMemory", {
+      agentId: params.id,
+      userId: auth.userId,
+    });
+
+    sendJson(res, result.ok ? 200 : 502, result);
   });
 
   // POST /api/v1/siclaw/agents/:id/run — synchronous execution
@@ -267,6 +351,83 @@ export function registerChatRoutes(
         resolved = true;
         clearTimeout(timeout);
         sendJson(res, 502, { error: "Runtime connection closed unexpectedly" });
+      }
+    });
+  });
+}
+
+// ── Simple RPC helper (connect WS, send one RPC, wait for response, close) ──
+
+async function runtimeRpc(
+  runtimeWsUrl: string,
+  runtimeSecret: string,
+  agentId: string,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<{ ok: boolean; payload?: unknown; error?: string }> {
+  return new Promise((resolve) => {
+    const wsUrl = `${runtimeWsUrl}/ws`;
+    const ws = new WebSocket(wsUrl, {
+      headers: {
+        "X-Auth-Token": runtimeSecret,
+        "X-Agent-Id": agentId,
+      },
+    });
+
+    const reqId = rpcId();
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        ws.close();
+        resolve({ ok: false, error: "RPC timeout" });
+      }
+    }, 30_000);
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "req", id: reqId, method, params }));
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString()) as {
+          type: string;
+          id?: string;
+          ok?: boolean;
+          payload?: unknown;
+          error?: string;
+        };
+        if (msg.type === "res" && msg.id === reqId) {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timeout);
+            ws.close();
+            if (msg.ok) {
+              resolve({ ok: true, payload: msg.payload });
+            } else {
+              resolve({ ok: false, error: msg.error ?? "RPC failed" });
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[chat-gateway] Failed to parse WS message:", err);
+      }
+    });
+
+    ws.on("error", (err) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ ok: false, error: `WS error: ${err.message}` });
+      }
+    });
+
+    ws.on("close", () => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ ok: false, error: "WS closed unexpectedly" });
       }
     });
   });

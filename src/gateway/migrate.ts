@@ -186,6 +186,7 @@ const SCHEMA_SQLS: string[] = [
     agent_id CHAR(36) NOT NULL,
     name VARCHAR(255) NOT NULL,
     key_hash VARCHAR(255) NOT NULL,
+    key_plain VARCHAR(255) NOT NULL,
     key_prefix VARCHAR(10) NOT NULL,
     last_used_at TIMESTAMP(3) NULL DEFAULT NULL,
     expires_at TIMESTAMP(3) NULL DEFAULT NULL,

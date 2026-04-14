@@ -62,7 +62,8 @@ async function fetchAgentResources(
 export async function handleSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
-  _identity: CertificateIdentity,
+  identity: CertificateIdentity,
+  config: RuntimeConfig,
 ): Promise<void> {
   try {
     const db = getDb();
@@ -73,7 +74,8 @@ export async function handleSettings(
        FROM model_providers ORDER BY sort_order, created_at`,
     ) as any;
 
-    const providers: Record<string, unknown>[] = [];
+    // Build providers as Record<string, ProviderConfig> (matching SiclawConfig format)
+    const providers: Record<string, unknown> = {};
     for (const p of providerRows) {
       const [modelRows] = await db.query(
         `SELECT model_id, name, reasoning, context_window, max_tokens, is_default, sort_order
@@ -81,33 +83,52 @@ export async function handleSettings(
         [p.id],
       ) as any;
 
-      providers.push({
-        name: p.name,
+      providers[p.name] = {
         baseUrl: p.base_url,
-        apiKey: p.api_key || undefined,
+        apiKey: p.api_key || "",
         api: p.api_type,
-        models: modelRows.map((m: any) => ({
+        models: (modelRows as any[]).map((m: any) => ({
           id: m.model_id,
           name: m.name || m.model_id,
-          reasoning: m.reasoning,
+          reasoning: !!m.reasoning,
           contextWindow: m.context_window,
           maxTokens: m.max_tokens,
         })),
-      });
+      };
     }
 
-    // Find default model
-    const [defaultRows] = await db.query(
-      `SELECT me.model_id, mp.name as provider_name
-       FROM model_entries me
-       JOIN model_providers mp ON me.provider_id = mp.id
-       WHERE me.is_default = 1 LIMIT 1`,
-    ) as any;
+    // Get this Agent's configured model from Portal/Upstream Adapter
+    let agentProvider = "";
+    let agentModelId = "";
+    try {
+      const agentRes = await fetchAgentResources(config, identity.orgId, identity.agentId);
+      // fetchAgentResources returns skill/mcp IDs — but we need model info from agent itself
+      // Use the adapter /agent/:id endpoint instead
+      const agentUrl = `${config.serverUrl}/api/internal/siclaw/adapter/agent/${identity.agentId}`;
+      const agentResp = await fetch(agentUrl, {
+        headers: { "X-Auth-Token": config.portalSecret, "X-Cert-Org-Id": identity.orgId },
+      });
+      if (agentResp.ok) {
+        const agentData = await agentResp.json() as { model_provider?: string; model_id?: string };
+        agentProvider = agentData.model_provider || "";
+        agentModelId = agentData.model_id || "";
+      }
+    } catch { /* fallback to global default */ }
 
+    // Determine default model: Agent-configured takes priority, then global is_default
     const settings: Record<string, unknown> = { providers };
-    if (defaultRows.length > 0) {
-      settings.defaultProvider = defaultRows[0].provider_name;
-      settings.defaultModel = defaultRows[0].model_id;
+    if (agentProvider && agentModelId) {
+      settings.default = { provider: agentProvider, modelId: agentModelId };
+    } else {
+      const [defaultRows] = await db.query(
+        `SELECT me.model_id, mp.name as provider_name
+         FROM model_entries me
+         JOIN model_providers mp ON me.provider_id = mp.id
+         WHERE me.is_default = 1 LIMIT 1`,
+      ) as any;
+      if (defaultRows.length > 0) {
+        settings.default = { provider: defaultRows[0].provider_name, modelId: defaultRows[0].model_id };
+      }
     }
 
     sendJson(res, 200, settings);

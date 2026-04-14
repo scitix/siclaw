@@ -154,7 +154,7 @@ export class CronCoordinator {
       console.log(`[cron-coordinator] Executing job ${job.id} (${job.name}) agent=${agentId} user=${job.userId}`);
 
       // Get or create AgentBox for this user+agent
-      const handle = await this.manager.getOrCreate(job.userId, agentId);
+      const handle = await this.manager.getOrCreate(job.userId!, agentId);
       const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
       // Build and send the prompt

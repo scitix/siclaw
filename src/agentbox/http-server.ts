@@ -11,10 +11,7 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
-import type { BrainType } from "../core/brain-session.js";
-import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";
-import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/workflow/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -105,11 +102,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         console.log("[agentbox-http] Credential broker initialized");
       }).catch(err => console.warn("[agentbox-http] Credential broker init failed:", err));
     }
-  }
-
-  // Pre-start LLM proxy (fire-and-forget, ready before first prompt)
-  if (hasOpenAIProvider()) {
-    ensureProxy().catch(err => console.warn("[agentbox] LLM proxy pre-start failed:", err));
   }
 
   // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
@@ -214,14 +206,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType, body.systemPromptTemplate);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
 
     // Dynamically register provider config from gateway DB (before findModel)
     if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
@@ -280,17 +272,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (!managed._promptDone) {
         managed._eventBuffer.push(event);
       }
-      // Null dpState.checklist when deep_search completes — this is the exit signal
-      // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
-      const ev = event as Record<string, unknown>;
-      if (ev.type === "tool_execution_end" && managed.dpState?.checklist) {
-        // Find the matching tool_execution_start to get toolName
-        // (tool_execution_end doesn't carry toolName directly in all brain types)
-        const toolName = (ev.toolName as string) ?? "";
-        if (toolName === "deep_search") {
-          managed.dpState.checklist = null;
-        }
-      }
     });
 
     // Also buffer deep_search progress events (same stream as session events)
@@ -302,19 +283,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           progress: event,
         });
       }
-      // Sync phase events to SDK brain's dpState so the auto-continue loop
-      // sees correct phase progression without relying on LLM tool calls.
-      // Guard with _promptDone to avoid stale events mutating state after completion.
-      if (!managed._promptDone && managed.dpState?.checklist) {
-        const ev = event as Record<string, unknown>;
-        if (ev.type === "phase") {
-          const phaseStr = typeof ev.phase === "string" ? ev.phase : "";
-          const phaseNum = parsePhaseNum(phaseStr);
-          if (phaseNum >= 1) {
-            applyPhaseToChecklist(managed.dpState.checklist.items, phaseNum);
-          }
-        }
-      }
     };
     deepSearchEvents.on("progress", deepProgressBufHandler);
 
@@ -323,35 +291,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       deepSearchEvents.off("progress", deepProgressBufHandler);
     };
 
-    // --- DP input transformation (SDK brain only — pi-agent uses extension input handlers) ---
     let promptText = body.text;
-    if (managed.dpState) {
-      const dpState = managed.dpState;
-      const DP_MARKER = "[Deep Investigation]\n";
-      const EXIT_MARKER = "[DP_EXIT]\n";
-
-      if (promptText.startsWith(DP_MARKER)) {
-        const question = promptText.slice(DP_MARKER.length).trim();
-        if (question) {
-          dpState.checklist = createChecklist(question);
-          promptText = buildActivationMessage(question);
-          console.log(`[agentbox-http] DP activated for SDK brain, session ${managed.id}`);
-        }
-      } else if (promptText.startsWith(EXIT_MARKER)) {
-        const userText = promptText.slice(EXIT_MARKER.length).trim();
-        if (dpState.checklist) {
-          for (const item of dpState.checklist.items) {
-            if (item.status === "pending" || item.status === "in_progress") {
-              item.status = "skipped";
-              item.summary = "User exited investigation";
-            }
-          }
-        }
-        dpState.checklist = null;
-        promptText = `The user has exited deep investigation mode. ${userText}`;
-        console.log(`[agentbox-http] DP exited for SDK brain, session ${managed.id}`);
-      }
-    }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
     // IMPORTANT: append after DP markers, not prepend before them.
@@ -466,7 +406,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       onPromptFinish();
     });
 
-    sendJson(res, 200, { ok: true, sessionId: managed.id, brainType: managed.brainType });
+    sendJson(res, 200, { ok: true, sessionId: managed.id });
   });
 
   /**
@@ -651,24 +591,12 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const managed = sessionManager.get(sessionId);
 
     if (managed) {
-      // pi-agent brain: read from dpStateRef (updated by extension on every state change)
       if (managed.dpStateRef) {
         sendJson(res, 200, {
           dpStatus: managed.dpStateRef.status,
           question: managed.dpStateRef.question,
           round: managed.dpStateRef.round,
           confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
-        });
-        return;
-      }
-
-      // SDK brain: read from dpState
-      if (managed.dpState) {
-        sendJson(res, 200, {
-          dpStatus: managed.dpState.status,
-          question: managed.dpState.question,
-          round: managed.dpState.round,
-          confirmedHypotheses: managed.dpState.confirmedHypotheses,
         });
         return;
       }
@@ -816,7 +744,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const model = managed.brain.getModel();
     sendJson(res, 200, {
       model: model ?? null,
-      brainType: managed.brainType,
     });
   });
 
@@ -926,9 +853,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         sendJson(res, 403, { error: "Client certificate required" });
         return;
       }
-      if (peerCert.subject.OU !== "Gateway") {
-        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway)`);
-        sendJson(res, 403, { error: "Forbidden: only Gateway can access this API" });
+      if (peerCert.subject.OU !== "Gateway" && peerCert.subject.OU !== "Runtime") {
+        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway or Runtime)`);
+        sendJson(res, 403, { error: "Forbidden: only Gateway/Runtime can access this API" });
         return;
       }
     }
