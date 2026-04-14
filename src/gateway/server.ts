@@ -35,7 +35,8 @@ import {
   type BroadcastFn,
 } from "./ws-protocol.js";
 import { authenticateProxy, type ProxyIdentity } from "./trusted-proxy.js";
-import { handleCredentialRequest } from "./credential-proxy.js";
+import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
+import { createCredentialService, type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
@@ -51,6 +52,7 @@ export interface RuntimeServer {
   broadcast: BroadcastFn;
   rpcMethods: Map<string, RpcHandler>;
   agentBoxTlsOptions?: { cert: string; key: string; ca: string };
+  credentialService: CredentialService;
   close(): Promise<void>;
 }
 
@@ -58,6 +60,12 @@ export interface StartRuntimeOptions {
   config: RuntimeConfig;
   agentBoxManager: AgentBoxManager;
   spawner?: BoxSpawner;
+  /**
+   * Optional pre-constructed credential service. When omitted, startRuntime
+   * builds one from config. Providing it externally allows the caller to
+   * share the same instance with a LocalSpawner (direct in-process transport).
+   */
+  credentialService?: CredentialService;
 }
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
@@ -65,6 +73,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   const clients = new Set<WebSocket>();
   const broadcast = createBroadcaster(clients);
+
+  // ── Credential Service ───────────────────────────────────
+  const credentialService = opts.credentialService ?? createCredentialService(config);
 
   // ── Certificate Manager ──────────────────────────────────
   const certManager = await CertificateManager.create();
@@ -222,6 +233,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     }
 
     return { ok: true, deletedFiles };
+  });
+
+  rpcMethods.set("agent.terminate", async (params) => {
+    const agentId = params.agentId as string;
+    if (!agentId) throw new Error("agentId required");
+
+    const boxes = await agentBoxManager.list();
+    const targets = boxes.filter((b) => b.agentId === agentId);
+
+    // Stop all matching boxes in parallel; each error is contained so one
+    // failure doesn't block the rest.
+    const results = await Promise.all(
+      targets.map(async (box) => {
+        try {
+          await agentBoxManager.stop(box.userId, agentId);
+          return { ok: true, boxId: box.boxId };
+        } catch (err: any) {
+          console.warn(`[rpc] agent.terminate: failed to stop ${box.boxId}: ${err.message}`);
+          return { ok: false, boxId: box.boxId, error: err.message as string };
+        }
+      }),
+    );
+
+    const stopped = results.filter((r) => r.ok).length;
+    const failed = results.filter((r) => !r.ok);
+
+    console.log(`[rpc] agent.terminate: stopped ${stopped}/${targets.length} boxes for agent=${agentId}`);
+    return { ok: true, stopped, total: targets.length, failed };
   });
 
   // ── REST API Router (Siclaw CRUD) ────────────────────────
@@ -384,14 +423,25 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         mtlsMiddleware(req, res, () => {
           const identity = (req as any).certIdentity as CertificateIdentity | undefined;
 
-          // Credential request proxy → Upstream Adapter
+          // Credential request — resolve via CredentialService (local DB or external)
           if (url === "/api/internal/credential-request" && method === "POST") {
             if (!identity) {
               res.writeHead(401, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "Client certificate required" }));
               return;
             }
-            handleCredentialRequest(req, res, identity, config);
+            void handleCredentialRequest(req, res, identity, credentialService);
+            return;
+          }
+
+          // Credential list — metadata for all clusters bound to this agent
+          if (url === "/api/internal/credential-list" && method === "POST") {
+            if (!identity) {
+              res.writeHead(401, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Client certificate required" }));
+              return;
+            }
+            void handleCredentialList(req, res, identity, credentialService);
             return;
           }
 
@@ -452,6 +502,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     broadcast,
     rpcMethods,
     agentBoxTlsOptions,
+    credentialService,
     async close() {
       await agentBoxManager.cleanup();
       for (const ws of clients) ws.close();

@@ -1,64 +1,60 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { resolveRequiredKubeconfig } from "./kubeconfig-resolver.js";
+import { describe, it, expect } from "vitest";
+import { resolveRequiredKubeconfig, resolveKubeconfigByName, resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import type { CredentialBroker, ClusterLocalInfo } from "../../agentbox/credential-broker.js";
+
+/**
+ * Minimal broker stub for resolver tests. The resolver only touches the sync
+ * getLocalInfo / listLocalInfo API, so we don't need the full broker here.
+ */
+function makeBroker(entries: ClusterLocalInfo[]): CredentialBroker {
+  const map = new Map<string, ClusterLocalInfo>();
+  for (const e of entries) map.set(e.name, e);
+  return {
+    getLocalInfo: (name: string) => map.get(name),
+    listLocalInfo: () => Array.from(map.values()),
+  } as unknown as CredentialBroker;
+}
+
+const PROD: ClusterLocalInfo = {
+  name: "prod",
+  is_production: true,
+  path: "/tmp/creds/prod.kubeconfig",
+};
+
+const STAGING: ClusterLocalInfo = {
+  name: "staging",
+  is_production: false,
+  path: "/tmp/creds/staging.kubeconfig",
+};
 
 describe("resolveRequiredKubeconfig", () => {
-  let credDir: string;
-
-  beforeEach(() => {
-    credDir = mkdtempSync(join(tmpdir(), "kube-test-"));
+  it("returns null path when no broker", () => {
+    expect(resolveRequiredKubeconfig({}, undefined)).toEqual({ path: null });
   });
 
-  afterEach(() => {
-    rmSync(credDir, { recursive: true, force: true });
+  it("returns null path when broker registry is empty", () => {
+    const broker = makeBroker([]);
+    expect(resolveRequiredKubeconfig({ broker }, undefined)).toEqual({ path: null });
   });
 
-  function writeManifest(entries: Array<{ name: string; type: string; files: string[] }>) {
-    writeFileSync(join(credDir, "manifest.json"), JSON.stringify(entries));
-    // Create dummy kubeconfig files
-    for (const e of entries) {
-      for (const f of e.files) {
-        writeFileSync(join(credDir, f), "dummy");
-      }
-    }
-  }
-
-  it("returns null path when no credentialsDir", () => {
-    const result = resolveRequiredKubeconfig(undefined, undefined);
-    expect(result).toEqual({ path: null });
+  it("skips entries without a path (metadata-only)", () => {
+    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    expect(resolveRequiredKubeconfig({ broker }, undefined)).toEqual({ path: null });
   });
 
-  it("returns null path when no manifest.json", () => {
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect(result).toEqual({ path: null });
+  it("auto-selects a single loaded kubeconfig without name", () => {
+    const broker = makeBroker([PROD]);
+    expect(resolveRequiredKubeconfig({ broker }, undefined)).toEqual({ path: PROD.path });
   });
 
-  it("returns null path when no kubeconfig entries", () => {
-    writeManifest([{ name: "ssh", type: "ssh_key", files: ["id_rsa"] }]);
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect(result).toEqual({ path: null });
-  });
-
-  it("auto-selects single kubeconfig without name", () => {
-    writeManifest([{ name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] }]);
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect(result).toEqual({ path: join(credDir, "prod.kubeconfig") });
-  });
-
-  it("resolves single kubeconfig by name", () => {
-    writeManifest([{ name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] }]);
-    const result = resolveRequiredKubeconfig(credDir, "prod");
-    expect(result).toEqual({ path: join(credDir, "prod.kubeconfig") });
+  it("resolves single loaded kubeconfig by explicit name", () => {
+    const broker = makeBroker([PROD]);
+    expect(resolveRequiredKubeconfig({ broker }, "prod")).toEqual({ path: PROD.path });
   });
 
   it("errors on multiple kubeconfigs without name", () => {
-    writeManifest([
-      { name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] },
-      { name: "staging", type: "kubeconfig", files: ["staging.kubeconfig"] },
-    ]);
-    const result = resolveRequiredKubeconfig(credDir, undefined);
+    const broker = makeBroker([PROD, STAGING]);
+    const result = resolveRequiredKubeconfig({ broker }, undefined);
     expect("error" in result).toBe(true);
     if ("error" in result) {
       expect(result.error).toContain("Multiple kubeconfigs");
@@ -68,65 +64,62 @@ describe("resolveRequiredKubeconfig", () => {
     }
   });
 
-  it("resolves by name when multiple kubeconfigs", () => {
-    writeManifest([
-      { name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] },
-      { name: "staging", type: "kubeconfig", files: ["staging.kubeconfig"] },
-    ]);
-    const result = resolveRequiredKubeconfig(credDir, "staging");
-    expect(result).toEqual({ path: join(credDir, "staging.kubeconfig") });
+  it("resolves by name when multiple are loaded", () => {
+    const broker = makeBroker([PROD, STAGING]);
+    expect(resolveRequiredKubeconfig({ broker }, "staging")).toEqual({ path: STAGING.path });
   });
 
-  it("errors when name not found among multiple kubeconfigs", () => {
-    writeManifest([
-      { name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] },
-      { name: "staging", type: "kubeconfig", files: ["staging.kubeconfig"] },
-    ]);
-    const result = resolveRequiredKubeconfig(credDir, "dev");
+  it("errors when requested name is not loaded among multiple", () => {
+    const broker = makeBroker([PROD, STAGING]);
+    const result = resolveRequiredKubeconfig({ broker }, "dev");
     expect("error" in result).toBe(true);
     if ("error" in result) {
-      expect(result.error).toContain("not found");
+      expect(result.error).toContain("not loaded");
       expect(result.error).toContain("dev");
       expect(result.availableNames).toEqual(["prod", "staging"]);
     }
   });
 
-  it("errors when single kubeconfig + explicit name does not match", () => {
-    writeManifest([{ name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] }]);
-    const result = resolveRequiredKubeconfig(credDir, "staging");
+  it("errors when single kubeconfig + explicit name mismatches", () => {
+    const broker = makeBroker([PROD]);
+    const result = resolveRequiredKubeconfig({ broker }, "staging");
     expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error).toContain("not found");
-      expect(result.error).toContain("staging");
-    }
+  });
+});
+
+describe("resolveKubeconfigByName", () => {
+  it("throws when broker is absent", () => {
+    expect(() => resolveKubeconfigByName({}, "prod")).toThrow("not loaded");
   });
 
-  it("returns null path when kubeconfig entry has empty files array", () => {
-    writeManifest([{ name: "empty", type: "kubeconfig", files: [] }]);
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect(result).toEqual({ path: null });
+  it("throws when cluster has no path (metadata only)", () => {
+    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    expect(() => resolveKubeconfigByName({ broker }, "prod")).toThrow("not loaded");
   });
 
-  it("rejects path traversal in manifest file entries", () => {
-    // Write manifest directly — writeManifest helper would try to create the traversal file
-    writeFileSync(
-      join(credDir, "manifest.json"),
-      JSON.stringify([{ name: "evil", type: "kubeconfig", files: ["../../etc/passwd"] }]),
-    );
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect("error" in result).toBe(true);
-    if ("error" in result) {
-      expect(result.error).toContain("escapes credentials directory");
-    }
+  it("returns the path for a loaded cluster", () => {
+    const broker = makeBroker([PROD]);
+    expect(resolveKubeconfigByName({ broker }, "prod")).toBe(PROD.path);
+  });
+});
+
+describe("resolveKubeconfigPath", () => {
+  it("returns null when broker is absent", () => {
+    expect(resolveKubeconfigPath({})).toBeNull();
   });
 
-  it("ignores non-kubeconfig entries when counting", () => {
-    writeManifest([
-      { name: "prod", type: "kubeconfig", files: ["prod.kubeconfig"] },
-      { name: "ssh-key", type: "ssh_key", files: ["id_rsa"] },
-    ]);
-    // Only 1 kubeconfig → auto-select
-    const result = resolveRequiredKubeconfig(credDir, undefined);
-    expect(result).toEqual({ path: join(credDir, "prod.kubeconfig") });
+  it("returns null when registry has no loaded kubeconfigs", () => {
+    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    expect(resolveKubeconfigPath({ broker })).toBeNull();
+  });
+
+  it("auto-returns the single loaded path", () => {
+    const broker = makeBroker([PROD]);
+    expect(resolveKubeconfigPath({ broker })).toBe(PROD.path);
+  });
+
+  it("throws when multiple kubeconfigs are loaded", () => {
+    const broker = makeBroker([PROD, STAGING]);
+    expect(() => resolveKubeconfigPath({ broker })).toThrow("Multiple kubeconfigs");
   });
 });

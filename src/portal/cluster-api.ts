@@ -27,7 +27,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, name, description, api_server, is_production, created_at, updated_at FROM clusters ORDER BY created_at DESC",
+      "SELECT id, name, description, api_server, debug_image, is_production, created_at, updated_at FROM clusters ORDER BY created_at DESC",
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -42,6 +42,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
       description?: string;
       kubeconfig?: string;
       api_server?: string;
+      debug_image?: string;
       is_production?: boolean;
     }>(req);
 
@@ -52,13 +53,13 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     await db.query(
-      `INSERT INTO clusters (id, name, description, kubeconfig, api_server, is_production)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [id, body.name, body.description ?? null, body.kubeconfig ?? null, apiServer, body.is_production ?? 1],
+      `INSERT INTO clusters (id, name, description, kubeconfig, api_server, debug_image, is_production)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, body.name, body.description ?? null, body.kubeconfig ?? null, apiServer, body.debug_image ?? null, body.is_production ?? 1],
     );
 
     const [rows] = await db.query(
-      "SELECT id, name, description, api_server, is_production, created_at, updated_at FROM clusters WHERE id = ?",
+      "SELECT id, name, description, api_server, debug_image, is_production, created_at, updated_at FROM clusters WHERE id = ?",
       [id],
     ) as any;
     sendJson(res, 201, rows[0]);
@@ -88,7 +89,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
-    const fields = ["name", "description", "kubeconfig", "api_server", "is_production"];
+    const fields = ["name", "description", "kubeconfig", "api_server", "debug_image", "is_production"];
     const setClauses: string[] = [];
     const values: unknown[] = [];
 

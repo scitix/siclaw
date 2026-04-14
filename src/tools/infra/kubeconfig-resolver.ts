@@ -1,147 +1,138 @@
 /**
- * Shared kubeconfig resolution utility.
- * Reads manifest.json from the credentials directory and returns the path
- * to the first kubeconfig file, for use by tools that call kubectl internally.
+ * Synchronous kubeconfig resolver.
+ *
+ * Translates `--kubeconfig=<name>` (a cluster name, not a path) into an
+ * absolute file path on disk. The data source is the CredentialBroker's
+ * in-memory registry, which must have been populated by an async ensure()
+ * call from the caller's execute() entry point before this runs.
+ *
+ * Fail-fast contract: every resolver function throws a descriptive error
+ * when the broker has no record of a cluster name. Callers must NOT handle
+ * "not found" as null — if a kubectl command mentions a cluster, that
+ * cluster must already have been ensured. See ensure-kubeconfigs.ts.
  */
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
-import { resolveUnderDir } from "../../shared/path-utils.js";
 
-interface CredentialEntry {
-  name: string;
-  type: string;
-  files: string[];
-  metadata?: { debugImage?: string; [key: string]: unknown };
+import type { CredentialBroker, ClusterLocalInfo } from "../../agentbox/credential-broker.js";
+
+export interface ResolverDeps {
+  broker?: CredentialBroker;
 }
 
-/**
- * Read and parse manifest.json from the credentials directory.
- * Returns an empty array on any failure (missing dir, missing file, parse error).
- */
-function readManifestEntries(credentialsDir: string): CredentialEntry[] {
-  const manifestPath = join(credentialsDir, "manifest.json");
-  if (!existsSync(manifestPath)) return [];
-  try {
-    return JSON.parse(readFileSync(manifestPath, "utf-8")) as CredentialEntry[];
-  } catch {
-    return [];
-  }
+// ──────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────
+
+function throwNotLoaded(name: string): never {
+  throw new Error(
+    `Kubeconfig "${name}" not loaded into broker registry. ` +
+    `Caller must await broker.ensure("${name}") before invoking the resolver ` +
+    `(normally via ensureKubeconfigsForCommand in the tool's execute entry).`,
+  );
 }
 
-/**
- * Resolve the path to the first kubeconfig file from the credentials directory.
- * Returns null if no credentials directory, no manifest, or no kubeconfig entry.
- */
-export function resolveKubeconfigPath(credentialsDir?: string): string | null {
-  if (!credentialsDir) return null;
-
-  const entries = readManifestEntries(credentialsDir);
-  const kubeEntry = entries.find((e) => e.type === "kubeconfig");
-  if (!kubeEntry) return null;
-
-  const kubeconfigFile = kubeEntry.files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntry.files[0];
-  if (!kubeconfigFile) return null;
-
-  try {
-    return resolveUnderDir(credentialsDir, kubeconfigFile);
-  } catch {
-    return null;
-  }
+function getLoaded(broker: CredentialBroker, name: string): ClusterLocalInfo {
+  const info = broker.getLocalInfo(name);
+  if (!info) throwNotLoaded(name);
+  if (!info.path) throwNotLoaded(name);
+  return info;
 }
 
+// ──────────────────────────────────────────────────────────
+// Public API
+// ──────────────────────────────────────────────────────────
+
 /**
- * Resolve a kubeconfig path by credential name.
- * Used to translate `--kubeconfig=<name>` into an actual file path.
- * Returns null if no match found.
+ * Resolve the kubeconfig path when the caller hasn't specified a cluster name.
+ * Returns null when the broker is absent or empty. Throws if multiple clusters
+ * are loaded (caller must specify a name).
  */
-export function resolveKubeconfigByName(credentialsDir: string, name: string): string | null {
-  const entries = readManifestEntries(credentialsDir);
-  const match = entries.find((e) => e.type === "kubeconfig" && e.name === name);
-  if (!match) return null;
-  const kubeconfigFile = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
-  try {
-    return kubeconfigFile ? resolveUnderDir(credentialsDir, kubeconfigFile) : null;
-  } catch {
-    return null;
+export function resolveKubeconfigPath(deps: ResolverDeps): string | null {
+  if (!deps.broker) return null;
+  const all = deps.broker.listLocalInfo().filter((e) => e.path);
+  if (all.length === 0) return null;
+  if (all.length > 1) {
+    const names = all.map((e) => e.name).join(", ");
+    throw new Error(
+      `Multiple kubeconfigs are loaded (${names}). Specify --kubeconfig=<name> to pick one.`,
+    );
   }
+  return all[0].path ?? null;
+}
+
+/** Resolve a kubeconfig file path by cluster name. Throws if not loaded. */
+export function resolveKubeconfigByName(deps: ResolverDeps, name: string): string {
+  if (!deps.broker) throwNotLoaded(name);
+  return getLoaded(deps.broker, name).path!;
 }
 
 /**
  * Resolve kubeconfig with mandatory selection when multiple clusters exist.
  *
- * - 0 kubeconfigs → { path: null }
- * - 1 kubeconfig, no name → auto-select
- * - 1 kubeconfig, name given → resolve by name (error if mismatch)
- * - >1 kubeconfigs, no name → error (ambiguous)
- * - >1 kubeconfigs, name given → resolve by name (error if not found)
+ * - broker absent / registry empty → { path: null }
+ * - 1 loaded, no name → auto-select
+ * - 1 loaded, name given → resolve by name (error if mismatch)
+ * - >1 loaded, no name → error (ambiguous)
+ * - >1 loaded, name given → resolve by name (error if not loaded)
+ *
+ * "Loaded" means the broker has a path for that cluster (i.e. ensure() ran).
  */
 export function resolveRequiredKubeconfig(
-  credentialsDir: string | undefined,
+  deps: ResolverDeps,
   name: string | undefined,
 ): { path: string | null } | { error: string; availableNames?: string[] } {
-  if (!credentialsDir) return { path: null };
+  if (!deps.broker) return { path: null };
+  const loaded = deps.broker.listLocalInfo().filter((e) => e.path);
 
-  const entries = readManifestEntries(credentialsDir);
-  const kubeEntries = entries.filter((e) => e.type === "kubeconfig");
-
-  if (kubeEntries.length === 0) return { path: null };
-
-  /** Safely resolve file under credentialsDir; returns error on path traversal. */
-  const safeResolve = (file: string): { path: string } | { error: string } => {
-    try {
-      return { path: resolveUnderDir(credentialsDir, file) };
-    } catch {
-      return { error: `Kubeconfig file path escapes credentials directory: ${file}` };
+  if (loaded.length === 0) {
+    // A name was requested but ensure() produced no path — something upstream
+    // failed silently. Fail fast instead of kubectl-ing /dev/null.
+    if (name) {
+      return {
+        error: `Kubeconfig "${name}" is not available (broker ensure did not populate a path). Confirm the agent is bound to this cluster in the Portal.`,
+        availableNames: [],
+      };
     }
-  };
-
-  // Single kubeconfig — auto-select (name is optional)
-  if (kubeEntries.length === 1 && !name) {
-    const file = kubeEntries[0].files.find((f) => f.endsWith(".kubeconfig")) ?? kubeEntries[0].files[0];
-    return file ? safeResolve(file) : { path: null };
+    return { path: null };
   }
 
-  // Name required from here
+  if (loaded.length === 1 && !name) {
+    return { path: loaded[0].path ?? null };
+  }
+
   if (!name) {
-    const names = kubeEntries.map((e) => e.name);
+    const names = loaded.map((e) => e.name);
     return {
-      error: `Multiple kubeconfigs available (${names.join(", ")}). You must specify the kubeconfig parameter to select a cluster. Use credential_list to see available credentials.`,
+      error:
+        `Multiple kubeconfigs available (${names.join(", ")}). ` +
+        `Specify the kubeconfig parameter to select a cluster. Use cluster_list to discover available clusters.`,
       availableNames: names,
     };
   }
 
-  // Resolve by name
-  const match = kubeEntries.find((e) => e.name === name);
+  const match = loaded.find((e) => e.name === name);
   if (!match) {
-    const names = kubeEntries.map((e) => e.name);
+    const names = loaded.map((e) => e.name);
     return {
-      error: `Kubeconfig "${name}" not found. Available: ${names.join(", ")}`,
+      error: `Kubeconfig "${name}" not loaded. Available: ${names.join(", ") || "(none)"}`,
       availableNames: names,
     };
   }
-
-  const file = match.files.find((f) => f.endsWith(".kubeconfig")) ?? match.files[0];
-  return file ? safeResolve(file) : { error: `Kubeconfig "${name}" has no files` };
+  return { path: match.path ?? null };
 }
 
 /**
- * Resolve the debug image for a specific kubeconfig credential.
- * Returns the per-cluster debugImage from manifest metadata, or null if not set.
- *
- * When name is undefined and there's exactly one kubeconfig, auto-selects it.
+ * Per-cluster debug image for pod-based debug tools. Reads from the
+ * broker registry (source: clusters.debug_image column, propagated through
+ * CredentialService.listClusters metadata).
  */
-export function resolveDebugImage(credentialsDir: string | undefined, name: string | undefined): string | null {
-  if (!credentialsDir) return null;
-
-  const entries = readManifestEntries(credentialsDir);
-  const kubeEntries = entries.filter((e) => e.type === "kubeconfig");
-
-  let match: CredentialEntry | undefined;
+export function resolveDebugImage(deps: ResolverDeps, name: string | undefined): string | null {
+  if (!deps.broker) return null;
+  let match: ClusterLocalInfo | undefined;
   if (name) {
-    match = kubeEntries.find((e) => e.name === name);
-  } else if (kubeEntries.length === 1) {
-    match = kubeEntries[0];
+    match = deps.broker.getLocalInfo(name);
+  } else {
+    const loaded = deps.broker.listLocalInfo().filter((e) => e.path);
+    if (loaded.length === 1) match = loaded[0];
   }
-
-  return match?.metadata?.debugImage ?? null;
+  return match?.debug_image ?? null;
 }

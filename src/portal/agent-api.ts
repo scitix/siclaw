@@ -15,8 +15,14 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
+import { runtimeRpc } from "./chat-gateway.js";
 
-export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void {
+export function registerAgentRoutes(
+  router: RestRouter,
+  jwtSecret: string,
+  runtimeWsUrl: string,
+  runtimeSecret: string,
+): void {
   // GET /api/v1/agents — list (paginated, search)
   router.get("/api/v1/agents", async (req, res) => {
     const auth = requireAuth(req, jwtSecret);
@@ -174,8 +180,22 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
       return;
     }
 
+    // Terminate any running AgentBox pods bound to this agent before DB delete
+    // so they don't become orphans. Log and proceed on failure — the DB delete
+    // is the user's explicit intent; orphan pods can be cleaned up via kubectl.
+    const termResult = await runtimeRpc(
+      runtimeWsUrl,
+      runtimeSecret,
+      params.id,
+      "agent.terminate",
+      { agentId: params.id },
+    );
+    if (!termResult.ok) {
+      console.warn(`[agent-api] delete ${params.id}: runtime terminate failed: ${termResult.error}`);
+    }
+
     await db.query("DELETE FROM agents WHERE id = ?", [params.id]);
-    sendJson(res, 200, { deleted: true });
+    sendJson(res, 200, { deleted: true, terminate: termResult });
   });
 
   // PUT /api/v1/agents/:id/resources — bind resources (admin only)

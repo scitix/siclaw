@@ -90,6 +90,22 @@ export class AgentBoxSessionManager {
   /** Optional credential broker — set by http-server for on-demand credential acquisition */
   credentialBroker?: import("./credential-broker.js").CredentialBroker;
 
+  /**
+   * Optional credential transport — set by LocalSpawner (in-process, Local mode).
+   * When present, http-server uses this transport to construct the broker
+   * instead of building an mTLS HTTP client. K8s mode leaves this undefined
+   * and http-server falls back to HttpMtlsTransport.
+   */
+  credentialTransport?: import("./credential-transport.js").CredentialTransport;
+
+  /**
+   * Optional override for the directory where the broker materializes credential
+   * files. LocalSpawner sets this to a per-user path so multiple in-process
+   * AgentBoxes don't collide on a shared credentialsDir. When undefined the
+   * broker falls back to `<cwd>/.siclaw/credentials`.
+   */
+  credentialsDir?: string;
+
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
@@ -203,7 +219,9 @@ export class AgentBoxSessionManager {
 
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
-      credentialsDir: path.resolve(process.cwd(), config.paths.credentialsDir),
+      // Prefer the per-user dir set by LocalSpawner; fall back to the
+      // config-driven global path (K8s mode and TUI both use this).
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
       credentialBroker: this.credentialBroker,
     };
     const effectiveMode = mode ?? "web";

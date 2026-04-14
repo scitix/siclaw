@@ -60,7 +60,7 @@ export interface ExecEnv {
 export function prepareExecEnv(kubeconfigRef?: KubeconfigRef, resolvedKubeconfigPath?: string | null): ExecEnv {
   const kubeconfigPath = resolvedKubeconfigPath !== undefined
     ? resolvedKubeconfigPath
-    : resolveKubeconfigPath(kubeconfigRef?.credentialsDir);
+    : resolveKubeconfigPath({ broker: kubeconfigRef?.credentialBroker });
   return {
     childEnv: {
       ...sanitizeEnv(process.env as Record<string, string>),

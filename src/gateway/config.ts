@@ -19,6 +19,14 @@ export interface RuntimeConfig {
   databaseUrl: string;
   /** Shared JWT secret for token verification */
   jwtSecret: string;
+  /**
+   * Optional URL of an external credential provider. When set, all credential
+   * list/get requests are forwarded there and the local clusters DB is bypassed.
+   * When empty, credentials come from the local clusters + agent_clusters tables.
+   */
+  externalCredentialUrl: string;
+  /** Bearer token sent as X-Auth-Token to the external credential provider. */
+  externalCredentialToken: string;
 }
 
 export function loadRuntimeConfig(): RuntimeConfig {
@@ -31,5 +39,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     portalSecret: process.env.SICLAW_PORTAL_SECRET || "",
     databaseUrl: process.env.DATABASE_URL || "",
     jwtSecret: process.env.JWT_SECRET || "",
+    externalCredentialUrl: process.env.EXTERNAL_CREDENTIAL_URL || "",
+    externalCredentialToken: process.env.EXTERNAL_CREDENTIAL_TOKEN || "",
   };
 }

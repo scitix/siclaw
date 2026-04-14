@@ -6,11 +6,14 @@
  */
 
 import http from "node:http";
+import path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import type { MemoryIndexer } from "../../memory/index.js";
+import type { CredentialService } from "../../shared/credential-types.js";
+import { DirectCallTransport } from "../../agentbox/credential-transport.js";
 
 interface LocalBox {
   userId: string;
@@ -30,7 +33,11 @@ export class LocalSpawner implements BoxSpawner {
   /** Injected knowledge base indexer (set via setKnowledgeIndexer) */
   private knowledgeIndexer: MemoryIndexer | null = null;
 
-  constructor(basePort = 4000) {
+  /** Injected credential service (Local mode: AgentBox calls it via DirectCallTransport) */
+  private readonly credentialService: CredentialService;
+
+  constructor(credentialService: CredentialService, basePort = 4000) {
+    this.credentialService = credentialService;
     this.basePort = basePort;
     this.nextPort = basePort;
   }
@@ -42,7 +49,10 @@ export class LocalSpawner implements BoxSpawner {
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { userId } = config;
-    const agentId = config.agentId || "default";
+    const agentId = config.agentId;
+    if (!userId || !agentId) {
+      throw new Error(`LocalSpawner.spawn requires non-empty userId and agentId; got userId=${userId} agentId=${agentId}`);
+    }
     const boxId = `local-${userId}-${agentId}`;
 
     // Check if already exists
@@ -66,6 +76,19 @@ export class LocalSpawner implements BoxSpawner {
     if (this.knowledgeIndexer) {
       sessionManager.knowledgeIndexer = this.knowledgeIndexer;
     }
+    // Local mode: inject a DirectCallTransport so the broker hits the in-process
+    // CredentialService directly rather than going through mTLS HTTP.
+    sessionManager.credentialTransport = new DirectCallTransport(this.credentialService, {
+      userId,
+      agentId,
+    });
+    // Each in-process box gets its own credentials directory so multiple users
+    // on the same LocalSpawner don't fight over the shared cwd-based default.
+    sessionManager.credentialsDir = path.resolve(
+      process.cwd(),
+      ".siclaw/credentials",
+      `${userId}-${agentId}`,
+    );
     const httpServer = createHttpServer(sessionManager);
 
     // Start server
@@ -101,6 +124,7 @@ export class LocalSpawner implements BoxSpawner {
     console.log(`[local-spawner] Stopping AgentBox: ${boxId}`);
 
     await box.sessionManager.closeAll();
+    box.sessionManager.credentialBroker?.dispose();
     box.httpServer.close();
     this.boxes.delete(boxId);
   }

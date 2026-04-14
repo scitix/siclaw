@@ -11,6 +11,7 @@ import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -78,7 +79,7 @@ Examples:
       }),
       kubeconfig: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -103,7 +104,16 @@ Examples:
     async execute(_toolCallId, rawParams) {
       const params = rawParams as PodExecParams;
 
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "pod_exec");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],

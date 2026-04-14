@@ -5,17 +5,17 @@ import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
 
 interface Cluster {
-  id: string; name: string; description: string; api_server: string; is_production: boolean; created_at: string
+  id: string; name: string; description: string; api_server: string; debug_image: string | null; is_production: boolean; created_at: string
 }
 
 export function Clusters() {
   const [clusters, setClusters] = useState<Cluster[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
-  const [form, setForm] = useState({ name: "", description: "", kubeconfig: "", is_production: true })
+  const [form, setForm] = useState({ name: "", description: "", kubeconfig: "", debug_image: "", is_production: true })
   const [creating, setCreating] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [editForm, setEditForm] = useState({ name: "", description: "", kubeconfig: "", is_production: true })
+  const [editForm, setEditForm] = useState({ name: "", description: "", kubeconfig: "", debug_image: "", is_production: true })
   const [saving, setSaving] = useState(false)
   const toast = useToast()
   const confirmDialog = useConfirm()
@@ -27,10 +27,17 @@ export function Clusters() {
   const handleCreate = async () => {
     setCreating(true)
     try {
-      const c = await api<Cluster>("/clusters", { method: "POST", body: form })
+      const payload: Record<string, unknown> = {
+        name: form.name,
+        description: form.description,
+        kubeconfig: form.kubeconfig,
+        is_production: form.is_production,
+      }
+      if (form.debug_image) payload.debug_image = form.debug_image
+      const c = await api<Cluster>("/clusters", { method: "POST", body: payload })
       setClusters((prev) => [...prev, c])
       setShowCreate(false)
-      setForm({ name: "", description: "", kubeconfig: "", is_production: true })
+      setForm({ name: "", description: "", kubeconfig: "", debug_image: "", is_production: true })
       toast.success("Cluster created")
     } catch (err: any) {
       toast.error(err.message)
@@ -47,14 +54,19 @@ export function Clusters() {
 
   const startEditCluster = (c: Cluster) => {
     setEditingId(c.id)
-    setEditForm({ name: c.name, description: c.description || "", kubeconfig: "", is_production: c.is_production })
+    setEditForm({ name: c.name, description: c.description || "", kubeconfig: "", debug_image: c.debug_image || "", is_production: c.is_production })
   }
 
   const handleSaveEdit = async () => {
     if (!editingId) return
     setSaving(true)
     try {
-      const body: Record<string, unknown> = { name: editForm.name, description: editForm.description, is_production: editForm.is_production }
+      const body: Record<string, unknown> = {
+        name: editForm.name,
+        description: editForm.description,
+        is_production: editForm.is_production,
+        debug_image: editForm.debug_image || null,
+      }
       if (editForm.kubeconfig) body.kubeconfig = editForm.kubeconfig
       const updated = await api<Cluster>(`/clusters/${editingId}`, { method: "PUT", body })
       setClusters((prev) => prev.map((c) => c.id === editingId ? updated : c))
@@ -86,6 +98,7 @@ export function Clusters() {
           <input placeholder="Cluster Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
           <input placeholder="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
           <textarea placeholder="Paste kubeconfig YAML here..." value={form.kubeconfig} onChange={(e) => setForm({ ...form, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+          <input placeholder="Debug image (optional, e.g. nicolaka/netshoot:latest)" value={form.debug_image} onChange={(e) => setForm({ ...form, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
           <label className="flex items-center gap-2 text-sm text-muted-foreground">
             <input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} />
             Production environment
@@ -134,6 +147,7 @@ export function Clusters() {
                       <textarea placeholder="Paste kubeconfig YAML here..." value={editForm.kubeconfig} onChange={(e) => setEditForm({ ...editForm, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
                       <p className="text-xs text-muted-foreground mt-1">Leave empty to keep current</p>
                     </div>
+                    <input placeholder="Debug image (optional)" value={editForm.debug_image} onChange={(e) => setEditForm({ ...editForm, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                     <label className="flex items-center gap-2 text-sm text-muted-foreground">
                       <input type="checkbox" checked={editForm.is_production} onChange={(e) => setEditForm({ ...editForm, is_production: e.target.checked })} />
                       Production environment

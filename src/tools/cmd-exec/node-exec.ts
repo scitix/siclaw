@@ -16,6 +16,7 @@ import {
 } from "../infra/exec-utils.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 // Re-export for backward compatibility (tests + downstream imports)
 export { validateNodeName, validatePodName } from "../infra/exec-utils.js";
@@ -100,7 +101,7 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       ),
       kubeconfig: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
         })
       ),
       image: Type.Optional(
@@ -129,7 +130,16 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
 
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "node_exec");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -181,7 +191,7 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       }
 
       const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const commands = extractCommands(params.command);
       const needsShell = commands.length > 1;

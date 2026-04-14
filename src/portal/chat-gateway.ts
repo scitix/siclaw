@@ -453,7 +453,7 @@ export function registerChatRoutes(
 
 // ── Simple RPC helper (connect WS, send one RPC, wait for response, close) ──
 
-async function runtimeRpc(
+export async function runtimeRpc(
   runtimeWsUrl: string,
   runtimeSecret: string,
   agentId: string,
