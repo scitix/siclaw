@@ -1,20 +1,33 @@
 /**
  * Internal API handlers for AgentBox consumption (Port 3002 mTLS).
  *
- * These endpoints serve data from the Runtime's own DB tables (skills, mcp, models, cron).
+ * These endpoints serve data from the Runtime's own DB tables (skills, mcp, models, tasks).
  * For resource bindings (which skills/mcp are bound to an agent), we call the Upstream Adapter.
  *
  * Endpoints:
- *   GET /api/internal/settings        — model providers + entries
- *   GET /api/internal/mcp-servers     — MCP config for the agent
- *   GET /api/internal/skills/bundle   — skill bundle for the agent
- *   GET /api/internal/cron-list       — cron jobs for the agent
+ *   GET    /api/internal/settings          — model providers + entries
+ *   GET    /api/internal/mcp-servers       — MCP config for the agent
+ *   GET    /api/internal/skills/bundle     — skill bundle for the agent
+ *   GET    /api/internal/agent-tasks       — scheduled tasks for the agent
+ *   POST   /api/internal/agent-tasks       — create a task
+ *   PUT    /api/internal/agent-tasks/:id   — update a task
+ *   DELETE /api/internal/agent-tasks/:id   — delete a task
  */
 
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { getDb } from "./db.js";
 import type { RuntimeConfig } from "./config.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
+import { validateSchedule } from "../cron/cron-limits.js";
+
+/** Read + JSON-parse an HTTP request body. */
+async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  const text = Buffer.concat(chunks).toString("utf8");
+  return text ? JSON.parse(text) : {};
+}
 
 /** Send JSON response helper */
 function sendJson(res: http.ServerResponse, status: number, data: unknown): void {
@@ -188,25 +201,28 @@ export async function handleSkillsBundle(
 }
 
 /**
- * GET /api/internal/cron-list
+ * GET /api/internal/agent-tasks
  *
- * Returns cron jobs for the agent identified by the mTLS certificate.
+ * Returns the scheduled tasks for the agent identified by the mTLS certificate.
+ * Used by the agent's in-conversation `manage_schedule` tool.
  */
-export async function handleCronList(
+export async function handleAgentTasksList(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
 ): Promise<void> {
   try {
     const db = getDb();
+    // Scope by (agent, user): each AgentBox pod's cert identifies both,
+    // matching the REST handler's (agent_id, created_by) tenancy.
     const [rows] = await db.query(
       `SELECT id, name, schedule, status, description, prompt, last_run_at, last_result
-       FROM cron_jobs WHERE agent_id = ? AND status = 'active'
+       FROM agent_tasks WHERE agent_id = ? AND created_by = ? AND status = 'active'
        ORDER BY created_at`,
-      [identity.agentId],
+      [identity.agentId, identity.userId],
     ) as any;
 
-    const jobs = rows.map((row: any) => ({
+    const tasks = rows.map((row: any) => ({
       id: row.id,
       name: row.name,
       schedule: row.schedule,
@@ -218,9 +234,134 @@ export async function handleCronList(
       agentId: identity.agentId,
     }));
 
-    sendJson(res, 200, { jobs });
+    sendJson(res, 200, { tasks });
   } catch (err) {
-    console.error("[internal-api] cron-list error:", err);
+    console.error("[internal-api] agent-tasks list error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * POST /api/internal/agent-tasks
+ *
+ * Body: { name, description?, schedule, prompt, status? }
+ * Creates a task bound to the agent identified by the mTLS certificate.
+ */
+export async function handleAgentTasksCreate(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+): Promise<void> {
+  try {
+    const body = await readJsonBody(req) as {
+      name?: string;
+      description?: string;
+      schedule?: string;
+      prompt?: string;
+      status?: "active" | "paused";
+    };
+    if (!body.name || !body.schedule || !body.prompt) {
+      sendJson(res, 400, { error: "name, schedule, prompt are required" });
+      return;
+    }
+    // Same CRON_LIMITS as the REST path — a compromised agent must not be
+    // able to POST here with a sub-minute schedule and bypass the UI check.
+    const invalid = validateSchedule(body.schedule);
+    if (invalid) { sendJson(res, 400, { error: invalid }); return; }
+    const id = randomUUID();
+    const db = getDb();
+    // created_by comes from the mTLS cert's CN so chat-initiated tasks match
+    // the same (agent, user) tenancy as UI-created ones.
+    await db.query(
+      `INSERT INTO agent_tasks (id, agent_id, name, description, schedule, prompt, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, identity.agentId, body.name, body.description ?? null, body.schedule, body.prompt, body.status ?? "active", identity.userId],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [id]) as any;
+    sendJson(res, 201, rows[0]);
+  } catch (err) {
+    console.error("[internal-api] agent-tasks create error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * PUT /api/internal/agent-tasks/:id
+ *
+ * Body: any of { name, description, schedule, prompt, status }
+ * Only tasks owned by the agent (mTLS identity) can be updated.
+ */
+export async function handleAgentTasksUpdate(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  taskId: string,
+): Promise<void> {
+  try {
+    const body = await readJsonBody(req) as Record<string, unknown>;
+    // If the update carries a schedule, re-validate — otherwise a poisoned
+    // agent could UPDATE an existing task to a sub-minute schedule.
+    if (typeof body.schedule === "string" && body.schedule.length > 0) {
+      const invalid = validateSchedule(body.schedule);
+      if (invalid) { sendJson(res, 400, { error: invalid }); return; }
+    }
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [taskId, identity.agentId, identity.userId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Task not found" });
+      return;
+    }
+    await db.query(
+      `UPDATE agent_tasks SET
+         name = COALESCE(?, name),
+         description = COALESCE(?, description),
+         schedule = COALESCE(?, schedule),
+         prompt = COALESCE(?, prompt),
+         status = COALESCE(?, status)
+       WHERE id = ?`,
+      [
+        typeof body.name === "string" ? body.name : null,
+        typeof body.description === "string" ? body.description : null,
+        typeof body.schedule === "string" ? body.schedule : null,
+        typeof body.prompt === "string" ? body.prompt : null,
+        typeof body.status === "string" ? body.status : null,
+        taskId,
+      ],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [taskId]) as any;
+    sendJson(res, 200, rows[0]);
+  } catch (err) {
+    console.error("[internal-api] agent-tasks update error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
+ * DELETE /api/internal/agent-tasks/:id
+ */
+export async function handleAgentTasksDelete(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  taskId: string,
+): Promise<void> {
+  try {
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [taskId, identity.agentId, identity.userId],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Task not found" });
+      return;
+    }
+    await db.query("DELETE FROM agent_tasks WHERE id = ?", [taskId]);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    console.error("[internal-api] agent-tasks delete error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
 }

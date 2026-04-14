@@ -119,6 +119,21 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_at_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // Notifications (per-user inbox for task completions etc.)
+  `CREATE TABLE IF NOT EXISTS notifications (
+    id CHAR(36) PRIMARY KEY,
+    user_id CHAR(36) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    message TEXT,
+    related_agent_id CHAR(36),
+    related_task_id CHAR(36),
+    related_run_id CHAR(36),
+    read_at TIMESTAMP(3) NULL DEFAULT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_notifications_user (user_id, read_at, created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
   // Agent Task Runs (execution history)
   `CREATE TABLE IF NOT EXISTS agent_task_runs (
     id CHAR(36) PRIMARY KEY,
@@ -127,7 +142,10 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     result_text TEXT,
     error TEXT,
     duration_ms INT,
+    session_id CHAR(36),
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_agent_task_runs_task (task_id, created_at),
+    INDEX idx_agent_task_runs_session (session_id),
     CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
@@ -175,7 +193,9 @@ export async function runPortalMigrations(): Promise<void> {
     await db.query(sql);
   }
 
+  // Additive column migrations (safe to re-run)
   await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
+  await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
 
   console.log("[portal-migrate] Portal tables ready");
 }

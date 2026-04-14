@@ -1,11 +1,13 @@
 import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Clock } from "lucide-react"
 import { api, clearToken } from "../api"
+import { NotificationBell } from "../components/NotificationBell"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
   { path: "/agents", label: "Agents", icon: Bot },
+  { path: "/my-tasks", label: "My Schedules", icon: Clock },
   { path: "/skills", label: "Skills", icon: Zap },
   { path: "/mcp", label: "MCP", icon: Plug },
 ]
@@ -93,6 +95,7 @@ export function Layout() {
             </div>
           )}
         </nav>
+        <NotificationBell />
         <button
           onClick={() => { clearToken(); window.location.href = "/login" }}
           className="flex items-center gap-2.5 px-4 py-3 text-[13px] text-muted-foreground hover:text-foreground border-t border-border"

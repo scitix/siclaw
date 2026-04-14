@@ -2,7 +2,7 @@
  * Gateway Client for AgentBox
  *
  * HTTP client that uses mTLS client certificates to call Gateway's internal APIs.
- * Used by AgentBox to query metadata (settings, cron jobs, etc.)
+ * Used by AgentBox to query metadata (settings, agent tasks, etc.)
  */
 
 import http from "node:http";
@@ -15,12 +15,13 @@ export interface GatewayClientOptions {
   certPath?: string; // Directory containing tls.crt, tls.key, ca.crt
 }
 
-export interface CronJob {
+export interface AgentTask {
   id: string;
   name: string;
   schedule: string;
   status: string;
   description?: string | null;
+  prompt?: string | null;
   lastRunAt?: string | null;
   lastResult?: string | null;
   agentId?: string | null;
@@ -62,15 +63,39 @@ export class GatewayClient {
   }
 
   /**
-   * List cron jobs for a user
+   * List the agent's scheduled tasks. Agent identity is derived from the
+   * mTLS client certificate by the Gateway — no userId/agentId needed here.
    */
-  async listCronJobs(userId: string, agentId?: string): Promise<CronJob[]> {
-    let url = `/api/internal/cron-list?userId=${encodeURIComponent(userId)}`;
-    if (agentId) {
-      url += `&agentId=${encodeURIComponent(agentId)}`;
-    }
-    const data = await this.request(url, "GET");
-    return data.jobs || [];
+  async listAgentTasks(): Promise<AgentTask[]> {
+    const data = await this.request("/api/internal/agent-tasks", "GET");
+    return data.tasks || [];
+  }
+
+  async createAgentTask(input: {
+    name: string;
+    schedule: string;
+    prompt: string;
+    description?: string;
+    status?: "active" | "paused";
+  }): Promise<AgentTask> {
+    return this.request("/api/internal/agent-tasks", "POST", input);
+  }
+
+  async updateAgentTask(
+    taskId: string,
+    updates: Partial<{
+      name: string;
+      schedule: string;
+      prompt: string;
+      description: string;
+      status: "active" | "paused";
+    }>,
+  ): Promise<AgentTask> {
+    return this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}`, "PUT", updates);
+  }
+
+  async deleteAgentTask(taskId: string): Promise<void> {
+    await this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}`, "DELETE");
   }
 
   /**
@@ -87,14 +112,14 @@ export class GatewayClient {
    */
   toClientLike(): import("../shared/resource-sync.js").GatewayClientLike {
     return {
-      request: (p: string, m: "GET" | "POST", b?: unknown) => this.request(p, m, b),
+      request: (p: string, m: "GET" | "POST" | "PUT" | "DELETE", b?: unknown) => this.request(p, m, b),
     };
   }
 
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -119,7 +144,11 @@ export class GatewayClient {
         });
 
         res.on("end", () => {
-          if (res.statusCode === 200) {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            if (res.statusCode === 204 || !data) {
+              resolve(undefined);
+              return;
+            }
             try {
               const json = JSON.parse(data);
               resolve(json);

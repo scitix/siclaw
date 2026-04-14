@@ -1,7 +1,7 @@
 /**
  * Siclaw domain REST API handlers.
  *
- * Registers all CRUD routes for skills, mcp, chat, models, cron,
+ * Registers all CRUD routes for skills, mcp, chat, models,
  * channels, diagnostics, api-keys, and dashboard on a RestRouter.
  *
  * All data lives in the shared MySQL database.
@@ -18,8 +18,13 @@ import {
   type AuthContext,
 } from "./rest-router.js";
 import { getDb } from "./db.js";
+import { getMessages } from "./chat-repo.js";
 import { evaluateScriptsStatic, buildAssessment } from "./skills/script-evaluator.js";
 import { evaluateScriptsAI } from "./skills/ai-security-reviewer.js";
+import { validateSchedule } from "../cron/cron-limits.js";
+
+/** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
+const MAX_TRACE_MESSAGES = 200;
 
 // ── Permission check helper ───────────────────────────────────
 
@@ -957,13 +962,20 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
+    // origin='cron' sessions are scheduled-task execution traces — they live
+    // in the same table so FK + sse-consumer keep working, but the user-facing
+    // Chat list should hide them (entry point is My Schedules / the run page).
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
-        "SELECT COUNT(*) AS count FROM chat_sessions WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+        `SELECT COUNT(*) AS count FROM chat_sessions
+         WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
+           AND (origin IS NULL OR origin <> 'cron')`,
         [params.id, auth.userId],
       ),
       db.query(
-        `SELECT * FROM chat_sessions WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
+        `SELECT * FROM chat_sessions
+         WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
+           AND (origin IS NULL OR origin <> 'cron')
          ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),
@@ -1091,202 +1103,302 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     });
   });
 
+
   // ================================================================
-  // Cron Jobs
+  // Tasks (Agent sub-resource) — scheduled cron jobs
+  //
+  // Runtime owns scheduling + execution. Clients (Portal / future upstream)
+  // hit these over REST; the TaskCoordinator inside Runtime picks up changes
+  // on its next DB sync (≤60s) and fires runs via AgentBoxClient directly.
   // ================================================================
 
-  // List cron jobs
-  router.get(`${P}/cron`, async (req, res) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+  // Schedule validation is shared from cron-limits to guarantee the
+  // internal mTLS path uses identical rules. See validateSchedule import.
 
-    const query = parseQuery(req.url ?? "");
-    const { page, pageSize, offset } = parsePagination(query);
-    const db = getDb();
-
-    let countSql = "SELECT COUNT(*) AS count FROM cron_jobs WHERE org_id = ?";
-    let listSql = "SELECT * FROM cron_jobs WHERE org_id = ?";
-    const params: unknown[] = [auth.orgId];
-
-    if (query.agent_id) {
-      countSql += " AND agent_id = ?";
-      listSql += " AND agent_id = ?";
-      params.push(query.agent_id);
-    }
-
-    listSql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
-
-    const [[countRows], [listRows]] = await Promise.all([
-      db.query(countSql, params),
-      db.query(listSql, [...params, pageSize, offset]),
-    ]) as [any, any];
-
-    sendJson(res, 200, {
-      data: listRows,
-      total: Number(countRows[0].count),
-      page,
-      page_size: pageSize,
-    });
-  });
-
-  // Create cron job
-  router.post(`${P}/cron`, async (req, res) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<Record<string, unknown>>(req);
-    const id = crypto.randomUUID();
-    const db = getDb();
-
-    await db.query(
-      `INSERT INTO cron_jobs (id, org_id, agent_id, name, description, schedule, prompt, status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id, auth.orgId, body.agent_id, body.name, body.description || null,
-        body.schedule, body.prompt, body.status || "active",
-        auth.userId,
-      ],
-    );
-
-    const [rows] = await db.query("SELECT * FROM cron_jobs WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
-  });
-
-  // Get cron job
-  router.get(`${P}/cron/:id`, async (req, res, params) => {
+  // Read-only overview — "My Schedules" across every agent the caller has
+  // tasks on. Intentionally no CRUD here: that still lives at the per-agent
+  // endpoint so the creation surface stays tied to an explicit agent context.
+  router.get(`${P}/my-tasks`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT * FROM cron_jobs WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
+      `SELECT t.id, t.agent_id, t.name, t.description, t.schedule, t.prompt,
+              t.status, t.last_run_at, t.last_result, t.created_at,
+              a.name AS agent_name
+       FROM agent_tasks t
+       LEFT JOIN agents a ON t.agent_id = a.id
+       WHERE t.created_by = ?
+       ORDER BY t.created_at DESC`,
+      [auth.userId],
     ) as any;
-    if (rows.length === 0) {
-      sendJson(res, 404, { error: "Cron job not found" });
-      return;
-    }
-    sendJson(res, 200, rows[0]);
+    sendJson(res, 200, { data: rows });
   });
 
-  // Update cron job
-  router.put(`${P}/cron/:id`, async (req, res, params) => {
+  // List tasks for an agent — scoped to (agent, user) so each caller only sees
+  // their own schedules on a shared agent.
+  router.get(`${P}/agents/:agentId/tasks`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM cron_jobs WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status,
+              last_run_at, last_result, created_by, created_at
+       FROM agent_tasks WHERE agent_id = ? AND created_by = ? ORDER BY created_at DESC`,
+      [params.agentId, auth.userId],
     ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Cron job not found" });
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Get a single task — used by the per-task runs page (L2) to render the
+  // task header without paging through the full list.
+  router.get(`${P}/agents/:agentId/tasks/:taskId`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status,
+              last_run_at, last_result, created_by, created_at
+       FROM agent_tasks
+       WHERE id = ? AND agent_id = ? AND created_by = ?
+       LIMIT 1`,
+      [params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
+    sendJson(res, 200, rows[0]);
+  });
+
+  // Create task
+  router.post(`${P}/agents/:agentId/tasks`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const body = await parseBody<Record<string, unknown>>(req);
+    if (!body.name || !body.schedule || !body.prompt) {
+      sendJson(res, 400, { error: "name, schedule, and prompt are required" });
       return;
     }
+    const invalid = validateSchedule(body.schedule as string);
+    if (invalid) { sendJson(res, 400, { error: invalid }); return; }
 
+    const id = crypto.randomUUID();
+    const db = getDb();
     await db.query(
-      `UPDATE cron_jobs SET
-       name = COALESCE(?, name), description = COALESCE(?, description),
-       schedule = COALESCE(?, schedule), prompt = COALESCE(?, prompt),
-       agent_id = COALESCE(?, agent_id)
-       WHERE id = ?`,
+      `INSERT INTO agent_tasks (id, agent_id, name, description, schedule, prompt, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        body.name ?? null, body.description ?? null,
-        body.schedule ?? null, body.prompt ?? null,
-        body.agent_id ?? null, params.id,
+        id, params.agentId, body.name, body.description ?? null,
+        body.schedule, body.prompt, body.status ?? "active", auth.userId,
       ],
     );
-
-    const [rows] = await db.query("SELECT * FROM cron_jobs WHERE id = ?", [params.id]) as any;
-    sendJson(res, 200, rows[0]);
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [id]) as any;
+    sendJson(res, 201, rows[0]);
   });
 
-  // Delete cron job
-  router.delete(`${P}/cron/:id`, async (req, res, params) => {
+  // Update task
+  router.put(`${P}/agents/:agentId/tasks/:taskId`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
-    if (await guardAccess(res, config, auth, "write")) return;
-    const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM cron_jobs WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Cron job not found" });
-      return;
+    const body = await parseBody<Record<string, unknown>>(req);
+    if (body.schedule) {
+      const invalid = validateSchedule(body.schedule as string);
+      if (invalid) { sendJson(res, 400, { error: invalid }); return; }
     }
 
-    await db.query("DELETE FROM cron_job_runs WHERE job_id = ?", [params.id]);
-    await db.query("DELETE FROM cron_jobs WHERE id = ?", [params.id]);
-    sendJson(res, 200, { ok: true });
-  });
-
-  // Set cron job status (active/paused)
-  router.put(`${P}/cron/:id/status`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    const body = await parseBody<{ status: string }>(req);
-    const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM cron_jobs WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Cron job not found" });
+    const fields = ["name", "description", "schedule", "prompt", "status"];
+    const setClauses: string[] = [];
+    const values: unknown[] = [];
+    for (const field of fields) {
+      if (field in body) {
+        setClauses.push(`${field} = ?`);
+        values.push(body[field]);
+      }
+    }
+    if (setClauses.length === 0) {
+      sendJson(res, 400, { error: "No fields to update" });
       return;
     }
+    values.push(params.taskId, params.agentId, auth.userId);
 
+    const db = getDb();
     await db.query(
-      "UPDATE cron_jobs SET status = ? WHERE id = ?",
-      [body.status, params.id],
+      `UPDATE agent_tasks SET ${setClauses.join(", ")}
+       WHERE id = ? AND agent_id = ? AND created_by = ?`,
+      values,
     );
-
-    const [rows] = await db.query("SELECT * FROM cron_jobs WHERE id = ?", [params.id]) as any;
+    const [rows] = await db.query(
+      "SELECT * FROM agent_tasks WHERE id = ? AND created_by = ?",
+      [params.taskId, auth.userId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
     sendJson(res, 200, rows[0]);
   });
 
-  // List cron job runs (paginated)
-  router.get(`${P}/cron/:id/runs`, async (req, res, params) => {
+  // Delete task
+  router.delete(`${P}/agents/:agentId/tasks/:taskId`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (existing.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
+    await db.query("DELETE FROM agent_tasks WHERE id = ?", [params.taskId]);
+    sendJson(res, 200, { deleted: true });
+  });
+
+  // List runs for a task — only the owner of the task can view its runs.
+  // Cursor-paginated: pass ?before=<ISO created_at> to fetch the next page.
+  // Cursor (not offset) so new runs arriving mid-scroll don't shift indices.
+  router.get(`${P}/agents/:agentId/tasks/:taskId/runs`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [owner] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (owner.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
 
     const query = parseQuery(req.url ?? "");
-    const { page, pageSize, offset } = parsePagination(query);
-    const db = getDb();
+    const limit = Math.min(100, Math.max(1, parseInt(query.limit || "30", 10)));
+    const before = query.before; // ISO timestamp
 
-    // Verify job belongs to org
-    const [job] = await db.query(
-      "SELECT id FROM cron_jobs WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
-    ) as any;
-    if (job.length === 0) {
-      sendJson(res, 404, { error: "Cron job not found" });
-      return;
+    const whereClauses = ["task_id = ?"];
+    const sqlParams: unknown[] = [params.taskId];
+    if (before) {
+      whereClauses.push("created_at < ?");
+      sqlParams.push(new Date(before));
     }
 
-    const [[countRows], [listRows]] = await Promise.all([
-      db.query("SELECT COUNT(*) AS count FROM cron_job_runs WHERE job_id = ?", [params.id]),
+    // LIMIT N+1 to detect hasMore without an extra COUNT(*)
+    sqlParams.push(limit + 1);
+    const [rows] = await db.query(
+      `SELECT id, task_id, status, result_text, error, duration_ms, session_id, created_at
+       FROM agent_task_runs WHERE ${whereClauses.join(" AND ")}
+       ORDER BY created_at DESC LIMIT ?`,
+      sqlParams,
+    ) as any;
+
+    const hasMore = rows.length > limit;
+    const data = hasMore ? rows.slice(0, limit) : rows;
+    sendJson(res, 200, { data, hasMore });
+  });
+
+  // Get a single run with its owning task — for the dedicated run-detail page.
+  // Verify ownership via (task, agent, user). Messages are NOT included here —
+  // the report view loads them lazily via the /messages endpoint below.
+  router.get(`${P}/agents/:agentId/tasks/:taskId/runs/:runId`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT r.id, r.task_id, r.status, r.result_text, r.error, r.duration_ms,
+              r.session_id, r.created_at,
+              t.name AS task_name, t.description AS task_description,
+              t.schedule AS task_schedule, t.prompt AS task_prompt,
+              t.agent_id AS task_agent_id
+       FROM agent_task_runs r
+       JOIN agent_tasks t ON r.task_id = t.id
+       WHERE r.id = ? AND r.task_id = ? AND t.agent_id = ? AND t.created_by = ?
+       LIMIT 1`,
+      [params.runId, params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Run not found" }); return; }
+    const r = rows[0];
+
+    // Neighbor lookup for L3's prev/next nav. "Older" = earlier created_at
+    // within the same task; "newer" = later. Two tiny indexed queries —
+    // cheap enough to co-locate here so the page doesn't fan out.
+    const [[olderRows], [newerRows]] = await Promise.all([
       db.query(
-        "SELECT * FROM cron_job_runs WHERE job_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        [params.id, pageSize, offset],
+        `SELECT id FROM agent_task_runs
+         WHERE task_id = ? AND created_at < ?
+         ORDER BY created_at DESC LIMIT 1`,
+        [params.taskId, r.created_at],
+      ),
+      db.query(
+        `SELECT id FROM agent_task_runs
+         WHERE task_id = ? AND created_at > ?
+         ORDER BY created_at ASC LIMIT 1`,
+        [params.taskId, r.created_at],
       ),
     ]) as [any, any];
 
     sendJson(res, 200, {
-      data: listRows,
-      total: Number(countRows[0].count),
-      page,
-      page_size: pageSize,
+      run: {
+        id: r.id,
+        task_id: r.task_id,
+        status: r.status,
+        result_text: r.result_text,
+        error: r.error,
+        duration_ms: r.duration_ms,
+        session_id: r.session_id,
+        created_at: r.created_at,
+      },
+      task: {
+        id: r.task_id,
+        agent_id: r.task_agent_id,
+        name: r.task_name,
+        description: r.task_description,
+        schedule: r.task_schedule,
+        prompt: r.task_prompt,
+      },
+      neighbors: {
+        older_run_id: olderRows[0]?.id ?? null,
+        newer_run_id: newerRows[0]?.id ?? null,
+      },
     });
   });
+
+  // Get full trace for a run — verify through (task, agent, user).
+  router.get(`${P}/agents/:agentId/tasks/:taskId/runs/:runId/messages`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT r.session_id
+       FROM agent_task_runs r
+       JOIN agent_tasks t ON r.task_id = t.id
+       WHERE r.id = ? AND r.task_id = ? AND t.agent_id = ? AND t.created_by = ?
+       LIMIT 1`,
+      [params.runId, params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "Run not found" }); return; }
+
+    const sessionId = rows[0].session_id as string | null;
+    if (!sessionId) {
+      sendJson(res, 200, { sessionId: null, truncated: false, messages: [] });
+      return;
+    }
+    const fetched = await getMessages(sessionId, { limit: MAX_TRACE_MESSAGES + 1 });
+    const truncated = fetched.length > MAX_TRACE_MESSAGES;
+    const msgs = truncated ? fetched.slice(fetched.length - MAX_TRACE_MESSAGES) : fetched;
+    sendJson(res, 200, {
+      sessionId,
+      truncated,
+      messages: msgs.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        toolName: m.toolName,
+        toolInput: m.toolInput,
+        outcome: m.outcome,
+        durationMs: m.durationMs,
+        timestamp: m.createdAt?.toISOString() ?? null,
+      })),
+    });
+  });
+
 
   // ================================================================
   // Channels (Agent sub-resource)
@@ -1806,14 +1918,14 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     const db = getDb();
     const orgId = auth.orgId;
 
-    const [[skillRows], [mcpRows], [activeRows], [msgRows], [cronRows]] = await Promise.all([
+    const [[skillRows], [mcpRows], [activeRows], [msgRows], [taskRows]] = await Promise.all([
       db.query("SELECT COUNT(*) AS count FROM skills WHERE org_id = ?", [orgId]),
       db.query("SELECT COUNT(*) AS count FROM mcp_servers WHERE org_id = ?", [orgId]),
       db.query(
         "SELECT COUNT(*) AS count FROM chat_sessions WHERE last_active_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) AND deleted_at IS NULL",
       ),
       db.query("SELECT COUNT(*) AS count FROM chat_messages"),
-      db.query("SELECT COUNT(*) AS count FROM cron_jobs WHERE org_id = ?", [orgId]),
+      db.query("SELECT COUNT(*) AS count FROM agent_tasks"),
     ]) as any;
 
     sendJson(res, 200, {
@@ -1821,7 +1933,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
       total_mcp: Number(mcpRows[0].count),
       active_sessions: Number(activeRows[0].count),
       total_messages: Number(msgRows[0].count),
-      total_cron: Number(cronRows[0].count),
+      total_tasks: Number(taskRows[0].count),
     });
   });
 

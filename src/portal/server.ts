@@ -11,11 +11,11 @@ import { createRestRouter, sendJson } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
-import { registerTaskRoutes } from "./task-api.js";
 import { registerClusterRoutes } from "./cluster-api.js";
 import { registerHostRoutes } from "./host-api.js";
 import { registerAdapterRoutes } from "./adapter.js";
 import { registerChatRoutes } from "./chat-gateway.js";
+import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
 import { createRuntimeProxy } from "./proxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,7 +57,7 @@ export function startPortal(config: PortalConfig): http.Server {
   registerHostRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
   registerAdapterRoutes(router, config.portalSecret);
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
-  registerTaskRoutes(router, config.jwtSecret);
+  registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);
 
   const server = http.createServer(async (req, res) => {
     const url = req.url ?? "/";
@@ -91,8 +91,9 @@ export function startPortal(config: PortalConfig): http.Server {
       url.startsWith("/api/v1/siclaw/skills") ||
       url.startsWith("/api/v1/siclaw/reviews") ||
       url.startsWith("/api/v1/siclaw/mcp") ||
-      url.startsWith("/api/v1/siclaw/cron") ||
       url.startsWith("/api/v1/siclaw/admin") ||
+      url.match(/^\/api\/v1\/siclaw\/agents\/[^/]+\/tasks/) ||
+      url.startsWith("/api/v1/siclaw/my-tasks") ||
       (url.includes("/chat/sessions") && !url.includes("/chat/send")) ||
       url.includes("/channels") ||
       url.includes("/diagnostics") ||
@@ -171,6 +172,9 @@ export function startPortal(config: PortalConfig): http.Server {
     res.writeHead(200, { "Content-Type": contentType });
     fs.createReadStream(filePath).pipe(res);
   });
+
+  // Attach WS upgrade for /ws/notifications before listen
+  registerNotificationWs(server, config.jwtSecret);
 
   server.listen(config.port, () => {
     console.log(`[portal] Listening on http://0.0.0.0:${config.port}`);
