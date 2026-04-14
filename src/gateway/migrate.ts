@@ -191,6 +191,35 @@ const SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_aksa_api_key FOREIGN KEY (api_key_id) REFERENCES agent_api_keys(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // Agent Channel Authorization (admin controls which channels an agent can use)
+  `CREATE TABLE IF NOT EXISTS agent_channel_auth (
+    agent_id CHAR(36) NOT NULL,
+    channel_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, channel_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Channel Bindings (maps channel + chat_id/user_id → agent)
+  `CREATE TABLE IF NOT EXISTS channel_bindings (
+    id CHAR(36) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    route_key VARCHAR(255) NOT NULL,
+    route_type VARCHAR(20) NOT NULL DEFAULT 'group',
+    created_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_channel_route (channel_id, route_key),
+    INDEX idx_channel_bindings_agent (agent_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Channel Pairing Codes (ephemeral, 5-min TTL)
+  `CREATE TABLE IF NOT EXISTS channel_pairing_codes (
+    code VARCHAR(10) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    created_by CHAR(36) NOT NULL,
+    expires_at TIMESTAMP(3) NOT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
 ];
 
 /**

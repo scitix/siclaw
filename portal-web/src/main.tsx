@@ -19,6 +19,7 @@ import { MyTasks } from "./pages/MyTasks"
 import { TaskRuns } from "./pages/TaskRuns"
 import { TaskRunDetail } from "./pages/TaskRunDetail"
 import { Users } from "./pages/Users"
+import { Channels } from "./pages/Channels"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("token")
@@ -45,6 +46,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="agents/:agentId/tasks/:taskId" element={<TaskRuns />} />
         <Route path="agents/:agentId/tasks/:taskId/runs/:runId" element={<TaskRunDetail />} />
         <Route path="settings/users" element={<Users />} />
+        <Route path="settings/channels" element={<Channels />} />
         <Route path="settings/clusters" element={<Clusters />} />
         <Route path="settings/hosts" element={<Hosts />} />
         <Route path="settings/models" element={<Models />} />

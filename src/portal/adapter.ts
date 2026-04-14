@@ -425,4 +425,18 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     ) as any;
     sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
   });
+
+  // GET /api/internal/siclaw/adapter/channels — list active channels for Runtime to boot
+  router.get("/api/internal/siclaw/adapter/channels", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at",
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
 }

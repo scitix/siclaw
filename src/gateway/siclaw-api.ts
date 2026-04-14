@@ -1401,102 +1401,91 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
 
 
   // ================================================================
-  // Channels (Agent sub-resource)
+  // Channel Bindings + Pairing (Agent sub-resource)
   // ================================================================
 
-  // List channels
-  router.get(`${P}/agents/:id/channels`, async (req, res, params) => {
+  // List channel bindings for an agent
+  // Admin sees all bindings; regular user sees only their own
+  router.get(`${P}/agents/:id/channel-bindings`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
     const db = getDb();
-    const [rows] = await db.query(
-      "SELECT * FROM agent_channels WHERE agent_id = ? ORDER BY created_at DESC",
-      [params.id],
-    ) as any;
+    const isAdmin = auth.role === "admin";
+
+    const sql = isAdmin
+      ? `SELECT cb.*, c.name as channel_name, c.type as channel_type
+         FROM channel_bindings cb
+         LEFT JOIN channels c ON cb.channel_id = c.id
+         WHERE cb.agent_id = ? ORDER BY cb.created_at DESC`
+      : `SELECT cb.*, c.name as channel_name, c.type as channel_type
+         FROM channel_bindings cb
+         LEFT JOIN channels c ON cb.channel_id = c.id
+         WHERE cb.agent_id = ? AND cb.created_by = ? ORDER BY cb.created_at DESC`;
+
+    const params2 = isAdmin ? [params.id] : [params.id, auth.userId];
+    const [rows] = await db.query(sql, params2) as any;
     sendJson(res, 200, { data: rows });
   });
 
-  // Create channel
-  router.post(`${P}/agents/:id/channels`, async (req, res, params) => {
+  // Generate pairing code — any authenticated user can pair
+  // (but only for channels that admin has bound to this agent)
+  router.post(`${P}/agents/:id/channel-bindings/pair`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<Record<string, unknown>>(req);
-    const id = crypto.randomUUID();
-    const db = getDb();
-
-    await db.query(
-      `INSERT INTO agent_channels (id, agent_id, name, type, config, auth_mode, service_account_id, status, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id, params.id, body.name, body.type,
-        JSON.stringify(body.config || {}), body.auth_mode || null,
-        body.service_account_id || null, body.status || "active",
-        auth.userId,
-      ],
-    );
-
-    const [rows] = await db.query("SELECT * FROM agent_channels WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
-  });
-
-  // Update channel
-  router.put(`${P}/agents/:id/channels/:cid`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<Record<string, unknown>>(req);
-    const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM agent_channels WHERE id = ? AND agent_id = ?",
-      [params.cid, params.id],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Channel not found" });
+    const body = await parseBody<{ channel_id?: string }>(req);
+    if (!body.channel_id) {
+      sendJson(res, 400, { error: "channel_id is required" });
       return;
     }
 
-    await db.query(
-      `UPDATE agent_channels SET
-       name = COALESCE(?, name), type = COALESCE(?, type),
-       config = COALESCE(?, config), auth_mode = COALESCE(?, auth_mode),
-       service_account_id = COALESCE(?, service_account_id),
-       status = COALESCE(?, status)
-       WHERE id = ?`,
-      [
-        body.name ?? null, body.type ?? null,
-        body.config ? JSON.stringify(body.config) : null,
-        body.auth_mode ?? null, body.service_account_id ?? null,
-        body.status ?? null, params.cid,
-      ],
-    );
-
-    const [rows] = await db.query("SELECT * FROM agent_channels WHERE id = ?", [params.cid]) as any;
-    sendJson(res, 200, rows[0]);
-  });
-
-  // Delete channel
-  router.delete(`${P}/agents/:id/channels/:cid`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
     const db = getDb();
 
-    const [existing] = await db.query(
-      "SELECT id FROM agent_channels WHERE id = ? AND agent_id = ?",
-      [params.cid, params.id],
+    // Verify channel is authorized for this agent (admin must have bound it)
+    const [bound] = await db.query(
+      "SELECT 1 FROM agent_channel_auth WHERE agent_id = ? AND channel_id = ?",
+      [params.id, body.channel_id],
     ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Channel not found" });
+    if (bound.length === 0) {
+      sendJson(res, 403, { error: "This channel is not authorized for this agent. Ask an admin to bind it." });
       return;
     }
 
-    await db.query("DELETE FROM agent_channels WHERE id = ?", [params.cid]);
+    // Clean expired codes
+    await db.query("DELETE FROM channel_pairing_codes WHERE expires_at < NOW()");
+
+    const code = crypto.randomBytes(3).toString("hex").toUpperCase();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    await db.query(
+      "INSERT INTO channel_pairing_codes (code, channel_id, agent_id, created_by, expires_at) VALUES (?, ?, ?, ?, ?)",
+      [code, body.channel_id, params.id, auth.userId, expiresAt],
+    );
+
+    sendJson(res, 200, { code, expires_at: expiresAt.toISOString() });
+  });
+
+  // Delete a channel binding — admin can delete any, user can delete own
+  router.delete(`${P}/agents/:id/channel-bindings/:bindingId`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const isAdmin = auth.role === "admin";
+
+    const sql = isAdmin
+      ? "SELECT id FROM channel_bindings WHERE id = ? AND agent_id = ?"
+      : "SELECT id FROM channel_bindings WHERE id = ? AND agent_id = ? AND created_by = ?";
+    const params2 = isAdmin ? [params.bindingId, params.id] : [params.bindingId, params.id, auth.userId];
+
+    const [existing] = await db.query(sql, params2) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Binding not found" });
+      return;
+    }
+
+    await db.query("DELETE FROM channel_bindings WHERE id = ?", [params.bindingId]);
     sendJson(res, 200, { ok: true });
   });
 

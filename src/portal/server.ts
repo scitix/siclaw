@@ -15,6 +15,7 @@ import { registerClusterRoutes } from "./cluster-api.js";
 import { registerHostRoutes } from "./host-api.js";
 import { registerAdapterRoutes } from "./adapter.js";
 import { registerChatRoutes } from "./chat-gateway.js";
+import { registerChannelRoutes } from "./channel-api.js";
 import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
 import { createRuntimeProxy } from "./proxy.js";
 
@@ -57,6 +58,7 @@ export function startPortal(config: PortalConfig): http.Server {
   registerHostRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
   registerAdapterRoutes(router, config.portalSecret);
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
+  registerChannelRoutes(router, config.jwtSecret);
   registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);
 
   const server = http.createServer(async (req, res) => {
@@ -95,14 +97,14 @@ export function startPortal(config: PortalConfig): http.Server {
       url.match(/^\/api\/v1\/siclaw\/agents\/[^/]+\/tasks/) ||
       url.startsWith("/api/v1/siclaw/my-tasks") ||
       (url.includes("/chat/sessions") && !url.includes("/chat/send")) ||
-      url.includes("/channels") ||
+      url.includes("/channel-bindings") ||
       url.includes("/diagnostics") ||
       url.includes("/api-keys")
     ) {
       // Admin-only routes (all methods)
       const adminOnly =
         url.startsWith("/api/v1/siclaw/admin") ||
-        url.includes("/channels") ||
+        url.includes("/channel-bindings") ||
         url.includes("/diagnostics") ||
         url.includes("/api-keys");
       // MCP: read is open, write requires admin
