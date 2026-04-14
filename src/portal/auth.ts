@@ -97,7 +97,7 @@ export function registerAuthRoutes(router: RestRouter, jwtSecret: string): void 
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, username, password_hash, role FROM siclaw_users WHERE username = ?",
+      "SELECT id, username, password_hash, role, can_review_skills FROM siclaw_users WHERE username = ?",
       [body.username],
     ) as any;
 
@@ -113,7 +113,7 @@ export function registerAuthRoutes(router: RestRouter, jwtSecret: string): void 
     }
 
     const token = signToken(user.id, user.username, jwtSecret);
-    sendJson(res, 200, { token, user: { id: user.id, username: user.username, role: user.role } });
+    sendJson(res, 200, { token, user: { id: user.id, username: user.username, role: user.role, can_review_skills: !!user.can_review_skills } });
   });
 
   // GET /api/v1/auth/me
@@ -126,7 +126,7 @@ export function registerAuthRoutes(router: RestRouter, jwtSecret: string): void 
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, username, role, created_at FROM siclaw_users WHERE id = ?",
+      "SELECT id, username, role, can_review_skills, created_at FROM siclaw_users WHERE id = ?",
       [auth.userId],
     ) as any;
 

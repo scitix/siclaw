@@ -147,6 +147,33 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     });
   });
 
+  /** Validate SKILL.md specs format — must have frontmatter with name field */
+  function validateSpecs(specs: string | undefined): { valid: boolean; error?: string; name?: string; description?: string } {
+    if (!specs || typeof specs !== "string") return { valid: false, error: "specs (SKILL.md content) is required" };
+    const fmMatch = specs.match(/^---\n([\s\S]*?)\n---/);
+    if (!fmMatch) return { valid: false, error: "specs must start with YAML frontmatter (--- ... ---). Example:\n---\nname: my-skill\ndescription: What this skill does\n---" };
+    const nameMatch = fmMatch[1].match(/^name:\s*(.+)$/m);
+    if (!nameMatch || !nameMatch[1].trim()) return { valid: false, error: "specs frontmatter must include a 'name' field" };
+    // Extract description from frontmatter
+    const lines = fmMatch[1].split("\n");
+    const descIdx = lines.findIndex(l => l.match(/^description:\s/));
+    let description = "";
+    if (descIdx >= 0) {
+      const firstLine = lines[descIdx].replace(/^description:\s*/, "").trim();
+      if (firstLine === ">-" || firstLine === ">" || firstLine === "|" || firstLine === "|-") {
+        const contLines: string[] = [];
+        for (let i = descIdx + 1; i < lines.length; i++) {
+          if (lines[i].match(/^\s+/)) contLines.push(lines[i].trim());
+          else break;
+        }
+        description = contLines.join(" ");
+      } else {
+        description = firstLine;
+      }
+    }
+    return { valid: true, name: nameMatch[1].trim(), description };
+  }
+
   // Create skill
   router.post(`${P}/skills`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
@@ -154,19 +181,31 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
+
+    // Validate specs format
+    const specsCheck = validateSpecs(body.specs as string);
+    if (!specsCheck.valid) {
+      sendJson(res, 400, { error: specsCheck.error });
+      return;
+    }
+
     const id = crypto.randomUUID();
     const version = 1;
 
     const db = getDb();
 
+    // Use name/description from frontmatter if not explicitly provided
+    const skillName = (body.name as string)?.trim() || specsCheck.name || "untitled";
+    const skillDescription = (body.description as string)?.trim() || specsCheck.description || "";
+
     await db.query(
       `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, auth.orgId, body.name, body.description || null,
+        id, auth.orgId, skillName, skillDescription || null,
         JSON.stringify(body.labels || []),
         auth.userId, "draft", version,
-        JSON.stringify(body.specs || {}), JSON.stringify(body.scripts || {}),
+        body.specs || "", JSON.stringify(body.scripts || []),
         auth.userId,
       ],
     );
@@ -177,7 +216,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         crypto.randomUUID(), id, version,
-        JSON.stringify(body.specs || {}), JSON.stringify(body.scripts || {}),
+        body.specs || "", JSON.stringify(body.scripts || []),
         body.commit_message || "Initial version", auth.userId,
       ],
     );
@@ -234,10 +273,11 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     if (skill.status === "installed") {
       // Bump version, create version record, reset to draft
       const newVersion = (skill.version || 0) + 1;
-      const newSpecs = body.specs ? JSON.stringify(body.specs) : (typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs));
-      const newScripts = body.scripts ? JSON.stringify(body.scripts) : (typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts));
-      const oldSpecs = typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs);
-      const oldScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts);
+      // specs is MEDIUMTEXT (raw string), scripts is JSON
+      const newSpecs = body.specs ?? skill.specs ?? "";
+      const newScripts = body.scripts ? JSON.stringify(body.scripts) : (typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts || []));
+      const oldSpecs = skill.specs ?? "";
+      const oldScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts || []);
 
       // Create version record with diff between old and new
       await db.query(
@@ -264,7 +304,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
           body.name ?? null, body.description ?? null,
           body.labels ? JSON.stringify(body.labels) : null,
           newVersion,
-          body.specs ? JSON.stringify(body.specs) : null,
+          body.specs ?? null,
           body.scripts ? JSON.stringify(body.scripts) : null,
           params.id,
         ],
@@ -279,7 +319,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
         [
           body.name ?? null, body.description ?? null,
           body.labels ? JSON.stringify(body.labels) : null,
-          body.specs ? JSON.stringify(body.specs) : null,
+          body.specs ?? null,
           body.scripts ? JSON.stringify(body.scripts) : null,
           params.id,
         ],
@@ -375,6 +415,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
 
+    const body = await parseBody<{ comment?: string }>(req);
     const db = getDb();
 
     const [existing] = await db.query(
@@ -405,27 +446,25 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     ) as any;
     const baseline = baselineRows.length > 0 ? baselineRows[0] : null;
 
+    // Decode specs — may be double-encoded from earlier bug
+    function decodeSpecs(raw: string | null): string | null {
+      if (!raw) return null;
+      if (raw.startsWith('"')) { try { return JSON.parse(raw); } catch {} }
+      return raw;
+    }
+
     const diff = JSON.stringify({
-      specs_diff: { old: baseline?.specs || null, new: skill.specs },
+      specs_diff: { old: decodeSpecs(baseline?.specs) || null, new: decodeSpecs(skill.specs) },
       scripts_diff: { old: baseline?.scripts || null, new: skill.scripts },
+      ...(body.comment ? { comment: body.comment } : {}),
     });
 
-    // Two-phase security assessment
-    const scriptsArr: { name: string; content: string }[] = skill.scripts
-      ? (typeof skill.scripts === "string" ? JSON.parse(skill.scripts) : skill.scripts)
-      : [];
-    // Phase 1: static pattern matching
-    const staticFindings = evaluateScriptsStatic(scriptsArr);
-    const staticAssessment = buildAssessment(staticFindings);
-    // Phase 2: AI semantic analysis (non-blocking — falls back to static-only)
-    const aiAssessment = await evaluateScriptsAI(scriptsArr, staticFindings);
-    const securityAssessment = JSON.stringify(aiAssessment || staticAssessment);
-
+    // Insert review record — no security assessment yet (computed async)
     const reviewId = crypto.randomUUID();
     await db.query(
-      `INSERT INTO skill_reviews (id, skill_id, version, diff, security_assessment, submitted_by)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [reviewId, params.id, skill.version, diff, securityAssessment, auth.userId],
+      `INSERT INTO skill_reviews (id, skill_id, version, diff, submitted_by)
+       VALUES (?, ?, ?, ?, ?)`,
+      [reviewId, params.id, skill.version, diff, auth.userId],
     );
 
     await db.query(
@@ -434,6 +473,39 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     );
 
     sendJson(res, 200, { review_id: reviewId, status: "pending_review" });
+
+    // Security assessment runs entirely in background — reviewer sees results when they open the review
+    const scriptsArr: { name: string; content: string }[] = skill.scripts
+      ? (typeof skill.scripts === "string" ? JSON.parse(skill.scripts) : skill.scripts)
+      : [];
+
+    (async () => {
+      try {
+        // Phase 1: static
+        const staticFindings = evaluateScriptsStatic(scriptsArr);
+        const staticAssessment = buildAssessment(staticFindings);
+
+        // Phase 2: AI (may take 10-30s)
+        const aiAssessment = await evaluateScriptsAI(scriptsArr, staticFindings);
+        const finalAssessment = aiAssessment || staticAssessment;
+
+        await db.query(
+          "UPDATE skill_reviews SET security_assessment = ? WHERE id = ?",
+          [JSON.stringify(finalAssessment), reviewId],
+        );
+        console.log(`[skills] Security assessment completed for skill ${params.id} — risk: ${finalAssessment.risk_level}`);
+      } catch (err) {
+        // Fallback: at least store static assessment
+        try {
+          const staticFindings = evaluateScriptsStatic(scriptsArr);
+          await db.query(
+            "UPDATE skill_reviews SET security_assessment = ? WHERE id = ?",
+            [JSON.stringify(buildAssessment(staticFindings)), reviewId],
+          );
+        } catch { /* give up */ }
+        console.warn("[skills] Security assessment failed:", err);
+      }
+    })();
   });
 
   // Withdraw review
@@ -466,6 +538,12 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     await db.query(
       "UPDATE skills SET status = 'draft' WHERE id = ?",
+      [params.id],
+    );
+
+    // Close pending review records
+    await db.query(
+      "UPDATE skill_reviews SET decision = 'withdrawn', reviewed_at = NOW(3) WHERE skill_id = ? AND decision IS NULL",
       [params.id],
     );
 
