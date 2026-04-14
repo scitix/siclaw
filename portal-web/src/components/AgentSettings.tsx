@@ -28,6 +28,14 @@ interface AgentResources {
   workflows: { id: string; name: string }[]
 }
 
+interface AvailableCluster {
+  id: string; name: string; api_server: string; is_production: boolean
+}
+
+interface AvailableHost {
+  id: string; name: string; ip: string; is_production: boolean
+}
+
 interface ModelEntry {
   id: string
   model_id: string
@@ -54,7 +62,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   const [groupName, setGroupName] = useState(agent.group_name || "")
   const [modelProvider, setModelProvider] = useState(agent.model_provider || "")
   const [modelId, setModelId] = useState(agent.model_id || "")
-  const [brainType, setBrainType] = useState(agent.brain_type || "pi-agent")
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
   const [isProduction, setIsProduction] = useState(agent.is_production)
 
@@ -65,6 +72,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   const [resources, setResources] = useState<AgentResources | null>(null)
   const [loadingResources, setLoadingResources] = useState(true)
 
+  // Available clusters and hosts
+  const [allClusters, setAllClusters] = useState<AvailableCluster[]>([])
+  const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
+  const [selectedClusterIds, setSelectedClusterIds] = useState<Set<string>>(new Set())
+  const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set())
+
   const [saving, setSaving] = useState(false)
 
   // Sync form state when agent prop changes
@@ -74,7 +87,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
     setGroupName(agent.group_name || "")
     setModelProvider(agent.model_provider || "")
     setModelId(agent.model_id || "")
-    setBrainType(agent.brain_type || "pi-agent")
     setSystemPrompt(agent.system_prompt || "")
     setIsProduction(agent.is_production)
   }, [agent])
@@ -84,6 +96,20 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
     api<{ data: Provider[] }>("/siclaw/admin/models/providers")
       .then((r) => setProviders(Array.isArray(r.data) ? r.data : []))
       .catch(() => setProviders([]))
+  }, [])
+
+  // Load available clusters
+  useEffect(() => {
+    api<{ data: AvailableCluster[] }>("/clusters")
+      .then(r => setAllClusters(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setAllClusters([]))
+  }, [])
+
+  // Load available hosts
+  useEffect(() => {
+    api<{ data: AvailableHost[] }>("/hosts")
+      .then(r => setAllHosts(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setAllHosts([]))
   }, [])
 
   // Load resources
@@ -104,6 +130,14 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
     return () => { cancelled = true }
   }, [agent.id])
 
+  // Pre-select currently bound clusters/hosts when resources load
+  useEffect(() => {
+    if (resources) {
+      setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
+      setSelectedHostIds(new Set(resources.hosts?.sample?.map(h => h.id) || []))
+    }
+  }, [resources])
+
   // Models for selected provider
   const selectedProvider = providers.find((p) => p.name === modelProvider)
   const availableModels = selectedProvider?.models || []
@@ -120,11 +154,23 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
           group_name: groupName.trim(),
           model_provider: modelProvider.trim(),
           model_id: modelId.trim(),
-          brain_type: brainType,
           system_prompt: systemPrompt.trim(),
           is_production: isProduction,
         },
       })
+
+      // Save resource bindings
+      await api(`/agents/${agent.id}/resources`, {
+        method: "PUT",
+        body: {
+          cluster_ids: Array.from(selectedClusterIds),
+          host_ids: Array.from(selectedHostIds),
+          // Keep existing skill/mcp bindings unchanged
+          skill_ids: resources?.skill_ids || [],
+          mcp_server_ids: resources?.mcp_server_ids || [],
+        },
+      })
+
       onUpdate(updated)
       toast.success("Settings saved")
     } catch (err: any) {
@@ -133,15 +179,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
       setSaving(false)
     }
   }
-
-  const hasBindings =
-    resources &&
-    ((resources.clusters?.length || 0) > 0 ||
-      (resources.hosts?.total || 0) > 0 ||
-      (resources.skill_ids?.length || 0) > 0 ||
-      (resources.mcp_server_ids?.length || 0) > 0 ||
-      (resources.tools?.length || 0) > 0 ||
-      (resources.workflows?.length || 0) > 0)
 
   return (
     <div className="flex-1 overflow-auto">
@@ -240,17 +277,6 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 </select>
               </div>
             </div>
-            <div className="space-y-1.5">
-              <label className="text-[12px] text-muted-foreground">Brain Type</label>
-              <select
-                value={brainType}
-                onChange={(e) => setBrainType(e.target.value)}
-                className="w-full h-8 px-3 text-[13px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
-              >
-                <option value="pi-agent">pi-agent</option>
-                <option value="claude-sdk">claude-sdk</option>
-              </select>
-            </div>
           </div>
         </section>
 
@@ -277,51 +303,72 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
             <div className="flex items-center justify-center py-6">
               <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
             </div>
-          ) : !hasBindings ? (
-            <p className="text-[12px] text-muted-foreground py-2">No resource bindings configured.</p>
           ) : (
             <div className="space-y-3">
               {/* Clusters */}
-              {resources!.clusters?.length > 0 && (
-                <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">Bound Clusters</label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {resources!.clusters.map((c) => (
-                      <span key={c.id} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground">
-                        {c.name}
-                      </span>
+              <div className="space-y-1.5">
+                <label className="text-[12px] text-muted-foreground font-medium">Clusters</label>
+                {allClusters.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground/60">No clusters available. Add clusters in Settings.</p>
+                ) : (
+                  <div className="space-y-1 max-h-[200px] overflow-auto border border-border rounded-md p-2">
+                    {allClusters.map(c => (
+                      <label key={c.id} className="flex items-center gap-2 py-1 px-1 rounded hover:bg-secondary/30 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedClusterIds.has(c.id)}
+                          onChange={e => {
+                            const next = new Set(selectedClusterIds)
+                            e.target.checked ? next.add(c.id) : next.delete(c.id)
+                            setSelectedClusterIds(next)
+                          }}
+                        />
+                        <span className="text-[12px] font-mono flex-1">{c.name}</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${c.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>
+                          {c.is_production ? "PROD" : "DEV"}
+                        </span>
+                        {c.api_server && <span className="text-[10px] text-muted-foreground/50">{c.api_server}</span>}
+                      </label>
                     ))}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
 
               {/* Hosts */}
-              {(resources!.hosts?.total || 0) > 0 && (
-                <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">
-                    Bound Hosts ({resources!.hosts.total})
-                  </label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {resources!.hosts.sample.map((h) => (
-                      <span key={h.id} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground">
-                        {h.name || h.ip}
-                      </span>
+              <div className="space-y-1.5">
+                <label className="text-[12px] text-muted-foreground font-medium">Hosts</label>
+                {allHosts.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground/60">No hosts available. Add hosts in Settings.</p>
+                ) : (
+                  <div className="space-y-1 max-h-[200px] overflow-auto border border-border rounded-md p-2">
+                    {allHosts.map(h => (
+                      <label key={h.id} className="flex items-center gap-2 py-1 px-1 rounded hover:bg-secondary/30 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedHostIds.has(h.id)}
+                          onChange={e => {
+                            const next = new Set(selectedHostIds)
+                            e.target.checked ? next.add(h.id) : next.delete(h.id)
+                            setSelectedHostIds(next)
+                          }}
+                        />
+                        <span className="text-[12px] font-mono flex-1">{h.name}</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${h.is_production ? "bg-red-500/20 text-red-400" : "bg-blue-500/20 text-blue-400"}`}>
+                          {h.is_production ? "PROD" : "DEV"}
+                        </span>
+                        {h.ip && <span className="text-[10px] text-muted-foreground/50">{h.ip}</span>}
+                      </label>
                     ))}
-                    {resources!.hosts.total > resources!.hosts.sample.length && (
-                      <span className="inline-block px-2 py-0.5 text-[11px] rounded border border-border text-muted-foreground">
-                        +{resources!.hosts.total - resources!.hosts.sample.length} more
-                      </span>
-                    )}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
 
-              {/* Skills */}
-              {resources!.skill_ids?.length > 0 && (
+              {/* Skills (read-only) */}
+              {resources && resources.skill_ids?.length > 0 && (
                 <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">Bound Skills</label>
+                  <label className="text-[12px] text-muted-foreground font-medium">Bound Skills</label>
                   <div className="flex flex-wrap gap-1.5">
-                    {resources!.skill_ids.map((sid) => (
+                    {resources.skill_ids.map((sid) => (
                       <span key={sid} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground font-mono">
                         {sid}
                       </span>
@@ -330,12 +377,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 </div>
               )}
 
-              {/* MCP Servers */}
-              {resources!.mcp_server_ids?.length > 0 && (
+              {/* MCP Servers (read-only) */}
+              {resources && resources.mcp_server_ids?.length > 0 && (
                 <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">Bound MCP Servers</label>
+                  <label className="text-[12px] text-muted-foreground font-medium">Bound MCP Servers</label>
                   <div className="flex flex-wrap gap-1.5">
-                    {resources!.mcp_server_ids.map((mid) => (
+                    {resources.mcp_server_ids.map((mid) => (
                       <span key={mid} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground font-mono">
                         {mid}
                       </span>
@@ -344,12 +391,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 </div>
               )}
 
-              {/* Tools */}
-              {resources!.tools?.length > 0 && (
+              {/* Tools (read-only) */}
+              {resources && resources.tools?.length > 0 && (
                 <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">Bound Tools</label>
+                  <label className="text-[12px] text-muted-foreground font-medium">Bound Tools</label>
                   <div className="flex flex-wrap gap-1.5">
-                    {resources!.tools.map((tool) => (
+                    {resources.tools.map((tool) => (
                       <span key={tool} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground">
                         {tool}
                       </span>
@@ -358,12 +405,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
                 </div>
               )}
 
-              {/* Workflows */}
-              {resources!.workflows?.length > 0 && (
+              {/* Workflows (read-only) */}
+              {resources && resources.workflows?.length > 0 && (
                 <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground">Bound Workflows</label>
+                  <label className="text-[12px] text-muted-foreground font-medium">Bound Workflows</label>
                   <div className="flex flex-wrap gap-1.5">
-                    {resources!.workflows.map((w) => (
+                    {resources.workflows.map((w) => (
                       <span key={w.id} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground">
                         {w.name}
                       </span>
