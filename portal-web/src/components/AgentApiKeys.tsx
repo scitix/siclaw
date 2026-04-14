@@ -101,7 +101,7 @@ export function AgentApiKeys({ agentId }: AgentApiKeysProps) {
   }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col">
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-border">
         <span className="text-[13px] font-medium">API Keys</span>

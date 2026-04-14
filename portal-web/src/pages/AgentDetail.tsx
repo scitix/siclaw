@@ -3,8 +3,6 @@ import { useParams, useSearchParams, useNavigate } from "react-router-dom"
 import { ArrowLeft, Loader2 } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
-import { AgentTasks } from "../components/AgentTasks"
-import { AgentApiKeys } from "../components/AgentApiKeys"
 import { AgentSettings } from "../components/AgentSettings"
 
 interface Agent {
@@ -19,12 +17,6 @@ const statusColors: Record<string, string> = {
   error: "bg-[#EF4444]",
 }
 
-const viewLabels: Record<string, string> = {
-  tasks: "Tasks",
-  "api-keys": "API Keys",
-  settings: "Settings",
-}
-
 export function AgentDetail() {
   const { id } = useParams()
   const [searchParams] = useSearchParams()
@@ -34,7 +26,7 @@ export function AgentDetail() {
   const [agent, setAgent] = useState<Agent | null>(null)
   const [loading, setLoading] = useState(true)
 
-  const view = searchParams.get("tab") || "settings"
+  const initialTab = searchParams.get("tab") || "basic"
 
   useEffect(() => {
     if (!id) return
@@ -69,10 +61,11 @@ export function AgentDetail() {
   return (
     <div className="flex flex-col h-full overflow-hidden">
       {/* Header bar */}
-      <div className="flex items-center justify-between border-b border-border px-6 py-3">
+      <div className="flex items-center border-b border-border px-6 py-3">
         <div className="flex items-center gap-3">
           <button
             onClick={() => navigate("/agents")}
+            title="Back"
             className="h-7 w-7 flex items-center justify-center rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"
           >
             <ArrowLeft className="h-4 w-4" />
@@ -93,14 +86,11 @@ export function AgentDetail() {
             </p>
           </div>
         </div>
-        <span className="text-[13px] text-muted-foreground">{viewLabels[view] || view}</span>
       </div>
 
-      {/* Content — directly render based on ?tab= param */}
+      {/* Settings with tabs */}
       <div className="flex-1 overflow-auto">
-        {view === "tasks" && <AgentTasks agentId={agent.id} />}
-        {view === "api-keys" && <AgentApiKeys agentId={agent.id} />}
-        {view === "settings" && <AgentSettings agent={agent} onUpdate={(updated) => setAgent(updated)} />}
+        <AgentSettings agent={agent} onUpdate={(updated) => setAgent(updated)} initialTab={initialTab} />
       </div>
     </div>
   )
