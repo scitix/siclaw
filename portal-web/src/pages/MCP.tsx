@@ -208,6 +208,7 @@ export function MCP() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState("")
   const [transportFilter, setTransportFilter] = useState<McpTransport | "">("")
+  const [isAdmin, setIsAdmin] = useState(false)
   const toast = useToast()
   const confirmDialog = useConfirm()
 
@@ -220,7 +221,7 @@ export function MCP() {
 
   const fetchServers = async () => {
     try {
-      const res = await api<{ data: McpServer[] }>("/siclaw/admin/mcp")
+      const res = await api<{ data: McpServer[] }>("/siclaw/mcp")
       setServers(Array.isArray(res.data) ? res.data : [])
     } catch {
       setServers([])
@@ -229,7 +230,10 @@ export function MCP() {
     }
   }
 
-  useEffect(() => { fetchServers() }, [])
+  useEffect(() => {
+    fetchServers()
+    api<{ role: string }>("/auth/me").then((u) => setIsAdmin(u.role === "admin")).catch(() => {})
+  }, [])
 
   const filtered = useMemo(() => {
     let list = servers
@@ -248,7 +252,7 @@ export function MCP() {
 
   const handleCreate = async (data: Record<string, unknown>) => {
     try {
-      await api("/siclaw/admin/mcp", { method: "POST", body: data })
+      await api("/siclaw/mcp", { method: "POST", body: data })
       setShowCreate(false)
       await fetchServers()
       toast.success("MCP server created")
@@ -260,7 +264,7 @@ export function MCP() {
   const handleUpdate = async (data: Record<string, unknown>) => {
     if (!editingServer) return
     try {
-      await api(`/siclaw/admin/mcp/${editingServer.id}`, { method: "PUT", body: data })
+      await api(`/siclaw/mcp/${editingServer.id}`, { method: "PUT", body: data })
       setEditingServer(null)
       await fetchServers()
       toast.success("MCP server updated")
@@ -273,7 +277,7 @@ export function MCP() {
     if (toggling) return
     setToggling(server.id)
     try {
-      await api(`/siclaw/admin/mcp/${server.id}/toggle`, {
+      await api(`/siclaw/mcp/${server.id}/toggle`, {
         method: "PUT",
         body: { enabled: !server.enabled },
       })
@@ -295,7 +299,7 @@ export function MCP() {
       confirmLabel: "Delete",
     }))) return
     try {
-      await api(`/siclaw/admin/mcp/${server.id}`, { method: "DELETE" })
+      await api(`/siclaw/mcp/${server.id}`, { method: "DELETE" })
       setServers((prev) => prev.filter((s) => s.id !== server.id))
       if (editingServer?.id === server.id) setEditingServer(null)
       toast.success("MCP server deleted")
@@ -314,9 +318,11 @@ export function MCP() {
           <h1 className="text-lg font-semibold">MCP Servers</h1>
           <p className="text-sm text-muted-foreground">Manage Model Context Protocol server connections</p>
         </div>
-        <button onClick={() => { setShowCreate(true); setEditingServer(null) }} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
-          <Plus className="h-3.5 w-3.5" /> New Server
-        </button>
+        {isAdmin && (
+          <button onClick={() => { setShowCreate(true); setEditingServer(null) }} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
+            <Plus className="h-3.5 w-3.5" /> New Server
+          </button>
+        )}
       </div>
 
       {/* Create form */}
@@ -393,34 +399,36 @@ export function MCP() {
                     <span className="text-xs text-muted-foreground font-mono max-w-[200px] truncate hidden sm:block">
                       {server.url || server.command || "\u2014"}
                     </span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => handleToggle(server)}
-                        disabled={toggling === server.id}
-                        className={`p-1.5 rounded-md transition-colors ${
-                          server.enabled
-                            ? "text-green-500 hover:text-orange-400 hover:bg-secondary"
-                            : "text-muted-foreground hover:text-green-500 hover:bg-secondary"
-                        } disabled:opacity-50`}
-                        title={server.enabled ? "Disable" : "Enable"}
-                      >
-                        {toggling === server.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
-                      </button>
-                      <button
-                        onClick={() => { setEditingServer(server); setShowCreate(false) }}
-                        className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
-                        title="Edit"
-                      >
-                        <Pencil className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(server)}
-                        className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-destructive/20 transition-colors"
-                        title="Delete"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
+                    {isAdmin && (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => handleToggle(server)}
+                          disabled={toggling === server.id}
+                          className={`p-1.5 rounded-md transition-colors ${
+                            server.enabled
+                              ? "text-green-500 hover:text-orange-400 hover:bg-secondary"
+                              : "text-muted-foreground hover:text-green-500 hover:bg-secondary"
+                          } disabled:opacity-50`}
+                          title={server.enabled ? "Disable" : "Enable"}
+                        >
+                          {toggling === server.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
+                        </button>
+                        <button
+                          onClick={() => { setEditingServer(server); setShowCreate(false) }}
+                          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                          title="Edit"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDelete(server)}
+                          className="p-1.5 rounded-md text-muted-foreground hover:text-red-400 hover:bg-destructive/20 transition-colors"
+                          title="Delete"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
 

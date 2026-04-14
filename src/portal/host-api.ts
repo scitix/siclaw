@@ -10,9 +10,9 @@ import { getDb } from "../gateway/db.js";
 import {
   sendJson,
   parseBody,
-  requireAuth,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { requireAdmin } from "./auth.js";
 
 /** Column list that excludes sensitive fields. */
 const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_production, created_at, updated_at";
@@ -20,8 +20,8 @@ const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_p
 export function registerHostRoutes(router: RestRouter, jwtSecret: string): void {
   // GET /api/v1/hosts — list all (no secrets)
   router.get("/api/v1/hosts", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query(
@@ -32,8 +32,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
 
   // POST /api/v1/hosts — create
   router.post("/api/v1/hosts", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<{
       name?: string;
@@ -78,8 +78,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
 
   // GET /api/v1/hosts/:id — get by id (no secrets)
   router.get("/api/v1/hosts/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query(`SELECT ${SAFE_COLUMNS} FROM hosts WHERE id = ?`, [params.id]) as any;
@@ -94,8 +94,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
 
   // PUT /api/v1/hosts/:id — update
   router.put("/api/v1/hosts/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
@@ -134,8 +134,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
 
   // DELETE /api/v1/hosts/:id
   router.delete("/api/v1/hosts/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
 
@@ -152,8 +152,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
 
   // POST /api/v1/hosts/:id/test — test SSH connection (stub)
   router.post("/api/v1/hosts/:id/test", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query("SELECT id FROM hosts WHERE id = ?", [params.id]) as any;

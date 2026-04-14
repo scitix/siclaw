@@ -14,6 +14,7 @@ import {
   requireAuth,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { requireAdmin } from "./auth.js";
 
 export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void {
   // GET /api/v1/agents — list (paginated, search)
@@ -51,10 +52,10 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     sendJson(res, 200, { data: listRows, total, page, page_size: pageSize });
   });
 
-  // POST /api/v1/agents — create
+  // POST /api/v1/agents — create (admin only)
   router.post("/api/v1/agents", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<Record<string, unknown>>(req);
     if (!body.name) { sendJson(res, 400, { error: "name is required" }); return; }
@@ -116,10 +117,10 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     sendJson(res, 200, rows[0]);
   });
 
-  // PUT /api/v1/agents/:id — update
+  // PUT /api/v1/agents/:id — update (admin only)
   router.put("/api/v1/agents/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
@@ -159,10 +160,10 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     sendJson(res, 200, rows[0]);
   });
 
-  // DELETE /api/v1/agents/:id
+  // DELETE /api/v1/agents/:id (admin only)
   router.delete("/api/v1/agents/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
 
@@ -177,10 +178,10 @@ export function registerAgentRoutes(router: RestRouter, jwtSecret: string): void
     sendJson(res, 200, { deleted: true });
   });
 
-  // PUT /api/v1/agents/:id/resources — bind resources
+  // PUT /api/v1/agents/:id/resources — bind resources (admin only)
   router.put("/api/v1/agents/:id/resources", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<{
       cluster_ids?: string[];
