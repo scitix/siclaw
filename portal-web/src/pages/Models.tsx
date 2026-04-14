@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react"
 import { Plus, Trash2, Loader2, ChevronDown, ChevronRight, Settings } from "lucide-react"
 import { api } from "../api"
+import { useToast } from "../components/toast"
+import { useConfirm } from "../components/confirm-dialog"
 
 interface ModelEntry {
   id: string
@@ -17,6 +19,7 @@ export interface Provider {
   id: string
   name: string
   base_url: string
+  api_key?: string
   api_type: string
   models?: ModelEntry[]
 }
@@ -25,9 +28,20 @@ export function Models() {
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+  const toast = useToast()
+  const confirmDialog = useConfirm()
+
+  // Create provider
   const [showCreateProvider, setShowCreateProvider] = useState(false)
   const [providerForm, setProviderForm] = useState({ name: "", base_url: "", api_key: "", api_type: "openai-completions" })
   const [creating, setCreating] = useState(false)
+
+  // Edit provider
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editForm, setEditForm] = useState({ name: "", base_url: "", api_key: "", api_type: "openai-completions" })
+  const [saving, setSaving] = useState(false)
+
+  // Add model
   const [showAddModel, setShowAddModel] = useState<string | null>(null)
   const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
@@ -35,9 +49,9 @@ export function Models() {
   const fetchProviders = async () => {
     try {
       const res = await api<{ data: Provider[] }>("/siclaw/admin/models/providers")
-      setProviders(res.data || [])
-    } catch (err: any) {
-      console.error(err)
+      setProviders(Array.isArray(res.data) ? res.data : [])
+    } catch {
+      setProviders([])
     } finally {
       setLoading(false)
     }
@@ -52,13 +66,39 @@ export function Models() {
       setShowCreateProvider(false)
       setProviderForm({ name: "", base_url: "", api_key: "", api_type: "openai-completions" })
       await fetchProviders()
-    } catch (err: any) { alert(err.message) } finally { setCreating(false) }
+      toast.success("Provider created")
+    } catch (err: any) { toast.error(err.message) } finally { setCreating(false) }
+  }
+
+  const startEdit = (provider: Provider) => {
+    setEditingId(provider.id)
+    setEditForm({
+      name: provider.name,
+      base_url: provider.base_url,
+      api_key: provider.api_key || "",
+      api_type: provider.api_type,
+    })
+    setExpandedId(provider.id)
+  }
+
+  const handleSaveEdit = async () => {
+    if (!editingId) return
+    setSaving(true)
+    try {
+      await api(`/siclaw/admin/models/providers/${editingId}`, { method: "PUT", body: editForm })
+      setEditingId(null)
+      await fetchProviders()
+      toast.success("Provider updated")
+    } catch (err: any) { toast.error(err.message) } finally { setSaving(false) }
   }
 
   const handleDeleteProvider = async (id: string) => {
-    if (!confirm("Delete this provider and all its models?")) return
-    await api(`/siclaw/admin/models/providers/${id}`, { method: "DELETE" })
-    setProviders((prev) => prev.filter((p) => p.id !== id))
+    if (!(await confirmDialog({ title: "Delete Provider", message: "Delete this provider and all its models? This cannot be undone.", destructive: true, confirmLabel: "Delete" }))) return
+    try {
+      await api(`/siclaw/admin/models/providers/${id}`, { method: "DELETE" })
+      setProviders((prev) => prev.filter((p) => p.id !== id))
+      if (editingId === id) setEditingId(null)
+    } catch (err: any) { toast.error(err.message) }
   }
 
   const handleAddModel = async (providerId: string) => {
@@ -71,7 +111,8 @@ export function Models() {
       setShowAddModel(null)
       setModelForm({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, is_default: false })
       await fetchProviders()
-    } catch (err: any) { alert(err.message) } finally { setAddingModel(false) }
+      toast.success("Model added")
+    } catch (err: any) { toast.error(err.message) } finally { setAddingModel(false) }
   }
 
   const handleDeleteModel = async (providerId: string, modelId: string) => {
@@ -93,6 +134,7 @@ export function Models() {
         </button>
       </div>
 
+      {/* Create provider form */}
       {showCreateProvider && (
         <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
           <p className="text-sm font-medium">New Provider</p>
@@ -112,6 +154,7 @@ export function Models() {
         </div>
       )}
 
+      {/* Provider list */}
       <div className="flex-1 overflow-auto">
         {providers.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20">
@@ -123,6 +166,7 @@ export function Models() {
           <div className="px-6 py-4 space-y-3">
             {providers.map((provider) => (
               <div key={provider.id} className="rounded-lg border border-border/50">
+                {/* Provider header */}
                 <div className="flex items-center justify-between p-3 cursor-pointer hover:bg-secondary/30" onClick={() => setExpandedId(expandedId === provider.id ? null : provider.id)}>
                   <div className="flex items-center gap-2">
                     {expandedId === provider.id ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
@@ -133,12 +177,35 @@ export function Models() {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">{provider.models?.length || 0} models</span>
+                    <button onClick={(e) => { e.stopPropagation(); startEdit(provider) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
                     <button onClick={(e) => { e.stopPropagation(); handleDeleteProvider(provider.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
                   </div>
                 </div>
 
+                {/* Expanded content */}
                 {expandedId === provider.id && (
                   <div className="border-t border-border/50 p-3 bg-secondary/10">
+                    {/* Edit form */}
+                    {editingId === provider.id && (
+                      <div className="p-3 mb-3 rounded-md border border-border bg-card space-y-2">
+                        <p className="text-xs font-medium text-muted-foreground">Edit Provider</p>
+                        <div className="grid grid-cols-2 gap-2">
+                          <input placeholder="Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                          <select value={editForm.api_type} onChange={(e) => setEditForm({ ...editForm, api_type: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background">
+                            <option value="openai-completions">OpenAI Compatible</option>
+                            <option value="anthropic">Anthropic</option>
+                          </select>
+                        </div>
+                        <input placeholder="Base URL" value={editForm.base_url} onChange={(e) => setEditForm({ ...editForm, base_url: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
+                        <input type="password" placeholder="API Key (leave empty to keep current)" value={editForm.api_key} onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                        <div className="flex gap-2">
+                          <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.base_url} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "..." : "Save"}</button>
+                          <button onClick={() => setEditingId(null)} className="h-7 px-3 text-xs rounded-md border border-border text-muted-foreground">Cancel</button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Models list */}
                     {provider.models && provider.models.length > 0 && (
                       <div className="space-y-1.5 mb-3">
                         {provider.models.map((model) => (
@@ -156,6 +223,7 @@ export function Models() {
                       </div>
                     )}
 
+                    {/* Add model form */}
                     {showAddModel === provider.id ? (
                       <div className="p-3 rounded-md border border-border bg-card space-y-2">
                         <div className="grid grid-cols-2 gap-2">
