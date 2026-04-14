@@ -160,7 +160,7 @@ export class TaskCoordinator {
     const t0 = Date.now();
     const [sessResult] = (await db.query(
       `DELETE FROM chat_sessions
-       WHERE origin = 'cron' AND last_active_at < NOW() - INTERVAL ? DAY`,
+       WHERE origin = 'task' AND last_active_at < NOW() - INTERVAL ? DAY`,
       [days],
     )) as any;
     const [runsResult] = (await db.query(
@@ -268,7 +268,7 @@ export class TaskCoordinator {
       const promptOpts: PromptOptions = {
         sessionId,
         text: prompt,
-        mode: "cron",
+        mode: "task",
         agentId,
         modelProvider: binding.modelProvider,
         modelId: binding.modelId,

@@ -46,6 +46,6 @@ export function createTaskReportTool(): ToolDefinition {
 export const registration: ToolEntry = {
   category: "workflow",
   create: (_refs) => createTaskReportTool(),
-  modes: ["cron"],
+  modes: ["task"],
   platform: true,
 };

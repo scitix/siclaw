@@ -3,7 +3,7 @@ import { useNavigate, Link } from "react-router-dom"
 import { Clock, ClipboardList, Loader2, ChevronRight, Bot, Play, Pause, ArrowRight } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
-import { nextFireHint } from "../lib/cronPreview"
+import { nextFireHint } from "../lib/taskSchedule"
 
 interface MyTask {
   id: string
