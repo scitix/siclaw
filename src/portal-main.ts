@@ -7,6 +7,7 @@
 import { initDb, closeDb } from "./gateway/db.js";
 import { runMigrations } from "./gateway/migrate.js";
 import { runPortalMigrations } from "./portal/migrate.js";
+import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { startPortal } from "./portal/server.js";
 import { PortalTaskService } from "./portal/task-service.js";
 
@@ -31,6 +32,9 @@ initDb(config.databaseUrl);
 // Run migrations (Siclaw tables first, then Portal tables)
 await runMigrations();
 await runPortalMigrations();
+
+// Sync builtin skills from skills/core/ into the DB
+await syncBuiltinSkills("default");
 console.log("[portal] Database ready");
 
 // Start server
