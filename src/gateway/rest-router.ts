@@ -101,7 +101,7 @@ export async function parseBody<T>(req: http.IncomingMessage): Promise<T> {
     req.on("end", () => {
       try {
         const body = Buffer.concat(chunks).toString("utf-8");
-        resolve(JSON.parse(body) as T);
+        resolve(body ? JSON.parse(body) as T : {} as T);
       } catch (err) {
         reject(new Error("Invalid JSON body"));
       }

@@ -44,10 +44,6 @@ Primary defense: **OS-level user isolation** — child processes run as `sandbox
 | Gateway DB | sql.js (WASM) | Users, sessions, skills, MCP config. Single-process lock. DDL in both `schema-sqlite.ts` AND `migrate-sqlite.ts`. |
 | Memory DB | node:sqlite | Embeddings, chunks, investigations. pi-agent only. |
 
-### 🟡 Brain Type Gap
-
-Memory tools are **pi-agent only**. When adding tools, test both brain types.
-
 ### 🟡 mTLS Scope
 
 mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths.
@@ -97,7 +93,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 ```
 Runtime:    Node.js ≥22.12.0  (ESM-only)     Tests:      vitest (npm test)
 Language:   TypeScript 5.9    (strict, .js)   Type check: npx tsc --noEmit
-Frontend:   React + Vite + Tailwind           Agent:      pi-coding-agent / claude-agent-sdk
+Frontend:   React + Vite + Tailwind           Agent:      pi-coding-agent
 DB (GW):    Drizzle → sql.js / MySQL          DB (mem):   node:sqlite + FTS5
 ```
 

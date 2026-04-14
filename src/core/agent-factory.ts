@@ -19,12 +19,6 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
-import {
-  type DpState,
-  createDpState,
-  createProposeHypothesesTool,
-  createEndInvestigationTool,
-} from "../tools/workflow/dp-tools.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { ToolRegistry } from "./tool-registry.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -35,12 +29,9 @@ import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
-import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
-import type { BrainSession, BrainType } from "./brain-session.js";
-import { hasOpenAIProvider, ensureProxy } from "./llm-proxy.js";
+import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
-import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -49,7 +40,6 @@ export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
-  brainType?: BrainType;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for agent customization */
@@ -82,8 +72,6 @@ export interface SiclawSessionResult {
   /** MCP client manager — call shutdown() on session close */
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
-  /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
-  dpState?: DpState;
   /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
@@ -471,71 +459,6 @@ export async function createSiclawSession(
   if (!fs.existsSync(skeletonProfilePath)) {
     fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
   }
-
-  // -- Claude SDK brain path --
-  if (opts?.brainType === "claude-sdk") {
-    console.log(`[agent-factory] Creating Claude SDK brain`);
-
-    // Restricted file tools are already in customTools (pushed above)
-    const sdkTools = [...customTools];
-
-    // DP tools are NOT registered for SDK brain — the interactive DP workflow
-    // (propose_hypotheses → user confirm → deep_search) requires pi-agent extension
-    // handlers for [DP_CONFIRM]/[DP_ADJUST]/[DP_SKIP] markers. Without those,
-    // SDK brain DP gets stuck at awaiting_confirmation. Tracked for future work.
-    const dpState: DpState = createDpState();
-
-    const systemPrompt = buildSreSystemPrompt(mode, opts?.systemPromptTemplate);
-
-    // Build the same append content that pi-agent gets via appendSystemPromptOverride
-    const appendParts = buildAppendSystemPrompt(memoryDir);
-    let systemPromptAppend = appendParts.join("\n") || undefined;
-
-    // Investigation Capability prompt removed — deep_search is now DP-mode-only.
-    // The workflow instructions are injected via buildActivationMessage() when
-    // the user explicitly triggers DP mode.
-
-    // Append agent custom prompt
-    if (opts?.systemPromptAppend) {
-      systemPromptAppend = (systemPromptAppend ?? "") + "\n\n" + opts.systemPromptAppend;
-    }
-
-    // Start LLM proxy if an OpenAI-compatible provider is configured
-    let proxyUrl: string | undefined;
-    if (hasOpenAIProvider()) {
-      try {
-        proxyUrl = await ensureProxy();
-        console.log(`[agent-factory] LLM proxy active at ${proxyUrl}`);
-      } catch (err) {
-        console.warn(`[agent-factory] LLM proxy failed to start, falling back to direct Anthropic API:`, err);
-      }
-    }
-
-    const brain: BrainSession = new ClaudeSdkBrain({
-      systemPrompt,
-      systemPromptAppend,
-      cwd,
-      customTools: sdkTools,
-      proxyUrl,
-      externalMcpServers: mcpServers && Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
-      dpState,
-    });
-
-    return {
-      brain,
-      session: null as any,  // No pi-agent session for SDK brain
-      customTools: sdkTools,
-      kubeconfigRef,
-      llmConfigRef,
-      skillsDirs,
-      mode,
-      mcpManager,
-      dpState,
-      sessionIdRef,
-    };
-  }
-
-  // -- Pi-agent brain path (default) --
 
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());

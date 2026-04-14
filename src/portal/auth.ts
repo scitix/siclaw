@@ -32,7 +32,7 @@ export function verifyPassword(password: string, hash: string): boolean {
 // ── JWT helper ───────────────────────────────────────────────
 
 export function signToken(userId: string, username: string, secret: string): string {
-  return jwt.sign({ sub: userId, username }, secret, { expiresIn: "24h" });
+  return jwt.sign({ sub: userId, username, org_id: "default" }, secret, { expiresIn: "24h" });
 }
 
 // ── Route registration ───────────────────────────────────────

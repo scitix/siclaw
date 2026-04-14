@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createRestRouter, sendJson } from "../gateway/rest-router.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
+import { registerTaskRoutes } from "./task-api.js";
 import { registerClusterRoutes } from "./cluster-api.js";
 import { registerHostRoutes } from "./host-api.js";
 import { registerAdapterRoutes } from "./adapter.js";
@@ -55,6 +56,7 @@ export function startPortal(config: PortalConfig): http.Server {
   registerHostRoutes(router, config.jwtSecret);
   registerAdapterRoutes(router, config.portalSecret);
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
+  registerTaskRoutes(router, config.jwtSecret);
 
   const server = http.createServer((req, res) => {
     const url = req.url ?? "/";

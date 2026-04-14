@@ -27,7 +27,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, name, description, api_server, created_at, updated_at FROM clusters ORDER BY created_at DESC",
+      "SELECT id, name, description, api_server, is_production, created_at, updated_at FROM clusters ORDER BY created_at DESC",
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -42,6 +42,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
       description?: string;
       kubeconfig?: string;
       api_server?: string;
+      is_production?: boolean;
     }>(req);
 
     if (!body.name) { sendJson(res, 400, { error: "name is required" }); return; }
@@ -51,13 +52,13 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     await db.query(
-      `INSERT INTO clusters (id, name, description, kubeconfig, api_server)
-       VALUES (?, ?, ?, ?, ?)`,
-      [id, body.name, body.description ?? null, body.kubeconfig ?? null, apiServer],
+      `INSERT INTO clusters (id, name, description, kubeconfig, api_server, is_production)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [id, body.name, body.description ?? null, body.kubeconfig ?? null, apiServer, body.is_production ?? 1],
     );
 
     const [rows] = await db.query(
-      "SELECT id, name, description, api_server, created_at, updated_at FROM clusters WHERE id = ?",
+      "SELECT id, name, description, api_server, is_production, created_at, updated_at FROM clusters WHERE id = ?",
       [id],
     ) as any;
     sendJson(res, 201, rows[0]);
@@ -87,7 +88,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
-    const fields = ["name", "description", "kubeconfig", "api_server"];
+    const fields = ["name", "description", "kubeconfig", "api_server", "is_production"];
     const setClauses: string[] = [];
     const values: unknown[] = [];
 

@@ -31,6 +31,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     model_id VARCHAR(255),
     system_prompt TEXT,
     brain_type VARCHAR(50) NOT NULL DEFAULT 'pi-agent',
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
     icon VARCHAR(50),
     color VARCHAR(50),
     created_by CHAR(36),
@@ -45,6 +46,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     description TEXT,
     kubeconfig TEXT,
     api_server VARCHAR(500),
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
@@ -60,6 +62,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     password VARCHAR(500),
     private_key TEXT,
     description TEXT,
+    is_production TINYINT(1) NOT NULL DEFAULT 1,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
@@ -97,6 +100,35 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     PRIMARY KEY (agent_id, mcp_server_id),
     CONSTRAINT fk_ams_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
     CONSTRAINT fk_ams_mcp FOREIGN KEY (mcp_server_id) REFERENCES mcp_servers(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Agent Tasks (scheduled jobs scoped to agents)
+  `CREATE TABLE IF NOT EXISTS agent_tasks (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    schedule VARCHAR(100) NOT NULL,
+    prompt TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    last_run_at TIMESTAMP(3) NULL,
+    last_result VARCHAR(50) NULL,
+    created_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    CONSTRAINT fk_at_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Agent Task Runs (execution history)
+  `CREATE TABLE IF NOT EXISTS agent_task_runs (
+    id CHAR(36) PRIMARY KEY,
+    task_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    result_text TEXT,
+    error TEXT,
+    duration_ms INT,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 ];
 

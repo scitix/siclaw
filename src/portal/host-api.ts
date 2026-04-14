@@ -15,7 +15,7 @@ import {
 } from "../gateway/rest-router.js";
 
 /** Column list that excludes sensitive fields. */
-const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, created_at, updated_at";
+const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_production, created_at, updated_at";
 
 export function registerHostRoutes(router: RestRouter, jwtSecret: string): void {
   // GET /api/v1/hosts — list all (no secrets)
@@ -44,6 +44,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
       password?: string;
       private_key?: string;
       description?: string;
+      is_production?: boolean;
     }>(req);
 
     if (!body.name || !body.ip) {
@@ -55,8 +56,8 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
     const db = getDb();
 
     await db.query(
-      `INSERT INTO hosts (id, name, ip, port, username, auth_type, password, private_key, description)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO hosts (id, name, ip, port, username, auth_type, password, private_key, description, is_production)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -67,6 +68,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
         body.password ?? null,
         body.private_key ?? null,
         body.description ?? null,
+        body.is_production ?? 1,
       ],
     );
 
@@ -98,7 +100,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
-    const fields = ["name", "ip", "port", "username", "auth_type", "password", "private_key", "description"];
+    const fields = ["name", "ip", "port", "username", "auth_type", "password", "private_key", "description", "is_production"];
     const setClauses: string[] = [];
     const values: unknown[] = [];
 

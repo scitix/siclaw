@@ -14,7 +14,7 @@ import {
 } from "../gateway/rest-router.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
-  const token = req.headers["x-internal-token"] as string | undefined;
+  const token = req.headers["x-auth-token"] as string | undefined;
   return token === internalSecret;
 }
 
@@ -44,7 +44,6 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       model_provider: agent.model_provider,
       model_id: agent.model_id,
       system_prompt: agent.system_prompt,
-      brain_type: agent.brain_type,
       icon: agent.icon,
       color: agent.color,
     });

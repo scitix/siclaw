@@ -16,6 +16,8 @@
  *   POST /api/internal/feedback            — AgentBox feedback
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import { WebSocketServer, WebSocket } from "ws";
@@ -104,7 +106,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       agentId,
       modelProvider: params.modelProvider as string | undefined,
       modelId: params.modelId as string | undefined,
-      brainType: params.brainType as string | undefined,
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
       modelConfig: params.modelConfig as PromptOptions["modelConfig"],
@@ -163,6 +164,64 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.steerSession(sessionId, text);
     return { ok: true };
+  });
+
+  rpcMethods.set("chat.clearQueue", async (params) => {
+    const userId = params.userId as string;
+    const agentId = params.agentId as string;
+    const sessionId = params.sessionId as string;
+    if (!userId || !agentId || !sessionId) throw new Error("userId, agentId, sessionId required");
+
+    const handle = await agentBoxManager.getOrCreate(userId, agentId);
+    const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+    const cleared = await client.clearQueue(sessionId);
+    return { ok: true, ...cleared };
+  });
+
+  rpcMethods.set("agent.clearMemory", async (params) => {
+    const userId = params.userId as string;
+    const agentId = params.agentId as string;
+    if (!userId || !agentId) throw new Error("userId, agentId required");
+
+    // Compute memory directory on PVC
+    const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+    const userDataBase = "/app/.siclaw/user-data";
+    const memoryDir = path.resolve(userDataBase, "users", sanitize(userId), sanitize(agentId), "memory");
+
+    // Delete memory files
+    let deletedFiles = 0;
+    if (fs.existsSync(memoryDir)) {
+      const investigationsDir = path.join(memoryDir, "investigations");
+      if (fs.existsSync(investigationsDir)) {
+        const invFiles = fs.readdirSync(investigationsDir).filter((f: string) => f.endsWith(".md"));
+        deletedFiles += invFiles.length;
+        fs.rmSync(investigationsDir, { recursive: true });
+      }
+      for (const entry of fs.readdirSync(memoryDir)) {
+        if (entry === "PROFILE.md") continue;
+        const fullPath = path.join(memoryDir, entry);
+        if (fs.statSync(fullPath).isFile() && !entry.startsWith(".memory.db")) {
+          fs.unlinkSync(fullPath);
+          if (entry.endsWith(".md")) deletedFiles++;
+        }
+      }
+    }
+
+    console.log(`[rpc] agent.clearMemory: deleted ${deletedFiles} files in ${memoryDir}`);
+
+    // Notify AgentBox to reset indexer
+    try {
+      const handle = await agentBoxManager.getAsync(userId, agentId);
+      if (handle) {
+        const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
+        await client.resetMemory();
+        console.log("[rpc] agent.clearMemory: AgentBox notified to reset indexer");
+      }
+    } catch (err: any) {
+      console.warn(`[rpc] agent.clearMemory: AgentBox notify failed: ${err.message}`);
+    }
+
+    return { ok: true, deletedFiles };
   });
 
   // ── REST API Router (Siclaw CRUD) ────────────────────────
@@ -339,7 +398,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           // Settings (model providers + entries) — from Runtime DB
           if (url === "/api/internal/settings" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            handleSettings(req, res, identity);
+            handleSettings(req, res, identity, config);
             return;
           }
 
