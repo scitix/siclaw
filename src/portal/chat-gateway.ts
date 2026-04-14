@@ -1,11 +1,12 @@
 /**
  * Chat gateway — bridges the frontend (HTTP/SSE) to the Runtime (WebSocket).
  *
- * POST /api/v1/siclaw/agents/:id/chat/send  → SSE streaming
- * POST /api/v1/siclaw/agents/:id/run         → synchronous execution
+ * POST /api/v1/siclaw/agents/:id/chat/send  → SSE streaming (JWT auth, web frontend)
+ * POST /api/v1/run                           → synchronous execution (API key auth, external)
  */
 
 import crypto from "node:crypto";
+import http from "node:http";
 import {
   sendJson,
   parseBody,
@@ -13,6 +14,40 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { resolveAgentModelBinding } from "../gateway/agent-model-binding.js";
+import { getDb } from "../gateway/db.js";
+
+// ── API key authentication ──────────────────────────────────
+
+interface ApiKeyAuthResult {
+  agentId: string;
+  keyId: string;
+  keyName: string;
+  createdBy: string;
+}
+
+async function authenticateApiKey(req: http.IncomingMessage): Promise<ApiKeyAuthResult | null> {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer sk-")) return null;
+
+  const plaintext = auth.slice(7);
+  const keyHash = crypto.createHash("sha256").update(plaintext).digest("hex");
+
+  const db = getDb();
+  const [rows] = await db.query(
+    `SELECT id, agent_id, name, expires_at, created_by
+     FROM agent_api_keys WHERE key_hash = ? LIMIT 1`,
+    [keyHash],
+  ) as any;
+
+  if (rows.length === 0) return null;
+  const key = rows[0];
+
+  if (key.expires_at && new Date(key.expires_at) < new Date()) return null;
+
+  db.query("UPDATE agent_api_keys SET last_used_at = NOW(3) WHERE id = ?", [key.id]).catch(() => {});
+
+  return { agentId: key.agent_id, keyId: key.id, keyName: key.name, createdBy: key.created_by };
+}
 import WebSocket from "ws";
 
 /** Send an SSE event to the response stream. No-op if the stream is already closed. */
@@ -226,55 +261,51 @@ export function registerChatRoutes(
     sendJson(res, result.ok ? 200 : 502, result);
   });
 
-  // POST /api/v1/siclaw/agents/:id/run — synchronous execution
-  router.post("/api/v1/siclaw/agents/:id/run", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+  // ================================================================
+  // POST /api/v1/run — External API (API key auth, agent resolved from key)
+  // ================================================================
 
-    const body = await parseBody<{ text?: string; session_id?: string; mode?: string }>(req);
+  router.post("/api/v1/run", async (req, res) => {
+    const keyAuth = await authenticateApiKey(req);
+    if (!keyAuth) {
+      sendJson(res, 401, {
+        error: "Invalid or expired API key",
+        hint: "Use Authorization: Bearer sk-xxx header with a valid API key",
+      });
+      return;
+    }
+
+    const body = await parseBody<{ text?: string; session_id?: string }>(req);
     if (!body.text) { sendJson(res, 400, { error: "text is required" }); return; }
 
-    const agentId = params.id;
+    const agentId = keyAuth.agentId;
     const sessionId = body.session_id ?? crypto.randomUUID();
     const reqId = rpcId();
 
     const modelBinding = await resolveAgentModelBinding(agentId);
     if (!modelBinding) {
-      sendJson(res, 400, { error: "Agent has no model configured, or the bound provider/model was not found" });
+      sendJson(res, 400, { error: "Agent has no model configured" });
       return;
     }
 
-    // Connect to Runtime WS
     const wsUrl = `${runtimeWsUrl}/ws`;
     const ws = new WebSocket(wsUrl, {
-      headers: {
-        "X-Auth-Token": runtimeSecret,
-        "X-Agent-Id": agentId,
-      },
+      headers: { "X-Auth-Token": runtimeSecret, "X-Agent-Id": agentId },
     });
 
     let assistantText = "";
     let resolved = false;
 
     const timeout = setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        ws.close();
-        sendJson(res, 504, { error: "Execution timeout" });
-      }
-    }, 300_000); // 5 minutes
+      if (!resolved) { resolved = true; ws.close(); sendJson(res, 504, { error: "Execution timeout" }); }
+    }, 300_000);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({
-        type: "req",
-        id: reqId,
-        method: "chat.send",
+        type: "req", id: reqId, method: "chat.send",
         params: {
-          agentId,
-          userId: auth.userId,
-          text: body.text,
-          sessionId,
-          mode: body.mode,
+          agentId, userId: keyAuth.createdBy, text: body.text,
+          sessionId, mode: "api",
           modelProvider: modelBinding.modelProvider,
           modelId: modelBinding.modelId,
           modelConfig: modelBinding.modelConfig,
@@ -285,76 +316,41 @@ export function registerChatRoutes(
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString()) as {
-          type: string;
-          id?: string;
-          ok?: boolean;
-          event?: string;
-          payload?: Record<string, unknown>;
-          error?: string;
+          type: string; id?: string; ok?: boolean;
+          event?: string; payload?: Record<string, unknown>; error?: string;
         };
 
         if (msg.type === "res" && msg.id === reqId && !msg.ok) {
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            ws.close();
-            sendJson(res, 500, { error: msg.error ?? "RPC failed" });
-          }
+          if (!resolved) { resolved = true; clearTimeout(timeout); ws.close(); sendJson(res, 500, { error: msg.error ?? "Execution failed" }); }
           return;
         }
 
         if (msg.type === "event" && msg.event === "chat.event" && msg.payload) {
           const evt = msg.payload.event as Record<string, unknown> | undefined;
           if (evt) {
-            if (evt.type === "agent_message" && typeof evt.text === "string") {
-              assistantText += evt.text;
-            }
-
-            // Accumulate pi-agent text deltas so /run callers (task-service)
-            // receive the final assistant text, not an empty string.
+            if (evt.type === "agent_message" && typeof evt.text === "string") assistantText += evt.text;
             if (evt.type === "message_update") {
               const ame = (evt as any).assistantMessageEvent;
-              if (ame?.type === "text_delta" && typeof ame.delta === "string") {
-                assistantText += ame.delta;
-              }
+              if (ame?.type === "text_delta" && typeof ame.delta === "string") assistantText += ame.delta;
             }
-
-            // Align with /chat/send terminal events — pi-agent emits agent_end,
-            // not turn_complete, so /run was previously hanging until timeout.
             if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
               if (!resolved) {
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                // Runtime already persisted the trace via sse-consumer.
-                sendJson(res, 200, {
-                  sessionId,
-                  text: assistantText,
-                });
+                resolved = true; clearTimeout(timeout); ws.close();
+                sendJson(res, 200, { session_id: sessionId, agent_id: agentId, text: assistantText, status: "success" });
               }
             }
           }
         }
-      } catch (err) {
-        console.error("[chat-gateway] Failed to parse WS message:", err);
-      }
+      } catch (err) { console.error("[api-run] Failed to parse WS message:", err); }
     });
 
     ws.on("error", (err) => {
-      console.error("[chat-gateway] WS error:", err.message);
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        sendJson(res, 502, { error: "Runtime connection failed" });
-      }
+      console.error("[api-run] WS error:", err.message);
+      if (!resolved) { resolved = true; clearTimeout(timeout); sendJson(res, 502, { error: "Runtime connection failed" }); }
     });
 
     ws.on("close", () => {
-      if (!resolved) {
-        resolved = true;
-        clearTimeout(timeout);
-        sendJson(res, 502, { error: "Runtime connection closed unexpectedly" });
-      }
+      if (!resolved) { resolved = true; clearTimeout(timeout); sendJson(res, 502, { error: "Runtime connection closed unexpectedly" }); }
     });
   });
 }

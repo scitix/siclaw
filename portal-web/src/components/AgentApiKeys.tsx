@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Plus, Copy, Trash2, KeyRound, Loader2 } from "lucide-react"
+import { Plus, Copy, Trash2, KeyRound, Loader2, ChevronDown, ChevronRight, Terminal, Code2 } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { useConfirm } from "./confirm-dialog"
@@ -261,6 +261,189 @@ export function AgentApiKeys({ agentId }: AgentApiKeysProps) {
           </div>
         )}
       </div>
+
+      {/* Usage Guide */}
+      {keys.length > 0 && <ApiUsageGuide apiKey={keys[0]?.key_plain || "sk-your-api-key"} />}
+    </div>
+  )
+}
+
+// ── API Usage Guide ─────────────────────────────────────────
+
+function CodeBlock({ code }: { code: string }) {
+  const toast = useToast()
+  return (
+    <div className="relative group">
+      <pre className="bg-[#1e1e1e] rounded-lg px-4 py-3 text-[12px] font-mono leading-relaxed overflow-x-auto text-gray-300">
+        <code>{code}</code>
+      </pre>
+      <button
+        onClick={() => { navigator.clipboard.writeText(code); toast.success("Copied") }}
+        className="absolute top-2 right-2 p-1.5 rounded-md bg-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-opacity"
+        title="Copy"
+      >
+        <Copy className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  )
+}
+
+function ApiUsageGuide({ apiKey }: { apiKey: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const [activeTab, setActiveTab] = useState<"curl" | "python" | "node">("curl")
+  const baseUrl = `${window.location.protocol}//${window.location.host}`
+  const maskedKey = apiKey.slice(0, 7) + "..." + apiKey.slice(-4)
+
+  const curlExample = `curl -X POST ${baseUrl}/api/v1/run \\
+  -H "Authorization: Bearer ${maskedKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"text": "List all pods in kube-system namespace"}'`
+
+  const curlSessionExample = `# Continue a conversation (pass session_id from previous response)
+curl -X POST ${baseUrl}/api/v1/run \\
+  -H "Authorization: Bearer ${maskedKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "text": "Show me the logs of coredns",
+    "session_id": "SESSION_ID_FROM_PREVIOUS_RESPONSE"
+  }'`
+
+  const pythonExample = `import requests
+
+response = requests.post(
+    "${baseUrl}/api/v1/run",
+    headers={
+        "Authorization": "Bearer ${maskedKey}",
+        "Content-Type": "application/json",
+    },
+    json={"text": "List all pods in kube-system namespace"},
+    timeout=300,
+)
+
+data = response.json()
+print(data["text"])        # Agent's response
+print(data["session_id"])  # Use this to continue the conversation`
+
+  const nodeExample = `const response = await fetch("${baseUrl}/api/v1/run", {
+  method: "POST",
+  headers: {
+    "Authorization": "Bearer ${maskedKey}",
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    text: "List all pods in kube-system namespace",
+  }),
+});
+
+const data = await response.json();
+console.log(data.text);        // Agent's response
+console.log(data.session_id);  // Use this to continue the conversation`
+
+  const tabs = [
+    { id: "curl" as const, label: "cURL", icon: Terminal },
+    { id: "python" as const, label: "Python", icon: Code2 },
+    { id: "node" as const, label: "Node.js", icon: Code2 },
+  ]
+
+  return (
+    <div className="border-t border-border">
+      <button onClick={() => setExpanded(!expanded)}
+        className="w-full flex items-center gap-2 px-6 py-3 text-[12px] font-medium text-muted-foreground hover:text-foreground transition-colors">
+        {expanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+        API Usage Guide
+      </button>
+
+      {expanded && (
+        <div className="px-6 pb-6 space-y-4">
+          {/* Endpoint info */}
+          <div className="rounded-lg border border-border overflow-hidden">
+            <div className="px-4 py-2.5 bg-secondary/30 flex items-center gap-3">
+              <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-green-500/20 text-green-400">POST</span>
+              <code className="text-[13px] font-mono">{baseUrl}/api/v1/run</code>
+            </div>
+            <div className="px-4 py-3 space-y-2 text-[12px] text-muted-foreground">
+              <p>Send a message to the agent and receive the complete response synchronously.</p>
+              <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 mt-3">
+                <span className="font-medium text-foreground">Auth</span>
+                <span><code className="px-1 py-0.5 rounded bg-secondary font-mono text-[11px]">Authorization: Bearer sk-xxx</code></span>
+                <span className="font-medium text-foreground">Body</span>
+                <span><code className="px-1 py-0.5 rounded bg-secondary font-mono text-[11px]">{"{"}"text": "your question", "session_id": "optional"{"}"}</code></span>
+                <span className="font-medium text-foreground">Timeout</span>
+                <span>5 minutes (agent may take time to run diagnostics)</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Response format */}
+          <div className="rounded-lg border border-border overflow-hidden">
+            <div className="px-4 py-2.5 bg-secondary/30">
+              <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">Response</span>
+            </div>
+            <div className="px-4 py-3">
+              <CodeBlock code={`{
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_id": "agent-uuid",
+  "text": "Found 5 pods in kube-system namespace:\\n...",
+  "status": "success"
+}`} />
+              <div className="mt-2 text-[11px] text-muted-foreground space-y-1">
+                <p><code className="font-mono text-foreground">session_id</code> — Pass this in subsequent requests to continue the same conversation</p>
+                <p><code className="font-mono text-foreground">text</code> — The agent's complete response (may include markdown)</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Code examples with tabs */}
+          <div className="rounded-lg border border-border overflow-hidden">
+            <div className="px-4 py-2 bg-secondary/30 flex items-center gap-1">
+              {tabs.map(tab => (
+                <button key={tab.id} onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-[11px] font-medium transition-colors ${
+                    activeTab === tab.id ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                  }`}>
+                  <tab.icon className="h-3 w-3" />
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+            <div className="p-4 space-y-3">
+              {activeTab === "curl" && (
+                <>
+                  <CodeBlock code={curlExample} />
+                  <p className="text-[11px] text-muted-foreground font-medium mt-3">Multi-turn conversation:</p>
+                  <CodeBlock code={curlSessionExample} />
+                </>
+              )}
+              {activeTab === "python" && <CodeBlock code={pythonExample} />}
+              {activeTab === "node" && <CodeBlock code={nodeExample} />}
+            </div>
+          </div>
+
+          {/* Error codes */}
+          <div className="rounded-lg border border-border overflow-hidden">
+            <div className="px-4 py-2.5 bg-secondary/30">
+              <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">Error Codes</span>
+            </div>
+            <div className="divide-y divide-border/50">
+              {[
+                { code: "401", desc: "Invalid or expired API key" },
+                { code: "400", desc: "Missing text parameter or agent has no model configured" },
+                { code: "500", desc: "Agent execution failed" },
+                { code: "502", desc: "Runtime unavailable" },
+                { code: "504", desc: "Execution timeout (5 minutes)" },
+              ].map(err => (
+                <div key={err.code} className="flex items-center gap-3 px-4 py-2">
+                  <code className={`text-[11px] font-mono font-bold ${
+                    err.code === "401" || err.code === "400" ? "text-yellow-400" :
+                    err.code === "504" ? "text-orange-400" : "text-red-400"
+                  }`}>{err.code}</code>
+                  <span className="text-[12px] text-muted-foreground">{err.desc}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
