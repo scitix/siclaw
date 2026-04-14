@@ -88,6 +88,7 @@ export function startPortal(config: PortalConfig): http.Server {
     // Proxy Siclaw domain APIs to Runtime
     if (
       url.startsWith("/api/v1/siclaw/skills") ||
+      url.startsWith("/api/v1/siclaw/reviews") ||
       url.startsWith("/api/v1/siclaw/mcp") ||
       url.startsWith("/api/v1/siclaw/cron") ||
       url.startsWith("/api/v1/siclaw/admin") ||

@@ -42,6 +42,9 @@ COPY --from=backend-builder /app/dist/ ./dist/
 # Frontend static files → served by Portal server
 COPY --from=frontend-builder /app/portal-web/dist/ ./portal-web/dist/
 
+# Builtin skills (synced to DB on startup by builtin-sync.ts)
+COPY skills/core/ ./skills/core/
+
 ENV NODE_ENV=production
 ENV PORTAL_PORT=3003
 

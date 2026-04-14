@@ -18,16 +18,11 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve } from "node:path";
 import { getDb } from "../db.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// Resolve the skills/core/ directory relative to the project root.
-// In the Docker image the project root is the CWD; in dev it is two levels
-// above src/gateway/skills/.
-const SKILLS_CORE_DIR = resolve(__dirname, "../../../../skills/core");
+// Resolve skills/core/ relative to CWD (project root in both dev and Docker).
+const SKILLS_CORE_DIR = resolve(process.cwd(), "skills/core");
 
 interface ScriptEntry {
   name: string;
@@ -59,20 +54,24 @@ function parseFrontmatter(md: string): { name: string; description: string } {
 
   // description: may be a YAML block scalar (>-, >, |) or inline
   let description = "";
-  const descMatch = block.match(/^description:\s*([\s\S]*?)(?=\n\S|\n?$)/m);
-  if (descMatch) {
-    const raw = descMatch[1].trim();
-    // Strip YAML block scalar indicators and collapse folded lines
-    description = raw
-      .replace(/^>-?\s*\n/, "")
-      .replace(/^[|>][-+]?\s*\n/, "")
-      .split("\n")
-      .map((l) => l.trim())
-      .join(" ")
-      .trim();
-    if (!description) {
+  const lines = block.split("\n");
+  const descIdx = lines.findIndex(l => l.match(/^description:\s/));
+  if (descIdx >= 0) {
+    const firstLine = lines[descIdx].replace(/^description:\s*/, "").trim();
+    if (firstLine === ">-" || firstLine === ">" || firstLine === "|" || firstLine === "|-") {
+      // Block scalar: collect indented continuation lines
+      const contLines: string[] = [];
+      for (let i = descIdx + 1; i < lines.length; i++) {
+        if (lines[i].match(/^\s+/)) {
+          contLines.push(lines[i].trim());
+        } else {
+          break;
+        }
+      }
+      description = contLines.join(" ");
+    } else {
       // Inline scalar
-      description = raw.replace(/^>-?\s*|^[|>][-+]?\s*/, "").trim();
+      description = firstLine;
     }
   }
 
@@ -150,7 +149,8 @@ export async function syncBuiltinSkills(
 
   for (const skill of entries) {
     const hash = computeHash(skill.specs, skill.scripts);
-    const specsJson = JSON.stringify(skill.specs);
+    // specs is MEDIUMTEXT — store raw string, not JSON-encoded
+    const specsRaw = skill.specs;
     const scriptsJson = JSON.stringify(skill.scripts);
     const labelsJson = JSON.stringify(skill.labels);
 
@@ -168,13 +168,13 @@ export async function syncBuiltinSkills(
       await db.query(
         `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
          VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, 'system')`,
-        [skillId, orgId, skill.name, skill.description, labelsJson, specsJson, scriptsJson],
+        [skillId, orgId, skill.name, skill.description, labelsJson, specsRaw, scriptsJson],
       );
 
       await db.query(
         `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
          VALUES (?, ?, 1, ?, ?, 'Initial builtin import', 'system', 1)`,
-        [versionId, skillId, specsJson, scriptsJson],
+        [versionId, skillId, specsRaw, scriptsJson],
       );
 
       inserted++;
@@ -182,12 +182,20 @@ export async function syncBuiltinSkills(
     }
 
     // ── Existing skill ────────────────────────────────────
-    // mysql2 auto-decodes JSON columns; specs is mediumtext (string), scripts is JSON (already parsed).
-    const existing = rows[0] as { id: string; version: number; specs: string; scripts: unknown };
-    const currentHash = computeHash(
-      JSON.parse(existing.specs as string),
-      (typeof existing.scripts === "string" ? JSON.parse(existing.scripts) : existing.scripts) as ScriptEntry[],
-    );
+    const existing = rows[0] as { id: string; version: number; specs: any; scripts: any };
+    // specs is MEDIUMTEXT — should be a raw string, but may be double-encoded from old bug
+    let existingSpecs: string = typeof existing.specs === "string" ? existing.specs : String(existing.specs || "");
+    if (existingSpecs.startsWith('"')) { try { existingSpecs = JSON.parse(existingSpecs); } catch { /* keep */ } }
+    // scripts is JSON column — MySQL driver may return string or parsed object
+    let existingScripts: ScriptEntry[];
+    if (Array.isArray(existing.scripts)) {
+      existingScripts = existing.scripts;
+    } else if (typeof existing.scripts === "string") {
+      try { existingScripts = JSON.parse(existing.scripts); } catch { existingScripts = []; }
+    } else {
+      existingScripts = [];
+    }
+    const currentHash = computeHash(existingSpecs, existingScripts);
 
     if (currentHash === hash) {
       // Content identical — nothing to do
@@ -202,11 +210,14 @@ export async function syncBuiltinSkills(
     );
 
     if (v1Rows.length > 0) {
-      const v1 = v1Rows[0] as { specs: string; scripts: unknown };
-      const v1Hash = computeHash(
-        JSON.parse(v1.specs as string),
-        (typeof v1.scripts === "string" ? JSON.parse(v1.scripts) : v1.scripts) as ScriptEntry[],
-      );
+      const v1 = v1Rows[0] as { specs: any; scripts: any };
+      let v1Specs: string = typeof v1.specs === "string" ? v1.specs : String(v1.specs || "");
+      if (v1Specs.startsWith('"')) { try { v1Specs = JSON.parse(v1Specs); } catch { /* keep */ } }
+      let v1Scripts: ScriptEntry[];
+      if (Array.isArray(v1.scripts)) { v1Scripts = v1.scripts; }
+      else if (typeof v1.scripts === "string") { try { v1Scripts = JSON.parse(v1.scripts); } catch { v1Scripts = []; } }
+      else { v1Scripts = []; }
+      const v1Hash = computeHash(v1Specs, v1Scripts);
 
       if (v1Hash !== currentHash) {
         // User has edited since v1 — leave their version alone
@@ -223,13 +234,13 @@ export async function syncBuiltinSkills(
     await db.query(
       `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP(3)
        WHERE id = ?`,
-      [skill.description, labelsJson, newVersion, specsJson, scriptsJson, existing.id],
+      [skill.description, labelsJson, newVersion, specsRaw, scriptsJson, existing.id],
     );
 
     await db.query(
       `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
        VALUES (?, ?, ?, ?, ?, 'Builtin update from image', 'system', 1)`,
-      [versionId, existing.id, newVersion, specsJson, scriptsJson],
+      [versionId, existing.id, newVersion, specsRaw, scriptsJson],
     );
 
     updated++;
