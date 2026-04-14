@@ -130,8 +130,6 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
-  // Migration: add can_review_skills to users
-  `ALTER TABLE siclaw_users ADD COLUMN can_review_skills TINYINT(1) NOT NULL DEFAULT 0 AFTER role`,
 ];
 
 export async function runPortalMigrations(): Promise<void> {
