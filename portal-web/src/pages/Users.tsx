@@ -164,11 +164,11 @@ export function Users() {
                     </div>
                   </div>
                   <div className="flex items-center gap-1">
-                    <button onClick={() => startEdit(u)} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
+                    <button onClick={() => startEdit(u)} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
                       <Settings className="h-4 w-4" />
                     </button>
                     {u.role !== "admin" && (
-                      <button onClick={() => handleDelete(u)} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                      <button onClick={() => handleDelete(u)} title="Delete" className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
                         <Trash2 className="h-4 w-4" />
                       </button>
                     )}

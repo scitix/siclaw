@@ -103,8 +103,8 @@ function SessionSidebar({
                     autoFocus
                     className="flex-1 h-6 px-1.5 text-[12px] rounded border border-border bg-background min-w-0"
                   />
-                  <button onClick={handleSaveRename} className="p-0.5 rounded hover:bg-secondary text-green-400"><Check className="h-3 w-3" /></button>
-                  <button onClick={() => setRenamingId(null)} className="p-0.5 rounded hover:bg-secondary text-muted-foreground"><X className="h-3 w-3" /></button>
+                  <button onClick={handleSaveRename} title="Save" className="p-0.5 rounded hover:bg-secondary text-green-400"><Check className="h-3 w-3" /></button>
+                  <button onClick={() => setRenamingId(null)} title="Cancel" className="p-0.5 rounded hover:bg-secondary text-muted-foreground"><X className="h-3 w-3" /></button>
                 </div>
               ) : (
                 <>
@@ -115,8 +115,8 @@ function SessionSidebar({
                     </p>
                   </div>
                   <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
-                    <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} className="p-1 rounded hover:bg-secondary text-muted-foreground"><Pencil className="h-3 w-3" /></button>
-                    <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} className="p-1 rounded hover:bg-destructive/20 hover:text-red-400 text-muted-foreground"><Trash2 className="h-3 w-3" /></button>
+                    <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} title="Rename" className="p-1 rounded hover:bg-secondary text-muted-foreground"><Pencil className="h-3 w-3" /></button>
+                    <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} title="Delete" className="p-1 rounded hover:bg-destructive/20 hover:text-red-400 text-muted-foreground"><Trash2 className="h-3 w-3" /></button>
                   </div>
                 </>
               )}
