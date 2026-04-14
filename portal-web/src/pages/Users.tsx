@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Plus, Users as UsersIcon, Trash2, Loader2, Settings, X } from "lucide-react"
+import { Plus, Users as UsersIcon, Trash2, Loader2, Settings } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -18,7 +18,7 @@ export function Users() {
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState({ username: "", password: "", can_review_skills: false })
   const [creating, setCreating] = useState(false)
-  const [editUser, setEditUser] = useState<User | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [editForm, setEditForm] = useState({ can_review_skills: false, password: "" })
   const [saving, setSaving] = useState(false)
   const toast = useToast()
@@ -69,33 +69,33 @@ export function Users() {
     }
   }
 
-  const openEdit = (u: User) => {
-    setEditUser(u)
+  const startEdit = (u: User) => {
+    setEditingId(u.id)
     setEditForm({ can_review_skills: !!u.can_review_skills, password: "" })
   }
 
   const handleSaveEdit = async () => {
-    if (!editUser) return
+    if (!editingId) return
+    const user = users.find((u) => u.id === editingId)
+    if (!user) return
     setSaving(true)
     try {
-      // Update permissions (non-admin only)
-      if (editUser.role !== "admin") {
-        const updated = await api<User>(`/users/${editUser.id}`, {
+      if (user.role !== "admin") {
+        const updated = await api<User>(`/users/${editingId}`, {
           method: "PUT",
           body: { can_review_skills: editForm.can_review_skills },
         })
-        setUsers((prev) => prev.map((x) => x.id === editUser.id ? updated : x))
+        setUsers((prev) => prev.map((x) => x.id === editingId ? updated : x))
       }
 
-      // Reset password if provided
       if (editForm.password.trim()) {
-        await api(`/users/${editUser.id}/password`, {
+        await api(`/users/${editingId}/password`, {
           method: "PUT",
           body: { password: editForm.password },
         })
       }
 
-      setEditUser(null)
+      setEditingId(null)
       toast.success("User updated")
     } catch (err: any) {
       toast.error(err.message)
@@ -144,82 +144,69 @@ export function Users() {
         ) : (
           <div className="px-6 py-4 space-y-2">
             {users.map((u) => (
-              <div key={u.id} className="flex items-center justify-between p-3 rounded-lg border border-border/50 hover:bg-secondary/30">
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center justify-center w-8 h-8 rounded-full bg-secondary text-foreground text-sm font-medium">
-                    {u.username.charAt(0).toUpperCase()}
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-sm font-medium">{u.username}</p>
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] ${u.role === "admin" ? "bg-amber-500/20 text-amber-400" : "bg-blue-500/20 text-blue-400"}`}>
-                        {u.role.toUpperCase()}
-                      </span>
-                      {!!u.can_review_skills && (
-                        <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-500/20 text-green-400">REVIEWER</span>
-                      )}
+              <div key={u.id}>
+                <div className="flex items-center justify-between p-3 rounded-lg border border-border/50 hover:bg-secondary/30">
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center justify-center w-8 h-8 rounded-full bg-secondary text-foreground text-sm font-medium">
+                      {u.username.charAt(0).toUpperCase()}
                     </div>
-                    <p className="text-xs text-muted-foreground">Created {new Date(u.created_at).toLocaleDateString()}</p>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm font-medium">{u.username}</p>
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] ${u.role === "admin" ? "bg-amber-500/20 text-amber-400" : "bg-blue-500/20 text-blue-400"}`}>
+                          {u.role.toUpperCase()}
+                        </span>
+                        {!!u.can_review_skills && (
+                          <span className="px-1.5 py-0.5 rounded text-[10px] bg-green-500/20 text-green-400">REVIEWER</span>
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground">Created {new Date(u.created_at).toLocaleDateString()}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <button onClick={() => startEdit(u)} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
+                      <Settings className="h-4 w-4" />
+                    </button>
+                    {u.role !== "admin" && (
+                      <button onClick={() => handleDelete(u)} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
                   </div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <button onClick={() => openEdit(u)} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
-                    <Settings className="h-4 w-4" />
-                  </button>
-                  {u.role !== "admin" && (
-                    <button onClick={() => handleDelete(u)} title="Delete user" className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  )}
-                </div>
+                {editingId === u.id && (
+                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-3">
+                    {u.role !== "admin" && (
+                      <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={editForm.can_review_skills}
+                          onChange={(e) => setEditForm({ ...editForm, can_review_skills: e.target.checked })}
+                        />
+                        Can review skills
+                      </label>
+                    )}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-muted-foreground">Reset Password</label>
+                      <input
+                        type="password"
+                        placeholder="Leave empty to keep current"
+                        value={editForm.password}
+                        onChange={(e) => setEditForm({ ...editForm, password: e.target.value })}
+                        className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background"
+                      />
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={handleSaveEdit} disabled={saving} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
+                      <button onClick={() => setEditingId(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
       </div>
-
-      {/* Edit dialog */}
-      {editUser && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setEditUser(null)}>
-          <div className="w-[400px] rounded-lg border border-border bg-card p-6 space-y-4" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold">User Settings — {editUser.username}</h2>
-              <button onClick={() => setEditUser(null)} className="p-1 rounded-md text-muted-foreground hover:text-foreground">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3">
-              {editUser.role !== "admin" && (
-                <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={editForm.can_review_skills}
-                    onChange={(e) => setEditForm({ ...editForm, can_review_skills: e.target.checked })}
-                  />
-                  Can review skills
-                </label>
-              )}
-
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-muted-foreground">Reset Password</label>
-                <input
-                  type="password"
-                  placeholder="Leave empty to keep current"
-                  value={editForm.password}
-                  onChange={(e) => setEditForm({ ...editForm, password: e.target.value })}
-                  className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background"
-                />
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setEditUser(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
-              <button onClick={handleSaveEdit} disabled={saving} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

@@ -298,4 +298,60 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [rows] = await db.query(sql, params) as any;
     sendJson(res, 200, { hosts: rows });
   });
+
+  // GET /api/internal/siclaw/adapter/agent/:agentId/settings — provider + models for agentbox
+  router.get("/api/internal/siclaw/adapter/agent/:agentId/settings", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const [agentRows] = await db.query(
+      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      [params.agentId],
+    ) as any;
+
+    if (agentRows.length === 0 || !agentRows[0].model_provider) {
+      sendJson(res, 200, { providers: {} });
+      return;
+    }
+
+    const agent = agentRows[0] as { model_provider: string; model_id: string };
+
+    const [providerRows] = await db.query(
+      "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
+      [agent.model_provider],
+    ) as any;
+
+    if (providerRows.length === 0) {
+      sendJson(res, 200, { providers: {} });
+      return;
+    }
+
+    const p = providerRows[0];
+    const [modelRows] = await db.query(
+      `SELECT model_id, name, reasoning, context_window, max_tokens
+       FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
+      [p.id],
+    ) as any;
+
+    sendJson(res, 200, {
+      providers: {
+        [p.name]: {
+          baseUrl: p.base_url,
+          apiKey: p.api_key || "",
+          api: p.api_type,
+          models: (modelRows as any[]).map((m: any) => ({
+            id: m.model_id,
+            name: m.name || m.model_id,
+            reasoning: !!m.reasoning,
+            contextWindow: m.context_window,
+            maxTokens: m.max_tokens,
+          })),
+        },
+      },
+      default: { provider: agent.model_provider, modelId: agent.model_id },
+    });
+  });
 }

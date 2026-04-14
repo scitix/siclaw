@@ -46,6 +46,11 @@ export function Models() {
   const [modelForm, setModelForm] = useState({ model_id: "", name: "", context_window: "128000", max_tokens: "65536", reasoning: false, is_default: false })
   const [addingModel, setAddingModel] = useState(false)
 
+  // Edit model
+  const [editingModelId, setEditingModelId] = useState<string | null>(null)
+  const [editModelForm, setEditModelForm] = useState({ model_id: "", name: "", context_window: "", max_tokens: "", reasoning: false, is_default: false })
+  const [savingModel, setSavingModel] = useState(false)
+
   const fetchProviders = async () => {
     try {
       const res = await api<{ data: Provider[] }>("/siclaw/admin/models/providers")
@@ -118,6 +123,39 @@ export function Models() {
   const handleDeleteModel = async (providerId: string, modelId: string) => {
     await api(`/siclaw/admin/models/providers/${providerId}/models/${modelId}`, { method: "DELETE" })
     await fetchProviders()
+  }
+
+  const startEditModel = (model: ModelEntry) => {
+    setEditingModelId(model.id)
+    setEditModelForm({
+      model_id: model.model_id,
+      name: model.name || "",
+      context_window: String(model.context_window),
+      max_tokens: String(model.max_tokens),
+      reasoning: !!model.reasoning,
+      is_default: !!model.is_default,
+    })
+  }
+
+  const handleSaveModel = async (providerId: string) => {
+    if (!editingModelId) return
+    setSavingModel(true)
+    try {
+      await api(`/siclaw/admin/models/providers/${providerId}/models/${editingModelId}`, {
+        method: "PUT",
+        body: {
+          model_id: editModelForm.model_id,
+          name: editModelForm.name,
+          context_window: parseInt(editModelForm.context_window),
+          max_tokens: parseInt(editModelForm.max_tokens),
+          reasoning: editModelForm.reasoning,
+          is_default: editModelForm.is_default,
+        },
+      })
+      setEditingModelId(null)
+      await fetchProviders()
+      toast.success("Model updated")
+    } catch (err: any) { toast.error(err.message) } finally { setSavingModel(false) }
   }
 
   if (loading) return <div className="flex items-center justify-center h-full"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
@@ -209,15 +247,38 @@ export function Models() {
                     {provider.models && provider.models.length > 0 && (
                       <div className="space-y-1.5 mb-3">
                         {provider.models.map((model) => (
-                          <div key={model.id} className="flex items-center justify-between px-3 py-2 rounded-md bg-card border border-border/30">
-                            <div>
-                              <p className="text-sm font-mono">{model.model_id}</p>
-                              <p className="text-xs text-muted-foreground">
-                                {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""} · {(model.context_window / 1000).toFixed(0)}K
-                                {model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
-                              </p>
+                          <div key={model.id}>
+                            <div className="flex items-center justify-between px-3 py-2 rounded-md bg-card border border-border/30">
+                              <div>
+                                <p className="text-sm font-mono">{model.model_id}</p>
+                                <p className="text-xs text-muted-foreground">
+                                  {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""} · {(model.context_window / 1000).toFixed(0)}K
+                                  {model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                <button onClick={() => startEditModel(model)} className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
+                                <button onClick={() => handleDeleteModel(provider.id, model.id)} className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
+                              </div>
                             </div>
-                            <button onClick={() => handleDeleteModel(provider.id, model.id)} className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
+                            {editingModelId === model.id && (
+                              <div className="ml-4 mt-1.5 mb-1.5 p-3 rounded-md border border-border bg-card space-y-2">
+                                <div className="grid grid-cols-2 gap-2">
+                                  <input placeholder="Model ID *" value={editModelForm.model_id} onChange={(e) => setEditModelForm({ ...editModelForm, model_id: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
+                                  <input placeholder="Display Name" value={editModelForm.name} onChange={(e) => setEditModelForm({ ...editModelForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                                  <input placeholder="Context Window" value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                                  <input placeholder="Max Tokens" value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                                </div>
+                                <div className="flex items-center gap-4">
+                                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={editModelForm.reasoning} onChange={(e) => setEditModelForm({ ...editModelForm, reasoning: e.target.checked })} /> Reasoning</label>
+                                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={editModelForm.is_default} onChange={(e) => setEditModelForm({ ...editModelForm, is_default: e.target.checked })} /> Default</label>
+                                </div>
+                                <div className="flex gap-2">
+                                  <button onClick={() => handleSaveModel(provider.id)} disabled={savingModel || !editModelForm.model_id} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">{savingModel ? "..." : "Save"}</button>
+                                  <button onClick={() => setEditingModelId(null)} className="h-7 px-3 text-xs rounded-md border border-border text-muted-foreground">Cancel</button>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
