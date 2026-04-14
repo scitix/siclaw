@@ -130,7 +130,32 @@ export interface AuthContext {
   role?: string;
 }
 
+/**
+ * Authenticate an incoming request.
+ *
+ * Two modes:
+ * 1. **JWT** (community Portal): Authorization: Bearer <jwt>
+ * 2. **Trusted proxy** (Upstream): X-Auth-Token matches SICLAW_RUNTIME_SECRET,
+ *    identity passed via X-Siclaw-User-Id / X-Siclaw-Org-Id / X-Siclaw-Username headers.
+ *    This allows Upstream to proxy requests without re-signing JWTs.
+ */
 export function requireAuth(req: http.IncomingMessage, jwtSecret: string): AuthContext | null {
+  // Trusted proxy mode — Upstream Go backend forwards identity via headers
+  const proxyToken = req.headers["x-auth-token"] as string | undefined;
+  const runtimeSecret = process.env.SICLAW_RUNTIME_SECRET;
+  if (proxyToken && runtimeSecret && proxyToken === runtimeSecret) {
+    const userId = req.headers["x-siclaw-user-id"] as string | undefined;
+    if (userId) {
+      return {
+        userId,
+        orgId: req.headers["x-siclaw-org-id"] as string | undefined,
+        username: req.headers["x-siclaw-username"] as string | undefined,
+        role: req.headers["x-siclaw-role"] as string | undefined,
+      };
+    }
+  }
+
+  // JWT mode — community Portal
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return null;
   const payload = verifyJwt(auth.slice(7), jwtSecret);
