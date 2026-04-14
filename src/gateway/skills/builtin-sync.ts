@@ -182,10 +182,11 @@ export async function syncBuiltinSkills(
     }
 
     // ── Existing skill ────────────────────────────────────
-    const existing = rows[0] as { id: string; version: number; specs: string; scripts: string };
+    // mysql2 auto-decodes JSON columns; specs is mediumtext (string), scripts is JSON (already parsed).
+    const existing = rows[0] as { id: string; version: number; specs: string; scripts: unknown };
     const currentHash = computeHash(
       JSON.parse(existing.specs as string),
-      JSON.parse(existing.scripts as string) as ScriptEntry[],
+      (typeof existing.scripts === "string" ? JSON.parse(existing.scripts) : existing.scripts) as ScriptEntry[],
     );
 
     if (currentHash === hash) {
@@ -201,10 +202,10 @@ export async function syncBuiltinSkills(
     );
 
     if (v1Rows.length > 0) {
-      const v1 = v1Rows[0] as { specs: string; scripts: string };
+      const v1 = v1Rows[0] as { specs: string; scripts: unknown };
       const v1Hash = computeHash(
         JSON.parse(v1.specs as string),
-        JSON.parse(v1.scripts as string) as ScriptEntry[],
+        (typeof v1.scripts === "string" ? JSON.parse(v1.scripts) : v1.scripts) as ScriptEntry[],
       );
 
       if (v1Hash !== currentHash) {

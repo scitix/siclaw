@@ -1528,12 +1528,13 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     const id = crypto.randomUUID();
     const db = getDb();
 
+    const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
     await db.query(
       `INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, auth.orgId, body.name, body.base_url,
-        body.api_key || null, body.api_type || "openai",
+        id, auth.orgId, trim(body.name), trim(body.base_url),
+        trim(body.api_key) || null, trim(body.api_type) || "openai",
         body.sort_order ?? 0,
       ],
     );
@@ -1560,6 +1561,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
       return;
     }
 
+    const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
     await db.query(
       `UPDATE model_providers SET
        name = COALESCE(?, name), base_url = COALESCE(?, base_url),
@@ -1567,8 +1569,8 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
        sort_order = COALESCE(?, sort_order)
        WHERE id = ?`,
       [
-        body.name ?? null, body.base_url ?? null,
-        body.api_key ?? null, body.api_type ?? null,
+        trim(body.name), trim(body.base_url),
+        trim(body.api_key), trim(body.api_type),
         body.sort_order ?? null, params.id,
       ],
     );
@@ -1620,11 +1622,13 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const id = crypto.randomUUID();
 
+    const trim = (v: unknown): string | null => (typeof v === "string" ? v.trim() : null);
+    const modelId = trim(body.model_id);
     await db.query(
       `INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, params.id, body.model_id, body.name || body.model_id,
+        id, params.id, modelId, trim(body.name) || modelId,
         body.reasoning ? 1 : 0, body.context_window ?? null,
         body.max_tokens ?? null, body.is_default ? 1 : 0,
         body.sort_order ?? 0,
