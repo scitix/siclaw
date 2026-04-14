@@ -15,6 +15,7 @@ import { SkillDetail } from "./pages/SkillDetail"
 import { MCP } from "./pages/MCP"
 import { Models } from "./pages/Models"
 import { Chat } from "./pages/Chat"
+import { Users } from "./pages/Users"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("token")
@@ -37,6 +38,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="skills/new" element={<SkillDetail />} />
         <Route path="skills/:id" element={<SkillDetail />} />
         <Route path="mcp" element={<MCP />} />
+        <Route path="settings/users" element={<Users />} />
         <Route path="settings/clusters" element={<Clusters />} />
         <Route path="settings/hosts" element={<Hosts />} />
         <Route path="settings/models" element={<Models />} />

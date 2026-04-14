@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRestRouter, sendJson } from "../gateway/rest-router.js";
+import { requireAdmin } from "./auth.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
 import { registerTaskRoutes } from "./task-api.js";
@@ -58,7 +59,7 @@ export function startPortal(config: PortalConfig): http.Server {
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
   registerTaskRoutes(router, config.jwtSecret);
 
-  const server = http.createServer((req, res) => {
+  const server = http.createServer(async (req, res) => {
     const url = req.url ?? "/";
 
     // CORS
@@ -97,6 +98,20 @@ export function startPortal(config: PortalConfig): http.Server {
       url.includes("/diagnostics") ||
       url.includes("/api-keys")
     ) {
+      // Admin-only routes (all methods)
+      const adminOnly =
+        url.startsWith("/api/v1/siclaw/admin") ||
+        url.startsWith("/api/v1/siclaw/cron") ||
+        url.includes("/channels") ||
+        url.includes("/diagnostics") ||
+        url.includes("/api-keys");
+      // MCP: read is open, write requires admin
+      const mcpWrite = url.startsWith("/api/v1/siclaw/mcp") && req.method !== "GET";
+
+      if (adminOnly || mcpWrite) {
+        const auth = requireAdmin(req, res, config.jwtSecret);
+        if (!auth) return;
+      }
       runtimeProxy(req, res);
       return;
     }

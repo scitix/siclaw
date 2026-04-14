@@ -5,7 +5,6 @@ import { api, setToken } from "../api"
 export function Login() {
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
-  const [isRegister, setIsRegister] = useState(false)
   const [error, setError] = useState("")
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
@@ -15,8 +14,7 @@ export function Login() {
     setError("")
     setLoading(true)
     try {
-      const endpoint = isRegister ? "/auth/register" : "/auth/login"
-      const res = await api<{ token: string }>(endpoint, {
+      const res = await api<{ token: string }>("/auth/login", {
         method: "POST",
         body: { username, password },
       })
@@ -33,9 +31,7 @@ export function Login() {
     <div className="min-h-screen flex items-center justify-center">
       <div className="w-[360px] p-8 rounded-lg border border-border bg-card">
         <h1 className="text-xl font-bold mb-1">Siclaw Portal</h1>
-        <p className="text-sm text-muted-foreground mb-6">
-          {isRegister ? "Create your admin account" : "Sign in to continue"}
-        </p>
+        <p className="text-sm text-muted-foreground mb-6">Sign in to continue</p>
         <form onSubmit={handleSubmit} className="space-y-4">
           <input
             type="text"
@@ -59,15 +55,9 @@ export function Login() {
             disabled={loading}
             className="w-full h-9 text-sm font-medium rounded-md bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? "..." : isRegister ? "Create Account" : "Sign In"}
+            {loading ? "..." : "Sign In"}
           </button>
         </form>
-        <button
-          onClick={() => setIsRegister(!isRegister)}
-          className="mt-4 text-xs text-muted-foreground hover:text-foreground w-full text-center"
-        >
-          {isRegister ? "Already have an account? Sign in" : "First time? Create an account"}
-        </button>
       </div>
     </div>
   )

@@ -1,7 +1,7 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu } from "lucide-react"
-import { clearToken } from "../api"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users } from "lucide-react"
+import { api, clearToken } from "../api"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
@@ -11,6 +11,7 @@ const siclawItems = [
 ]
 
 const settingsItems = [
+  { path: "/settings/users", label: "Users", icon: Users },
   { path: "/settings/clusters", label: "Clusters", icon: Server },
   { path: "/settings/hosts", label: "Hosts", icon: Monitor },
   { path: "/settings/models", label: "Models", icon: Cpu },
@@ -21,6 +22,13 @@ export function Layout() {
   const [settingsOpen, setSettingsOpen] = useState(
     location.pathname.startsWith("/settings")
   )
+  const [isAdmin, setIsAdmin] = useState(false)
+
+  useEffect(() => {
+    api<{ role: string }>("/auth/me")
+      .then((u) => setIsAdmin(u.role === "admin"))
+      .catch(() => {})
+  }, [])
 
   const isActive = (path: string) => location.pathname.startsWith(path)
 
@@ -51,37 +59,39 @@ export function Layout() {
             </Link>
           ))}
 
-          {/* Settings section — collapsible */}
-          <div className="mt-2">
-            <button
-              onClick={() => setSettingsOpen(!settingsOpen)}
-              className={`flex items-center gap-2.5 px-4 py-2 text-[13px] w-full transition-colors ${
-                isActive("/settings")
-                  ? "text-foreground"
-                  : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
-              }`}
-            >
-              <Settings className="h-4 w-4" />
-              <span className="flex-1 text-left">Settings</span>
-              {settingsOpen
-                ? <ChevronDown className="h-3.5 w-3.5" />
-                : <ChevronRight className="h-3.5 w-3.5" />}
-            </button>
-            {settingsOpen && settingsItems.map(({ path, label, icon: Icon }) => (
-              <Link
-                key={path}
-                to={path}
-                className={`flex items-center gap-2.5 pl-7 pr-4 py-2 text-[13px] transition-colors ${
-                  isActive(path)
-                    ? "text-foreground bg-secondary"
+          {/* Settings section — admin only, collapsible */}
+          {isAdmin && (
+            <div className="mt-2">
+              <button
+                onClick={() => setSettingsOpen(!settingsOpen)}
+                className={`flex items-center gap-2.5 px-4 py-2 text-[13px] w-full transition-colors ${
+                  isActive("/settings")
+                    ? "text-foreground"
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                 }`}
               >
-                <Icon className="h-4 w-4" />
-                {label}
-              </Link>
-            ))}
-          </div>
+                <Settings className="h-4 w-4" />
+                <span className="flex-1 text-left">Settings</span>
+                {settingsOpen
+                  ? <ChevronDown className="h-3.5 w-3.5" />
+                  : <ChevronRight className="h-3.5 w-3.5" />}
+              </button>
+              {settingsOpen && settingsItems.map(({ path, label, icon: Icon }) => (
+                <Link
+                  key={path}
+                  to={path}
+                  className={`flex items-center gap-2.5 pl-7 pr-4 py-2 text-[13px] transition-colors ${
+                    isActive(path)
+                      ? "text-foreground bg-secondary"
+                      : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+                  }`}
+                >
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </Link>
+              ))}
+            </div>
+          )}
         </nav>
         <button
           onClick={() => { clearToken(); window.location.href = "/login" }}

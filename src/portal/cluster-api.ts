@@ -9,9 +9,9 @@ import { getDb } from "../gateway/db.js";
 import {
   sendJson,
   parseBody,
-  requireAuth,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { requireAdmin } from "./auth.js";
 
 /** Extract the first `server:` value from a kubeconfig YAML string. */
 function extractApiServer(kubeconfig: string): string | null {
@@ -22,8 +22,8 @@ function extractApiServer(kubeconfig: string): string | null {
 export function registerClusterRoutes(router: RestRouter, jwtSecret: string): void {
   // GET /api/v1/clusters — list all
   router.get("/api/v1/clusters", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query(
@@ -34,8 +34,8 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
   // POST /api/v1/clusters — create
   router.post("/api/v1/clusters", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<{
       name?: string;
@@ -66,8 +66,8 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
   // GET /api/v1/clusters/:id — get by id
   router.get("/api/v1/clusters/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query("SELECT * FROM clusters WHERE id = ?", [params.id]) as any;
@@ -82,8 +82,8 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
   // PUT /api/v1/clusters/:id — update
   router.put("/api/v1/clusters/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
@@ -130,8 +130,8 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
   // DELETE /api/v1/clusters/:id
   router.delete("/api/v1/clusters/:id", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
 
@@ -148,8 +148,8 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
 
   // POST /api/v1/clusters/:id/test — test connection (stub)
   router.post("/api/v1/clusters/:id/test", async (req, res, params) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
 
     const db = getDb();
     const [rows] = await db.query("SELECT id FROM clusters WHERE id = ?", [params.id]) as any;

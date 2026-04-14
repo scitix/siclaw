@@ -127,6 +127,7 @@ export interface AuthContext {
   userId: string;
   orgId?: string;
   username?: string;
+  role?: string;
 }
 
 export function requireAuth(req: http.IncomingMessage, jwtSecret: string): AuthContext | null {
@@ -134,5 +135,5 @@ export function requireAuth(req: http.IncomingMessage, jwtSecret: string): AuthC
   if (!auth?.startsWith("Bearer ")) return null;
   const payload = verifyJwt(auth.slice(7), jwtSecret);
   if (!payload?.sub) return null;
-  return { userId: payload.sub, orgId: payload.org_id, username: payload.username };
+  return { userId: payload.sub, orgId: payload.org_id, username: payload.username, role: payload.role };
 }
