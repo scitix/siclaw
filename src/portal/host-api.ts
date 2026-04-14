@@ -13,11 +13,12 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
+import { notifyBoundAgents } from "./notify.js";
 
 /** Column list that excludes sensitive fields. */
 const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_production, created_at, updated_at";
 
-export function registerHostRoutes(router: RestRouter, jwtSecret: string): void {
+export function registerHostRoutes(router: RestRouter, jwtSecret: string, runtimeWsUrl: string, runtimeSecret: string): void {
   // GET /api/v1/hosts — list all (no secrets)
   router.get("/api/v1/hosts", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -130,6 +131,9 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string): void 
     // Return safe columns only
     const [updated] = await db.query(`SELECT ${SAFE_COLUMNS} FROM hosts WHERE id = ?`, [params.id]) as any;
     sendJson(res, 200, updated[0]);
+
+    // Notify bound agents to clear cached credentials
+    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_hosts", "host_id", params.id, ["credentials"]);
   });
 
   // DELETE /api/v1/hosts/:id

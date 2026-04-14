@@ -53,8 +53,8 @@ export function startPortal(config: PortalConfig): http.Server {
   // Register Portal's own routes
   registerAuthRoutes(router, config.jwtSecret);
   registerAgentRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
-  registerClusterRoutes(router, config.jwtSecret);
-  registerHostRoutes(router, config.jwtSecret);
+  registerClusterRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
+  registerHostRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
   registerAdapterRoutes(router, config.portalSecret);
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
   registerTaskRoutes(router, config.jwtSecret);

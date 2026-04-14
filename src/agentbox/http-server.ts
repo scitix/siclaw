@@ -722,6 +722,21 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   /**
+   * POST /api/reload-credentials — clear cached credential files.
+   * Next acquire() will re-fetch from Gateway on demand.
+   */
+  addRoute("POST", "/api/reload-credentials", async (_req, res) => {
+    const broker = sessionManager.credentialBroker;
+    if (!broker) {
+      sendJson(res, 200, { ok: true, cleared: 0, type: "credentials" });
+      return;
+    }
+    const cleared = broker.clearCache();
+    console.log(`[agentbox-http] Credentials cache cleared: ${cleared} entries`);
+    sendJson(res, 200, { ok: true, cleared, type: "credentials" });
+  });
+
+  /**
    * GET /api/models - list available models (read from settings.json)
    */
   addRoute("GET", "/api/models", async (_req, res) => {

@@ -43,7 +43,7 @@ import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
 import { handleSettings, handleMcpServers, handleSkillsBundle, handleCronList } from "./internal-api.js";
 import { createRestRouter } from "./rest-router.js";
-import { registerSiclawRoutes } from "./siclaw-api.js";
+import { registerSiclawRoutes, type SiclawApiContext } from "./siclaw-api.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -263,9 +263,76 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, stopped, total: targets.length, failed };
   });
 
+  rpcMethods.set("agent.reload", async (params) => {
+    const agentId = params.agentId as string;
+    if (!agentId) throw new Error("agentId required");
+
+    // Supported: "skills", "mcp" (via RESOURCE_DESCRIPTORS), "credentials" (custom endpoint)
+    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "credentials"];
+
+    const boxes = await agentBoxManager.list();
+    const targets = boxes.filter((b) => b.agentId === agentId);
+
+    if (targets.length === 0) {
+      console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
+      return { ok: true, reloaded: [], skipped: resourceTypes, boxes: 0 };
+    }
+
+    const reloaded: string[] = [];
+    const failed: string[] = [];
+
+    for (const box of targets) {
+      const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
+      for (const rt of resourceTypes) {
+        try {
+          if (rt === "credentials") {
+            await client.post("/api/reload-credentials");
+          } else {
+            await client.reloadResource(rt as import("../shared/resource-sync.js").ResourceType);
+          }
+          if (!reloaded.includes(rt)) reloaded.push(rt);
+        } catch (err: any) {
+          console.warn(`[rpc] agent.reload: ${rt} failed for box=${box.boxId}: ${err.message}`);
+          if (!failed.includes(rt)) failed.push(rt);
+        }
+      }
+    }
+
+    console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
+    return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
   // ── REST API Router (Siclaw CRUD) ────────────────────────
   const restRouter = createRestRouter();
-  registerSiclawRoutes(restRouter, config);
+
+  /** Query Portal Adapter for bound agents, then dispatch agent.reload for each. */
+  function notifyViaAdapter(adapterPath: string, resources: string[]) {
+    const url = `${config.serverUrl}${adapterPath}`;
+    fetch(url, { headers: { "X-Auth-Token": config.portalSecret } })
+      .then((resp) => resp.ok ? resp.json() as Promise<{ agent_ids: string[] }> : null)
+      .then((data) => {
+        if (!data?.agent_ids?.length) return;
+        console.log(`[notify] ${adapterPath} → reloading ${data.agent_ids.length} agent(s)`);
+        const handler = rpcMethods.get("agent.reload");
+        for (const agentId of data.agent_ids) {
+          handler?.({ agentId, resources }, {} as any).catch((err: any) => {
+            console.warn(`[notify] agent.reload failed for agent=${agentId}: ${err.message}`);
+          });
+        }
+      })
+      .catch((err) => console.warn(`[notify] Failed to query ${adapterPath}:`, err));
+  }
+
+  const siclawCtx: SiclawApiContext = {
+    notifySkillAgents: (skillId, resources) =>
+      notifyViaAdapter(`/api/internal/siclaw/adapter/skill/${skillId}/agents`, resources),
+    notifySkillDevAgents: (skillId, resources) =>
+      notifyViaAdapter(`/api/internal/siclaw/adapter/skill/${skillId}/agents?dev_only=1`, resources),
+    notifyMcpAgents: (mcpId, resources) =>
+      notifyViaAdapter(`/api/internal/siclaw/adapter/mcp/${mcpId}/agents`, resources),
+  };
+
+  registerSiclawRoutes(restRouter, config, siclawCtx);
 
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;

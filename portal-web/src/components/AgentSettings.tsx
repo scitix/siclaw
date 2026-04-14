@@ -80,6 +80,10 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
   const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set())
   const [skillLabelFilter, setSkillLabelFilter] = useState("")
 
+  // MCP binding
+  const [allMcpServers, setAllMcpServers] = useState<{ id: string; name: string; transport: string; enabled: number }[]>([])
+  const [selectedMcpIds, setSelectedMcpIds] = useState<Set<string>>(new Set())
+
   const [saving, setSaving] = useState(false)
 
   // Sync form state when agent prop changes
@@ -120,6 +124,13 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
       .catch(() => setAllSkills([]))
   }, [])
 
+  // Load available MCP servers
+  useEffect(() => {
+    api<{ data: { id: string; name: string; transport: string; enabled: number }[] }>("/siclaw/mcp")
+      .then(r => setAllMcpServers(Array.isArray(r.data) ? r.data : []))
+      .catch(() => setAllMcpServers([]))
+  }, [])
+
   // Load resources
   useEffect(() => {
     let cancelled = false
@@ -144,6 +155,7 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
       setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
       setSelectedHostIds(new Set(resources.hosts?.sample?.map(h => h.id) || []))
       setSelectedSkillIds(new Set(resources.skill_ids || []))
+      setSelectedMcpIds(new Set(resources.mcp_server_ids || []))
     }
   }, [resources])
 
@@ -174,12 +186,12 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
           cluster_ids: Array.from(selectedClusterIds),
           host_ids: Array.from(selectedHostIds),
           skill_ids: Array.from(selectedSkillIds),
-          mcp_server_ids: resources?.mcp_server_ids || [],
+          mcp_server_ids: Array.from(selectedMcpIds),
         },
       })
 
       onUpdate(updated)
-      toast.success("Settings saved")
+      toast.success("Saved — agent will reload automatically")
     } catch (err: any) {
       toast.error(err.message || "Failed to save changes")
     } finally {
@@ -365,63 +377,130 @@ export function AgentSettings({ agent, onUpdate }: AgentSettingsProps) {
               {/* Skills Binding */}
               <div className="space-y-1.5">
                 <label className="text-[12px] text-muted-foreground font-medium">
-                  Bound Skills ({selectedSkillIds.size})
+                  Bound Skills ({selectedSkillIds.size} / {allSkills.length})
                 </label>
-                <input
-                  value={skillLabelFilter}
-                  onChange={e => setSkillLabelFilter(e.target.value)}
-                  placeholder="Filter by label..."
-                  className="w-full h-7 px-2 text-[12px] rounded border border-border bg-background"
-                />
-                <div className="max-h-48 overflow-auto border border-border rounded-md">
-                  {allSkills
-                    .filter(s => {
-                      if (!skillLabelFilter) return true
-                      const labels = Array.isArray(s.labels) ? s.labels : []
-                      return labels.some(l => l.toLowerCase().includes(skillLabelFilter.toLowerCase()))
-                    })
-                    .map(s => (
+
+                {/* Label filter chips + dropdown */}
+                {(() => {
+                  const allLabels = Array.from(new Set(allSkills.flatMap(s => Array.isArray(s.labels) ? s.labels : []))).sort()
+                  const filteredSkills = allSkills.filter(s => {
+                    if (!skillLabelFilter) return true
+                    const labels = Array.isArray(s.labels) ? s.labels : []
+                    return labels.includes(skillLabelFilter)
+                  })
+                  const filteredIds = new Set(filteredSkills.map(s => s.id))
+                  const allFilteredSelected = filteredSkills.length > 0 && filteredSkills.every(s => selectedSkillIds.has(s.id))
+
+                  const toggleFilteredAll = () => {
+                    const next = new Set(selectedSkillIds)
+                    if (allFilteredSelected) {
+                      for (const id of filteredIds) next.delete(id)
+                    } else {
+                      for (const id of filteredIds) next.add(id)
+                    }
+                    setSelectedSkillIds(next)
+                  }
+
+                  return <>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={skillLabelFilter}
+                        onChange={e => setSkillLabelFilter(e.target.value)}
+                        className="flex-1 h-7 px-2 text-[12px] rounded border border-border bg-background"
+                      >
+                        <option value="">All labels</option>
+                        {allLabels.map(l => <option key={l} value={l}>{l}</option>)}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={toggleFilteredAll}
+                        className="h-7 px-2 text-[11px] rounded border border-border text-muted-foreground hover:text-foreground whitespace-nowrap"
+                      >
+                        {allFilteredSelected ? "Deselect All" : "Select All"}
+                      </button>
+                    </div>
+                    <div className="max-h-48 overflow-auto border border-border rounded-md">
+                      {filteredSkills.map(s => (
+                        <label key={s.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-secondary/30 cursor-pointer text-[12px]">
+                          <input
+                            type="checkbox"
+                            checked={selectedSkillIds.has(s.id)}
+                            onChange={e => {
+                              const next = new Set(selectedSkillIds)
+                              if (e.target.checked) next.add(s.id)
+                              else next.delete(s.id)
+                              setSelectedSkillIds(next)
+                            }}
+                            className="rounded"
+                          />
+                          <span className="font-mono flex-1">{s.name}</span>
+                          {Array.isArray(s.labels) && s.labels.map(l => (
+                            <span key={l} className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">{l}</span>
+                          ))}
+                          <span className={`px-1 py-0.5 rounded text-[9px] ${
+                            s.status === "installed" ? "bg-green-500/20 text-green-400" :
+                            s.status === "pending_review" ? "bg-blue-500/20 text-blue-400" :
+                            "bg-yellow-500/20 text-yellow-400"
+                          }`}>
+                            {s.status === "installed" ? "Installed" : s.status === "pending_review" ? "Pending" : "Draft"}
+                          </span>
+                        </label>
+                      ))}
+                      {filteredSkills.length === 0 && (
+                        <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">
+                          {allSkills.length === 0 ? "No skills available" : "No skills match this label"}
+                        </p>
+                      )}
+                    </div>
+                  </>
+                })()}
+              </div>
+
+              {/* MCP Servers Binding */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[12px] text-muted-foreground font-medium">
+                    MCP Servers ({selectedMcpIds.size} / {allMcpServers.length})
+                  </label>
+                  {allMcpServers.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const allSelected = allMcpServers.every(s => selectedMcpIds.has(s.id))
+                        if (allSelected) setSelectedMcpIds(new Set())
+                        else setSelectedMcpIds(new Set(allMcpServers.map(s => s.id)))
+                      }}
+                      className="h-7 px-2 text-[11px] rounded border border-border text-muted-foreground hover:text-foreground"
+                    >
+                      {allMcpServers.every(s => selectedMcpIds.has(s.id)) ? "Deselect All" : "Select All"}
+                    </button>
+                  )}
+                </div>
+                {allMcpServers.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground/60">No MCP servers available. Add servers in the MCP page.</p>
+                ) : (
+                  <div className="max-h-48 overflow-auto border border-border rounded-md">
+                    {allMcpServers.map(s => (
                       <label key={s.id} className="flex items-center gap-2 px-2 py-1.5 hover:bg-secondary/30 cursor-pointer text-[12px]">
                         <input
                           type="checkbox"
-                          checked={selectedSkillIds.has(s.id)}
+                          checked={selectedMcpIds.has(s.id)}
                           onChange={e => {
-                            const next = new Set(selectedSkillIds)
+                            const next = new Set(selectedMcpIds)
                             if (e.target.checked) next.add(s.id)
                             else next.delete(s.id)
-                            setSelectedSkillIds(next)
+                            setSelectedMcpIds(next)
                           }}
                           className="rounded"
                         />
-                        <span className="font-mono">{s.name}</span>
-                        <span className={`px-1 py-0.5 rounded text-[9px] ${
-                          s.status === "installed" ? "bg-green-500/20 text-green-400" :
-                          s.status === "pending_review" ? "bg-blue-500/20 text-blue-400" :
-                          "bg-yellow-500/20 text-yellow-400"
-                        }`}>
-                          {s.status === "installed" ? "Installed" : s.status === "pending_review" ? "Pending" : "Draft"}
-                        </span>
+                        <span className="font-mono flex-1">{s.name}</span>
+                        <span className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">{s.transport}</span>
+                        <span className={`h-2 w-2 rounded-full ${s.enabled ? "bg-green-500" : "bg-muted-foreground/40"}`} />
                       </label>
                     ))}
-                  {allSkills.length === 0 && (
-                    <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">No skills available</p>
-                  )}
-                </div>
-              </div>
-
-              {/* MCP Servers (read-only) */}
-              {resources && resources.mcp_server_ids?.length > 0 && (
-                <div className="space-y-1.5">
-                  <label className="text-[12px] text-muted-foreground font-medium">Bound MCP Servers</label>
-                  <div className="flex flex-wrap gap-1.5">
-                    {resources.mcp_server_ids.map((mid) => (
-                      <span key={mid} className="inline-block px-2 py-0.5 text-[11px] rounded bg-secondary text-secondary-foreground font-mono">
-                        {mid}
-                      </span>
-                    ))}
                   </div>
-                </div>
-              )}
+                )}
+              </div>
 
               {/* Tools (read-only) */}
               {resources && resources.tools?.length > 0 && (

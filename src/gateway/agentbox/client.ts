@@ -158,6 +158,14 @@ export class AgentBoxClient {
   }
 
   /**
+   * POST to an arbitrary path on the AgentBox.
+   */
+  async post(path: string): Promise<unknown> {
+    const resp = await this.fetch(path, { method: "POST" });
+    return resp.json();
+  }
+
+  /**
    * Get context usage
    */
   async getContextUsage(sessionId: string): Promise<ContextUsageResponse> {

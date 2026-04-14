@@ -354,4 +354,75 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       default: { provider: agent.model_provider, modelId: agent.model_id },
     });
   });
+
+  // GET /api/internal/siclaw/adapter/skill/:skillId/agents — agents bound to a skill
+  //   ?dev_only=1  → only return agents with is_production=0
+  router.get("/api/internal/siclaw/adapter/skill/:skillId/agents", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const qIdx = (req.url ?? "").indexOf("?");
+    const qs = qIdx >= 0 ? new URLSearchParams((req.url ?? "").slice(qIdx + 1)) : null;
+    const devOnly = qs?.get("dev_only") === "1";
+
+    const sql = devOnly
+      ? `SELECT ask.agent_id FROM agent_skills ask
+         JOIN agents a ON ask.agent_id = a.id
+         WHERE ask.skill_id = ? AND a.is_production = 0`
+      : "SELECT agent_id FROM agent_skills WHERE skill_id = ?";
+
+    const [rows] = await db.query(sql, [params.skillId]) as any;
+
+    sendJson(res, 200, {
+      agent_ids: rows.map((r: { agent_id: string }) => r.agent_id),
+    });
+  });
+
+  // GET /api/internal/siclaw/adapter/mcp/:mcpId/agents — agents bound to an MCP server
+  router.get("/api/internal/siclaw/adapter/mcp/:mcpId/agents", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_mcp_servers WHERE mcp_server_id = ?",
+      [params.mcpId],
+    ) as any;
+    sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
+  });
+
+  // GET /api/internal/siclaw/adapter/cluster/:clusterId/agents — agents bound to a cluster
+  router.get("/api/internal/siclaw/adapter/cluster/:clusterId/agents", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_clusters WHERE cluster_id = ?",
+      [params.clusterId],
+    ) as any;
+    sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
+  });
+
+  // GET /api/internal/siclaw/adapter/host/:hostId/agents — agents bound to a host
+  router.get("/api/internal/siclaw/adapter/host/:hostId/agents", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_hosts WHERE host_id = ?",
+      [params.hostId],
+    ) as any;
+    sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
+  });
 }

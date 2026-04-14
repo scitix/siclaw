@@ -93,7 +93,16 @@ function parsePagination(query: Record<string, string>): {
 
 // ── Route registration ────────────────────────────────────────
 
-export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig): void {
+export interface SiclawApiContext {
+  /** Notify all agents bound to a skill to reload (used on approve). */
+  notifySkillAgents?: (skillId: string, resources: string[]) => void;
+  /** Notify only dev agents bound to a skill to reload (used on draft update). */
+  notifySkillDevAgents?: (skillId: string, resources: string[]) => void;
+  /** Notify agents bound to an MCP server to reload. */
+  notifyMcpAgents?: (mcpId: string, resources: string[]) => void;
+}
+
+export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
 
   // ================================================================
@@ -328,6 +337,9 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);
+
+    // Draft update: notify dev agents to reload skills
+    ctx?.notifySkillDevAgents?.(params.id, ["skills"]);
   });
 
   // Delete skill
@@ -616,6 +628,9 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
     );
 
     sendJson(res, 200, { status: "installed" });
+
+    // Notify agents bound to this skill to reload (fire-and-forget)
+    ctx?.notifySkillAgents?.(params.id, ["skills"]);
   });
 
   // Reject skill
@@ -877,6 +892,9 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig):
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);
+
+    // Notify bound agents to reload MCP config
+    ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
   });
 
   // Delete MCP server

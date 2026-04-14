@@ -246,16 +246,24 @@ export class CredentialBroker {
     }
   }
 
-  dispose(): void {
-    clearInterval(this.cleanupTimer);
+  /** Clear all cached credentials and files. Broker remains usable — next acquire() re-fetches. */
+  clearCache(): number {
+    let cleared = 0;
     for (const entry of this.registry.values()) {
       if (entry.filePaths) {
         for (const fp of entry.filePaths) {
           try { fs.unlinkSync(fp); } catch { /* best-effort */ }
         }
+        cleared++;
       }
     }
     this.registry.clear();
+    return cleared;
+  }
+
+  dispose(): void {
+    clearInterval(this.cleanupTimer);
+    this.clearCache();
   }
 
   // ──────────────────────────────────────────────────────────
