@@ -490,7 +490,28 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // Subscribe to Agent events (live, after buffer replay)
-    const unsubscribe = managed.brain.subscribe((event) => {
+    const unsubscribe = managed.brain.subscribe((event: any) => {
+      // Enrich agent_end with context usage so frontend can display token stats
+      if (event?.type === "agent_end") {
+        const usage = managed.brain.getContextUsage?.();
+        const stats = managed.brain.getSessionStats?.();
+        if (usage || stats) {
+          writeEvent({
+            ...event,
+            contextUsage: {
+              tokens: usage?.tokens ?? 0,
+              contextWindow: usage?.contextWindow ?? 0,
+              percent: usage?.percent ?? 0,
+              inputTokens: stats?.tokens?.input ?? 0,
+              outputTokens: stats?.tokens?.output ?? 0,
+              cacheReadTokens: stats?.tokens?.cacheRead ?? 0,
+              cacheWriteTokens: stats?.tokens?.cacheWrite ?? 0,
+              cost: stats?.cost ?? 0,
+            },
+          });
+          return;
+        }
+      }
       writeEvent(event);
     });
 

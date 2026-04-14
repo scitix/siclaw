@@ -2,7 +2,7 @@ import { useRef, useEffect, useState, useCallback, useMemo } from "react"
 import {
   Terminal,
   User,
-  Cpu,
+  Bot,
   Loader2,
   ChevronRight,
   FileCode,
@@ -297,7 +297,7 @@ function ThinkingIndicator() {
   return (
     <div className="flex gap-4">
       <div className="w-8 h-8 rounded-full bg-card border border-border flex items-center justify-center text-blue-400 shadow-sm shadow-black/10">
-        <Cpu className="w-5 h-5" />
+        <Bot className="w-5 h-5" />
       </div>
       <div className="flex items-center gap-2 text-muted-foreground/70">
         <Loader2 className="w-4 h-4 animate-spin" />
@@ -499,7 +499,7 @@ function MessageItem({
           isUser ? "bg-blue-600 border-blue-600 text-white" : "bg-card border-border text-blue-400",
         )}
       >
-        {isUser ? <User className="w-4 h-4" /> : <Cpu className="w-5 h-5" />}
+        {isUser ? <User className="w-4 h-4" /> : <Bot className="w-5 h-5" />}
       </div>
 
       <div className={cn("flex flex-col min-w-0", isUser ? "items-end" : "items-start")}>
@@ -579,21 +579,19 @@ function CopyableMessage({ isUser, content }: { isUser: boolean; content: string
   }
 
   return (
-    <div className="group relative">
-      <div
-        className={cn(
-          "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 max-w-3xl min-w-0 overflow-hidden",
-          isUser
-            ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
-            : "bg-card border border-border text-foreground rounded-tl-sm",
-        )}
-      >
-        <Markdown>{content}</Markdown>
-      </div>
+    <div
+      className={cn(
+        "group relative px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 max-w-3xl min-w-0 overflow-hidden",
+        isUser
+          ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
+          : "bg-card border border-border text-foreground rounded-tl-sm",
+      )}
+    >
+      <Markdown>{content}</Markdown>
       {!isUser && (
         <button
           onClick={handleCopy}
-          className="absolute -bottom-3 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-md bg-secondary border border-border text-muted-foreground hover:text-foreground"
+          className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-secondary"
           title="Copy markdown"
         >
           {copied ? <Check className="h-3.5 w-3.5 text-green-400" /> : <Copy className="h-3.5 w-3.5" />}

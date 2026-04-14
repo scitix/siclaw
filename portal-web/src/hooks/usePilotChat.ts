@@ -567,12 +567,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // --- Agent end / turn complete / done ---
         case "agent_end":
         case "turn_complete":
-        case "done":
+        case "done": {
           setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
           setStreaming(false)
           streamingRef.current = false
           setPendingMessages([])
+          // Update context usage from agent_end event
+          const cu = evt.contextUsage as ContextUsage | undefined
+          if (cu) {
+            setContextUsage(cu)
+          }
           break
+        }
 
         // --- Auto retry (model retries) ---
         case "auto_retry_start":
