@@ -17,6 +17,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     username VARCHAR(100) NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     role VARCHAR(20) NOT NULL DEFAULT 'admin',
+    can_review_skills TINYINT(1) NOT NULL DEFAULT 0,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
@@ -128,6 +129,9 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     CONSTRAINT fk_atr_task FOREIGN KEY (task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Migration: add can_review_skills to users
+  `ALTER TABLE siclaw_users ADD COLUMN can_review_skills TINYINT(1) NOT NULL DEFAULT 0 AFTER role`,
 ];
 
 export async function runPortalMigrations(): Promise<void> {

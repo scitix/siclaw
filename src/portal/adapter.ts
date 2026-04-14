@@ -58,7 +58,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
     const agentId = params.agentId;
 
-    const [[clusters], [hosts], [skills], [mcpServers]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [agentRows]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -77,23 +77,50 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         "SELECT mcp_server_id FROM agent_mcp_servers WHERE agent_id = ?",
         [agentId],
       ),
+      db.query(
+        "SELECT is_production FROM agents WHERE id = ?",
+        [agentId],
+      ),
     ]) as any;
+
+    const isProduction = agentRows.length > 0 ? !!agentRows[0].is_production : true; // default to prod for safety
 
     sendJson(res, 200, {
       clusters,
       hosts,
       skill_ids: skills.map((r: { skill_id: string }) => r.skill_id),
       mcp_server_ids: mcpServers.map((r: { mcp_server_id: string }) => r.mcp_server_id),
+      is_production: isProduction,
     });
   });
 
-  // POST /api/internal/siclaw/adapter/check-access — always allow
+  // POST /api/internal/siclaw/adapter/check-access
   router.post("/api/internal/siclaw/adapter/check-access", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
     }
 
+    const body = await parseBody<{ user_id?: string; action?: string }>(req);
+
+    // "review" action requires can_review_skills flag or admin role
+    if (body.action === "review" && body.user_id) {
+      const db = getDb();
+      const [rows] = await db.query(
+        "SELECT role, can_review_skills FROM siclaw_users WHERE id = ?",
+        [body.user_id],
+      ) as any;
+      if (rows.length === 0) {
+        sendJson(res, 200, { allowed: false, grant_all: false, agent_group_ids: [] });
+        return;
+      }
+      const user = rows[0];
+      const allowed = user.role === "admin" || !!user.can_review_skills;
+      sendJson(res, 200, { allowed, grant_all: allowed, agent_group_ids: [] });
+      return;
+    }
+
+    // All other actions: allow (existing behavior)
     sendJson(res, 200, { allowed: true, grant_all: true, agent_group_ids: [] });
   });
 

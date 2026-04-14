@@ -17,9 +17,9 @@ const SCHEMA_SQLS: string[] = [
     org_id CHAR(36) NOT NULL,
     name VARCHAR(255) NOT NULL,
     description TEXT,
-    scope VARCHAR(20) NOT NULL DEFAULT 'global',
-    author_id CHAR(36),
-    status VARCHAR(50) NOT NULL DEFAULT 'installed',
+    labels JSON,
+    author_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
     version INT NOT NULL DEFAULT 1,
     specs MEDIUMTEXT,
     scripts JSON,
@@ -35,11 +35,28 @@ const SCHEMA_SQLS: string[] = [
     version INT NOT NULL,
     specs MEDIUMTEXT,
     scripts JSON,
+    diff JSON,
     commit_message VARCHAR(500),
-    author_id CHAR(36),
+    author_id CHAR(36) NOT NULL,
+    is_approved TINYINT(1) NOT NULL DEFAULT 0,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     UNIQUE KEY uq_skill_versions (skill_id, version),
     CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS skill_reviews (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    diff JSON,
+    security_assessment JSON,
+    submitted_by CHAR(36) NOT NULL,
+    reviewed_by CHAR(36),
+    decision VARCHAR(20),
+    reject_reason TEXT,
+    submitted_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    reviewed_at TIMESTAMP(3),
+    CONSTRAINT fk_review_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
   // MCP Servers
@@ -201,6 +218,18 @@ const SCHEMA_SQLS: string[] = [
     PRIMARY KEY (api_key_id, service_account_id),
     CONSTRAINT fk_aksa_api_key FOREIGN KEY (api_key_id) REFERENCES agent_api_keys(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Migration ALTERs for existing databases — each is wrapped in its own
+  // statement so a failure on one (e.g. column already dropped/added) does
+  // not block the rest. New installs skip these because the CREATE TABLE
+  // statements above already reflect the target schema.
+  `ALTER TABLE skills DROP COLUMN IF EXISTS scope`,
+  `ALTER TABLE skills ADD COLUMN IF NOT EXISTS labels JSON AFTER description`,
+  `ALTER TABLE skills MODIFY COLUMN status VARCHAR(20) NOT NULL DEFAULT 'draft'`,
+  `ALTER TABLE skills MODIFY COLUMN author_id CHAR(36) NOT NULL`,
+  `ALTER TABLE skill_versions ADD COLUMN IF NOT EXISTS diff JSON AFTER scripts`,
+  `ALTER TABLE skill_versions ADD COLUMN IF NOT EXISTS is_approved TINYINT(1) NOT NULL DEFAULT 0 AFTER author_id`,
+  `ALTER TABLE skill_versions MODIFY COLUMN author_id CHAR(36) NOT NULL`,
 ];
 
 export async function runMigrations(): Promise<void> {
