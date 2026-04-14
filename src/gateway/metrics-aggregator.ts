@@ -40,7 +40,7 @@ export class MetricsAggregator {
   private ringBuffer = new Map<number, MetricsBucket>();
   private toolCallMap = new Map<string, { success: number; error: number }>();
   private skillCallMap = new Map<string, {
-    scope: "builtin" | "global" | "personal" | "skillset";
+    scope: "builtin" | "global";
     success: number;
     error: number;
     totalDurationMs: number;

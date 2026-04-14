@@ -119,7 +119,7 @@ describe("metrics subscriber", () => {
       type: "skill_call",
       skillName: "custom-tool",
       scriptName: "run",
-      scope: "personal",
+      scope: "global",
       outcome: "success",
       durationMs: 300,
     });
@@ -128,12 +128,12 @@ describe("metrics subscriber", () => {
     // Full-label counter
     expect(output).toContain('siclaw_skill_calls_total{skill_name="k8s-diagnostics",scope="builtin",outcome="success"} 1');
     expect(output).toContain('siclaw_skill_calls_total{skill_name="k8s-diagnostics",scope="builtin",outcome="error"} 1');
-    expect(output).toContain('siclaw_skill_calls_total{skill_name="custom-tool",scope="personal",outcome="success"} 1');
+    expect(output).toContain('siclaw_skill_calls_total{skill_name="custom-tool",scope="global",outcome="success"} 1');
 
     // Low-cardinality scope counter
     expect(output).toContain('siclaw_skill_calls_by_scope_total{scope="builtin",outcome="success"} 1');
     expect(output).toContain('siclaw_skill_calls_by_scope_total{scope="builtin",outcome="error"} 1');
-    expect(output).toContain('siclaw_skill_calls_by_scope_total{scope="personal",outcome="success"} 1');
+    expect(output).toContain('siclaw_skill_calls_by_scope_total{scope="global",outcome="success"} 1');
   });
 
   it("should track context usage (Phase 2)", async () => {

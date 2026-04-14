@@ -85,7 +85,7 @@ interface SkillBundlePayload {
   version: string;
   skills: Array<{
     dirName: string;
-    scope: "builtin" | "global" | "personal" | "skillset";
+    scope: "builtin" | "global";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
     skillSpaceId?: string;
@@ -106,7 +106,7 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
     const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
 
     // Build a flat unified "resolved/" directory with priority-based merging:
-    //   personal > skillset > global > builtin
+    //   global > builtin
     // First dirName written wins; later duplicates are skipped.
     // All scopes come from the bundle payload (including builtin, synced to DB at startup).
     const resolvedDir = path.join(skillsDir, "resolved");
@@ -119,8 +119,8 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
 
     const seen = new Set<string>();
 
-    // Write in priority order: personal > skillset > global > builtin
-    for (const scope of ["personal", "skillset", "global", "builtin"] as const) {
+    // Write in priority order: global > builtin
+    for (const scope of ["global", "builtin"] as const) {
       for (const skill of payload.skills.filter(s => s.scope === scope)) {
         if (seen.has(skill.dirName)) continue;
         seen.add(skill.dirName);

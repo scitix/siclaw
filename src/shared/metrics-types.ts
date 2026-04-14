@@ -34,7 +34,7 @@ export interface ToolCallStats {
 /** Skill call ranking entry */
 export interface SkillCallStats {
   skillName: string;
-  scope: "builtin" | "global" | "personal" | "skillset";
+  scope: "builtin" | "global";
   success: number;
   error: number;
   total: number;
