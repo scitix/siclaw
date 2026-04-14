@@ -113,3 +113,21 @@ export function chatSSE(
 
   return { abort: () => controller.abort() }
 }
+
+export async function chatSteer(agentId: string, sessionId: string, text: string): Promise<void> {
+  await api(`/siclaw/agents/${agentId}/chat/steer`, {
+    method: "POST",
+    body: { session_id: sessionId, text },
+  })
+}
+
+export async function chatAbort(agentId: string, sessionId: string): Promise<void> {
+  await api(`/siclaw/agents/${agentId}/chat/abort`, {
+    method: "POST",
+    body: { session_id: sessionId },
+  })
+}
+
+export async function clearAgentMemory(agentId: string): Promise<{ deletedFiles: number }> {
+  return api(`/siclaw/agents/${agentId}/clear-memory`, { method: "POST" })
+}
