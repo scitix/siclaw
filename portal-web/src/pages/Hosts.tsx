@@ -144,10 +144,10 @@ export function Hosts() {
                     <p className="text-xs text-muted-foreground">{h.username}@{h.ip}:{h.port} · {h.auth_type}{h.description ? ` · ${h.description}` : ""}</p>
                   </div>
                   <div className="flex items-center gap-1">
-                    <button onClick={(e) => { e.stopPropagation(); startEditHost(h) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
+                    <button onClick={(e) => { e.stopPropagation(); startEditHost(h) }} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
                       <Settings className="h-4 w-4" />
                     </button>
-                    <button onClick={() => handleDelete(h.id)} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                    <button onClick={() => handleDelete(h.id)} title="Delete" className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </div>

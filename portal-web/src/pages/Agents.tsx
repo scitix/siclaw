@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom"
 import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, ClipboardList, Key, Eraser } from "lucide-react"
 import { api, clearAgentMemory } from "../api"
 import { useToast } from "../components/toast"
+import { Tooltip } from "../components/tooltip"
 import { useConfirm } from "../components/confirm-dialog"
 
 interface Agent {
@@ -158,12 +159,12 @@ export function Agents() {
                 </div>
                 <div className="flex items-center gap-0.5">
                   <span className={`h-2 w-2 rounded-full mr-2 ${a.status === "active" ? "bg-green-500" : "bg-gray-500"}`} />
-                  <button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} title="Chat" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button>
-                  <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=tasks`) }} title="Tasks" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><ClipboardList className="h-4 w-4" /></button>
-                  <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=api-keys`) }} title="API Keys" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Key className="h-4 w-4" /></button>
-                  <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=settings`) }} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button>
-                  <button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} title="Clear Memory" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button>
-                  <button onClick={(e) => { e.stopPropagation(); handleDelete(a.id) }} title="Delete" className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-4 w-4" /></button>
+                  <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Tasks"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=tasks`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><ClipboardList className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="API Keys"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=api-keys`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Key className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=settings`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Clear Memory"><button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Delete"><button onClick={(e) => { e.stopPropagation(); handleDelete(a.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-4 w-4" /></button></Tooltip>
                 </div>
               </div>
             ))}

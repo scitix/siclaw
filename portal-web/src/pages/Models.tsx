@@ -215,8 +215,8 @@ export function Models() {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-muted-foreground">{provider.models?.length || 0} models</span>
-                    <button onClick={(e) => { e.stopPropagation(); startEdit(provider) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
-                    <button onClick={(e) => { e.stopPropagation(); handleDeleteProvider(provider.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
+                    <button onClick={(e) => { e.stopPropagation(); startEdit(provider) }} title="Edit provider" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
+                    <button onClick={(e) => { e.stopPropagation(); handleDeleteProvider(provider.id) }} title="Delete provider" className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
                   </div>
                 </div>
 
@@ -257,8 +257,8 @@ export function Models() {
                                 </p>
                               </div>
                               <div className="flex items-center gap-1">
-                                <button onClick={() => startEditModel(model)} className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
-                                <button onClick={() => handleDeleteModel(provider.id, model.id)} className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
+                                <button onClick={() => startEditModel(model)} title="Edit model" className="p-1 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-3.5 w-3.5" /></button>
+                                <button onClick={() => handleDeleteModel(provider.id, model.id)} title="Delete model" className="p-1 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-3.5 w-3.5" /></button>
                               </div>
                             </div>
                             {editingModelId === model.id && (
