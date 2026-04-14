@@ -16,6 +16,7 @@ import {
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
 import { runtimeRpc } from "./chat-gateway.js";
+import { notifyAgentReload } from "./notify.js";
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -164,6 +165,11 @@ export function registerAgentRoutes(
     }
 
     sendJson(res, 200, rows[0]);
+
+    // is_production change affects skills bundle (prod=approved only, dev=all)
+    if ("is_production" in body) {
+      notifyAgentReload(runtimeWsUrl, runtimeSecret, params.id, ["skills"]);
+    }
   });
 
   // DELETE /api/v1/agents/:id (admin only)
@@ -259,6 +265,9 @@ export function registerAgentRoutes(
     }
 
     sendJson(res, 200, { ok: true });
+
+    // Notify running AgentBox to reload (fire-and-forget with retry)
+    notifyAgentReload(runtimeWsUrl, runtimeSecret, params.id);
   });
 
   // GET /api/v1/agents/:id/resources — get bindings

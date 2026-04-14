@@ -12,6 +12,7 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
+import { notifyBoundAgents } from "./notify.js";
 
 /** Extract the first `server:` value from a kubeconfig YAML string. */
 function extractApiServer(kubeconfig: string): string | null {
@@ -19,7 +20,7 @@ function extractApiServer(kubeconfig: string): string | null {
   return match ? match[1].trim() : null;
 }
 
-export function registerClusterRoutes(router: RestRouter, jwtSecret: string): void {
+export function registerClusterRoutes(router: RestRouter, jwtSecret: string, runtimeWsUrl: string, runtimeSecret: string): void {
   // GET /api/v1/clusters — list all
   router.get("/api/v1/clusters", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -127,6 +128,9 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string): vo
     }
 
     sendJson(res, 200, rows[0]);
+
+    // Notify bound agents to clear cached credentials
+    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_clusters", "cluster_id", params.id, ["credentials"]);
   });
 
   // DELETE /api/v1/clusters/:id
