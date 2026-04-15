@@ -133,6 +133,11 @@ if (config.databaseUrl) {
   await taskCoordinator.start();
 }
 
+// Late-attach the Run-now handler to the REST routes registered inside
+// startRuntime. Route handlers read `ctx.fireTaskNow` at request time, so
+// assigning it after registerSiclawRoutes has already been called is safe.
+runtime.siclawCtx.fireTaskNow = (taskId) => taskCoordinator.fireNow(taskId);
+
 // Graceful shutdown
 async function shutdown() {
   console.log("\n[runtime] Shutting down...");

@@ -113,6 +113,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     last_run_at TIMESTAMP(3) NULL,
     last_result VARCHAR(50) NULL,
+    last_manual_run_at TIMESTAMP(3) NULL DEFAULT NULL,
     created_by CHAR(36),
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -217,6 +218,8 @@ export async function runPortalMigrations(): Promise<void> {
   // Additive column migrations (safe to re-run)
   await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
+  // last_manual_run_at used by the Run-now cooldown check.
+  await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP(3) NULL DEFAULT NULL");
 
   console.log("[portal-migrate] Portal tables ready");
 }

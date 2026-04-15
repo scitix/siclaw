@@ -69,6 +69,13 @@ export interface RuntimeServer {
   broadcast: BroadcastFn;
   rpcMethods: Map<string, RpcHandler>;
   agentBoxTlsOptions?: { cert: string; key: string; ca: string };
+  /**
+   * Exposed so callers (gateway-main) can late-attach context that only
+   * becomes available after startRuntime returns — e.g. the
+   * TaskCoordinator, which depends on agentBoxTlsOptions from the startup
+   * result.
+   */
+  siclawCtx: SiclawApiContext;
   credentialService: CredentialService;
   close(): Promise<void>;
 }
@@ -649,6 +656,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     rpcMethods,
     agentBoxTlsOptions,
     credentialService,
+    siclawCtx,
     async close() {
       metricsAggregator.destroy();
       await agentBoxManager.cleanup();

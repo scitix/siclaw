@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react"
 import { useParams, useNavigate, Link } from "react-router-dom"
-import { ArrowLeft, Clock, Loader2, AlertCircle, CheckCircle2, ChevronRight, ClipboardList } from "lucide-react"
+import { ArrowLeft, Clock, Loader2, AlertCircle, CheckCircle2, ChevronRight, ClipboardList, Play } from "lucide-react"
 import { api } from "../api"
+import { useToast } from "../components/toast"
 import { nextFireFull } from "../lib/taskSchedule"
 
 interface AgentTask {
@@ -78,6 +79,7 @@ function RunStatusBadge({ status }: { status: string }) {
 export function TaskRuns() {
   const { agentId, taskId } = useParams<{ agentId: string; taskId: string }>()
   const navigate = useNavigate()
+  const toast = useToast()
 
   const [task, setTask] = useState<AgentTask | null>(null)
   const [runs, setRuns] = useState<TaskRun[]>([])
@@ -86,7 +88,12 @@ export function TaskRuns() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  const [triggering, setTriggering] = useState(false)
+  const [cooldownUntil, setCooldownUntil] = useState<number>(0)
+  const [cooldownSec, setCooldownSec] = useState<number>(0)
+
   const PAGE_SIZE = 30
+  const hasRunningRun = runs.some((r) => r.status === "running")
 
   useEffect(() => {
     if (!agentId || !taskId) return
@@ -133,6 +140,77 @@ export function TaskRuns() {
     }
   }
 
+  // While any run is 'running', poll the first page every 5s so the user
+  // sees the status transition + final result without a manual refresh.
+  useEffect(() => {
+    if (!hasRunningRun || !agentId || !taskId) return
+    const tick = setInterval(async () => {
+      try {
+        const res = await api<{ data: TaskRun[]; hasMore: boolean }>(
+          `/siclaw/agents/${agentId}/tasks/${taskId}/runs?limit=${PAGE_SIZE}`,
+        )
+        setRuns((prev) => {
+          // Merge: keep any rows older than the newest page's oldest row to
+          // preserve user's loaded-more history; replace the rest.
+          const fresh = Array.isArray(res.data) ? res.data : []
+          if (fresh.length === 0) return prev
+          const cutoff = new Date(fresh[fresh.length - 1].created_at).getTime()
+          const older = prev.filter((r) => new Date(r.created_at).getTime() < cutoff)
+          return [...fresh, ...older]
+        })
+      } catch {
+        // Transient error — keep polling; the next tick will retry.
+      }
+    }, 5_000)
+    return () => clearInterval(tick)
+  }, [hasRunningRun, agentId, taskId])
+
+  // Cooldown countdown (1s tick, refreshes the button label).
+  useEffect(() => {
+    if (cooldownUntil <= Date.now()) {
+      if (cooldownSec !== 0) setCooldownSec(0)
+      return
+    }
+    const tick = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000))
+      setCooldownSec(remaining)
+      if (remaining === 0) clearInterval(tick)
+    }, 500)
+    setCooldownSec(Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000)))
+    return () => clearInterval(tick)
+  }, [cooldownUntil, cooldownSec])
+
+  const handleRunNow = async () => {
+    if (!agentId || !taskId) return
+    if (triggering || hasRunningRun || cooldownSec > 0) return
+    setTriggering(true)
+    try {
+      await api<{ run_id: string }>(`/siclaw/agents/${agentId}/tasks/${taskId}/runs`, {
+        method: "POST",
+      })
+      // Optimistic: refetch the first page so the new running row appears
+      // immediately. Polling kicks in from hasRunningRun.
+      const res = await api<{ data: TaskRun[]; hasMore: boolean }>(
+        `/siclaw/agents/${agentId}/tasks/${taskId}/runs?limit=${PAGE_SIZE}`,
+      )
+      setRuns(Array.isArray(res.data) ? res.data : [])
+      setHasMore(Boolean(res.hasMore))
+      toast.success("Run triggered")
+    } catch (err: any) {
+      const msg: string = err?.message || "Failed to trigger run"
+      // Server sends retry_after_sec on 429 (cooldown). Attach it to the
+      // local countdown so the button shows "Wait Ns" until the window
+      // expires, without a second network round-trip.
+      const retry = err?.body?.retry_after_sec
+      if (typeof retry === "number" && retry > 0) {
+        setCooldownUntil(Date.now() + retry * 1000)
+      }
+      toast.error(msg)
+    } finally {
+      setTriggering(false)
+    }
+  }
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
@@ -175,31 +253,58 @@ export function TaskRuns() {
             <>
               {/* Task summary — read-only; edit on L1 */}
               <div className="rounded-lg border border-border bg-card p-5 space-y-3">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <span
-                    className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                      task.status === "active"
-                        ? "bg-green-500/20 text-green-400"
-                        : "bg-gray-500/20 text-gray-400"
-                    }`}
-                  >
-                    {task.status}
-                  </span>
-                  <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground font-mono">
-                    <Clock className="h-3.5 w-3.5 shrink-0" />
-                    {task.schedule}
-                    <span className="px-1 py-[1px] rounded text-[9px] font-medium bg-muted text-muted-foreground/70 uppercase tracking-wider leading-none">
-                      UTC
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3 flex-wrap min-w-0">
+                    <span
+                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        task.status === "active"
+                          ? "bg-green-500/20 text-green-400"
+                          : "bg-gray-500/20 text-gray-400"
+                      }`}
+                    >
+                      {task.status}
                     </span>
+                    <div className="flex items-center gap-1.5 text-[12px] text-muted-foreground font-mono">
+                      <Clock className="h-3.5 w-3.5 shrink-0" />
+                      {task.schedule}
+                      <span className="px-1 py-[1px] rounded text-[9px] font-medium bg-muted text-muted-foreground/70 uppercase tracking-wider leading-none">
+                        UTC
+                      </span>
+                    </div>
+                    {task.status === "active" && (() => {
+                      const hint = nextFireFull(task.schedule)
+                      return hint ? (
+                        <div className="text-[11px] text-muted-foreground/70 tabular-nums">
+                          Next fire: {hint}
+                        </div>
+                      ) : null
+                    })()}
                   </div>
-                  {task.status === "active" && (() => {
-                    const hint = nextFireFull(task.schedule)
-                    return hint ? (
-                      <div className="text-[11px] text-muted-foreground/70 tabular-nums">
-                        Next fire: {hint}
-                      </div>
-                    ) : null
-                  })()}
+                  <button
+                    onClick={handleRunNow}
+                    disabled={triggering || hasRunningRun || cooldownSec > 0}
+                    className="flex items-center gap-1.5 h-8 px-3 text-[12px] rounded-md bg-primary text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed hover:opacity-90 shrink-0"
+                    title={
+                      hasRunningRun
+                        ? "A run is already in progress"
+                        : cooldownSec > 0
+                          ? `Cooldown: wait ${cooldownSec}s`
+                          : "Fire this task now, outside the cron schedule"
+                    }
+                  >
+                    {triggering || hasRunningRun ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Play className="h-3.5 w-3.5" />
+                    )}
+                    {triggering
+                      ? "Triggering…"
+                      : hasRunningRun
+                        ? "Running…"
+                        : cooldownSec > 0
+                          ? `Wait ${cooldownSec}s`
+                          : "Run now"}
+                  </button>
                 </div>
                 {task.description && (
                   <p className="text-[12px] text-muted-foreground/80 pt-1 border-t border-border/40">
