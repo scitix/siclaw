@@ -105,7 +105,20 @@ export interface SiclawApiContext {
   notifySkillDevAgents?: (skillId: string, resources: string[]) => void;
   /** Notify agents bound to an MCP server to reload. */
   notifyMcpAgents?: (mcpId: string, resources: string[]) => void;
+  /**
+   * Trigger a manual Run-now for the given task. Field is filled in by
+   * gateway-main after the TaskCoordinator is constructed; route handlers
+   * read it at request time so the late-attach pattern is safe. Undefined
+   * in DB-less modes where the coordinator isn't running.
+   */
+  fireTaskNow?: (taskId: string) => Promise<SiclawTaskFireOutcome>;
 }
+
+export type SiclawTaskFireOutcome =
+  | { kind: "ok"; runId: string }
+  | { kind: "in_flight" }
+  | { kind: "cooldown"; retryAfterSec: number }
+  | { kind: "not_found" };
 
 export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
@@ -1251,6 +1264,48 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     if (existing.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
     await db.query("DELETE FROM agent_tasks WHERE id = ?", [params.taskId]);
     sendJson(res, 200, { deleted: true });
+  });
+
+  // Manually trigger a run for this task now (bypassing the cron schedule
+  // but going through the same execution path). Rate-limited by an in-flight
+  // check + a configurable cooldown so trivially-fast tasks can't be
+  // hammered. Ownership is verified here; the coordinator then does an
+  // independent DB check before actually reserving the run row.
+  router.post(`${P}/agents/:agentId/tasks/:taskId/runs`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [owner] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [params.taskId, params.agentId, auth.userId],
+    ) as any;
+    if (owner.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
+
+    if (!ctx?.fireTaskNow) {
+      sendJson(res, 503, { error: "Task coordinator not available" });
+      return;
+    }
+
+    const outcome = await ctx.fireTaskNow(params.taskId);
+    switch (outcome.kind) {
+      case "ok":
+        sendJson(res, 202, { run_id: outcome.runId });
+        return;
+      case "in_flight":
+        sendJson(res, 409, { error: "A run is already in flight for this task" });
+        return;
+      case "cooldown":
+        res.setHeader("Retry-After", String(outcome.retryAfterSec));
+        sendJson(res, 429, {
+          error: `Too soon — wait ${outcome.retryAfterSec}s before triggering another run`,
+          retry_after_sec: outcome.retryAfterSec,
+        });
+        return;
+      case "not_found":
+        sendJson(res, 404, { error: "Task not found" });
+        return;
+    }
   });
 
   // List runs for a task — only the owner of the task can view its runs.
