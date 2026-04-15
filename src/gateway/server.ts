@@ -513,8 +513,14 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     ws.on("close", () => {
       clients.delete(ws);
-      const ctrl = activeStreams.get(ws);
-      if (ctrl) { ctrl.abort(); activeStreams.delete(ws); }
+      // Do NOT abort in-flight SSE consumers on WS close. A prompt is the
+      // minimal unit of work: once submitted, let it run to completion so
+      // the agent's full output — including empty-response retries and the
+      // post-deep_search synthesis turn — is persisted to DB via
+      // persistMessages. On reconnect the frontend fetches history and
+      // sees messages produced after the disconnect. Explicit cancellation
+      // still flows through chat.abort → agentbox abortSession.
+      activeStreams.delete(ws);
       console.log(`[runtime] WS disconnected (total: ${clients.size})`);
     });
 
