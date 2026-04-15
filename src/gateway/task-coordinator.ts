@@ -7,7 +7,7 @@
  * hop through Portal's /run endpoint.
  *
  * Pattern mirrors siclaw_main's CronService:
- *   - Load active tasks at startup, re-sync every 60s (picks up rows created
+ *   - Load active tasks at startup, re-sync every 15s (picks up rows created
  *     via UI REST, chat-tool manage_schedule, or any other writer)
  *   - Each fire: resolve agent's model binding, create a fresh session, stream
  *     events through sse-consumer (which persists the full trace), record the
@@ -24,7 +24,7 @@ import { AgentBoxClient, type AgentBoxTlsOptions, type PromptOptions } from "./a
 import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import { appendMessage, incrementMessageCount } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
-import { buildRedactionConfig } from "./output-redactor.js";
+import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 
 /** Row shape needed by the scheduler — carries the task prompt out-of-band. */
 interface AgentTaskDbRow {
@@ -64,7 +64,7 @@ export type TaskCompletedHandler = (evt: TaskCompletedEvent) => void;
 export interface TaskCoordinatorOptions {
   agentBoxManager: AgentBoxManager;
   agentBoxTlsOptions?: AgentBoxTlsOptions;
-  /** Resync cadence to pick up changes from other writers (default 60s). */
+  /** Resync cadence to pick up changes from other writers (default 15s). */
   syncIntervalMs?: number;
   /** Per-task soft timeout (default 5 min). */
   executionTimeoutMs?: number;
@@ -144,7 +144,8 @@ export class TaskCoordinator {
   }
 
   /**
-   * Delete cron-triggered sessions + run records older than retentionDays.
+   * Delete scheduled-task-triggered sessions + run records older than
+   * retentionDays.
    *
    * chat_messages is wiped transitively via the FK cascade from chat_sessions.
    * agent_task_runs.session_id is a plain column (no FK) so we delete it in
@@ -152,7 +153,7 @@ export class TaskCoordinator {
    * deleted row is harmless (the messages endpoint returns empty for
    * missing sessions).
    *
-   * Scoped to origin='cron' for sessions so user chat history is not touched.
+   * Scoped to origin='task' for sessions so user chat history is not touched.
    */
   private async pruneOldRuns(): Promise<void> {
     const db = getDb();
@@ -281,10 +282,7 @@ export class TaskCoordinator {
       await appendMessage({ sessionId, role: "user", content: prompt });
       await incrementMessageCount(sessionId);
 
-      const redactionConfig = buildRedactionConfig(undefined, undefined, [
-        binding.modelConfig.apiKey,
-        binding.modelConfig.baseUrl,
-      ]);
+      const redactionConfig = buildRedactionConfigForModelConfig(binding.modelConfig);
 
       const abortCtrl = new AbortController();
       const timer = setTimeout(() => abortCtrl.abort(), this.executionTimeoutMs);
