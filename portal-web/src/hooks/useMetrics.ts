@@ -218,12 +218,10 @@ export function useUsers(): { users: UserListEntry[]; loading: boolean } {
 
   useEffect(() => {
     let cancelled = false
-    // Portal adapter route — returns all users in the org. Admin-only by server.
-    api<{ data?: UserListEntry[]; users?: UserListEntry[] }>("/siclaw/admin/users")
+    api<{ data: UserListEntry[] }>("/users")
       .then((r) => {
         if (cancelled) return
-        const list = r.data ?? r.users ?? []
-        setUsers(Array.isArray(list) ? list : [])
+        setUsers(Array.isArray(r.data) ? r.data : [])
         setLoading(false)
       })
       .catch(() => { if (!cancelled) setLoading(false) })
