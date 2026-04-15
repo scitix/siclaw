@@ -1193,6 +1193,7 @@ const CONTEXT_POLICIES: Record<string, ContextPolicy> = {
   },
   node: { available: ALL_COMMAND_CATEGORIES },
   pod:  { available: ALL_COMMAND_CATEGORIES },
+  host: { available: ALL_COMMAND_CATEGORIES },
 };
 
 // ── Context-based allowed command set ──────────────────────────

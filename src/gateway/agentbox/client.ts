@@ -6,7 +6,7 @@
  */
 
 import https from "node:https";
-import { RESOURCE_DESCRIPTORS, type ResourceType } from "../../shared/resource-sync.js";
+import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -147,10 +147,10 @@ export class AgentBoxClient {
   }
 
   /**
-   * Generic resource reload — POST to the descriptor's reloadPath.
+   * Generic sync reload — POST to the descriptor's reloadPath.
    */
-  async reloadResource(type: ResourceType): Promise<unknown> {
-    const descriptor = RESOURCE_DESCRIPTORS[type];
+  async reloadResource(type: GatewaySyncType): Promise<unknown> {
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS[type];
     const resp = await this.fetch(descriptor.reloadPath, {
       method: "POST",
     });

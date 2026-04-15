@@ -9,9 +9,12 @@ import type { KubeconfigRef } from "../../core/types.js";
  * cluster_info — return admin-provided infrastructure descriptions for the
  * clusters bound to the current agent.
  *
- * Data source: CredentialBroker's in-memory registry (populated by the
- * gateway's CredentialService). The description field typically carries
- * context that is not discoverable via kubectl — RDMA/CNI/scheduler etc.
+ * Data source: CredentialBroker's in-memory registry. The Map is populated
+ * lazily on first call (one refresh from the gateway's CredentialService)
+ * and kept fresh thereafter via notify-driven refreshes (POST
+ * /api/reload-cluster from the Gateway on CRUD / binding changes).
+ * The description field typically carries context that is not discoverable
+ * via kubectl — RDMA/CNI/scheduler etc.
  */
 export function createClusterInfoTool(kubeconfigRef: KubeconfigRef): ToolDefinition {
   return {
@@ -46,7 +49,7 @@ the cluster administrator.`,
       }
 
       try {
-        await broker.list();
+        if (!broker.isClustersReady()) await broker.refreshClusters();
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return {
@@ -55,15 +58,15 @@ the cluster administrator.`,
         };
       }
 
-      let clusters = broker.listLocalInfo();
+      let clusters = broker.listClustersLocalInfo();
       if (params.name) {
         const needle = params.name.toLowerCase();
-        clusters = clusters.filter((c) => c.name.toLowerCase().includes(needle));
+        clusters = clusters.filter((c) => c.meta.name.toLowerCase().includes(needle));
       }
 
       const result = clusters.map((c) => ({
-        name: c.name,
-        infra_context: c.description ?? null,
+        name: c.meta.name,
+        infra_context: c.meta.description ?? null,
       }));
 
       return {

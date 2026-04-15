@@ -4,7 +4,7 @@
  * Every cmd-exec / script-exec tool must call this at the top of its
  * execute() method (BEFORE the synchronous security pipeline runs). It
  * scans the command for --kubeconfig=<name> / --kubeconfig <name> / -k <name>
- * arguments and calls broker.ensure() for each, so the synchronous
+ * arguments and calls broker.ensureCluster() for each, so the synchronous
  * kubeconfig-resolver can later look up the path without any async work.
  *
  * Rationale (see DESIGN.md §模块 6): the resolver is synchronous because
@@ -52,7 +52,7 @@ export async function ensureKubeconfigsForCommand(
   if (!broker) return;
   const names = extractKubeconfigNames(command);
   if (names.length === 0) return;
-  await Promise.all(names.map((n) => broker.ensure(n, purpose)));
+  await Promise.all(names.map((n) => broker.ensureCluster(n, purpose)));
 }
 
 /**
@@ -72,11 +72,27 @@ export async function ensureClusterForTool(
 ): Promise<void> {
   if (!broker) return;
   if (kubeconfigParam) {
-    await broker.ensure(kubeconfigParam, purpose);
+    await broker.ensureCluster(kubeconfigParam, purpose);
     return;
   }
-  const clusters = await broker.list();
+  const clusters = await broker.refreshClusters();
   if (clusters.length === 1) {
-    await broker.ensure(clusters[0].name, purpose);
+    await broker.ensureCluster(clusters[0].name, purpose);
   }
+}
+
+/**
+ * Ensure a host's credential file is materialized on disk before host_exec /
+ * host_script tries to read it. Throws when the broker is missing, or when
+ * the broker can't fetch the host (not bound, gateway error, etc).
+ */
+export async function ensureHostForTool(
+  broker: CredentialBroker | undefined,
+  hostName: string,
+  purpose: string,
+): Promise<void> {
+  if (!broker) {
+    throw new Error("Credential broker required for host_exec / host_script");
+  }
+  await broker.ensureHost(hostName, purpose);
 }

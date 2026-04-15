@@ -6,9 +6,9 @@
  * resource-type-agnostic implementation.
  */
 
-import type { GatewayClientLike, ResourceType } from "../shared/resource-sync.js";
-import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
-import { getResourceHandler } from "./resource-handlers.js";
+import type { GatewaySyncClientLike, GatewaySyncType } from "../shared/gateway-sync.js";
+import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
+import { getSyncHandler } from "./sync-handlers.js";
 
 /**
  * Synchronise a single resource type from the Gateway to local disk.
@@ -20,13 +20,13 @@ import { getResourceHandler } from "./resource-handlers.js";
  * @throws  If all retry attempts are exhausted.
  */
 export async function syncResource(
-  type: ResourceType,
-  client: GatewayClientLike,
+  type: GatewaySyncType,
+  client: GatewaySyncClientLike,
 ): Promise<number> {
-  const descriptor = RESOURCE_DESCRIPTORS[type];
-  const handler = getResourceHandler(type);
+  const descriptor = GATEWAY_SYNC_DESCRIPTORS[type];
+  const handler = getSyncHandler(type);
   if (!handler) {
-    throw new Error(`[resource-sync] No handler registered for resource type "${type}"`);
+    throw new Error(`[gateway-sync] No handler registered for sync type "${type}"`);
   }
 
   const { maxRetries, baseDelayMs } = descriptor.retry;
@@ -68,11 +68,15 @@ export async function syncResource(
  * A summary is logged at the end.
  */
 export async function syncAllResources(
-  client: GatewayClientLike,
-): Promise<{ succeeded: ResourceType[]; failed: ResourceType[] }> {
-  const types = Object.keys(RESOURCE_DESCRIPTORS) as ResourceType[];
-  const succeeded: ResourceType[] = [];
-  const failed: ResourceType[] = [];
+  client: GatewaySyncClientLike,
+): Promise<{ succeeded: GatewaySyncType[]; failed: GatewaySyncType[] }> {
+  // Only types flagged initialSync=true pull at startup. Types whose handlers
+  // depend on a later-constructed singleton (e.g. broker) opt out via
+  // initialSync=false and rely on lazy-fill by their consumer.
+  const types = (Object.keys(GATEWAY_SYNC_DESCRIPTORS) as GatewaySyncType[])
+    .filter((t) => GATEWAY_SYNC_DESCRIPTORS[t].initialSync);
+  const succeeded: GatewaySyncType[] = [];
+  const failed: GatewaySyncType[] = [];
 
   for (const type of types) {
     try {

@@ -21,6 +21,10 @@ interface CredentialRequestBody {
   purpose?: string;
 }
 
+interface CredentialListBody {
+  kind?: string;
+}
+
 // Keep identity fields to a safe charset before they land in SQL params or
 // outbound HTTP headers. Node will reject CRLF in headers anyway, but we
 // narrow further to prevent surprises (e.g. a non-UUID agentId slipping
@@ -77,7 +81,7 @@ export async function handleCredentialRequest(
     return;
   }
 
-  if (body.source !== "cluster") {
+  if (body.source !== "cluster" && body.source !== "host") {
     sendError(res, 400, `Unsupported source: ${body.source ?? "(missing)"}`);
     return;
   }
@@ -87,33 +91,52 @@ export async function handleCredentialRequest(
   }
 
   try {
-    const payload = await service.getClusterCredential(
-      toIdentity(identity),
-      body.source_id,
-      body.purpose ?? "",
-    );
+    const id = toIdentity(identity);
+    const payload = body.source === "cluster"
+      ? await service.getClusterCredential(id, body.source_id, body.purpose ?? "")
+      : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
     sendJson(res, 200, payload);
   } catch (err) {
     if (err instanceof CredentialNotFoundError) {
       sendError(res, 404, err.message);
       return;
     }
-    console.error("[credential-proxy] getClusterCredential failed:", err);
+    console.error(`[credential-proxy] get${body.source}Credential failed:`, err);
     sendError(res, 502, err instanceof Error ? err.message : "Unknown error");
   }
 }
 
 export async function handleCredentialList(
-  _req: http.IncomingMessage,
+  req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
   service: CredentialService,
 ): Promise<void> {
+  const raw = await readBody(req);
+  let body: CredentialListBody;
   try {
-    const clusters = await service.listClusters(toIdentity(identity));
-    sendJson(res, 200, { clusters });
+    body = raw ? (JSON.parse(raw) as CredentialListBody) : {};
+  } catch {
+    sendError(res, 400, "Invalid JSON body");
+    return;
+  }
+
+  if (body.kind !== "cluster" && body.kind !== "host") {
+    sendError(res, 400, `Unsupported kind: ${body.kind ?? "(missing)"}`);
+    return;
+  }
+
+  try {
+    const id = toIdentity(identity);
+    if (body.kind === "cluster") {
+      const clusters = await service.listClusters(id);
+      sendJson(res, 200, { clusters });
+    } else {
+      const hosts = await service.listHosts(id);
+      sendJson(res, 200, { hosts });
+    }
   } catch (err) {
-    console.error("[credential-proxy] listClusters failed:", err);
+    console.error(`[credential-proxy] list${body.kind} failed:`, err);
     sendError(res, 502, err instanceof Error ? err.message : "Unknown error");
   }
 }

@@ -133,7 +133,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, runtim
     sendJson(res, 200, updated[0]);
 
     // Notify bound agents to clear cached credentials
-    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_hosts", "host_id", params.id, ["credentials"]);
+    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_hosts", "host_id", params.id, ["host"]);
   });
 
   // DELETE /api/v1/hosts/:id

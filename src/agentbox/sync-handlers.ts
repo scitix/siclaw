@@ -1,24 +1,24 @@
 /**
- * AgentBox Resource Handlers
+ * AgentBox Sync Handlers
  *
- * Concrete AgentBoxResourceHandler implementations for each ResourceType.
+ * Concrete AgentBoxSyncHandler implementations for each GatewaySyncType.
  * Each handler knows how to fetch, materialize, and optionally post-reload
- * a specific resource.
+ * a specific syncable type.
  *
  * These handlers are consumed by the generic syncResource() function in
- * resource-sync.ts, as well as by the HTTP reload endpoints (Phase 2).
+ * resource-sync.ts, as well as by the HTTP reload endpoints.
  */
 
 import fs from "node:fs";
 import path from "node:path";
 import { loadConfig, reloadConfig, writeConfig } from "../core/config.js";
 import type {
-  ResourceType,
-  AgentBoxResourceHandler,
-  GatewayClientLike,
+  GatewaySyncType,
+  AgentBoxSyncHandler,
+  GatewaySyncClientLike,
   ReloadContext,
-} from "../shared/resource-sync.js";
-import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+} from "../shared/gateway-sync.js";
+import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
@@ -30,11 +30,12 @@ interface McpPayload {
   mcpServers: Record<string, unknown>;
 }
 
-export const mcpHandler: AgentBoxResourceHandler<McpPayload> = {
+export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
   type: "mcp",
 
-  async fetch(client: GatewayClientLike): Promise<McpPayload> {
-    const descriptor = RESOURCE_DESCRIPTORS.mcp;
+  async fetch(client: GatewaySyncClientLike | null): Promise<McpPayload> {
+    if (!client) throw new Error("[mcp] GatewaySyncClientLike required but missing");
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS.mcp;
     const data = await client.request(descriptor.gatewayPath, "GET");
     return data as McpPayload;
   },
@@ -92,11 +93,12 @@ interface SkillBundlePayload {
   }>;
 }
 
-export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
+export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
   type: "skills",
 
-  async fetch(client: GatewayClientLike): Promise<SkillBundlePayload> {
-    const descriptor = RESOURCE_DESCRIPTORS.skills;
+  async fetch(client: GatewaySyncClientLike | null): Promise<SkillBundlePayload> {
+    if (!client) throw new Error("[skills] GatewaySyncClientLike required but missing");
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS.skills;
     const data = await client.request(descriptor.gatewayPath, "GET");
     return data as SkillBundlePayload;
   },
@@ -146,17 +148,66 @@ export const skillsHandler: AgentBoxResourceHandler<SkillBundlePayload> = {
   },
 };
 
+// ── Cluster / Host handlers (factory, broker-dependent) ───────────────
+
+import type { CredentialBroker } from "./credential-broker.js";
+
+/**
+ * cluster handler — refresh cluster metadata Map on notify.
+ *
+ * Does NOT use GatewaySyncClientLike: the CredentialBroker carries its own
+ * CredentialTransport that already abstracts HTTP-mTLS (K8s mode) and
+ * in-process direct call (Local mode). The framework's generic HTTP client
+ * is the wrong tool here — in Local mode it would be null.
+ *
+ * Consequence: fetch() drives the entire refresh; materialize() is a
+ * no-op that just returns the count for the framework log line.
+ */
+export function createClusterHandler(broker: CredentialBroker): AgentBoxSyncHandler<number> {
+  return {
+    type: "cluster",
+    async fetch(_client): Promise<number> {
+      const metas = await broker.refreshClusters();
+      return metas.length;
+    },
+    async materialize(count: number): Promise<number> {
+      return count;
+    },
+  };
+}
+
+/** host handler — mirror of cluster handler. */
+export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler<number> {
+  return {
+    type: "host",
+    async fetch(_client): Promise<number> {
+      const metas = await broker.refreshHosts();
+      return metas.length;
+    },
+    async materialize(count: number): Promise<number> {
+      return count;
+    },
+  };
+}
+
 // ── Registry ──────────────────────────────────────────────────────────
 
-const handlers = new Map<ResourceType, AgentBoxResourceHandler<any>>([
+const handlers = new Map<GatewaySyncType, AgentBoxSyncHandler<any>>([
   ["mcp", mcpHandler],
   ["skills", skillsHandler],
 ]);
 
 /**
- * Look up the handler for a given resource type.
- * Returns undefined if the type is unknown.
+ * Look up the static handler for a given sync type. Only mcp and skills
+ * are registered here — their handlers are process-global and carry no
+ * per-session state.
+ *
+ * cluster/host handlers are NOT registered in this map: each AgentBox
+ * httpServer constructs its own factory-bound instance (closing over
+ * that server's broker) and wires it directly into the reload route.
+ * Routing cluster/host through a module-level Map would let Local mode's
+ * multi-spawn pattern silently pick the wrong broker on notify.
  */
-export function getResourceHandler(type: ResourceType): AgentBoxResourceHandler<any> | undefined {
+export function getSyncHandler(type: GatewaySyncType): AgentBoxSyncHandler<any> | undefined {
   return handlers.get(type);
 }

@@ -18,8 +18,8 @@ import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metri
 import { GatewayClient } from "./gateway-client.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { HttpMtlsTransport } from "./credential-transport.js";
-import { getResourceHandler } from "./resource-handlers.js";
-import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
+import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
 
 type RequestHandler = (
@@ -115,6 +115,18 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         console.log("[agentbox-http] Credential broker initialized (mTLS transport)");
       }
     }
+  }
+
+  // cluster/host handlers close over this server's broker. In Local mode,
+  // LocalSpawner runs multiple AgentBoxes in the SAME process — if we had
+  // used the module-level sync-handlers registry (as mcp/skills do), each
+  // spawn() would overwrite the previous registration and cross-tenant
+  // request routing would silently pick the wrong broker. We instead bind
+  // these handlers per-httpServer and hand them to the route loop below.
+  const perServerHandlers: Partial<Record<GatewaySyncType, AgentBoxSyncHandler<any>>> = {};
+  if (sessionManager.credentialBroker) {
+    perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
+    perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
 
   // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
@@ -689,7 +701,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   /**
    * POST /api/reload-{mcp,skills} — unified resource reload endpoints
    *
-   * Each endpoint delegates to the matching AgentBoxResourceHandler:
+   * Each endpoint delegates to the matching AgentBoxSyncHandler:
    * fetch → materialize → postReload.
    * URL paths are preserved for backward compatibility.
    */
@@ -701,26 +713,34 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     return _reloadGatewayClient;
   }
 
-  for (const descriptor of Object.values(RESOURCE_DESCRIPTORS)) {
+  for (const descriptor of Object.values(GATEWAY_SYNC_DESCRIPTORS)) {
     addRoute("POST", descriptor.reloadPath, async (_req, res) => {
       const resourceType = descriptor.type;
       console.log(`[agentbox-http] Reloading ${resourceType} configuration`);
 
       const client = getReloadGatewayClient();
-      if (!client) {
+      // Only skip for handlers that actually need the HTTP client. Handlers
+      // with requiresGatewayClient=false (cluster/host) bring their own
+      // transport via the broker and run fine even when SICLAW_GATEWAY_URL
+      // is unset (Local mode).
+      if (descriptor.requiresGatewayClient && !client) {
         console.warn(`[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping ${resourceType} reload`);
         sendJson(res, 200, { ok: true, count: 0, type: resourceType });
         return;
       }
 
-      const handler = getResourceHandler(resourceType);
+      // Prefer the per-server handler (cluster/host) to guarantee the
+      // closure binds to THIS httpServer's broker (Local mode isolation);
+      // fall back to the module-level registry for mcp/skills which are
+      // process-global and carry no per-session state.
+      const handler = perServerHandlers[resourceType] ?? getSyncHandler(resourceType);
       if (!handler) {
-        sendJson(res, 500, { error: `No handler for resource type "${resourceType}"` });
+        sendJson(res, 500, { error: `No handler for sync type "${resourceType}"` });
         return;
       }
 
       try {
-        const payload = await handler.fetch(client.toClientLike());
+        const payload = await handler.fetch(client ? client.toClientLike() : null);
         const count = await handler.materialize(payload);
 
         // Build session list for postReload (skills needs brain.reload())
@@ -741,21 +761,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     });
   }
-
-  /**
-   * POST /api/reload-credentials — clear cached credential files.
-   * Next acquire() will re-fetch from Gateway on demand.
-   */
-  addRoute("POST", "/api/reload-credentials", async (_req, res) => {
-    const broker = sessionManager.credentialBroker;
-    if (!broker) {
-      sendJson(res, 200, { ok: true, cleared: 0, type: "credentials" });
-      return;
-    }
-    const cleared = broker.clearCache();
-    console.log(`[agentbox-http] Credentials cache cleared: ${cleared} entries`);
-    sendJson(res, 200, { ok: true, cleared, type: "credentials" });
-  });
 
   /**
    * GET /api/models - list available models (read from settings.json)

@@ -16,6 +16,8 @@ export interface Identity {
   boxId?: string;
 }
 
+export type ResourceKind = "cluster" | "host";
+
 export interface ClusterMeta {
   name: string;
   description?: string;
@@ -24,6 +26,16 @@ export interface ClusterMeta {
   contexts?: Array<{ name: string; cluster?: string; namespace?: string }>;
   current_context?: string;
   debug_image?: string;
+}
+
+export interface HostMeta {
+  name: string;
+  description?: string;
+  ip: string;
+  port: number;
+  username: string;
+  auth_type: "password" | "key";
+  is_production: boolean;
 }
 
 export interface CredentialFile {
@@ -35,7 +47,7 @@ export interface CredentialFile {
 export interface CredentialPayload {
   credential: {
     name: string;
-    type: string;
+    type: "kubeconfig" | "ssh";
     files: CredentialFile[];
     metadata?: Record<string, unknown>;
     ttl_seconds?: number;
@@ -47,12 +59,22 @@ export interface CredentialPayload {
  * Gateway-side credential resolution contract. Implemented by gateway modules
  * (LocalDbCredentialService, ExternalCredentialService) and consumed both by
  * HTTP handlers (credential-proxy) and by the in-process DirectCallTransport.
+ *
+ * Methods are kind-specific (no `getCredential(kind, ...)` dispatch) — every
+ * implementation walks completely different code paths per kind, so a unified
+ * entry would just wrap two independent functions.
  */
 export interface CredentialService {
   listClusters(identity: Identity): Promise<ClusterMeta[]>;
+  listHosts(identity: Identity): Promise<HostMeta[]>;
   getClusterCredential(
     identity: Identity,
     clusterName: string,
+    purpose: string,
+  ): Promise<CredentialPayload>;
+  getHostCredential(
+    identity: Identity,
+    hostName: string,
     purpose: string,
   ): Promise<CredentialPayload>;
 }

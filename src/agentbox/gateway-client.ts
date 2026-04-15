@@ -107,10 +107,10 @@ export class GatewayClient {
   }
 
   /**
-   * Return a GatewayClientLike adapter for use with resource handlers.
+   * Return a GatewaySyncClientLike adapter for use with sync handlers.
    * Keeps `request()` private while exposing a minimal interface.
    */
-  toClientLike(): import("../shared/resource-sync.js").GatewayClientLike {
+  toClientLike(): import("../shared/gateway-sync.js").GatewaySyncClientLike {
     return {
       request: (p: string, m: "GET" | "POST" | "PUT" | "DELETE", b?: unknown) => this.request(p, m, b),
     };

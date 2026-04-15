@@ -51,7 +51,7 @@ Returns { name, reachable, server_version?, probe_error? }.`,
         };
       }
 
-      const result = await broker.probe(params.name);
+      const result = await broker.probeCluster(params.name);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         details: {},
