@@ -29,6 +29,8 @@ interface RunSkillParams {
 export function createLocalScriptTool(
   kubeconfigRef?: KubeconfigRef,
   sessionIdRef?: { current: string },
+  userId?: string,
+  agentId?: string | null,
 ): ToolDefinition {
   return {
     name: "local_script",
@@ -207,6 +209,8 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           outcome: "success",
           durationMs: Date.now() - startMs,
           sessionId: sessionIdRef?.current,
+          userId: userId ?? "unknown",
+          agentId: agentId ?? null,
         });
         return {
           content: [{ type: "text", text: postExecSecurity(stdout.trim(), null, { stderr: stderr.trim() || undefined }) }],
@@ -222,6 +226,8 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           outcome: "error",
           durationMs: Date.now() - startMs,
           sessionId: sessionIdRef?.current,
+          userId: userId ?? "unknown",
+          agentId: agentId ?? null,
         });
         return {
           content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}`, null, { stderr: errStderr || undefined }) }],
@@ -234,5 +240,5 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  create: (refs) => createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef),
+  create: (refs) => createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef, refs.userId, refs.agentId),
 };

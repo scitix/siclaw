@@ -84,6 +84,9 @@ export class AgentBoxSessionManager {
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
   userId?: string;
 
+  /** Optional agentId — set by LocalSpawner / K8s spawner; used for metrics labeling */
+  agentId?: string;
+
   /** Optional knowledge base indexer — set by LocalSpawner for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
 
@@ -231,6 +234,7 @@ export class AgentBoxSessionManager {
       mode: effectiveMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
+      agentId: this.agentId ?? null,
       knowledgeIndexer: this.knowledgeIndexer,
       systemPromptTemplate,
     });
@@ -302,6 +306,8 @@ export class AgentBoxSessionManager {
           toolName: event.toolName ?? entry?.name ?? "unknown",
           outcome: event.isError ? "error" : "success",
           durationMs: entry ? Date.now() - entry.startMs : 0,
+          userId: this.userId ?? "unknown",
+          agentId: this.agentId ?? null,
         });
       }
       if (event.type === "agent_start") {
@@ -524,17 +530,8 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({
-        type: "session_released",
-        sessionId,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
       this.onSessionRelease?.();
@@ -610,17 +607,8 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] Memory sync on close failed:`, err);
         }
       }
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({
-        type: "session_released",
-        sessionId,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId });
     }
   }
 
@@ -648,16 +636,7 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
       }
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
-      emitDiagnostic({
-        type: "session_released",
-        sessionId: id,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId: id });
     }
 
     // Close shared memory indexer

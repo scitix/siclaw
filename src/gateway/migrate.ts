@@ -107,6 +107,7 @@ const SCHEMA_SQLS: string[] = [
     metadata JSON,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     INDEX idx_chat_messages_session (session_id, created_at),
+    INDEX idx_chat_messages_audit (role, created_at),
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
@@ -218,6 +219,14 @@ const SCHEMA_SQLS: string[] = [
     agent_id CHAR(36) NOT NULL,
     created_by CHAR(36) NOT NULL,
     expires_at TIMESTAMP(3) NOT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // System config (admin-managed kv, e.g. system.grafanaUrl)
+  `CREATE TABLE IF NOT EXISTS system_config (
+    config_key VARCHAR(100) PRIMARY KEY,
+    config_value TEXT,
+    updated_by CHAR(36),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
 ];

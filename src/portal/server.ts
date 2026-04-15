@@ -88,6 +88,15 @@ export function startPortal(config: PortalConfig): http.Server {
     // Portal's own routes
     if (router.handle(req, res)) return;
 
+    // Proxy admin Metrics + System config APIs to Runtime (admin-only enforced
+    // both here and on Runtime side via requireAdmin)
+    if (url.startsWith("/api/v1/metrics/") || url.startsWith("/api/v1/system/")) {
+      const auth = requireAdmin(req, res, config.jwtSecret);
+      if (!auth) return;
+      runtimeProxy(req, res);
+      return;
+    }
+
     // Proxy Siclaw domain APIs to Runtime
     if (
       url.startsWith("/api/v1/siclaw/skills") ||

@@ -19,6 +19,8 @@ export type { SessionMode };
 export interface ToolRefs {
   kubeconfigRef: KubeconfigRef;
   userId: string;
+  /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
+  agentId: string | null;
   sessionIdRef: { current: string };
   llmConfigRef: LlmConfigRef;
   memoryRef: MemoryRef;
