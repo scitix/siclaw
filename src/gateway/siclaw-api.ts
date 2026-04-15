@@ -115,7 +115,7 @@ export interface SiclawApiContext {
 }
 
 export type SiclawTaskFireOutcome =
-  | { kind: "ok"; runId: string }
+  | { kind: "ok" }
   | { kind: "in_flight" }
   | { kind: "cooldown"; retryAfterSec: number }
   | { kind: "not_found" };
@@ -1290,7 +1290,7 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     const outcome = await ctx.fireTaskNow(params.taskId);
     switch (outcome.kind) {
       case "ok":
-        sendJson(res, 202, { run_id: outcome.runId });
+        sendJson(res, 202, { ok: true });
         return;
       case "in_flight":
         sendJson(res, 409, { error: "A run is already in flight for this task" });
