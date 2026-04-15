@@ -118,16 +118,53 @@ function clampScore(v: unknown): number {
 }
 
 function extractJson(text: string): string {
-  const objMatch = text.match(/\{[\s\S]*\}/);
-  if (objMatch) return objMatch[0];
-
+  // 1) Prefer a fenced ```json code block — standard LLM output format
   const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (codeBlockMatch) {
     const inner = codeBlockMatch[1].trim();
-    const innerObj = inner.match(/\{[\s\S]*\}/);
-    if (innerObj) return innerObj[0];
-    return inner;
+    const balanced = findBalancedJsonObject(inner);
+    if (balanced) return balanced;
   }
 
+  // 2) Walk the text from the END looking for a balanced {...} object that
+  //    contains a score field. Reasoning text often mentions jsonpath like
+  //    `{.spec...}` which a naive /\{[\s\S]*\}/ would swallow.
+  const balanced = findBalancedJsonObject(text);
+  if (balanced) return balanced;
+
   throw new Error("Failed to extract JSON from LLM scoring response");
+}
+
+/**
+ * Find the last balanced {...} block in `text` that contains "scoreCommands".
+ * Walks right-to-left from each `}`, matching braces while respecting strings,
+ * to reliably pull the scoring JSON out of chatty reasoning text.
+ */
+function findBalancedJsonObject(text: string): string | null {
+  const endPositions: number[] = [];
+  for (let i = 0; i < text.length; i++) if (text[i] === "}") endPositions.push(i);
+
+  for (let k = endPositions.length - 1; k >= 0; k--) {
+    const end = endPositions[k];
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = end; i >= 0; i--) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === "\\") { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === "}") depth++;
+      else if (ch === "{") {
+        depth--;
+        if (depth === 0) {
+          const candidate = text.slice(i, end + 1);
+          if (candidate.includes("scoreCommands")) return candidate;
+          break; // this {...} doesn't contain the score — try next closing brace
+        }
+      }
+    }
+  }
+  return null;
 }

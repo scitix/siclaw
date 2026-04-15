@@ -19,6 +19,9 @@ import { consumeAgentSse } from "../sse-consumer.js";
 import { buildRedactionConfig } from "../output-redactor.js";
 import { generateFaultCases } from "./fault-generator.js";
 import { scoreCase } from "./evaluator.js";
+import { parseRegressionMarkdown } from "./regression/md-parser.js";
+import { runCase, type CaseResult } from "./regression/runner.js";
+import { renderReport } from "./regression/reporter.js";
 
 function requireAuth(context: RpcContext): string {
   const userId = context.auth?.userId;
@@ -511,6 +514,124 @@ export function registerDevEvalMethods(
     })();
 
     return { ok: true, status: "scoring" };
+  });
+
+  // ── deveval.runRegression ───────────────────────────
+  // Parse a markdown case-bank, run each case through agent + evaluator,
+  // and return a markdown report. Used by the regress CLI for pre-release
+  // regression testing.
+  methods.set("deveval.runRegression", async (params, context: RpcContext) => {
+    const userId = requireAuth(context);
+    const { chatRepo, workspaceRepo } = requireDb();
+
+    const markdown = params.markdown as string;
+    const workspaceId = params.workspaceId as string | undefined;
+    const workOrderIndex = Number(params.workOrderIndex ?? 0);
+    if (!markdown) throw new Error("Missing required param: markdown");
+
+    const workspace = workspaceId
+      ? await workspaceRepo.getById(workspaceId)
+      : await workspaceRepo.getOrCreateDefault(userId);
+    if (!workspace || workspace.userId !== userId) throw new Error("Workspace not found");
+
+    const modelProvider = (params.modelProvider as string | undefined)
+      ?? workspace.configJson?.defaultModel?.provider;
+    const modelId = (params.modelId as string | undefined)
+      ?? workspace.configJson?.defaultModel?.modelId;
+
+    let modelConfig: Record<string, unknown> | undefined;
+    if (modelProvider && modelConfigRepo) {
+      try {
+        const pc = await modelConfigRepo.getProviderWithModels(modelProvider);
+        if (pc) modelConfig = pc as unknown as Record<string, unknown>;
+      } catch {}
+    }
+
+    const parsed = parseRegressionMarkdown(markdown);
+    if (parsed.cases.length === 0) {
+      throw new Error(
+        `No valid cases parsed. Warnings: ${JSON.stringify(parsed.warnings)}`,
+      );
+    }
+
+    const runId = `r${Date.now().toString(36)}`;
+    const startedAt = new Date().toISOString();
+    const notify = (payload: Record<string, unknown>) => {
+      if (sendToUser) sendToUser(userId, "deveval_event", payload);
+      else context.sendEvent("deveval_event", payload);
+    };
+    notify({
+      type: "regress_started",
+      runId,
+      total: parsed.cases.length,
+      warnings: parsed.warnings,
+    });
+
+    const handle = await agentBoxManager.getOrCreate(userId, workspace.id, {
+      workspaceId: workspace.id,
+      podEnv: (workspace.envType === "test" ? "test" : "prod") as "prod" | "dev" | "test",
+    });
+    const client = new AgentBoxClient(handle.endpoint, 300_000, agentBoxTlsOptions);
+
+    let credentials: any;
+    if (buildCredentialPayload) {
+      credentials = await buildCredentialPayload(userId, workspace.id, workspace.isDefault).catch(() => undefined);
+    }
+
+    const results: CaseResult[] = [];
+    for (const c of parsed.cases) {
+      notify({ type: "regress_case_start", runId, caseId: c.public.id });
+      const result = await runCase(c, {
+        client,
+        chatRepo,
+        userId,
+        workspaceId: workspace.id,
+        runId,
+        workOrderIndex,
+        modelProvider,
+        modelId,
+        modelConfig: modelConfig as any,
+        credentials,
+        onProgress: (ev) => notify({ ...ev, runId }),
+      });
+      results.push(result);
+      notify({
+        type: "regress_case_done",
+        runId,
+        caseId: c.public.id,
+        outcome: result.outcome,
+        scoreCommands: result.scoreCommands,
+        scoreConclusion: result.scoreConclusion,
+      });
+    }
+
+    const finishedAt = new Date().toISOString();
+    const report = renderReport(results, {
+      runId,
+      startedAt,
+      finishedAt,
+      modelProvider,
+      modelId,
+    });
+
+    const summary = {
+      pass: results.filter(r => r.outcome === "PASS").length,
+      fail: results.filter(r => r.outcome === "FAIL").length,
+      skip: results.filter(r => r.outcome === "SKIP").length,
+      error: results.filter(r => r.outcome === "ERROR").length,
+      total: results.length,
+    };
+    notify({ type: "regress_finished", runId, summary });
+
+    return {
+      runId,
+      startedAt,
+      finishedAt,
+      summary,
+      warnings: parsed.warnings,
+      results,
+      report,
+    };
   });
 
   // ── deveval.updateWorkOrder ─────────────────────────
