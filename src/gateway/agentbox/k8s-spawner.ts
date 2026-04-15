@@ -168,6 +168,7 @@ export class K8sSpawner implements BoxSpawner {
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
       { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-runtime.${namespace}.svc.cluster.local:3002` },
       { name: "SICLAW_AGENT_ID", value: agentId },
+      { name: "USER_ID", value: userId },
     ];
 
     // Add custom environment variables

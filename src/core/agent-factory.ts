@@ -54,6 +54,8 @@ export interface CreateSiclawSessionOpts {
   mcpTools?: ToolDefinition[];
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
+  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
+  agentId?: string | null;
   /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
 }
@@ -227,6 +229,7 @@ export async function createSiclawSession(
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
+  const agentId: string | null = opts?.agentId ?? null;
   // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
   // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
   // a model-change notification — so this initialization does not conflict with that path.
@@ -283,7 +286,7 @@ export async function createSiclawSession(
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, sessionIdRef, llmConfigRef,
+      kubeconfigRef, userId, agentId, sessionIdRef, llmConfigRef,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer,

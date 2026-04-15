@@ -28,20 +28,15 @@ export type DiagnosticEvent =
     }
   // Session lifecycle
   | { type: "session_created"; sessionId: string }
-  | {
-      type: "session_released";
-      sessionId: string;
-      stats: BrainSessionStats;
-      userId?: string;
-      model?: BrainModelInfo;
-      createdAt: number;
-    }
+  | { type: "session_released"; sessionId: string }
   // Tool execution
   | {
       type: "tool_call";
       toolName: string;
       outcome: "success" | "error";
       durationMs: number;
+      userId: string;
+      agentId: string | null;
     }
   // WebSocket connections (Gateway)
   | { type: "ws_connected" }
@@ -63,6 +58,8 @@ export type DiagnosticEvent =
       outcome: "success" | "error";
       durationMs: number;
       sessionId?: string;
+      userId: string;
+      agentId: string | null;
     }
   // Stuck session detection (Phase 2)
   | { type: "session_stuck"; sessionId: string; idleMs: number };

@@ -57,6 +57,10 @@ import { getDb } from "./db.js";
 import { appendMessage, incrementMessageCount } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
+import { registerMetricsRoutes } from "./metrics-api.js";
+import { registerSystemRoutes } from "./system-api.js";
+import { MetricsAggregator } from "./metrics-aggregator.js";
+import { LocalSpawner } from "./agentbox/local-spawner.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -82,7 +86,7 @@ export interface StartRuntimeOptions {
 }
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
-  const { config, agentBoxManager } = opts;
+  const { config, agentBoxManager, spawner } = opts;
 
   const clients = new Set<WebSocket>();
   const broadcast = createBroadcaster(clients);
@@ -368,6 +372,28 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   registerSiclawRoutes(restRouter, config, siclawCtx);
 
+  // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
+  const isK8sMode = !(spawner instanceof LocalSpawner);
+  let metricsAggregator: MetricsAggregator;
+  if (isK8sMode) {
+    metricsAggregator = new MetricsAggregator("k8s", undefined, agentBoxManager, {
+      async fetch(endpoint: string) {
+        try {
+          const client = new AgentBoxClient(endpoint, 3000, agentBoxTlsOptions);
+          return await client.getJson("/api/internal/metrics-snapshot");
+        } catch {
+          return null;
+        }
+      },
+    });
+  } else {
+    const { localCollector } = await import("../shared/local-collector.js");
+    metricsAggregator = new MetricsAggregator("local", localCollector);
+  }
+
+  registerMetricsRoutes(restRouter, config, metricsAggregator);
+  registerSystemRoutes(restRouter, config);
+
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;
 
@@ -624,6 +650,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     agentBoxTlsOptions,
     credentialService,
     async close() {
+      metricsAggregator.destroy();
       await agentBoxManager.cleanup();
       for (const ws of clients) ws.close();
       clients.clear();

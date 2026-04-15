@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3 } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 
@@ -12,6 +12,7 @@ const siclawItems = [
 ]
 
 const settingsItems = [
+  { path: "/metrics", label: "Metrics", icon: BarChart3 },
   { path: "/settings/users", label: "Users", icon: Users },
   { path: "/settings/clusters", label: "Clusters", icon: Server },
   { path: "/settings/hosts", label: "Hosts", icon: Monitor },
@@ -22,7 +23,7 @@ const settingsItems = [
 export function Layout() {
   const location = useLocation()
   const [settingsOpen, setSettingsOpen] = useState(
-    location.pathname.startsWith("/settings")
+    location.pathname.startsWith("/settings") || location.pathname.startsWith("/metrics")
   )
   const [isAdmin, setIsAdmin] = useState(false)
 
@@ -67,7 +68,7 @@ export function Layout() {
               <button
                 onClick={() => setSettingsOpen(!settingsOpen)}
                 className={`flex items-center gap-2.5 px-4 py-2 text-[13px] w-full transition-colors ${
-                  isActive("/settings")
+                  isActive("/settings") || isActive("/metrics")
                     ? "text-foreground"
                     : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                 }`}

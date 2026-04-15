@@ -162,3 +162,11 @@ export function requireAuth(req: http.IncomingMessage, jwtSecret: string): AuthC
   if (!payload?.sub) return null;
   return { userId: payload.sub, orgId: payload.org_id, username: payload.username, role: payload.role };
 }
+
+/** Auth + admin role check. Returns null if not authenticated or not admin. */
+export function requireAdmin(req: http.IncomingMessage, jwtSecret: string): AuthContext | null {
+  const auth = requireAuth(req, jwtSecret);
+  if (!auth) return null;
+  if (auth.role !== "admin") return null;
+  return auth;
+}

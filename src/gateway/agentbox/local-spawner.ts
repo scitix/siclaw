@@ -72,6 +72,8 @@ export class LocalSpawner implements BoxSpawner {
     const sessionManager = new AgentBoxSessionManager();
     // Set userId so sessions created in this box use per-user skill directories
     sessionManager.userId = userId;
+    // Set agentId for metrics labeling (tool_call / skill_call events carry agentId)
+    sessionManager.agentId = agentId;
     // Pass knowledge indexer for knowledge_search tool
     if (this.knowledgeIndexer) {
       sessionManager.knowledgeIndexer = this.knowledgeIndexer;
