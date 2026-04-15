@@ -1,18 +1,21 @@
 /**
- * Siclaw Agent Runtime — Agent service with shared MySQL.
+ * Siclaw Agent Runtime — stateless execution engine (DB-free).
+ *
+ * All data access goes through Portal/Upstream adapter API.
  *
  * Port 3001 (HTTP):
  *   GET  /api/health              — K8s liveness/readiness
  *   GET  /metrics                 — Prometheus
  *   WS   /ws                      — Upstream WS RPC (Trusted Proxy auth)
- *   /api/v1/siclaw/*              — REST API (JWT auth, skills/mcp/chat/cron/etc.)
+ *   /api/v1/siclaw/metrics/*      — Metrics (proxied to adapter for summary/audit)
+ *   /api/v1/siclaw/system/*       — System config (proxied to adapter)
  *
  * Port 3002 (HTTPS mTLS):
- *   POST /api/internal/credential-request  — proxy to Upstream Adapter
- *   GET  /api/internal/settings            — model providers (from DB)
- *   GET  /api/internal/mcp-servers         — MCP config (from DB + Upstream binding)
- *   GET  /api/internal/skills/bundle       — skill bundle (from DB + Upstream binding)
- *   *    /api/internal/agent-tasks[/:id]   — CRUD scheduled tasks (from DB)
+ *   POST /api/internal/credential-request  — proxy to adapter
+ *   GET  /api/internal/settings            — proxy to adapter
+ *   GET  /api/internal/mcp-servers         — proxy to adapter
+ *   GET  /api/internal/skills/bundle       — proxy to adapter
+ *   *    /api/internal/agent-tasks[/:id]   — proxy to adapter
  *   POST /api/internal/feedback            — AgentBox feedback
  */
 

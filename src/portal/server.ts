@@ -65,6 +65,8 @@ export function startPortal(config: PortalConfig): http.Server {
     jwtSecret: config.jwtSecret,
     serverUrl: config.runtimeUrl,
     portalSecret: config.portalSecret,
+    runtimeWsUrl: config.runtimeWsUrl,
+    runtimeSecret: config.runtimeSecret,
   });
 
   const server = http.createServer(async (req, res) => {
