@@ -34,8 +34,17 @@ export async function api<T>(path: string, options?: ApiOptions): Promise<T> {
   }
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `HTTP ${res.status}`)
+    const body = await res.json().catch(() => ({ error: res.statusText }))
+    // Attach the full response body + status so callers can act on extra
+    // fields (e.g. retry_after_sec on 429). Message keeps the flat behavior
+    // existing callers expect.
+    const err = new Error(body.error || `HTTP ${res.status}`) as Error & {
+      status?: number
+      body?: Record<string, unknown>
+    }
+    err.status = res.status
+    err.body = body
+    throw err
   }
 
   if (res.status === 204) return undefined as T
