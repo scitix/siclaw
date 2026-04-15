@@ -18,14 +18,19 @@ import {
   listClustersForAgent,
   getClusterByNameForAgent,
 } from "./clusters-dao.js";
+import {
+  listHostsForAgent,
+  getHostByNameForAgent,
+} from "./hosts-dao.js";
 import type {
   Identity,
   ClusterMeta,
+  HostMeta,
   CredentialPayload,
   CredentialService,
 } from "../shared/credential-types.js";
 
-export type { Identity, ClusterMeta, CredentialPayload, CredentialService } from "../shared/credential-types.js";
+export type { Identity, ClusterMeta, HostMeta, CredentialPayload, CredentialService } from "../shared/credential-types.js";
 
 // ---------------------------------------------------------------------------
 // Local DB implementation
@@ -48,6 +53,20 @@ export class LocalDbCredentialService implements CredentialService {
       };
       return meta;
     });
+  }
+
+  async listHosts(identity: Identity): Promise<HostMeta[]> {
+    // listHostsForAgent only SELECTs non-secret columns — no need to strip.
+    const rows = await listHostsForAgent(identity.agentId);
+    return rows.map((r) => ({
+      name: r.name,
+      ip: r.ip,
+      port: r.port,
+      username: r.username,
+      auth_type: r.auth_type,
+      is_production: !!r.is_production,
+      ...(r.description ? { description: r.description } : {}),
+    }));
   }
 
   async getClusterCredential(
@@ -78,6 +97,54 @@ export class LocalDbCredentialService implements CredentialService {
       },
     };
   }
+
+  async getHostCredential(
+    identity: Identity,
+    hostName: string,
+    _purpose: string,
+  ): Promise<CredentialPayload> {
+    const row = await getHostByNameForAgent(identity.agentId, hostName);
+    if (!row) {
+      throw new CredentialNotFoundError(
+        `Host "${hostName}" not found or agent ${identity.agentId} is not bound to it`,
+      );
+    }
+    const file = buildHostCredentialFile(row);
+    return {
+      credential: {
+        name: row.name,
+        type: "ssh",
+        files: [file],
+        metadata: {
+          ip: row.ip,
+          port: row.port,
+          username: row.username,
+          auth_type: row.auth_type,
+          is_production: !!row.is_production,
+          ...(row.description ? { description: row.description } : {}),
+        },
+        ttl_seconds: 300,
+      },
+    };
+  }
+}
+
+function buildHostCredentialFile(row: {
+  name: string;
+  auth_type: "password" | "key";
+  password: string | null;
+  private_key: string | null;
+}) {
+  if (row.auth_type === "key") {
+    if (!row.private_key) {
+      throw new Error(`Host "${row.name}" has no key credential stored`);
+    }
+    return { name: `${row.name}.key`, content: row.private_key, mode: 0o640 };
+  }
+  if (!row.password) {
+    throw new Error(`Host "${row.name}" has no password credential stored`);
+  }
+  return { name: `${row.name}.password`, content: row.password, mode: 0o640 };
 }
 
 function parseKubeconfigMeta(kubeconfigYaml: string): Partial<ClusterMeta> {
@@ -122,12 +189,21 @@ export class ExternalCredentialService implements CredentialService {
   ) {}
 
   async listClusters(identity: Identity): Promise<ClusterMeta[]> {
-    const body = await this.post("/credential-list", identity, {});
+    const body = await this.post("/credential-list", identity, { kind: "cluster" });
     const parsed = JSON.parse(body) as { clusters?: ClusterMeta[] };
     if (!Array.isArray(parsed.clusters)) {
-      throw new Error("External credential provider returned malformed list response");
+      throw new Error("External credential provider returned malformed cluster list response");
     }
     return parsed.clusters;
+  }
+
+  async listHosts(identity: Identity): Promise<HostMeta[]> {
+    const body = await this.post("/credential-list", identity, { kind: "host" });
+    const parsed = JSON.parse(body) as { hosts?: HostMeta[] };
+    if (!Array.isArray(parsed.hosts)) {
+      throw new Error("External credential provider returned malformed host list response");
+    }
+    return parsed.hosts;
   }
 
   async getClusterCredential(
@@ -138,6 +214,19 @@ export class ExternalCredentialService implements CredentialService {
     const body = await this.post("/credential-request", identity, {
       source: "cluster",
       source_id: clusterName,
+      purpose,
+    });
+    return JSON.parse(body) as CredentialPayload;
+  }
+
+  async getHostCredential(
+    identity: Identity,
+    hostName: string,
+    purpose: string,
+  ): Promise<CredentialPayload> {
+    const body = await this.post("/credential-request", identity, {
+      source: "host",
+      source_id: hostName,
       purpose,
     });
     return JSON.parse(body) as CredentialPayload;

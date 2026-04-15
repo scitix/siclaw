@@ -25,13 +25,13 @@ export interface ResolverDeps {
 function throwNotLoaded(name: string): never {
   throw new Error(
     `Kubeconfig "${name}" not loaded into broker registry. ` +
-    `Caller must await broker.ensure("${name}") before invoking the resolver ` +
+    `Caller must await broker.ensureCluster("${name}") before invoking the resolver ` +
     `(normally via ensureKubeconfigsForCommand in the tool's execute entry).`,
   );
 }
 
 function getLoaded(broker: CredentialBroker, name: string): ClusterLocalInfo {
-  const info = broker.getLocalInfo(name);
+  const info = broker.getClusterLocalInfo(name);
   if (!info) throwNotLoaded(name);
   if (!info.path) throwNotLoaded(name);
   return info;
@@ -48,10 +48,10 @@ function getLoaded(broker: CredentialBroker, name: string): ClusterLocalInfo {
  */
 export function resolveKubeconfigPath(deps: ResolverDeps): string | null {
   if (!deps.broker) return null;
-  const all = deps.broker.listLocalInfo().filter((e) => e.path);
+  const all = deps.broker.listClustersLocalInfo().filter((e) => e.path);
   if (all.length === 0) return null;
   if (all.length > 1) {
-    const names = all.map((e) => e.name).join(", ");
+    const names = all.map((e) => e.meta.name).join(", ");
     throw new Error(
       `Multiple kubeconfigs are loaded (${names}). Specify --kubeconfig=<name> to pick one.`,
     );
@@ -81,7 +81,7 @@ export function resolveRequiredKubeconfig(
   name: string | undefined,
 ): { path: string | null } | { error: string; availableNames?: string[] } {
   if (!deps.broker) return { path: null };
-  const loaded = deps.broker.listLocalInfo().filter((e) => e.path);
+  const loaded = deps.broker.listClustersLocalInfo().filter((e) => e.path);
 
   if (loaded.length === 0) {
     // A name was requested but ensure() produced no path — something upstream
@@ -100,7 +100,7 @@ export function resolveRequiredKubeconfig(
   }
 
   if (!name) {
-    const names = loaded.map((e) => e.name);
+    const names = loaded.map((e) => e.meta.name);
     return {
       error:
         `Multiple kubeconfigs available (${names.join(", ")}). ` +
@@ -109,9 +109,9 @@ export function resolveRequiredKubeconfig(
     };
   }
 
-  const match = loaded.find((e) => e.name === name);
+  const match = loaded.find((e) => e.meta.name === name);
   if (!match) {
-    const names = loaded.map((e) => e.name);
+    const names = loaded.map((e) => e.meta.name);
     return {
       error: `Kubeconfig "${name}" not loaded. Available: ${names.join(", ") || "(none)"}`,
       availableNames: names,
@@ -129,10 +129,10 @@ export function resolveDebugImage(deps: ResolverDeps, name: string | undefined):
   if (!deps.broker) return null;
   let match: ClusterLocalInfo | undefined;
   if (name) {
-    match = deps.broker.getLocalInfo(name);
+    match = deps.broker.getClusterLocalInfo(name);
   } else {
-    const loaded = deps.broker.listLocalInfo().filter((e) => e.path);
+    const loaded = deps.broker.listClustersLocalInfo().filter((e) => e.path);
     if (loaded.length === 1) match = loaded[0];
   }
-  return match?.debug_image ?? null;
+  return match?.meta.debug_image ?? null;
 }

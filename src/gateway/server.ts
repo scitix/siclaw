@@ -306,8 +306,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     if (!agentId) throw new Error("agentId required");
 
-    // Supported: "skills", "mcp" (via RESOURCE_DESCRIPTORS), "credentials" (custom endpoint)
-    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "credentials"];
+    // All types route through GATEWAY_SYNC_DESCRIPTORS — the legacy
+    // "credentials" umbrella type is replaced by the more granular
+    // "cluster" + "host" so CRUD events can notify only what changed.
+    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host"];
 
     const boxes = await agentBoxManager.list();
     const targets = boxes.filter((b) => b.agentId === agentId);
@@ -324,11 +326,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
       for (const rt of resourceTypes) {
         try {
-          if (rt === "credentials") {
-            await client.post("/api/reload-credentials");
-          } else {
-            await client.reloadResource(rt as import("../shared/resource-sync.js").ResourceType);
-          }
+          await client.reloadResource(rt as import("../shared/gateway-sync.js").GatewaySyncType);
           if (!reloaded.includes(rt)) reloaded.push(rt);
         } catch (err: any) {
           console.warn(`[rpc] agent.reload: ${rt} failed for box=${box.boxId}: ${err.message}`);

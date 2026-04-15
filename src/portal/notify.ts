@@ -8,6 +8,7 @@
  */
 
 import { runtimeRpc } from "./chat-gateway.js";
+import type { GatewaySyncType } from "../shared/gateway-sync.js";
 
 const RETRY_DELAYS = [5_000, 15_000, 30_000]; // 3 retries: 5s, 15s, 30s
 
@@ -19,7 +20,7 @@ export function notifyAgentReload(
   runtimeWsUrl: string,
   runtimeSecret: string,
   agentId: string,
-  resources?: string[],
+  resources?: GatewaySyncType[],
 ): void {
   const params: Record<string, unknown> = { agentId };
   if (resources) params.resources = resources;
@@ -61,7 +62,7 @@ export function notifyAgentsReload(
   runtimeWsUrl: string,
   runtimeSecret: string,
   agentIds: string[],
-  resources?: string[],
+  resources?: GatewaySyncType[],
 ): void {
   for (const agentId of agentIds) {
     notifyAgentReload(runtimeWsUrl, runtimeSecret, agentId, resources);
@@ -82,7 +83,7 @@ export function notifyBoundAgents(
   table: string,
   column: string,
   resourceId: string,
-  resources: string[],
+  resources: GatewaySyncType[],
 ): void {
   import("../gateway/db.js").then(({ getDb }) => {
     const db = getDb();

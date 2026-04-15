@@ -130,7 +130,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, run
     sendJson(res, 200, rows[0]);
 
     // Notify bound agents to clear cached credentials
-    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_clusters", "cluster_id", params.id, ["credentials"]);
+    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_clusters", "cluster_id", params.id, ["cluster"]);
   });
 
   // DELETE /api/v1/clusters/:id

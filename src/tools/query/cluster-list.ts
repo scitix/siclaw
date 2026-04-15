@@ -34,23 +34,28 @@ Use this before running any kubectl command to discover available clusters.`,
         };
       }
 
-      try {
-        await broker.list();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: `Failed to list clusters: ${message}` }) }],
-          details: {},
-        };
+      // Lazy fill: pay one transport round-trip only on first access.
+      // Subsequent calls serve the cached Map synchronously; the Map is
+      // kept fresh by notify-driven refresh (POST /api/reload-cluster).
+      if (!broker.isClustersReady()) {
+        try {
+          await broker.refreshClusters();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: `Failed to list clusters: ${message}` }) }],
+            details: {},
+          };
+        }
       }
 
-      const entries = broker.listLocalInfo().map((info) => ({
-        name: info.name,
-        description: info.description ?? null,
-        api_server: info.api_server ?? null,
-        is_production: info.is_production,
-        ...(info.contexts ? { contexts: info.contexts } : {}),
-        ...(info.current_context ? { current_context: info.current_context } : {}),
+      const entries = broker.getClustersLocal().map((meta) => ({
+        name: meta.name,
+        description: meta.description ?? null,
+        api_server: meta.api_server ?? null,
+        is_production: meta.is_production,
+        ...(meta.contexts ? { contexts: meta.contexts } : {}),
+        ...(meta.current_context ? { current_context: meta.current_context } : {}),
       }));
 
       let hint = "";

@@ -122,12 +122,15 @@ Call these tools before doing anything else:
 1. **\`cluster_info\`** — know the environment: retrieve cluster infrastructure context (RDMA network type, GPU scheduler, CNI, storage backend, etc.). This is not discoverable via kubectl.
 2. **\`cluster_list\`** — discover clusters available to this agent.
 3. **\`cluster_probe\`** — test connectivity to a specific cluster by name (use when you need to verify a cluster is reachable before running kubectl against it).
+4. **\`host_list\`** — discover SSH-reachable hosts available to this agent (for node-level work outside the K8s API; e.g. bare-metal nodes, jump hosts). Returns metadata only — credentials are materialized lazily.
 
 One cluster: use directly. Multiple: ask user which to use, pass \`--kubeconfig=<name>\` (name, not path).
 
+**Reaching non-K8s hosts**: To run commands on a host bound via \`host_list\`, use \`host_exec\` (single command) or \`host_script\` (skill script via SSH stdin). The \`bash\` (restricted-bash) tool does NOT permit \`ssh\`/\`scp\`/\`sftp\`/\`sshpass\` — you cannot assemble your own ssh invocation. Only \`host_exec\`/\`host_script\` carry a valid SSH credential.
+
 ### Step 2 — Skill check (HARD GATE before every action)
 
-You MUST NOT call \`bash\`, \`node_exec\`, \`pod_exec\`, or any execution tool until you have checked whether a skill covers the action. This applies to EVERY action, not just the first one.
+You MUST NOT call \`bash\`, \`node_exec\`, \`pod_exec\`, \`host_exec\`, or any execution tool until you have checked whether a skill covers the action. This applies to EVERY action, not just the first one.
 
 **Decision flow for each action:**
 1. What am I about to do? (e.g., "check node health", "diagnose RoCE config")
@@ -138,7 +141,7 @@ You MUST NOT call \`bash\`, \`node_exec\`, \`pod_exec\`, or any execution tool u
 **Anti-pattern** (WRONG): jumping straight to \`bash\`/\`node_exec\` without checking skills first.
 **Correct pattern**: for each action, scan skills → use matching skill → only ad-hoc if no skill covers it.
 
-- **Skill found**: read its SKILL.md first (skills may be updated — never rely on memory), then follow it exactly. The SKILL.md specifies which tool to use — different skills run in different environments (\`local_script\` for local, \`node_script\` for node host, \`pod_script\` for inside a pod, \`node_script\` with \`netns\` param for pod network namespace — requires \`resolve_pod_netns\` first). Always use the tool specified in SKILL.md.
+- **Skill found**: read its SKILL.md first (skills may be updated — never rely on memory), then follow it exactly. The SKILL.md specifies which tool to use — different skills run in different environments (\`local_script\` for local, \`node_script\` for K8s node host, \`pod_script\` for inside a pod, \`node_script\` with \`netns\` param for pod network namespace — requires \`resolve_pod_netns\` first, \`host_script\` for non-K8s SSH-reachable hosts from \`host_list\`). Always use the tool specified in SKILL.md.
 - **No skill match**: only then are ad-hoc commands acceptable — for this specific action only. Resume skill checking for the next action.
 - **Skill fails**: analyze the failure. Do not silently fall back to ad-hoc commands.
 - **NEVER** manually replicate what a skill script already does with ad-hoc commands.

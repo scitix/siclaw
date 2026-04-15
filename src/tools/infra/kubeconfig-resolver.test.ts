@@ -4,27 +4,26 @@ import type { CredentialBroker, ClusterLocalInfo } from "../../agentbox/credenti
 
 /**
  * Minimal broker stub for resolver tests. The resolver only touches the sync
- * getLocalInfo / listLocalInfo API, so we don't need the full broker here.
+ * getClusterLocalInfo / listClustersLocalInfo API, so we don't need the full
+ * broker here.
  */
 function makeBroker(entries: ClusterLocalInfo[]): CredentialBroker {
   const map = new Map<string, ClusterLocalInfo>();
-  for (const e of entries) map.set(e.name, e);
+  for (const e of entries) map.set(e.meta.name, e);
   return {
-    getLocalInfo: (name: string) => map.get(name),
-    listLocalInfo: () => Array.from(map.values()),
+    getClusterLocalInfo: (name: string) => map.get(name),
+    listClustersLocalInfo: () => Array.from(map.values()),
   } as unknown as CredentialBroker;
 }
 
 const PROD: ClusterLocalInfo = {
-  name: "prod",
-  is_production: true,
-  path: "/tmp/creds/prod.kubeconfig",
+  meta: { name: "prod", is_production: true },
+  path: "/tmp/creds/clusters/prod.kubeconfig",
 };
 
 const STAGING: ClusterLocalInfo = {
-  name: "staging",
-  is_production: false,
-  path: "/tmp/creds/staging.kubeconfig",
+  meta: { name: "staging", is_production: false },
+  path: "/tmp/creds/clusters/staging.kubeconfig",
 };
 
 describe("resolveRequiredKubeconfig", () => {
@@ -38,7 +37,7 @@ describe("resolveRequiredKubeconfig", () => {
   });
 
   it("skips entries without a path (metadata-only)", () => {
-    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    const broker = makeBroker([{ meta: { name: "prod", is_production: true } }]);
     expect(resolveRequiredKubeconfig({ broker }, undefined)).toEqual({ path: null });
   });
 
@@ -93,7 +92,7 @@ describe("resolveKubeconfigByName", () => {
   });
 
   it("throws when cluster has no path (metadata only)", () => {
-    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    const broker = makeBroker([{ meta: { name: "prod", is_production: true } }]);
     expect(() => resolveKubeconfigByName({ broker }, "prod")).toThrow("not loaded");
   });
 
@@ -109,7 +108,7 @@ describe("resolveKubeconfigPath", () => {
   });
 
   it("returns null when registry has no loaded kubeconfigs", () => {
-    const broker = makeBroker([{ name: "prod", is_production: true }]);
+    const broker = makeBroker([{ meta: { name: "prod", is_production: true } }]);
     expect(resolveKubeconfigPath({ broker })).toBeNull();
   });
 
