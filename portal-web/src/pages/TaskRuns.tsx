@@ -185,7 +185,7 @@ export function TaskRuns() {
     if (triggering || hasRunningRun || cooldownSec > 0) return
     setTriggering(true)
     try {
-      await api<{ run_id: string }>(`/siclaw/agents/${agentId}/tasks/${taskId}/runs`, {
+      await api<{ ok: true }>(`/siclaw/agents/${agentId}/tasks/${taskId}/runs`, {
         method: "POST",
       })
       // Optimistic: refetch the first page so the new running row appears

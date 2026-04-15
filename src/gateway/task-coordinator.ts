@@ -77,7 +77,7 @@ export interface TaskCoordinatorOptions {
 }
 
 export type FireNowOutcome =
-  | { kind: "ok"; runId: string }
+  | { kind: "ok" }
   | { kind: "in_flight" }
   | { kind: "cooldown"; retryAfterSec: number }
   | { kind: "not_found" };
@@ -237,22 +237,47 @@ export class TaskCoordinator {
 
   /** Execute one fire of a task: run agent, persist trace + run row, emit event.
    *
-   *  The "running" agent_task_runs row is created up-front (either here, or
-   *  externally by fireNow to get the runId synchronously for the HTTP
-   *  response). Scheduler-fired jobs do NOT pass preCreated; manual-fire path
-   *  does. Either way finalizeRun UPDATEs the same row at the end.
+   *  Sole execution entry point — both the cron-scheduler path and the
+   *  manual Run-now path end up here. The first thing this function does
+   *  is a synchronous claim on `this.executing`: if another fire is in
+   *  flight for the same task we bail immediately. The check + add are
+   *  synchronous (no `await`), so under Node's single-threaded event loop
+   *  no two coroutines can both pass the check — that's what closes the
+   *  cron/manual coincidence window.
+   *
+   *  The 'running' agent_task_runs row is also created here (not in
+   *  fireNow) so bailing on the claim check doesn't leak an orphan row.
    */
   private async executeJob(
     job: CronJobRow,
-    preCreated?: { runId: string; sessionId: string; skipStatusCheck?: boolean },
+    opts?: { skipStatusCheck?: boolean },
+  ): Promise<void> {
+    // ── Synchronous claim gate (must come BEFORE any await) ─────────────
+    if (this.executing.has(job.id)) {
+      console.log(`[task-coordinator] Task ${job.id} (${job.name}) already executing, skipping duplicate fire`);
+      return;
+    }
+    this.executing.add(job.id);
+    // ────────────────────────────────────────────────────────────────────
+
+    try {
+      await this.executeJobInner(job, opts);
+    } finally {
+      // Always release the in-memory claim, even on uncaught error.
+      this.executing.delete(job.id);
+    }
+  }
+
+  /** Inner body of executeJob — kept separate so the claim/release in
+   *  executeJob can be guaranteed by a single try/finally at the top. */
+  private async executeJobInner(
+    job: CronJobRow,
+    opts?: { skipStatusCheck?: boolean },
   ): Promise<void> {
     const startTime = Date.now();
     const prompt = this.jobPrompts.get(job.id);
     if (!prompt) {
       console.error(`[task-coordinator] No prompt for task ${job.id} (${job.name}), skipping`);
-      if (preCreated) {
-        await this.finalizeRun(preCreated.runId, "failure", "", "No prompt loaded for task", 0).catch(() => {});
-      }
       return;
     }
 
@@ -269,7 +294,7 @@ export class TaskCoordinator {
     //
     // Manual-fire path skips this: fireNow did its own validation and the
     // task is intentionally being run regardless of paused/active status.
-    if (!preCreated?.skipStatusCheck) {
+    if (!opts?.skipStatusCheck) {
       try {
         const db = getDb();
         const [rows] = (await db.query(
@@ -289,24 +314,20 @@ export class TaskCoordinator {
 
     const agentId = job.agentId ?? "";
     const userId = job.userId || "";
-    const sessionId = preCreated?.sessionId ?? crypto.randomUUID();
+    const sessionId = crypto.randomUUID();
     let status: "success" | "failure" = "success";
     let resultText = "";
     let error: string | null = null;
 
-    // Reserve the run row up-front so UIs can see "running" state. If
-    // fireNow already did it, reuse that runId.
-    let runId = preCreated?.runId ?? "";
-    if (!runId) {
-      try {
-        runId = await this.createRunningRun(job.id, sessionId);
-      } catch (err) {
-        console.error(`[task-coordinator] Could not create running row for ${job.id}:`, err);
-        // Continue without a reserved row; recordRun below will still try.
-      }
+    // Reserve the run row up-front so UIs can see "running" state.
+    let runId = "";
+    try {
+      runId = await this.createRunningRun(job.id, sessionId);
+    } catch (err) {
+      console.error(`[task-coordinator] Could not create running row for ${job.id}:`, err);
+      // Continue without a reserved row; recordRun below will still try.
     }
 
-    this.executing.add(job.id);
     try {
       console.log(`[task-coordinator] Executing task ${job.id} (${job.name}) agent=${agentId} user=${userId}`);
 
@@ -358,8 +379,6 @@ export class TaskCoordinator {
       error = err instanceof Error ? err.message : String(err);
       console.error(`[task-coordinator] Task ${job.id} failed:`, error);
     }
-
-    this.executing.delete(job.id);
 
     const durationMs = Date.now() - startTime;
 
@@ -478,17 +497,17 @@ export class TaskCoordinator {
   }
 
   /**
-   * Manually trigger a run for the given task right now. Validation layers
-   * (in order):
-   *   1. Task exists / ownership is the caller's — the HTTP handler enforces
-   *      this, we re-verify existence here so a bad taskId doesn't fire.
-   *   2. In-flight: no concurrent execution for this task. Checked against
-   *      the in-memory executing Set AND a DB status='running' row.
-   *   3. Cooldown: at least manualRunCooldownSec since the last manual run.
-   *      Read from agent_tasks.last_manual_run_at.
+   * Manually trigger a run for the given task. Validation layers (in order):
+   *   1. Task exists (HTTP handler already verified ownership).
+   *   2. In-flight: no concurrent execution. Two levels — the in-memory
+   *      executing Set (catches both manual + cron-fired coincidences in
+   *      this process) AND a DB status='running' row (catches stale state
+   *      from a Runtime restart mid-run).
+   *   3. Cooldown: at least manualRunCooldownSec since the last manual fire.
    *
-   * Fire is kicked off async so the HTTP response returns immediately with
-   * the reserved runId — the UI can then poll /runs to watch it finish.
+   * We do NOT create the agent_task_runs row here — executeJob owns that,
+   * so if the synchronous claim gate in executeJob bails no orphan row is
+   * left behind.
    */
   async fireNow(taskId: string): Promise<FireNowOutcome> {
     const db = getDb();
@@ -515,9 +534,9 @@ export class TaskCoordinator {
       }
     }
 
-    // Reserve before fire so we can return the runId synchronously.
-    const sessionId = crypto.randomUUID();
-    const runId = await this.createRunningRun(taskId, sessionId);
+    // Record the manual trigger moment so a rapid follow-up click hits the
+    // cooldown. Done before executeJob so two near-simultaneous fireNow
+    // calls (both past the in-flight check) don't both pass cooldown.
     await db.query(
       "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
       [taskId],
@@ -542,9 +561,11 @@ export class TaskCoordinator {
       agentId: row.agent_id,
     };
 
-    // Kick off asynchronously — HTTP handler returns 202 with the runId and
-    // the UI polls /runs to watch the status transition.
-    void this.executeJob(cronJob, { runId, sessionId, skipStatusCheck: true });
-    return { kind: "ok", runId };
+    // Kick off asynchronously. executeJob does its own synchronous claim
+    // gate + createRunningRun; if a concurrent cron fire has already
+    // claimed this task, executeJob will bail without creating an extra
+    // run row.
+    void this.executeJob(cronJob, { skipStatusCheck: true });
+    return { kind: "ok" };
   }
 }
