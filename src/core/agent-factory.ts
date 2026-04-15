@@ -390,17 +390,21 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directory: single "resolved/" directory built by materialize (K8s)
-  // or syncSkills (local). Contains all skills flattened with priority:
-  //   personal > skillset > global > builtin (symlinked)
-  // Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
-  // K8s mode: {skillsBase}/resolved/
-  const resolvedSkillsDir = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId, "resolved")
-    : path.join(skillsBase, "resolved");
+  // Skill directory: single "resolved/" built by sync-handlers.ts materialize
+  // at {skillsBase}/resolved/. Contains every skill this agent is bound to,
+  // flattened (bundle from Gateway is already priority-merged: global > builtin).
+  //
+  // Note: there is intentionally no per-user segment here. Earlier drafts
+  // picked {skillsBase}/user/{userId}/resolved when userId was set, but no
+  // writer ever materialized to that path — materialize always writes the
+  // shared location — so agent-factory would miss every synced skill the
+  // moment mtls cert provided a userId. Both paths now align on the shared
+  // location; LocalSpawner's multi-tenant safety is handled upstream
+  // (materialize is gated in local mode per the invariants doc).
+  const resolvedSkillsDir = path.join(skillsBase, "resolved");
 
-  // Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
-  // use builtin directories directly.
+  // Fallback: only when resolved/ doesn't exist (TUI mode where Gateway sync
+  // never runs). Server modes always have resolved/ created by materialize.
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
 
@@ -408,7 +412,6 @@ export async function createSiclawSession(
   if (fs.existsSync(resolvedSkillsDir)) {
     skillsDirs.push(resolvedSkillsDir);
   } else {
-    // Pre-materialize fallback: load builtins directly
     for (const bDir of [builtinPath, extensionPath]) {
       if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
