@@ -15,8 +15,6 @@ export interface RuntimeConfig {
   serverUrl: string;
   /** Portal/Upstream's secret — Runtime presents this when calling the management server */
   portalSecret: string;
-  /** MySQL connection string */
-  databaseUrl: string;
   /** Shared JWT secret for token verification */
   jwtSecret: string;
 }
@@ -29,7 +27,6 @@ export function loadRuntimeConfig(): RuntimeConfig {
     runtimeSecret: process.env.SICLAW_RUNTIME_SECRET || "",
     serverUrl: process.env.SICLAW_SERVER_URL || "",
     portalSecret: process.env.SICLAW_PORTAL_SECRET || "",
-    databaseUrl: process.env.DATABASE_URL || "",
     jwtSecret: process.env.JWT_SECRET || "",
   };
 }

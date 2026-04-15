@@ -1,44 +1,47 @@
 /**
  * SystemConfigRepo — admin-managed key-value system configuration.
  *
- * Backed by the `system_config` MySQL table. Current keys:
- * - `system.grafanaUrl` — remote Grafana dashboard URL embedded in Portal
- *
- * Writers must be admin (enforced at REST layer).
+ * Runtime no longer accesses the database directly. All config operations
+ * are proxied through Portal's adapter API.
  */
 
-import { getDb } from "./db.js";
+import { loadRuntimeConfig } from "./config.js";
 
 /** Whitelist of config keys that are allowed to be written via the REST API. */
 export const ALLOWED_CONFIG_KEYS = new Set<string>(["system.grafanaUrl"]);
 
+function getAdapterUrl(): { url: string; token: string } {
+  const config = loadRuntimeConfig();
+  return { url: config.serverUrl, token: config.portalSecret };
+}
+
 export class SystemConfigRepo {
   async get(key: string): Promise<string | null> {
-    const [rows] = await getDb().query(
-      "SELECT config_value FROM system_config WHERE config_key = ?",
-      [key],
-    ) as [Array<{ config_value: string | null }>, unknown];
-    if (!rows.length) return null;
-    return rows[0].config_value ?? null;
+    const all = await this.getAll();
+    return all[key] ?? null;
   }
 
   async getAll(): Promise<Record<string, string>> {
-    const [rows] = await getDb().query(
-      "SELECT config_key, config_value FROM system_config",
-    ) as [Array<{ config_key: string; config_value: string | null }>, unknown];
-    const result: Record<string, string> = {};
-    for (const row of rows) {
-      if (row.config_value != null) result[row.config_key] = row.config_value;
+    const { url, token } = getAdapterUrl();
+    const resp = await fetch(`${url}/api/internal/siclaw/system-config`, {
+      headers: { "X-Auth-Token": token },
+    });
+    if (!resp.ok) {
+      throw new Error(`Adapter system-config returned ${resp.status}`);
     }
-    return result;
+    const data = await resp.json() as { config: Record<string, string> };
+    return data.config;
   }
 
   async set(key: string, value: string, updatedBy: string): Promise<void> {
-    await getDb().query(
-      `INSERT INTO system_config (config_key, config_value, updated_by)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
-      [key, value, updatedBy],
-    );
+    const { url, token } = getAdapterUrl();
+    const resp = await fetch(`${url}/api/internal/siclaw/system-config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Auth-Token": token },
+      body: JSON.stringify({ key, value, updated_by: updatedBy }),
+    });
+    if (!resp.ok) {
+      throw new Error(`Adapter system-config set returned ${resp.status}`);
+    }
   }
 }

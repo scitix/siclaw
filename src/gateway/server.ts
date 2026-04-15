@@ -52,9 +52,8 @@ import {
   handleAgentTasksDelete,
 } from "./internal-api.js";
 import { createRestRouter } from "./rest-router.js";
-import { registerSiclawRoutes, type SiclawApiContext } from "./siclaw-api.js";
-import { getDb } from "./db.js";
-import { appendMessage, incrementMessageCount } from "./chat-repo.js";
+// siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
+import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import { registerMetricsRoutes } from "./metrics-api.js";
@@ -69,13 +68,6 @@ export interface RuntimeServer {
   broadcast: BroadcastFn;
   rpcMethods: Map<string, RpcHandler>;
   agentBoxTlsOptions?: { cert: string; key: string; ca: string };
-  /**
-   * Exposed so callers (gateway-main) can late-attach context that only
-   * becomes available after startRuntime returns — e.g. the
-   * TaskCoordinator, which depends on agentBoxTlsOptions from the startup
-   * result.
-   */
-  siclawCtx: SiclawApiContext;
   credentialService: CredentialService;
   close(): Promise<void>;
 }
@@ -345,37 +337,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
-  // ── REST API Router (Siclaw CRUD) ────────────────────────
+  // ── REST API Router ──────────────────────────────────────
+  // Siclaw CRUD routes are now handled by Portal (portal/siclaw-api.ts).
+  // Runtime only serves health, WS, and internal mTLS endpoints.
   const restRouter = createRestRouter();
-
-  /** Query Portal Adapter for bound agents, then dispatch agent.reload for each. */
-  function notifyViaAdapter(adapterPath: string, resources: string[]) {
-    const url = `${config.serverUrl}${adapterPath}`;
-    fetch(url, { headers: { "X-Auth-Token": config.portalSecret } })
-      .then((resp) => resp.ok ? resp.json() as Promise<{ agent_ids: string[] }> : null)
-      .then((data) => {
-        if (!data?.agent_ids?.length) return;
-        console.log(`[notify] ${adapterPath} → reloading ${data.agent_ids.length} agent(s)`);
-        const handler = rpcMethods.get("agent.reload");
-        for (const agentId of data.agent_ids) {
-          handler?.({ agentId, resources }, {} as any).catch((err: any) => {
-            console.warn(`[notify] agent.reload failed for agent=${agentId}: ${err.message}`);
-          });
-        }
-      })
-      .catch((err) => console.warn(`[notify] Failed to query ${adapterPath}:`, err));
-  }
-
-  const siclawCtx: SiclawApiContext = {
-    notifySkillAgents: (skillId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/skill/${skillId}/agents`, resources),
-    notifySkillDevAgents: (skillId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/skill/${skillId}/agents?dev_only=1`, resources),
-    notifyMcpAgents: (mcpId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/mcp/${mcpId}/agents`, resources),
-  };
-
-  registerSiclawRoutes(restRouter, config, siclawCtx);
 
   // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
   const isK8sMode = !(spawner instanceof LocalSpawner);
@@ -610,19 +575,19 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             const pathOnly = url.split("?")[0];
             const idMatch = pathOnly.match(/^\/api\/internal\/agent-tasks\/([^/]+)$/);
             if (pathOnly === "/api/internal/agent-tasks" && method === "GET") {
-              handleAgentTasksList(req, res, identity);
+              handleAgentTasksList(req, res, identity, config);
               return;
             }
             if (pathOnly === "/api/internal/agent-tasks" && method === "POST") {
-              handleAgentTasksCreate(req, res, identity);
+              handleAgentTasksCreate(req, res, identity, config);
               return;
             }
             if (idMatch && method === "PUT") {
-              handleAgentTasksUpdate(req, res, identity, idMatch[1]);
+              handleAgentTasksUpdate(req, res, identity, idMatch[1], config);
               return;
             }
             if (idMatch && method === "DELETE") {
-              handleAgentTasksDelete(req, res, identity, idMatch[1]);
+              handleAgentTasksDelete(req, res, identity, idMatch[1], config);
               return;
             }
             res.writeHead(405, { "Content-Type": "application/json" });
@@ -660,7 +625,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     rpcMethods,
     agentBoxTlsOptions,
     credentialService,
-    siclawCtx,
     async close() {
       metricsAggregator.destroy();
       await agentBoxManager.cleanup();
@@ -675,20 +639,3 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   return runtimeServer;
 }
 
-/**
- * Ensure a chat_sessions row exists for this session so chat_messages inserts
- * don't violate the FK. Idempotent via INSERT IGNORE.
- */
-async function ensureChatSession(
-  sessionId: string,
-  agentId: string,
-  userId: string,
-  firstUserText: string,
-): Promise<void> {
-  const db = getDb();
-  await db.query(
-    `INSERT IGNORE INTO chat_sessions (id, agent_id, user_id, title, preview)
-     VALUES (?, ?, ?, ?, ?)`,
-    [sessionId, agentId, userId, firstUserText.slice(0, 100), firstUserText.slice(0, 500)],
-  );
-}

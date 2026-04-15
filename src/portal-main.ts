@@ -5,7 +5,6 @@
  */
 
 import { initDb, closeDb } from "./gateway/db.js";
-import { runMigrations } from "./gateway/migrate.js";
 import { runPortalMigrations } from "./portal/migrate.js";
 import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { startPortal } from "./portal/server.js";
@@ -28,8 +27,7 @@ if (!config.databaseUrl) {
 // Initialize DB
 initDb(config.databaseUrl);
 
-// Run migrations (Siclaw tables first, then Portal tables)
-await runMigrations();
+// Run migrations (Portal owns all tables)
 await runPortalMigrations();
 
 // Sync builtin skills from skills/core/ into the DB

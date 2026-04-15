@@ -1,8 +1,8 @@
 /**
- * Portal-specific database migrations.
+ * Database migrations — Portal owns ALL tables.
  *
- * Creates tables for users, agents, clusters, hosts, and junction tables.
- * Runs after gateway/migrate.ts so that `skills` and `mcp_servers` already exist.
+ * Creates tables for users, agents, clusters, hosts, skills, MCP servers,
+ * chat sessions, tasks, channels, and all junction tables.
  *
  * MySQL DDL causes implicit commit, so we run each statement sequentially
  * without wrapping in a transaction.
@@ -84,7 +84,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
-  // Agent <-> Skill junction (skills table created by gateway/migrate.ts)
+  // Agent <-> Skill junction
   `CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id CHAR(36) NOT NULL,
     skill_id CHAR(36) NOT NULL,
@@ -93,7 +93,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_as_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
-  // Agent <-> MCP Server junction (mcp_servers table created by gateway/migrate.ts)
+  // Agent <-> MCP Server junction
   `CREATE TABLE IF NOT EXISTS agent_mcp_servers (
     agent_id CHAR(36) NOT NULL,
     mcp_server_id CHAR(36) NOT NULL,
@@ -171,6 +171,206 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ach_channel FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // API Keys (Portal-owned — validation + CRUD here, Runtime never touches)
+  `CREATE TABLE IF NOT EXISTS agent_api_keys (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    key_hash VARCHAR(255) NOT NULL,
+    key_plain VARCHAR(255) NOT NULL,
+    key_prefix VARCHAR(10) NOT NULL,
+    last_used_at TIMESTAMP(3) NULL DEFAULT NULL,
+    expires_at TIMESTAMP(3) NULL DEFAULT NULL,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_api_keys_hash (key_hash),
+    CONSTRAINT fk_ak_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS api_key_service_accounts (
+    api_key_id CHAR(36) NOT NULL,
+    service_account_id CHAR(36) NOT NULL,
+    PRIMARY KEY (api_key_id, service_account_id),
+    CONSTRAINT fk_aksa_api_key FOREIGN KEY (api_key_id) REFERENCES agent_api_keys(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // ================================================================
+  // Siclaw core tables (skills, MCP, chat, tasks, models, etc.)
+  // ================================================================
+
+  // Skills
+  `CREATE TABLE IF NOT EXISTS skills (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    labels JSON,
+    author_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    version INT NOT NULL DEFAULT 1,
+    specs MEDIUMTEXT,
+    scripts JSON,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_skills_org_name (org_id, name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS skill_versions (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    specs MEDIUMTEXT,
+    scripts JSON,
+    diff JSON,
+    commit_message VARCHAR(500),
+    author_id CHAR(36) NOT NULL,
+    is_approved TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_skill_versions (skill_id, version),
+    CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS skill_reviews (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    diff JSON,
+    security_assessment JSON,
+    submitted_by CHAR(36) NOT NULL,
+    reviewed_by CHAR(36),
+    decision VARCHAR(20),
+    reject_reason TEXT,
+    submitted_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    reviewed_at TIMESTAMP(3),
+    CONSTRAINT fk_review_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // MCP Servers
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    transport VARCHAR(30) NOT NULL,
+    url VARCHAR(500),
+    command VARCHAR(500),
+    args JSON,
+    env JSON,
+    headers JSON,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    description TEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_mcp_servers_org_name (org_id, name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Chat
+  `CREATE TABLE IF NOT EXISTS chat_sessions (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    user_id CHAR(36) NOT NULL,
+    title VARCHAR(255),
+    preview VARCHAR(500),
+    message_count INT NOT NULL DEFAULT 0,
+    origin VARCHAR(20) DEFAULT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    last_active_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    deleted_at TIMESTAMP(3) NULL DEFAULT NULL,
+    INDEX idx_chat_sessions_user (user_id, last_active_at),
+    INDEX idx_chat_sessions_agent (agent_id),
+    INDEX idx_chat_sessions_origin (origin)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS chat_messages (
+    id CHAR(36) PRIMARY KEY,
+    session_id CHAR(36) NOT NULL,
+    role VARCHAR(20) NOT NULL,
+    content TEXT,
+    tool_name VARCHAR(100),
+    tool_input MEDIUMTEXT,
+    outcome VARCHAR(16),
+    duration_ms INT,
+    metadata JSON,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_chat_messages_session (session_id, created_at),
+    INDEX idx_chat_messages_audit (role, created_at),
+    CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Model Providers
+  `CREATE TABLE IF NOT EXISTS model_providers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36),
+    name VARCHAR(100) NOT NULL,
+    base_url VARCHAR(500) NOT NULL,
+    api_key VARCHAR(500),
+    api_type VARCHAR(50) NOT NULL DEFAULT 'openai-completions',
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS model_entries (
+    id CHAR(36) PRIMARY KEY,
+    provider_id CHAR(36) NOT NULL,
+    model_id VARCHAR(255) NOT NULL,
+    name VARCHAR(255),
+    reasoning TINYINT(1) NOT NULL DEFAULT 0,
+    context_window INT NOT NULL DEFAULT 128000,
+    max_tokens INT NOT NULL DEFAULT 65536,
+    is_default TINYINT(1) NOT NULL DEFAULT 0,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_model_entries_provider_model (provider_id, model_id),
+    CONSTRAINT fk_model_entries_provider FOREIGN KEY (provider_id) REFERENCES model_providers(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Diagnostics
+  `CREATE TABLE IF NOT EXISTS agent_diagnostics (
+    id CHAR(36) PRIMARY KEY,
+    agent_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    prompt_template TEXT NOT NULL,
+    params JSON,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_agent_diagnostics (agent_id, name)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Channel Bindings (maps channel + route_key → agent)
+  `CREATE TABLE IF NOT EXISTS channel_bindings (
+    id CHAR(36) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    route_key VARCHAR(255) NOT NULL,
+    route_type VARCHAR(20) NOT NULL DEFAULT 'group',
+    created_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_channel_route (channel_id, route_key),
+    INDEX idx_channel_bindings_agent (agent_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Channel Pairing Codes (ephemeral, 5-min TTL)
+  `CREATE TABLE IF NOT EXISTS channel_pairing_codes (
+    code VARCHAR(10) PRIMARY KEY,
+    channel_id CHAR(36) NOT NULL,
+    agent_id CHAR(36) NOT NULL,
+    created_by CHAR(36) NOT NULL,
+    expires_at TIMESTAMP(3) NOT NULL
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // System config (admin-managed kv)
+  `CREATE TABLE IF NOT EXISTS system_config (
+    config_key VARCHAR(100) PRIMARY KEY,
+    config_value TEXT,
+    updated_by CHAR(36),
+    updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
 ];
 
 /**
@@ -221,5 +421,8 @@ export async function runPortalMigrations(): Promise<void> {
   // last_manual_run_at used by the Run-now cooldown check.
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP(3) NULL DEFAULT NULL");
 
-  console.log("[portal-migrate] Portal tables ready");
+  // Backfill: normalise legacy 'cron' origin to 'task'
+  await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
+
+  console.log("[portal-migrate] All tables ready");
 }

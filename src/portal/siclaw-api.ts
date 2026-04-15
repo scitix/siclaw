@@ -1,26 +1,31 @@
 /**
- * Siclaw domain REST API handlers.
+ * Siclaw domain REST API — Portal-owned.
  *
- * Registers all CRUD routes for skills, mcp, chat, models,
- * channels, diagnostics, api-keys, and dashboard on a RestRouter.
- *
- * All data lives in the shared MySQL database.
+ * All CRUD for skills, mcp, chat sessions, models, diagnostics,
+ * channels, and dashboard. Portal owns the database; Runtime is
+ * a pure execution engine that never touches these tables.
  */
 
 import crypto from "node:crypto";
-import type { RestRouter } from "./rest-router.js";
-import type { RuntimeConfig } from "./config.js";
+import type { RestRouter } from "../gateway/rest-router.js";
+/** Subset of config needed by siclaw API routes */
+interface SiclawConfig {
+  jwtSecret: string;
+  serverUrl: string;
+  portalSecret: string;
+}
 import {
   sendJson,
   parseBody,
   parseQuery,
   requireAuth,
+  requireAdmin,
   type AuthContext,
-} from "./rest-router.js";
-import { getDb } from "./db.js";
-import { getMessages } from "./chat-repo.js";
-import { evaluateScriptsStatic, buildAssessment } from "./skills/script-evaluator.js";
-import { evaluateScriptsAI } from "./skills/ai-security-reviewer.js";
+} from "../gateway/rest-router.js";
+import { getDb } from "../gateway/db.js";
+import { getMessages } from "../gateway/chat-repo.js";
+import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
+import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
@@ -35,7 +40,7 @@ interface AccessResult {
 }
 
 async function checkAccess(
-  config: RuntimeConfig,
+  config: SiclawConfig,
   userId: string,
   orgId: string,
   action: "read" | "write" | "review",
@@ -68,7 +73,7 @@ async function checkAccess(
  */
 async function guardAccess(
   res: import("node:http").ServerResponse,
-  config: RuntimeConfig,
+  config: SiclawConfig,
   auth: AuthContext,
   action: "read" | "write" | "review",
 ): Promise<boolean> {
@@ -120,7 +125,7 @@ export type SiclawTaskFireOutcome =
   | { kind: "cooldown"; retryAfterSec: number }
   | { kind: "not_found" };
 
-export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, ctx?: SiclawApiContext): void {
+export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
 
   // ================================================================
@@ -1642,110 +1647,8 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     sendJson(res, 200, { ok: true });
   });
 
-  // ================================================================
-  // API Keys (Agent sub-resource)
-  // ================================================================
-
-  // List API keys (return key_plain for copy support)
-  router.get(`${P}/agents/:id/api-keys`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    const db = getDb();
-    const [rows] = await db.query(
-      `SELECT id, agent_id, name, key_plain, key_prefix, last_used_at, expires_at, created_by, created_at
-       FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC`,
-      [params.id],
-    ) as any;
-    sendJson(res, 200, { data: rows });
-  });
-
-  // Create API key
-  router.post(`${P}/agents/:id/api-keys`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<Record<string, unknown>>(req);
-    const id = crypto.randomUUID();
-    // Generate key: "sk-" + 32 random hex bytes
-    const rawKey = crypto.randomBytes(32).toString("hex");
-    const plaintext = `sk-${rawKey}`;
-    const keyPrefix = plaintext.slice(0, 7); // "sk-XXXX"
-    const keyHash = crypto.createHash("sha256").update(plaintext).digest("hex");
-
-    const db = getDb();
-    await db.query(
-      `INSERT INTO agent_api_keys (id, agent_id, name, key_hash, key_plain, key_prefix, expires_at, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id, params.id, body.name || "API Key",
-        keyHash, plaintext, keyPrefix,
-        body.expires_at || null, auth.userId,
-      ],
-    );
-
-    // Return the plaintext key only on creation (query back to get DB-generated created_at)
-    const [rows] = await db.query(
-      "SELECT id, agent_id, name, key_prefix, expires_at, created_by, created_at FROM agent_api_keys WHERE id = ?",
-      [id],
-    ) as any;
-    sendJson(res, 201, { ...rows[0], key: plaintext });
-  });
-
-  // Delete API key
-  router.delete(`${P}/agents/:id/api-keys/:kid`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
-    const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM agent_api_keys WHERE id = ? AND agent_id = ?",
-      [params.kid, params.id],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "API key not found" });
-      return;
-    }
-
-    await db.query("DELETE FROM api_key_service_accounts WHERE api_key_id = ?", [params.kid]);
-    await db.query("DELETE FROM agent_api_keys WHERE id = ?", [params.kid]);
-    sendJson(res, 200, { ok: true });
-  });
-
-  // Replace service account whitelist for an API key
-  router.put(`${P}/agents/:id/api-keys/:kid/service-accounts`, async (req, res, params) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    if (await guardAccess(res, config, auth, "write")) return;
-    const body = await parseBody<{ service_account_ids: string[] }>(req);
-    const db = getDb();
-
-    const [existing] = await db.query(
-      "SELECT id FROM agent_api_keys WHERE id = ? AND agent_id = ?",
-      [params.kid, params.id],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "API key not found" });
-      return;
-    }
-
-    // Replace: delete all existing, insert new
-    await db.query("DELETE FROM api_key_service_accounts WHERE api_key_id = ?", [params.kid]);
-
-    const saIds = body.service_account_ids || [];
-    for (const saId of saIds) {
-      await db.query(
-        "INSERT INTO api_key_service_accounts (api_key_id, service_account_id) VALUES (?, ?)",
-        [params.kid, saId],
-      );
-    }
-
-    sendJson(res, 200, { ok: true, service_account_ids: saIds });
-  });
+  // API Keys — moved to Portal (agent-api.ts). Portal owns the table and
+  // handles CRUD + validation for /api/v1/run. Runtime does not touch api keys.
 
   // ================================================================
   // Admin Models (Providers & Entries)
@@ -2044,5 +1947,223 @@ export function registerSiclawRoutes(router: RestRouter, config: RuntimeConfig, 
     }
 
     sendJson(res, 200, { data });
+  });
+
+  // ================================================================
+  // Metrics — summary + audit (admin-only, Portal owns the data)
+  // ================================================================
+
+  const PERIODS: Record<string, number> = {
+    today: 86_400_000,
+    "7d": 7 * 86_400_000,
+    "30d": 30 * 86_400_000,
+  };
+
+  // GET /api/v1/siclaw/metrics/summary
+  router.get("/api/v1/siclaw/metrics/summary", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const period = query.period || "7d";
+    const rangeMs = PERIODS[period];
+    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
+    const cutoff = new Date(Date.now() - rangeMs);
+    const userFilter = query.userId || null;
+
+    const db = getDb();
+
+    const sessionParams: unknown[] = [cutoff];
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
+    const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
+    const totalSessions = Number(sRows[0]?.c ?? 0);
+
+    const pParams: unknown[] = [cutoff];
+    let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'user' AND m.created_at >= ?`;
+    if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
+    const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
+    const totalPrompts = Number(pRows[0]?.c ?? 0);
+
+    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
+    if (!userFilter) {
+      const [uRows] = await db.query(
+        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
+         FROM chat_sessions s WHERE s.created_at >= ?
+         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
+        [cutoff],
+      ) as any;
+      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
+    }
+
+    sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+  });
+
+  // GET /api/v1/siclaw/metrics/audit
+  router.get("/api/v1/siclaw/metrics/audit", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const limit = Math.min(200, Math.max(1, parseInt(query.limit || "50", 10)));
+    const startDate = query.startDate ? new Date(query.startDate) : new Date(Date.now() - 86_400_000);
+    const endDate = query.endDate ? new Date(query.endDate) : new Date();
+
+    const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
+    const params: unknown[] = [startDate, endDate];
+    if (query.userId) { conds.push("s.user_id = ?"); params.push(query.userId); }
+    if (query.toolName) { conds.push("m.tool_name = ?"); params.push(query.toolName); }
+    if (query.outcome) { conds.push("m.outcome = ?"); params.push(query.outcome); }
+    if (query.cursorTs && query.cursorId) {
+      const cursorDate = new Date(parseInt(query.cursorTs, 10));
+      conds.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
+      params.push(cursorDate, cursorDate, query.cursorId);
+    }
+    params.push(limit + 1);
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
+              LEFT(m.tool_input, 500) AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE ${conds.join(" AND ")}
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT ?`,
+      params,
+    ) as any;
+
+    const hasMore = rows.length > limit;
+    const logs = rows.slice(0, limit).map((r: any) => ({
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
+      durationMs: r.durationMs,
+      timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    }));
+
+    sendJson(res, 200, { logs, hasMore });
+  });
+
+  // GET /api/v1/siclaw/metrics/audit/:id
+  router.get("/api/v1/siclaw/metrics/audit/:id", async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName, m.tool_input AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.content, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE m.id = ? AND m.role = 'tool'`,
+      [params.id],
+    ) as any;
+    if (!rows.length) { sendJson(res, 404, { error: "Not found" }); return; }
+    const r = rows[0];
+    sendJson(res, 200, {
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, content: r.content,
+      outcome: r.outcome, durationMs: r.durationMs,
+      timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    });
+  });
+
+  // ================================================================
+  // Metrics live — proxied to Runtime (in-memory MetricsAggregator)
+  // ================================================================
+
+  // GET /api/v1/siclaw/metrics/live
+  router.get("/api/v1/siclaw/metrics/live", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    try {
+      const qIdx = (req.url ?? "").indexOf("?");
+      const qs = qIdx >= 0 ? (req.url ?? "").slice(qIdx) : "";
+      const resp = await fetch(`${config.serverUrl}/api/v1/siclaw/metrics/live${qs}`, {
+        headers: { Authorization: req.headers.authorization ?? "" },
+      });
+      const data = await resp.json();
+      sendJson(res, resp.status, data);
+    } catch (err) {
+      console.error("[siclaw-api] metrics/live proxy error:", err);
+      sendJson(res, 502, { error: "Runtime unreachable" });
+    }
+  });
+
+  // ================================================================
+  // System config — admin-managed key-value store
+  // ================================================================
+
+  const ALLOWED_CONFIG_KEYS = new Set<string>(["system.grafanaUrl"]);
+
+  /** Reject dangerous URL schemes. Only http/https allowed. */
+  function validateHttpUrl(value: string): { ok: true } | { ok: false; error: string } {
+    try {
+      const u = new URL(value);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        return { ok: false, error: `Invalid URL scheme: ${u.protocol} (only http/https allowed)` };
+      }
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Invalid URL" };
+    }
+  }
+
+  // GET /api/v1/siclaw/system/config
+  router.get("/api/v1/siclaw/system/config", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT config_key, config_value FROM system_config",
+    ) as any;
+    const result: Record<string, string> = {};
+    for (const row of rows) {
+      if (row.config_value != null) result[row.config_key] = row.config_value;
+    }
+    sendJson(res, 200, { config: result });
+  });
+
+  // PUT /api/v1/siclaw/system/config
+  router.put("/api/v1/siclaw/system/config", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const body = await parseBody<{ values?: Record<string, string> }>(req);
+    const values = body?.values ?? {};
+
+    const rejected: string[] = [];
+    for (const key of Object.keys(values)) {
+      if (!ALLOWED_CONFIG_KEYS.has(key)) rejected.push(key);
+    }
+    if (rejected.length > 0) {
+      sendJson(res, 400, { error: `Unknown config keys: ${rejected.join(", ")}` });
+      return;
+    }
+
+    for (const [key, value] of Object.entries(values)) {
+      if (key === "system.grafanaUrl") {
+        const check = validateHttpUrl(String(value));
+        if (!check.ok) { sendJson(res, 400, { error: `${key}: ${check.error}` }); return; }
+      }
+    }
+
+    const db = getDb();
+    for (const [key, value] of Object.entries(values)) {
+      await db.query(
+        `INSERT INTO system_config (config_key, config_value, updated_by)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+        [key, String(value), admin.userId],
+      );
+    }
+    sendJson(res, 200, { ok: true });
   });
 }
