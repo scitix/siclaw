@@ -119,7 +119,6 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string,
-  memoryIndexerRef?: { current?: MemoryIndexer },
 ): string[] {
   const parts: string[] = [];
 
@@ -169,18 +168,12 @@ This is a new user (profile has only defaults).
     }
   }
 
-  // Knowledge Overview (between PROFILE and MEMORY)
+  // Knowledge Overview (repos/docs summary — past DP investigations are NOT
+  // auto-injected here; the agent pulls them on demand via `memory_search`).
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  let investigationPatterns: Array<{ category: string; count: number }> | undefined;
-  if (memoryIndexerRef?.current) {
-    try {
-      investigationPatterns = memoryIndexerRef.current.getInvestigationPatterns(3)
-        .map(p => ({ category: p.rootCauseCategory, count: p.count }));
-    } catch { /* ignore — patterns are a nice-to-have */ }
-  }
-  const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_, investigationPatterns });
+  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_ });
   if (overview) {
     parts.push(overview);
   }
@@ -431,7 +424,7 @@ export async function createSiclawSession(
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(memoryDir, memoryIndexerRef);
+      const parts = buildAppendSystemPrompt(memoryDir);
       if (agentSystemPromptAppend) {
         parts.push("\n\n" + agentSystemPromptAppend);
       }

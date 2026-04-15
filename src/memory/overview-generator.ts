@@ -6,35 +6,26 @@ import path from "node:path";
 // ---------------------------------------------------------------------------
 
 export interface OverviewOpts {
-  memoryDir: string;
   reposDir?: string;
   docsDir?: string;
-  investigationPatterns?: Array<{ category: string; count: number }>;
 }
 
 /**
  * Build a concise knowledge overview from content directories.
- * Scans repos/, docs/, and investigations/ (topic files no longer injected).
+ * Scans repos/ and docs/ only. Past investigations live under
+ * memory/investigations/ but are intentionally NOT auto-injected into the
+ * prompt — the agent pulls them on demand via the `memory_search` tool.
  * Pure sync filesystem scan — no DB dependency.
  * Returns empty string if no knowledge files exist.
  */
 export function buildKnowledgeOverview(opts: OverviewOpts): string {
-  const { memoryDir, reposDir, docsDir, investigationPatterns } = opts;
+  const { reposDir, docsDir } = opts;
   const TOTAL_BUDGET = 1200;
-
-  const investigationsDir = path.join(memoryDir, "investigations");
 
   const repoEntries = reposDir ? scanRepos(reposDir) : [];
   const docEntries = docsDir ? scanDocs(docsDir) : [];
-  const investigationEntries = scanInvestigations(investigationsDir);
 
-  const hasPatterns = investigationPatterns && investigationPatterns.length > 0;
-  if (
-    repoEntries.length === 0 &&
-    docEntries.length === 0 &&
-    investigationEntries.length === 0 &&
-    !hasPatterns
-  ) {
+  if (repoEntries.length === 0 && docEntries.length === 0) {
     return "";
   }
 
@@ -50,7 +41,7 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     for (const entry of repoEntries) {
       const langs = entry.topExtensions.length > 0 ? entry.topExtensions.join(", ") : "-";
       const row = `\n| ${entry.name} | ${entry.fileCount} | ${langs} |`;
-      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 800) break; // reserve for docs + investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 400) break; // reserve for docs + footer
       rows.push(row);
       sectionLen += row.length;
     }
@@ -69,7 +60,7 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     let sectionLen = header.length;
     for (const entry of docEntries) {
       const row = `\n| ${entry.category} | ${entry.fileCount} |`;
-      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 400) break; // reserve for investigations + footer
+      if (currentLen + sectionLen + row.length > TOTAL_BUDGET - 100) break; // reserve for footer
       rows.push(row);
       sectionLen += row.length;
     }
@@ -80,34 +71,8 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     }
   }
 
-  // --- Recent Investigations (~300 chars budget) ---
-  if (investigationEntries.length > 0 || (investigationPatterns && investigationPatterns.length > 0)) {
-    const maxInvestigations = currentLen > TOTAL_BUDGET - 600 ? 3 : 5;
-    const entries = investigationEntries.slice(0, maxInvestigations);
-
-    const header = "\n\n### Recent Investigations";
-    const lines = entries.map(e => `\n- ${e.date}: ${e.question}`);
-
-    // Append pattern summary if available
-    if (investigationPatterns && investigationPatterns.length > 0) {
-      const patternStr = investigationPatterns.map(p => `${p.category} (${p.count}x)`).join(", ");
-      lines.push(`\n- Patterns: ${patternStr}`);
-    }
-
-    const section = header + lines.join("");
-
-    if (currentLen + section.length <= TOTAL_BUDGET - 100) {
-      parts.push(section);
-      currentLen += section.length;
-    }
-  }
-
   // --- Footer ---
-  const hasContent = repoEntries.length > 0 || docEntries.length > 0;
-  const footer = hasContent
-    ? '\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.'
-    : '\n\nUse `memory_search` to find specific facts from past sessions or investigations.';
-  parts.push(footer);
+  parts.push('\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.');
 
   return parts.join("");
 }
@@ -125,11 +90,6 @@ interface RepoInfo {
 interface DocEntry {
   category: string;
   fileCount: number;
-}
-
-interface InvestigationInfo {
-  date: string;
-  question: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,37 +211,3 @@ function scanDocs(docsDir: string): DocEntry[] {
   return entries;
 }
 
-function scanInvestigations(investigationsDir: string): InvestigationInfo[] {
-  if (!fs.existsSync(investigationsDir)) return [];
-
-  let files: string[];
-  try {
-    files = fs.readdirSync(investigationsDir).filter(f => f.endsWith(".md"));
-  } catch {
-    return [];
-  }
-
-  // Sort by filename descending (filenames are date-based: YYYY-MM-DD-HH-MM-SS.md)
-  files.sort((a, b) => b.localeCompare(a));
-
-  const entries: InvestigationInfo[] = [];
-  for (const file of files.slice(0, 5)) {
-    try {
-      // Read only first 300 bytes to extract the title
-      const content = fs.readFileSync(path.join(investigationsDir, file), "utf-8");
-      const head = content.slice(0, 300);
-      const titleMatch = head.match(/^# Investigation:\s*(.+)/m);
-      const question = titleMatch ? titleMatch[1].trim() : file.replace(/\.md$/, "");
-
-      // Parse date from filename (YYYY-MM-DD-HH-MM-SS.md → YYYY-MM-DD)
-      const dateMatch = file.match(/^(\d{4}-\d{2}-\d{2})/);
-      const date = dateMatch ? dateMatch[1] : "unknown";
-
-      entries.push({ date, question });
-    } catch {
-      // Skip unreadable files
-    }
-  }
-
-  return entries;
-}
