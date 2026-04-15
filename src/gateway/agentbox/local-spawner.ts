@@ -2,7 +2,8 @@
  * Local AgentBox Spawner
  *
  * Spawner for local development; runs the AgentBox HTTP server within the same process.
- * Each user gets an independent port.
+ * Each user gets an independent port. Uses the same mTLS certificate architecture
+ * as K8s mode — gateway signs a client cert for each AgentBox instance.
  */
 
 import http from "node:http";
@@ -12,8 +13,7 @@ import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import type { MemoryIndexer } from "../../memory/index.js";
-import type { CredentialService } from "../../shared/credential-types.js";
-import { DirectCallTransport } from "../../agentbox/credential-transport.js";
+import type { CertificateManager } from "../security/cert-manager.js";
 
 interface LocalBox {
   userId: string;
@@ -33,11 +33,14 @@ export class LocalSpawner implements BoxSpawner {
   /** Injected knowledge base indexer (set via setKnowledgeIndexer) */
   private knowledgeIndexer: MemoryIndexer | null = null;
 
-  /** Injected credential service (Local mode: AgentBox calls it via DirectCallTransport) */
-  private readonly credentialService: CredentialService;
+  /** Certificate manager for signing agentbox client certs */
+  private readonly certManager: CertificateManager;
+  /** Gateway internal mTLS URL (e.g. https://127.0.0.1:3002) */
+  private readonly gatewayInternalUrl: string;
 
-  constructor(credentialService: CredentialService, basePort = 4000) {
-    this.credentialService = credentialService;
+  constructor(certManager: CertificateManager, gatewayInternalUrl: string, basePort = 4000) {
+    this.certManager = certManager;
+    this.gatewayInternalUrl = gatewayInternalUrl;
     this.basePort = basePort;
     this.nextPort = basePort;
   }
@@ -68,24 +71,33 @@ export class LocalSpawner implements BoxSpawner {
     // Allocate port
     const port = this.nextPort++;
 
+    // Sign a client certificate for this agentbox (same as K8s mode)
+    const certBundle = this.certManager.issueAgentBoxCertificate(
+      userId, agentId, "default", boxId, "dev",
+    );
+
+    // Write cert files to a temp dir so GatewayClient can use them
+    const certDir = path.resolve(process.cwd(), ".siclaw/certs", boxId);
+    const fs = await import("node:fs");
+    fs.mkdirSync(certDir, { recursive: true });
+    fs.writeFileSync(path.join(certDir, "cert.pem"), certBundle.cert);
+    fs.writeFileSync(path.join(certDir, "key.pem"), certBundle.key);
+    fs.writeFileSync(path.join(certDir, "ca.pem"), certBundle.ca);
+
+    // Set env vars so http-server.ts initializes HttpTransport (same as K8s)
+    process.env.SICLAW_GATEWAY_URL = this.gatewayInternalUrl;
+    process.env.SICLAW_TLS_CERT = path.join(certDir, "cert.pem");
+    process.env.SICLAW_TLS_KEY = path.join(certDir, "key.pem");
+    process.env.SICLAW_TLS_CA = path.join(certDir, "ca.pem");
+
     // Create session manager and HTTP server
     const sessionManager = new AgentBoxSessionManager();
-    // Set userId so sessions created in this box use per-user skill directories
     sessionManager.userId = userId;
-    // Set agentId for metrics labeling (tool_call / skill_call events carry agentId)
     sessionManager.agentId = agentId;
-    // Pass knowledge indexer for knowledge_search tool
     if (this.knowledgeIndexer) {
       sessionManager.knowledgeIndexer = this.knowledgeIndexer;
     }
-    // Local mode: inject a DirectCallTransport so the broker hits the in-process
-    // CredentialService directly rather than going through mTLS HTTP.
-    sessionManager.credentialTransport = new DirectCallTransport(this.credentialService, {
-      userId,
-      agentId,
-    });
-    // Each in-process box gets its own credentials directory so multiple users
-    // on the same LocalSpawner don't fight over the shared cwd-based default.
+    // Each box gets its own credentials directory
     sessionManager.credentialsDir = path.resolve(
       process.cwd(),
       ".siclaw/credentials",

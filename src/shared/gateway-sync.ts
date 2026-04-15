@@ -134,7 +134,7 @@ export const GATEWAY_SYNC_DESCRIPTORS: Record<GatewaySyncType, GatewaySyncDescri
   cluster: {
     type: "cluster",
     // gatewayPath unused: handler walks through the CredentialBroker's
-    // own transport (HTTP mTLS in K8s mode, DirectCall in Local mode).
+    // own HttpTransport (same for K8s and Local mode).
     gatewayPath: "",
     reloadPath: "/api/reload-cluster",
     retry: { maxRetries: 3, baseDelayMs: 1000 },

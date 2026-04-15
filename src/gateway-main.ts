@@ -38,10 +38,13 @@ if (config.databaseUrl) {
   console.log("[runtime] Database ready");
 }
 
-// Credential service — shared by startRuntime (for mTLS handlers) and
-// LocalSpawner (for in-process DirectCallTransport). Must exist before spawner
-// accepts any spawn calls.
+// Credential service — used by mTLS credential-proxy on port 3002.
 const credentialService = createCredentialService(config);
+
+// CertManager — needed early for LocalSpawner to sign agentbox certs.
+// In K8s mode, startRuntime() creates its own; here we create it once and share.
+import { CertificateManager } from "./gateway/security/cert-manager.js";
+const certManager = await CertificateManager.create();
 
 // Create Spawner
 const spawner = useK8s
@@ -57,7 +60,7 @@ const spawner = useK8s
     })
   : useProcess
     ? new ProcessSpawner()
-    : new LocalSpawner(credentialService, 4000);
+    : new LocalSpawner(certManager, `https://127.0.0.1:${config.internalPort}`, 4000);
 
 console.log(`[runtime] Using spawner: ${spawner.name}`);
 
@@ -73,6 +76,7 @@ const runtime = await startRuntime({
   agentBoxManager,
   spawner,
   credentialService,
+  certManager,
 });
 
 // Boot channel integrations (Lark, etc.) from DB

@@ -54,15 +54,3 @@ export interface CredentialPayload {
   };
   audit_id?: string;
 }
-
-/**
- * Credential service contract — consumed by credential-proxy, DirectCallTransport,
- * LocalSpawner. Single implementation in gateway/credential-service.ts calls
- * the adapter API (Portal or Upstream).
- */
-export interface CredentialService {
-  listClusters(identity: Identity): Promise<ClusterMeta[]>;
-  listHosts(identity: Identity): Promise<HostMeta[]>;
-  getClusterCredential(identity: Identity, clusterName: string, purpose: string): Promise<CredentialPayload>;
-  getHostCredential(identity: Identity, hostName: string, purpose: string): Promise<CredentialPayload>;
-}
