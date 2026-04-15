@@ -328,4 +328,65 @@ export function registerAgentRoutes(
       channels,
     });
   });
+
+  // ================================================================
+  // API Keys (Portal-owned)
+  // ================================================================
+
+  // List API keys
+  router.get("/api/v1/siclaw/agents/:id/api-keys", async (req, res, params) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, key_plain, key_prefix, last_used_at, expires_at, created_by, created_at
+       FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC`,
+      [params.id],
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Create API key
+  router.post("/api/v1/siclaw/agents/:id/api-keys", async (req, res, params) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+
+    const body = await parseBody<Record<string, unknown>>(req);
+    const id = crypto.randomUUID();
+    const rawKey = crypto.randomBytes(32).toString("hex");
+    const plaintext = `sk-${rawKey}`;
+    const keyPrefix = plaintext.slice(0, 7);
+    const keyHash = crypto.createHash("sha256").update(plaintext).digest("hex");
+
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_api_keys (id, agent_id, name, key_hash, key_plain, key_prefix, expires_at, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, params.id, body.name || "API Key", keyHash, plaintext, keyPrefix, body.expires_at || null, auth.userId],
+    );
+
+    const [rows] = await db.query(
+      "SELECT id, agent_id, name, key_prefix, expires_at, created_by, created_at FROM agent_api_keys WHERE id = ?",
+      [id],
+    ) as any;
+    sendJson(res, 201, { ...rows[0], key: plaintext });
+  });
+
+  // Delete API key
+  router.delete("/api/v1/siclaw/agents/:id/api-keys/:kid", async (req, res, params) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_api_keys WHERE id = ? AND agent_id = ?",
+      [params.kid, params.id],
+    ) as any;
+    if (existing.length === 0) { sendJson(res, 404, { error: "API key not found" }); return; }
+
+    await db.query("DELETE FROM api_key_service_accounts WHERE api_key_id = ?", [params.kid]);
+    await db.query("DELETE FROM agent_api_keys WHERE id = ?", [params.kid]);
+    sendJson(res, 200, { ok: true });
+  });
 }

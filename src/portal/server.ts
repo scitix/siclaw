@@ -17,6 +17,7 @@ import { registerAdapterRoutes } from "./adapter.js";
 import { registerChatRoutes } from "./chat-gateway.js";
 import { registerChannelRoutes } from "./channel-api.js";
 import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
+import { registerSiclawRoutes } from "./siclaw-api.js";
 import { createRuntimeProxy } from "./proxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,6 +61,11 @@ export function startPortal(config: PortalConfig): http.Server {
   registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
   registerChannelRoutes(router, config.jwtSecret);
   registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);
+  registerSiclawRoutes(router, {
+    jwtSecret: config.jwtSecret,
+    serverUrl: config.runtimeUrl,
+    portalSecret: config.portalSecret,
+  });
 
   const server = http.createServer(async (req, res) => {
     const url = req.url ?? "/";
@@ -88,44 +94,8 @@ export function startPortal(config: PortalConfig): http.Server {
     // Portal's own routes
     if (router.handle(req, res)) return;
 
-    // Proxy admin Metrics + System config APIs to Runtime (admin-only enforced
-    // both here and on Runtime side via requireAdmin)
-    if (url.startsWith("/api/v1/siclaw/metrics/") || url.startsWith("/api/v1/siclaw/system/")) {
-      const auth = requireAdmin(req, res, config.jwtSecret);
-      if (!auth) return;
-      runtimeProxy(req, res);
-      return;
-    }
-
-    // Proxy Siclaw domain APIs to Runtime
-    if (
-      url.startsWith("/api/v1/siclaw/skills") ||
-      url.startsWith("/api/v1/siclaw/reviews") ||
-      url.startsWith("/api/v1/siclaw/mcp") ||
-      url.startsWith("/api/v1/siclaw/admin") ||
-      url.match(/^\/api\/v1\/siclaw\/agents\/[^/]+\/tasks/) ||
-      url.startsWith("/api/v1/siclaw/my-tasks") ||
-      (url.includes("/chat/sessions") && !url.includes("/chat/send")) ||
-      url.includes("/channel-bindings") ||
-      url.includes("/diagnostics") ||
-      url.includes("/api-keys")
-    ) {
-      // Admin-only routes (all methods)
-      const adminOnly =
-        url.startsWith("/api/v1/siclaw/admin") ||
-        url.includes("/channel-bindings") ||
-        url.includes("/diagnostics") ||
-        url.includes("/api-keys");
-      // MCP: read is open, write requires admin
-      const mcpWrite = url.startsWith("/api/v1/siclaw/mcp") && req.method !== "GET";
-
-      if (adminOnly || mcpWrite) {
-        const auth = requireAdmin(req, res, config.jwtSecret);
-        if (!auth) return;
-      }
-      runtimeProxy(req, res);
-      return;
-    }
+    // All /api/v1/siclaw/* routes are now handled by registerSiclawRoutes
+    // via router.handle() above. No more proxy to Runtime for CRUD.
 
     // Adapter API proxy (internal, called by Runtime)
     if (url.startsWith("/api/internal/")) {
