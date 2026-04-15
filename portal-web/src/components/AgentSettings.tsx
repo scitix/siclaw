@@ -12,10 +12,10 @@ interface Agent {
 }
 
 interface AgentResources {
-  clusters: { id: string; name: string }[]
-  hosts: { total: number; sample: { id: string; name: string; ip: string }[] }
-  skill_ids: string[]
-  mcp_server_ids: string[]
+  clusters: { id: string; name: string; api_server?: string }[]
+  hosts: { id: string; name: string; ip: string; port?: number }[]
+  skills: { id: string; name: string; description?: string }[]
+  mcp_servers: { id: string; name: string; transport?: string }[]
   channels: { id: string; name: string; type: string }[]
 }
 
@@ -100,10 +100,10 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   useEffect(() => {
     if (resources) {
       setSelectedClusterIds(new Set(resources.clusters?.map(c => c.id) || []))
-      setSelectedHostIds(new Set(resources.hosts?.sample?.map(h => h.id) || []))
-      setSelectedSkillIds(new Set(resources.skill_ids || []))
-      setSelectedMcpIds(new Set(resources.mcp_server_ids || []))
-      setSelectedChannelIds(new Set(resources.channels?.map((c: any) => c.id) || []))
+      setSelectedHostIds(new Set(resources.hosts?.map(h => h.id) || []))
+      setSelectedSkillIds(new Set(resources.skills?.map(s => s.id) || []))
+      setSelectedMcpIds(new Set(resources.mcp_servers?.map(m => m.id) || []))
+      setSelectedChannelIds(new Set(resources.channels?.map(c => c.id) || []))
     }
   }, [resources])
 
