@@ -94,16 +94,8 @@ export class AgentBoxSessionManager {
   credentialBroker?: import("./credential-broker.js").CredentialBroker;
 
   /**
-   * Optional credential transport — set by LocalSpawner (in-process, Local mode).
-   * When present, http-server uses this transport to construct the broker
-   * instead of building an mTLS HTTP client. K8s mode leaves this undefined
-   * and http-server falls back to HttpMtlsTransport.
-   */
-  credentialTransport?: import("./credential-transport.js").CredentialTransport;
-
-  /**
    * Optional override for the directory where the broker materializes credential
-   * files. LocalSpawner sets this to a per-user path so multiple in-process
+   * files. LocalSpawner sets this to a per-user path so multiple
    * AgentBoxes don't collide on a shared credentialsDir. When undefined the
    * broker falls back to `<cwd>/.siclaw/credentials`.
    */

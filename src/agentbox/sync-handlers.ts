@@ -156,9 +156,7 @@ import type { CredentialBroker } from "./credential-broker.js";
  * cluster handler — refresh cluster metadata Map on notify.
  *
  * Does NOT use GatewaySyncClientLike: the CredentialBroker carries its own
- * CredentialTransport that already abstracts HTTP-mTLS (K8s mode) and
- * in-process direct call (Local mode). The framework's generic HTTP client
- * is the wrong tool here — in Local mode it would be null.
+ * HttpTransport. The framework's generic HTTP client is the wrong tool here.
  *
  * Consequence: fetch() drives the entire refresh; materialize() is a
  * no-op that just returns the count for the framework log line.

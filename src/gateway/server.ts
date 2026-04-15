@@ -84,12 +84,10 @@ export interface StartRuntimeOptions {
   config: RuntimeConfig;
   agentBoxManager: AgentBoxManager;
   spawner?: BoxSpawner;
-  /**
-   * Optional pre-constructed credential service. When omitted, startRuntime
-   * builds one from config. Providing it externally allows the caller to
-   * share the same instance with a LocalSpawner (direct in-process transport).
-   */
+  /** Optional pre-constructed credential service. When omitted, builds from config. */
   credentialService?: CredentialService;
+  /** Optional pre-constructed CertificateManager. When omitted, creates a new one. */
+  certManager?: CertificateManager;
 }
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
@@ -102,7 +100,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   const credentialService = opts.credentialService ?? createCredentialService(config);
 
   // ── Certificate Manager ──────────────────────────────────
-  const certManager = await CertificateManager.create();
+  const certManager = opts.certManager ?? await CertificateManager.create();
   agentBoxManager.setCertManager(certManager);
   const gatewayHostname = process.env.SICLAW_GATEWAY_HOSTNAME || "siclaw-runtime.siclaw.svc.cluster.local";
   const serverCert = certManager.issueServerCertificate(gatewayHostname);
