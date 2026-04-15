@@ -13,6 +13,8 @@ interface SiclawConfig {
   jwtSecret: string;
   serverUrl: string;
   portalSecret: string;
+  runtimeWsUrl?: string;
+  runtimeSecret?: string;
 }
 import {
   sendJson,
@@ -27,6 +29,7 @@ import { getMessages } from "../gateway/chat-repo.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";
+import { runtimeRpc } from "./chat-gateway.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -110,20 +113,7 @@ export interface SiclawApiContext {
   notifySkillDevAgents?: (skillId: string, resources: string[]) => void;
   /** Notify agents bound to an MCP server to reload. */
   notifyMcpAgents?: (mcpId: string, resources: string[]) => void;
-  /**
-   * Trigger a manual Run-now for the given task. Field is filled in by
-   * gateway-main after the TaskCoordinator is constructed; route handlers
-   * read it at request time so the late-attach pattern is safe. Undefined
-   * in DB-less modes where the coordinator isn't running.
-   */
-  fireTaskNow?: (taskId: string) => Promise<SiclawTaskFireOutcome>;
 }
-
-export type SiclawTaskFireOutcome =
-  | { kind: "ok" }
-  | { kind: "in_flight" }
-  | { kind: "cooldown"; retryAfterSec: number }
-  | { kind: "not_found" };
 
 export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, ctx?: SiclawApiContext): void {
   const P = "/api/v1/siclaw";
@@ -1287,13 +1277,25 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     ) as any;
     if (owner.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
 
-    if (!ctx?.fireTaskNow) {
-      sendJson(res, 503, { error: "Task coordinator not available" });
+    if (!config.runtimeWsUrl || !config.runtimeSecret) {
+      sendJson(res, 503, { error: "Runtime not configured" });
       return;
     }
 
-    const outcome = await ctx.fireTaskNow(params.taskId);
-    switch (outcome.kind) {
+    // Trigger execution via WS RPC to Runtime's task-coordinator
+    const rpcResult = await runtimeRpc(
+      config.runtimeWsUrl, config.runtimeSecret,
+      params.agentId, "task.fireNow",
+      { taskId: params.taskId },
+    );
+
+    if (!rpcResult.ok) {
+      sendJson(res, 502, { error: rpcResult.error || "Runtime RPC failed" });
+      return;
+    }
+
+    const outcome = rpcResult.payload as { kind: string; retryAfterSec?: number } | undefined;
+    switch (outcome?.kind) {
       case "ok":
         sendJson(res, 202, { ok: true });
         return;
@@ -1309,6 +1311,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         return;
       case "not_found":
         sendJson(res, 404, { error: "Task not found" });
+        return;
+      default:
+        sendJson(res, 500, { error: "Unexpected outcome" });
         return;
     }
   });

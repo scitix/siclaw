@@ -129,7 +129,12 @@ if (config.serverUrl) {
   await taskCoordinator.start();
 }
 
-// fireTaskNow moved to Portal — Runtime task API no longer registered here.
+// Register task.fireNow RPC — called by Portal/Upstream to trigger manual task execution
+runtime.rpcMethods.set("task.fireNow", async (params) => {
+  const taskId = params.taskId as string;
+  if (!taskId) throw new Error("taskId required");
+  return taskCoordinator.fireNow(taskId);
+});
 
 // Graceful shutdown
 async function shutdown() {
