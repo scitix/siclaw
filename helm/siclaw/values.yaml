@@ -12,7 +12,7 @@ mysql:
   username: siclaw
   password: ""
 
-# -- Database (MySQL, shared by Runtime + Portal)
+# -- Database (MySQL, Portal only — Runtime uses adapter API)
 database:
   url: ""               # mysql://user:pass@host:3306/siclaw
 
