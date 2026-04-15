@@ -6,125 +6,39 @@ import { buildKnowledgeOverview } from "./overview-generator.js";
 
 describe("buildKnowledgeOverview", () => {
   let tmpDir: string;
-  let memoryDir: string;
   let reposDir: string;
   let docsDir: string;
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "overview-test-"));
-    memoryDir = path.join(tmpDir, "memory");
     reposDir = path.join(tmpDir, "repos");
     docsDir = path.join(tmpDir, "docs");
-    fs.mkdirSync(memoryDir);
   });
 
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // --- Backward compatibility (memoryDir only) ---
+  // --- Empty / no-content cases ---
 
-  it("returns empty string for empty memoryDir", () => {
-    expect(buildKnowledgeOverview({ memoryDir })).toBe("");
+  it("returns empty string when nothing is passed", () => {
+    expect(buildKnowledgeOverview({})).toBe("");
   });
 
-  it("returns empty string when topics/ and investigations/ don't exist", () => {
-    fs.writeFileSync(path.join(memoryDir, "PROFILE.md"), "hello");
-    expect(buildKnowledgeOverview({ memoryDir })).toBe("");
-  });
-
-  it("works with only memoryDir (backward compat, repos/docs optional)", () => {
-    // Topics no longer scanned — only investigations produce output for memoryDir-only
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-16-14-30-00.md"),
-      `# Investigation: OOM in prod\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("### Recent Investigations");
-    expect(result).not.toContain("### Code Repositories");
-    expect(result).not.toContain("### Documentation");
-    expect(result).not.toContain("### Accumulated Knowledge");
-  });
-
-  // --- Investigations ---
-
-  it("shows only investigations when only investigations/ exists", () => {
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-16-14-30-00.md"),
-      `# Investigation: Pod CrashLoopBackOff in prod-us-west\n\n**Date**: 2026-03-16\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("## Knowledge Overview");
-    expect(result).toContain("### Recent Investigations");
-    expect(result).toContain("2026-03-16: Pod CrashLoopBackOff in prod-us-west");
-    expect(result).not.toContain("### Accumulated Knowledge");
-  });
-
-  it("shows investigations (topics no longer scanned)", () => {
-    // Topics dir exists but is ignored — only investigations shown
-    const topicsDir = path.join(memoryDir, "topics");
-    fs.mkdirSync(topicsDir);
-    fs.writeFileSync(
-      path.join(topicsDir, "networking.md"),
-      `# Networking\n\n## 2026-03-15\n- fact a\n- fact b\n`,
-    );
-
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-08-10-00-00.md"),
-      `# Investigation: RoCE network latency spike\n\n**Date**: 2026-03-08\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).not.toContain("### Accumulated Knowledge");
-    expect(result).toContain("### Recent Investigations");
-    expect(result).toContain("2026-03-08: RoCE network latency spike");
-  });
-
-  it("limits investigations to 5 and sorts descending", () => {
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    for (let i = 1; i <= 7; i++) {
-      const day = String(i).padStart(2, "0");
-      fs.writeFileSync(
-        path.join(invDir, `2026-03-${day}-12-00-00.md`),
-        `# Investigation: Issue ${i}\n`,
-      );
-    }
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("Issue 7");
-    expect(result).toContain("Issue 3");
-    expect(result).not.toContain("Issue 1");
-    expect(result).not.toContain("Issue 2");
-  });
-
-  it("handles investigation files without title gracefully", () => {
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(path.join(invDir, "2026-03-10-08-00-00.md"), "no title here");
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("2026-03-10:");
+  it("returns empty string when repos/ and docs/ are both unset", () => {
+    expect(buildKnowledgeOverview({})).toBe("");
   });
 
   // --- Code Repositories ---
 
   it("returns empty when repos/ doesn't exist", () => {
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toBe("");
   });
 
   it("returns empty when repos/ exists but is empty", () => {
     fs.mkdirSync(reposDir);
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toBe("");
   });
 
@@ -136,7 +50,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(repo, "util.ts"), "export {}");
     fs.writeFileSync(path.join(repo, "go.mod"), "module x");
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toContain("## Knowledge Overview");
     expect(result).toContain("### Code Repositories");
     expect(result).toContain("my-service");
@@ -159,7 +73,7 @@ describe("buildKnowledgeOverview", () => {
       fs.writeFileSync(path.join(large, `file${i}.go`), "");
     }
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     const largeIdx = result.indexOf("large-repo");
     const smallIdx = result.indexOf("small-repo");
     expect(largeIdx).toBeLessThan(smallIdx);
@@ -175,7 +89,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(repo, "README.md"), "");
     fs.writeFileSync(path.join(repo, "package.json"), "{}");
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toContain("nested-service");
     expect(result).toContain("5"); // total files
     expect(result).toContain(".ts"); // top extension
@@ -190,7 +104,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(repo, "node_modules", "pkg", "index.js"), "");
     fs.writeFileSync(path.join(repo, "src.ts"), "");
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toContain("| 1 |"); // only src.ts counted
   });
 
@@ -204,7 +118,7 @@ describe("buildKnowledgeOverview", () => {
     // Symlink into repos/
     fs.symlinkSync(realRepo, path.join(reposDir, "linked-repo"));
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toContain("linked-repo");
     expect(result).toContain("2"); // file count
   });
@@ -216,20 +130,20 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(realDocs, "deploy.md"), "");
     fs.symlinkSync(realDocs, path.join(docsDir, "runbooks"));
 
-    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    const result = buildKnowledgeOverview({ docsDir });
     expect(result).toContain("runbooks");
   });
 
   // --- Documentation ---
 
   it("returns empty when docs/ doesn't exist", () => {
-    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    const result = buildKnowledgeOverview({ docsDir });
     expect(result).toBe("");
   });
 
   it("returns empty when docs/ exists but is empty", () => {
     fs.mkdirSync(docsDir);
-    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    const result = buildKnowledgeOverview({ docsDir });
     expect(result).toBe("");
   });
 
@@ -244,7 +158,7 @@ describe("buildKnowledgeOverview", () => {
     fs.mkdirSync(arch);
     fs.writeFileSync(path.join(arch, "overview.md"), "# Overview");
 
-    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    const result = buildKnowledgeOverview({ docsDir });
     expect(result).toContain("### Documentation");
     expect(result).toContain("runbooks");
     expect(result).toContain("architecture");
@@ -255,7 +169,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(docsDir, "getting-started.md"), "# Hello");
     fs.writeFileSync(path.join(docsDir, "faq.md"), "# FAQ");
 
-    const result = buildKnowledgeOverview({ memoryDir, docsDir });
+    const result = buildKnowledgeOverview({ docsDir });
     expect(result).toContain("### Documentation");
     expect(result).toContain("(root)");
     expect(result).toContain("| 2 |");
@@ -263,7 +177,7 @@ describe("buildKnowledgeOverview", () => {
 
   // --- Mixed scenarios ---
 
-  it("shows repos + docs + investigations (topics no longer scanned)", () => {
+  it("shows repos + docs together", () => {
     // repos
     fs.mkdirSync(reposDir);
     const repo = path.join(reposDir, "api-svc");
@@ -276,22 +190,13 @@ describe("buildKnowledgeOverview", () => {
     fs.mkdirSync(runbooks);
     fs.writeFileSync(path.join(runbooks, "deploy.md"), "# Deploy");
 
-    // investigations
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-16-14-30-00.md"),
-      `# Investigation: Pod CrashLoopBackOff\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir, reposDir, docsDir });
+    const result = buildKnowledgeOverview({ reposDir, docsDir });
     expect(result).toContain("### Code Repositories");
     expect(result).toContain("api-svc");
     expect(result).toContain("### Documentation");
     expect(result).toContain("runbooks");
+    expect(result).not.toContain("### Recent Investigations");
     expect(result).not.toContain("### Accumulated Knowledge");
-    expect(result).toContain("### Recent Investigations");
-    expect(result).toContain("Pod CrashLoopBackOff");
   });
 
   it("uses content-aware footer when repos or docs present", () => {
@@ -300,28 +205,41 @@ describe("buildKnowledgeOverview", () => {
     fs.mkdirSync(repo);
     fs.writeFileSync(path.join(repo, "x.ts"), "");
 
-    const result = buildKnowledgeOverview({ memoryDir, reposDir });
+    const result = buildKnowledgeOverview({ reposDir });
     expect(result).toContain("repos/");
     expect(result).toContain("docs/");
   });
 
-  // --- Budget ---
+  // --- Intentional non-injection of investigations ---
 
-  it("stays within budget with many investigations", () => {
+  it("never injects past investigations, even when memory/investigations/ exists", () => {
+    // Simulate a past DP investigation file on disk — it must NOT appear in the overview.
+    const memoryDir = path.join(tmpDir, "memory");
+    fs.mkdirSync(memoryDir);
     const invDir = path.join(memoryDir, "investigations");
     fs.mkdirSync(invDir);
-    for (let i = 1; i <= 10; i++) {
-      fs.writeFileSync(
-        path.join(invDir, `2026-03-${String(i).padStart(2, "0")}-12-00-00.md`),
-        `# Investigation: A fairly long investigation question number ${i}\n`,
-      );
-    }
+    fs.writeFileSync(
+      path.join(invDir, "2026-03-16-14-30-00.md"),
+      `# Investigation: Pod CrashLoopBackOff in prod-us-west\n`,
+    );
 
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result.length).toBeLessThanOrEqual(1200 + 150); // small slack for footer
+    // Also give the overview something to render so we're checking selective omission,
+    // not a trivial empty-result path.
+    fs.mkdirSync(reposDir);
+    const repo = path.join(reposDir, "svc");
+    fs.mkdirSync(repo);
+    fs.writeFileSync(path.join(repo, "main.ts"), "");
+
+    const result = buildKnowledgeOverview({ reposDir });
+    expect(result).toContain("### Code Repositories");
+    expect(result).not.toContain("### Recent Investigations");
+    expect(result).not.toContain("Pod CrashLoopBackOff");
+    expect(result).not.toContain("Patterns:");
   });
 
-  it("stays within budget with large repos + many docs + investigations", () => {
+  // --- Budget ---
+
+  it("stays within budget with large repos + many docs", () => {
     // Large repos
     fs.mkdirSync(reposDir);
     for (let r = 0; r < 10; r++) {
@@ -342,56 +260,7 @@ describe("buildKnowledgeOverview", () => {
       }
     }
 
-    // Investigations
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    for (let i = 1; i <= 5; i++) {
-      fs.writeFileSync(
-        path.join(invDir, `2026-03-${String(i).padStart(2, "0")}-12-00-00.md`),
-        `# Investigation: Long investigation title number ${i}\n`,
-      );
-    }
-
-    const result = buildKnowledgeOverview({ memoryDir, reposDir, docsDir });
+    const result = buildKnowledgeOverview({ reposDir, docsDir });
     expect(result.length).toBeLessThanOrEqual(1200 + 150);
-  });
-
-  // --- Investigation patterns ---
-
-  it("renders investigation patterns when provided", () => {
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-16-14-30-00.md"),
-      `# Investigation: Pod CrashLoopBackOff\n`,
-    );
-
-    const patterns = [
-      { category: "networking", count: 3 },
-      { category: "resource_exhaustion", count: 2 },
-    ];
-    const result = buildKnowledgeOverview({ memoryDir, investigationPatterns: patterns });
-    expect(result).toContain("Patterns: networking (3x), resource_exhaustion (2x)");
-  });
-
-  it("renders patterns even without investigation files", () => {
-    // No investigations/ dir, but patterns provided (from DB)
-    const patterns = [{ category: "mtu_mismatch", count: 5 }];
-    const result = buildKnowledgeOverview({ memoryDir, investigationPatterns: patterns });
-    expect(result).toContain("### Recent Investigations");
-    expect(result).toContain("Patterns: mtu_mismatch (5x)");
-  });
-
-  it("backward compatible when no patterns provided", () => {
-    const invDir = path.join(memoryDir, "investigations");
-    fs.mkdirSync(invDir);
-    fs.writeFileSync(
-      path.join(invDir, "2026-03-16-14-30-00.md"),
-      `# Investigation: Pod CrashLoopBackOff\n`,
-    );
-
-    const result = buildKnowledgeOverview({ memoryDir });
-    expect(result).toContain("### Recent Investigations");
-    expect(result).not.toContain("Patterns:");
   });
 });
