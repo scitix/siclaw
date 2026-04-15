@@ -354,7 +354,7 @@ export class TaskCoordinator {
     const db = getDb();
     await db.query(
       `INSERT IGNORE INTO chat_sessions (id, agent_id, user_id, title, preview, origin)
-       VALUES (?, ?, ?, ?, ?, 'cron')`,
+       VALUES (?, ?, ?, ?, ?, 'task')`,
       [sessionId, agentId, userId, title.slice(0, 255), promptText.slice(0, 500)],
     );
   }

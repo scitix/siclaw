@@ -263,5 +263,17 @@ export async function runMigrations(): Promise<void> {
   }
   // Evolve pre-existing chat_sessions rows to carry an origin column.
   await safeAlterTable(db, "chat_sessions", "origin", "VARCHAR(20) DEFAULT NULL");
+
+  // One-time backfill: the cron→task terminology rename updated the
+  // filter + prune queries to 'task' but left the INSERT in
+  // task-coordinator hard-coded to 'cron'. That meant newly-created cron
+  // sessions wrote 'cron' but the Chat filter now matched 'task', so the
+  // cron traces leaked back into the Chat session list and also escaped
+  // the retention sweep (which only deletes 'task'). Normalise once so
+  // historical rows stop surfacing and the daily prune catches them.
+  await db.query(
+    "UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'",
+  );
+
   console.log("[migrate] Siclaw tables ready");
 }
