@@ -1,15 +1,15 @@
 /**
  * Channel Manager — boots and manages active channel connections.
  *
- * Loads channels from Portal (global `channels` table) and starts
- * one handler per channel. Messages are routed to agents dynamically
- * via `channel_bindings` lookup (not hardcoded agent_id).
+ * Loads channels from Portal adapter and starts one handler per channel.
+ * Messages are routed to agents dynamically via channel_bindings lookup
+ * through the adapter API.
+ *
+ * Runtime no longer accesses the database directly.
  */
 
-import crypto from "node:crypto";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import type { RuntimeConfig } from "./config.js";
-import { getDb } from "./db.js";
 import { createLarkHandler } from "./channels/lark.js";
 
 export interface ChannelHandler {
@@ -17,67 +17,47 @@ export interface ChannelHandler {
   stop(): Promise<void>;
 }
 
-/** Resolve agent_id for a (channel_id, route_key) pair from channel_bindings. */
+/** POST helper for adapter calls. */
+async function adapterPost(config: RuntimeConfig, path: string, body: unknown): Promise<any> {
+  const resp = await fetch(`${config.serverUrl}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Auth-Token": config.portalSecret },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
+  }
+  return resp.json();
+}
+
+/** Resolve agent_id for a (channel_id, route_key) pair via adapter. */
 export async function resolveBinding(
   channelId: string,
   routeKey: string,
+  config: RuntimeConfig,
 ): Promise<{ agentId: string; bindingId: string } | null> {
-  const db = getDb();
-  const [rows] = await db.query(
-    "SELECT id, agent_id FROM channel_bindings WHERE channel_id = ? AND route_key = ?",
-    [channelId, routeKey],
-  ) as any;
-  if (rows.length === 0) return null;
-  return { agentId: rows[0].agent_id, bindingId: rows[0].id };
+  const data = await adapterPost(config, "/api/internal/siclaw/channel/resolve-binding", {
+    channel_id: channelId,
+    route_key: routeKey,
+  });
+  return data.binding ?? null;
 }
 
-/** Handle a PAIR code — validates and creates binding. */
+/** Handle a PAIR code — validates and creates binding via adapter. */
 export async function handlePairingCode(
   code: string,
   channelId: string,
   routeKey: string,
   routeType: "group" | "user",
+  config: RuntimeConfig,
 ): Promise<{ success: boolean; agentName?: string; error?: string }> {
-  const db = getDb();
-
-  // Look up the code
-  const [codeRows] = await db.query(
-    "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > NOW()",
-    [code, channelId],
-  ) as any;
-
-  if (codeRows.length === 0) {
-    return { success: false, error: "Invalid or expired pairing code" };
-  }
-
-  const pairingCode = codeRows[0];
-
-  // Create binding (upsert — if route_key already exists for this channel, update agent)
-  const bindingId = crypto.randomUUID();
-  try {
-    await db.query(
-      `INSERT INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE agent_id = VALUES(agent_id), route_type = VALUES(route_type), created_by = VALUES(created_by)`,
-      [bindingId, channelId, pairingCode.agent_id, routeKey, routeType, pairingCode.created_by],
-    );
-  } catch (err: any) {
-    return { success: false, error: `Failed to create binding: ${err.message}` };
-  }
-
-  // Delete used code
-  await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [code]);
-
-  // Try to get agent name for the reply
-  try {
-    const [agentRows] = await db.query(
-      "SELECT name FROM agents WHERE id = ?",
-      [pairingCode.agent_id],
-    ) as any;
-    return { success: true, agentName: agentRows[0]?.name ?? pairingCode.agent_id };
-  } catch {
-    return { success: true, agentName: pairingCode.agent_id };
-  }
+  const data = await adapterPost(config, "/api/internal/siclaw/channel/pair", {
+    code,
+    channel_id: channelId,
+    route_key: routeKey,
+    route_type: routeType,
+  });
+  return data;
 }
 
 export class ChannelManager {
@@ -138,6 +118,7 @@ export class ChannelManager {
           channel,
           this.agentBoxManager,
           this.agentBoxTlsOptions,
+          this.config,
         );
         break;
       default:

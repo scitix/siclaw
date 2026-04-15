@@ -10,6 +10,7 @@ import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
 import { resolveBinding, handlePairingCode } from "../channel-manager.js";
+import type { RuntimeConfig } from "../config.js";
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -26,6 +27,7 @@ export function createLarkHandler(
   channel: Record<string, any>,
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
+  runtimeConfig?: RuntimeConfig,
 ): ChannelHandler {
   const channelId: string = channel.id;
   const config: LarkChannelConfig =
@@ -61,7 +63,7 @@ export function createLarkHandler(
       dispatcher.register({
         "im.message.receive_v1": async (data: any) => {
           try {
-            await handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions);
+            await handleLarkMessage(data, larkClient, channelId, agentBoxManager, tlsOptions, runtimeConfig);
           } catch (err) {
             console.error(`[lark] Error handling message for channel=${channelId}:`, err);
           }
@@ -98,6 +100,7 @@ async function handleLarkMessage(
   channelId: string,
   agentBoxManager: AgentBoxManager,
   tlsOptions?: { cert: string; key: string; ca: string },
+  runtimeConfig?: RuntimeConfig,
 ): Promise<void> {
   const message = data?.event?.message;
   if (!message) return;
@@ -122,7 +125,7 @@ async function handleLarkMessage(
   const pairMatch = text.match(/^PAIR\s+([A-Z0-9]{6})$/i);
   if (pairMatch) {
     const code = pairMatch[1].toUpperCase();
-    const result = await handlePairingCode(code, channelId, chatId, "group");
+    const result = await handlePairingCode(code, channelId, chatId, "group", runtimeConfig!);
 
     const replyText = result.success
       ? `✅ Paired! This group is now connected to agent "${result.agentName}".`
@@ -133,7 +136,7 @@ async function handleLarkMessage(
   }
 
   // Look up binding for this chat
-  const binding = await resolveBinding(channelId, chatId);
+  const binding = await resolveBinding(channelId, chatId, runtimeConfig!);
   if (!binding) {
     console.log(`[lark] No binding for channel=${channelId} chat=${chatId} — ignoring`);
     // Don't spam the group with "not paired" for every message.

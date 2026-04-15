@@ -5,6 +5,7 @@
  * Auth: X-Auth-Token header (shared secret).
  */
 
+import crypto from "node:crypto";
 import http from "node:http";
 import { getDb } from "../gateway/db.js";
 import {
@@ -483,5 +484,766 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at",
     ) as any;
     sendJson(res, 200, { data: rows });
+  });
+
+  // ================================================================
+  // Chat persistence — called by Runtime's sse-consumer during execution
+  // ================================================================
+
+  // POST /api/internal/siclaw/chat/ensure-session
+  router.post("/api/internal/siclaw/chat/ensure-session", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      session_id: string; agent_id: string; user_id: string;
+      title?: string; preview?: string; origin?: string;
+    }>(req);
+    const db = getDb();
+    await db.query(
+      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, origin, last_active_at)
+       VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP(3))
+       ON DUPLICATE KEY UPDATE last_active_at = CURRENT_TIMESTAMP(3)`,
+      [body.session_id, body.agent_id, body.user_id,
+       body.title || "New Session", body.preview || null, body.origin || null],
+    );
+    sendJson(res, 200, { ok: true });
+  });
+
+  // POST /api/internal/siclaw/chat/append-message
+  router.post("/api/internal/siclaw/chat/append-message", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      session_id: string; role: string; content: string;
+      tool_name?: string; tool_input?: string; metadata?: any;
+      outcome?: string; duration_ms?: number;
+    }>(req);
+    const id = crypto.randomUUID();
+    const db = getDb();
+    await db.query(
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, body.session_id, body.role, body.content,
+       body.tool_name || null, body.tool_input || null,
+       body.metadata ? JSON.stringify(body.metadata) : null,
+       body.outcome || null, body.duration_ms ?? null],
+    );
+    // Bump session message_count
+    await db.query(
+      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+      [body.session_id],
+    );
+    sendJson(res, 200, { id });
+  });
+
+  // ================================================================
+  // Task run persistence — called by Runtime's task-coordinator
+  // ================================================================
+
+  // POST /api/internal/siclaw/task-run
+  router.post("/api/internal/siclaw/task-run", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      id: string; task_id: string; status: string;
+      result_text?: string; error?: string; duration_ms?: number; session_id?: string;
+    }>(req);
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_task_runs (id, task_id, status, result_text, error, duration_ms, session_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [body.id, body.task_id, body.status,
+       body.result_text || null, body.error || null,
+       body.duration_ms ?? null, body.session_id || null],
+    );
+    // Update task last_run_at + last_result
+    await db.query(
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      [body.status, body.task_id],
+    );
+    sendJson(res, 200, { ok: true });
+  });
+
+  // GET /api/internal/siclaw/tasks/active — list active tasks for scheduling
+  router.get("/api/internal/siclaw/tasks/active", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status, created_by, last_run_at, last_result
+       FROM agent_tasks WHERE status = 'active'`,
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // ================================================================
+  // MCP servers by IDs — called by Runtime's internal-api (AgentBox bundle)
+  // ================================================================
+
+  // POST /api/internal/siclaw/mcp-servers/by-ids
+  router.post("/api/internal/siclaw/mcp-servers/by-ids", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ ids: string[] }>(req);
+    if (!body.ids?.length) {
+      sendJson(res, 200, { mcpServers: {} });
+      return;
+    }
+    const db = getDb();
+    const placeholders = body.ids.map(() => "?").join(",");
+    const [rows] = await db.query(
+      `SELECT name, transport, url, command, args, env, headers, enabled
+       FROM mcp_servers WHERE id IN (${placeholders}) AND enabled = 1`,
+      body.ids,
+    ) as any;
+    const mcpServers: Record<string, unknown> = {};
+    for (const row of rows) {
+      mcpServers[row.name] = {
+        transport: row.transport,
+        ...(row.url ? { url: row.url } : {}),
+        ...(row.command ? { command: row.command } : {}),
+        ...(row.args ? { args: typeof row.args === "string" ? JSON.parse(row.args) : row.args } : {}),
+        ...(row.env ? { env: typeof row.env === "string" ? JSON.parse(row.env) : row.env } : {}),
+        ...(row.headers ? { headers: typeof row.headers === "string" ? JSON.parse(row.headers) : row.headers } : {}),
+      };
+    }
+    sendJson(res, 200, { mcpServers });
+  });
+
+  // ================================================================
+  // Skills bundle by IDs — called by Runtime's internal-api (AgentBox bundle)
+  // ================================================================
+
+  // POST /api/internal/siclaw/skills/bundle
+  router.post("/api/internal/siclaw/skills/bundle", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ skill_ids: string[]; is_production: boolean }>(req);
+    const skillIds = body.skill_ids ?? [];
+    const isProduction = body.is_production ?? true;
+    if (skillIds.length === 0) {
+      sendJson(res, 200, { version: new Date().toISOString(), skills: [] });
+      return;
+    }
+    const db = getDb();
+    let rows: any[];
+    if (isProduction) {
+      const placeholders = skillIds.map(() => "?").join(",");
+      const [result] = await db.query(
+        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts
+         FROM skills s
+         JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
+         WHERE s.id IN (${placeholders})
+           AND sv.version = (
+             SELECT MAX(sv2.version) FROM skill_versions sv2
+             WHERE sv2.skill_id = s.id AND sv2.is_approved = 1
+           )`,
+        skillIds,
+      ) as any;
+      rows = result;
+    } else {
+      const placeholders = skillIds.map(() => "?").join(",");
+      const [result] = await db.query(
+        `SELECT id, name, labels, specs, scripts FROM skills WHERE id IN (${placeholders})`,
+        skillIds,
+      ) as any;
+      rows = result;
+    }
+    const skills = rows.map((row: any) => ({
+      dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
+      scope: "global",
+      specs: row.specs || "",
+      scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
+    }));
+    sendJson(res, 200, { version: new Date().toISOString(), skills });
+  });
+
+  // ================================================================
+  // Agent task CRUD — called by Runtime's internal-api (AgentBox mTLS)
+  // ================================================================
+
+  // POST /api/internal/siclaw/agent-tasks/list
+  router.post("/api/internal/siclaw/agent-tasks/list", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ agent_id: string; user_id: string }>(req);
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, name, schedule, status, description, prompt, last_run_at, last_result
+       FROM agent_tasks WHERE agent_id = ? AND created_by = ? AND status = 'active'
+       ORDER BY created_at`,
+      [body.agent_id, body.user_id],
+    ) as any;
+    sendJson(res, 200, { tasks: rows });
+  });
+
+  // POST /api/internal/siclaw/agent-tasks/create
+  router.post("/api/internal/siclaw/agent-tasks/create", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      id: string; agent_id: string; user_id: string;
+      name: string; description?: string; schedule: string; prompt: string; status?: string;
+    }>(req);
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_tasks (id, agent_id, name, description, schedule, prompt, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [body.id, body.agent_id, body.name, body.description ?? null,
+       body.schedule, body.prompt, body.status ?? "active", body.user_id],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [body.id]) as any;
+    sendJson(res, 201, rows[0]);
+  });
+
+  // POST /api/internal/siclaw/agent-tasks/update
+  router.post("/api/internal/siclaw/agent-tasks/update", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      task_id: string; agent_id: string; user_id: string;
+      name?: string; description?: string; schedule?: string; prompt?: string; status?: string;
+    }>(req);
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [body.task_id, body.agent_id, body.user_id],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Task not found" });
+      return;
+    }
+    await db.query(
+      `UPDATE agent_tasks SET
+         name = COALESCE(?, name),
+         description = COALESCE(?, description),
+         schedule = COALESCE(?, schedule),
+         prompt = COALESCE(?, prompt),
+         status = COALESCE(?, status)
+       WHERE id = ?`,
+      [body.name ?? null, body.description ?? null, body.schedule ?? null,
+       body.prompt ?? null, body.status ?? null, body.task_id],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [body.task_id]) as any;
+    sendJson(res, 200, rows[0]);
+  });
+
+  // POST /api/internal/siclaw/agent-tasks/delete
+  router.post("/api/internal/siclaw/agent-tasks/delete", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ task_id: string; agent_id: string; user_id: string }>(req);
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [body.task_id, body.agent_id, body.user_id],
+    ) as any;
+    if (existing.length === 0) {
+      sendJson(res, 404, { error: "Task not found" });
+      return;
+    }
+    await db.query("DELETE FROM agent_tasks WHERE id = ?", [body.task_id]);
+    sendJson(res, 200, { ok: true });
+  });
+
+  // ================================================================
+  // Task coordinator operations — scheduling, run management, pruning
+  // ================================================================
+
+  // GET /api/internal/siclaw/tasks/:taskId/status
+  router.get("/api/internal/siclaw/tasks/:taskId/status", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT status FROM agent_tasks WHERE id = ? LIMIT 1",
+      [params.taskId],
+    ) as any;
+    if (rows.length === 0) {
+      sendJson(res, 200, { status: null });
+      return;
+    }
+    sendJson(res, 200, { status: rows[0].status });
+  });
+
+  // POST /api/internal/siclaw/task-run/start — reserve a running row
+  router.post("/api/internal/siclaw/task-run/start", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ id: string; task_id: string; session_id: string }>(req);
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_task_runs (id, task_id, status, session_id)
+       VALUES (?, ?, 'running', ?)`,
+      [body.id, body.task_id, body.session_id],
+    );
+    sendJson(res, 200, { id: body.id });
+  });
+
+  // POST /api/internal/siclaw/task-run/finalize — update run with result
+  router.post("/api/internal/siclaw/task-run/finalize", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      run_id: string; status: string; result_text: string;
+      error?: string; duration_ms: number;
+    }>(req);
+    const db = getDb();
+    await db.query(
+      `UPDATE agent_task_runs
+         SET status = ?, result_text = ?, error = ?, duration_ms = ?
+       WHERE id = ?`,
+      [body.status, body.result_text, body.error ?? null, body.duration_ms, body.run_id],
+    );
+    sendJson(res, 200, { ok: true });
+  });
+
+  // POST /api/internal/siclaw/task-metadata/update — update task last_run_at + last_result
+  router.post("/api/internal/siclaw/task-metadata/update", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ task_id: string; last_result: string }>(req);
+    const db = getDb();
+    await db.query(
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      [body.last_result, body.task_id],
+    );
+    sendJson(res, 200, { ok: true });
+  });
+
+  // POST /api/internal/siclaw/tasks/fire-now — validate + prepare for manual run
+  router.post("/api/internal/siclaw/tasks/fire-now", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ task_id: string; cooldown_sec: number }>(req);
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status, created_by,
+              last_run_at, last_result, last_manual_run_at
+       FROM agent_tasks WHERE id = ? LIMIT 1`,
+      [body.task_id],
+    ) as any;
+    if (rows.length === 0) {
+      sendJson(res, 200, { outcome: "not_found" });
+      return;
+    }
+    const row = rows[0];
+    // Check in-flight runs
+    const [inflight] = await db.query(
+      "SELECT id FROM agent_task_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+      [body.task_id],
+    ) as any;
+    if (inflight.length > 0) {
+      sendJson(res, 200, { outcome: "in_flight" });
+      return;
+    }
+    // Check cooldown
+    if (row.last_manual_run_at) {
+      const elapsed = (Date.now() - new Date(row.last_manual_run_at).getTime()) / 1000;
+      if (elapsed < body.cooldown_sec) {
+        sendJson(res, 200, { outcome: "cooldown", retry_after_sec: Math.ceil(body.cooldown_sec - elapsed) });
+        return;
+      }
+    }
+    // Stamp manual run time
+    await db.query(
+      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
+      [body.task_id],
+    );
+    sendJson(res, 200, { outcome: "ok", task: row });
+  });
+
+  // POST /api/internal/siclaw/tasks/prune — prune old runs + task sessions
+  router.post("/api/internal/siclaw/tasks/prune", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ retention_days: number }>(req);
+    const db = getDb();
+    const days = body.retention_days;
+    const [sessResult] = await db.query(
+      `DELETE FROM chat_sessions
+       WHERE origin = 'task' AND last_active_at < NOW() - INTERVAL ? DAY`,
+      [days],
+    ) as any;
+    const [runsResult] = await db.query(
+      `DELETE FROM agent_task_runs WHERE created_at < NOW() - INTERVAL ? DAY`,
+      [days],
+    ) as any;
+    sendJson(res, 200, {
+      sessions_deleted: sessResult?.affectedRows ?? 0,
+      runs_deleted: runsResult?.affectedRows ?? 0,
+    });
+  });
+
+  // ================================================================
+  // Agent model binding — resolve provider + models for an agent
+  // ================================================================
+
+  // GET /api/internal/siclaw/agent/:agentId/model-binding
+  router.get("/api/internal/siclaw/agent/:agentId/model-binding", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [agentRows] = await db.query(
+      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      [params.agentId],
+    ) as any;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string } | undefined;
+    if (!agent?.model_provider || !agent?.model_id) {
+      sendJson(res, 200, { binding: null });
+      return;
+    }
+    const [providerRows] = await db.query(
+      "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
+      [agent.model_provider],
+    ) as any;
+    if (providerRows.length === 0) {
+      sendJson(res, 200, { binding: null });
+      return;
+    }
+    const p = providerRows[0];
+    const [entryRows] = await db.query(
+      "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      [p.id],
+    ) as any;
+    const models = (entryRows as any[]).map((m: any) => ({
+      id: m.model_id,
+      name: m.name ?? m.model_id,
+      reasoning: !!m.reasoning,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: m.context_window,
+      maxTokens: m.max_tokens,
+    }));
+    sendJson(res, 200, {
+      binding: {
+        modelProvider: p.name,
+        modelId: agent.model_id,
+        modelConfig: {
+          name: p.name,
+          baseUrl: p.base_url,
+          apiKey: p.api_key ?? "",
+          api: p.api_type,
+          authHeader: true,
+          models,
+        },
+      },
+    });
+  });
+
+  // ================================================================
+  // Channel operations — binding resolution + pairing
+  // ================================================================
+
+  // POST /api/internal/siclaw/channel/resolve-binding
+  router.post("/api/internal/siclaw/channel/resolve-binding", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ channel_id: string; route_key: string }>(req);
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT id, agent_id FROM channel_bindings WHERE channel_id = ? AND route_key = ?",
+      [body.channel_id, body.route_key],
+    ) as any;
+    if (rows.length === 0) {
+      sendJson(res, 200, { binding: null });
+      return;
+    }
+    sendJson(res, 200, { binding: { agentId: rows[0].agent_id, bindingId: rows[0].id } });
+  });
+
+  // POST /api/internal/siclaw/channel/pair
+  router.post("/api/internal/siclaw/channel/pair", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{
+      code: string; channel_id: string; route_key: string;
+      route_type: "group" | "user";
+    }>(req);
+    const db = getDb();
+    const [codeRows] = await db.query(
+      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > NOW()",
+      [body.code, body.channel_id],
+    ) as any;
+    if (codeRows.length === 0) {
+      sendJson(res, 200, { success: false, error: "Invalid or expired pairing code" });
+      return;
+    }
+    const pairingCode = codeRows[0];
+    const bindingId = crypto.randomUUID();
+    try {
+      await db.query(
+        `INSERT INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE agent_id = VALUES(agent_id), route_type = VALUES(route_type), created_by = VALUES(created_by)`,
+        [bindingId, body.channel_id, pairingCode.agent_id, body.route_key, body.route_type, pairingCode.created_by],
+      );
+    } catch (err: any) {
+      sendJson(res, 200, { success: false, error: `Failed to create binding: ${err.message}` });
+      return;
+    }
+    await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [body.code]);
+    let agentName = pairingCode.agent_id;
+    try {
+      const [agentRows] = await db.query(
+        "SELECT name FROM agents WHERE id = ?",
+        [pairingCode.agent_id],
+      ) as any;
+      if (agentRows.length > 0) agentName = agentRows[0].name;
+    } catch { /* ignore */ }
+    sendJson(res, 200, { success: true, agentName });
+  });
+
+  // ================================================================
+  // System config — key-value store
+  // ================================================================
+
+  // GET /api/internal/siclaw/system-config
+  router.get("/api/internal/siclaw/system-config", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT config_key, config_value FROM system_config",
+    ) as any;
+    const config: Record<string, string> = {};
+    for (const row of rows) {
+      if (row.config_value != null) config[row.config_key] = row.config_value;
+    }
+    sendJson(res, 200, { config });
+  });
+
+  // POST /api/internal/siclaw/system-config
+  router.post("/api/internal/siclaw/system-config", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ key: string; value: string; updated_by: string }>(req);
+    const db = getDb();
+    await db.query(
+      `INSERT INTO system_config (config_key, config_value, updated_by)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+      [body.key, body.value, body.updated_by],
+    );
+    sendJson(res, 200, { ok: true });
+  });
+
+  // ================================================================
+  // Chat messages — read messages for session
+  // ================================================================
+
+  // POST /api/internal/siclaw/chat/messages
+  router.post("/api/internal/siclaw/chat/messages", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const body = await parseBody<{ session_id: string; before?: string; limit?: number }>(req);
+    const db = getDb();
+    const limit = body.limit ?? 50;
+    const params: unknown[] = [body.session_id];
+    let where = "session_id = ?";
+    if (body.before) {
+      where += " AND created_at < ?";
+      params.push(new Date(body.before));
+    }
+    params.push(limit);
+    const [rows] = await db.query(
+      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
+       FROM chat_messages WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
+      params,
+    ) as any;
+    sendJson(res, 200, { messages: rows });
+  });
+
+  // ================================================================
+  // Default model provider — for AI security reviewer
+  // ================================================================
+
+  // GET /api/internal/siclaw/model-provider/default
+  router.get("/api/internal/siclaw/model-provider/default", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [providers] = await db.query(
+      "SELECT id, base_url, api_key, api_type FROM model_providers ORDER BY sort_order ASC LIMIT 1",
+    ) as any;
+    if (providers.length === 0) {
+      sendJson(res, 200, { provider: null });
+      return;
+    }
+    const provider = providers[0];
+    const [models] = await db.query(
+      "SELECT model_id FROM model_entries WHERE provider_id = ? ORDER BY is_default DESC, sort_order ASC LIMIT 1",
+      [provider.id],
+    ) as any;
+    if (models.length === 0) {
+      sendJson(res, 200, { provider: null });
+      return;
+    }
+    sendJson(res, 200, { provider, model: models[0] });
+  });
+
+  // ================================================================
+  // Metrics — summary + audit (moved from Runtime)
+  // ================================================================
+
+  // GET /api/internal/siclaw/metrics/summary
+  router.get("/api/internal/siclaw/metrics/summary", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const qIdx = (req.url ?? "").indexOf("?");
+    const qs = qIdx >= 0 ? new URLSearchParams((req.url ?? "").slice(qIdx + 1)) : new URLSearchParams();
+    const period = qs.get("period") || "7d";
+    const periods: Record<string, number> = { today: 86_400_000, "7d": 7 * 86_400_000, "30d": 30 * 86_400_000 };
+    const rangeMs = periods[period];
+    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
+    const cutoff = new Date(Date.now() - rangeMs);
+    const userFilter = qs.get("userId") || null;
+
+    const db = getDb();
+    const sessionParams: unknown[] = [cutoff];
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
+    const [sRows] = await db.query(totalSessionsSql, sessionParams) as any;
+    const totalSessions = Number(sRows[0]?.c ?? 0);
+
+    const pParams: unknown[] = [cutoff];
+    let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'user' AND m.created_at >= ?`;
+    if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
+    const [pRows] = await db.query(totalPromptsSql, pParams) as any;
+    const totalPrompts = Number(pRows[0]?.c ?? 0);
+
+    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
+    if (!userFilter) {
+      const [uRows] = await db.query(
+        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
+         FROM chat_sessions s WHERE s.created_at >= ?
+         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
+        [cutoff],
+      ) as any;
+      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
+    }
+    sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+  });
+
+  // GET /api/internal/siclaw/metrics/audit
+  router.get("/api/internal/siclaw/metrics/audit", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const qIdx = (req.url ?? "").indexOf("?");
+    const qs = qIdx >= 0 ? new URLSearchParams((req.url ?? "").slice(qIdx + 1)) : new URLSearchParams();
+    const limit = Math.min(200, Math.max(1, parseInt(qs.get("limit") || "50", 10)));
+    const startDate = qs.get("startDate") ? new Date(qs.get("startDate")!) : new Date(Date.now() - 86_400_000);
+    const endDate = qs.get("endDate") ? new Date(qs.get("endDate")!) : new Date();
+
+    const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
+    const params: unknown[] = [startDate, endDate];
+    if (qs.get("userId")) { conds.push("s.user_id = ?"); params.push(qs.get("userId")); }
+    if (qs.get("toolName")) { conds.push("m.tool_name = ?"); params.push(qs.get("toolName")); }
+    if (qs.get("outcome")) { conds.push("m.outcome = ?"); params.push(qs.get("outcome")); }
+    if (qs.get("cursorTs") && qs.get("cursorId")) {
+      const cursorDate = new Date(parseInt(qs.get("cursorTs")!, 10));
+      conds.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
+      params.push(cursorDate, cursorDate, qs.get("cursorId"));
+    }
+    params.push(limit + 1);
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
+              LEFT(m.tool_input, 500) AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE ${conds.join(" AND ")}
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT ?`,
+      params,
+    ) as any;
+    const hasMore = rows.length > limit;
+    const logs = rows.slice(0, limit).map((r: any) => ({
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
+      durationMs: r.durationMs, timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    }));
+    sendJson(res, 200, { logs, hasMore });
+  });
+
+  // GET /api/internal/siclaw/metrics/audit/:id
+  router.get("/api/internal/siclaw/metrics/audit/:id", async (req, res, params) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName, m.tool_input AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.content, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE m.id = ? AND m.role = 'tool'`,
+      [params.id],
+    ) as any;
+    if (!rows.length) { sendJson(res, 404, { error: "Not found" }); return; }
+    const r = rows[0];
+    sendJson(res, 200, {
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, content: r.content,
+      outcome: r.outcome, durationMs: r.durationMs,
+      timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    });
   });
 }

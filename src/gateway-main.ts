@@ -8,9 +8,6 @@
 import { loadRuntimeConfig } from "./gateway/config.js";
 import { startRuntime } from "./gateway/server.js";
 import { AgentBoxManager, K8sSpawner, ProcessSpawner, LocalSpawner } from "./gateway/agentbox/index.js";
-import { initDb, closeDb } from "./gateway/db.js";
-import { runMigrations } from "./gateway/migrate.js";
-import { syncBuiltinSkills } from "./gateway/skills/builtin-sync.js";
 import { ChannelManager } from "./gateway/channel-manager.js";
 import { TaskCoordinator } from "./gateway/task-coordinator.js";
 import { createCredentialService } from "./gateway/credential-service.js";
@@ -29,14 +26,8 @@ if (!config.runtimeSecret) {
   console.warn("[runtime] WARNING: SICLAW_RUNTIME_SECRET not set — WS connections will be rejected");
 }
 
-// Initialize MySQL connection pool
-if (config.databaseUrl) {
-  initDb(config.databaseUrl);
-  await runMigrations();
-  // TODO: use config.orgId if available; defaulting to "default" for now
-  await syncBuiltinSkills("default");
-  console.log("[runtime] Database ready");
-}
+// Runtime no longer accesses the database directly — all persistence
+// goes through Portal's adapter API.
 
 // Credential service — used by mTLS credential-proxy on port 3002.
 const credentialService = createCredentialService(config);
@@ -100,6 +91,7 @@ const portalSecret = config.portalSecret;
 
 const retentionDays = Math.max(0, parseInt(process.env.SICLAW_RUN_RETENTION_DAYS ?? "90", 10) || 0);
 const taskCoordinator = new TaskCoordinator({
+  config,
   agentBoxManager,
   agentBoxTlsOptions: runtime.agentBoxTlsOptions,
   retentionDays,
@@ -133,14 +125,11 @@ const taskCoordinator = new TaskCoordinator({
       }
     : undefined,
 });
-if (config.databaseUrl) {
+if (config.serverUrl) {
   await taskCoordinator.start();
 }
 
-// Late-attach the Run-now handler to the REST routes registered inside
-// startRuntime. Route handlers read `ctx.fireTaskNow` at request time, so
-// assigning it after registerSiclawRoutes has already been called is safe.
-runtime.siclawCtx.fireTaskNow = (taskId) => taskCoordinator.fireNow(taskId);
+// fireTaskNow moved to Portal — Runtime task API no longer registered here.
 
 // Graceful shutdown
 async function shutdown() {
@@ -148,7 +137,6 @@ async function shutdown() {
   taskCoordinator.stop();
   await channelManager.stopAll();
   await runtime.close();
-  await closeDb();
   process.exit(0);
 }
 
