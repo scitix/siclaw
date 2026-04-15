@@ -246,7 +246,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // Redact secrets from returned text. Tool results and assistant messages
   // are already redacted before being written to chat_messages above, but the
   // return values (resultText / taskReportText / errorMessage) are consumed by
-  // cron-coordinator / chat-gateway for cron_job_runs.result_text and
+  // task-coordinator / chat-gateway for agent_task_runs.result_text and
   // user-facing notifications, both of which bypass the per-message redaction.
   // Match the per-message redaction to keep the run summary and trace view
   // consistent.

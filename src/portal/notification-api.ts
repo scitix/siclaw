@@ -95,6 +95,12 @@ function rowToNotification(row: any): Notification {
  * Attach a /ws/notifications upgrade handler to the given HTTP server.
  * Auth: `?token=<jwt>` query param (EventSource-style; simpler than a custom
  * header, browsers restrict headers on `new WebSocket()`).
+ *
+ * TODO(prod): the JWT-in-URL approach leaks the raw token into nginx and
+ * k8s access logs. Replace with a short-lived ticket exchange before going
+ * to production (mirror the matching TODO in
+ * portal-web/src/components/NotificationBell.tsx so the two sides change
+ * together).
  */
 export function registerNotificationWs(
   httpServer: http.Server,

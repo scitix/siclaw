@@ -56,7 +56,7 @@ import { registerSiclawRoutes, type SiclawApiContext } from "./siclaw-api.js";
 import { getDb } from "./db.js";
 import { appendMessage, incrementMessageCount } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
-import { buildRedactionConfig } from "./output-redactor.js";
+import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -151,10 +151,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     // Minimal redaction: scrub the apiKey + baseUrl from any captured tool
     // output. Credential-manifest redaction is follow-up work.
-    const redactionConfig = buildRedactionConfig(undefined, undefined, [
-      modelConfig?.apiKey ?? "",
-      modelConfig?.baseUrl ?? "",
-    ].filter(Boolean));
+    const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
 
     // Stream + persist events back to the WS client.
     if (context.ws) {

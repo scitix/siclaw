@@ -86,6 +86,21 @@ export function buildRedactionConfig(
 }
 
 /**
+ * Shared helper: build a redaction config from a model-config-shaped object.
+ * Both the web-chat RPC path (server.ts chat.send) and the cron execution
+ * path (task-coordinator executeJob) redact the provider's apiKey + baseUrl
+ * from outbound text — centralising the field list here so adding a new
+ * provider-side secret (e.g. org id) only needs a change in one place.
+ */
+export function buildRedactionConfigForModelConfig(
+  modelConfig?: { apiKey?: string; baseUrl?: string },
+): RedactionConfig {
+  const extras = [modelConfig?.apiKey, modelConfig?.baseUrl]
+    .filter((v): v is string => typeof v === "string" && v.length > 0);
+  return buildRedactionConfig(undefined, undefined, extras);
+}
+
+/**
  * Built-in patterns for common secret/token formats.
  * Each regex uses a non-capturing group and global flag.
  * Patterns are designed to minimize false positives by requiring known prefixes
