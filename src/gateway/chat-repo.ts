@@ -2,12 +2,12 @@
  * Minimal chat repository for agent trace persistence.
  *
  * Used by sse-consumer to record agent events (user message, assistant message,
- * tool calls, outcomes) into chat_messages during cron / web chat execution,
- * and by cron.runMessages endpoint to read them back.
+ * tool calls, outcomes) into chat_messages during scheduled-task / web chat
+ * execution, and by the task-run messages endpoint to read them back.
  *
  * Scope is intentionally narrow — session management (create / delete / list)
  * lives elsewhere (see portal/chat-gateway.ts for web chat session creation,
- * cron-coordinator.ts for cron session creation).
+ * task-coordinator.ts ensureChatSession for scheduled-task session creation).
  */
 
 import crypto from "node:crypto";

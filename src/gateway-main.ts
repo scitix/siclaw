@@ -100,7 +100,7 @@ const taskCoordinator = new TaskCoordinator({
   agentBoxTlsOptions: runtime.agentBoxTlsOptions,
   retentionDays,
   // Best-effort fire-and-forget: if Portal is down or rejects, this fire's
-  // notification is lost. Acceptable for a low-frequency cron alert channel
+  // notification is lost. Acceptable for a low-frequency task-alert channel
   // — the run record is already durable in agent_task_runs so users can
   // still find the result through the UI. If notifications ever become
   // load-bearing (SLA / paging) switch this to a retry queue.
