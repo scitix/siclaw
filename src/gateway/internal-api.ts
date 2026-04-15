@@ -45,7 +45,7 @@ async function fetchAgentResources(
   agentId: string,
 ): Promise<{ skillIds: string[]; mcpServerIds: string[]; isProduction: boolean }> {
   try {
-    const url = `${config.serverUrl}/api/internal/siclaw/adapter/agent/${agentId}/resources`;
+    const url = `${config.serverUrl}/api/internal/siclaw/agent/${agentId}/resources`;
     const resp = await fetch(url, {
       headers: {
         "X-Auth-Token": config.portalSecret,
@@ -81,7 +81,7 @@ export async function handleSettings(
   config: RuntimeConfig,
 ): Promise<void> {
   try {
-    const url = `${config.serverUrl}/api/internal/siclaw/adapter/agent/${identity.agentId}/settings`;
+    const url = `${config.serverUrl}/api/internal/siclaw/agent/${identity.agentId}/settings`;
     const resp = await fetch(url, {
       headers: { "X-Auth-Token": config.portalSecret, "X-Cert-Org-Id": identity.orgId },
     });

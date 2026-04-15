@@ -40,7 +40,7 @@ async function checkAccess(
   orgId: string,
   action: "read" | "write" | "review",
 ): Promise<AccessResult> {
-  const url = `${config.serverUrl}/api/internal/siclaw/adapter/check-access`;
+  const url = `${config.serverUrl}/api/internal/siclaw/check-access`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {

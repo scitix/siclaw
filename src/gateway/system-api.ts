@@ -26,7 +26,7 @@ function validateHttpUrl(value: string): { ok: true } | { ok: false; error: stri
 export function registerSystemRoutes(router: RestRouter, config: RuntimeConfig): void {
   const repo = new SystemConfigRepo();
 
-  router.get("/api/v1/system/config", async (req, res) => {
+  router.get("/api/v1/siclaw/system/config", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
@@ -34,7 +34,7 @@ export function registerSystemRoutes(router: RestRouter, config: RuntimeConfig):
     sendJson(res, 200, { config: all });
   });
 
-  router.put("/api/v1/system/config", async (req, res) => {
+  router.put("/api/v1/siclaw/system/config", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 

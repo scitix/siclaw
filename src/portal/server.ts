@@ -90,7 +90,7 @@ export function startPortal(config: PortalConfig): http.Server {
 
     // Proxy admin Metrics + System config APIs to Runtime (admin-only enforced
     // both here and on Runtime side via requireAdmin)
-    if (url.startsWith("/api/v1/metrics/") || url.startsWith("/api/v1/system/")) {
+    if (url.startsWith("/api/v1/siclaw/metrics/") || url.startsWith("/api/v1/siclaw/system/")) {
       const auth = requireAdmin(req, res, config.jwtSecret);
       if (!auth) return;
       runtimeProxy(req, res);

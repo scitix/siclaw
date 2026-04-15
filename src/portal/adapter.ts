@@ -19,8 +19,8 @@ function requireInternalAuth(req: http.IncomingMessage, internalSecret: string):
 }
 
 export function registerAdapterRoutes(router: RestRouter, internalSecret: string): void {
-  // GET /api/internal/siclaw/adapter/agent/:agentId — agent basic info
-  router.get("/api/internal/siclaw/adapter/agent/:agentId", async (req, res, params) => {
+  // GET /api/internal/siclaw/agent/:agentId — agent basic info
+  router.get("/api/internal/siclaw/agent/:agentId", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -48,8 +48,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 
-  // GET /api/internal/siclaw/adapter/agent/:agentId/resources — bound resources
-  router.get("/api/internal/siclaw/adapter/agent/:agentId/resources", async (req, res, params) => {
+  // GET /api/internal/siclaw/agent/:agentId/resources — bound resources
+  router.get("/api/internal/siclaw/agent/:agentId/resources", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -94,8 +94,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 
-  // POST /api/internal/siclaw/adapter/check-access
-  router.post("/api/internal/siclaw/adapter/check-access", async (req, res) => {
+  // POST /api/internal/siclaw/check-access
+  router.post("/api/internal/siclaw/check-access", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -124,8 +124,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, { allowed: true, grant_all: true, agent_group_ids: [] });
   });
 
-  // POST /api/internal/siclaw/adapter/credential-request
-  router.post("/api/internal/siclaw/adapter/credential-request", async (req, res) => {
+  // POST /api/internal/siclaw/credential-request
+  router.post("/api/internal/siclaw/credential-request", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -228,8 +228,53 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 400, { error: `Unknown source type: ${body.source}` });
   });
 
-  // POST /api/internal/siclaw/adapter/resource-manifest
-  router.post("/api/internal/siclaw/adapter/resource-manifest", async (req, res) => {
+  // POST /api/internal/siclaw/credential-list
+  router.post("/api/internal/siclaw/credential-list", async (req, res) => {
+    if (!requireInternalAuth(req, internalSecret)) {
+      sendJson(res, 401, { error: "Invalid internal token" });
+      return;
+    }
+
+    const body = await parseBody<{ kind?: string }>(req);
+    const agentId = req.headers["x-cert-agent-id"] as string | undefined;
+    if (!agentId) { sendJson(res, 400, { error: "X-Cert-Agent-Id header required" }); return; }
+
+    const db = getDb();
+
+    if (body.kind === "host" || body.kind === "hosts") {
+      const [rows] = await db.query(
+        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description
+         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+        [agentId],
+      ) as any;
+      sendJson(res, 200, {
+        hosts: rows.map((r: any) => ({
+          name: r.name, ip: r.ip, port: r.port, username: r.username,
+          auth_type: r.auth_type, is_production: !!r.is_production,
+          ...(r.description ? { description: r.description } : {}),
+        })),
+      });
+      return;
+    }
+
+    // Default: clusters
+    const [rows] = await db.query(
+      `SELECT c.name, c.api_server, c.is_production, c.kubeconfig, c.description, c.debug_image
+       FROM agent_clusters ac JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+      [agentId],
+    ) as any;
+    sendJson(res, 200, {
+      clusters: rows.map((r: any) => ({
+        name: r.name, is_production: !!r.is_production,
+        ...(r.api_server ? { api_server: r.api_server } : {}),
+        ...(r.description ? { description: r.description } : {}),
+        ...(r.debug_image ? { debug_image: r.debug_image } : {}),
+      })),
+    });
+  });
+
+  // POST /api/internal/siclaw/resource-manifest
+  router.post("/api/internal/siclaw/resource-manifest", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -262,8 +307,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 
-  // POST /api/internal/siclaw/adapter/host-search
-  router.post("/api/internal/siclaw/adapter/host-search", async (req, res) => {
+  // POST /api/internal/siclaw/host-search
+  router.post("/api/internal/siclaw/host-search", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -299,8 +344,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, { hosts: rows });
   });
 
-  // GET /api/internal/siclaw/adapter/agent/:agentId/settings — provider + models for agentbox
-  router.get("/api/internal/siclaw/adapter/agent/:agentId/settings", async (req, res, params) => {
+  // GET /api/internal/siclaw/agent/:agentId/settings — provider + models for agentbox
+  router.get("/api/internal/siclaw/agent/:agentId/settings", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -355,9 +400,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 
-  // GET /api/internal/siclaw/adapter/skill/:skillId/agents — agents bound to a skill
+  // GET /api/internal/siclaw/skill/:skillId/agents — agents bound to a skill
   //   ?dev_only=1  → only return agents with is_production=0
-  router.get("/api/internal/siclaw/adapter/skill/:skillId/agents", async (req, res, params) => {
+  router.get("/api/internal/siclaw/skill/:skillId/agents", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -381,8 +426,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 
-  // GET /api/internal/siclaw/adapter/mcp/:mcpId/agents — agents bound to an MCP server
-  router.get("/api/internal/siclaw/adapter/mcp/:mcpId/agents", async (req, res, params) => {
+  // GET /api/internal/siclaw/mcp/:mcpId/agents — agents bound to an MCP server
+  router.get("/api/internal/siclaw/mcp/:mcpId/agents", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -396,8 +441,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
   });
 
-  // GET /api/internal/siclaw/adapter/cluster/:clusterId/agents — agents bound to a cluster
-  router.get("/api/internal/siclaw/adapter/cluster/:clusterId/agents", async (req, res, params) => {
+  // GET /api/internal/siclaw/cluster/:clusterId/agents — agents bound to a cluster
+  router.get("/api/internal/siclaw/cluster/:clusterId/agents", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -411,8 +456,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
   });
 
-  // GET /api/internal/siclaw/adapter/host/:hostId/agents — agents bound to a host
-  router.get("/api/internal/siclaw/adapter/host/:hostId/agents", async (req, res, params) => {
+  // GET /api/internal/siclaw/host/:hostId/agents — agents bound to a host
+  router.get("/api/internal/siclaw/host/:hostId/agents", async (req, res, params) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;
@@ -426,8 +471,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     sendJson(res, 200, { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) });
   });
 
-  // GET /api/internal/siclaw/adapter/channels — list active channels for Runtime to boot
-  router.get("/api/internal/siclaw/adapter/channels", async (req, res) => {
+  // GET /api/internal/siclaw/channels — list active channels for Runtime to boot
+  router.get("/api/internal/siclaw/channels", async (req, res) => {
     if (!requireInternalAuth(req, internalSecret)) {
       sendJson(res, 401, { error: "Invalid internal token" });
       return;

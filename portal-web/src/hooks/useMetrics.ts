@@ -68,7 +68,7 @@ export function useLive(userId: string | null): { data: LiveData | null; loading
   const fetchOnce = useCallback(() => {
     const uid = userIdRef.current
     const q = uid ? `?userId=${encodeURIComponent(uid)}` : ""
-    return api<LiveData>(`/metrics/live${q}`)
+    return api<LiveData>(`/siclaw/metrics/live${q}`)
       .then((d) => { setData(d); setError(null); setLoading(false) })
       .catch((e: Error) => { setError(e); setLoading(false) })
   }, [])
@@ -93,7 +93,7 @@ export function useSummary(period: string, userId: string | null): { data: Summa
     const { period: p, userId: uid } = paramsRef.current
     const q = new URLSearchParams({ period: p })
     if (uid) q.set("userId", uid)
-    return api<SummaryData>(`/metrics/summary?${q.toString()}`)
+    return api<SummaryData>(`/siclaw/metrics/summary?${q.toString()}`)
       .then((d) => { setData(d); setLoading(false) })
       .catch(() => setLoading(false))
   }, [])
@@ -146,7 +146,7 @@ export function useAudit(params: AuditParams): {
       q.set("cursorId", last.id)
     }
 
-    api<AuditResponse>(`/metrics/audit?${q.toString()}`)
+    api<AuditResponse>(`/siclaw/metrics/audit?${q.toString()}`)
       .then((r) => {
         if (append) setLogs((prev) => [...prev, ...r.logs])
         else setLogs(r.logs)
@@ -174,7 +174,7 @@ export function useAuditDetail(id: string | null): { detail: AuditDetail | null;
     if (!id) { setDetail(null); return }
     let cancelled = false
     setLoading(true)
-    api<AuditDetail>(`/metrics/audit/${id}`)
+    api<AuditDetail>(`/siclaw/metrics/audit/${id}`)
       .then((d) => { if (!cancelled) { setDetail(d); setLoading(false) } })
       .catch(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
@@ -193,7 +193,7 @@ export function useSystemConfig(): { config: Record<string, string>; loading: bo
 
   const reload = useCallback(() => {
     setLoading(true)
-    api<SystemConfig>("/system/config")
+    api<SystemConfig>("/siclaw/system/config")
       .then((r) => { setConfig(r.config); setLoading(false) })
       .catch(() => setLoading(false))
   }, [])
@@ -201,7 +201,7 @@ export function useSystemConfig(): { config: Record<string, string>; loading: bo
   useEffect(() => { reload() }, [reload])
 
   const save = useCallback(async (key: string, value: string) => {
-    await api("/system/config", { method: "PUT", body: { values: { [key]: value } } })
+    await api("/siclaw/system/config", { method: "PUT", body: { values: { [key]: value } } })
     setConfig((c) => ({ ...c, [key]: value }))
   }, [])
 
