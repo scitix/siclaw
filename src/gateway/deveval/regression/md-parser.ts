@@ -44,6 +44,13 @@ export interface PrivateCase {
   expectedAnswer: string;
   passThreshold: { commands: number; conclusion: number };
   stubReason?: string;
+  /**
+   * Optional case-author scoring rubric (free natural language). Forwarded
+   * verbatim to the evaluator LLM, where it overrides the built-in default
+   * scoring criteria. Lives in PrivateCase because, like expectedAnswer, it
+   * must NOT be visible to the agent during diagnosis.
+   */
+  customRubric?: string;
 }
 
 export interface ParsedCase {
@@ -148,6 +155,7 @@ function parseCase(block: string): ParsedCase {
   const solutionCommands = extractBashCommands(solutionText);
 
   const expectedAnswer = requireSection(sections, "期望结论", caseId).trim();
+  const customRubric = sections.get("评分规则")?.trim() || undefined;
 
   const pub: PublicCase = {
     id: String(meta.id ?? caseId),
@@ -164,6 +172,7 @@ function parseCase(block: string): ParsedCase {
     id: pub.id,
     solutionCommands,
     expectedAnswer,
+    customRubric,
     passThreshold,
     stubReason,
   };

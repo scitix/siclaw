@@ -56,6 +56,8 @@ export interface CaseResult {
   agentCommands?: string[];
   expectedAnswer?: string;
   solutionCommands?: string[];
+  /** True if case-author supplied a custom scoring rubric (overrode default) */
+  usedCustomRubric?: boolean;
   injectOutput?: string;
   /** Literal YAML manifest applied to the cluster (after placeholder substitution) */
   injectYamlApplied?: string;
@@ -104,6 +106,7 @@ export async function runCase(c: ParsedCase, opts: RunOptions): Promise<CaseResu
     passThreshold: threshold,
     expectedAnswer: c.private.expectedAnswer,
     solutionCommands: c.private.solutionCommands,
+    usedCustomRubric: !!c.private.customRubric,
   };
 
   // Non-reproducible cases ALWAYS go through knowledge-QA. If the case author
@@ -250,6 +253,7 @@ export async function runCase(c: ParsedCase, opts: RunOptions): Promise<CaseResu
       diagnosticSteps: c.private.solutionCommands.map(s => subst(s, vars)),
       agentResponse,
       agentCommands,
+      customRubric: c.private.customRubric,
       modelProvider: opts.modelProvider,
       modelId: opts.modelId,
       onEvent(evt, eventType) {
@@ -370,7 +374,7 @@ async function runKnowledgeQaCase(
   c: ParsedCase,
   opts: RunOptions,
   start: number,
-  base: Pick<CaseResult, "id" | "title" | "reproducible" | "passThreshold" | "expectedAnswer" | "solutionCommands">,
+  base: Pick<CaseResult, "id" | "title" | "reproducible" | "passThreshold" | "expectedAnswer" | "solutionCommands" | "usedCustomRubric">,
 ): Promise<CaseResult> {
   const idx = Math.min(opts.workOrderIndex ?? 0, c.public.workOrders.length - 1);
   const wo = c.public.workOrders[idx];
@@ -459,6 +463,7 @@ async function runKnowledgeQaCase(
       // "commands the agent proposed" not just "commands actually executed".
       agentResponse,
       agentCommands,
+      customRubric: c.private.customRubric,
       modelProvider: opts.modelProvider,
       modelId: opts.modelId,
       onEvent(evt, eventType) {

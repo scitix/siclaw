@@ -14,6 +14,13 @@ interface ScoreInput {
   agentCommands: string[];
   modelProvider?: string;
   modelId?: string;
+  /**
+   * Case-author-provided natural-language scoring rubric. When present, the
+   * scoring LLM is instructed to PRIORITIZE this rubric over the built-in
+   * default criteria. Output JSON shape (scoreCommands/scoreConclusion 1-5)
+   * stays the same so the PASS/FAIL gate logic doesn't change.
+   */
+  customRubric?: string;
   /** Optional callback to forward SSE events (for streaming to frontend) */
   onEvent?: OnEventCallback;
 }
@@ -59,23 +66,43 @@ Given the expected diagnosis and the agent's actual output, score the agent's pe
    - 2: Vaguely related conclusion, significant gaps
    - 1: Wrong conclusion or no conclusion
 
+{customRubricBlock}
+
 Think step by step before giving scores. Then output VALID JSON:
 {
   "scoreCommands": <1-5>,
   "scoreConclusion": <1-5>,
-  "scoreReasoning": "<brief explanation of scores>"
+  "scoreReasoning": "<brief explanation of scores; if a case-specific rubric override was provided above, explicitly cite which rubric clauses you applied and how>"
 }`;
+
+const CUSTOM_RUBRIC_TEMPLATE = `
+
+## ⚠️ CASE-SPECIFIC SCORING OVERRIDE (provided by case author)
+
+The following case-specific instructions OVERRIDE the default Scoring Criteria
+above when they conflict. Apply them strictly. Where the case-specific rubric
+does not address something, fall back to the default criteria.
+
+\`\`\`
+{customRubric}
+\`\`\`
+
+When in doubt, the case-specific override wins.`;
 
 export async function scoreCase(
   client: AgentBoxClient,
   input: ScoreInput,
 ): Promise<ScoreResult> {
+  const customBlock = input.customRubric && input.customRubric.trim()
+    ? CUSTOM_RUBRIC_TEMPLATE.replace("{customRubric}", input.customRubric.trim())
+    : "";
   const prompt = SCORING_PROMPT
     .replace("{faultType}", input.faultType)
     .replace("{expectedSteps}", input.diagnosticSteps.join("\n") || "(none specified)")
     .replace("{expectedAnswer}", input.expectedAnswer || "(none specified)")
     .replace("{agentCommands}", input.agentCommands.join("\n") || "(no commands proposed)")
-    .replace("{agentResponse}", input.agentResponse || "(no response)");
+    .replace("{agentResponse}", input.agentResponse || "(no response)")
+    .replace("{customRubricBlock}", customBlock);
 
   // Cryptographic random suffix — Date.now() collides under parallel scoring
   // (multiple workers can hit the same millisecond), which would cause the

@@ -47,17 +47,18 @@ export function renderReport(results: CaseResult[], meta: ReportMeta): string {
 
   lines.push(`## 汇总`);
   lines.push("");
-  lines.push(`| Case | 类型 | 命令分 | 结论分 | 阈值 | 耗时 | 结果 |`);
-  lines.push(`|---|---|---|---|---|---|---|`);
+  lines.push(`| Case | 类型 | 评分规则 | 命令分 | 结论分 | 阈值 | 耗时 | 结果 |`);
+  lines.push(`|---|---|---|---|---|---|---|---|`);
   for (const r of results) {
     const type = r.reproducible
       ? "reproducible"
       : r.outcome === "MISSING_CONTEXT" ? "no-context" : "knowledge-qa";
+    const rubric = r.usedCustomRubric ? "🛠 custom" : "default";
     const cs = r.scoreCommands != null ? String(r.scoreCommands) : "-";
     const cc = r.scoreConclusion != null ? String(r.scoreConclusion) : "-";
     const th = `${r.passThreshold.commands}/${r.passThreshold.conclusion}`;
     lines.push(
-      `| \`${r.id}\` | ${type} | ${cs} | ${cc} | ${th} | ${formatDuration(r.durationMs)} | ${outcomeIcon(r.outcome)} ${r.outcome} |`,
+      `| \`${r.id}\` | ${type} | ${rubric} | ${cs} | ${cc} | ${th} | ${formatDuration(r.durationMs)} | ${outcomeIcon(r.outcome)} ${r.outcome} |`,
     );
   }
   lines.push("");
