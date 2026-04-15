@@ -370,11 +370,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   const siclawCtx: SiclawApiContext = {
     notifySkillAgents: (skillId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/adapter/skill/${skillId}/agents`, resources),
+      notifyViaAdapter(`/api/internal/siclaw/skill/${skillId}/agents`, resources),
     notifySkillDevAgents: (skillId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/adapter/skill/${skillId}/agents?dev_only=1`, resources),
+      notifyViaAdapter(`/api/internal/siclaw/skill/${skillId}/agents?dev_only=1`, resources),
     notifyMcpAgents: (mcpId, resources) =>
-      notifyViaAdapter(`/api/internal/siclaw/adapter/mcp/${mcpId}/agents`, resources),
+      notifyViaAdapter(`/api/internal/siclaw/mcp/${mcpId}/agents`, resources),
   };
 
   registerSiclawRoutes(restRouter, config, siclawCtx);

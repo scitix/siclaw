@@ -12,8 +12,8 @@
 
 import http from "node:http";
 import type { CertificateIdentity } from "./security/cert-manager.js";
-import type { CredentialService, Identity } from "./credential-service.js";
-import { CredentialNotFoundError } from "./credential-service.js";
+import type { Identity } from "../shared/credential-types.js";
+import { CredentialService, CredentialNotFoundError } from "./credential-service.js";
 
 interface CredentialRequestBody {
   source?: string;

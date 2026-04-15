@@ -99,7 +99,7 @@ export class ChannelManager {
     }
 
     try {
-      const url = `${this.config.serverUrl}/api/internal/siclaw/adapter/channels`;
+      const url = `${this.config.serverUrl}/api/internal/siclaw/channels`;
       const resp = await fetch(url, {
         headers: { "X-Auth-Token": this.config.portalSecret },
       });

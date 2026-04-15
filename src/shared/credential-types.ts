@@ -56,25 +56,13 @@ export interface CredentialPayload {
 }
 
 /**
- * Gateway-side credential resolution contract. Implemented by gateway modules
- * (LocalDbCredentialService, ExternalCredentialService) and consumed both by
- * HTTP handlers (credential-proxy) and by the in-process DirectCallTransport.
- *
- * Methods are kind-specific (no `getCredential(kind, ...)` dispatch) — every
- * implementation walks completely different code paths per kind, so a unified
- * entry would just wrap two independent functions.
+ * Credential service contract — consumed by credential-proxy, DirectCallTransport,
+ * LocalSpawner. Single implementation in gateway/credential-service.ts calls
+ * the adapter API (Portal or Upstream).
  */
 export interface CredentialService {
   listClusters(identity: Identity): Promise<ClusterMeta[]>;
   listHosts(identity: Identity): Promise<HostMeta[]>;
-  getClusterCredential(
-    identity: Identity,
-    clusterName: string,
-    purpose: string,
-  ): Promise<CredentialPayload>;
-  getHostCredential(
-    identity: Identity,
-    hostName: string,
-    purpose: string,
-  ): Promise<CredentialPayload>;
+  getClusterCredential(identity: Identity, clusterName: string, purpose: string): Promise<CredentialPayload>;
+  getHostCredential(identity: Identity, hostName: string, purpose: string): Promise<CredentialPayload>;
 }

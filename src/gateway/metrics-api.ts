@@ -32,7 +32,7 @@ export function registerMetricsRoutes(
 ): void {
 
   // ── GET /api/v1/metrics/live ─────────────────────────────
-  router.get("/api/v1/metrics/live", async (req, res) => {
+  router.get("/api/v1/siclaw/metrics/live", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
@@ -47,7 +47,7 @@ export function registerMetricsRoutes(
   });
 
   // ── GET /api/v1/metrics/summary ──────────────────────────
-  router.get("/api/v1/metrics/summary", async (req, res) => {
+  router.get("/api/v1/siclaw/metrics/summary", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
@@ -93,7 +93,7 @@ export function registerMetricsRoutes(
   });
 
   // ── GET /api/v1/metrics/audit ────────────────────────────
-  router.get("/api/v1/metrics/audit", async (req, res) => {
+  router.get("/api/v1/siclaw/metrics/audit", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
@@ -159,7 +159,7 @@ export function registerMetricsRoutes(
   });
 
   // ── GET /api/v1/metrics/audit/:id ────────────────────────
-  router.get("/api/v1/metrics/audit/:id", async (req, res, params) => {
+  router.get("/api/v1/siclaw/metrics/audit/:id", async (req, res, params) => {
     const auth = requireAdmin(req, config.jwtSecret);
     if (!auth) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
