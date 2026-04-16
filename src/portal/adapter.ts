@@ -1247,3 +1247,847 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     });
   });
 }
+
+// ================================================================
+// WS RPC handler registry — parallel dispatch layer for phone-home
+// ================================================================
+
+export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: string) => Promise<any>> {
+  const handlers = new Map<string, (params: any, agentId: string) => Promise<any>>();
+
+  // --- config.* ---
+
+  handlers.set("config.getAgent", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query("SELECT * FROM agents WHERE id = ?", [params.agentId]) as any;
+    if (rows.length === 0) throw new Error("Agent not found");
+    const agent = rows[0];
+    return {
+      id: agent.id,
+      name: agent.name,
+      description: agent.description,
+      status: agent.status,
+      model_provider: agent.model_provider,
+      model_id: agent.model_id,
+      system_prompt: agent.system_prompt,
+      icon: agent.icon,
+      color: agent.color,
+    };
+  });
+
+  handlers.set("config.getResources", async (params) => {
+    const db = getDb();
+    const agentId = params.agentId;
+    const [[clusters], [hosts], [skills], [mcpServers], [agentRows]] = await Promise.all([
+      db.query(
+        `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
+         JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+        [agentId],
+      ),
+      db.query(
+        `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type FROM agent_hosts ah
+         JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+        [agentId],
+      ),
+      db.query(
+        "SELECT skill_id FROM agent_skills WHERE agent_id = ?",
+        [agentId],
+      ),
+      db.query(
+        "SELECT mcp_server_id FROM agent_mcp_servers WHERE agent_id = ?",
+        [agentId],
+      ),
+      db.query(
+        "SELECT is_production FROM agents WHERE id = ?",
+        [agentId],
+      ),
+    ]) as any;
+    const isProduction = agentRows.length > 0 ? !!agentRows[0].is_production : true;
+    return {
+      clusters,
+      hosts,
+      skill_ids: skills.map((r: { skill_id: string }) => r.skill_id),
+      mcp_server_ids: mcpServers.map((r: { mcp_server_id: string }) => r.mcp_server_id),
+      is_production: isProduction,
+    };
+  });
+
+  handlers.set("config.getSettings", async (params) => {
+    const db = getDb();
+    const [agentRows] = await db.query(
+      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      [params.agentId],
+    ) as any;
+    if (agentRows.length === 0 || !agentRows[0].model_provider) {
+      return { providers: {} };
+    }
+    const agent = agentRows[0] as { model_provider: string; model_id: string };
+    const [providerRows] = await db.query(
+      "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
+      [agent.model_provider],
+    ) as any;
+    if (providerRows.length === 0) {
+      return { providers: {} };
+    }
+    const p = providerRows[0];
+    const [modelRows] = await db.query(
+      `SELECT model_id, name, reasoning, context_window, max_tokens
+       FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
+      [p.id],
+    ) as any;
+    return {
+      providers: {
+        [p.name]: {
+          baseUrl: p.base_url,
+          apiKey: p.api_key || "",
+          api: p.api_type,
+          models: (modelRows as any[]).map((m: any) => ({
+            id: m.model_id,
+            name: m.name || m.model_id,
+            reasoning: !!m.reasoning,
+            contextWindow: m.context_window,
+            maxTokens: m.max_tokens,
+          })),
+        },
+      },
+      default: { provider: agent.model_provider, modelId: agent.model_id },
+    };
+  });
+
+  handlers.set("config.getModelBinding", async (params) => {
+    const db = getDb();
+    const [agentRows] = await db.query(
+      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      [params.agentId],
+    ) as any;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string } | undefined;
+    if (!agent?.model_provider || !agent?.model_id) {
+      return { binding: null };
+    }
+    const [providerRows] = await db.query(
+      "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
+      [agent.model_provider],
+    ) as any;
+    if (providerRows.length === 0) {
+      return { binding: null };
+    }
+    const p = providerRows[0];
+    const [entryRows] = await db.query(
+      "SELECT model_id, name, reasoning, context_window, max_tokens FROM model_entries WHERE provider_id = ?",
+      [p.id],
+    ) as any;
+    const models = (entryRows as any[]).map((m: any) => ({
+      id: m.model_id,
+      name: m.name ?? m.model_id,
+      reasoning: !!m.reasoning,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: m.context_window,
+      maxTokens: m.max_tokens,
+    }));
+    return {
+      binding: {
+        modelProvider: p.name,
+        modelId: agent.model_id,
+        modelConfig: {
+          name: p.name,
+          baseUrl: p.base_url,
+          apiKey: p.api_key ?? "",
+          api: p.api_type,
+          authHeader: true,
+          models,
+        },
+      },
+    };
+  });
+
+  handlers.set("config.getMcpServers", async (params) => {
+    if (!params.ids?.length) {
+      return { mcpServers: {} };
+    }
+    const db = getDb();
+    const placeholders = params.ids.map(() => "?").join(",");
+    const [rows] = await db.query(
+      `SELECT name, transport, url, command, args, env, headers, enabled
+       FROM mcp_servers WHERE id IN (${placeholders}) AND enabled = 1`,
+      params.ids,
+    ) as any;
+    const mcpServers: Record<string, unknown> = {};
+    for (const row of rows) {
+      mcpServers[row.name] = {
+        transport: row.transport,
+        ...(row.url ? { url: row.url } : {}),
+        ...(row.command ? { command: row.command } : {}),
+        ...(row.args ? { args: typeof row.args === "string" ? JSON.parse(row.args) : row.args } : {}),
+        ...(row.env ? { env: typeof row.env === "string" ? JSON.parse(row.env) : row.env } : {}),
+        ...(row.headers ? { headers: typeof row.headers === "string" ? JSON.parse(row.headers) : row.headers } : {}),
+      };
+    }
+    return { mcpServers };
+  });
+
+  handlers.set("config.getSkillBundle", async (params) => {
+    const skillIds = params.skill_ids ?? [];
+    const isProduction = params.is_production ?? true;
+    if (skillIds.length === 0) {
+      return { version: new Date().toISOString(), skills: [] };
+    }
+    const db = getDb();
+    let rows: any[];
+    if (isProduction) {
+      const placeholders = skillIds.map(() => "?").join(",");
+      const [result] = await db.query(
+        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts
+         FROM skills s
+         JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
+         WHERE s.id IN (${placeholders})
+           AND sv.version = (
+             SELECT MAX(sv2.version) FROM skill_versions sv2
+             WHERE sv2.skill_id = s.id AND sv2.is_approved = 1
+           )`,
+        skillIds,
+      ) as any;
+      rows = result;
+    } else {
+      const placeholders = skillIds.map(() => "?").join(",");
+      const [result] = await db.query(
+        `SELECT id, name, labels, specs, scripts FROM skills WHERE id IN (${placeholders})`,
+        skillIds,
+      ) as any;
+      rows = result;
+    }
+    const skills = rows.map((row: any) => ({
+      dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
+      scope: "global",
+      specs: row.specs || "",
+      scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
+    }));
+    return { version: new Date().toISOString(), skills };
+  });
+
+  handlers.set("config.getSystemConfig", async () => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT config_key, config_value FROM system_config",
+    ) as any;
+    const config: Record<string, string> = {};
+    for (const row of rows) {
+      if (row.config_value != null) config[row.config_key] = row.config_value;
+    }
+    return { config };
+  });
+
+  handlers.set("config.setSystemConfig", async (params) => {
+    const db = getDb();
+    await db.query(
+      `INSERT INTO system_config (config_key, config_value, updated_by)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+      [params.key, params.value, params.updated_by],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("config.getDefaultModel", async () => {
+    const db = getDb();
+    const [providers] = await db.query(
+      "SELECT id, base_url, api_key, api_type FROM model_providers ORDER BY sort_order ASC LIMIT 1",
+    ) as any;
+    if (providers.length === 0) {
+      return { provider: null };
+    }
+    const provider = providers[0];
+    const [models] = await db.query(
+      "SELECT model_id FROM model_entries WHERE provider_id = ? ORDER BY is_default DESC, sort_order ASC LIMIT 1",
+      [provider.id],
+    ) as any;
+    if (models.length === 0) {
+      return { provider: null };
+    }
+    return { provider, model: models[0] };
+  });
+
+  // --- credential.* ---
+
+  handlers.set("credential.list", async (params, agentId) => {
+    const db = getDb();
+    if (params.kind === "host" || params.kind === "hosts") {
+      const [rows] = await db.query(
+        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description
+         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+        [agentId],
+      ) as any;
+      return {
+        hosts: rows.map((r: any) => ({
+          name: r.name, ip: r.ip, port: r.port, username: r.username,
+          auth_type: r.auth_type, is_production: !!r.is_production,
+          ...(r.description ? { description: r.description } : {}),
+        })),
+      };
+    }
+    // Default: clusters
+    const [rows] = await db.query(
+      `SELECT c.name, c.api_server, c.is_production, c.kubeconfig, c.description, c.debug_image
+       FROM agent_clusters ac JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+      [agentId],
+    ) as any;
+    return {
+      clusters: rows.map((r: any) => ({
+        name: r.name, is_production: !!r.is_production,
+        ...(r.api_server ? { api_server: r.api_server } : {}),
+        ...(r.description ? { description: r.description } : {}),
+        ...(r.debug_image ? { debug_image: r.debug_image } : {}),
+      })),
+    };
+  });
+
+  handlers.set("credential.get", async (params, agentId) => {
+    if (!params.source || !params.source_id) {
+      throw new Error("source and source_id are required");
+    }
+    const db = getDb();
+
+    if (params.source === "cluster") {
+      if (agentId) {
+        const [binding] = await db.query(
+          "SELECT 1 FROM agent_clusters WHERE agent_id = ? AND cluster_id = ?",
+          [agentId, params.source_id],
+        ) as any;
+        if (binding.length === 0) throw new Error("Agent not bound to this cluster");
+      }
+      const [rows] = await db.query(
+        "SELECT name, kubeconfig FROM clusters WHERE id = ?",
+        [params.source_id],
+      ) as any;
+      if (rows.length === 0) throw new Error("Cluster not found");
+      const cluster = rows[0];
+      return {
+        credential: {
+          name: cluster.name,
+          type: "kubeconfig",
+          files: [{ name: "cluster.kubeconfig", content: cluster.kubeconfig }],
+          ttl_seconds: 300,
+        },
+      };
+    }
+
+    if (params.source === "host") {
+      if (agentId) {
+        const [binding] = await db.query(
+          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
+          [agentId, params.source_id],
+        ) as any;
+        if (binding.length === 0) throw new Error("Agent not bound to this host");
+      }
+      const [rows] = await db.query(
+        "SELECT name, ip, port, username, auth_type, password, private_key FROM hosts WHERE id = ?",
+        [params.source_id],
+      ) as any;
+      if (rows.length === 0) throw new Error("Host not found");
+      const host = rows[0];
+      const files: { name: string; content: string; mode?: number }[] = [];
+      if (host.auth_type === "key" && host.private_key) {
+        files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
+      } else if (host.password) {
+        files.push({ name: "host.password", content: host.password });
+      }
+      return {
+        credential: {
+          name: host.name,
+          type: "ssh",
+          host: host.ip,
+          port: host.port,
+          username: host.username,
+          auth_type: host.auth_type,
+          files,
+          ttl_seconds: 300,
+        },
+      };
+    }
+
+    throw new Error(`Unknown source type: ${params.source}`);
+  });
+
+  handlers.set("credential.checkAccess", async (params) => {
+    if (params.action === "review" && params.user_id) {
+      const db = getDb();
+      const [rows] = await db.query(
+        "SELECT role, can_review_skills FROM siclaw_users WHERE id = ?",
+        [params.user_id],
+      ) as any;
+      if (rows.length === 0) {
+        return { allowed: false, grant_all: false, agent_group_ids: [] };
+      }
+      const user = rows[0];
+      const allowed = user.role === "admin" || !!user.can_review_skills;
+      return { allowed, grant_all: allowed, agent_group_ids: [] };
+    }
+    return { allowed: true, grant_all: true, agent_group_ids: [] };
+  });
+
+  handlers.set("credential.resourceManifest", async (params, agentId) => {
+    const db = getDb();
+    const effectiveAgentId = params.agent_id ?? agentId;
+    if (!effectiveAgentId) throw new Error("agent_id required");
+    const [[clusters], [hosts]] = await Promise.all([
+      db.query(
+        `SELECT c.id, c.name, c.api_server, 'cluster' AS type FROM agent_clusters ac
+         JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+        [effectiveAgentId],
+      ),
+      db.query(
+        `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, 'host' AS type FROM agent_hosts ah
+         JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+        [effectiveAgentId],
+      ),
+    ]) as any;
+    return { resources: [...clusters, ...hosts] };
+  });
+
+  handlers.set("credential.hostSearch", async (params, agentId) => {
+    const db = getDb();
+    const effectiveAgentId = params.agent_id ?? agentId;
+    let sql: string;
+    const sqlParams: unknown[] = [];
+
+    if (effectiveAgentId) {
+      sql = `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.description
+             FROM agent_hosts ah
+             JOIN hosts h ON ah.host_id = h.id
+             WHERE ah.agent_id = ?`;
+      sqlParams.push(effectiveAgentId);
+      if (params.query) {
+        sql += " AND (h.name LIKE ? OR h.ip LIKE ? OR h.description LIKE ?)";
+        sqlParams.push(`%${params.query}%`, `%${params.query}%`, `%${params.query}%`);
+      }
+    } else {
+      sql = "SELECT id, name, ip, port, username, auth_type, description FROM hosts";
+      if (params.query) {
+        sql += " WHERE name LIKE ? OR ip LIKE ? OR description LIKE ?";
+        sqlParams.push(`%${params.query}%`, `%${params.query}%`, `%${params.query}%`);
+      }
+    }
+    const [rows] = await db.query(sql, sqlParams) as any;
+    return { hosts: rows };
+  });
+
+  // --- chat.* ---
+
+  handlers.set("chat.ensureSession", async (params) => {
+    const db = getDb();
+    await db.query(
+      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, origin, last_active_at)
+       VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP(3))
+       ON DUPLICATE KEY UPDATE last_active_at = CURRENT_TIMESTAMP(3)`,
+      [params.session_id, params.agent_id, params.user_id,
+       params.title || "New Session", params.preview || null, params.origin || null],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("chat.appendMessage", async (params) => {
+    const id = crypto.randomUUID();
+    const db = getDb();
+    await db.query(
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, params.session_id, params.role, params.content,
+       params.tool_name || null, params.tool_input || null,
+       params.metadata ? JSON.stringify(params.metadata) : null,
+       params.outcome || null, params.duration_ms ?? null],
+    );
+    await db.query(
+      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+      [params.session_id],
+    );
+    return { id };
+  });
+
+  handlers.set("chat.getMessages", async (params) => {
+    const db = getDb();
+    const limit = params.limit ?? 50;
+    const sqlParams: unknown[] = [params.session_id];
+    let where = "session_id = ?";
+    if (params.before) {
+      where += " AND created_at < ?";
+      sqlParams.push(new Date(params.before));
+    }
+    sqlParams.push(limit);
+    const [rows] = await db.query(
+      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
+       FROM chat_messages WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
+      sqlParams,
+    ) as any;
+    return { messages: rows };
+  });
+
+  // --- task.* ---
+
+  handlers.set("task.listActive", async () => {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status, created_by, last_run_at, last_result
+       FROM agent_tasks WHERE status = 'active'`,
+    ) as any;
+    return { data: rows };
+  });
+
+  handlers.set("task.getStatus", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT status FROM agent_tasks WHERE id = ? LIMIT 1",
+      [params.taskId],
+    ) as any;
+    if (rows.length === 0) {
+      return { status: null };
+    }
+    return { status: rows[0].status };
+  });
+
+  handlers.set("task.list", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, name, schedule, status, description, prompt, last_run_at, last_result
+       FROM agent_tasks WHERE agent_id = ? AND created_by = ? AND status = 'active'
+       ORDER BY created_at`,
+      [params.agent_id, params.user_id],
+    ) as any;
+    return { tasks: rows };
+  });
+
+  handlers.set("task.create", async (params) => {
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_tasks (id, agent_id, name, description, schedule, prompt, status, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [params.id, params.agent_id, params.name, params.description ?? null,
+       params.schedule, params.prompt, params.status ?? "active", params.user_id],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [params.id]) as any;
+    return rows[0];
+  });
+
+  handlers.set("task.update", async (params) => {
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [params.task_id, params.agent_id, params.user_id],
+    ) as any;
+    if (existing.length === 0) throw new Error("Task not found");
+    await db.query(
+      `UPDATE agent_tasks SET
+         name = COALESCE(?, name),
+         description = COALESCE(?, description),
+         schedule = COALESCE(?, schedule),
+         prompt = COALESCE(?, prompt),
+         status = COALESCE(?, status)
+       WHERE id = ?`,
+      [params.name ?? null, params.description ?? null, params.schedule ?? null,
+       params.prompt ?? null, params.status ?? null, params.task_id],
+    );
+    const [rows] = await db.query("SELECT * FROM agent_tasks WHERE id = ?", [params.task_id]) as any;
+    return rows[0];
+  });
+
+  handlers.set("task.delete", async (params) => {
+    const db = getDb();
+    const [existing] = await db.query(
+      "SELECT id FROM agent_tasks WHERE id = ? AND agent_id = ? AND created_by = ?",
+      [params.task_id, params.agent_id, params.user_id],
+    ) as any;
+    if (existing.length === 0) throw new Error("Task not found");
+    await db.query("DELETE FROM agent_tasks WHERE id = ?", [params.task_id]);
+    return { ok: true };
+  });
+
+  handlers.set("task.runRecord", async (params) => {
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_task_runs (id, task_id, status, result_text, error, duration_ms, session_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [params.id, params.task_id, params.status,
+       params.result_text || null, params.error || null,
+       params.duration_ms ?? null, params.session_id || null],
+    );
+    await db.query(
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      [params.status, params.task_id],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("task.runStart", async (params) => {
+    const db = getDb();
+    await db.query(
+      `INSERT INTO agent_task_runs (id, task_id, status, session_id)
+       VALUES (?, ?, 'running', ?)`,
+      [params.id, params.task_id, params.session_id],
+    );
+    return { id: params.id };
+  });
+
+  handlers.set("task.runFinalize", async (params) => {
+    const db = getDb();
+    await db.query(
+      `UPDATE agent_task_runs
+         SET status = ?, result_text = ?, error = ?, duration_ms = ?
+       WHERE id = ?`,
+      [params.status, params.result_text, params.error ?? null, params.duration_ms, params.run_id],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("task.updateMeta", async (params) => {
+    const db = getDb();
+    await db.query(
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      [params.last_result, params.task_id],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("task.fireNow", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, agent_id, name, description, schedule, prompt, status, created_by,
+              last_run_at, last_result, last_manual_run_at
+       FROM agent_tasks WHERE id = ? LIMIT 1`,
+      [params.task_id],
+    ) as any;
+    if (rows.length === 0) {
+      return { outcome: "not_found" };
+    }
+    const row = rows[0];
+    const [inflight] = await db.query(
+      "SELECT id FROM agent_task_runs WHERE task_id = ? AND status = 'running' LIMIT 1",
+      [params.task_id],
+    ) as any;
+    if (inflight.length > 0) {
+      return { outcome: "in_flight" };
+    }
+    if (row.last_manual_run_at) {
+      const elapsed = (Date.now() - new Date(row.last_manual_run_at).getTime()) / 1000;
+      if (elapsed < params.cooldown_sec) {
+        return { outcome: "cooldown", retry_after_sec: Math.ceil(params.cooldown_sec - elapsed) };
+      }
+    }
+    await db.query(
+      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
+      [params.task_id],
+    );
+    return { outcome: "ok", task: row };
+  });
+
+  handlers.set("task.prune", async (params) => {
+    const db = getDb();
+    const days = params.retention_days;
+    const [sessResult] = await db.query(
+      `DELETE FROM chat_sessions
+       WHERE origin = 'task' AND last_active_at < NOW() - INTERVAL ? DAY`,
+      [days],
+    ) as any;
+    const [runsResult] = await db.query(
+      `DELETE FROM agent_task_runs WHERE created_at < NOW() - INTERVAL ? DAY`,
+      [days],
+    ) as any;
+    return {
+      sessions_deleted: sessResult?.affectedRows ?? 0,
+      runs_deleted: runsResult?.affectedRows ?? 0,
+    };
+  });
+
+  // --- channel.* ---
+
+  handlers.set("channel.list", async () => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at",
+    ) as any;
+    return { data: rows };
+  });
+
+  handlers.set("channel.resolveBinding", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT id, agent_id FROM channel_bindings WHERE channel_id = ? AND route_key = ?",
+      [params.channel_id, params.route_key],
+    ) as any;
+    if (rows.length === 0) {
+      return { binding: null };
+    }
+    return { binding: { agentId: rows[0].agent_id, bindingId: rows[0].id } };
+  });
+
+  handlers.set("channel.pair", async (params) => {
+    const db = getDb();
+    const [codeRows] = await db.query(
+      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > NOW()",
+      [params.code, params.channel_id],
+    ) as any;
+    if (codeRows.length === 0) {
+      return { success: false, error: "Invalid or expired pairing code" };
+    }
+    const pairingCode = codeRows[0];
+    const bindingId = crypto.randomUUID();
+    try {
+      await db.query(
+        `INSERT INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE agent_id = VALUES(agent_id), route_type = VALUES(route_type), created_by = VALUES(created_by)`,
+        [bindingId, params.channel_id, pairingCode.agent_id, params.route_key, params.route_type, pairingCode.created_by],
+      );
+    } catch (err: any) {
+      return { success: false, error: `Failed to create binding: ${err.message}` };
+    }
+    await db.query("DELETE FROM channel_pairing_codes WHERE code = ?", [params.code]);
+    let agentName = pairingCode.agent_id;
+    try {
+      const [agentRows] = await db.query(
+        "SELECT name FROM agents WHERE id = ?",
+        [pairingCode.agent_id],
+      ) as any;
+      if (agentRows.length > 0) agentName = agentRows[0].name;
+    } catch { /* ignore */ }
+    return { success: true, agentName };
+  });
+
+  // --- agent.* ---
+
+  handlers.set("agent.listForSkill", async (params) => {
+    const db = getDb();
+    const sql = params.dev_only
+      ? `SELECT ask.agent_id FROM agent_skills ask
+         JOIN agents a ON ask.agent_id = a.id
+         WHERE ask.skill_id = ? AND a.is_production = 0`
+      : "SELECT agent_id FROM agent_skills WHERE skill_id = ?";
+    const [rows] = await db.query(sql, [params.skillId]) as any;
+    return { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) };
+  });
+
+  handlers.set("agent.listForMcp", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_mcp_servers WHERE mcp_server_id = ?",
+      [params.mcpId],
+    ) as any;
+    return { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) };
+  });
+
+  handlers.set("agent.listForCluster", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_clusters WHERE cluster_id = ?",
+      [params.clusterId],
+    ) as any;
+    return { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) };
+  });
+
+  handlers.set("agent.listForHost", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT agent_id FROM agent_hosts WHERE host_id = ?",
+      [params.hostId],
+    ) as any;
+    return { agent_ids: rows.map((r: { agent_id: string }) => r.agent_id) };
+  });
+
+  // --- metrics.* ---
+
+  handlers.set("metrics.summary", async (params) => {
+    const period = params.period || "7d";
+    const periods: Record<string, number> = { today: 86_400_000, "7d": 7 * 86_400_000, "30d": 30 * 86_400_000 };
+    const rangeMs = periods[period];
+    if (!rangeMs) throw new Error("Invalid period");
+    const cutoff = new Date(Date.now() - rangeMs);
+    const userFilter = params.userId || null;
+
+    const db = getDb();
+    const sessionParams: unknown[] = [cutoff];
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
+    const [sRows] = await db.query(totalSessionsSql, sessionParams) as any;
+    const totalSessions = Number(sRows[0]?.c ?? 0);
+
+    const pParams: unknown[] = [cutoff];
+    let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'user' AND m.created_at >= ?`;
+    if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
+    const [pRows] = await db.query(totalPromptsSql, pParams) as any;
+    const totalPrompts = Number(pRows[0]?.c ?? 0);
+
+    let byUser: Array<{ userId: string; sessions: number; messages: number }> = [];
+    if (!userFilter) {
+      const [uRows] = await db.query(
+        `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
+         FROM chat_sessions s WHERE s.created_at >= ?
+         GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
+        [cutoff],
+      ) as any;
+      byUser = uRows.map((r: any) => ({ userId: r.userId, sessions: Number(r.sessions), messages: Number(r.messages ?? 0) }));
+    }
+    return { totalSessions, totalPrompts, byUser };
+  });
+
+  handlers.set("metrics.audit", async (params) => {
+    const limit = Math.min(200, Math.max(1, parseInt(params.limit || "50", 10)));
+    const startDate = params.startDate ? new Date(params.startDate) : new Date(Date.now() - 86_400_000);
+    const endDate = params.endDate ? new Date(params.endDate) : new Date();
+
+    const conds: string[] = ["m.role = 'tool'", "m.created_at BETWEEN ? AND ?"];
+    const sqlParams: unknown[] = [startDate, endDate];
+    if (params.userId) { conds.push("s.user_id = ?"); sqlParams.push(params.userId); }
+    if (params.toolName) { conds.push("m.tool_name = ?"); sqlParams.push(params.toolName); }
+    if (params.outcome) { conds.push("m.outcome = ?"); sqlParams.push(params.outcome); }
+    if (params.cursorTs && params.cursorId) {
+      const cursorDate = new Date(parseInt(params.cursorTs, 10));
+      conds.push("(m.created_at < ? OR (m.created_at = ? AND m.id < ?))");
+      sqlParams.push(cursorDate, cursorDate, params.cursorId);
+    }
+    sqlParams.push(limit + 1);
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
+              LEFT(m.tool_input, 500) AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE ${conds.join(" AND ")}
+       ORDER BY m.created_at DESC, m.id DESC
+       LIMIT ?`,
+      sqlParams,
+    ) as any;
+    const hasMore = rows.length > limit;
+    const logs = rows.slice(0, limit).map((r: any) => ({
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, outcome: r.outcome,
+      durationMs: r.durationMs, timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    }));
+    return { logs, hasMore };
+  });
+
+  handlers.set("metrics.auditDetail", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName, m.tool_input AS toolInput,
+              m.outcome, m.duration_ms AS durationMs, m.content, m.created_at AS timestamp,
+              s.user_id AS userId, s.agent_id AS agentId
+       FROM chat_messages m
+       LEFT JOIN chat_sessions s ON m.session_id = s.id
+       WHERE m.id = ? AND m.role = 'tool'`,
+      [params.id],
+    ) as any;
+    if (!rows.length) throw new Error("Not found");
+    const r = rows[0];
+    return {
+      id: r.id, sessionId: r.sessionId, userId: r.userId, agentId: r.agentId,
+      toolName: r.toolName, toolInput: r.toolInput, content: r.content,
+      outcome: r.outcome, durationMs: r.durationMs,
+      timestamp: r.timestamp instanceof Date ? r.timestamp.toISOString() : r.timestamp,
+    };
+  });
+
+  return handlers;
+}

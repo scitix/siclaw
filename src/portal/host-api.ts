@@ -13,12 +13,12 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
-import { notifyBoundAgents } from "./notify.js";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 /** Column list that excludes sensitive fields. */
 const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_production, created_at, updated_at";
 
-export function registerHostRoutes(router: RestRouter, jwtSecret: string, runtimeWsUrl: string, runtimeSecret: string): void {
+export function registerHostRoutes(router: RestRouter, jwtSecret: string, connectionMap: RuntimeConnectionMap): void {
   // GET /api/v1/hosts — list all (no secrets)
   router.get("/api/v1/hosts", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -133,7 +133,12 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, runtim
     sendJson(res, 200, updated[0]);
 
     // Notify bound agents to clear cached credentials
-    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_hosts", "host_id", params.id, ["host"]);
+    getDb().query("SELECT agent_id FROM agent_hosts WHERE host_id = ?", [params.id])
+      .then(([rows]: any) => {
+        const agentIds = (rows as { agent_id: string }[]).map((r) => r.agent_id);
+        if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["host"] });
+      })
+      .catch((err: any) => console.warn("[host-api] notify failed:", err.message));
   });
 
   // DELETE /api/v1/hosts/:id

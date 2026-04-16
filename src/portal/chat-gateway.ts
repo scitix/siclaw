@@ -95,7 +95,7 @@ async function authenticateApiKey(req: http.IncomingMessage): Promise<ApiKeyAuth
 
   return { agentId: key.agent_id, keyId: key.id, keyName: key.name, createdBy: key.created_by };
 }
-import WebSocket from "ws";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 /** Send an SSE event to the response stream. No-op if the stream is already closed. */
 function sseWrite(res: import("node:http").ServerResponse, event: string, data: unknown): void {
@@ -103,15 +103,9 @@ function sseWrite(res: import("node:http").ServerResponse, event: string, data: 
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-/** Generate a unique RPC id. */
-function rpcId(): string {
-  return crypto.randomUUID().slice(0, 8);
-}
-
 export function registerChatRoutes(
   router: RestRouter,
-  runtimeWsUrl: string,
-  runtimeSecret: string,
+  connectionMap: RuntimeConnectionMap,
   jwtSecret: string,
 ): void {
   // POST /api/v1/siclaw/agents/:id/chat/send — SSE streaming
@@ -124,7 +118,11 @@ export function registerChatRoutes(
 
     const agentId = params.id;
     const sessionId = body.session_id ?? crypto.randomUUID();
-    const reqId = rpcId();
+
+    if (!connectionMap.isConnected(agentId)) {
+      sendJson(res, 503, { error: "Agent runtime is not connected" });
+      return;
+    }
 
     // Resolve agent's bound model + provider config from DB
     const modelBinding = await resolveAgentModelBinding(agentId);
@@ -141,106 +139,51 @@ export function registerChatRoutes(
       "X-Accel-Buffering": "no",
     });
 
-    // Connect to Runtime WS
-    const wsUrl = `${runtimeWsUrl}/ws`;
-    const ws = new WebSocket(wsUrl, {
-      headers: {
-        "X-Auth-Token": runtimeSecret,
-        "X-Agent-Id": agentId,
-      },
-    });
-
-    let closed = false;
+    // Subscribe to chat events for this agent, filter by sessionId
+    let unsubscribe: (() => void) | null = null;
 
     function cleanup(): void {
-      if (closed) return;
-      closed = true;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
+      if (unsubscribe) { unsubscribe(); unsubscribe = null; }
     }
 
     req.on("close", cleanup);
 
-    ws.on("open", () => {
-      // Send chat.send RPC
-      ws.send(JSON.stringify({
-        type: "req",
-        id: reqId,
-        method: "chat.send",
-        params: {
-          agentId,
-          userId: auth.userId,
-          text: body.text,
-          sessionId,
-          modelProvider: modelBinding.modelProvider,
-          modelId: modelBinding.modelId,
-          modelConfig: modelBinding.modelConfig,
-        },
-      }));
-    });
+    unsubscribe = connectionMap.subscribe(agentId, "chat.event", (data: unknown) => {
+      const envelope = data as { sessionId?: string; event?: Record<string, unknown> } | undefined;
+      if (!envelope?.event) return;
+      if (envelope.sessionId && envelope.sessionId !== sessionId) return;
 
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString()) as {
-          type: string;
-          id?: string;
-          ok?: boolean;
-          event?: string;
-          payload?: Record<string, unknown>;
-          error?: string;
-        };
+      const evt = envelope.event;
+      sseWrite(res, "chat.event", evt);
 
-        if (msg.type === "res" && msg.id === reqId) {
-          if (!msg.ok) {
-            sseWrite(res, "error", { error: msg.error ?? "RPC failed" });
-            res.end();
-            cleanup();
-            return;
-          }
-          // Initial response — send session info
-          sseWrite(res, "session", { sessionId: (msg.payload as Record<string, unknown>)?.sessionId ?? sessionId });
-        }
-
-        if (msg.type === "event" && msg.event === "chat.event" && msg.payload) {
-          const evt = msg.payload.event as Record<string, unknown> | undefined;
-          if (evt) {
-            sseWrite(res, "chat.event", evt);
-
-            // Runtime persists user/assistant/tool events to chat_messages via
-            // sse-consumer; Portal only forwards the stream to the browser.
-
-            // Stream complete
-            if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
-              sseWrite(res, "done", {});
-              res.end();
-              cleanup();
-            }
-          }
-        }
-      } catch (err) {
-        console.error("[chat-gateway] Failed to parse WS message:", err);
-      }
-    });
-
-    ws.on("error", (err) => {
-      console.error("[chat-gateway] WS error:", err.message);
-      if (!res.headersSent) {
-        sendJson(res, 502, { error: "Runtime connection failed" });
-      } else {
-        sseWrite(res, "error", { error: "Runtime connection lost" });
-        res.end();
-      }
-      cleanup();
-    });
-
-    ws.on("close", () => {
-      if (!closed) {
+      // Stream complete
+      if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
         sseWrite(res, "done", {});
         res.end();
         cleanup();
       }
     });
+
+    // Send chat.send command
+    const result = await connectionMap.sendCommand(agentId, "chat.send", {
+      agentId,
+      userId: auth.userId,
+      text: body.text,
+      sessionId,
+      modelProvider: modelBinding.modelProvider,
+      modelId: modelBinding.modelId,
+      modelConfig: modelBinding.modelConfig,
+    });
+
+    if (!result.ok) {
+      sseWrite(res, "error", { error: result.error ?? "RPC failed" });
+      res.end();
+      cleanup();
+      return;
+    }
+
+    // Initial response — send session info
+    sseWrite(res, "session", { sessionId: (result.payload as Record<string, unknown>)?.sessionId ?? sessionId });
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message
@@ -251,7 +194,7 @@ export function registerChatRoutes(
     const body = await parseBody<{ session_id?: string; text?: string }>(req);
     if (!body.session_id || !body.text) { sendJson(res, 400, { error: "session_id and text are required" }); return; }
 
-    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.steer", {
+    const result = await connectionMap.sendCommand(params.id, "chat.steer", {
       agentId: params.id,
       userId: auth.userId,
       sessionId: body.session_id,
@@ -269,7 +212,7 @@ export function registerChatRoutes(
     const body = await parseBody<{ session_id?: string }>(req);
     if (!body.session_id) { sendJson(res, 400, { error: "session_id is required" }); return; }
 
-    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.abort", {
+    const result = await connectionMap.sendCommand(params.id, "chat.abort", {
       agentId: params.id,
       userId: auth.userId,
       sessionId: body.session_id,
@@ -286,7 +229,7 @@ export function registerChatRoutes(
     const body = await parseBody<{ session_id?: string }>(req);
     if (!body.session_id) { sendJson(res, 400, { error: "session_id is required" }); return; }
 
-    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "chat.clearQueue", {
+    const result = await connectionMap.sendCommand(params.id, "chat.clearQueue", {
       agentId: params.id,
       userId: auth.userId,
       sessionId: body.session_id,
@@ -300,7 +243,7 @@ export function registerChatRoutes(
     const auth = requireAuth(req, jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
 
-    const result = await runtimeRpc(runtimeWsUrl, runtimeSecret, params.id, "agent.clearMemory", {
+    const result = await connectionMap.sendCommand(params.id, "agent.clearMemory", {
       agentId: params.id,
       userId: auth.userId,
     });
@@ -327,7 +270,11 @@ export function registerChatRoutes(
 
     const agentId = keyAuth.agentId;
     const sessionId = body.session_id ?? crypto.randomUUID();
-    const reqId = rpcId();
+
+    if (!connectionMap.isConnected(agentId)) {
+      sendJson(res, 503, { error: "Agent runtime is not connected" });
+      return;
+    }
 
     const modelBinding = await resolveAgentModelBinding(agentId);
     if (!modelBinding) {
@@ -335,147 +282,67 @@ export function registerChatRoutes(
       return;
     }
 
-    const wsUrl = `${runtimeWsUrl}/ws`;
-    const ws = new WebSocket(wsUrl, {
-      headers: { "X-Auth-Token": runtimeSecret, "X-Agent-Id": agentId },
-    });
-
     let assistantText = "";
     let resolved = false;
 
+    function cleanup(): void {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    }
+
+    req.on("close", () => {
+      cleanup();
+    });
+
     const timeout = setTimeout(() => {
-      if (!resolved) { resolved = true; ws.close(); sendJson(res, 504, { error: "Execution timeout" }); }
+      if (!resolved) {
+        resolved = true;
+        if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+        sendJson(res, 504, { error: "Execution timeout" });
+      }
     }, 300_000);
 
-    ws.on("open", () => {
-      ws.send(JSON.stringify({
-        type: "req", id: reqId, method: "chat.send",
-        params: {
-          agentId, userId: keyAuth.createdBy, text: body.text,
-          sessionId, mode: "api",
-          modelProvider: modelBinding.modelProvider,
-          modelId: modelBinding.modelId,
-          modelConfig: modelBinding.modelConfig,
-        },
-      }));
-    });
+    let unsubscribe: (() => void) | null = connectionMap.subscribe(agentId, "chat.event", (data: unknown) => {
+      if (resolved) return;
+      const envelope = data as { sessionId?: string; event?: Record<string, unknown> } | undefined;
+      if (!envelope?.event) return;
+      if (envelope.sessionId && envelope.sessionId !== sessionId) return;
 
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString()) as {
-          type: string; id?: string; ok?: boolean;
-          event?: string; payload?: Record<string, unknown>; error?: string;
-        };
-
-        if (msg.type === "res" && msg.id === reqId && !msg.ok) {
-          if (!resolved) { resolved = true; clearTimeout(timeout); ws.close(); sendJson(res, 500, { error: msg.error ?? "Execution failed" }); }
-          return;
+      const evt = envelope.event;
+      if (evt.type === "agent_message" && typeof evt.text === "string") assistantText += evt.text;
+      if (evt.type === "message_update") {
+        const ame = (evt as any).assistantMessageEvent;
+        if (ame?.type === "text_delta" && typeof ame.delta === "string") assistantText += ame.delta;
+      }
+      if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+          sendJson(res, 200, { session_id: sessionId, agent_id: agentId, text: assistantText, status: "success" });
         }
-
-        if (msg.type === "event" && msg.event === "chat.event" && msg.payload) {
-          const evt = msg.payload.event as Record<string, unknown> | undefined;
-          if (evt) {
-            if (evt.type === "agent_message" && typeof evt.text === "string") assistantText += evt.text;
-            if (evt.type === "message_update") {
-              const ame = (evt as any).assistantMessageEvent;
-              if (ame?.type === "text_delta" && typeof ame.delta === "string") assistantText += ame.delta;
-            }
-            if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
-              if (!resolved) {
-                resolved = true; clearTimeout(timeout); ws.close();
-                sendJson(res, 200, { session_id: sessionId, agent_id: agentId, text: assistantText, status: "success" });
-              }
-            }
-          }
-        }
-      } catch (err) { console.error("[api-run] Failed to parse WS message:", err); }
-    });
-
-    ws.on("error", (err) => {
-      console.error("[api-run] WS error:", err.message);
-      if (!resolved) { resolved = true; clearTimeout(timeout); sendJson(res, 502, { error: "Runtime connection failed" }); }
-    });
-
-    ws.on("close", () => {
-      if (!resolved) { resolved = true; clearTimeout(timeout); sendJson(res, 502, { error: "Runtime connection closed unexpectedly" }); }
-    });
-  });
-}
-
-// ── Simple RPC helper (connect WS, send one RPC, wait for response, close) ──
-
-export async function runtimeRpc(
-  runtimeWsUrl: string,
-  runtimeSecret: string,
-  agentId: string,
-  method: string,
-  params: Record<string, unknown>,
-): Promise<{ ok: boolean; payload?: unknown; error?: string }> {
-  return new Promise((resolve) => {
-    const wsUrl = `${runtimeWsUrl}/ws`;
-    const ws = new WebSocket(wsUrl, {
-      headers: {
-        "X-Auth-Token": runtimeSecret,
-        "X-Agent-Id": agentId,
-      },
-    });
-
-    const reqId = rpcId();
-    let settled = false;
-
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        ws.close();
-        resolve({ ok: false, error: "RPC timeout" });
-      }
-    }, 30_000);
-
-    ws.on("open", () => {
-      ws.send(JSON.stringify({ type: "req", id: reqId, method, params }));
-    });
-
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString()) as {
-          type: string;
-          id?: string;
-          ok?: boolean;
-          payload?: unknown;
-          error?: string;
-        };
-        if (msg.type === "res" && msg.id === reqId) {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timeout);
-            ws.close();
-            if (msg.ok) {
-              resolve({ ok: true, payload: msg.payload });
-            } else {
-              resolve({ ok: false, error: msg.error ?? "RPC failed" });
-            }
-          }
-        }
-      } catch (err) {
-        console.error("[chat-gateway] Failed to parse WS message:", err);
       }
     });
 
-    ws.on("error", (err) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        resolve({ ok: false, error: `WS error: ${err.message}` });
-      }
+    const result = await connectionMap.sendCommand(agentId, "chat.send", {
+      agentId,
+      userId: keyAuth.createdBy,
+      text: body.text,
+      sessionId,
+      mode: "api",
+      modelProvider: modelBinding.modelProvider,
+      modelId: modelBinding.modelId,
+      modelConfig: modelBinding.modelConfig,
     });
 
-    ws.on("close", () => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        resolve({ ok: false, error: "WS closed unexpectedly" });
-      }
-    });
+    if (!result.ok && !resolved) {
+      resolved = true;
+      clearTimeout(timeout);
+      if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+      sendJson(res, 500, { error: result.error ?? "Execution failed" });
+    }
   });
 }
 

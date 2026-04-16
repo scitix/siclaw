@@ -10,13 +10,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { RestRouter } from "../gateway/rest-router.js";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
+
 /** Subset of config needed by siclaw API routes */
 interface SiclawConfig {
   jwtSecret: string;
   serverUrl: string;
   portalSecret: string;
-  runtimeWsUrl?: string;
-  runtimeSecret?: string;
+  connectionMap: RuntimeConnectionMap;
 }
 import {
   sendJson,
@@ -32,7 +33,6 @@ import { getDb } from "../gateway/db.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";
-import { runtimeRpc } from "./chat-gateway.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -1285,14 +1285,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     ) as any;
     if (owner.length === 0) { sendJson(res, 404, { error: "Task not found" }); return; }
 
-    if (!config.runtimeWsUrl || !config.runtimeSecret) {
-      sendJson(res, 503, { error: "Runtime not configured" });
+    if (!config.connectionMap.isConnected(params.agentId)) {
+      sendJson(res, 503, { error: "Agent runtime is not connected" });
       return;
     }
 
     // Trigger execution via WS RPC to Runtime's task-coordinator
-    const rpcResult = await runtimeRpc(
-      config.runtimeWsUrl, config.runtimeSecret,
+    const rpcResult = await config.connectionMap.sendCommand(
       params.agentId, "task.fireNow",
       { taskId: params.taskId },
     );

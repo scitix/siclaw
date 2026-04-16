@@ -8,17 +8,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRestRouter, sendJson } from "../gateway/rest-router.js";
-import { requireAdmin } from "./auth.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerAgentRoutes } from "./agent-api.js";
 import { registerClusterRoutes } from "./cluster-api.js";
 import { registerHostRoutes } from "./host-api.js";
-import { registerAdapterRoutes } from "./adapter.js";
+import { registerAdapterRoutes, buildAdapterRpcHandlers } from "./adapter.js";
 import { registerChatRoutes } from "./chat-gateway.js";
 import { registerChannelRoutes } from "./channel-api.js";
 import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
 import { registerSiclawRoutes } from "./siclaw-api.js";
 import { createRuntimeProxy } from "./proxy.js";
+import { registerRuntimeWs } from "./runtime-connection.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -43,8 +43,8 @@ export interface PortalConfig {
   port: number;
   jwtSecret: string;
   runtimeUrl: string;
-  runtimeWsUrl: string;
-  runtimeSecret: string;
+  runtimeWsUrl?: string;   // Optional — Phase 1 backward compat
+  runtimeSecret?: string;  // Optional — Phase 1 backward compat
   portalSecret: string;
 }
 
@@ -52,22 +52,14 @@ export function startPortal(config: PortalConfig): http.Server {
   const router = createRestRouter();
   const runtimeProxy = createRuntimeProxy(config.runtimeUrl);
 
+  // Build phone-home connection map (Runtimes connect to Portal via WS)
+  const rpcHandlers = buildAdapterRpcHandlers();
+
   // Register Portal's own routes
   registerAuthRoutes(router, config.jwtSecret);
-  registerAgentRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
-  registerClusterRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
-  registerHostRoutes(router, config.jwtSecret, config.runtimeWsUrl, config.runtimeSecret);
   registerAdapterRoutes(router, config.portalSecret);
-  registerChatRoutes(router, config.runtimeWsUrl, config.runtimeSecret, config.jwtSecret);
   registerChannelRoutes(router, config.jwtSecret);
   registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);
-  registerSiclawRoutes(router, {
-    jwtSecret: config.jwtSecret,
-    serverUrl: config.runtimeUrl,
-    portalSecret: config.portalSecret,
-    runtimeWsUrl: config.runtimeWsUrl,
-    runtimeSecret: config.runtimeSecret,
-  });
 
   const server = http.createServer(async (req, res) => {
     const url = req.url ?? "/";
@@ -155,8 +147,21 @@ export function startPortal(config: PortalConfig): http.Server {
     fs.createReadStream(filePath).pipe(res);
   });
 
-  // Attach WS upgrade for /ws/notifications before listen
+  // Attach WS upgrade handlers before listen
+  const connectionMap = registerRuntimeWs(server, config.portalSecret, rpcHandlers);
   registerNotificationWs(server, config.jwtSecret);
+
+  // Register routes that need the connectionMap (requires server to exist for WS)
+  registerAgentRoutes(router, config.jwtSecret, connectionMap);
+  registerClusterRoutes(router, config.jwtSecret, connectionMap);
+  registerHostRoutes(router, config.jwtSecret, connectionMap);
+  registerChatRoutes(router, connectionMap, config.jwtSecret);
+  registerSiclawRoutes(router, {
+    jwtSecret: config.jwtSecret,
+    serverUrl: config.runtimeUrl,
+    portalSecret: config.portalSecret,
+    connectionMap,
+  });
 
   server.listen(config.port, () => {
     console.log(`[portal] Listening on http://0.0.0.0:${config.port}`);

@@ -15,14 +15,12 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
-import { runtimeRpc } from "./chat-gateway.js";
-import { notifyAgentReload } from "./notify.js";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 export function registerAgentRoutes(
   router: RestRouter,
   jwtSecret: string,
-  runtimeWsUrl: string,
-  runtimeSecret: string,
+  connectionMap: RuntimeConnectionMap,
 ): void {
   // GET /api/v1/agents — list (paginated, search)
   router.get("/api/v1/agents", async (req, res) => {
@@ -176,7 +174,7 @@ export function registerAgentRoutes(
 
     // is_production change affects skills bundle (prod=approved only, dev=all)
     if ("is_production" in body) {
-      notifyAgentReload(runtimeWsUrl, runtimeSecret, params.id, ["skills"]);
+      connectionMap.notify(params.id, "agent.reload", { resources: ["skills"] });
     }
   });
 
@@ -197,9 +195,7 @@ export function registerAgentRoutes(
     // Terminate any running AgentBox pods bound to this agent before DB delete
     // so they don't become orphans. Log and proceed on failure — the DB delete
     // is the user's explicit intent; orphan pods can be cleaned up via kubectl.
-    const termResult = await runtimeRpc(
-      runtimeWsUrl,
-      runtimeSecret,
+    const termResult = await connectionMap.sendCommand(
       params.id,
       "agent.terminate",
       { agentId: params.id },
@@ -281,8 +277,8 @@ export function registerAgentRoutes(
 
     sendJson(res, 200, { ok: true });
 
-    // Notify running AgentBox to reload (fire-and-forget with retry)
-    notifyAgentReload(runtimeWsUrl, runtimeSecret, params.id);
+    // Notify running AgentBox to reload (fire-and-forget)
+    connectionMap.notify(params.id, "agent.reload", {});
   });
 
   // GET /api/v1/agents/:id/resources — get bindings
