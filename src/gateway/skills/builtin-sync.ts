@@ -39,6 +39,19 @@ interface BuiltinSkillData {
 }
 
 // ---------------------------------------------------------------------------
+// Public parsed skill type
+// ---------------------------------------------------------------------------
+
+export interface ParsedSkill {
+  dirName: string;
+  name: string;
+  description: string;
+  labels: string[];
+  specs: string;
+  scripts: Array<{ name: string; content: string }>;
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
@@ -78,9 +91,7 @@ function parseFrontmatter(md: string): { name: string; description: string } {
   return { name, description };
 }
 
-function readSkillDir(dirName: string, labelsMap: Record<string, string[]>): BuiltinSkillData | null {
-  const dirPath = join(SKILLS_CORE_DIR, dirName);
-
+function readSkillDir(dirName: string, dirPath: string, labelsMap: Record<string, string[]>): BuiltinSkillData | null {
   const skillMdPath = join(dirPath, "SKILL.md");
   if (!existsSync(skillMdPath)) return null;
 
@@ -113,7 +124,41 @@ function computeHash(specs: string, scripts: ScriptEntry[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API — parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a skills directory into structured skill objects.
+ * Pure filesystem → data transform. Does NOT touch the database.
+ *
+ * Expects the directory to follow the standard layout:
+ *   <skillsDir>/
+ *     meta.json          (optional) — { labels: { [dirName]: string[] } }
+ *     <dirName>/
+ *       SKILL.md         (required) — frontmatter with name + description
+ *       scripts/         (optional) — .sh and .py files
+ */
+export function parseSkillsDir(skillsDir: string): ParsedSkill[] {
+  // Load label map from meta.json if present
+  const metaPath = join(skillsDir, "meta.json");
+  let labelsMap: Record<string, string[]> = {};
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { labels?: Record<string, string[]> };
+      labelsMap = meta.labels ?? {};
+    } catch {
+      // labels will be empty — caller may warn if needed
+    }
+  }
+
+  return readdirSync(skillsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => readSkillDir(d.name, join(skillsDir, d.name), labelsMap))
+    .filter((s): s is BuiltinSkillData => s !== null);
+}
+
+// ---------------------------------------------------------------------------
+// Public API — database sync
 // ---------------------------------------------------------------------------
 
 export async function syncBuiltinSkills(
@@ -124,23 +169,18 @@ export async function syncBuiltinSkills(
     return { inserted: 0, updated: 0, skipped: 0 };
   }
 
-  // Load label map
+  // Load label map (also needed for warning on parse failure)
   const metaPath = join(SKILLS_CORE_DIR, "meta.json");
-  let labelsMap: Record<string, string[]> = {};
   if (existsSync(metaPath)) {
     try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { labels?: Record<string, string[]> };
-      labelsMap = meta.labels ?? {};
+      JSON.parse(readFileSync(metaPath, "utf8"));
     } catch {
       console.warn("[builtin-sync] Failed to parse meta.json — labels will be empty");
     }
   }
 
-  // Read all skill directories
-  const entries = readdirSync(SKILLS_CORE_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => readSkillDir(d.name, labelsMap))
-    .filter((s): s is BuiltinSkillData => s !== null);
+  // Read all skill directories via shared parser
+  const entries = parseSkillsDir(SKILLS_CORE_DIR);
 
   const db = getDb();
   let inserted = 0;

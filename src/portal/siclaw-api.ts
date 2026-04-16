@@ -139,9 +139,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
 
-    let countSql = "SELECT COUNT(*) AS count FROM skills WHERE org_id = ?";
-    let listSql = "SELECT * FROM skills WHERE org_id = ?";
-    const params: unknown[] = [auth.orgId];
+    const overlayExclude = " AND NOT (is_builtin = 1 AND id IN (SELECT overlay_of FROM skills WHERE overlay_of IS NOT NULL AND org_id = ?))";
+    let countSql = "SELECT COUNT(*) AS count FROM skills WHERE org_id = ?" + overlayExclude;
+    let listSql = "SELECT * FROM skills WHERE org_id = ?" + overlayExclude;
+    const params: unknown[] = [auth.orgId, auth.orgId];
 
     if (search) {
       const clause = " AND (name LIKE ? OR description LIKE ?)";
@@ -280,17 +281,48 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
 
-    // Verify ownership
-    const [existing] = await db.query(
-      "SELECT * FROM skills WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Skill not found" });
+    // Check if this is a builtin skill
+    const [targetRows] = await db.query("SELECT * FROM skills WHERE id = ? AND org_id = ?", [params.id, auth.orgId]) as any;
+    if (targetRows.length === 0) { sendJson(res, 404, { error: "Skill not found" }); return; }
+    const targetSkill = targetRows[0];
+
+    if (targetSkill.is_builtin) {
+      // Check if overlay already exists
+      const [existingOverlay] = await db.query(
+        "SELECT id FROM skills WHERE overlay_of = ? AND org_id = ?",
+        [params.id, auth.orgId],
+      ) as any;
+      if (existingOverlay.length > 0) {
+        sendJson(res, 409, {
+          error: "This builtin skill already has an overlay. Edit the overlay instead.",
+          overlay_id: existingOverlay[0].id,
+        });
+        return;
+      }
+      // Create overlay — full copy with user's edits applied
+      const overlayId = crypto.randomUUID();
+      const newSpecs = (body.specs as string) ?? targetSkill.specs;
+      const newScripts = body.scripts ? JSON.stringify(body.scripts) : targetSkill.scripts;
+      const newLabels = body.labels ? JSON.stringify(body.labels) : targetSkill.labels;
+      const newDesc = (body.description as string) ?? targetSkill.description;
+
+      await db.query(
+        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by, is_builtin, overlay_of)
+         VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, 0, ?)`,
+        [overlayId, auth.orgId, targetSkill.name, newDesc, newLabels, auth.userId, newSpecs, newScripts, auth.userId, params.id],
+      );
+      await db.query(
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved)
+         VALUES (?, ?, 1, ?, ?, ?, 0)`,
+        [crypto.randomUUID(), overlayId, newSpecs, newScripts, auth.userId],
+      );
+
+      const [created] = await db.query("SELECT * FROM skills WHERE id = ?", [overlayId]) as any;
+      sendJson(res, 201, created[0]);
       return;
     }
 
-    const skill = existing[0];
+    const skill = targetSkill;
 
     // Status-aware edit behavior
     if (skill.status === "pending_review") {
@@ -369,18 +401,31 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (await guardAccess(res, config, auth, "write")) return;
     const db = getDb();
 
-    const [existing] = await db.query(
-      "SELECT id FROM skills WHERE id = ? AND org_id = ?",
-      [params.id, auth.orgId],
-    ) as any;
-    if (existing.length === 0) {
-      sendJson(res, 404, { error: "Skill not found" });
+    // Fetch skill to check type
+    const [targetRows] = await db.query("SELECT * FROM skills WHERE id = ? AND org_id = ?", [params.id, auth.orgId]) as any;
+    if (targetRows.length === 0) { sendJson(res, 404, { error: "Skill not found" }); return; }
+    const targetSkill = targetRows[0];
+
+    if (targetSkill.is_builtin) {
+      sendJson(res, 403, { error: "Builtin skills cannot be deleted. Use skill import to manage builtin skills." });
       return;
     }
+
+    // Check agent bindings
+    const [bindRows] = await db.query(
+      `SELECT a.id, a.name FROM agent_skills ask
+       JOIN agents a ON a.id = ask.agent_id WHERE ask.skill_id = ?`,
+      [params.id],
+    ) as any;
 
     await db.query("DELETE FROM skill_reviews WHERE skill_id = ?", [params.id]);
     await db.query("DELETE FROM skill_versions WHERE skill_id = ?", [params.id]);
     await db.query("DELETE FROM skills WHERE id = ?", [params.id]);
+
+    // Notify affected agents to reload skills
+    for (const agent of bindRows) {
+      ctx?.notifySkillAgents?.(agent.id, ["skills"]);
+    }
 
     sendJson(res, 200, { ok: true });
   });
@@ -811,6 +856,138 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);
+  });
+
+  // ================================================================
+  // Skill Import (builtin pack management)
+  // ================================================================
+
+  // Upload zip with dry_run or execute
+  router.post(`${P}/skills/import`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    // Read raw body
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = Buffer.concat(chunks);
+    const contentType = req.headers["content-type"] || "";
+
+    // JSON request: dry_run from builtin directory
+    if (contentType.includes("application/json")) {
+      const json = JSON.parse(body.toString("utf8"));
+      if (json.source === "builtin") {
+        const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
+        const nodePath = await import("node:path");
+        const skills = parseSkillsDir(nodePath.join(process.cwd(), "skills", "core"));
+        if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
+        const { computeImportDiff } = await import("./skill-import.js");
+        const diff = await computeImportDiff(auth.orgId, skills);
+        sendJson(res, 200, { dry_run: true, ...diff });
+        return;
+      }
+      sendJson(res, 400, { error: "Invalid JSON request" });
+      return;
+    }
+
+    // Binary zip upload: Content-Type: application/zip or application/octet-stream
+    // Query params: ?dry_run=true&comment=...
+    const query = parseQuery(req.url ?? "");
+    const dryRun = query.dry_run === "true";
+    const comment = (query.comment as string) || "";
+
+    const { parseSkillPack, computeImportDiff, executeImport } = await import("./skill-import.js");
+    let skills;
+    try {
+      skills = await parseSkillPack(body);
+    } catch (err: any) {
+      sendJson(res, 400, { error: `Failed to parse skill pack: ${err.message}` });
+      return;
+    }
+    if (skills.length === 0) { sendJson(res, 400, { error: "No skills found in zip" }); return; }
+
+    if (dryRun) {
+      const diff = await computeImportDiff(auth.orgId, skills);
+      sendJson(res, 200, { dry_run: true, skill_count: skills.length, ...diff });
+      return;
+    }
+
+    try {
+      const result = await executeImport(auth.orgId, skills, auth.userId, comment,
+        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      sendJson(res, 500, { error: `Import failed: ${err.message}` });
+    }
+  });
+
+  // Init from bundled skills/core/
+  router.post(`${P}/skills/import/init`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const body = await parseBody<{ comment?: string }>(req);
+    const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
+    const { executeImport } = await import("./skill-import.js");
+    const nodePath = await import("node:path");
+
+    const skillsDir = nodePath.join(process.cwd(), "skills", "core");
+    const skills = parseSkillsDir(skillsDir);
+    if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
+
+    try {
+      const result = await executeImport(auth.orgId, skills, auth.userId,
+        body.comment || "Initialize from builtin",
+        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      sendJson(res, 500, { error: `Init failed: ${err.message}` });
+    }
+  });
+
+  // List import versions (history)
+  router.get(`${P}/skills/import/history`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, version, comment, skill_count, added, updated, deleted, imported_by, created_at
+       FROM skill_import_history ORDER BY version DESC LIMIT 20`,
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Rollback to a previous import version
+  router.post(`${P}/skills/import/rollback`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const body = await parseBody<{ version: number; comment?: string }>(req);
+    if (!body.version) { sendJson(res, 400, { error: "version required" }); return; }
+
+    const db = getDb();
+    const [histRows] = await db.query(
+      "SELECT snapshot FROM skill_import_history WHERE version = ?",
+      [body.version],
+    ) as any;
+    if (histRows.length === 0) { sendJson(res, 404, { error: "Import version not found" }); return; }
+
+    const { executeImport } = await import("./skill-import.js");
+    const skills = JSON.parse(histRows[0].snapshot);
+
+    try {
+      const result = await executeImport(auth.orgId, skills, auth.userId,
+        body.comment || `Rollback to v${body.version}`,
+        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      sendJson(res, 500, { error: `Rollback failed: ${err.message}` });
+    }
   });
 
   // ================================================================

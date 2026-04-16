@@ -642,31 +642,46 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     if (isProduction) {
       const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts
+        `SELECT
+           COALESCE(o.id, s.id) AS id,
+           COALESCE(o.name, s.name) AS name,
+           COALESCE(o.labels, s.labels) AS labels,
+           COALESCE(ov.specs, sv.specs) AS specs,
+           COALESCE(ov.scripts, sv.scripts) AS scripts
          FROM skills s
-         JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
-         WHERE s.id IN (${placeholders})
-           AND sv.version = (
-             SELECT MAX(sv2.version) FROM skill_versions sv2
-             WHERE sv2.skill_id = s.id AND sv2.is_approved = 1
-           )`,
+         LEFT JOIN skills o ON o.overlay_of = s.id
+         LEFT JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
+           AND sv.version = (SELECT MAX(v2.version) FROM skill_versions v2 WHERE v2.skill_id = s.id AND v2.is_approved = 1)
+         LEFT JOIN skill_versions ov ON ov.skill_id = o.id AND ov.is_approved = 1
+           AND ov.version = (SELECT MAX(v3.version) FROM skill_versions v3 WHERE v3.skill_id = o.id AND v3.is_approved = 1)
+         WHERE s.id IN (${placeholders})`,
         skillIds,
       ) as any;
       rows = result;
     } else {
       const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT id, name, labels, specs, scripts FROM skills WHERE id IN (${placeholders})`,
+        `SELECT
+           COALESCE(o.id, s.id) AS id,
+           COALESCE(o.name, s.name) AS name,
+           COALESCE(o.labels, s.labels) AS labels,
+           COALESCE(o.specs, s.specs) AS specs,
+           COALESCE(o.scripts, s.scripts) AS scripts
+         FROM skills s
+         LEFT JOIN skills o ON o.overlay_of = s.id
+         WHERE s.id IN (${placeholders})`,
         skillIds,
       ) as any;
       rows = result;
     }
-    const skills = rows.map((row: any) => ({
-      dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
-      scope: "global",
-      specs: row.specs || "",
-      scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
-    }));
+    const skills = rows
+      .filter((row: any) => row.specs != null)
+      .map((row: any) => ({
+        dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
+        scope: "global",
+        specs: row.specs || "",
+        scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
+      }));
     sendJson(res, 200, { version: new Date().toISOString(), skills });
   });
 

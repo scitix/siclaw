@@ -371,6 +371,20 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     updated_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // Skill import history (audit log for bulk skill imports)
+  `CREATE TABLE IF NOT EXISTS skill_import_history (
+    id CHAR(36) PRIMARY KEY,
+    version INT NOT NULL,
+    comment VARCHAR(500),
+    snapshot LONGTEXT NOT NULL,
+    skill_count INT NOT NULL DEFAULT 0,
+    added JSON,
+    updated JSON,
+    deleted JSON,
+    imported_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
 ];
 
 /**
@@ -423,6 +437,60 @@ export async function runPortalMigrations(): Promise<void> {
 
   // Backfill: normalise legacy 'cron' origin to 'task'
   await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
+
+  // Skill overlay columns
+  await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
+  await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
+
+  // Index on overlay_of (safe to re-run — swallow duplicate-index error)
+  try {
+    const [idxRows] = await db.query(
+      `SELECT INDEX_NAME FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'skills' AND INDEX_NAME = 'idx_skills_overlay'`,
+    ) as [Array<{ INDEX_NAME: string }>, unknown];
+    if (idxRows.length === 0) {
+      await db.query("ALTER TABLE `skills` ADD INDEX `idx_skills_overlay` (`overlay_of`)");
+      console.log("[portal-migrate] added index skills.idx_skills_overlay");
+    }
+  } catch (err: unknown) {
+    const e = err as { code?: string; errno?: number };
+    if (e?.code !== "ER_DUP_KEYNAME" && e?.errno !== 1061) throw err;
+  }
+
+  // Relax the unique constraint on (org_id, name) so a builtin skill and its
+  // overlay can share the same name. Drop the unique key and replace with a
+  // regular index.
+  try {
+    const [ukRows] = await db.query(
+      `SELECT INDEX_NAME FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'skills'
+         AND INDEX_NAME = 'uq_skills_org_name' AND NON_UNIQUE = 0`,
+    ) as [Array<{ INDEX_NAME: string }>, unknown];
+    if (ukRows.length > 0) {
+      await db.query("ALTER TABLE `skills` DROP INDEX `uq_skills_org_name`");
+      console.log("[portal-migrate] dropped unique key skills.uq_skills_org_name");
+    }
+  } catch (err: unknown) {
+    const e = err as { code?: string; errno?: number };
+    if (e?.code !== "ER_CANT_DROP_FIELD_OR_KEY" && e?.errno !== 1091) throw err;
+  }
+
+  try {
+    const [regIdxRows] = await db.query(
+      `SELECT INDEX_NAME FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'skills' AND INDEX_NAME = 'idx_skills_org_name'`,
+    ) as [Array<{ INDEX_NAME: string }>, unknown];
+    if (regIdxRows.length === 0) {
+      await db.query("ALTER TABLE `skills` ADD INDEX `idx_skills_org_name` (`org_id`, `name`)");
+      console.log("[portal-migrate] added index skills.idx_skills_org_name");
+    }
+  } catch (err: unknown) {
+    const e = err as { code?: string; errno?: number };
+    if (e?.code !== "ER_DUP_KEYNAME" && e?.errno !== 1061) throw err;
+  }
+
+  // Backfill: mark existing system-created skills as builtin
+  await db.query("UPDATE skills SET is_builtin = 1 WHERE created_by = 'system' AND is_builtin = 0");
 
   console.log("[portal-migrate] All tables ready");
 }

@@ -97,7 +97,8 @@ export function registerAgentRoutes(
     // Auto-bind builtin skills to new agent
     try {
       const [builtinSkills] = await db.query(
-        "SELECT id FROM skills WHERE created_by = 'system' AND status = 'installed'",
+        "SELECT id FROM skills WHERE is_builtin = 1 AND status = 'installed' AND org_id = ?",
+        [auth.orgId],
       ) as any;
       for (const skill of builtinSkills) {
         await db.query(
