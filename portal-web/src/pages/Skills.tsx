@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react"
 import { useNavigate, useSearchParams } from "react-router-dom"
-import { Plus, Zap, Trash2, Loader2, Search, ClipboardCheck, ShieldCheck, Tag, ChevronDown, ChevronRight, X, Check, CheckCircle, XCircle } from "lucide-react"
+import { Plus, Zap, Trash2, Loader2, Search, ClipboardCheck, ShieldCheck, Tag, ChevronDown, ChevronRight, X, Check, CheckCircle, XCircle, Upload } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -12,6 +12,7 @@ interface Skill {
   id: string; name: string; description: string; labels: string[] | null
   author_id: string; status: "draft" | "pending_review" | "installed"
   version: number; created_at: string; updated_at: string
+  is_builtin?: boolean; overlay_of?: string | null
 }
 
 interface PendingReview {
@@ -218,10 +219,15 @@ export function Skills() {
         </div>
 
         {activeTab === "all" && (
-          <button onClick={() => navigate("/skills/new")}
-            className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
-            <Plus className="h-3.5 w-3.5" /> New Skill
-          </button>
+          <div className="flex items-center gap-2">
+            <button onClick={() => navigate("/skills/import")} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">
+              <Upload className="h-3.5 w-3.5" /> Import
+            </button>
+            <button onClick={() => navigate("/skills/new")}
+              className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
+              <Plus className="h-3.5 w-3.5" /> New Skill
+            </button>
+          </div>
         )}
       </div>
 
@@ -327,6 +333,12 @@ export function Skills() {
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-medium font-mono truncate">{s.name}</p>
                           <span className={`px-1.5 py-0.5 rounded text-[10px] ${st.bg} ${st.text}`}>{st.label}</span>
+                          {s.is_builtin && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-400">BUILTIN</span>
+                          )}
+                          {s.overlay_of && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/20 text-cyan-400">OVERLAY</span>
+                          )}
                           <span className="text-[10px] text-muted-foreground">v{s.version}</span>
                         </div>
                         <p className="text-xs text-muted-foreground truncate">{s.description || "No description"}</p>
@@ -339,10 +351,12 @@ export function Skills() {
                         )}
                       </div>
                     </div>
-                    <button onClick={e => { e.stopPropagation(); handleDelete(s.id) }} title="Delete"
-                      className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400 shrink-0">
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                    {!s.is_builtin && (
+                      <button onClick={e => { e.stopPropagation(); handleDelete(s.id) }} title="Delete"
+                        className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400 shrink-0">
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
                   </div>
                 )
               })}
