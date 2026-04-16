@@ -140,8 +140,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     const overlayExclude = " AND NOT (is_builtin = 1 AND id IN (SELECT overlay_of FROM skills WHERE overlay_of IS NOT NULL AND org_id = ?))";
+    const overlayExcludeAliased = " AND NOT (s.is_builtin = 1 AND s.id IN (SELECT overlay_of FROM skills WHERE overlay_of IS NOT NULL AND org_id = ?))";
     let countSql = "SELECT COUNT(*) AS count FROM skills WHERE org_id = ?" + overlayExclude;
-    let listSql = "SELECT * FROM skills WHERE org_id = ?" + overlayExclude;
+    let listSql = "SELECT s.*, (SELECT MAX(sv.version) FROM skill_versions sv WHERE sv.skill_id = s.id AND sv.is_approved = 1) AS installed_version FROM skills s WHERE s.org_id = ?" + overlayExcludeAliased;
     const params: unknown[] = [auth.orgId, auth.orgId];
 
     if (search) {
@@ -161,7 +162,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       }
     }
 
-    listSql += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+    listSql += " ORDER BY s.created_at DESC LIMIT ? OFFSET ?";
 
     const [[countRows], [listRows]] = await Promise.all([
       db.query(countSql, params),

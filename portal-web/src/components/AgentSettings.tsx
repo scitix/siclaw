@@ -61,7 +61,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [loadingResources, setLoadingResources] = useState(true)
   const [allClusters, setAllClusters] = useState<AvailableCluster[]>([])
   const [allHosts, setAllHosts] = useState<AvailableHost[]>([])
-  const [allSkills, setAllSkills] = useState<{ id: string; name: string; description: string; status: string; labels: string[] | null }[]>([])
+  const [allSkills, setAllSkills] = useState<{ id: string; name: string; description: string; status: string; version: number; installed_version?: number | null; labels: string[] | null; is_builtin?: boolean }[]>([])
   const [allMcpServers, setAllMcpServers] = useState<{ id: string; name: string; transport: string; enabled: number }[]>([])
   const [selectedClusterIds, setSelectedClusterIds] = useState<Set<string>>(new Set())
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set())
@@ -168,7 +168,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       <div className="flex-1 overflow-auto">
         {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} />}
         {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} />}
-        {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} />}
+        {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} />}
         {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} />}
         {activeTab === "channels" && <ChannelsTab agentId={agent.id} selectedChannelIds={selectedChannelIds} setSelectedChannelIds={setSelectedChannelIds} />}
@@ -250,13 +250,19 @@ function ModelTab({ providers, modelProvider, setModelProvider, modelId, setMode
   )
 }
 
-function SkillsTab({ allSkills, selectedSkillIds, setSelectedSkillIds, skillLabelFilter, setSkillLabelFilter }: {
-  allSkills: { id: string; name: string; status: string; labels: string[] | null }[]
+function SkillsTab({ allSkills, selectedSkillIds, setSelectedSkillIds, skillLabelFilter, setSkillLabelFilter, isProduction }: {
+  allSkills: { id: string; name: string; status: string; version: number; installed_version?: number | null; labels: string[] | null; is_builtin?: boolean }[]
   selectedSkillIds: Set<string>; setSelectedSkillIds: (v: Set<string>) => void
   skillLabelFilter: string; setSkillLabelFilter: (v: string) => void
+  isProduction: boolean
 }) {
-  const allLabels = Array.from(new Set(allSkills.flatMap(s => Array.isArray(s.labels) ? s.labels : []))).sort()
-  const filtered = allSkills.filter(s => {
+  // Production agents: only show skills with an approved version
+  // Dev agents: show all skills
+  const visibleSkills = isProduction
+    ? allSkills.filter(s => s.installed_version != null && s.installed_version > 0)
+    : allSkills
+  const allLabels = Array.from(new Set(visibleSkills.flatMap(s => Array.isArray(s.labels) ? s.labels : []))).sort()
+  const filtered = visibleSkills.filter(s => {
     if (!skillLabelFilter) return true
     return (Array.isArray(s.labels) ? s.labels : []).includes(skillLabelFilter)
   })
@@ -273,7 +279,7 @@ function SkillsTab({ allSkills, selectedSkillIds, setSelectedSkillIds, skillLabe
   return (
     <div className="px-6 py-6 space-y-3">
       <div className="flex items-center justify-between">
-        <span className="text-[12px] text-muted-foreground font-medium">Bound Skills ({selectedSkillIds.size} / {allSkills.length})</span>
+        <span className="text-[12px] text-muted-foreground font-medium">Bound Skills ({selectedSkillIds.size} / {visibleSkills.length}){isProduction && visibleSkills.length < allSkills.length ? ` · ${allSkills.length - visibleSkills.length} draft-only hidden` : ""}</span>
       </div>
       <div className="flex items-center gap-2">
         <select value={skillLabelFilter} onChange={e => setSkillLabelFilter(e.target.value)} className="flex-1 h-7 px-2 text-[12px] rounded border border-border bg-background">
@@ -290,9 +296,20 @@ function SkillsTab({ allSkills, selectedSkillIds, setSelectedSkillIds, skillLabe
             <input type="checkbox" checked={selectedSkillIds.has(s.id)} onChange={e => { const next = new Set(selectedSkillIds); e.target.checked ? next.add(s.id) : next.delete(s.id); setSelectedSkillIds(next) }} className="rounded" />
             <span className="font-mono flex-1">{s.name}</span>
             {Array.isArray(s.labels) && s.labels.map(l => <span key={l} className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">{l}</span>)}
-            <span className={`px-1 py-0.5 rounded text-[9px] ${s.status === "installed" ? "bg-green-500/20 text-green-400" : s.status === "pending_review" ? "bg-blue-500/20 text-blue-400" : "bg-yellow-500/20 text-yellow-400"}`}>
-              {s.status === "installed" ? "Installed" : s.status === "pending_review" ? "Pending" : "Draft"}
-            </span>
+            {isProduction ? (
+              <span className="px-1 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400">v{s.installed_version}</span>
+            ) : (
+              <>
+                {s.installed_version != null && s.installed_version > 0 && (
+                  <span className="px-1 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400">v{s.installed_version}</span>
+                )}
+                {s.version !== (s.installed_version ?? 0) && (
+                  <span className={`px-1 py-0.5 rounded text-[9px] ${s.status === "pending_review" ? "bg-blue-500/20 text-blue-400" : "bg-yellow-500/20 text-yellow-400"}`}>
+                    draft v{s.version}
+                  </span>
+                )}
+              </>
+            )}
           </label>
         ))}
         {filtered.length === 0 && <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">{allSkills.length === 0 ? "No skills available" : "No skills match this label"}</p>}

@@ -407,6 +407,7 @@ export async function createSiclawSession(
   // never runs). Server modes always have resolved/ created by materialize.
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
+  const platformPath = path.resolve(cwd, "skills", "platform");
 
   const skillsDirs: string[] = [];
   if (fs.existsSync(resolvedSkillsDir)) {
@@ -416,6 +417,8 @@ export async function createSiclawSession(
       if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
   }
+  // Platform skills are always loaded (system-level, not user-managed)
+  if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
 
   // Resolve credentials directory for tools and /setup extension
   const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
