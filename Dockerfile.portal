@@ -45,6 +45,9 @@ COPY --from=frontend-builder /app/portal-web/dist/ ./portal-web/dist/
 # Builtin skills (synced to DB on startup by builtin-sync.ts)
 COPY skills/core/ ./skills/core/
 
+# Knowledge wiki (compiled pages + raw materials)
+COPY knowledge/ ./knowledge/
+
 ENV NODE_ENV=production
 ENV PORTAL_PORT=3003
 
