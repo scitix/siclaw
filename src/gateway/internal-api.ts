@@ -2,7 +2,7 @@
  * Internal API handlers for AgentBox consumption (Port 3002 mTLS).
  *
  * Runtime no longer accesses the database directly. All data queries
- * are proxied through Portal's adapter API endpoints.
+ * are proxied through Portal via FrontendWsClient RPC.
  *
  * Endpoints:
  *   GET    /api/internal/settings          — model providers + entries
@@ -16,7 +16,7 @@
 
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import type { RuntimeConfig } from "./config.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 
@@ -34,45 +34,20 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
-/** POST helper for calling Portal adapter endpoints. */
-async function adapterPost(config: RuntimeConfig, path: string, body: unknown): Promise<any> {
-  const resp = await fetch(`${config.serverUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": config.portalSecret },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
-}
-
-/** GET helper for calling Portal adapter endpoints. */
-async function adapterGet(config: RuntimeConfig, path: string, headers?: Record<string, string>): Promise<any> {
-  const resp = await fetch(`${config.serverUrl}${path}`, {
-    headers: { "X-Auth-Token": config.portalSecret, ...headers },
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
-}
-
 /**
- * Fetch agent resource bindings from Portal Adapter.
+ * Fetch agent resource bindings from Portal via RPC.
  * Returns skill_ids and mcp_server_ids bound to the agent.
  */
 async function fetchAgentResources(
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
   orgId: string,
   agentId: string,
 ): Promise<{ skillIds: string[]; mcpServerIds: string[]; isProduction: boolean }> {
   try {
-    const data = await adapterGet(
-      config,
-      `/api/internal/siclaw/agent/${agentId}/resources`,
-      { "X-Cert-Org-Id": orgId },
-    );
+    const data = await frontendClient.request("config.getResources", {
+      agentId,
+      orgId,
+    });
     return {
       skillIds: data.skill_ids ?? [],
       mcpServerIds: data.mcp_server_ids ?? [],
@@ -87,20 +62,19 @@ async function fetchAgentResources(
 /**
  * GET /api/internal/settings
  *
- * Proxies to Portal Adapter to get the agent's bound provider + models.
+ * Proxies to Portal via RPC to get the agent's bound provider + models.
  */
 export async function handleSettings(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
-    const data = await adapterGet(
-      config,
-      `/api/internal/siclaw/agent/${identity.agentId}/settings`,
-      { "X-Cert-Org-Id": identity.orgId },
-    );
+    const data = await frontendClient.request("config.getSettings", {
+      agentId: identity.agentId,
+      orgId: identity.orgId,
+    });
     sendJson(res, 200, data);
   } catch (err) {
     console.error("[internal-api] settings error:", err);
@@ -112,23 +86,23 @@ export async function handleSettings(
  * GET /api/internal/mcp-servers
  *
  * Returns MCP server configs bound to the agent.
- * Fetches binding from adapter, then queries MCP details via adapter.
+ * Fetches binding via RPC, then queries MCP details via RPC.
  */
 export async function handleMcpServers(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
-    const { mcpServerIds } = await fetchAgentResources(config, identity.orgId, identity.agentId);
+    const { mcpServerIds } = await fetchAgentResources(frontendClient, identity.orgId, identity.agentId);
 
     if (mcpServerIds.length === 0) {
       sendJson(res, 200, { mcpServers: {} });
       return;
     }
 
-    const data = await adapterPost(config, "/api/internal/siclaw/mcp-servers/by-ids", {
+    const data = await frontendClient.request("config.getMcpServers", {
       ids: mcpServerIds,
     });
     sendJson(res, 200, { mcpServers: data.mcpServers });
@@ -141,18 +115,18 @@ export async function handleMcpServers(
 /**
  * GET /api/internal/skills/bundle
  *
- * Returns a skill bundle for the agent via Portal adapter.
+ * Returns a skill bundle for the agent via RPC.
  */
 export async function handleSkillsBundle(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
-    const { skillIds, isProduction } = await fetchAgentResources(config, identity.orgId, identity.agentId);
+    const { skillIds, isProduction } = await fetchAgentResources(frontendClient, identity.orgId, identity.agentId);
 
-    const data = await adapterPost(config, "/api/internal/siclaw/skills/bundle", {
+    const data = await frontendClient.request("config.getSkillBundle", {
       skill_ids: skillIds,
       is_production: isProduction,
     });
@@ -172,10 +146,10 @@ export async function handleAgentTasksList(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
-    const data = await adapterPost(config, "/api/internal/siclaw/agent-tasks/list", {
+    const data = await frontendClient.request("task.list", {
       agent_id: identity.agentId,
       user_id: identity.userId,
     });
@@ -209,7 +183,7 @@ export async function handleAgentTasksCreate(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
     const body = await readJsonBody(req) as {
@@ -226,7 +200,7 @@ export async function handleAgentTasksCreate(
     const invalid = validateSchedule(body.schedule);
     if (invalid) { sendJson(res, 400, { error: invalid }); return; }
 
-    const data = await adapterPost(config, "/api/internal/siclaw/agent-tasks/create", {
+    const data = await frontendClient.request("task.create", {
       id: randomUUID(),
       agent_id: identity.agentId,
       user_id: identity.userId,
@@ -254,7 +228,7 @@ export async function handleAgentTasksUpdate(
   res: http.ServerResponse,
   identity: CertificateIdentity,
   taskId: string,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
     const body = await readJsonBody(req) as Record<string, unknown>;
@@ -263,7 +237,7 @@ export async function handleAgentTasksUpdate(
       if (invalid) { sendJson(res, 400, { error: invalid }); return; }
     }
 
-    const data = await adapterPost(config, "/api/internal/siclaw/agent-tasks/update", {
+    const data = await frontendClient.request("task.update", {
       task_id: taskId,
       agent_id: identity.agentId,
       user_id: identity.userId,
@@ -288,10 +262,10 @@ export async function handleAgentTasksDelete(
   res: http.ServerResponse,
   identity: CertificateIdentity,
   taskId: string,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
-    const data = await adapterPost(config, "/api/internal/siclaw/agent-tasks/delete", {
+    const data = await frontendClient.request("task.delete", {
       task_id: taskId,
       agent_id: identity.agentId,
       user_id: identity.userId,

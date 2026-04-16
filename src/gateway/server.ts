@@ -40,8 +40,9 @@ import {
 } from "./ws-protocol.js";
 import { authenticateProxy, type ProxyIdentity } from "./trusted-proxy.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
-import { createCredentialService, type CredentialService } from "./credential-service.js";
+import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
@@ -79,6 +80,8 @@ export interface StartRuntimeOptions {
   config: RuntimeConfig;
   agentBoxManager: AgentBoxManager;
   spawner?: BoxSpawner;
+  /** FrontendWsClient for Portal RPC communication. */
+  frontendClient: FrontendWsClient;
   /** Optional pre-constructed credential service. When omitted, builds from config. */
   credentialService?: CredentialService;
   /** Optional pre-constructed CertificateManager. When omitted, creates a new one. */
@@ -86,13 +89,14 @@ export interface StartRuntimeOptions {
 }
 
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
-  const { config, agentBoxManager, spawner } = opts;
+  const { config, agentBoxManager, spawner, frontendClient } = opts;
 
   const clients = new Set<WebSocket>();
   const broadcast = createBroadcaster(clients);
 
   // ── Credential Service ───────────────────────────────────
-  const credentialService = opts.credentialService ?? createCredentialService(config);
+  if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
+  const credentialService = opts.credentialService;
 
   // ── Certificate Manager ──────────────────────────────────
   const certManager = opts.certManager ?? await CertificateManager.create();
@@ -157,10 +161,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // output. Credential-manifest redaction is follow-up work.
     const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
 
-    // Stream + persist events back to the WS client.
-    if (context.ws) {
+    // Stream + persist events back to the caller via sendEvent().
+    // - Direct WS mode: sendEvent writes to the originating WS connection
+    // - Phone-home mode: sendEvent emits via FrontendWsClient to Portal
+    {
       const abortCtrl = new AbortController();
-      activeStreams.set(context.ws, abortCtrl);
+      if (context.ws) activeStreams.set(context.ws, abortCtrl);
 
       // Non-blocking: consume events in background
       (async () => {
@@ -173,10 +179,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             redactionConfig,
             signal: abortCtrl.signal,
             onEvent: (evt) => {
-              if (context.ws && context.ws.readyState === WebSocket.OPEN) {
-                if (context.ws.bufferedAmount > MAX_BUFFERED_BYTES) return;
-                context.ws.send(buildEvent("chat.event", { sessionId: promptResult.sessionId, event: evt }));
-              }
+              context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: evt });
             },
           });
         } catch (err) {
@@ -184,7 +187,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
           }
         } finally {
-          activeStreams.delete(context.ws!);
+          if (context.ws) activeStreams.delete(context.ws);
         }
       })();
     }
@@ -340,6 +343,24 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
 
+  // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
+  // Portal sends commands (e.g. chat.send, agent.reload, task.fireNow) to
+  // Runtime over the persistent WS connection. We route them through the
+  // same rpcMethods map used by the WS server.
+  frontendClient.onCommand(async (method, params) => {
+    const handler = rpcMethods.get(method);
+    if (!handler) throw new Error(`Unknown RPC method: ${method}`);
+    // Build a context that emits events back to Portal via the WS connection.
+    // chat.send uses context.sendEvent + context.ws to stream SSE events;
+    // in phone-home mode we use frontendClient.emitEvent() instead of a WS ref.
+    const context: RpcContext = {
+      sendEvent: (event, payload) => {
+        frontendClient.emitEvent(event, payload);
+      },
+    };
+    return handler(params, context);
+  });
+
   // ── REST API Router ──────────────────────────────────────
   // Siclaw CRUD routes are now handled by Portal (portal/siclaw-api.ts).
   // Runtime only serves health, WS, and internal mTLS endpoints.
@@ -364,8 +385,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     metricsAggregator = new MetricsAggregator("local", localCollector);
   }
 
-  registerMetricsRoutes(restRouter, config, metricsAggregator);
-  registerSystemRoutes(restRouter, config);
+  registerMetricsRoutes(restRouter, config, metricsAggregator, frontendClient);
+  registerSystemRoutes(restRouter, config, frontendClient);
 
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;
@@ -551,46 +572,46 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
-          // Settings (model providers + entries) — from Runtime DB
+          // Settings (model providers + entries) — via RPC
           if (url === "/api/internal/settings" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            handleSettings(req, res, identity, config);
+            handleSettings(req, res, identity, frontendClient);
             return;
           }
 
-          // MCP servers — from Runtime DB, filtered by agent binding (via Upstream Adapter)
+          // MCP servers — filtered by agent binding (via RPC)
           if (url === "/api/internal/mcp-servers" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            handleMcpServers(req, res, identity, config);
+            handleMcpServers(req, res, identity, frontendClient);
             return;
           }
 
-          // Skills bundle — from Runtime DB, filtered by agent binding (via Upstream Adapter)
+          // Skills bundle — filtered by agent binding (via RPC)
           if (url === "/api/internal/skills/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
-            handleSkillsBundle(req, res, identity, config);
+            handleSkillsBundle(req, res, identity, frontendClient);
             return;
           }
 
-          // Agent tasks — CRUD from Runtime DB, scoped by mTLS identity.agentId
+          // Agent tasks — CRUD scoped by mTLS identity.agentId (via RPC)
           if (url.startsWith("/api/internal/agent-tasks")) {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             const pathOnly = url.split("?")[0];
             const idMatch = pathOnly.match(/^\/api\/internal\/agent-tasks\/([^/]+)$/);
             if (pathOnly === "/api/internal/agent-tasks" && method === "GET") {
-              handleAgentTasksList(req, res, identity, config);
+              handleAgentTasksList(req, res, identity, frontendClient);
               return;
             }
             if (pathOnly === "/api/internal/agent-tasks" && method === "POST") {
-              handleAgentTasksCreate(req, res, identity, config);
+              handleAgentTasksCreate(req, res, identity, frontendClient);
               return;
             }
             if (idMatch && method === "PUT") {
-              handleAgentTasksUpdate(req, res, identity, idMatch[1], config);
+              handleAgentTasksUpdate(req, res, identity, idMatch[1], frontendClient);
               return;
             }
             if (idMatch && method === "DELETE") {
-              handleAgentTasksDelete(req, res, identity, idMatch[1], config);
+              handleAgentTasksDelete(req, res, identity, idMatch[1], frontendClient);
               return;
             }
             res.writeHead(405, { "Content-Type": "application/json" });
@@ -630,6 +651,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     credentialService,
     async close() {
       metricsAggregator.destroy();
+      frontendClient.close();
       await agentBoxManager.cleanup();
       for (const ws of clients) ws.close();
       clients.clear();

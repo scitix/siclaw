@@ -2,12 +2,12 @@
  * Task Coordinator — scheduler + executor for agent_tasks in Runtime.
  *
  * Runtime no longer accesses the database directly. All task persistence
- * is proxied through Portal's adapter API endpoints.
+ * is proxied through Portal via FrontendWsClient RPC.
  *
  * Pattern:
- *   - Load active tasks at startup via adapter, re-sync every 15s
- *   - Each fire: resolve agent's model binding via adapter, create a fresh
- *     session, stream events through sse-consumer, record the run via adapter
+ *   - Load active tasks at startup via RPC, re-sync every 15s
+ *   - Each fire: resolve agent's model binding via RPC, create a fresh
+ *     session, stream events through sse-consumer, record the run via RPC
  *   - Emits task.completed events via the supplied broadcaster so upstream
  *     (upstream in prod, Portal in test) can route notifications to users.
  */
@@ -21,6 +21,7 @@ import { resolveAgentModelBinding } from "./agent-model-binding.js";
 import { appendMessage, ensureChatSession, incrementMessageCount } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 
 /** Row shape needed by the scheduler — carries the task prompt out-of-band. */
 interface AgentTaskDbRow {
@@ -57,6 +58,7 @@ export type TaskCompletedHandler = (evt: TaskCompletedEvent) => void;
 
 export interface TaskCoordinatorOptions {
   config: RuntimeConfig;
+  frontendClient: FrontendWsClient;
   agentBoxManager: AgentBoxManager;
   agentBoxTlsOptions?: AgentBoxTlsOptions;
   syncIntervalMs?: number;
@@ -72,34 +74,11 @@ export type FireNowOutcome =
   | { kind: "cooldown"; retryAfterSec: number }
   | { kind: "not_found" };
 
-/** POST helper for adapter calls. */
-async function adapterPost(config: RuntimeConfig, path: string, body: unknown): Promise<any> {
-  const resp = await fetch(`${config.serverUrl}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": config.portalSecret },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
-}
-
-/** GET helper for adapter calls. */
-async function adapterGet(config: RuntimeConfig, path: string): Promise<any> {
-  const resp = await fetch(`${config.serverUrl}${path}`, {
-    headers: { "X-Auth-Token": config.portalSecret },
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
-}
-
 export class TaskCoordinator {
   private scheduler: CronScheduler;
   private manager: AgentBoxManager;
   private config: RuntimeConfig;
+  private frontendClient: FrontendWsClient;
   private tlsOptions?: AgentBoxTlsOptions;
   private syncTimer?: ReturnType<typeof setInterval>;
   private pruneTimer?: ReturnType<typeof setInterval>;
@@ -114,6 +93,7 @@ export class TaskCoordinator {
 
   constructor(opts: TaskCoordinatorOptions) {
     this.config = opts.config;
+    this.frontendClient = opts.frontendClient;
     this.manager = opts.agentBoxManager;
     this.tlsOptions = opts.agentBoxTlsOptions;
     this.syncIntervalMs = opts.syncIntervalMs ?? 15_000;
@@ -168,7 +148,7 @@ export class TaskCoordinator {
   private async pruneOldRuns(): Promise<void> {
     const t0 = Date.now();
     try {
-      const result = await adapterPost(this.config, "/api/internal/siclaw/tasks/prune", {
+      const result = await this.frontendClient.request("task.prune", {
         retention_days: this.retentionDays,
       });
       const sessions = result.sessions_deleted ?? 0;
@@ -183,9 +163,9 @@ export class TaskCoordinator {
     }
   }
 
-  /** Reconcile scheduler state with active tasks from Portal adapter. */
+  /** Reconcile scheduler state with active tasks from Portal via RPC. */
   private async syncFromAdapter(): Promise<void> {
-    const result = await adapterGet(this.config, "/api/internal/siclaw/tasks/active");
+    const result = await this.frontendClient.request("task.listActive");
     const rows = result.data as AgentTaskDbRow[];
 
     const activeIds = new Set<string>();
@@ -244,11 +224,11 @@ export class TaskCoordinator {
       return;
     }
 
-    // Defensive re-check against adapter: between the scheduler's setTimeout
+    // Defensive re-check via RPC: between the scheduler's setTimeout
     // and the callback firing, the user may have paused the task.
     if (!opts?.skipStatusCheck) {
       try {
-        const statusResult = await adapterGet(this.config, `/api/internal/siclaw/tasks/${job.id}/status`);
+        const statusResult = await this.frontendClient.request("task.getStatus", { taskId: job.id });
         const current = statusResult.status;
         if (current !== "active") {
           console.log(`[task-coordinator] Skipping task ${job.id} (${job.name}) — status=${current ?? "missing"}`);
@@ -271,7 +251,7 @@ export class TaskCoordinator {
     let runId = "";
     try {
       runId = crypto.randomUUID();
-      await adapterPost(this.config, "/api/internal/siclaw/task-run/start", {
+      await this.frontendClient.request("task.runStart", {
         id: runId,
         task_id: job.id,
         session_id: sessionId,
@@ -284,7 +264,7 @@ export class TaskCoordinator {
     try {
       console.log(`[task-coordinator] Executing task ${job.id} (${job.name}) agent=${agentId} user=${userId}`);
 
-      const binding = await resolveAgentModelBinding(agentId, this.config);
+      const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
       if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
 
       const handle = await this.manager.getOrCreate(userId, agentId);
@@ -301,7 +281,7 @@ export class TaskCoordinator {
       };
       await client.prompt(promptOpts);
 
-      // Seed chat_sessions + user message via adapter
+      // Seed chat_sessions + user message via RPC
       await ensureChatSession(sessionId, agentId, userId, job.name, prompt);
       await appendMessage({ sessionId, role: "user", content: prompt });
       await incrementMessageCount(sessionId);
@@ -338,7 +318,7 @@ export class TaskCoordinator {
     // Persistence + notification — best-effort
     try {
       if (runId) {
-        await adapterPost(this.config, "/api/internal/siclaw/task-run/finalize", {
+        await this.frontendClient.request("task.runFinalize", {
           run_id: runId,
           status,
           result_text: resultText.slice(0, 10_000),
@@ -348,7 +328,7 @@ export class TaskCoordinator {
       } else {
         // Fallback: no reserved row → use the existing task-run endpoint
         runId = crypto.randomUUID();
-        await adapterPost(this.config, "/api/internal/siclaw/task-run", {
+        await this.frontendClient.request("task.runRecord", {
           id: runId,
           task_id: job.id,
           status,
@@ -358,7 +338,7 @@ export class TaskCoordinator {
           session_id: sessionId,
         });
       }
-      await adapterPost(this.config, "/api/internal/siclaw/task-metadata/update", {
+      await this.frontendClient.request("task.updateMeta", {
         task_id: job.id,
         last_result: status,
       });
@@ -391,7 +371,7 @@ export class TaskCoordinator {
     if (this.executing.has(taskId)) return { kind: "in_flight" };
 
     try {
-      const result = await adapterPost(this.config, "/api/internal/siclaw/tasks/fire-now", {
+      const result = await this.frontendClient.request("task.fireNow", {
         task_id: taskId,
         cooldown_sec: this.manualRunCooldownSec,
       });

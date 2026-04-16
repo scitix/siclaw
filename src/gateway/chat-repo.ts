@@ -1,11 +1,11 @@
 /**
- * Chat repository — thin HTTP client that calls Portal adapter endpoints.
+ * Chat repository — FrontendWsClient RPC client for chat persistence.
  *
  * Runtime no longer accesses the database directly. All chat persistence
- * goes through Portal's adapter API.
+ * goes through Portal via WS RPC.
  */
 
-import { loadRuntimeConfig } from "./config.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 
 export interface AppendMessageInput {
   sessionId: string;
@@ -31,42 +31,37 @@ export interface StoredMessage {
   createdAt: Date;
 }
 
-function getAdapterUrl(): { url: string; token: string } {
-  const config = loadRuntimeConfig();
-  return { url: config.serverUrl, token: config.portalSecret };
+/** Module-level FrontendWsClient reference, set via initChatRepo(). */
+let _client: FrontendWsClient | null = null;
+
+/** Initialize the chat repo module with a FrontendWsClient instance. */
+export function initChatRepo(client: FrontendWsClient): void {
+  _client = client;
 }
 
-async function adapterPost(path: string, body: unknown): Promise<any> {
-  const { url, token } = getAdapterUrl();
-  const resp = await fetch(`${url}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": token },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter ${path} returned ${resp.status}: ${await resp.text()}`);
-  }
-  return resp.json();
+function getClient(): FrontendWsClient {
+  if (!_client) throw new Error("[chat-repo] FrontendWsClient not initialized — call initChatRepo() first");
+  return _client;
 }
 
 /**
- * Ensure a chat_sessions row exists (upsert via adapter).
+ * Ensure a chat_sessions row exists (upsert via RPC).
  */
 export async function ensureChatSession(
   sessionId: string, agentId: string, userId: string,
   title?: string, preview?: string, origin?: string,
 ): Promise<void> {
-  await adapterPost("/api/internal/siclaw/chat/ensure-session", {
+  await getClient().request("chat.ensureSession", {
     session_id: sessionId, agent_id: agentId, user_id: userId,
     title, preview, origin,
   });
 }
 
 /**
- * Insert a single message row via adapter. Returns the generated id.
+ * Insert a single message row via RPC. Returns the generated id.
  */
 export async function appendMessage(msg: AppendMessageInput): Promise<string> {
-  const result = await adapterPost("/api/internal/siclaw/chat/append-message", {
+  const result = await getClient().request("chat.appendMessage", {
     session_id: msg.sessionId,
     role: msg.role,
     content: msg.content,
@@ -88,26 +83,17 @@ export async function incrementMessageCount(_sessionId: string): Promise<void> {
 }
 
 /**
- * Read messages for a session via adapter API.
+ * Read messages for a session via RPC.
  */
 export async function getMessages(
   sessionId: string,
   opts?: { before?: Date; limit?: number },
 ): Promise<StoredMessage[]> {
-  const { url, token } = getAdapterUrl();
-  const resp = await fetch(`${url}/api/internal/siclaw/chat/messages`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": token },
-    body: JSON.stringify({
-      session_id: sessionId,
-      before: opts?.before?.toISOString() ?? undefined,
-      limit: opts?.limit ?? 50,
-    }),
-  });
-  if (!resp.ok) {
-    throw new Error(`Adapter chat/messages returned ${resp.status}: ${await resp.text()}`);
-  }
-  const data = await resp.json() as { messages: Array<Record<string, unknown>> };
+  const data = await getClient().request("chat.getMessages", {
+    session_id: sessionId,
+    before: opts?.before?.toISOString() ?? undefined,
+    limit: opts?.limit ?? 50,
+  }) as { messages: Array<Record<string, unknown>> };
 
   return (data.messages as Array<Record<string, unknown>>).map((r) => {
     const rawMeta = r.metadata as unknown;

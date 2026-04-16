@@ -7,6 +7,7 @@
 
 import type { RestRouter } from "./rest-router.js";
 import type { RuntimeConfig } from "./config.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { sendJson, parseBody, requireAdmin } from "./rest-router.js";
 import { SystemConfigRepo, ALLOWED_CONFIG_KEYS } from "./system-config-repo.js";
 
@@ -23,8 +24,8 @@ function validateHttpUrl(value: string): { ok: true } | { ok: false; error: stri
   }
 }
 
-export function registerSystemRoutes(router: RestRouter, config: RuntimeConfig): void {
-  const repo = new SystemConfigRepo();
+export function registerSystemRoutes(router: RestRouter, config: RuntimeConfig, frontendClient: FrontendWsClient): void {
+  const repo = new SystemConfigRepo(frontendClient);
 
   router.get("/api/v1/siclaw/system/config", async (req, res) => {
     const auth = requireAdmin(req, config.jwtSecret);

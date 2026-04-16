@@ -11,6 +11,8 @@ import { AgentBoxManager, K8sSpawner, ProcessSpawner, LocalSpawner } from "./gat
 import { ChannelManager } from "./gateway/channel-manager.js";
 import { TaskCoordinator } from "./gateway/task-coordinator.js";
 import { createCredentialService } from "./gateway/credential-service.js";
+import { FrontendWsClient } from "./gateway/frontend-ws-client.js";
+import { initChatRepo } from "./gateway/chat-repo.js";
 
 // Parse arguments
 const args = process.argv.slice(2);
@@ -27,10 +29,24 @@ if (!config.runtimeSecret) {
 }
 
 // Runtime no longer accesses the database directly — all persistence
-// goes through Portal's adapter API.
+// goes through Portal via FrontendWsClient RPC.
+
+// ── FrontendWsClient — persistent WS connection to Portal ───
+const frontendClient = new FrontendWsClient({
+  serverUrl: config.serverUrl,
+  portalSecret: config.portalSecret,
+  agentId: process.env.SICLAW_AGENT_ID || "runtime",
+});
+
+if (config.serverUrl) {
+  await frontendClient.connect();
+}
+
+// Initialize chat-repo module with WS client
+initChatRepo(frontendClient);
 
 // Credential service — used by mTLS credential-proxy on port 3002.
-const credentialService = createCredentialService(config);
+const credentialService = createCredentialService(frontendClient);
 
 // CertManager — needed early for LocalSpawner to sign agentbox certs.
 // In K8s mode, startRuntime() creates its own; here we create it once and share.
@@ -66,61 +82,52 @@ const runtime = await startRuntime({
   config,
   agentBoxManager,
   spawner,
+  frontendClient,
   credentialService,
   certManager,
 });
 
-// Boot channel integrations (Lark, etc.) from DB
+// Boot channel integrations (Lark, etc.) via RPC
 const channelManager = new ChannelManager(
   agentBoxManager,
   runtime.agentBoxTlsOptions,
-  config,
+  frontendClient,
 );
 await channelManager.bootFromDb();
 
 // Scheduled-task coordinator — owns agent_tasks scheduler + execution.
 // Config writes from any source (UI REST, chat manage_schedule tool) land in
-// agent_tasks; this coordinator syncs from DB every 60s and fires runs via
-// AgentBoxClient directly. Task completion events are forwarded to the
-// upstream notification endpoint (Portal stand-in today, upstream eventually)
-// via POST to /api/internal/task-notify.
-const notifyUrl = config.serverUrl
-  ? `${config.serverUrl.replace(/\/$/, "")}/api/internal/task-notify`
-  : "";
-const portalSecret = config.portalSecret;
-
+// agent_tasks; this coordinator syncs via RPC every 15s and fires runs via
+// AgentBoxClient directly. Task completion events are forwarded via
+// FrontendWsClient RPC.
 const retentionDays = Math.max(0, parseInt(process.env.SICLAW_RUN_RETENTION_DAYS ?? "90", 10) || 0);
 const taskCoordinator = new TaskCoordinator({
   config,
+  frontendClient,
   agentBoxManager,
   agentBoxTlsOptions: runtime.agentBoxTlsOptions,
   retentionDays,
   // Best-effort fire-and-forget: if Portal is down or rejects, this fire's
   // notification is lost. Acceptable for a low-frequency task-alert channel
   // — the run record is already durable in agent_task_runs so users can
-  // still find the result through the UI. If notifications ever become
-  // load-bearing (SLA / paging) switch this to a retry queue.
-  onTaskCompleted: notifyUrl && portalSecret
+  // still find the result through the UI.
+  onTaskCompleted: config.serverUrl
     ? (evt) => {
         const displayName = evt.taskName || evt.taskId.slice(0, 8);
         const title = evt.status === "success"
           ? `Task "${displayName}" completed`
           : `Task "${displayName}" failed`;
         const message = evt.error ?? evt.resultText?.slice(0, 500) ?? null;
-        fetch(notifyUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Auth-Token": portalSecret },
-          body: JSON.stringify({
-            userId: evt.userId,
-            agentId: evt.agentId,
-            taskId: evt.taskId,
-            runId: evt.runId,
-            status: evt.status,
-            title,
-            message,
-          }),
+        frontendClient.request("task.notify", {
+          userId: evt.userId,
+          agentId: evt.agentId,
+          taskId: evt.taskId,
+          runId: evt.runId,
+          status: evt.status,
+          title,
+          message,
         }).catch((err) => {
-          console.warn(`[runtime] task-notify post failed: ${err instanceof Error ? err.message : String(err)}`);
+          console.warn(`[runtime] task-notify RPC failed: ${err instanceof Error ? err.message : String(err)}`);
         });
       }
     : undefined,
