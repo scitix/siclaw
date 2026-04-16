@@ -22,6 +22,7 @@ import { Users } from "./pages/Users"
 import { Channels } from "./pages/Channels"
 import { Metrics } from "./pages/Metrics"
 import { Knowledge } from "./pages/Knowledge"
+import { SkillImport } from "./pages/SkillImport"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("token")
@@ -41,6 +42,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="agents/:id" element={<AgentDetail />} />
         <Route path="chat" element={<Chat />} />
         <Route path="skills" element={<Skills />} />
+        <Route path="skills/import" element={<SkillImport />} />
         <Route path="skills/new" element={<SkillDetail />} />
         <Route path="skills/:id" element={<SkillDetail />} />
         <Route path="mcp" element={<MCP />} />

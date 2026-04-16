@@ -19,6 +19,7 @@ interface Skill {
   version: number; specs: string
   scripts: { name: string; content: string }[] | string | null
   created_at: string; updated_at: string
+  is_builtin?: boolean; overlay_of?: string | null
 }
 
 interface SkillVersion {
@@ -180,6 +181,12 @@ export function SkillDetail() {
       const updated = await api<Skill>(`/siclaw/skills/${id}`, {
         method: "PUT", body: { name: name.trim(), description: description.trim(), labels, specs, scripts, commit_message: commitMessage || undefined },
       })
+      // If the backend created an overlay (response has overlay_of set), redirect to the new overlay
+      if (updated.overlay_of) {
+        toast.success("Overlay created from builtin skill")
+        navigate(`/skills/${updated.id}`)
+        return
+      }
       setSkill(updated)
       setEditing(false)
       setCommitMessage("")
@@ -437,6 +444,16 @@ export function SkillDetail() {
         <div className="px-6 py-2 bg-amber-500/10 border-b border-amber-500/20 flex items-center gap-2 shrink-0">
           <ShieldAlert className="h-4 w-4 text-amber-400" />
           <span className="text-[12px] text-amber-300">Pending review — editing is locked until approved or withdrawn.</span>
+        </div>
+      )}
+      {skill?.is_builtin && (
+        <div className="mx-6 mt-4 p-3 rounded-lg bg-purple-500/10 border border-purple-500/20 text-sm text-purple-300 shrink-0">
+          This is a builtin skill. Editing will create a personal overlay — the original remains unchanged.
+        </div>
+      )}
+      {skill?.overlay_of && (
+        <div className="mx-6 mt-4 p-3 rounded-lg bg-cyan-500/10 border border-cyan-500/20 text-sm text-cyan-300 shrink-0">
+          This is an overlay of a builtin skill. Deleting it will revert to the original builtin version.
         </div>
       )}
 
