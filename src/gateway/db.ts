@@ -14,6 +14,9 @@ export function initDb(databaseUrl: string): mysql.Pool {
     uri: databaseUrl,
     waitForConnections: true,
     connectionLimit: 10,
+    idleTimeout: 60_000,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 30_000,
   });
   return pool;
 }
