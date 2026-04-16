@@ -27,7 +27,8 @@ import {
   type AuthContext,
 } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
-import { getMessages } from "../gateway/chat-repo.js";
+// NOTE: getMessages from chat-repo.ts is for Runtime→Portal HTTP calls.
+// Portal queries chat_messages directly since it owns the DB.
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";
@@ -1452,21 +1453,30 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 200, { sessionId: null, truncated: false, messages: [] });
       return;
     }
-    const fetched = await getMessages(sessionId, { limit: MAX_TRACE_MESSAGES + 1 });
-    const truncated = fetched.length > MAX_TRACE_MESSAGES;
-    const msgs = truncated ? fetched.slice(fetched.length - MAX_TRACE_MESSAGES) : fetched;
+    // Query DB directly (Portal owns chat_messages — no HTTP hop needed).
+    // Fetch newest N+1 rows DESC, then reverse to chronological order.
+    const [msgRows] = await db.query(
+      `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, created_at
+       FROM chat_messages WHERE session_id = ?
+       ORDER BY created_at DESC LIMIT ?`,
+      [sessionId, MAX_TRACE_MESSAGES + 1],
+    ) as any;
+    const allMsgs = msgRows as any[];
+    const truncated = allMsgs.length > MAX_TRACE_MESSAGES;
+    const msgs = truncated ? allMsgs.slice(0, MAX_TRACE_MESSAGES) : allMsgs;
+    msgs.reverse();
     sendJson(res, 200, {
       sessionId,
       truncated,
-      messages: msgs.map((m) => ({
+      messages: msgs.map((m: any) => ({
         id: m.id,
         role: m.role,
-        content: m.content,
-        toolName: m.toolName,
-        toolInput: m.toolInput,
-        outcome: m.outcome,
-        durationMs: m.durationMs,
-        timestamp: m.createdAt?.toISOString() ?? null,
+        content: m.content ?? "",
+        toolName: m.tool_name ?? null,
+        toolInput: m.tool_input ?? null,
+        outcome: m.outcome ?? null,
+        durationMs: m.duration_ms ?? null,
+        timestamp: m.created_at ? new Date(m.created_at).toISOString() : null,
       })),
     });
   });
