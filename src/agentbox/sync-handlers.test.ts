@@ -501,3 +501,146 @@ describe("skillsHandler", () => {
     expect(fs.existsSync(path.join(resolvedDir(), "empty-specs", "SKILL.md"))).toBe(false);
   });
 });
+
+// =========================================================================
+// skill directory resolution — replicates the skillsDirs logic from
+// agent-factory.ts so the selection rules can be unit-tested in isolation.
+// =========================================================================
+
+describe("skill directory resolution", () => {
+  // Replicate the skillsDirs logic from agent-factory.ts for testing
+  function resolveSkillDirs(cwd: string, skillsBase: string): string[] {
+    const resolvedSkillsDir = path.join(skillsBase, "resolved");
+    const builtinPath = path.resolve(cwd, "skills", "core");
+    const extensionPath = path.resolve(cwd, "skills", "extension");
+    const platformPath = path.resolve(cwd, "skills", "platform");
+
+    const skillsDirs: string[] = [];
+    if (fs.existsSync(resolvedSkillsDir)) {
+      skillsDirs.push(resolvedSkillsDir);
+    } else {
+      for (const bDir of [builtinPath, extensionPath]) {
+        if (fs.existsSync(bDir)) skillsDirs.push(bDir);
+      }
+    }
+    if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
+    return skillsDirs;
+  }
+
+  let tmpDir: string;
+  let skillsBase: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "skill-dirs-test-"));
+    skillsBase = path.join(tmpDir, ".siclaw", "skills");
+    fs.mkdirSync(skillsBase, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  // ── 1. server mode: resolved/ exists → use resolved/ + platform/ ──────
+  it("server mode: resolved/ takes priority over core/ and extension/ when it exists", () => {
+    const resolvedDir = path.join(skillsBase, "resolved");
+    const platformDir = path.join(tmpDir, "skills", "platform");
+    fs.mkdirSync(resolvedDir, { recursive: true });
+    fs.mkdirSync(platformDir, { recursive: true });
+    // Also create core/ and extension/ to confirm they are NOT included
+    fs.mkdirSync(path.join(tmpDir, "skills", "core"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "skills", "extension"), { recursive: true });
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([resolvedDir, platformDir]);
+    expect(result).not.toContain(path.join(tmpDir, "skills", "core"));
+    expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
+  });
+
+  // ── 2. server mode: resolved/ exists, no platform/ → use resolved/ only
+  it("server mode: resolved/ exists with no platform/ → only resolved/ in list", () => {
+    const resolvedDir = path.join(skillsBase, "resolved");
+    fs.mkdirSync(resolvedDir, { recursive: true });
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([resolvedDir]);
+  });
+
+  // ── 3. TUI mode: no resolved/ → fallback to core/ + extension/ + platform/
+  it("TUI mode: no resolved/ → falls back to core/ + extension/ + platform/", () => {
+    const coreDir = path.join(tmpDir, "skills", "core");
+    const extensionDir = path.join(tmpDir, "skills", "extension");
+    const platformDir = path.join(tmpDir, "skills", "platform");
+    fs.mkdirSync(coreDir, { recursive: true });
+    fs.mkdirSync(extensionDir, { recursive: true });
+    fs.mkdirSync(platformDir, { recursive: true });
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([coreDir, extensionDir, platformDir]);
+  });
+
+  // ── 4. TUI mode: no resolved/, no extension/ → core/ + platform/ ──────
+  it("TUI mode: no resolved/, no extension/ → core/ + platform/ only", () => {
+    const coreDir = path.join(tmpDir, "skills", "core");
+    const platformDir = path.join(tmpDir, "skills", "platform");
+    fs.mkdirSync(coreDir, { recursive: true });
+    fs.mkdirSync(platformDir, { recursive: true });
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([coreDir, platformDir]);
+    expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
+  });
+
+  // ── 5. platform always loaded: present in both server and TUI modes ───
+  it("platform/ is appended regardless of whether resolved/ exists", () => {
+    const resolvedDir = path.join(skillsBase, "resolved");
+    const platformDir = path.join(tmpDir, "skills", "platform");
+    fs.mkdirSync(resolvedDir, { recursive: true });
+    fs.mkdirSync(platformDir, { recursive: true });
+
+    // With resolved/ present (server mode)
+    let result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toContain(platformDir);
+
+    // Remove resolved/ (TUI mode) — platform/ should still appear
+    fs.rmdirSync(resolvedDir);
+    result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toContain(platformDir);
+  });
+
+  // ── 6. platform not present → not in list ─────────────────────────────
+  it("platform/ absent → not included in resolved list", () => {
+    const resolvedDir = path.join(skillsBase, "resolved");
+    fs.mkdirSync(resolvedDir, { recursive: true });
+    // platform/ intentionally not created
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([resolvedDir]);
+    expect(result).not.toContain(path.join(tmpDir, "skills", "platform"));
+  });
+
+  // ── 7. empty: nothing exists → empty list ─────────────────────────────
+  it("returns empty list when no skill directories exist", () => {
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toEqual([]);
+  });
+
+  // ── 8. platform skills don't appear in resolved/ (separation) ────────
+  it("resolved/ and platform/ are distinct directories — no content mixing", () => {
+    const resolvedDir = path.join(skillsBase, "resolved");
+    const platformDir = path.join(tmpDir, "skills", "platform");
+    fs.mkdirSync(path.join(resolvedDir, "k8s-debug"), { recursive: true });
+    fs.writeFileSync(path.join(resolvedDir, "k8s-debug", "SKILL.md"), "---\nname: k8s-debug\n---\n");
+    fs.mkdirSync(path.join(platformDir, "skill-authoring"), { recursive: true });
+    fs.writeFileSync(path.join(platformDir, "skill-authoring", "SKILL.md"), "---\nname: skill-authoring\n---\n");
+
+    const result = resolveSkillDirs(tmpDir, skillsBase);
+    expect(result).toContain(resolvedDir);
+    expect(result).toContain(platformDir);
+
+    // Verify content is isolated: k8s-debug only in resolved/, skill-authoring only in platform/
+    expect(fs.existsSync(path.join(resolvedDir, "k8s-debug", "SKILL.md"))).toBe(true);
+    expect(fs.existsSync(path.join(resolvedDir, "skill-authoring"))).toBe(false);
+    expect(fs.existsSync(path.join(platformDir, "skill-authoring", "SKILL.md"))).toBe(true);
+    expect(fs.existsSync(path.join(platformDir, "k8s-debug"))).toBe(false);
+  });
+});

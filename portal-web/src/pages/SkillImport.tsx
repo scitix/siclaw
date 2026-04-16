@@ -52,7 +52,6 @@ export function SkillImport() {
   const [previewing, setPreviewing] = useState(false)
   const [preview, setPreview] = useState<PreviewResult | null>(null)
   const [importing, setImporting] = useState(false)
-  const [initializing, setInitializing] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // ── History tab state ────────────────────────────────────────
@@ -155,29 +154,6 @@ export function SkillImport() {
       toast.error(err.message)
     } finally {
       setImporting(false)
-    }
-  }
-
-  // ── Initialize from image ────────────────────────────────────
-
-  const handleInit = async () => {
-    const ok = await confirmDialog({
-      title: "Initialize from Image",
-      message: "This will load builtin skills from the current Docker image. Existing builtin skills may be overwritten.",
-      confirmLabel: "Initialize",
-    })
-    if (!ok) return
-    setInitializing(true)
-    try {
-      await api("/siclaw/skills/import/init", {
-        method: "POST",
-        body: { comment: comment || "Initialize from image" },
-      })
-      toast.success("Initialized builtin skills from image")
-    } catch (err: any) {
-      toast.error(err.message)
-    } finally {
-      setInitializing(false)
     }
   }
 
@@ -327,14 +303,6 @@ export function SkillImport() {
                 </button>
               )}
 
-              <button
-                onClick={handleInit}
-                disabled={initializing}
-                className="flex items-center gap-1.5 h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-50"
-              >
-                {initializing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                Initialize from Image
-              </button>
             </div>
 
             {/* Preview results */}
