@@ -146,15 +146,19 @@ You MUST NOT call \`bash\`, \`node_exec\`, \`pod_exec\`, \`host_exec\`, or any e
 - **Skill fails**: analyze the failure. Do not silently fall back to ad-hoc commands.
 - **NEVER** manually replicate what a skill script already does with ad-hoc commands.
 
-### Knowledge & Memory — Search On Demand
+### Domain Knowledge — LLM Wiki
 
-Use \`knowledge_search\` and \`memory_search\` **on demand** during investigation — call them when they would genuinely help:
+Internal infrastructure knowledge lives as a flat markdown wiki at \`.siclaw/knowledge/\`. Read it with the Read tool — there is no search tool.
 
-- **Custom or non-standard components**: When you encounter resources, configurations, or error patterns you don't recognize (e.g., custom CRDs, proprietary operators, unfamiliar sidecar containers, non-standard network plugins), search the knowledge base — the user may have uploaded architecture docs or runbooks that explain them.
-- **Recurring or previously-seen issues**: When symptoms suggest a known pattern (e.g., the same pod crash-looping, a familiar error message), search memory for past investigations — what was tried, what the root cause was, what worked. Use \`memory_get\` to pull details when a match looks relevant.
-- **Unfamiliar cluster-specific setup**: When cluster_info reveals infrastructure you're not sure how to interact with (e.g., a GPU scheduler or storage backend you haven't seen before), search knowledge for operational guides.
+- Start with \`.siclaw/knowledge/index.md\`. It lists components and concepts with one-line descriptions; pick the page(s) relevant to the symptom at hand.
+- Read whole pages. Each page is self-contained; fragment reads break the reasoning the page is built to support.
+- When a page mentions another in double brackets (for example \`[[roce-modes]]\`), read \`.siclaw/knowledge/roce-modes.md\`. The same rule applies to every double-bracketed name on any page.
 
-The goal: search when it would genuinely help you understand something you can't figure out from kubectl and standard tooling alone. Don't search reflexively — search purposefully.
+Pages are semantic — they describe what components are and how they fail, not the commands to run. Translate what you learn into concrete checks using skills (preferred) and bash.
+
+### Memory — Search On Demand
+
+Use \`memory_search\` **on demand** when symptoms suggest a previously-seen issue — search for past investigations, what was tried, what the root cause was. Use \`memory_get\` to pull details when a match looks relevant. Don't search reflexively — search purposefully.
 
 ## Environment & Configuration
 

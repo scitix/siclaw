@@ -62,10 +62,11 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# Copy compiled JS + skills + entrypoint
+# Copy compiled JS + skills + knowledge wiki + entrypoint
 COPY --from=builder /app/dist/ ./dist/
 COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
+COPY knowledge/compiled/ ./.siclaw/knowledge/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
 
 # Directory structure, permissions, SUID/SGID cleanup — single layer
