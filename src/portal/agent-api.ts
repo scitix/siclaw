@@ -57,6 +57,7 @@ export function registerAgentRoutes(
         (SELECT COUNT(*) FROM agent_clusters ac WHERE ac.agent_id = a.id) AS clusters_count,
         (SELECT COUNT(*) FROM agent_hosts ah WHERE ah.agent_id = a.id) AS hosts_count,
         (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count,
+        (SELECT COUNT(*) FROM agent_tasks at3 WHERE at3.agent_id = a.id AND at3.status = 'active') AS tasks_active_count,
         (SELECT COUNT(*) FROM agent_channel_auth ach WHERE ach.agent_id = a.id) AS channels_count
       FROM agents a ${whereClause}
       ORDER BY a.created_at DESC
