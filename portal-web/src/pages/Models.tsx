@@ -174,17 +174,30 @@ export function Models() {
 
       {/* Create provider form */}
       {showCreateProvider && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
+        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
           <p className="text-sm font-medium">New Provider</p>
           <div className="grid grid-cols-2 gap-3">
-            <input placeholder="Provider Name *" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-            <select value={providerForm.api_type} onChange={(e) => setProviderForm({ ...providerForm, api_type: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background">
-              <option value="openai-completions">OpenAI Compatible</option>
-              <option value="anthropic">Anthropic</option>
-            </select>
+            <div>
+              <label className="block text-sm font-medium mb-1">Provider Name</label>
+              <input placeholder="e.g. openai" value={providerForm.name} onChange={(e) => setProviderForm({ ...providerForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">API Type</label>
+              <select value={providerForm.api_type} onChange={(e) => setProviderForm({ ...providerForm, api_type: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background">
+                <option value="openai-completions">OpenAI Compatible</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+            </div>
           </div>
-          <input placeholder="Base URL * (e.g. https://api.openai.com/v1)" value={providerForm.base_url} onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background font-mono" />
-          <input type="password" placeholder="API Key" value={providerForm.api_key} onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          <div>
+            <label className="block text-sm font-medium mb-1">Base URL</label>
+            <input placeholder="e.g. https://api.openai.com/v1" value={providerForm.base_url} onChange={(e) => setProviderForm({ ...providerForm, base_url: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background font-mono" />
+            <p className="text-xs text-muted-foreground mt-1">The API endpoint URL. Must support OpenAI-compatible or Anthropic chat completions.</p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">API Key</label>
+            <input type="password" placeholder="Bearer token for authentication" value={providerForm.api_key} onChange={(e) => setProviderForm({ ...providerForm, api_key: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
           <div className="flex gap-2">
             <button onClick={handleCreateProvider} disabled={creating || !providerForm.name || !providerForm.base_url} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "..." : "Create"}</button>
             <button onClick={() => setShowCreateProvider(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
@@ -264,14 +277,20 @@ export function Models() {
                             {editingModelId === model.id && (
                               <div className="ml-4 mt-1.5 mb-1.5 p-3 rounded-md border border-border bg-card space-y-2">
                                 <div className="grid grid-cols-2 gap-2">
-                                  <input placeholder="Model ID *" value={editModelForm.model_id} onChange={(e) => setEditModelForm({ ...editModelForm, model_id: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
-                                  <input placeholder="Display Name" value={editModelForm.name} onChange={(e) => setEditModelForm({ ...editModelForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
-                                  <input placeholder="Context Window" value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
-                                  <input placeholder="Max Tokens" value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                                  <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input value={editModelForm.model_id} onChange={(e) => setEditModelForm({ ...editModelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
+                                  <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input value={editModelForm.name} onChange={(e) => setEditModelForm({ ...editModelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                                  <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={editModelForm.context_window} onChange={(e) => setEditModelForm({ ...editModelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                                  <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={editModelForm.max_tokens} onChange={(e) => setEditModelForm({ ...editModelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                                 </div>
-                                <div className="flex items-center gap-4">
-                                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={editModelForm.reasoning} onChange={(e) => setEditModelForm({ ...editModelForm, reasoning: e.target.checked })} /> Reasoning</label>
-                                  <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={editModelForm.is_default} onChange={(e) => setEditModelForm({ ...editModelForm, is_default: e.target.checked })} /> Default</label>
+                                <div className="flex items-center gap-5">
+                                  <div className="flex items-center gap-2">
+                                    <button type="button" role="switch" aria-checked={editModelForm.reasoning} onClick={() => setEditModelForm({ ...editModelForm, reasoning: !editModelForm.reasoning })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editModelForm.reasoning ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${editModelForm.reasoning ? "translate-x-3" : "translate-x-0"}`} /></button>
+                                    <span className="text-xs text-muted-foreground">Reasoning model</span>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <button type="button" role="switch" aria-checked={editModelForm.is_default} onClick={() => setEditModelForm({ ...editModelForm, is_default: !editModelForm.is_default })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editModelForm.is_default ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${editModelForm.is_default ? "translate-x-3" : "translate-x-0"}`} /></button>
+                                    <span className="text-xs text-muted-foreground">Default model</span>
+                                  </div>
                                 </div>
                                 <div className="flex gap-2">
                                   <button onClick={() => handleSaveModel(provider.id)} disabled={savingModel || !editModelForm.model_id} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">{savingModel ? "..." : "Save"}</button>
@@ -288,14 +307,20 @@ export function Models() {
                     {showAddModel === provider.id ? (
                       <div className="p-3 rounded-md border border-border bg-card space-y-2">
                         <div className="grid grid-cols-2 gap-2">
-                          <input placeholder="Model ID *" value={modelForm.model_id} onChange={(e) => setModelForm({ ...modelForm, model_id: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" />
-                          <input placeholder="Display Name" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
-                          <input placeholder="Context Window" value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
-                          <input placeholder="Max Tokens" value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="h-7 px-2 text-xs rounded-md border border-border bg-background" />
+                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Model ID</label><input placeholder="e.g. gpt-4o" value={modelForm.model_id} onChange={(e) => setModelForm({ ...modelForm, model_id: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background font-mono" /></div>
+                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Display Name</label><input placeholder="e.g. GPT-4o" value={modelForm.name} onChange={(e) => setModelForm({ ...modelForm, name: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Context Window</label><input value={modelForm.context_window} onChange={(e) => setModelForm({ ...modelForm, context_window: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
+                          <div><label className="block text-[11px] font-medium text-muted-foreground mb-0.5">Max Output Tokens</label><input value={modelForm.max_tokens} onChange={(e) => setModelForm({ ...modelForm, max_tokens: e.target.value })} className="w-full h-7 px-2 text-xs rounded-md border border-border bg-background" /></div>
                         </div>
-                        <div className="flex items-center gap-4">
-                          <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={modelForm.reasoning} onChange={(e) => setModelForm({ ...modelForm, reasoning: e.target.checked })} /> Reasoning</label>
-                          <label className="flex items-center gap-1.5 text-xs text-muted-foreground"><input type="checkbox" checked={modelForm.is_default} onChange={(e) => setModelForm({ ...modelForm, is_default: e.target.checked })} /> Default</label>
+                        <div className="flex items-center gap-5">
+                          <div className="flex items-center gap-2">
+                            <button type="button" role="switch" aria-checked={modelForm.reasoning} onClick={() => setModelForm({ ...modelForm, reasoning: !modelForm.reasoning })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${modelForm.reasoning ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${modelForm.reasoning ? "translate-x-3" : "translate-x-0"}`} /></button>
+                            <span className="text-xs text-muted-foreground">Reasoning model</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button type="button" role="switch" aria-checked={modelForm.is_default} onClick={() => setModelForm({ ...modelForm, is_default: !modelForm.is_default })} className={`relative inline-flex h-4 w-7 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${modelForm.is_default ? "bg-primary" : "bg-muted"}`}><span className={`pointer-events-none inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${modelForm.is_default ? "translate-x-3" : "translate-x-0"}`} /></button>
+                            <span className="text-xs text-muted-foreground">Default model</span>
+                          </div>
                         </div>
                         <div className="flex gap-2">
                           <button onClick={() => handleAddModel(provider.id)} disabled={addingModel || !modelForm.model_id} className="h-7 px-3 text-xs rounded-md bg-primary text-primary-foreground disabled:opacity-50">{addingModel ? "..." : "Add"}</button>
