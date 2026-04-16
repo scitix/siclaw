@@ -45,31 +45,25 @@ interface AccessResult {
 }
 
 async function checkAccess(
-  config: SiclawConfig,
+  _config: SiclawConfig,
   userId: string,
-  orgId: string,
+  _orgId: string,
   action: "read" | "write" | "review",
 ): Promise<AccessResult> {
-  const url = `${config.serverUrl}/api/internal/siclaw/check-access`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Auth-Token": config.portalSecret,
-    },
-    body: JSON.stringify({
-      user_id: userId,
-      org_id: orgId,
-      module: "siclaw",
-      action,
-    }),
-  });
-
-  if (!resp.ok) {
-    return { allowed: false, grantAll: false, agentGroupIds: [] };
+  // "review" requires admin or can_review_skills flag
+  if (action === "review") {
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT role, can_review_skills FROM siclaw_users WHERE id = ?",
+      [userId],
+    ) as any;
+    if (rows.length === 0) return { allowed: false, grantAll: false, agentGroupIds: [] };
+    const user = rows[0];
+    const allowed = user.role === "admin" || !!user.can_review_skills;
+    return { allowed, grantAll: allowed, agentGroupIds: [] };
   }
-
-  return (await resp.json()) as AccessResult;
+  // All other actions (read, write): allow for any authenticated user
+  return { allowed: true, grantAll: true, agentGroupIds: [] };
 }
 
 /**
