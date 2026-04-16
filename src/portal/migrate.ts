@@ -385,6 +385,64 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 
+  // Knowledge Repos & Versions (admin-managed wiki packages)
+  `CREATE TABLE IF NOT EXISTS knowledge_repos (
+    id CHAR(36) PRIMARY KEY,
+    name VARCHAR(255) NOT NULL UNIQUE,
+    description VARCHAR(500),
+    max_versions INT NOT NULL DEFAULT 10,
+    created_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  `CREATE TABLE IF NOT EXISTS knowledge_versions (
+    id CHAR(36) PRIMARY KEY,
+    repo_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    message VARCHAR(500),
+    data LONGBLOB NOT NULL,
+    size_bytes INT NOT NULL,
+    sha256 VARCHAR(64),
+    file_count INT,
+    is_active TINYINT(1) NOT NULL DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'inactive',
+    activated_by CHAR(36),
+    activated_at TIMESTAMP(3),
+    error_message TEXT,
+    uploaded_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uk_kv_repo_version (repo_id, version),
+    CONSTRAINT fk_kv_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Agent <-> Knowledge Repo binding (like agent_skills)
+  `CREATE TABLE IF NOT EXISTS agent_knowledge_repos (
+    agent_id CHAR(36) NOT NULL,
+    repo_id CHAR(36) NOT NULL,
+    PRIMARY KEY (agent_id, repo_id),
+    CONSTRAINT fk_akr_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+    CONSTRAINT fk_akr_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+  // Knowledge publish audit log
+  `CREATE TABLE IF NOT EXISTS knowledge_publish_events (
+    id CHAR(36) PRIMARY KEY,
+    action VARCHAR(20) NOT NULL,
+    repo_id CHAR(36) NOT NULL,
+    version_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    previous_version_id CHAR(36),
+    previous_version INT,
+    snapshot_before JSON,
+    snapshot_after JSON,
+    status VARCHAR(20) NOT NULL,
+    requested_by CHAR(36),
+    created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    INDEX idx_kpe_created (created_at),
+    INDEX idx_kpe_repo (repo_id, created_at),
+    CONSTRAINT fk_kpe_repo FOREIGN KEY (repo_id) REFERENCES knowledge_repos(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
 ];
 
 /**

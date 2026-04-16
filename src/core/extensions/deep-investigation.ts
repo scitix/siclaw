@@ -166,6 +166,7 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
   let dpLastUserFeedback: string | undefined;
 
   function setDpStatus(status: DpStatus): void {
+    const wasIdle = dpStatus === "idle";
     dpStatus = status;
     // Sync the mutable ref so tools and agentbox can see current state
     if (dpStateRef) {
@@ -177,6 +178,13 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     }
     // Derive checklist from status (single direction: status → checklist)
     if (checklist) syncChecklistFromStatus({ checklist, status });
+    // Toggle deep_search visibility: visible only when DP is active
+    if (wasIdle && status !== "idle") {
+      const active = api.getActiveTools();
+      if (!active.includes("deep_search")) api.setActiveTools([...active, "deep_search"]);
+    } else if (!wasIdle && status === "idle") {
+      api.setActiveTools(api.getActiveTools().filter(t => t !== "deep_search"));
+    }
   }
 
   // --- Legacy mode state ---
@@ -735,6 +743,8 @@ export default function deepInvestigationExtension(api: ExtensionAPI, memoryRef?
     // Reset state — each session starts clean (prevents bleed from previous session)
     checklist = null;
     dpStatus = "idle";
+    // Hide deep_search by default; setDpStatus() will re-add it if DP restores
+    api.setActiveTools(api.getActiveTools().filter(t => t !== "deep_search"));
 
     // From CLI flag
     if (api.getFlag("dp") === true) {

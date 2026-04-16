@@ -138,6 +138,28 @@ export async function handleSkillsBundle(
 }
 
 /**
+ * GET /api/internal/knowledge/bundle
+ *
+ * Returns the active LLM wiki packages bound to this agent via RPC.
+ */
+export async function handleKnowledgeBundle(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const data = await frontendClient.request("config.getKnowledgeBundle", {
+      agentId: identity.agentId,
+    });
+    sendJson(res, 200, data);
+  } catch (err) {
+    console.error("[internal-api] knowledge/bundle error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+/**
  * GET /api/internal/agent-tasks
  *
  * Returns the scheduled tasks for the agent identified by the mTLS certificate.

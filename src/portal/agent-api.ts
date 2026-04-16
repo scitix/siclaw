@@ -56,7 +56,8 @@ export function registerAgentRoutes(
         (SELECT COUNT(*) FROM agent_hosts ah WHERE ah.agent_id = a.id) AS hosts_count,
         (SELECT COUNT(*) FROM agent_tasks at2 WHERE at2.agent_id = a.id) AS tasks_count,
         (SELECT COUNT(*) FROM agent_tasks at3 WHERE at3.agent_id = a.id AND at3.status = 'active') AS tasks_active_count,
-        (SELECT COUNT(*) FROM agent_channel_auth ach WHERE ach.agent_id = a.id) AS channels_count
+        (SELECT COUNT(*) FROM agent_channel_auth ach WHERE ach.agent_id = a.id) AS channels_count,
+        (SELECT COUNT(*) FROM agent_knowledge_repos akr WHERE akr.agent_id = a.id) AS knowledge_count
       FROM agents a ${whereClause}
       ORDER BY a.created_at DESC
       LIMIT ? OFFSET ?`;
@@ -220,6 +221,7 @@ export function registerAgentRoutes(
       skill_ids?: string[];
       mcp_server_ids?: string[];
       channel_ids?: string[];
+      knowledge_repo_ids?: string[];
     }>(req);
 
     const db = getDb();
@@ -267,6 +269,12 @@ export function registerAgentRoutes(
           await conn.query("INSERT INTO agent_channel_auth (agent_id, channel_id) VALUES (?, ?)", [agentId, cid]);
         }
       }
+      if (body.knowledge_repo_ids !== undefined) {
+        await conn.query("DELETE FROM agent_knowledge_repos WHERE agent_id = ?", [agentId]);
+        for (const kid of body.knowledge_repo_ids) {
+          await conn.query("INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)", [agentId, kid]);
+        }
+      }
 
       await conn.commit();
     } catch (err) {
@@ -279,7 +287,7 @@ export function registerAgentRoutes(
     sendJson(res, 200, { ok: true });
 
     // Notify running AgentBox to reload (fire-and-forget)
-    connectionMap.notify(params.id, "agent.reload", {});
+    connectionMap.notify(params.id, "agent.reload", { agentId: params.id });
   });
 
   // GET /api/v1/agents/:id/resources — get bindings
@@ -290,7 +298,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const agentId = params.id;
 
-    const [[clusters], [hosts], [skills], [mcpServers], [channels]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [channels], [knowledgeRepos]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -316,6 +324,11 @@ export function registerAgentRoutes(
          JOIN channels ch ON ach.channel_id = ch.id WHERE ach.agent_id = ?`,
         [agentId],
       ),
+      db.query(
+        `SELECT kr.id, kr.name, kr.description FROM agent_knowledge_repos akr
+         JOIN knowledge_repos kr ON akr.repo_id = kr.id WHERE akr.agent_id = ?`,
+        [agentId],
+      ),
     ]) as any;
 
     sendJson(res, 200, {
@@ -324,6 +337,7 @@ export function registerAgentRoutes(
       skills,
       mcp_servers: mcpServers,
       channels,
+      knowledge_repos: knowledgeRepos,
     });
   });
 

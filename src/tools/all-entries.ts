@@ -23,7 +23,7 @@ import { registration as clusterList } from "./query/cluster-list.js";
 import { registration as clusterProbe } from "./query/cluster-probe.js";
 import { registration as clusterInfo } from "./query/cluster-info.js";
 import { registration as hostList } from "./query/host-list.js";
-import { registration as knowledgeSearch } from "./query/knowledge-search.js";
+// knowledge_search removed — replaced by LLM Wiki (Read tool + .siclaw/knowledge/)
 import { registration as resolvePodNetns } from "./query/resolve-pod-netns.js";
 import { registration as memorySearch } from "./query/memory-search.js";
 import { registration as memoryGet } from "./query/memory-get.js";
@@ -34,7 +34,7 @@ import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
 
-// Total: 22 entries
+// Total: 21 entries (knowledge_search removed — LLM Wiki uses Read tool)
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
   nodeExec, podExec, restrictedBash, hostExec,
@@ -42,7 +42,7 @@ export const allToolEntries: ToolEntry[] = [
   nodeScript, podScript, localScript, hostScript,
   // ── query ──
   investigationFeedback, clusterList, clusterProbe, clusterInfo, hostList,
-  knowledgeSearch, resolvePodNetns, memorySearch, memoryGet,
+  resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
   deepSearch, saveFeedback, manageSchedule, taskReport, skillPreview,
 ];

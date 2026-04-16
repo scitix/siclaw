@@ -64,6 +64,7 @@ describe("config.getResources", () => {
       .mockResolvedValueOnce([[{ id: "h1", name: "host-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }], []])
       .mockResolvedValueOnce([[{ skill_id: "s1" }, { skill_id: "s2" }], []])
       .mockResolvedValueOnce([[{ mcp_server_id: "m1" }], []])
+      .mockResolvedValueOnce([[{ repo_id: "kr1" }], []])
       .mockResolvedValueOnce([[{ is_production: 1 }], []]);
     (getDb as any).mockReturnValue({ query });
 
@@ -72,11 +73,13 @@ describe("config.getResources", () => {
     expect(result.hosts).toHaveLength(1);
     expect(result.skill_ids).toEqual(["s1", "s2"]);
     expect(result.mcp_server_ids).toEqual(["m1"]);
+    expect(result.knowledge_repo_ids).toEqual(["kr1"]);
     expect(result.is_production).toBe(true);
   });
 
   it("defaults is_production to true when agent row missing", async () => {
     const query = vi.fn()
+      .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []])
       .mockResolvedValueOnce([[], []])
@@ -87,6 +90,7 @@ describe("config.getResources", () => {
     const result = await getHandler("config.getResources")({ agentId: "a1" }, "a1");
     expect(result.is_production).toBe(true);
     expect(result.skill_ids).toEqual([]);
+    expect(result.knowledge_repo_ids).toEqual([]);
   });
 });
 
@@ -1073,16 +1077,16 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 39 handlers", () => {
+  it("registers exactly 40 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(39);
+    expect(handlers.size).toBe(40);
   });
 
   it("all expected handler names are registered", () => {
     const handlers = buildAdapterRpcHandlers();
     const expected = [
       "config.getAgent", "config.getResources", "config.getSettings",
-      "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle",
+      "config.getModelBinding", "config.getMcpServers", "config.getSkillBundle", "config.getKnowledgeBundle",
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",

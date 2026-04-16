@@ -31,6 +31,7 @@ import { getDb } from "../gateway/db.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";
+import { validateKnowledgePackage } from "../shared/knowledge-package.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -2274,23 +2275,24 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // Metrics live — proxied to Runtime (in-memory MetricsAggregator)
   // ================================================================
 
-  // GET /api/v1/siclaw/metrics/live
+  // GET /api/v1/siclaw/metrics/live — via phone-home WS RPC to Runtime
   router.get("/api/v1/siclaw/metrics/live", async (req, res) => {
     const admin = requireAdmin(req, config.jwtSecret);
     if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
 
-    try {
-      const qIdx = (req.url ?? "").indexOf("?");
-      const qs = qIdx >= 0 ? (req.url ?? "").slice(qIdx) : "";
-      const resp = await fetch(`${config.serverUrl}/api/v1/siclaw/metrics/live${qs}`, {
-        headers: { Authorization: req.headers.authorization ?? "" },
-      });
-      const data = await resp.json();
-      sendJson(res, resp.status, data);
-    } catch (err) {
-      console.error("[siclaw-api] metrics/live proxy error:", err);
-      sendJson(res, 502, { error: "Runtime unreachable" });
+    const query = parseQuery(req.url ?? "");
+    const agentIds = config.connectionMap.connectedAgentIds();
+    if (agentIds.length === 0) {
+      sendJson(res, 502, { error: "Runtime not connected" });
+      return;
     }
+    // Use first connected agent (Runtime registers as "system" or any agentId)
+    const result = await config.connectionMap.sendCommand(agentIds[0], "metrics.live", { userId: query.userId });
+    if (!result.ok) {
+      sendJson(res, 502, { error: result.error ?? "Runtime metrics unavailable" });
+      return;
+    }
+    sendJson(res, 200, result.payload);
   });
 
   // ================================================================
@@ -2365,124 +2367,230 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   });
 
   // ================================================================
-  // Knowledge Wiki (filesystem-backed, no DB)
+  // Knowledge Version Management (admin, DB-backed)
   // ================================================================
 
-  const KNOWLEDGE_BASE = path.resolve("knowledge");
-
-  /** Parse YAML-ish frontmatter (title, type, compiled_from) without a YAML lib. */
-  function parseFrontmatter(content: string): Record<string, string> {
-    const m = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!m) return {};
-    const result: Record<string, string> = {};
-    for (const line of m[1].split("\n")) {
-      const colon = line.indexOf(":");
-      if (colon > 0) {
-        const key = line.slice(0, colon).trim();
-        const val = line.slice(colon + 1).trim().replace(/^["']|["']$/g, "");
-        if (key && val) result[key] = val;
-      }
-    }
-    return result;
-  }
-
-  /** Recursively list .md files under dir, returning paths relative to base. */
-  function listMdFiles(dir: string, base: string): string[] {
-    if (!fs.existsSync(dir)) return [];
-    const results: string[] = [];
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name.startsWith(".")) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        results.push(...listMdFiles(full, base));
-      } else if (entry.name.endsWith(".md")) {
-        results.push(path.relative(base, full));
-      }
-    }
-    return results;
-  }
-
-  // List knowledge pages (compiled + raw)
-  router.get(`${P}/knowledge`, async (req, res) => {
-    const auth = requireAuth(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    const compiledDir = path.join(KNOWLEDGE_BASE, "compiled");
-    const rawDir = path.join(KNOWLEDGE_BASE, "raw");
-
-    const compiled = listMdFiles(compiledDir, compiledDir).map(rel => {
-      const full = path.join(compiledDir, rel);
-      const stat = fs.statSync(full);
-      const content = fs.readFileSync(full, "utf-8");
-      const fm = parseFrontmatter(content);
-      return {
-        id: rel,
-        name: rel.replace(/\.md$/, ""),
-        title: fm.title || rel.replace(/\.md$/, ""),
-        type: fm.type || "unknown",
-        layer: "compiled" as const,
-        sizeBytes: stat.size,
-        updatedAt: stat.mtime.toISOString(),
-      };
-    });
-
-    const raw = listMdFiles(rawDir, rawDir).map(rel => {
-      const full = path.join(rawDir, rel);
-      const stat = fs.statSync(full);
-      const fm = parseFrontmatter(fs.readFileSync(full, "utf-8"));
-      return {
-        id: rel,
-        name: rel.replace(/\.md$/, ""),
-        title: fm.title || rel.replace(/\.md$/, ""),
-        type: fm.type || "raw",
-        layer: "raw" as const,
-        sizeBytes: stat.size,
-        updatedAt: stat.mtime.toISOString(),
-      };
-    });
-
-    sendJson(res, 200, { compiled, raw });
+  // List repos
+  router.get(`${P}/admin/knowledge/repos`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT r.*, (SELECT COUNT(*) FROM knowledge_versions v WHERE v.repo_id = r.id) AS version_count,
+       (SELECT v2.version FROM knowledge_versions v2 WHERE v2.repo_id = r.id AND v2.is_active = 1 LIMIT 1) AS active_version
+       FROM knowledge_repos r ORDER BY r.created_at DESC`,
+    ) as any;
+    sendJson(res, 200, { data: rows });
   });
 
-  // Get a single knowledge page content
-  router.get(`${P}/knowledge/:layer/:id`, async (req, res, params) => {
+  // Create repo
+  router.post(`${P}/admin/knowledge/repos`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const body = await parseBody<{ name?: string; description?: string }>(req);
+    if (!body.name?.trim()) { sendJson(res, 400, { error: "name is required" }); return; }
+    const id = crypto.randomUUID();
+    const db = getDb();
+    await db.query(
+      "INSERT INTO knowledge_repos (id, name, description, created_by) VALUES (?, ?, ?, ?)",
+      [id, body.name.trim(), body.description?.trim() || null, admin.userId],
+    );
+    const [rows] = await db.query("SELECT * FROM knowledge_repos WHERE id = ?", [id]) as any;
+    sendJson(res, 201, rows[0]);
+  });
+
+  // Delete repo
+  router.delete(`${P}/admin/knowledge/repos/:id`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const db = getDb();
+    // Query bound agents BEFORE delete (FK cascade will remove bindings)
+    const [boundAgents] = await db.query(
+      "SELECT agent_id FROM agent_knowledge_repos WHERE repo_id = ?", [params.id],
+    ) as any;
+    await db.query("DELETE FROM knowledge_repos WHERE id = ?", [params.id]);
+    sendJson(res, 200, { deleted: true });
+    // Notify bound agents to reload so they drop the deleted repo's knowledge
+    for (const r of boundAgents as any[]) {
+      config.connectionMap.notify(r.agent_id, "agent.reload", { agentId: r.agent_id, resources: ["knowledge"] });
+    }
+  });
+
+  // List versions for a repo (metadata only, no data blob)
+  router.get(`${P}/admin/knowledge/repos/:id/versions`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, repo_id, version, message, size_bytes, sha256, file_count,
+              is_active, status, activated_by, activated_at, error_message, uploaded_by, created_at
+       FROM knowledge_versions WHERE repo_id = ? ORDER BY version DESC`,
+      [params.id],
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Upload new version (base64 tar.gz in JSON body)
+  router.post(`${P}/admin/knowledge/repos/:id/versions`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const body = await parseBody<{ message?: string; data?: string }>(req);
+    if (!body.data) { sendJson(res, 400, { error: "data (base64 tar.gz) is required" }); return; }
+
+    const buf = Buffer.from(body.data, "base64");
+    const packageInfo = validateKnowledgePackage(buf);
+    const db = getDb();
+
+    const versionId = crypto.randomUUID();
+    const publishEventId = crypto.randomUUID();
+    let nextVersion: number;
+
+    // Transaction: version number + deactivate + insert + evict + event
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      // Lock repo row to serialize concurrent uploads
+      const [maxRows] = await conn.query(
+        "SELECT COALESCE(MAX(version), 0) AS max_v FROM knowledge_versions WHERE repo_id = ? FOR UPDATE",
+        [params.id],
+      ) as any;
+      nextVersion = Number(maxRows[0].max_v) + 1;
+
+      await conn.query("UPDATE knowledge_versions SET is_active = 0, status = 'inactive' WHERE repo_id = ? AND is_active = 1", [params.id]);
+      await conn.query(
+        `INSERT INTO knowledge_versions (id, repo_id, version, message, data, size_bytes, sha256, file_count, is_active, status, activated_by, activated_at, uploaded_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, CURRENT_TIMESTAMP(3), ?)`,
+        [versionId, params.id, nextVersion, body.message?.trim() || null, buf, buf.length,
+         packageInfo.sha256, packageInfo.fileCount, admin.userId, admin.userId],
+      );
+
+      // Evict oldest non-active versions beyond max_versions
+      const [repoRows] = await conn.query("SELECT max_versions FROM knowledge_repos WHERE id = ?", [params.id]) as any;
+      const maxVersions = repoRows[0]?.max_versions ?? 10;
+      const [allVersions] = await conn.query(
+        "SELECT id, is_active FROM knowledge_versions WHERE repo_id = ? ORDER BY version DESC",
+        [params.id],
+      ) as any;
+      const toDelete = (allVersions as any[]).filter((v: any) => !v.is_active).slice(maxVersions - 1);
+      for (const v of toDelete) {
+        await conn.query("DELETE FROM knowledge_versions WHERE id = ?", [v.id]);
+      }
+
+      await conn.query(
+        `INSERT INTO knowledge_publish_events (id, action, repo_id, version_id, version, status, requested_by)
+         VALUES (?, 'upload', ?, ?, ?, 'success', ?)`,
+        [publishEventId, params.id, versionId, nextVersion, admin.userId],
+      );
+
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    sendJson(res, 201, {
+      id: versionId,
+      version: nextVersion,
+      size_bytes: buf.length,
+      sha256: packageInfo.sha256,
+      file_count: packageInfo.fileCount,
+      publish_event_id: publishEventId,
+    });
+
+    // Notify agents bound to this repo to reload knowledge (fire-and-forget)
+    db.query("SELECT agent_id FROM agent_knowledge_repos WHERE repo_id = ?", [params.id])
+      .then(([rows]: any) => { for (const r of rows as any[]) config.connectionMap.notify(r.agent_id, "agent.reload", { agentId: r.agent_id, resources: ["knowledge"] }); })
+      .catch(() => {});
+  });
+
+  // Activate a version (publish / rollback)
+  router.post(`${P}/admin/knowledge/repos/:repoId/versions/:versionId/activate`, async (req, res, params) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const db = getDb();
+
+    // Transaction: deactivate all + activate target + publish event
+    const conn = await db.getConnection();
+    let publishEventId: string;
+    try {
+      await conn.beginTransaction();
+
+      const [targetRows] = await conn.query(
+        "SELECT id, version FROM knowledge_versions WHERE id = ? AND repo_id = ? LIMIT 1",
+        [params.versionId, params.repoId],
+      ) as any;
+      if (targetRows.length === 0) { await conn.rollback(); conn.release(); sendJson(res, 404, { error: "Version not found" }); return; }
+      const target = targetRows[0] as { id: string; version: number };
+
+      const [previousRows] = await conn.query(
+        "SELECT id, version FROM knowledge_versions WHERE repo_id = ? AND is_active = 1 LIMIT 1",
+        [params.repoId],
+      ) as any;
+      const previous = previousRows[0] as { id: string; version: number } | undefined;
+      const action = previous && target.version < previous.version ? "rollback" : "activate";
+
+      await conn.query("UPDATE knowledge_versions SET is_active = 0, status = 'inactive' WHERE repo_id = ?", [params.repoId]);
+      await conn.query(
+        "UPDATE knowledge_versions SET is_active = 1, status = 'active', activated_by = ?, activated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND repo_id = ?",
+        [admin.userId, params.versionId, params.repoId],
+      );
+
+      publishEventId = crypto.randomUUID();
+      await conn.query(
+        `INSERT INTO knowledge_publish_events (id, action, repo_id, version_id, version, previous_version_id, previous_version, status, requested_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'success', ?)`,
+        [publishEventId, action, params.repoId, params.versionId, target.version,
+         previous?.id ?? null, previous?.version ?? null, admin.userId],
+      );
+
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    sendJson(res, 200, { ok: true, publish_event_id: publishEventId });
+
+    // Notify agents bound to this repo to reload knowledge
+    db.query("SELECT agent_id FROM agent_knowledge_repos WHERE repo_id = ?", [params.repoId])
+      .then(([rows]: any) => { for (const r of rows as any[]) config.connectionMap.notify(r.agent_id, "agent.reload", { agentId: r.agent_id, resources: ["knowledge"] }); })
+      .catch(() => {});
+  });
+
+  // Publish event history
+  router.get(`${P}/admin/knowledge/publish-events`, async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+    const query = parseQuery(req.url ?? "");
+    const limit = Math.min(Math.max(parseInt(query.limit ?? "30", 10) || 30, 1), 100);
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT e.id, e.action, e.repo_id, r.name AS repo_name, e.version_id, e.version,
+              e.previous_version_id, e.previous_version, e.status, e.requested_by, e.created_at
+       FROM knowledge_publish_events e
+       JOIN knowledge_repos r ON r.id = e.repo_id
+       ORDER BY e.created_at DESC LIMIT ?`,
+      [limit],
+    ) as any;
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Download active version tar (for AgentBox pull at startup)
+  router.get(`${P}/admin/knowledge/repos/:id/active/download`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
-
-    const layer = params.layer;
-    if (layer !== "compiled" && layer !== "raw") {
-      sendJson(res, 400, { error: "layer must be compiled or raw" });
-      return;
-    }
-
-    const layerDir = path.join(KNOWLEDGE_BASE, layer);
-    // id can contain subdirectory (e.g. "components/roce-operator.md")
-    const query = parseQuery(req.url ?? "");
-    const fileId = query.path ? String(query.path) : params.id;
-
-    const fullPath = path.resolve(layerDir, fileId);
-    // Path traversal guard
-    if (!fullPath.startsWith(layerDir + path.sep) && fullPath !== layerDir) {
-      sendJson(res, 400, { error: "Invalid path" });
-      return;
-    }
-
-    try {
-      const content = fs.readFileSync(fullPath, "utf-8");
-      const stat = fs.statSync(fullPath);
-      const fm = parseFrontmatter(content);
-      sendJson(res, 200, {
-        id: fileId,
-        name: fileId.replace(/\.md$/, ""),
-        title: fm.title || fileId.replace(/\.md$/, ""),
-        type: fm.type || (layer === "raw" ? "raw" : "unknown"),
-        layer,
-        content,
-        sizeBytes: stat.size,
-        updatedAt: stat.mtime.toISOString(),
-      });
-    } catch {
-      sendJson(res, 404, { error: "Page not found" });
-    }
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT data FROM knowledge_versions WHERE repo_id = ? AND is_active = 1 LIMIT 1",
+      [params.id],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "No active version" }); return; }
+    res.writeHead(200, { "Content-Type": "application/gzip", "Content-Disposition": "attachment; filename=knowledge.tar.gz" });
+    res.end(rows[0].data);
   });
 }

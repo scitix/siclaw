@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
-import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, Clock, BoltIcon } from "lucide-react"
+import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, Clock, BoltIcon, BookOpen } from "lucide-react"
 import { api, clearAgentMemory } from "../api"
 import { useToast } from "../components/toast"
 import { Tooltip } from "../components/tooltip"
@@ -9,7 +9,7 @@ import { useConfirm } from "../components/confirm-dialog"
 interface Agent {
   id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; is_production: boolean; created_at: string
-  skills_count?: number; mcp_count?: number; clusters_count?: number; hosts_count?: number; tasks_count?: number; tasks_active_count?: number
+  skills_count?: number; mcp_count?: number; clusters_count?: number; hosts_count?: number; tasks_count?: number; tasks_active_count?: number; knowledge_count?: number
 }
 
 interface ModelEntry {
@@ -189,6 +189,9 @@ export function Agents() {
                         <Clock className="h-2.5 w-2.5" />{a.tasks_active_count ?? 0}/{a.tasks_count} scheduled
                       </button>
                     )}
+                    <button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=knowledge`) }} className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] bg-secondary/50 text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors">
+                      <BookOpen className="h-2.5 w-2.5" />{a.knowledge_count ?? 0} knowledge
+                    </button>
                   </div>
                 </div>
 

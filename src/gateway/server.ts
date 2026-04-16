@@ -50,6 +50,7 @@ import {
   handleSettings,
   handleMcpServers,
   handleSkillsBundle,
+  handleKnowledgeBundle,
   handleAgentTasksList,
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
@@ -182,10 +183,15 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: evt });
             },
           });
+          // Signal Portal that the prompt is fully complete (all agent turns done).
+          // agent_end fires after each turn — prompt_done fires once at the very end.
+          context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
           }
+          // Ensure prompt_done is sent even on error so Portal SSE doesn't hang
+          context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         } finally {
           if (context.ws) activeStreams.delete(context.ws);
         }
@@ -313,7 +319,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // All types route through GATEWAY_SYNC_DESCRIPTORS — the legacy
     // "credentials" umbrella type is replaced by the more granular
     // "cluster" + "host" so CRUD events can notify only what changed.
-    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host"];
+    const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
 
     const boxes = await agentBoxManager.list();
     const targets = boxes.filter((b) => b.agentId === agentId);
@@ -341,6 +347,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
     return { ok: true, reloaded, failed, boxes: targets.length };
+  });
+
+  // metrics.live — delayed ref to metricsAggregator (created after rpcMethods)
+  let metricsAggregatorRef: MetricsAggregator | null = null;
+  rpcMethods.set("metrics.live", async (params) => {
+    if (!metricsAggregatorRef) throw new Error("MetricsAggregator not ready");
+    const userId = (params as any)?.userId || undefined;
+    return {
+      snapshot: metricsAggregatorRef.snapshot(),
+      topTools: metricsAggregatorRef.topTools(10, userId),
+      topSkills: metricsAggregatorRef.topSkills(10, userId),
+    };
   });
 
   // ── Phone-home: register inbound commands from Portal via FrontendWsClient ──
@@ -385,6 +403,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     metricsAggregator = new MetricsAggregator("local", localCollector);
   }
 
+  metricsAggregatorRef = metricsAggregator;
   registerMetricsRoutes(restRouter, config, metricsAggregator, frontendClient);
   registerSystemRoutes(restRouter, config, frontendClient);
 
@@ -590,6 +609,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           if (url === "/api/internal/skills/bundle" && method === "GET") {
             if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
             handleSkillsBundle(req, res, identity, frontendClient);
+            return;
+          }
+
+          // Knowledge bundle — filtered by agent binding (via RPC)
+          if (url === "/api/internal/knowledge/bundle" && method === "GET") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleKnowledgeBundle(req, res, identity, frontendClient);
             return;
           }
 
