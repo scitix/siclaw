@@ -222,4 +222,34 @@ describe("parseSkillsDir", () => {
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.specs).toBe(specs);
   });
+
+  // ── platform skill isolation ──────────────────────────────────────────
+
+  it("does not parse platform directory skills when called with skills/core/ — separation is at call site", () => {
+    // parseSkillsDir is called with skills/core/ (not skills/), so skills/platform/
+    // is never in scope. Verify: calling parseSkillsDir(tmpDir) does not reach
+    // a sibling "platform" directory that lives outside tmpDir.
+    writeSkill("real-skill", "---\nname: real-skill\n---\nReal");
+
+    // Create a sibling platform dir outside tmpDir to confirm it can't bleed in
+    const siblingPlatform = path.join(os.tmpdir(), `platform-sibling-${Date.now()}`);
+    fs.mkdirSync(path.join(siblingPlatform, "skill-authoring"), { recursive: true });
+    fs.writeFileSync(path.join(siblingPlatform, "skill-authoring", "SKILL.md"), "---\nname: skill-authoring\n---\nPlatform skill");
+    try {
+      const result = parseSkillsDir(tmpDir);
+      expect(result.map((s) => s.name)).toContain("real-skill");
+      expect(result.map((s) => s.name)).not.toContain("skill-authoring");
+    } finally {
+      fs.rmSync(siblingPlatform, { recursive: true, force: true });
+    }
+  });
+
+  it("actual skills/core/ does not contain platform skills (skill-authoring, session-feedback)", () => {
+    const coreDir = path.resolve(process.cwd(), "skills", "core");
+    if (!fs.existsSync(coreDir)) return; // skip if not run from repo root
+    const result = parseSkillsDir(coreDir);
+    const names = result.map((s) => s.name);
+    expect(names).not.toContain("skill-authoring");
+    expect(names).not.toContain("session-feedback");
+  });
 });
