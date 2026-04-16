@@ -7,6 +7,8 @@
  */
 
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type { RestRouter } from "../gateway/rest-router.js";
 /** Subset of config needed by siclaw API routes */
 interface SiclawConfig {
@@ -2170,5 +2172,127 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       );
     }
     sendJson(res, 200, { ok: true });
+  });
+
+  // ================================================================
+  // Knowledge Wiki (filesystem-backed, no DB)
+  // ================================================================
+
+  const KNOWLEDGE_BASE = path.resolve("knowledge");
+
+  /** Parse YAML-ish frontmatter (title, type, compiled_from) without a YAML lib. */
+  function parseFrontmatter(content: string): Record<string, string> {
+    const m = content.match(/^---\n([\s\S]*?)\n---/);
+    if (!m) return {};
+    const result: Record<string, string> = {};
+    for (const line of m[1].split("\n")) {
+      const colon = line.indexOf(":");
+      if (colon > 0) {
+        const key = line.slice(0, colon).trim();
+        const val = line.slice(colon + 1).trim().replace(/^["']|["']$/g, "");
+        if (key && val) result[key] = val;
+      }
+    }
+    return result;
+  }
+
+  /** Recursively list .md files under dir, returning paths relative to base. */
+  function listMdFiles(dir: string, base: string): string[] {
+    if (!fs.existsSync(dir)) return [];
+    const results: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith(".")) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        results.push(...listMdFiles(full, base));
+      } else if (entry.name.endsWith(".md")) {
+        results.push(path.relative(base, full));
+      }
+    }
+    return results;
+  }
+
+  // List knowledge pages (compiled + raw)
+  router.get(`${P}/knowledge`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const compiledDir = path.join(KNOWLEDGE_BASE, "compiled");
+    const rawDir = path.join(KNOWLEDGE_BASE, "raw");
+
+    const compiled = listMdFiles(compiledDir, compiledDir).map(rel => {
+      const full = path.join(compiledDir, rel);
+      const stat = fs.statSync(full);
+      const content = fs.readFileSync(full, "utf-8");
+      const fm = parseFrontmatter(content);
+      return {
+        id: rel,
+        name: rel.replace(/\.md$/, ""),
+        title: fm.title || rel.replace(/\.md$/, ""),
+        type: fm.type || "unknown",
+        layer: "compiled" as const,
+        sizeBytes: stat.size,
+        updatedAt: stat.mtime.toISOString(),
+      };
+    });
+
+    const raw = listMdFiles(rawDir, rawDir).map(rel => {
+      const full = path.join(rawDir, rel);
+      const stat = fs.statSync(full);
+      const fm = parseFrontmatter(fs.readFileSync(full, "utf-8"));
+      return {
+        id: rel,
+        name: rel.replace(/\.md$/, ""),
+        title: fm.title || rel.replace(/\.md$/, ""),
+        type: fm.type || "raw",
+        layer: "raw" as const,
+        sizeBytes: stat.size,
+        updatedAt: stat.mtime.toISOString(),
+      };
+    });
+
+    sendJson(res, 200, { compiled, raw });
+  });
+
+  // Get a single knowledge page content
+  router.get(`${P}/knowledge/:layer/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const layer = params.layer;
+    if (layer !== "compiled" && layer !== "raw") {
+      sendJson(res, 400, { error: "layer must be compiled or raw" });
+      return;
+    }
+
+    const layerDir = path.join(KNOWLEDGE_BASE, layer);
+    // id can contain subdirectory (e.g. "components/roce-operator.md")
+    const query = parseQuery(req.url ?? "");
+    const fileId = query.path ? String(query.path) : params.id;
+
+    const fullPath = path.resolve(layerDir, fileId);
+    // Path traversal guard
+    if (!fullPath.startsWith(layerDir + path.sep) && fullPath !== layerDir) {
+      sendJson(res, 400, { error: "Invalid path" });
+      return;
+    }
+
+    try {
+      const content = fs.readFileSync(fullPath, "utf-8");
+      const stat = fs.statSync(fullPath);
+      const fm = parseFrontmatter(content);
+      sendJson(res, 200, {
+        id: fileId,
+        name: fileId.replace(/\.md$/, ""),
+        title: fm.title || fileId.replace(/\.md$/, ""),
+        type: fm.type || (layer === "raw" ? "raw" : "unknown"),
+        layer,
+        content,
+        sizeBytes: stat.size,
+        updatedAt: stat.mtime.toISOString(),
+      });
+    } catch {
+      sendJson(res, 404, { error: "Page not found" });
+    }
   });
 }

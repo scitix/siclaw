@@ -21,6 +21,7 @@ import { TaskRunDetail } from "./pages/TaskRunDetail"
 import { Users } from "./pages/Users"
 import { Channels } from "./pages/Channels"
 import { Metrics } from "./pages/Metrics"
+import { Knowledge } from "./pages/Knowledge"
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("token")
@@ -43,6 +44,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route path="skills/new" element={<SkillDetail />} />
         <Route path="skills/:id" element={<SkillDetail />} />
         <Route path="mcp" element={<MCP />} />
+        <Route path="knowledge" element={<Knowledge />} />
         <Route path="my-tasks" element={<MyTasks />} />
         <Route path="agents/:agentId/tasks/:taskId" element={<TaskRuns />} />
         <Route path="agents/:agentId/tasks/:taskId/runs/:runId" element={<TaskRunDetail />} />

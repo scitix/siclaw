@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3 } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 
@@ -9,6 +9,7 @@ const siclawItems = [
   { path: "/agents", label: "Agents", icon: Bot },
   { path: "/skills", label: "Skills", icon: Zap },
   { path: "/mcp", label: "MCP", icon: Plug },
+  { path: "/knowledge", label: "Knowledge", icon: BookOpen },
 ]
 
 const settingsItems = [
