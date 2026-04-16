@@ -243,12 +243,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Insert initial version
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, labels)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         crypto.randomUUID(), id, version,
         body.specs || "", JSON.stringify(body.scripts || []),
         body.commit_message || "Initial version", auth.userId,
+        JSON.stringify(body.labels || []),
       ],
     );
 
@@ -314,9 +315,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         [overlayId, auth.orgId, targetSkill.name, newDesc, newLabels, auth.userId, newSpecs, newScripts, auth.userId, params.id],
       );
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved)
-         VALUES (?, ?, 1, ?, ?, ?, 0)`,
-        [crypto.randomUUID(), overlayId, newSpecs, newScripts, auth.userId],
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved, labels)
+         VALUES (?, ?, 1, ?, ?, ?, 0, ?)`,
+        [crypto.randomUUID(), overlayId, newSpecs, newScripts, auth.userId, newLabels],
       );
 
       const [created] = await db.query("SELECT * FROM skills WHERE id = ?", [overlayId]) as any;
@@ -342,9 +343,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       const oldScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts || []);
 
       // Create version record with diff between old and new
+      const newLabels = body.labels ? JSON.stringify(body.labels) : targetSkill.labels;
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved, labels)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
         [
           crypto.randomUUID(), params.id, newVersion,
           newSpecs, newScripts,
@@ -354,6 +356,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
           }),
           body.commit_message || `Version ${newVersion}`,
           auth.userId,
+          newLabels,
         ],
       );
 
@@ -662,14 +665,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (versionRows.length === 0) {
       // Create one with current skill content, is_approved=1
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved, labels)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         [
           crypto.randomUUID(), params.id, skill.version,
           typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs),
           typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts),
           `Approved version ${skill.version}`,
           skill.author_id,
+          typeof skill.labels === "string" ? skill.labels : JSON.stringify(skill.labels || []),
         ],
       );
     } else {
@@ -835,9 +839,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const targetScripts = typeof target.scripts === "string" ? target.scripts : JSON.stringify(target.scripts);
 
     // Create new version record with target's content and diff vs current
+    const targetLabels = target.labels ?? skill.labels;
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved, labels)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
       [
         crypto.randomUUID(), params.id, newVersion,
         targetSpecs, targetScripts,
@@ -847,14 +852,26 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         }),
         `Rollback to version ${body.version}`,
         auth.userId,
+        typeof targetLabels === "string" ? targetLabels : JSON.stringify(targetLabels || []),
       ],
     );
 
-    // Update skills table with target content
-    await db.query(
-      `UPDATE skills SET specs = ?, scripts = ?, version = ?, status = 'draft' WHERE id = ?`,
-      [targetSpecs, targetScripts, newVersion, params.id],
-    );
+    // Parse name/description from target specs frontmatter
+    const fmMatch = targetSpecs.match(/^---\n([\s\S]*?)\n---/);
+    const nameMatch = fmMatch?.[1]?.match(/^name:\s*(.+)$/m);
+    const descMatch = fmMatch?.[1]?.match(/^description:\s*(.+)$/m);
+    const rollbackName = nameMatch?.[1]?.trim();
+    const rollbackDesc = descMatch?.[1]?.trim();
+
+    // Update skills table with target content + synced name/description/labels
+    const rollbackLabels = targetLabels;
+    const setClauses = ["specs = ?", "scripts = ?", "version = ?", "status = 'draft'"];
+    const setValues: unknown[] = [targetSpecs, targetScripts, newVersion];
+    if (rollbackName) { setClauses.push("name = ?"); setValues.push(rollbackName); }
+    if (rollbackDesc) { setClauses.push("description = ?"); setValues.push(rollbackDesc); }
+    if (rollbackLabels) { setClauses.push("labels = ?"); setValues.push(typeof rollbackLabels === "string" ? rollbackLabels : JSON.stringify(rollbackLabels)); }
+    setValues.push(params.id);
+    await db.query(`UPDATE skills SET ${setClauses.join(", ")} WHERE id = ?`, setValues);
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);

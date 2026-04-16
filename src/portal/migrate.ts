@@ -499,6 +499,7 @@ export async function runPortalMigrations(): Promise<void> {
   // Skill overlay columns
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "skill_versions", "labels", "JSON DEFAULT NULL");
 
   // Index on overlay_of (safe to re-run — swallow duplicate-index error)
   try {

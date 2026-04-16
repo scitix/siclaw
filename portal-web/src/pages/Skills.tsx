@@ -345,7 +345,7 @@ export function Skills() {
                           {s.overlay_of && (
                             <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/20 text-cyan-400">OVERLAY</span>
                           )}
-                          {s.installed_version && (
+                          {s.installed_version != null && s.installed_version > 0 && (
                             <span className="text-[10px] text-green-400">installed v{s.installed_version}</span>
                           )}
                           {s.version !== (s.installed_version ?? 0) && (

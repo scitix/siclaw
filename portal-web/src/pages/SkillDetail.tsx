@@ -333,7 +333,8 @@ export function SkillDetail() {
     const trimmed = val.trim()
     if (trimmed && !labels.includes(trimmed)) setLabels([...labels, trimmed])
     setLabelQuery("")
-    setShowLabelSuggestions(false)
+    // Keep dropdown open so user can continue adding labels
+    labelInputRef.current?.focus()
   }
 
   const handleLabelKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -686,6 +687,9 @@ export function SkillDetail() {
                       <span className="px-1 py-0.5 rounded text-[9px] bg-green-500/20 text-green-400">approved</span>
                     ) : (
                       <span className="px-1 py-0.5 rounded text-[9px] bg-secondary text-muted-foreground">draft</span>
+                    )}
+                    {v.commit_message?.startsWith("Rollback to") && (
+                      <span className="px-1 py-0.5 rounded text-[9px] bg-orange-500/20 text-orange-400">rollback</span>
                     )}
                   </div>
                   <p className="text-[11px] text-muted-foreground truncate">{v.commit_message || "No message"}</p>
