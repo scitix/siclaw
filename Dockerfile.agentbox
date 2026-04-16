@@ -66,6 +66,7 @@ RUN npm ci --omit=dev
 COPY --from=builder /app/dist/ ./dist/
 COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
+COPY skills/platform/ ./skills/platform/
 COPY knowledge/compiled/ ./.siclaw/knowledge/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
 

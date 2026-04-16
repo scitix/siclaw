@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useRef } from "react"
 import { useNavigate, useSearchParams } from "react-router-dom"
-import { Plus, Zap, Trash2, Loader2, Search, ClipboardCheck, ShieldCheck, Tag, ChevronDown, ChevronRight, X, Check, CheckCircle, XCircle, Upload } from "lucide-react"
+import { Plus, Zap, Trash2, Loader2, Search, ClipboardCheck, ShieldCheck, Tag, ChevronDown, ChevronRight, X, Check, CheckCircle, XCircle, Upload, Pencil } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -11,7 +11,7 @@ import { SkillDiffView } from "../components/SimpleDiff"
 interface Skill {
   id: string; name: string; description: string; labels: string[] | null
   author_id: string; status: "draft" | "pending_review" | "installed"
-  version: number; created_at: string; updated_at: string
+  version: number; installed_version?: number | null; created_at: string; updated_at: string
   is_builtin?: boolean; overlay_of?: string | null
 }
 
@@ -56,9 +56,13 @@ export function Skills() {
 
   // Current user permissions
   const [isReviewer, setIsReviewer] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
   useEffect(() => {
     api<{ role?: string; can_review_skills?: boolean }>("/auth/me")
-      .then(u => setIsReviewer(u.role === "admin" || !!u.can_review_skills))
+      .then(u => {
+        setIsReviewer(u.role === "admin" || !!u.can_review_skills)
+        setIsAdmin(u.role === "admin")
+      })
       .catch(() => {})
   }, [])
 
@@ -220,9 +224,11 @@ export function Skills() {
 
         {activeTab === "all" && (
           <div className="flex items-center gap-2">
-            <button onClick={() => navigate("/skills/import")} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">
-              <Upload className="h-3.5 w-3.5" /> Import
-            </button>
+            {isAdmin && (
+              <button onClick={() => navigate("/skills/import")} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">
+                <Upload className="h-3.5 w-3.5" /> Import
+              </button>
+            )}
             <button onClick={() => navigate("/skills/new")}
               className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
               <Plus className="h-3.5 w-3.5" /> New Skill
@@ -325,8 +331,8 @@ export function Skills() {
                 const st = STATUS_STYLES[s.status] || STATUS_STYLES.draft
                 const lbls = Array.isArray(s.labels) ? s.labels : []
                 return (
-                  <div key={s.id} onClick={() => navigate(`/skills/${s.id}`)}
-                    className="flex items-center justify-between p-3 rounded-lg border border-border/50 hover:bg-secondary/30 cursor-pointer">
+                  <div key={s.id}
+                    className="flex items-center justify-between p-3 rounded-lg border border-border/50 hover:bg-secondary/30">
                     <div className="flex items-center gap-3 min-w-0">
                       <Zap className="h-5 w-5 text-muted-foreground shrink-0" />
                       <div className="min-w-0">
@@ -339,7 +345,12 @@ export function Skills() {
                           {s.overlay_of && (
                             <span className="px-1.5 py-0.5 rounded text-[10px] bg-cyan-500/20 text-cyan-400">OVERLAY</span>
                           )}
-                          <span className="text-[10px] text-muted-foreground">v{s.version}</span>
+                          {s.installed_version && (
+                            <span className="text-[10px] text-green-400">installed v{s.installed_version}</span>
+                          )}
+                          {s.version !== (s.installed_version ?? 0) && (
+                            <span className="text-[10px] text-muted-foreground">draft v{s.version}</span>
+                          )}
                         </div>
                         <p className="text-xs text-muted-foreground truncate">{s.description || "No description"}</p>
                         {lbls.length > 0 && (
@@ -351,12 +362,18 @@ export function Skills() {
                         )}
                       </div>
                     </div>
-                    {!s.is_builtin && (
-                      <button onClick={e => { e.stopPropagation(); handleDelete(s.id) }} title="Delete"
-                        className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400 shrink-0">
-                        <Trash2 className="h-4 w-4" />
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button onClick={() => navigate(`/skills/${s.id}`)} title="Edit"
+                        className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
+                        <Pencil className="h-4 w-4" />
                       </button>
-                    )}
+                      {!s.is_builtin && (
+                        <button onClick={() => handleDelete(s.id)} title="Delete"
+                          className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400">
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )
               })}
