@@ -227,6 +227,10 @@ export class K8sSpawner implements BoxSpawner {
             name: "skills-local",
             emptyDir: {},
           },
+          {
+            name: "knowledge-local",
+            emptyDir: {},
+          },
           this.config.persistence?.enabled
             ? {
                 name: "user-data",
@@ -274,6 +278,10 @@ export class K8sSpawner implements BoxSpawner {
               {
                 name: "skills-local",
                 mountPath: "/app/.siclaw/skills",
+              },
+              {
+                name: "knowledge-local",
+                mountPath: "/app/.siclaw/knowledge",
               },
               {
                 name: "user-data",

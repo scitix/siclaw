@@ -87,6 +87,8 @@ spec:
       mountPath: /app/.siclaw/config
     - name: skills-local
       mountPath: /app/.siclaw/skills
+    - name: knowledge-local
+      mountPath: /app/.siclaw/knowledge
     - name: user-data
       mountPath: /app/.siclaw/user-data
       subPath: users/${USER_ID}/${WORKSPACE_ID}
@@ -105,6 +107,9 @@ spec:
     emptyDir: {}
   # Skills (synced from gateway via RPC buildSkillBundle)
   - name: skills-local
+    emptyDir: {}
+  # Knowledge (synced from gateway via RPC getKnowledgeBundle)
+  - name: knowledge-local
     emptyDir: {}
   # User data (memory, investigations, sessions) — persistent on shared PVC
   - name: user-data

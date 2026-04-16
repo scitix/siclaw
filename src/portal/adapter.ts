@@ -1293,7 +1293,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getResources", async (params) => {
     const db = getDb();
     const agentId = params.agentId;
-    const [[clusters], [hosts], [skills], [mcpServers], [agentRows]] = await Promise.all([
+    const [[clusters], [hosts], [skills], [mcpServers], [knowledgeRepos], [agentRows]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
          JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
@@ -1313,6 +1313,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         [agentId],
       ),
       db.query(
+        "SELECT repo_id FROM agent_knowledge_repos WHERE agent_id = ?",
+        [agentId],
+      ),
+      db.query(
         "SELECT is_production FROM agents WHERE id = ?",
         [agentId],
       ),
@@ -1323,6 +1327,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       hosts,
       skill_ids: skills.map((r: { skill_id: string }) => r.skill_id),
       mcp_server_ids: mcpServers.map((r: { mcp_server_id: string }) => r.mcp_server_id),
+      knowledge_repo_ids: (knowledgeRepos as any[]).map((r: any) => r.repo_id),
       is_production: isProduction,
     };
   });
@@ -1478,6 +1483,53 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
     }));
     return { version: new Date().toISOString(), skills };
+  });
+
+  handlers.set("config.getKnowledgeBundle", async (params) => {
+    const agentId = params.agentId as string | undefined;
+    const db = getDb();
+
+    // Get bound repo IDs for this agent (like skill filtering)
+    let repoIds: string[] = [];
+    if (agentId) {
+      const [bindings] = await db.query(
+        "SELECT repo_id FROM agent_knowledge_repos WHERE agent_id = ?",
+        [agentId],
+      ) as any;
+      repoIds = (bindings as any[]).map((r: any) => r.repo_id);
+    }
+
+    if (repoIds.length === 0) {
+      return { version: "1", repos: [] };
+    }
+
+    const placeholders = repoIds.map(() => "?").join(",");
+    const [rows] = await db.query(
+      `SELECT r.id AS repo_id, r.name, v.version, v.message, v.data, v.size_bytes,
+              v.sha256, v.file_count
+       FROM knowledge_repos r
+       JOIN knowledge_versions v ON v.repo_id = r.id
+       WHERE v.is_active = 1 AND r.id IN (${placeholders})
+       ORDER BY r.name`,
+      repoIds,
+    ) as any;
+
+    return {
+      version: "1",
+      repos: (rows as any[]).map((row: any) => {
+        const data = Buffer.isBuffer(row.data) ? row.data : Buffer.from(row.data);
+        return {
+          id: row.repo_id,
+          name: row.name,
+          version: Number(row.version),
+          message: row.message ?? null,
+          sha256: row.sha256 ?? crypto.createHash("sha256").update(data).digest("hex"),
+          sizeBytes: Number(row.size_bytes ?? data.length),
+          fileCount: row.file_count == null ? null : Number(row.file_count),
+          dataBase64: data.toString("base64"),
+        };
+      }),
+    };
   });
 
   handlers.set("config.getSystemConfig", async () => {

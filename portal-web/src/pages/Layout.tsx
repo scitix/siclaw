@@ -9,7 +9,6 @@ const siclawItems = [
   { path: "/agents", label: "Agents", icon: Bot },
   { path: "/skills", label: "Skills", icon: Zap },
   { path: "/mcp", label: "MCP", icon: Plug },
-  { path: "/knowledge", label: "Knowledge", icon: BookOpen },
 ]
 
 const settingsItems = [
@@ -19,6 +18,7 @@ const settingsItems = [
   { path: "/settings/hosts", label: "Hosts", icon: Monitor },
   { path: "/settings/channels", label: "Channels", icon: Radio },
   { path: "/settings/models", label: "Models", icon: Cpu },
+  { path: "/settings/knowledge", label: "Knowledge", icon: BookOpen },
 ]
 
 export function Layout() {

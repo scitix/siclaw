@@ -6,6 +6,7 @@
 
 import { initDb, closeDb, getDb } from "./gateway/db.js";
 import { runPortalMigrations } from "./portal/migrate.js";
+import { syncBuiltinKnowledge } from "./portal/knowledge-sync.js";
 import { startPortal } from "./portal/server.js";
 
 const config = {
@@ -48,6 +49,8 @@ await runPortalMigrations();
     }
   }
 }
+// Sync knowledge baseline from image
+await syncBuiltinKnowledge();
 console.log("[portal] Database ready");
 
 // Start server

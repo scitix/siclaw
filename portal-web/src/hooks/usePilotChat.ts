@@ -245,7 +245,22 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const abortControllerRef = useRef<AbortController | null>(null)
   const streamingRef = useRef(false)
   const isAbortingRef = useRef(false)
+  const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
+
+  // Per-session state cache: preserves ALL state across session switches so each
+  // agent's conversation feels independent — like browser tabs.
+  interface SessionCache {
+    messages: PilotMessage[]
+    streaming: boolean
+    dpProgress: InvestigationProgress | null
+    dpChecklist: DpChecklistItem[] | null
+    dpActive: boolean
+    dpFocus: string | null
+    contextUsage: ContextUsage | null
+  }
+  const messagesCacheRef = useRef<Map<string, SessionCache>>(new Map())
+  const prevSessionIdRef = useRef<string | undefined>(undefined)
 
   // Reset DP state
   const resetDpState = useCallback(() => {
@@ -259,14 +274,55 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
   // Load message history when session changes
   useEffect(() => {
+    // Save outgoing session's full state to cache
+    const prev = prevSessionIdRef.current
+    if (prev) {
+      messagesCacheRef.current.set(prev, {
+        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+      })
+    }
+    prevSessionIdRef.current = sessionId ?? undefined
+    activeSessionIdRef.current = sessionId ?? undefined
+
     if (!sessionId) {
       setMessages([])
+      setStreaming(false)
+      streamingRef.current = false
       setContextUsage(null)
       setHasMore(true)
       pageRef.current = 1
       resetDpState()
       return
     }
+
+    // Restore from cache ONLY if stream is still in progress (DB doesn't have
+    // all messages yet). Otherwise load from DB — it's the authoritative source
+    // and includes messages produced while the user was on another session.
+    const cached = messagesCacheRef.current.get(sessionId)
+    if (cached?.streaming) {
+      setMessages(cached.messages)
+      setStreaming(true)
+      streamingRef.current = true
+      setDpProgress(cached.dpProgress)
+      setDpChecklist(cached.dpChecklist)
+      setDpActive(cached.dpActive)
+      setDpFocus(cached.dpFocus)
+      setContextUsage(cached.contextUsage)
+      setHasMore(true)
+      return
+    }
+    // Restore DP state from cache if available (even when loading messages from DB)
+    if (cached) {
+      setDpProgress(cached.dpProgress)
+      setDpChecklist(cached.dpChecklist)
+      setDpActive(cached.dpActive)
+      setDpFocus(cached.dpFocus)
+      setContextUsage(cached.contextUsage)
+    } else {
+      resetDpState()
+    }
+
+    // No cache — load from DB (first visit to this session)
     let cancelled = false
     async function loadHistory() {
       try {
@@ -276,7 +332,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         if (cancelled) return
-        // Convert DB messages to PilotMessage format
         const pilotMsgs: PilotMessage[] = items.map((m) => ({
           id: m.id,
           role: m.role,
@@ -299,10 +354,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       }
     }
     loadHistory()
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, sessionId, resetDpState])
+
+  // Keep cache in sync with current state so switching back restores latest
+  useEffect(() => {
+    if (sessionId) {
+      messagesCacheRef.current.set(sessionId, {
+        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+      })
+    }
+  }, [sessionId, messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(
@@ -649,6 +712,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       // Start SSE
       const controller = new AbortController()
       abortControllerRef.current = controller
+      const streamSessionId = sessionId // capture at call time
       const token = localStorage.getItem("token")
 
       ;(async () => {
@@ -680,6 +744,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
             for (const frame of frames) {
               if (!frame.trim()) continue
+              const isActive = activeSessionIdRef.current === streamSessionId
               let event = "message"
               let data = ""
               for (const line of frame.split("\n")) {
@@ -692,12 +757,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                 if (event === "session") {
                   // Session ID from backend — we already have it from the prop
                 } else if (event === "chat.event") {
-                  // Full agent event — process it
-                  handleChatEvent(parsed)
+                  if (isActive) handleChatEvent(parsed)
                 } else if (event === "chat.text") {
-                  // Simplified text event (fallback compatibility)
                   const chunk = parsed.text || ""
-                  if (chunk) {
+                  if (chunk && isActive) {
                     setMessages((prev) => {
                       const last = prev[prev.length - 1]
                       if (last?.isStreaming && last.role === "assistant") {
@@ -716,14 +779,21 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                     })
                   }
                 } else if (event === "done") {
-                  setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
-                  setStreaming(false)
-                  streamingRef.current = false
-                  setPendingMessages([])
+                  if (isActive) {
+                    setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+                    setStreaming(false)
+                    streamingRef.current = false
+                    setPendingMessages([])
+                  }
+                  // Update cache: mark stream as finished so switching back shows final state
+                  if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
                 } else if (event === "error") {
                   console.error("[usePilotChat] SSE error:", parsed)
-                  setStreaming(false)
-                  streamingRef.current = false
+                  if (isActive) {
+                    setStreaming(false)
+                    streamingRef.current = false
+                  }
+                  if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
                 }
               } catch {
                 // Ignore parse errors
@@ -731,19 +801,23 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             }
           }
 
-          // Stream ended — finalize
-          setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
-          if (streamingRef.current) {
-            setStreaming(false)
-            streamingRef.current = false
+          // Stream ended — finalize (only if still on this session)
+          if (activeSessionIdRef.current === streamSessionId) {
+            setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+            if (streamingRef.current) {
+              setStreaming(false)
+              streamingRef.current = false
+            }
           }
         } catch (err) {
           if ((err as Error).name !== "AbortError") {
             console.error("[usePilotChat] SSE error:", err)
           }
-          setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
-          setStreaming(false)
-          streamingRef.current = false
+          if (activeSessionIdRef.current === streamSessionId) {
+            setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+            setStreaming(false)
+            streamingRef.current = false
+          }
         }
       })()
     },

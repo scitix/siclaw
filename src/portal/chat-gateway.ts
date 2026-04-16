@@ -156,8 +156,10 @@ export function registerChatRoutes(
       const evt = envelope.event;
       sseWrite(res, "chat.event", evt);
 
-      // Stream complete
-      if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
+      // Stream complete — only on prompt_done (sent by Runtime after ALL agent
+      // turns finish). agent_end fires after each individual turn and must NOT
+      // close the stream, or multi-turn responses (tool calls → text) get cut off.
+      if (evt.type === "prompt_done" || evt.type === "done") {
         sseWrite(res, "done", {});
         res.end();
         cleanup();
@@ -316,7 +318,7 @@ export function registerChatRoutes(
         const ame = (evt as any).assistantMessageEvent;
         if (ame?.type === "text_delta" && typeof ame.delta === "string") assistantText += ame.delta;
       }
-      if (evt.type === "agent_end" || evt.type === "turn_complete" || evt.type === "prompt_done" || evt.type === "done") {
+      if (evt.type === "prompt_done" || evt.type === "done") {
         if (!resolved) {
           resolved = true;
           clearTimeout(timeout);
