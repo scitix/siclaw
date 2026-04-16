@@ -355,4 +355,24 @@ describe("FrontendWsClient", () => {
 
     client.close();
   });
+
+  // ── close() rejects pending RPCs ─────────────────────────────
+
+  it("close() rejects all pending RPCs", async () => {
+    const client = await createClient();
+
+    const connectPromise = client.connect();
+    openLatestWs();
+    await connectPromise;
+
+    // Send two requests but don't simulate any response
+    const p1 = client.request("method.one");
+    const p2 = client.request("method.two");
+
+    // Close before any response arrives
+    client.close();
+
+    await expect(p1).rejects.toThrow("closed");
+    await expect(p2).rejects.toThrow("closed");
+  });
 });
