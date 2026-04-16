@@ -94,15 +94,33 @@ export function Clusters() {
       </div>
 
       {showCreate && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
-          <input placeholder="Cluster Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-          <input placeholder="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-          <textarea placeholder="Paste kubeconfig YAML here..." value={form.kubeconfig} onChange={(e) => setForm({ ...form, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
-          <input placeholder="Debug image (optional, e.g. nicolaka/netshoot:latest)" value={form.debug_image} onChange={(e) => setForm({ ...form, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} />
-            Production environment
-          </label>
+        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Cluster Name</label>
+            <input placeholder="e.g. prod-us-east" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Description</label>
+            <input placeholder="Optional description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Kubeconfig</label>
+            <textarea placeholder="Paste kubeconfig YAML here..." value={form.kubeconfig} onChange={(e) => setForm({ ...form, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Debug Image</label>
+            <input placeholder="e.g. nicolaka/netshoot:latest" value={form.debug_image} onChange={(e) => setForm({ ...form, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            <p className="text-xs text-muted-foreground mt-1">Container image for debug pods (kubectl debug). Each cluster can use its own registry. Leave empty to use the system default (SICLAW_DEBUG_IMAGE env or busybox:1.36).</p>
+          </div>
+          <div className="flex items-start gap-3">
+            <button type="button" role="switch" aria-checked={form.is_production} onClick={() => setForm({ ...form, is_production: !form.is_production })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${form.is_production ? "bg-primary" : "bg-muted"}`}>
+              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${form.is_production ? "translate-x-4" : "translate-x-0"}`} />
+            </button>
+            <div>
+              <label className="block text-sm font-medium">Production Environment</label>
+              <p className="text-xs text-muted-foreground">Production clusters only receive approved skills. Dev clusters can use draft skills.</p>
+            </div>
+          </div>
           <div className="flex gap-2">
             <button onClick={handleCreate} disabled={creating || !form.name || !form.kubeconfig} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "Creating..." : "Create"}</button>
             <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
@@ -140,18 +158,34 @@ export function Clusters() {
                   </div>
                 </div>
                 {editingId === c.id && (
-                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-3">
-                    <input placeholder="Cluster Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                    <input placeholder="Description" value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-4">
                     <div>
-                      <textarea placeholder="Paste kubeconfig YAML here..." value={editForm.kubeconfig} onChange={(e) => setEditForm({ ...editForm, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
-                      <p className="text-xs text-muted-foreground mt-1">Leave empty to keep current</p>
+                      <label className="block text-sm font-medium mb-1">Cluster Name</label>
+                      <input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                     </div>
-                    <input placeholder="Debug image (optional)" value={editForm.debug_image} onChange={(e) => setEditForm({ ...editForm, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                    <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <input type="checkbox" checked={editForm.is_production} onChange={(e) => setEditForm({ ...editForm, is_production: e.target.checked })} />
-                      Production environment
-                    </label>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Description</label>
+                      <input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Kubeconfig</label>
+                      <textarea placeholder="Paste kubeconfig YAML to replace..." value={editForm.kubeconfig} onChange={(e) => setEditForm({ ...editForm, kubeconfig: e.target.value })} rows={6} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                      <p className="text-xs text-muted-foreground mt-1">Leave empty to keep current kubeconfig unchanged.</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Debug Image</label>
+                      <input placeholder="e.g. nicolaka/netshoot:latest" value={editForm.debug_image} onChange={(e) => setEditForm({ ...editForm, debug_image: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      <p className="text-xs text-muted-foreground mt-1">Container image for debug pods. Each cluster can use a different registry. Leave empty to use the global default.</p>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <label className="block text-sm font-medium">Production Environment</label>
+                        <p className="text-xs text-muted-foreground">Production clusters only receive approved skills. Dev clusters can use draft skills.</p>
+                      </div>
+                      <button type="button" role="switch" aria-checked={editForm.is_production} onClick={() => setEditForm({ ...editForm, is_production: !editForm.is_production })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${editForm.is_production ? "bg-primary" : "bg-muted"}`}>
+                        <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${editForm.is_production ? "translate-x-4" : "translate-x-0"}`} />
+                      </button>
+                    </div>
                     <div className="flex gap-2">
                       <button onClick={handleSaveEdit} disabled={saving || !editForm.name} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
                       <button onClick={() => setEditingId(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>

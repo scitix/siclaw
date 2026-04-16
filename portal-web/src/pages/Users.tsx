@@ -119,15 +119,26 @@ export function Users() {
       </div>
 
       {showCreate && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
+        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
           <div className="grid grid-cols-2 gap-3">
-            <input placeholder="Username" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-            <input type="password" placeholder="Password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            <div>
+              <label className="block text-sm font-medium mb-1">Username</label>
+              <input placeholder="e.g. alice" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Password</label>
+              <input type="password" placeholder="Initial password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
           </div>
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={form.can_review_skills} onChange={(e) => setForm({ ...form, can_review_skills: e.target.checked })} />
-            Can review skills
-          </label>
+          <div className="flex items-start gap-3">
+            <button type="button" role="switch" aria-checked={form.can_review_skills} onClick={() => setForm({ ...form, can_review_skills: !form.can_review_skills })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${form.can_review_skills ? "bg-primary" : "bg-muted"}`}>
+              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${form.can_review_skills ? "translate-x-4" : "translate-x-0"}`} />
+            </button>
+            <div>
+              <label className="block text-sm font-medium">Skill Reviewer</label>
+              <p className="text-xs text-muted-foreground">Allow this user to review and approve skill submissions.</p>
+            </div>
+          </div>
           <div className="flex gap-2">
             <button onClick={handleCreate} disabled={creating || !form.username || !form.password} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "Creating..." : "Create"}</button>
             <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
@@ -175,19 +186,20 @@ export function Users() {
                   </div>
                 </div>
                 {editingId === u.id && (
-                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-3">
+                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-4">
                     {u.role !== "admin" && (
-                      <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                        <input
-                          type="checkbox"
-                          checked={editForm.can_review_skills}
-                          onChange={(e) => setEditForm({ ...editForm, can_review_skills: e.target.checked })}
-                        />
-                        Can review skills
-                      </label>
+                      <div className="flex items-start gap-3">
+                        <button type="button" role="switch" aria-checked={editForm.can_review_skills} onClick={() => setEditForm({ ...editForm, can_review_skills: !editForm.can_review_skills })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${editForm.can_review_skills ? "bg-primary" : "bg-muted"}`}>
+                          <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${editForm.can_review_skills ? "translate-x-4" : "translate-x-0"}`} />
+                        </button>
+                        <div>
+                          <label className="block text-sm font-medium">Skill Reviewer</label>
+                          <p className="text-xs text-muted-foreground">Allow this user to review and approve skill submissions.</p>
+                        </div>
+                      </div>
                     )}
-                    <div className="space-y-1">
-                      <label className="text-xs font-medium text-muted-foreground">Reset Password</label>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Reset Password</label>
                       <input
                         type="password"
                         placeholder="Leave empty to keep current"
