@@ -118,6 +118,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // Skills
   // ================================================================
 
+  // All distinct labels across skills (for autocomplete)
+  router.get(`${P}/skills/labels`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT DISTINCT jl.label FROM skills, JSON_TABLE(labels, '$[*]' COLUMNS(label VARCHAR(100) PATH '$')) AS jl WHERE jl.label IS NOT NULL ORDER BY jl.label`,
+    ) as any;
+    sendJson(res, 200, { labels: (rows as any[]).map((r: any) => r.label) });
+  });
+
   // List skills
   router.get(`${P}/skills`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
