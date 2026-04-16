@@ -89,42 +89,56 @@ export function Agents() {
       </div>
 
       {showCreate && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
-          <input placeholder="Agent Name *" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-          <input placeholder="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
+          <div>
+            <label className="block text-sm font-medium mb-1">Agent Name</label>
+            <input placeholder="e.g. sre-copilot" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">Description</label>
+            <input placeholder="Optional description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
           <div className="grid grid-cols-2 gap-3">
-            {/* Provider dropdown */}
-            <select
-              value={form.model_provider}
-              onChange={(e) => setForm({ ...form, model_provider: e.target.value, model_id: "" })}
-              className="h-8 px-3 text-sm rounded-md border border-border bg-background"
-            >
-              <option value="">Select Provider</option>
-              {providers.map((p) => (
-                <option key={p.id} value={p.name}>{p.name}</option>
-              ))}
-            </select>
-            {/* Model dropdown */}
-            <select
-              value={form.model_id}
-              onChange={(e) => setForm({ ...form, model_id: e.target.value })}
-              disabled={!form.model_provider}
-              className="h-8 px-3 text-sm rounded-md border border-border bg-background disabled:opacity-50"
-            >
-              <option value="">Select Model</option>
-              {availableModels.map((m) => (
-                <option key={m.id} value={m.model_id}>{m.name || m.model_id}</option>
-              ))}
-            </select>
+            <div>
+              <label className="block text-sm font-medium mb-1">Provider</label>
+              <select
+                value={form.model_provider}
+                onChange={(e) => setForm({ ...form, model_provider: e.target.value, model_id: "" })}
+                className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background"
+              >
+                <option value="">Select Provider</option>
+                {providers.map((p) => (
+                  <option key={p.id} value={p.name}>{p.name}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Model</label>
+              <select
+                value={form.model_id}
+                onChange={(e) => setForm({ ...form, model_id: e.target.value })}
+                disabled={!form.model_provider}
+                className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background disabled:opacity-50"
+              >
+                <option value="">Select Model</option>
+                {availableModels.map((m) => (
+                  <option key={m.id} value={m.model_id}>{m.name || m.model_id}</option>
+                ))}
+              </select>
+            </div>
           </div>
           {providers.length === 0 && (
             <p className="text-xs text-muted-foreground">No providers configured. <button onClick={() => navigate("/settings/models")} className="underline hover:text-foreground">Add one first</button></p>
           )}
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} />
-            Production agent
-            <span className="text-xs text-muted-foreground/70">(dev agents see draft skills and only dev clusters)</span>
-          </label>
+          <div className="flex items-start gap-3">
+            <button type="button" role="switch" aria-checked={form.is_production} onClick={() => setForm({ ...form, is_production: !form.is_production })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${form.is_production ? "bg-primary" : "bg-muted"}`}>
+              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${form.is_production ? "translate-x-4" : "translate-x-0"}`} />
+            </button>
+            <div>
+              <label className="block text-sm font-medium">Production Agent</label>
+              <p className="text-xs text-muted-foreground">Production agents only receive approved skills and can only access production clusters/hosts. Dev agents see draft skills and dev resources.</p>
+            </div>
+          </div>
           <div className="flex gap-2">
             <button onClick={handleCreate} disabled={creating || !form.name} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "..." : "Create"}</button>
             <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>

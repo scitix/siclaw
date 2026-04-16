@@ -91,31 +91,60 @@ export function Hosts() {
       </div>
 
       {showCreate && (
-        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-3">
+        <div className="mx-6 my-4 p-4 rounded-lg border border-border bg-card space-y-4">
           <div className="grid grid-cols-2 gap-3">
-            <input placeholder="Host Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-            <input placeholder="IP Address" value={form.ip} onChange={(e) => setForm({ ...form, ip: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-            <input placeholder="Port" value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-            <input placeholder="Username" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            <div>
+              <label className="block text-sm font-medium mb-1">Host Name</label>
+              <input placeholder="e.g. gpu-01" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">IP Address</label>
+              <input placeholder="e.g. 10.0.1.5" value={form.ip} onChange={(e) => setForm({ ...form, ip: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Port</label>
+              <input value={form.port} onChange={(e) => setForm({ ...form, port: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Username</label>
+              <input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
           </div>
-          <div className="flex gap-4">
-            <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
-              <input type="radio" name="auth" checked={form.auth_type === "password"} onChange={() => setForm({ ...form, auth_type: "password" })} /> Password
-            </label>
-            <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
-              <input type="radio" name="auth" checked={form.auth_type === "key"} onChange={() => setForm({ ...form, auth_type: "key" })} /> SSH Key
-            </label>
+          <div>
+            <label className="block text-sm font-medium mb-1">Authentication</label>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <input type="radio" name="auth" checked={form.auth_type === "password"} onChange={() => setForm({ ...form, auth_type: "password" })} /> Password
+              </label>
+              <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <input type="radio" name="auth" checked={form.auth_type === "key"} onChange={() => setForm({ ...form, auth_type: "key" })} /> SSH Key
+              </label>
+            </div>
           </div>
           {form.auth_type === "password" ? (
-            <input type="password" placeholder="Password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            <div>
+              <label className="block text-sm font-medium mb-1">Password</label>
+              <input type="password" placeholder="SSH password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+            </div>
           ) : (
-            <textarea placeholder="Paste SSH private key (PEM)" value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+            <div>
+              <label className="block text-sm font-medium mb-1">Private Key</label>
+              <textarea placeholder="Paste SSH private key (PEM format)" value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+            </div>
           )}
-          <input placeholder="Description (optional)" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" checked={form.is_production} onChange={(e) => setForm({ ...form, is_production: e.target.checked })} />
-            Production environment
-          </label>
+          <div>
+            <label className="block text-sm font-medium mb-1">Description</label>
+            <input placeholder="Optional description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+          </div>
+          <div className="flex items-start gap-3">
+            <button type="button" role="switch" aria-checked={form.is_production} onClick={() => setForm({ ...form, is_production: !form.is_production })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${form.is_production ? "bg-primary" : "bg-muted"}`}>
+              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${form.is_production ? "translate-x-4" : "translate-x-0"}`} />
+            </button>
+            <div>
+              <label className="block text-sm font-medium">Production Environment</label>
+              <p className="text-xs text-muted-foreground">Production hosts are only accessible by production agents.</p>
+            </div>
+          </div>
           <div className="flex gap-2">
             <button onClick={handleCreate} disabled={creating || !form.name || !form.ip} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "Creating..." : "Create"}</button>
             <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
@@ -153,31 +182,60 @@ export function Hosts() {
                   </div>
                 </div>
                 {editingId === h.id && (
-                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-3">
+                  <div className="ml-4 mt-2 mb-2 p-4 rounded-lg border border-border bg-card space-y-4">
                     <div className="grid grid-cols-2 gap-3">
-                      <input placeholder="Host Name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                      <input placeholder="IP Address" value={editForm.ip} onChange={(e) => setEditForm({ ...editForm, ip: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                      <input placeholder="Port" value={editForm.port} onChange={(e) => setEditForm({ ...editForm, port: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                      <input placeholder="Username" value={editForm.username} onChange={(e) => setEditForm({ ...editForm, username: e.target.value })} className="h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Host Name</label>
+                        <input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1">IP Address</label>
+                        <input value={editForm.ip} onChange={(e) => setEditForm({ ...editForm, ip: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Port</label>
+                        <input value={editForm.port} onChange={(e) => setEditForm({ ...editForm, port: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Username</label>
+                        <input value={editForm.username} onChange={(e) => setEditForm({ ...editForm, username: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      </div>
                     </div>
-                    <div className="flex gap-4">
-                      <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                        <input type="radio" name="edit-auth" checked={editForm.auth_type === "password"} onChange={() => setEditForm({ ...editForm, auth_type: "password" })} /> Password
-                      </label>
-                      <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                        <input type="radio" name="edit-auth" checked={editForm.auth_type === "key"} onChange={() => setEditForm({ ...editForm, auth_type: "key" })} /> SSH Key
-                      </label>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Authentication</label>
+                      <div className="flex gap-4">
+                        <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                          <input type="radio" name="edit-auth" checked={editForm.auth_type === "password"} onChange={() => setEditForm({ ...editForm, auth_type: "password" })} /> Password
+                        </label>
+                        <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                          <input type="radio" name="edit-auth" checked={editForm.auth_type === "key"} onChange={() => setEditForm({ ...editForm, auth_type: "key" })} /> SSH Key
+                        </label>
+                      </div>
                     </div>
                     {editForm.auth_type === "password" ? (
-                      <input type="password" placeholder="Leave empty to keep current" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Password</label>
+                        <input type="password" placeholder="Leave empty to keep current" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                      </div>
                     ) : (
-                      <textarea placeholder="Leave empty to keep current" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                      <div>
+                        <label className="block text-sm font-medium mb-1">Private Key</label>
+                        <textarea placeholder="Leave empty to keep current" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                      </div>
                     )}
-                    <input placeholder="Description (optional)" value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                    <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <input type="checkbox" checked={editForm.is_production} onChange={(e) => setEditForm({ ...editForm, is_production: e.target.checked })} />
-                      Production environment
-                    </label>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Description</label>
+                      <input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                    </div>
+                    <div className="flex items-start gap-3">
+                      <button type="button" role="switch" aria-checked={editForm.is_production} onClick={() => setEditForm({ ...editForm, is_production: !editForm.is_production })} className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors mt-0.5 ${editForm.is_production ? "bg-primary" : "bg-muted"}`}>
+                        <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform ${editForm.is_production ? "translate-x-4" : "translate-x-0"}`} />
+                      </button>
+                      <div>
+                        <label className="block text-sm font-medium">Production Environment</label>
+                        <p className="text-xs text-muted-foreground">Production hosts are only accessible by production agents.</p>
+                      </div>
+                    </div>
                     <div className="flex gap-2">
                       <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.ip} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
                       <button onClick={() => setEditingId(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
