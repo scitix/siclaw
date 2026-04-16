@@ -2,11 +2,10 @@
  * Resolve an agent's bound model provider + entry into a full modelConfig
  * payload that AgentBox's /api/prompt accepts.
  *
- * Runtime no longer accesses the database directly — resolution goes
- * through Portal's adapter API.
+ * Resolution goes through FrontendWsClient RPC.
  */
 
-import type { RuntimeConfig } from "./config.js";
+import type { FrontendWsClient } from "./frontend-ws-client.js";
 
 export interface ResolvedModelBinding {
   modelProvider: string;
@@ -32,15 +31,13 @@ export interface ResolvedModelBinding {
 
 export async function resolveAgentModelBinding(
   agentId: string,
-  config: RuntimeConfig,
+  frontendClient: FrontendWsClient,
 ): Promise<ResolvedModelBinding | null> {
-  const resp = await fetch(`${config.serverUrl}/api/internal/siclaw/agent/${agentId}/model-binding`, {
-    headers: { "X-Auth-Token": config.portalSecret },
-  });
-  if (!resp.ok) {
-    console.error(`[agent-model-binding] Adapter returned ${resp.status}`);
+  try {
+    const data = await frontendClient.request("config.getModelBinding", { agentId }) as { binding: ResolvedModelBinding | null };
+    return data.binding;
+  } catch (err) {
+    console.error(`[agent-model-binding] RPC error:`, err);
     return null;
   }
-  const data = await resp.json() as { binding: ResolvedModelBinding | null };
-  return data.binding;
 }

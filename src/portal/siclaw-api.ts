@@ -28,8 +28,6 @@ import {
   type AuthContext,
 } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
-// NOTE: getMessages from chat-repo.ts is for Runtime→Portal HTTP calls.
-// Portal queries chat_messages directly since it owns the DB.
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { validateSchedule } from "../cron/cron-limits.js";

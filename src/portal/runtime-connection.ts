@@ -57,9 +57,13 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export function createConnectionMap(): RuntimeConnectionMap {
   const connections = new Map<string, Set<WebSocket>>();
   const pending = new Map<string, PendingRpc>();
+  // Event subscribers: agentId → channel → handlers.
+  // A single Runtime serves all agents, so events arriving on any
+  // connection are dispatched to ALL matching channel subscribers
+  // regardless of agentId key. Subscribers already filter by sessionId.
   const subscribers = new Map<string, Map<string, Set<EventHandler>>>();
 
-  function handleMessage(agentId: string, raw: WebSocket.Data): void {
+  function handleMessage(_registeredId: string, raw: WebSocket.Data): void {
     let msg: any;
     try {
       msg = JSON.parse(String(raw));
@@ -82,16 +86,38 @@ export function createConnectionMap(): RuntimeConnectionMap {
     }
 
     if (msg.type === "event" && typeof msg.channel === "string") {
-      const channels = subscribers.get(agentId);
-      if (!channels) return;
-      const handlers = channels.get(msg.channel);
-      if (!handlers) return;
-      for (const h of handlers) {
-        try {
-          h(msg.data);
-        } catch { /* subscriber errors must not crash the loop */ }
+      // Broadcast to all subscribers for this channel across all agentIds.
+      // Each subscriber filters by sessionId internally.
+      for (const channels of subscribers.values()) {
+        const handlers = channels.get(msg.channel);
+        if (!handlers) continue;
+        for (const h of handlers) {
+          try {
+            h(msg.data);
+          } catch { /* subscriber errors must not crash the loop */ }
+        }
       }
     }
+  }
+
+  /** Check if an exact agentId has connections. */
+  function hasWs(agentId: string): boolean {
+    const set = connections.get(agentId);
+    return !!set && set.size > 0;
+  }
+
+  /**
+   * Get a WS for the given agentId. Falls back to any connected Runtime
+   * because a single Runtime process serves all agents.
+   */
+  function getWs(agentId: string): WebSocket | null {
+    const exact = connections.get(agentId);
+    if (exact && exact.size > 0) return exact.values().next().value!;
+    // Fallback: pick any connected Runtime
+    for (const set of connections.values()) {
+      if (set.size > 0) return set.values().next().value!;
+    }
+    return null;
   }
 
   const map: RuntimeConnectionMap = {
@@ -122,21 +148,21 @@ export function createConnectionMap(): RuntimeConnectionMap {
     },
 
     isConnected(agentId) {
-      const set = connections.get(agentId);
-      return !!set && set.size > 0;
+      // Exact match first, then fallback to any connected Runtime.
+      // A single Runtime process serves all agents; the connection is
+      // registered under its runtimeId (e.g. "runtime"), not per-agent.
+      if (hasWs(agentId)) return true;
+      return connections.size > 0;
     },
 
     async sendCommand(agentId, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
-      const set = connections.get(agentId);
-      if (!set || set.size === 0) {
+      const ws = getWs(agentId);
+      if (!ws) {
         return { ok: false, error: `Agent ${agentId} is not connected` };
       }
 
       const id = crypto.randomUUID().slice(0, 8);
       const frame = JSON.stringify({ type: "req", id, method, params });
-
-      // Pick the first WS in the set (round-robin can be added later).
-      const ws = set.values().next().value!;
 
       return new Promise<RpcResult>((resolve) => {
         const timer = setTimeout(() => {
@@ -151,12 +177,16 @@ export function createConnectionMap(): RuntimeConnectionMap {
     },
 
     notify(agentId, method, params) {
-      const set = connections.get(agentId);
-      if (!set || set.size === 0) return;
       const frame = JSON.stringify({ type: "req", id: crypto.randomUUID().slice(0, 8), method, params });
-      for (const ws of set) {
-        ws.send(frame);
+      // Exact match: broadcast to all connections for this agentId
+      const exact = connections.get(agentId);
+      if (exact && exact.size > 0) {
+        for (const ws of exact) ws.send(frame);
+        return;
       }
+      // Fallback: send to any connected Runtime
+      const ws = getWs(agentId);
+      if (ws) ws.send(frame);
     },
 
     notifyMany(agentIds, method, params) {
