@@ -193,4 +193,112 @@ describe("RuntimeConnectionMap", () => {
     expect(ids).toContain("y");
     expect(ids).toHaveLength(2);
   });
+
+  // ── Fallback to any connected Runtime ───────────────────────
+
+  describe("fallback to any connected Runtime", () => {
+    it("isConnected returns true for unknown agentId when any Runtime is connected", () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+      expect(map.isConnected("some-agent-uuid")).toBe(true);
+    });
+
+    it("isConnected returns false when no Runtime is connected", () => {
+      map = freshMap();
+      expect(map.isConnected("some-agent-uuid")).toBe(false);
+    });
+
+    it("sendCommand falls back to any connected Runtime for unknown agentId", async () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+
+      const promise = map.sendCommand("some-agent-uuid", "chat.send", { text: "hi" });
+
+      // Inspect the sent frame and simulate a response
+      expect(ws._sent).toHaveLength(1);
+      const frame = JSON.parse(ws._sent[0]);
+      expect(frame.type).toBe("req");
+      expect(frame.method).toBe("chat.send");
+      expect(frame.params).toEqual({ text: "hi" });
+
+      // Simulate Runtime responding
+      ws.emit("message", JSON.stringify({ type: "res", id: frame.id, ok: true, payload: { done: true } }));
+
+      const result = await promise;
+      expect(result.ok).toBe(true);
+      expect(result.payload).toEqual({ done: true });
+    });
+
+    it("notify falls back to any connected Runtime for unknown agentId", () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+
+      map.notify("some-agent-uuid", "agent.reload", { resources: ["skills"] });
+      expect(ws._sent).toHaveLength(1);
+      expect(JSON.parse(ws._sent[0]).method).toBe("agent.reload");
+    });
+  });
+
+  // ── Event broadcast ─────────────────────────────────────────
+
+  describe("event broadcast", () => {
+    it("events from Runtime are delivered to subscribers registered under different agentId", () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+
+      const received: unknown[] = [];
+      map.subscribe("some-agent-uuid", "chat.event", (data) => received.push(data));
+
+      // Simulate an event frame arriving on the "runtime" connection
+      ws.emit("message", JSON.stringify({
+        type: "event",
+        channel: "chat.event",
+        data: { sessionId: "s1", event: { type: "agent_start" } },
+      }));
+
+      expect(received).toHaveLength(1);
+      expect(received[0]).toEqual({ sessionId: "s1", event: { type: "agent_start" } });
+    });
+
+    it("events are delivered to all subscribers across different agentIds", () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+
+      const received1: unknown[] = [];
+      const received2: unknown[] = [];
+      map.subscribe("agent-1", "chat.event", (data) => received1.push(data));
+      map.subscribe("agent-2", "chat.event", (data) => received2.push(data));
+
+      ws.emit("message", JSON.stringify({
+        type: "event",
+        channel: "chat.event",
+        data: { text: "hello" },
+      }));
+
+      expect(received1).toHaveLength(1);
+      expect(received2).toHaveLength(1);
+    });
+
+    it("events on different channels are not cross-delivered", () => {
+      map = freshMap();
+      const ws = fakeWs();
+      map.register("runtime", ws);
+
+      const received: unknown[] = [];
+      map.subscribe("agent-1", "chat.event", (data) => received.push(data));
+
+      ws.emit("message", JSON.stringify({
+        type: "event",
+        channel: "other.channel",
+        data: { x: 1 },
+      }));
+
+      expect(received).toHaveLength(0);
+    });
+  });
 });
