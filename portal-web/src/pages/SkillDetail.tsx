@@ -104,8 +104,17 @@ export function SkillDetail() {
   const [versions, setVersions] = useState<SkillVersion[]>([])
   const [showHistory, setShowHistory] = useState(false)
 
-  // Label input
+  // Label input + autocomplete
   const labelInputRef = useRef<HTMLInputElement>(null)
+  const [labelQuery, setLabelQuery] = useState("")
+  const [allLabels, setAllLabels] = useState<string[]>([])
+  const [showLabelSuggestions, setShowLabelSuggestions] = useState(false)
+
+  useEffect(() => {
+    api<{ labels: string[] }>("/siclaw/skills/labels")
+      .then(r => setAllLabels(r.labels ?? []))
+      .catch(() => {})
+  }, [])
 
   // ── Data loading ──────────────────────────────────────────────
 
@@ -313,16 +322,38 @@ export function SkillDetail() {
 
   // ── Label management ──────────────────────────────────────────
 
+  const addLabel = (val: string) => {
+    const trimmed = val.trim()
+    if (trimmed && !labels.includes(trimmed)) setLabels([...labels, trimmed])
+    setLabelQuery("")
+    setShowLabelSuggestions(false)
+  }
+
   const handleLabelKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter" || e.key === ",") {
       e.preventDefault()
-      const val = (e.target as HTMLInputElement).value.trim()
-      if (val && !labels.includes(val)) setLabels([...labels, val])
-      ;(e.target as HTMLInputElement).value = ""
+      addLabel(labelQuery)
     }
+    if (e.key === "Escape") setShowLabelSuggestions(false)
   }
 
+  const labelSuggestions = useMemo(() => {
+    if (!labelQuery.trim()) return allLabels.filter(l => !labels.includes(l))
+    const q = labelQuery.toLowerCase()
+    return allLabels.filter(l => l.toLowerCase().includes(q) && !labels.includes(l))
+  }, [labelQuery, allLabels, labels])
+
   const removeLabel = (lbl: string) => setLabels(labels.filter(l => l !== lbl))
+
+  /** Sync header name → frontmatter `name:` field in specs */
+  const syncNameToFrontmatter = (newName: string) => {
+    setSpecs(prev => {
+      const fmMatch = prev.match(/^(---\n)([\s\S]*?)(\n---)/)
+      if (!fmMatch) return prev
+      const updated = fmMatch[2].replace(/^name:\s*.+$/m, `name: ${newName}`)
+      return `${fmMatch[1]}${updated}${fmMatch[3]}${prev.slice(fmMatch[0].length)}`
+    })
+  }
 
   // ── Render ────────────────────────────────────────────────────
 
@@ -340,11 +371,11 @@ export function SkillDetail() {
             <ArrowLeft className="h-4 w-4" />
           </button>
           {isCreate ? (
-            <input value={name} onChange={e => setName(e.target.value)} placeholder="Skill name..."
+            <input value={name} onChange={e => { setName(e.target.value); syncNameToFrontmatter(e.target.value) }} placeholder="Skill name..."
               className="text-lg font-semibold bg-transparent border-none outline-none w-64" autoFocus />
           ) : editing ? (
             <div className="flex items-center gap-2">
-              <input value={name} onChange={e => setName(e.target.value)}
+              <input value={name} onChange={e => { setName(e.target.value); syncNameToFrontmatter(e.target.value) }}
                 className="text-lg font-semibold bg-transparent border-none outline-none w-64 hover:bg-secondary/30 rounded px-1 -ml-1" />
               {isDirty && <span className="text-amber-400 text-lg leading-none" title="Unsaved changes">●</span>}
             </div>
@@ -430,8 +461,25 @@ export function SkillDetail() {
                   </span>
                 ))}
                 {(editing || isCreate) && (
-                  <input ref={labelInputRef} type="text" placeholder="+ Add label" onKeyDown={handleLabelKeyDown}
-                    className="text-[11px] px-1.5 py-0.5 border border-transparent rounded bg-transparent text-muted-foreground outline-none w-20 focus:border-border focus:bg-background placeholder:text-muted-foreground/40" />
+                  <div className="relative">
+                    <input ref={labelInputRef} type="text" placeholder="+ Add label"
+                      value={labelQuery}
+                      onChange={e => { setLabelQuery(e.target.value); setShowLabelSuggestions(true) }}
+                      onFocus={() => setShowLabelSuggestions(true)}
+                      onBlur={() => setTimeout(() => setShowLabelSuggestions(false), 150)}
+                      onKeyDown={handleLabelKeyDown}
+                      className="text-[11px] px-1.5 py-0.5 border border-transparent rounded bg-transparent text-muted-foreground outline-none w-24 focus:border-border focus:bg-background placeholder:text-muted-foreground/40" />
+                    {showLabelSuggestions && labelSuggestions.length > 0 && (
+                      <div className="absolute left-0 top-full mt-1 w-40 max-h-32 overflow-y-auto bg-card border border-border rounded-md shadow-lg z-20 py-0.5">
+                        {labelSuggestions.slice(0, 10).map(s => (
+                          <button key={s} onMouseDown={e => { e.preventDefault(); addLabel(s) }}
+                            className="w-full text-left px-2.5 py-1 text-[11px] hover:bg-secondary/50 transition-colors truncate">
+                            {s}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
                 {labels.length === 0 && !editing && !isCreate && (
                   <span className="text-[11px] text-muted-foreground/40">No labels</span>
