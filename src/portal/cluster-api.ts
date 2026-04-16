@@ -12,7 +12,7 @@ import {
   type RestRouter,
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
-import { notifyBoundAgents } from "./notify.js";
+import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 /** Extract the first `server:` value from a kubeconfig YAML string. */
 function extractApiServer(kubeconfig: string): string | null {
@@ -20,7 +20,7 @@ function extractApiServer(kubeconfig: string): string | null {
   return match ? match[1].trim() : null;
 }
 
-export function registerClusterRoutes(router: RestRouter, jwtSecret: string, runtimeWsUrl: string, runtimeSecret: string): void {
+export function registerClusterRoutes(router: RestRouter, jwtSecret: string, connectionMap: RuntimeConnectionMap): void {
   // GET /api/v1/clusters — list all
   router.get("/api/v1/clusters", async (req, res) => {
     const auth = requireAdmin(req, res, jwtSecret);
@@ -130,7 +130,12 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, run
     sendJson(res, 200, rows[0]);
 
     // Notify bound agents to clear cached credentials
-    notifyBoundAgents(runtimeWsUrl, runtimeSecret, "agent_clusters", "cluster_id", params.id, ["cluster"]);
+    getDb().query("SELECT agent_id FROM agent_clusters WHERE cluster_id = ?", [params.id])
+      .then(([rows]: any) => {
+        const agentIds = (rows as { agent_id: string }[]).map((r) => r.agent_id);
+        if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["cluster"] });
+      })
+      .catch((err: any) => console.warn("[cluster-api] notify failed:", err.message));
   });
 
   // DELETE /api/v1/clusters/:id
