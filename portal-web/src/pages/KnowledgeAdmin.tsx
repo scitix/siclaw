@@ -65,6 +65,12 @@ function reloadMessage(): string {
   return "Version saved and activated."
 }
 
+function humanBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
 function statusTone(status: string): string {
   if (status === "success") return "text-green-400"
   // reload issues are warnings, not failures — upload/activate itself succeeded
@@ -85,7 +91,9 @@ export function KnowledgeAdmin() {
   const [uploading, setUploading] = useState(false)
   const [uploadMessage, setUploadMessage] = useState("")
   const [showUpload, setShowUpload] = useState(false)
+  const [pickedFile, setPickedFile] = useState<File | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const uploadAbortRef = useRef<AbortController | null>(null)
   const toast = useToast()
   const confirm = useConfirm()
 
@@ -151,22 +159,36 @@ export function KnowledgeAdmin() {
   }
 
   const handleUpload = async (repoId: string, file: File) => {
+    const ctl = new AbortController()
+    uploadAbortRef.current = ctl
     setUploading(true)
     try {
       const buf = await file.arrayBuffer()
       const base64 = arrayBufferToBase64(buf)
-      const resp = await api<KnowledgeMutationResponse>(`/siclaw/admin/knowledge/repos/${repoId}/versions`, {
+      await api<KnowledgeMutationResponse>(`/siclaw/admin/knowledge/repos/${repoId}/versions`, {
         method: "POST",
         body: { message: uploadMessage.trim() || file.name, data: base64 },
+        signal: ctl.signal,
       })
-      setShowUpload(false)
-      setUploadMessage("")
+      closeUploadDialog()
       toast.success(reloadMessage())
       await loadRepos()
       await loadVersions(repoId)
       await loadEvents()
-    } catch (err: any) { toast.error(err.message) }
-    finally { setUploading(false) }
+    } catch (err: any) {
+      if (err.name === "AbortError") { toast.success("Upload cancelled."); return }
+      toast.error(err.message)
+    } finally {
+      setUploading(false)
+      uploadAbortRef.current = null
+    }
+  }
+
+  const closeUploadDialog = () => {
+    uploadAbortRef.current?.abort()
+    setShowUpload(false)
+    setUploadMessage("")
+    setPickedFile(null)
   }
 
   const handleActivate = async (repoId: string, version: Version) => {
@@ -336,36 +358,64 @@ export function KnowledgeAdmin() {
       </div>
 
       {/* Upload dialog */}
-      {showUpload && expandedRepo && (
+      {showUpload && expandedRepo && (() => {
+        const repo = repos.find(r => r.id === expandedRepo)
+        const nextVersion = (repo?.version_count ?? 0) + 1
+        return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/50" onClick={() => { setShowUpload(false); setUploadMessage("") }} />
+          <div className="absolute inset-0 bg-black/50" onClick={closeUploadDialog} />
           <div className="relative bg-card rounded-xl shadow-xl border border-border p-5 w-96 space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold">Upload Version</h3>
-              <button onClick={() => { setShowUpload(false); setUploadMessage("") }} className="p-1 text-muted-foreground hover:text-foreground">
+              <button onClick={closeUploadDialog} className="p-1 text-muted-foreground hover:text-foreground" title={uploading ? "Cancel upload" : "Close"}>
                 <X className="h-4 w-4" />
               </button>
             </div>
             <input value={uploadMessage} onChange={e => setUploadMessage(e.target.value)}
               placeholder="What changed? (optional)"
-              className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+              disabled={uploading}
+              className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background disabled:opacity-50" />
             <input ref={fileInputRef} type="file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip,application/x-tar" className="hidden"
               onChange={e => {
-                const file = e.target.files?.[0]
-                if (file && expandedRepo) handleUpload(expandedRepo, file)
+                const file = e.target.files?.[0] ?? null
+                setPickedFile(file)
                 e.target.value = ""
               }} />
-            <button onClick={() => fileInputRef.current?.click()} disabled={uploading}
-              className="w-full flex items-center justify-center gap-2 h-10 rounded-md border-2 border-dashed border-border hover:border-muted-foreground text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50">
-              {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-              {uploading ? "Uploading..." : "Select tar.gz file"}
-            </button>
+            {!pickedFile ? (
+              <button onClick={() => fileInputRef.current?.click()} disabled={uploading}
+                className="w-full flex items-center justify-center gap-2 h-10 rounded-md border-2 border-dashed border-border hover:border-muted-foreground text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50">
+                <Upload className="h-4 w-4" />
+                Select tar.gz file
+              </button>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-muted/30 border border-border text-xs">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Package className="h-4 w-4 text-muted-foreground shrink-0" />
+                    <span className="truncate">{pickedFile.name}</span>
+                    <span className="text-muted-foreground shrink-0">{humanBytes(pickedFile.size)}</span>
+                  </div>
+                  <button onClick={() => fileInputRef.current?.click()} disabled={uploading}
+                    className="text-muted-foreground hover:text-foreground underline shrink-0 disabled:opacity-50">
+                    Change
+                  </button>
+                </div>
+                <button onClick={() => handleUpload(expandedRepo, pickedFile)} disabled={uploading}
+                  className="w-full flex items-center justify-center gap-2 h-10 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50">
+                  {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                  {uploading ? "Uploading…" : `Upload as v${nextVersion}`}
+                </button>
+              </div>
+            )}
             <p className="text-[10px] text-muted-foreground/60 text-center">
-              New version will be automatically activated. Max {repos.find(r => r.id === expandedRepo)?.max_versions ?? 10} versions retained.
+              {pickedFile && !uploading
+                ? `Will be activated automatically after upload. Max ${repo?.max_versions ?? 10} versions retained.`
+                : `New version will be automatically activated. Max ${repo?.max_versions ?? 10} versions retained.`}
             </p>
           </div>
         </div>
-      )}
+        )
+      })()}
     </div>
   )
 }
