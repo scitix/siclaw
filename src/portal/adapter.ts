@@ -147,11 +147,23 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
 
     if (body.source === "cluster") {
-      // Check agent binding if agent header present
+      // source_id is the cluster's NAME (that is what CredentialService passes
+      // and what cluster_list returns to the agent). Look up by name first,
+      // then use the resolved id for the binding check.
+      const [rows] = await db.query(
+        "SELECT id, name, kubeconfig FROM clusters WHERE name = ?",
+        [body.source_id],
+      ) as any;
+      if (rows.length === 0) {
+        sendJson(res, 404, { error: "Cluster not found" });
+        return;
+      }
+      const cluster = rows[0];
+
       if (agentId) {
         const [binding] = await db.query(
           "SELECT 1 FROM agent_clusters WHERE agent_id = ? AND cluster_id = ?",
-          [agentId, body.source_id],
+          [agentId, cluster.id],
         ) as any;
         if (binding.length === 0) {
           sendJson(res, 403, { error: "Agent not bound to this cluster" });
@@ -159,16 +171,6 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         }
       }
 
-      const [rows] = await db.query(
-        "SELECT name, kubeconfig FROM clusters WHERE id = ?",
-        [body.source_id],
-      ) as any;
-      if (rows.length === 0) {
-        sendJson(res, 404, { error: "Cluster not found" });
-        return;
-      }
-
-      const cluster = rows[0];
       sendJson(res, 200, {
         credential: {
           name: cluster.name,
@@ -181,25 +183,25 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
 
     if (body.source === "host") {
-      // Check agent binding if agent header present
-      if (agentId) {
-        const [binding] = await db.query(
-          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
-          [agentId, body.source_id],
-        ) as any;
-        if (binding.length === 0) {
-          sendJson(res, 403, { error: "Agent not bound to this host" });
-          return;
-        }
-      }
-
+      // source_id is the host's NAME — see cluster branch above for rationale.
       const [rows] = await db.query(
-        "SELECT name, ip, port, username, auth_type, password, private_key FROM hosts WHERE id = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key FROM hosts WHERE name = ?",
         [body.source_id],
       ) as any;
       if (rows.length === 0) {
         sendJson(res, 404, { error: "Host not found" });
         return;
+      }
+
+      if (agentId) {
+        const [binding] = await db.query(
+          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
+          [agentId, rows[0].id],
+        ) as any;
+        if (binding.length === 0) {
+          sendJson(res, 403, { error: "Agent not bound to this host" });
+          return;
+        }
       }
 
       const host = rows[0];
@@ -1627,19 +1629,22 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
 
     if (params.source === "cluster") {
-      if (agentId) {
-        const [binding] = await db.query(
-          "SELECT 1 FROM agent_clusters WHERE agent_id = ? AND cluster_id = ?",
-          [agentId, params.source_id],
-        ) as any;
-        if (binding.length === 0) throw new Error("Agent not bound to this cluster");
-      }
+      // source_id is the cluster's NAME. Look up by name first, then use the
+      // resolved UUID for the agent-binding check.
       const [rows] = await db.query(
-        "SELECT name, kubeconfig FROM clusters WHERE id = ?",
+        "SELECT id, name, kubeconfig FROM clusters WHERE name = ?",
         [params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Cluster not found");
       const cluster = rows[0];
+
+      if (agentId) {
+        const [binding] = await db.query(
+          "SELECT 1 FROM agent_clusters WHERE agent_id = ? AND cluster_id = ?",
+          [agentId, cluster.id],
+        ) as any;
+        if (binding.length === 0) throw new Error("Agent not bound to this cluster");
+      }
       return {
         credential: {
           name: cluster.name,
@@ -1651,19 +1656,21 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
 
     if (params.source === "host") {
-      if (agentId) {
-        const [binding] = await db.query(
-          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
-          [agentId, params.source_id],
-        ) as any;
-        if (binding.length === 0) throw new Error("Agent not bound to this host");
-      }
+      // source_id is the host's NAME — see cluster branch above.
       const [rows] = await db.query(
-        "SELECT name, ip, port, username, auth_type, password, private_key FROM hosts WHERE id = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key FROM hosts WHERE name = ?",
         [params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Host not found");
       const host = rows[0];
+
+      if (agentId) {
+        const [binding] = await db.query(
+          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
+          [agentId, host.id],
+        ) as any;
+        if (binding.length === 0) throw new Error("Agent not bound to this host");
+      }
       const files: { name: string; content: string; mode?: number }[] = [];
       if (host.auth_type === "key" && host.private_key) {
         files.push({ name: "host.key", content: host.private_key, mode: 0o600 });

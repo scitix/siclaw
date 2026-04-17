@@ -377,14 +377,17 @@ describe("credential.list", () => {
 });
 
 describe("credential.get", () => {
+  // Query order for cluster: (1) cluster lookup by name, (2) agent_clusters binding check
+  // Query order for host:    (1) host lookup by name,    (2) agent_hosts binding check
+
   it("returns kubeconfig for cluster credential", async () => {
     mockQuery(
+      [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "apiVersion: v1\nkind: Config" }],
       [{ "1": 1 }],  // binding check
-      [{ name: "prod-cluster", kubeconfig: "apiVersion: v1\nkind: Config" }],
     );
 
     const result = await getHandler("credential.get")(
-      { source: "cluster", source_id: "c1" }, "agent-1",
+      { source: "cluster", source_id: "prod-cluster" }, "agent-1",
     );
     expect(result.credential.type).toBe("kubeconfig");
     expect(result.credential.name).toBe("prod-cluster");
@@ -392,27 +395,44 @@ describe("credential.get", () => {
 
   it("prefers params.agentId over the connection agentId (phone-home fix)", async () => {
     const query = mockQuery(
+      [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "apiVersion: v1" }],
       [{ "1": 1 }],
-      [{ name: "prod-cluster", kubeconfig: "apiVersion: v1" }],
     );
 
     await getHandler("credential.get")(
-      { source: "cluster", source_id: "c1", agentId: "real-agent" },
+      { source: "cluster", source_id: "prod-cluster", agentId: "real-agent" },
       "runtime",
     );
-    // First query is the binding check — its first bound param must be the
-    // real agent UUID from params.
-    expect(query.mock.calls[0][1]).toEqual(["real-agent", "c1"]);
+    // Second query is the agent-binding check — its first bound param must
+    // be the real agent UUID from params, and its second must be the
+    // resolved cluster UUID (not the name passed in source_id).
+    expect(query.mock.calls[1][1]).toEqual(["real-agent", "cluster-uuid-1"]);
+  });
+
+  it("looks up cluster by name and uses resolved UUID for binding check", async () => {
+    const query = mockQuery(
+      [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "yaml" }],
+      [{ "1": 1 }],
+    );
+
+    await getHandler("credential.get")(
+      { source: "cluster", source_id: "prod-cluster" }, "agent-1",
+    );
+    // First query looks up by NAME, not id.
+    expect(query.mock.calls[0][0]).toMatch(/WHERE name = \?/);
+    expect(query.mock.calls[0][1]).toEqual(["prod-cluster"]);
+    // Binding check uses the UUID resolved from the name lookup.
+    expect(query.mock.calls[1][1]).toEqual(["agent-1", "cluster-uuid-1"]);
   });
 
   it("returns SSH key file for host credential with key auth", async () => {
     mockQuery(
+      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----" }],
       [{ "1": 1 }],  // binding check
-      [{ name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----" }],
     );
 
     const result = await getHandler("credential.get")(
-      { source: "host", source_id: "h1" }, "agent-1",
+      { source: "host", source_id: "web-1" }, "agent-1",
     );
     expect(result.credential.type).toBe("ssh");
     expect(result.credential.host).toBe("10.0.0.1");
@@ -426,12 +446,12 @@ describe("credential.get", () => {
 
   it("returns password file for host credential with password auth", async () => {
     mockQuery(
+      [{ id: "host-uuid-2", name: "web-2", ip: "10.0.0.2", port: 22, username: "admin", auth_type: "password", password: "secret123", private_key: null }],
       [{ "1": 1 }],  // binding check
-      [{ name: "web-2", ip: "10.0.0.2", port: 22, username: "admin", auth_type: "password", password: "secret123", private_key: null }],
     );
 
     const result = await getHandler("credential.get")(
-      { source: "host", source_id: "h2" }, "agent-1",
+      { source: "host", source_id: "web-2" }, "agent-1",
     );
     expect(result.credential.files).toEqual([
       { name: "host.password", content: "secret123" },
@@ -439,36 +459,36 @@ describe("credential.get", () => {
   });
 
   it("throws when agent not bound to cluster", async () => {
-    mockQuery([]);  // binding check returns empty
+    mockQuery(
+      [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "yaml" }],
+      [],  // binding check returns empty
+    );
     await expect(
-      getHandler("credential.get")({ source: "cluster", source_id: "c1" }, "agent-1"),
+      getHandler("credential.get")({ source: "cluster", source_id: "prod-cluster" }, "agent-1"),
     ).rejects.toThrow("Agent not bound to this cluster");
   });
 
   it("throws when agent not bound to host", async () => {
-    mockQuery([]);  // binding check returns empty
+    mockQuery(
+      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "pk" }],
+      [],  // binding check returns empty
+    );
     await expect(
-      getHandler("credential.get")({ source: "host", source_id: "h1" }, "agent-1"),
+      getHandler("credential.get")({ source: "host", source_id: "web-1" }, "agent-1"),
     ).rejects.toThrow("Agent not bound to this host");
   });
 
   it("throws when cluster not found", async () => {
-    mockQuery(
-      [{ "1": 1 }],  // binding check passes
-      [],             // cluster not found
-    );
+    mockQuery([]);  // cluster lookup returns empty — short-circuits before binding check
     await expect(
-      getHandler("credential.get")({ source: "cluster", source_id: "c1" }, "agent-1"),
+      getHandler("credential.get")({ source: "cluster", source_id: "unknown-cluster" }, "agent-1"),
     ).rejects.toThrow("Cluster not found");
   });
 
   it("throws when host not found", async () => {
-    mockQuery(
-      [{ "1": 1 }],  // binding check passes
-      [],             // host not found
-    );
+    mockQuery([]);  // host lookup returns empty
     await expect(
-      getHandler("credential.get")({ source: "host", source_id: "h1" }, "agent-1"),
+      getHandler("credential.get")({ source: "host", source_id: "unknown-host" }, "agent-1"),
     ).rejects.toThrow("Host not found");
   });
 
