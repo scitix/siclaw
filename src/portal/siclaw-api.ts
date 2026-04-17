@@ -30,6 +30,7 @@ import {
 import { getDb } from "../gateway/db.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
+import { parseFrontmatter } from "../gateway/skills/builtin-sync.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { validateKnowledgePackage } from "../shared/knowledge-package.js";
 
@@ -856,12 +857,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       ],
     );
 
-    // Parse name/description from target specs frontmatter
-    const fmMatch = targetSpecs.match(/^---\n([\s\S]*?)\n---/);
-    const nameMatch = fmMatch?.[1]?.match(/^name:\s*(.+)$/m);
-    const descMatch = fmMatch?.[1]?.match(/^description:\s*(.+)$/m);
-    const rollbackName = nameMatch?.[1]?.trim();
-    const rollbackDesc = descMatch?.[1]?.trim();
+    // Parse name/description from target specs frontmatter. Use the shared
+    // parser — the naive inline regex captures ">-" as the description for
+    // skills that use YAML block scalar syntax (every built-in skill does).
+    const { name: rollbackName, description: rollbackDesc } = parseFrontmatter(targetSpecs);
 
     // Update skills table with target content + synced name/description/labels
     const rollbackLabels = targetLabels;

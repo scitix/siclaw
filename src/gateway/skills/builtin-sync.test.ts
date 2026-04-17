@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseSkillsDir } from "./builtin-sync.js";
+import { parseSkillsDir, parseFrontmatter } from "./builtin-sync.js";
 
 let tmpDir: string;
 
@@ -251,5 +251,38 @@ describe("parseSkillsDir", () => {
     const names = result.map((s) => s.name);
     expect(names).not.toContain("skill-authoring");
     expect(names).not.toContain("session-feedback");
+  });
+});
+
+describe("parseFrontmatter", () => {
+  it("parses inline name and description", () => {
+    const md = "---\nname: foo\ndescription: a short summary\n---\n\nbody";
+    expect(parseFrontmatter(md)).toEqual({ name: "foo", description: "a short summary" });
+  });
+
+  it("joins a `>-` block scalar description into a single line (regression for rollback bug)", () => {
+    // Every built-in skill uses this shape — the naive /^description:\s*(.+)$/m
+    // regex captured ">-" verbatim and corrupted skills on rollback.
+    const md = [
+      "---",
+      "name: pod-crash-debug",
+      "description: >-",
+      "  Diagnose pod crash failures (CrashLoopBackOff, OOMKilled).",
+      "  Checks pod status, events, and previous logs.",
+      "---",
+      "",
+      "# body",
+    ].join("\n");
+
+    const { name, description } = parseFrontmatter(md);
+    expect(name).toBe("pod-crash-debug");
+    expect(description).not.toBe(">-");
+    expect(description).toBe(
+      "Diagnose pod crash failures (CrashLoopBackOff, OOMKilled). Checks pod status, events, and previous logs.",
+    );
+  });
+
+  it("returns empty strings when frontmatter is missing", () => {
+    expect(parseFrontmatter("# no frontmatter here")).toEqual({ name: "", description: "" });
   });
 });

@@ -226,6 +226,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     commit_message VARCHAR(500),
     author_id CHAR(36) NOT NULL,
     is_approved TINYINT(1) NOT NULL DEFAULT 0,
+    labels JSON DEFAULT NULL,
     created_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     UNIQUE KEY uq_skill_versions (skill_id, version),
     CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
