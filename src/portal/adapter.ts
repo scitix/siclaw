@@ -1576,7 +1576,16 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   // --- credential.* ---
 
-  handlers.set("credential.list", async (params, agentId) => {
+  handlers.set("credential.list", async (params, connectionAgentId) => {
+    // Prefer params.agentId (the agent's real UUID, vouched for by Runtime
+    // after mTLS-verifying the AgentBox) over the WS-connection agentId. In
+    // phone-home architecture the Runtime opens a single WS registered as
+    // "runtime" for ALL agents, so connection-level agentId is a placeholder
+    // and can never match an agent_clusters / agent_hosts row. Fall back to
+    // connectionAgentId for legacy callers that still rely on it (covered
+    // by adapter-rpc.test.ts).
+    const agentId = (params.agentId as string | undefined) ?? connectionAgentId;
+    if (!agentId) throw new Error("agentId required");
     const db = getDb();
     if (params.kind === "host" || params.kind === "hosts") {
       const [rows] = await db.query(
@@ -1608,10 +1617,13 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     };
   });
 
-  handlers.set("credential.get", async (params, agentId) => {
+  handlers.set("credential.get", async (params, connectionAgentId) => {
     if (!params.source || !params.source_id) {
       throw new Error("source and source_id are required");
     }
+    // See credential.list for why params.agentId takes precedence. Fall
+    // back to connectionAgentId for legacy callers.
+    const agentId = (params.agentId as string | undefined) ?? connectionAgentId;
     const db = getDb();
 
     if (params.source === "cluster") {
@@ -1692,9 +1704,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { allowed: true, grant_all: true, agent_group_ids: [] };
   });
 
-  handlers.set("credential.resourceManifest", async (params, agentId) => {
+  handlers.set("credential.resourceManifest", async (params, connectionAgentId) => {
     const db = getDb();
-    const effectiveAgentId = params.agent_id ?? agentId;
+    // Prefer params.agentId (camel, matches credential.list/get), then
+    // params.agent_id (snake, legacy), then connection-level as final fallback.
+    const effectiveAgentId = (params.agentId ?? params.agent_id ?? connectionAgentId) as string | undefined;
     if (!effectiveAgentId) throw new Error("agent_id required");
     const [[clusters], [hosts]] = await Promise.all([
       db.query(
@@ -1711,9 +1725,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { resources: [...clusters, ...hosts] };
   });
 
-  handlers.set("credential.hostSearch", async (params, agentId) => {
+  handlers.set("credential.hostSearch", async (params, connectionAgentId) => {
     const db = getDb();
-    const effectiveAgentId = params.agent_id ?? agentId;
+    const effectiveAgentId = (params.agentId ?? params.agent_id ?? connectionAgentId) as string | undefined;
     let sql: string;
     const sqlParams: unknown[] = [];
 
