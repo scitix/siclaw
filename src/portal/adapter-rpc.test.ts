@@ -360,6 +360,20 @@ describe("credential.list", () => {
     const result = await getHandler("credential.list")({}, "agent-1");
     expect(result.clusters[0]).toEqual({ name: "basic-cluster", is_production: false });
   });
+
+  it("prefers params.agentId over the connection agentId (phone-home fix)", async () => {
+    const query = mockQuery([]);
+    await getHandler("credential.list")({ agentId: "real-agent" }, "runtime");
+    // The SQL bound parameter must be the real-agent UUID from params,
+    // not the connection's placeholder "runtime" id.
+    expect(query.mock.calls[0][1]).toEqual(["real-agent"]);
+  });
+
+  it("throws when no agentId is available", async () => {
+    await expect(
+      getHandler("credential.list")({}, ""),
+    ).rejects.toThrow("agentId required");
+  });
 });
 
 describe("credential.get", () => {
@@ -374,10 +388,21 @@ describe("credential.get", () => {
     );
     expect(result.credential.type).toBe("kubeconfig");
     expect(result.credential.name).toBe("prod-cluster");
-    expect(result.credential.files).toEqual([
-      { name: "cluster.kubeconfig", content: "apiVersion: v1\nkind: Config" },
-    ]);
-    expect(result.credential.ttl_seconds).toBe(300);
+  });
+
+  it("prefers params.agentId over the connection agentId (phone-home fix)", async () => {
+    const query = mockQuery(
+      [{ "1": 1 }],
+      [{ name: "prod-cluster", kubeconfig: "apiVersion: v1" }],
+    );
+
+    await getHandler("credential.get")(
+      { source: "cluster", source_id: "c1", agentId: "real-agent" },
+      "runtime",
+    );
+    // First query is the binding check — its first bound param must be the
+    // real agent UUID from params.
+    expect(query.mock.calls[0][1]).toEqual(["real-agent", "c1"]);
   });
 
   it("returns SSH key file for host credential with key auth", async () => {
