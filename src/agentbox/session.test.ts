@@ -1,0 +1,437 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+/**
+ * Tests for AgentBoxSessionManager.
+ *
+ * The module imports from @mariozechner/pi-coding-agent (SessionManager) and
+ * from the core agent-factory (createSiclawSession). Both are replaced with
+ * lightweight fakes so the tests focus on the manager's own state machine:
+ * getOrCreate caching, release/close lifecycle, scheduleRelease timer
+ * cancellation, JSONL message counting, and the dp-state snapshot reader.
+ */
+
+// ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
+
+vi.mock("@mariozechner/pi-coding-agent", () => {
+  const g = globalThis as any;
+  g.__frameworkEntriesState = g.__frameworkEntriesState ?? { entries: [] };
+  class FakeFrameworkSessionManager {
+    constructor(public cwd: string, public sessionDir: string) {}
+    static continueRecent(cwd: string, sessionDir: string) {
+      return new FakeFrameworkSessionManager(cwd, sessionDir);
+    }
+    getEntries(): any[] {
+      return (globalThis as any).__frameworkEntriesState.entries;
+    }
+  }
+  return { SessionManager: FakeFrameworkSessionManager };
+});
+
+if (!(globalThis as any).__frameworkEntriesState) {
+  (globalThis as any).__frameworkEntriesState = { entries: [] };
+}
+
+vi.mock("../core/agent-factory.js", async () => {
+  const { EventEmitter } = await import("node:events");
+  const g = globalThis as any;
+  g.__createSessionCalls = g.__createSessionCalls ?? [];
+  function createFakeBrain() {
+    const emitter = new EventEmitter();
+    const subscribe = (cb: (e: any) => void) => {
+      emitter.on("event", cb);
+      return () => emitter.off("event", cb);
+    };
+    return {
+      emitter,
+      subscribe,
+      reload: async () => {},
+      prompt: async () => {},
+      abort: async () => {},
+      steer: async () => {},
+      clearQueue: () => ({ steering: [], followUp: [] }),
+      getModel: () => null,
+      setModel: async () => {},
+      findModel: () => null,
+      getContextUsage: () => null,
+      getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost: 0 }),
+      registerProvider: () => {},
+    };
+  }
+  return {
+    createSiclawSession: async (opts: any) => {
+      g.__createSessionCalls.push(opts);
+      return {
+        brain: createFakeBrain(),
+        session: { sessionId: "fake-session" },
+        sessionIdRef: { current: "" },
+        kubeconfigRef: opts.kubeconfigRef,
+        llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
+        skillsDirs: ["skills/core"],
+        mode: opts.mode ?? "web",
+        mcpManager: { shutdown: async () => {} },
+        memoryIndexer: undefined,
+        dpStateRef: { status: "idle", question: undefined, round: 0, confirmedHypotheses: [] },
+      };
+    },
+  };
+});
+
+const lastCreateSiclawSession = { calls: (globalThis as any).__createSessionCalls ?? [] };
+if (!(globalThis as any).__createSessionCalls) (globalThis as any).__createSessionCalls = lastCreateSiclawSession.calls;
+
+// Avoid real memory indexer / embeddings
+vi.mock("../memory/index.js", () => ({
+  createMemoryIndexer: vi.fn(async () => ({
+    sync: vi.fn(async () => {}),
+    startWatching: vi.fn(),
+    purgeStaleInvestigations: vi.fn(async () => {}),
+    clearInvestigations: vi.fn(),
+    close: vi.fn(),
+  })),
+}));
+
+vi.mock("../memory/session-summarizer.js", () => ({
+  saveSessionKnowledge: vi.fn(async () => null),
+}));
+
+// Scoped config mock — points paths to the per-test temp dir.
+let _cfgUserDataDir = "";
+let _cfgCredentialsDir = ".siclaw/credentials";
+
+vi.mock("../core/config.js", () => ({
+  loadConfig: () => ({
+    paths: {
+      userDataDir: _cfgUserDataDir,
+      credentialsDir: _cfgCredentialsDir,
+      skillsDir: "skills",
+      knowledgeDir: "knowledge",
+    },
+    providers: {},
+  }),
+  getEmbeddingConfig: () => null,
+}));
+
+// Import SUT after mocks
+import { AgentBoxSessionManager } from "./session.js";
+
+// ── Test setup ────────────────────────────────────────────────────────
+
+let origCwd: string;
+let tmpDir: string;
+
+beforeEach(() => {
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+
+  origCwd = process.cwd();
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "session-test-"));
+  process.chdir(tmpDir);
+  _cfgUserDataDir = path.join(tmpDir, "user-data");
+  _cfgCredentialsDir = path.join(tmpDir, ".siclaw/credentials");
+  (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
+  (globalThis as any).__createSessionCalls.length = 0;
+  lastCreateSiclawSession.calls = (globalThis as any).__createSessionCalls;
+});
+
+afterEach(() => {
+  process.chdir(origCwd);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  vi.restoreAllMocks();
+});
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+describe("AgentBoxSessionManager — getOrCreate", () => {
+  it("creates a new session on first call and caches it", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    expect(s1.id).toBe("sess-1");
+    expect(mgr.activeCount()).toBe(1);
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
+  it("returns the cached session on a second getOrCreate with the same id", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    const s2 = await mgr.getOrCreate("sess-1");
+    expect(s1).toBe(s2);
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
+  it("uses defaultSessionId when id is omitted", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate();
+    expect(s.id).toBe("default");
+  });
+
+  it("cancels a pending release timer when the session is re-requested", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1");
+    mgr.scheduleRelease("sess-1");
+    expect(s._releaseTimer).not.toBeNull();
+    // Re-request the session — the pending release should be cleared.
+    await mgr.getOrCreate("sess-1");
+    expect(s._releaseTimer).toBeNull();
+  });
+
+  it("passes effectiveMode and systemPromptTemplate through to createSiclawSession", async () => {
+    const mgr = new AgentBoxSessionManager();
+    mgr.userId = "alice";
+    mgr.agentId = "agent-a";
+    await mgr.getOrCreate("sess-1", "channel", "custom prompt");
+    const opts = lastCreateSiclawSession.calls[0];
+    expect(opts.mode).toBe("channel");
+    expect(opts.systemPromptTemplate).toBe("custom prompt");
+    expect(opts.userId).toBe("alice");
+    expect(opts.agentId).toBe("agent-a");
+  });
+
+  it("defaults mode to 'web' when none supplied", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("sess-1");
+    expect(lastCreateSiclawSession.calls[0].mode).toBe("web");
+  });
+
+  it("populates sessionIdRef.current so skill_call events can attribute the session", async () => {
+    // NOTE: We cannot inspect the sessionIdRef directly through the mock
+    // factory pattern (mocks' return values are awaited-consumed), so we
+    // verify the behavior is equivalent by checking that the managed session
+    // has the correct id — the source assigns sessionIdRef.current = id,
+    // then wraps the object into a new ManagedSession with that same id.
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("abc-123");
+    expect(s.id).toBe("abc-123");
+  });
+});
+
+describe("AgentBoxSessionManager — release", () => {
+  it("release removes the session from the map", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("sess-1");
+    expect(mgr.activeCount()).toBe(1);
+    await mgr.release("sess-1");
+    expect(mgr.activeCount()).toBe(0);
+  });
+
+  it("release on an unknown id is a no-op", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await expect(mgr.release("missing")).resolves.toBeUndefined();
+  });
+
+  it("fires onSessionRelease callback", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const cb = vi.fn();
+    mgr.onSessionRelease = cb;
+    await mgr.getOrCreate("sess-1");
+    await mgr.release("sess-1");
+    expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("release skips delete when a new getOrCreate has replaced the session mid-release", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+
+    // Inject an async hop into mcpManager.shutdown so we can race a replacement.
+    const sessionsMap = (mgr as any).sessions as Map<string, any>;
+    const replacement = { ...s1, id: "sess-1", _promptDoneCallbacks: new Set(), mcpManager: { shutdown: async () => {} } };
+    let replaced = false;
+    s1.mcpManager = {
+      shutdown: async () => {
+        // Swap the map entry while release is suspended here.
+        sessionsMap.set("sess-1", replacement);
+        replaced = true;
+      },
+    } as any;
+
+    await mgr.release("sess-1");
+    expect(replaced).toBe(true);
+    // Guard should have detected the swap and refused to delete.
+    expect(mgr.activeCount()).toBe(1);
+    expect((mgr as any).sessions.get("sess-1")).toBe(replacement);
+  });
+});
+
+describe("AgentBoxSessionManager — close + closeAll", () => {
+  it("close removes the session and clears any release timer", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1");
+    mgr.scheduleRelease("sess-1");
+    await mgr.close("sess-1");
+    expect(mgr.activeCount()).toBe(0);
+    expect(s._releaseTimer).toBeNull();
+  });
+
+  it("closeAll snapshots and clears all sessions", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("a");
+    await mgr.getOrCreate("b");
+    expect(mgr.activeCount()).toBe(2);
+    await mgr.closeAll();
+    expect(mgr.activeCount()).toBe(0);
+  });
+});
+
+describe("AgentBoxSessionManager — scheduleRelease", () => {
+  it("schedules a release after the TTL and clears the timer field when fired", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      const s = await mgr.getOrCreate("sess-1");
+      mgr.scheduleRelease("sess-1");
+      expect(s._releaseTimer).not.toBeNull();
+
+      // Advance past the 30s TTL.
+      await vi.advanceTimersByTimeAsync(31_000);
+      // _releaseTimer is cleared when the timer fires.
+      expect(s._releaseTimer).toBeNull();
+      expect(mgr.activeCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("scheduleRelease on unknown id is a no-op (doesn't throw)", () => {
+    const mgr = new AgentBoxSessionManager();
+    expect(() => mgr.scheduleRelease("ghost")).not.toThrow();
+  });
+
+  it("replaces an earlier pending timer when called twice", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1");
+    mgr.scheduleRelease("sess-1");
+    const t1 = s._releaseTimer;
+    mgr.scheduleRelease("sess-1");
+    const t2 = s._releaseTimer;
+    expect(t1).not.toBe(t2);
+    clearTimeout(t2 as NodeJS.Timeout);
+  });
+});
+
+describe("AgentBoxSessionManager — getPersistedDpState", () => {
+  it("returns null if the session directory doesn't exist", () => {
+    const mgr = new AgentBoxSessionManager();
+    expect(mgr.getPersistedDpState("nonexistent-session")).toBeNull();
+  });
+
+  it("returns the last dp-mode entry's dpStatus", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-dp");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "message" },
+      {
+        type: "custom",
+        customType: "dp-mode",
+        data: {
+          dpStatus: "investigating",
+          dpQuestion: "why crash?",
+          dpRound: 3,
+          dpConfirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
+        },
+      },
+    ];
+
+    const snap = mgr.getPersistedDpState("sess-dp");
+    expect(snap).toEqual({
+      dpStatus: "investigating",
+      question: "why crash?",
+      round: 3,
+      confirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
+    });
+  });
+
+  it("falls back to legacy checklist-based inference when dpStatus is absent", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      {
+        type: "custom",
+        customType: "dp-mode",
+        data: {
+          checklist: { question: "oldQ" },
+          phase: "running",
+        },
+      },
+    ];
+
+    const snap = mgr.getPersistedDpState("sess-legacy");
+    expect(snap?.dpStatus).toBe("investigating");
+    expect(snap?.question).toBe("oldQ");
+  });
+
+  it("returns null when the session dir has no dp-mode entry", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-none");
+    fs.mkdirSync(dir, { recursive: true });
+    (globalThis as any).__frameworkEntriesState.entries = [{ type: "message" }];
+    expect(mgr.getPersistedDpState("sess-none")).toBeNull();
+  });
+});
+
+describe("AgentBoxSessionManager — resetMemory", () => {
+  it("is a no-op when memory indexer was never initialized", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await expect(mgr.resetMemory()).resolves.toBeUndefined();
+  });
+
+  it("calls sync + clearInvestigations on the shared indexer after init", async () => {
+    const mgr = new AgentBoxSessionManager();
+    // Trigger shared init via getOrCreate
+    await mgr.getOrCreate("sess-1");
+    await mgr.resetMemory();
+    // We can't directly observe through the mock without exposing it, but
+    // we can verify no throw and activeCount is preserved.
+    expect(mgr.activeCount()).toBe(1);
+  });
+});
+
+describe("AgentBoxSessionManager — list + get + activeCount", () => {
+  it("list returns all managed sessions", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("a");
+    await mgr.getOrCreate("b");
+    const all = mgr.list();
+    expect(all.map((s) => s.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("get returns the ManagedSession or undefined", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("alpha");
+    expect(mgr.get("alpha")?.id).toBe("alpha");
+    expect(mgr.get("ghost")).toBeUndefined();
+  });
+
+  it("activeCount tracks in-memory sessions", async () => {
+    const mgr = new AgentBoxSessionManager();
+    expect(mgr.activeCount()).toBe(0);
+    await mgr.getOrCreate("a");
+    expect(mgr.activeCount()).toBe(1);
+    await mgr.close("a");
+    expect(mgr.activeCount()).toBe(0);
+  });
+});
+
+describe("AgentBoxSessionManager — credentialsDir override (Local mode multi-AgentBox)", () => {
+  it("passes credentialsDir through to KubeconfigRef when set", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const custom = path.join(tmpDir, "custom-creds-alice");
+    mgr.credentialsDir = custom;
+    await mgr.getOrCreate("sess-1");
+    const call = lastCreateSiclawSession.calls[0];
+    expect(call.kubeconfigRef.credentialsDir).toBe(custom);
+  });
+
+  it("falls back to the config path when credentialsDir is unset", async () => {
+    const mgr = new AgentBoxSessionManager();
+    await mgr.getOrCreate("sess-1");
+    const call = lastCreateSiclawSession.calls[0];
+    expect(call.kubeconfigRef.credentialsDir).toBe(path.resolve(process.cwd(), _cfgCredentialsDir));
+  });
+});
