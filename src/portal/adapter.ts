@@ -62,12 +62,16 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [[clusters], [hosts], [skills], [mcpServers], [agentRows]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server FROM agent_clusters ac
-         JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+         JOIN clusters c ON ac.cluster_id = c.id
+         JOIN agents a ON ac.agent_id = a.id
+         WHERE ac.agent_id = ? AND a.is_production = c.is_production`,
         [agentId],
       ),
       db.query(
         `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type FROM agent_hosts ah
-         JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+         JOIN hosts h ON ah.host_id = h.id
+         JOIN agents a ON ah.agent_id = a.id
+         WHERE ah.agent_id = ? AND a.is_production = h.is_production`,
         [agentId],
       ),
       db.query(
@@ -160,9 +164,16 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       }
       const cluster = rows[0];
 
+      // Check agent binding if agent header present. Also require matching
+      // is_production so a prod agent can't acquire a test cluster (or vice
+      // versa) via a stale cross-env binding.
       if (agentId) {
         const [binding] = await db.query(
-          "SELECT 1 FROM agent_clusters WHERE agent_id = ? AND cluster_id = ?",
+          `SELECT 1 FROM agent_clusters ac
+           JOIN agents a ON ac.agent_id = a.id
+           JOIN clusters c ON ac.cluster_id = c.id
+           WHERE ac.agent_id = ? AND ac.cluster_id = ?
+             AND a.is_production = c.is_production`,
           [agentId, cluster.id],
         ) as any;
         if (binding.length === 0) {
@@ -193,9 +204,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         return;
       }
 
+      // Check agent binding if agent header present. Also require matching
+      // is_production so cross-env access via stale bindings is blocked.
       if (agentId) {
         const [binding] = await db.query(
-          "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
+          `SELECT 1 FROM agent_hosts ah
+           JOIN agents a ON ah.agent_id = a.id
+           JOIN hosts h ON ah.host_id = h.id
+           WHERE ah.agent_id = ? AND ah.host_id = ?
+             AND a.is_production = h.is_production`,
           [agentId, rows[0].id],
         ) as any;
         if (binding.length === 0) {
@@ -247,7 +264,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     if (body.kind === "host" || body.kind === "hosts") {
       const [rows] = await db.query(
         `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description
-         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+         FROM agent_hosts ah
+         JOIN hosts h ON ah.host_id = h.id
+         JOIN agents a ON ah.agent_id = a.id
+         WHERE ah.agent_id = ? AND a.is_production = h.is_production`,
         [agentId],
       ) as any;
       sendJson(res, 200, {
@@ -260,10 +280,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       return;
     }
 
-    // Default: clusters
+    // Default: clusters. is_production must match between agent and cluster —
+    // a prod agent never sees test clusters and vice versa, even if a stale
+    // agent_clusters row exists from before an is_production flip.
     const [rows] = await db.query(
       `SELECT c.name, c.api_server, c.is_production, c.kubeconfig, c.description, c.debug_image
-       FROM agent_clusters ac JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+       FROM agent_clusters ac
+       JOIN clusters c ON ac.cluster_id = c.id
+       JOIN agents a ON ac.agent_id = a.id
+       WHERE ac.agent_id = ? AND a.is_production = c.is_production`,
       [agentId],
     ) as any;
     sendJson(res, 200, {
@@ -295,12 +320,16 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [[clusters], [hosts]] = await Promise.all([
       db.query(
         `SELECT c.id, c.name, c.api_server, 'cluster' AS type FROM agent_clusters ac
-         JOIN clusters c ON ac.cluster_id = c.id WHERE ac.agent_id = ?`,
+         JOIN clusters c ON ac.cluster_id = c.id
+         JOIN agents a ON ac.agent_id = a.id
+         WHERE ac.agent_id = ? AND a.is_production = c.is_production`,
         [agentId],
       ),
       db.query(
         `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, 'host' AS type FROM agent_hosts ah
-         JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+         JOIN hosts h ON ah.host_id = h.id
+         JOIN agents a ON ah.agent_id = a.id
+         WHERE ah.agent_id = ? AND a.is_production = h.is_production`,
         [agentId],
       ),
     ]) as any;
@@ -328,7 +357,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       sql = `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.description
              FROM agent_hosts ah
              JOIN hosts h ON ah.host_id = h.id
-             WHERE ah.agent_id = ?`;
+             JOIN agents a ON ah.agent_id = a.id
+             WHERE ah.agent_id = ? AND a.is_production = h.is_production`;
       params.push(agentId);
 
       if (body.query) {

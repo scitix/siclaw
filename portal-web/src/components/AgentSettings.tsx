@@ -180,7 +180,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}
-        {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} />}
+        {activeTab === "resources" && <ResourcesTab allClusters={allClusters} allHosts={allHosts} selectedClusterIds={selectedClusterIds} setSelectedClusterIds={setSelectedClusterIds} selectedHostIds={selectedHostIds} setSelectedHostIds={setSelectedHostIds} loading={loadingResources} isProduction={isProduction} />}
         {activeTab === "channels" && <ChannelsTab agentId={agent.id} selectedChannelIds={selectedChannelIds} setSelectedChannelIds={setSelectedChannelIds} />}
         {activeTab === "tasks" && <AgentTasks agentId={agent.id} />}
         {activeTab === "api-keys" && <AgentApiKeys agentId={agent.id} />}
@@ -324,7 +324,7 @@ function SkillsTab({ allSkills, selectedSkillIds, setSelectedSkillIds, skillLabe
             )}
           </label>
         ))}
-        {filtered.length === 0 && <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">{allSkills.length === 0 ? "No skills available" : "No skills match this label"}</p>}
+        {filtered.length === 0 && <p className="px-2 py-3 text-[11px] text-muted-foreground text-center">{visibleSkills.length === 0 ? (isProduction ? "No approved skills available for production agents" : "No skills available") : "No skills match this label"}</p>}
       </div>
     </div>
   )
@@ -411,24 +411,31 @@ function KnowledgeTab({ allRepos, selectedIds, setSelectedIds, loading }: {
   )
 }
 
-function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedClusterIds, selectedHostIds, setSelectedHostIds, loading }: {
+function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedClusterIds, selectedHostIds, setSelectedHostIds, loading, isProduction }: {
   allClusters: AvailableCluster[]; allHosts: AvailableHost[]
   selectedClusterIds: Set<string>; setSelectedClusterIds: (v: Set<string>) => void
   selectedHostIds: Set<string>; setSelectedHostIds: (v: Set<string>) => void
-  loading: boolean
+  loading: boolean; isProduction: boolean
 }) {
   if (loading) return <div className="flex items-center justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+
+  // Cross-env bindings are rejected server-side (credential-list filters by
+  // agent.is_production = resource.is_production). Hide mismatched resources
+  // so admins can't prepare a binding that will be silently ignored.
+  const visibleClusters = allClusters.filter(c => c.is_production === isProduction)
+  const visibleHosts = allHosts.filter(h => h.is_production === isProduction)
+  const envLabel = isProduction ? "production" : "development"
 
   return (
     <div className="px-6 py-6 space-y-5">
       {/* Clusters */}
       <div className="space-y-1.5">
         <label className="text-[12px] text-muted-foreground font-medium">Clusters ({selectedClusterIds.size})</label>
-        {allClusters.length === 0 ? (
-          <p className="text-[11px] text-muted-foreground/60">No clusters available. Add clusters in Settings.</p>
+        {visibleClusters.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60">No {envLabel} clusters available. Add matching clusters in Settings.</p>
         ) : (
           <div className="space-y-1 max-h-[200px] overflow-auto border border-border rounded-md p-2">
-            {allClusters.map(c => (
+            {visibleClusters.map(c => (
               <label key={c.id} className="flex items-center gap-2 py-1 px-1 rounded hover:bg-secondary/30 cursor-pointer">
                 <input type="checkbox" checked={selectedClusterIds.has(c.id)} onChange={e => { const next = new Set(selectedClusterIds); e.target.checked ? next.add(c.id) : next.delete(c.id); setSelectedClusterIds(next) }} />
                 <span className="text-[12px] font-mono flex-1">{c.name}</span>
@@ -443,11 +450,11 @@ function ResourcesTab({ allClusters, allHosts, selectedClusterIds, setSelectedCl
       {/* Hosts */}
       <div className="space-y-1.5">
         <label className="text-[12px] text-muted-foreground font-medium">Hosts ({selectedHostIds.size})</label>
-        {allHosts.length === 0 ? (
-          <p className="text-[11px] text-muted-foreground/60">No hosts available. Add hosts in Settings.</p>
+        {visibleHosts.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60">No {envLabel} hosts available. Add matching hosts in Settings.</p>
         ) : (
           <div className="space-y-1 max-h-[200px] overflow-auto border border-border rounded-md p-2">
-            {allHosts.map(h => (
+            {visibleHosts.map(h => (
               <label key={h.id} className="flex items-center gap-2 py-1 px-1 rounded hover:bg-secondary/30 cursor-pointer">
                 <input type="checkbox" checked={selectedHostIds.has(h.id)} onChange={e => { const next = new Set(selectedHostIds); e.target.checked ? next.add(h.id) : next.delete(h.id); setSelectedHostIds(next) }} />
                 <span className="text-[12px] font-mono flex-1">{h.name}</span>

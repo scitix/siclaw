@@ -243,7 +243,7 @@ describe("registerAgentRoutes", () => {
         body: { is_production: false },
       }));
 
-      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { resources: ["skills"] });
+      expect(connMap.notify).toHaveBeenCalledWith("a1", "agent.reload", { resources: ["skills", "cluster", "host"] });
     });
 
     it("does not notify when is_production not changed", async () => {
