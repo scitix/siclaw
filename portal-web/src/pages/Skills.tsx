@@ -339,7 +339,7 @@ export function Skills() {
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-medium font-mono truncate">{s.name}</p>
                           <span className={`px-1.5 py-0.5 rounded text-[10px] ${st.bg} ${st.text}`}>{st.label}</span>
-                          {s.is_builtin && (
+                          {!!s.is_builtin && (
                             <span className="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-400">BUILTIN</span>
                           )}
                           {s.overlay_of && (

@@ -266,7 +266,7 @@ export function Models() {
                                 <p className="text-sm font-mono">{model.model_id}</p>
                                 <p className="text-xs text-muted-foreground">
                                   {model.name || model.model_id}{model.reasoning ? " · reasoning" : ""} · {(model.context_window / 1000).toFixed(0)}K
-                                  {model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
+                                  {!!model.is_default && <span className="ml-2 px-1.5 py-0.5 rounded text-[10px] bg-primary/20 text-primary">default</span>}
                                 </p>
                               </div>
                               <div className="flex items-center gap-1">

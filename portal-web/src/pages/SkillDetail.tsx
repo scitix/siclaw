@@ -447,7 +447,7 @@ export function SkillDetail() {
           <span className="text-[12px] text-amber-300">Pending review — editing is locked until approved or withdrawn.</span>
         </div>
       )}
-      {skill?.is_builtin && (
+      {!!skill?.is_builtin && (
         <div className="mx-6 mt-4 p-3 rounded-lg bg-purple-500/10 border border-purple-500/20 text-sm text-purple-300 shrink-0">
           This is a builtin skill. Editing will create a personal overlay — the original remains unchanged.
         </div>
