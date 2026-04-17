@@ -55,7 +55,12 @@ export interface ParsedSkill {
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-function parseFrontmatter(md: string): { name: string; description: string } {
+/**
+ * Parse a skill's YAML frontmatter and return its `name` and `description`.
+ * Handles inline values and block scalars (`>-`, `>`, `|`, `|-`) — built-in
+ * skills rely on `description: >-` for multi-line text.
+ */
+export function parseFrontmatter(md: string): { name: string; description: string } {
   const match = md.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return { name: "", description: "" };
 
