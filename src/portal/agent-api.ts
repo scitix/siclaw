@@ -175,8 +175,10 @@ export function registerAgentRoutes(
     sendJson(res, 200, rows[0]);
 
     // is_production change affects skills bundle (prod=approved only, dev=all)
+    // and also the visible cluster/host set — credential-list filters out
+    // cross-env bindings, so the AgentBox must drop its cached list.
     if ("is_production" in body) {
-      connectionMap.notify(params.id, "agent.reload", { resources: ["skills"] });
+      connectionMap.notify(params.id, "agent.reload", { resources: ["skills", "cluster", "host"] });
     }
   });
 
