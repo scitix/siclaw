@@ -24,7 +24,8 @@ const MIN_FACT_LINES = 20;
 
 // Guard against concurrent consolidation of the same file in LocalSpawner mode
 // (single process, shared filesystem). In K8s mode, topics are pod-scoped so
-// cross-pod races don't occur; the mtime optimistic lock is the safety net there.
+// cross-pod races don't occur; the content-snapshot optimistic lock is the safety
+// net there.
 const consolidationInProgress = new Set<string>();
 
 // ---------------------------------------------------------------------------
@@ -116,7 +117,6 @@ async function doConsolidateTopicFile(
   filePath: string,
   llmConfig: { apiKey: string; baseUrl: string; model?: string },
 ): Promise<void> {
-  const mtimeBefore = fs.statSync(filePath).mtimeMs;
   const content = fs.readFileSync(filePath, "utf-8");
 
   // Extract the topic title from the first heading
@@ -160,9 +160,11 @@ Call the consolidate_knowledge tool with the merged result.`;
     return;
   }
 
-  // Optimistic lock: check mtime hasn't changed since we read the file
-  const mtimeAfter = fs.statSync(filePath).mtimeMs;
-  if (mtimeAfter !== mtimeBefore) {
+  // Optimistic lock: re-read and compare content. Using content instead of mtime
+  // because mtime has millisecond resolution — two writes in the same ms collide
+  // and the lock would miss the concurrent modification.
+  const contentAfter = fs.readFileSync(filePath, "utf-8");
+  if (contentAfter !== content) {
     console.warn(`[topic-consolidator] File ${path.basename(filePath)} was modified during consolidation, skipping write`);
     return;
   }
