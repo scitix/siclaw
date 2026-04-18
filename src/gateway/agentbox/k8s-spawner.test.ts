@@ -154,7 +154,7 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
     expect(handle.endpoint).toBe("https://10.1.2.3:3000");
     expect(cm.issuedCalls).toHaveLength(1);
     // CN=agentId (no userId leaked into cert) — see spec 2026-04-18.
-    expect(cm.issuedCalls[0]).toEqual(["default", "", "agentbox-default", "prod"]);
+    expect(cm.issuedCalls[0]).toEqual(["default", "", "agentbox-default"]);
 
     // Secret created with kubernetes.io/tls type + base64 cert fields
     expect(calls.createNamespacedSecret).toHaveLength(1);
@@ -163,22 +163,6 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
     expect(Buffer.from(secretBody.data["tls.crt"], "base64").toString()).toBe("CERT");
     expect(Buffer.from(secretBody.data["tls.key"], "base64").toString()).toBe("KEY");
     expect(Buffer.from(secretBody.data["ca.crt"], "base64").toString()).toBe("CA");
-  });
-
-  it("podEnv defaults to 'prod' but can be overridden", async () => {
-    const cm = new FakeCertManager();
-    const s = new K8sSpawner();
-    s.setCertManager(cm as any);
-    let r = 0;
-    readPodImpl.fn = async () => {
-      r++;
-      if (r === 1) throw Object.assign(new Error("nf"), { code: 404 });
-      return { status: { phase: "Running", podIP: "10.0.0.1", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
-    };
-
-    await s.spawn({ agentId: "default", podEnv: "dev" });
-    // issueAgentBoxCertificate(agentId, orgId, boxId, env) → env is 4th arg
-    expect(cm.issuedCalls[0][3]).toBe("dev");
   });
 
   it("sanitizes forbidden chars in agentId and caps the pod name", async () => {

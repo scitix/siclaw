@@ -103,10 +103,9 @@ export class K8sSpawner implements BoxSpawner {
       // Pod doesn't exist, proceed to create
     }
 
-    // Issue client certificate for mTLS authentication (env encoded in cert)
+    // Issue client certificate for mTLS authentication.
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
-    const podEnv: "prod" | "dev" | "test" = boxConfig.podEnv ?? "prod";
-    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName, podEnv);
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName);
     const certSecretName = `${podName}-cert`;
 
     // Create certificate Secret
