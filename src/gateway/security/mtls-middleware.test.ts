@@ -49,7 +49,7 @@ let validCertDER: Buffer;
 
 beforeAll(async () => {
   manager = await CertificateManager.create();
-  const bundle = manager.issueAgentBoxCertificate("a-1", "o-1", "b-1", "prod");
+  const bundle = manager.issueAgentBoxCertificate("a-1", "o-1", "b-1");
   const der = forge.asn1.toDer(
     forge.pki.certificateToAsn1(forge.pki.certificateFromPem(bundle.cert))
   ).getBytes();
@@ -170,7 +170,6 @@ describe("authorizeAgent", () => {
     agentId: "agent-x",
     orgId: "",
     boxId: "box-1",
-    env: "dev",
     issuedAt: new Date(),
     expiresAt: new Date(Date.now() + 10_000),
   };

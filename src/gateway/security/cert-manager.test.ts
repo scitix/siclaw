@@ -106,46 +106,36 @@ describe("CertificateManager.create — loading priority", () => {
 
 describe("CertificateManager — issue + verify round-trip", () => {
   it("issues a client cert with the given identity and verifies back the same fields", () => {
-    const bundle = manager.issueAgentBoxCertificate("agent-9", "org-42", "box-7", "dev");
+    const bundle = manager.issueAgentBoxCertificate("agent-9", "org-42", "box-7");
     expect(bundle.cert).toContain("BEGIN CERTIFICATE");
     expect(bundle.key).toContain("PRIVATE KEY");
     expect(bundle.ca).toBe(manager.getCACertificate());
     expect(bundle.identity.agentId).toBe("agent-9");
     expect(bundle.identity.orgId).toBe("org-42");
     expect(bundle.identity.boxId).toBe("box-7");
-    expect(bundle.identity.env).toBe("dev");
 
     const verified = manager.verifyCertificate(bundle.cert);
     expect(verified).not.toBeNull();
     expect(verified!.agentId).toBe("agent-9");
     expect(verified!.orgId).toBe("org-42");
     expect(verified!.boxId).toBe("box-7");
-    expect(verified!.env).toBe("dev");
   }, 60_000);
 
-  it("defaults env to 'prod' when not specified", () => {
-    const bundle = manager.issueAgentBoxCertificate("a", "o", "b");
-    expect(bundle.identity.env).toBe("prod");
-    const v = manager.verifyCertificate(bundle.cert);
-    expect(v!.env).toBe("prod");
-  }, 60_000);
-
-  it("round-trips env=test", () => {
-    const bundle = manager.issueAgentBoxCertificate("a", "o", "b", "test");
-    const v = manager.verifyCertificate(bundle.cert);
-    expect(v!.env).toBe("test");
-  }, 60_000);
-
-  it("encodes agentId as CN (not userId) — AgentBox is user-unaware", () => {
+  it("encodes agentId as CN; no userId, no env — AgentBox is user-unaware and env-agnostic", () => {
     const bundle = manager.issueAgentBoxCertificate("agent-cn-test", "o", "b");
     const parsed = forge.pki.certificateFromPem(bundle.cert);
+
     const cn = parsed.subject.attributes.find(a => a.name === "commonName")?.value;
     expect(cn).toBe("agent-cn-test");
-    // OU should not carry agentId anymore
+
+    // Removed dimensions: no OU (userId/env lived here), no L (env lived here).
     const ou = parsed.subject.attributes.find(a => a.name === "organizationalUnitName")?.value;
     expect(ou).toBeUndefined();
-    // Identity has no userId field
+    const l = parsed.subject.attributes.find(a => a.name === "localityName")?.value;
+    expect(l).toBeUndefined();
+
     expect((bundle.identity as any).userId).toBeUndefined();
+    expect((bundle.identity as any).env).toBeUndefined();
   }, 60_000);
 });
 
