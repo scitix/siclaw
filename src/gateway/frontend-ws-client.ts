@@ -134,18 +134,27 @@ export class FrontendWsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    // Reject all pending RPCs
-    for (const [id, entry] of this.pending) {
-      clearTimeout(entry.timer);
-      entry.reject(new Error("FrontendWsClient closed"));
-      this.pending.delete(id);
-    }
+    this.rejectPendingRpcs(new Error("FrontendWsClient closed"));
     if (this.ws) {
       this.ws.removeAllListeners();
       this.ws.close();
       this.ws = null;
     }
     this._connected = false;
+  }
+
+  /**
+   * Reject every pending RPC and clear their timers. Called both by the
+   * explicit `close()` and by the `'close'` event handler when the WS
+   * drops — in both cases any response would never arrive because the
+   * connection that owns the request-id namespace is gone.
+   */
+  private rejectPendingRpcs(err: Error): void {
+    for (const [id, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.reject(err);
+      this.pending.delete(id);
+    }
   }
 
   // ── Private ──────────────────────────────────────────────────
@@ -190,6 +199,12 @@ export class FrontendWsClient {
       console.log("[upstream-ws] connection closed");
       this._connected = false;
       this.ws = null;
+      // Reject any in-flight RPCs immediately — the WS that would have
+      // delivered their response is gone, and the new reconnection is a
+      // fresh channel (request ids are per-connection). Without this
+      // callers wait the full 30s timeout for something that will never
+      // arrive, which in turn strands bootFromDb() on startup races.
+      this.rejectPendingRpcs(new Error("FrontendWsClient disconnected"));
       this.scheduleReconnect();
     });
 

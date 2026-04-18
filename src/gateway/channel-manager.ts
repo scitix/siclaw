@@ -46,38 +46,79 @@ export async function handlePairingCode(
   });
 }
 
+export interface ChannelManagerOptions {
+  /** Max retry attempts for bootFromDb when channel.list races with WS connect. */
+  bootRetryAttempts?: number;
+  /** Base backoff ms between bootFromDb retries (doubles each attempt up to 8s). */
+  bootRetryBaseMs?: number;
+}
+
 export class ChannelManager {
   private handlers = new Map<string, ChannelHandler>();
+  private readonly bootRetryAttempts: number;
+  private readonly bootRetryBaseMs: number;
 
   constructor(
     private agentBoxManager: AgentBoxManager,
     private agentBoxTlsOptions?: { cert: string; key: string; ca: string },
     private frontendClient?: FrontendWsClient,
-  ) {}
+    options: ChannelManagerOptions = {},
+  ) {
+    this.bootRetryAttempts = options.bootRetryAttempts ?? 5;
+    this.bootRetryBaseMs = options.bootRetryBaseMs ?? 1000;
+  }
 
   /**
    * Load active channels from Portal via RPC and start handlers.
    */
+  /**
+   * Fetch active channels via RPC and start a handler per channel.
+   *
+   * Retries with backoff if the RPC fails — this happens on startup when
+   * the Runtime's `FrontendWsClient` races with the WS server (brief
+   * reconnect during handshake leaves the initial `channel.list` stranded).
+   * Without retry, that race is non-recoverable and the channel stays
+   * silent until the pod is manually restarted.
+   */
   async bootFromDb(): Promise<void> {
-    if (!this.frontendClient?.connected) {
-      console.log("[channel-manager] No FrontendWsClient connected — skipping channel boot");
-      return;
-    }
-
-    try {
-      const result = await this.frontendClient.request("channel.list") as { data: Record<string, any>[] };
-      const channels = result.data;
-      console.log(`[channel-manager] Found ${channels.length} active channel(s)`);
-
-      for (const ch of channels) {
-        try {
-          await this.startChannel(ch);
-        } catch (err) {
-          console.error(`[channel-manager] Failed to start channel id=${ch.id} type=${ch.type}:`, err);
+    const maxAttempts = this.bootRetryAttempts;
+    const base = this.bootRetryBaseMs;
+    // Backoff schedule caps at 8*base, which comfortably covers the
+    // observed ~1-3s WS reconnect gap on pod start (default base=1000ms).
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (!this.frontendClient?.connected) {
+        if (attempt === maxAttempts) {
+          console.warn("[channel-manager] FrontendWsClient never connected — giving up channel boot");
+          return;
         }
+        const wait = Math.min(base * 2 ** (attempt - 1), base * 8);
+        console.log(`[channel-manager] FrontendWsClient not connected; retrying channel boot in ${wait}ms (attempt ${attempt}/${maxAttempts})`);
+        await new Promise<void>((r) => setTimeout(r, wait));
+        continue;
       }
-    } catch (err) {
-      console.error("[channel-manager] Failed to boot channels:", err);
+
+      try {
+        const result = await this.frontendClient.request("channel.list") as { data: Record<string, any>[] };
+        const channels = result.data;
+        console.log(`[channel-manager] Found ${channels.length} active channel(s)`);
+
+        for (const ch of channels) {
+          try {
+            await this.startChannel(ch);
+          } catch (err) {
+            console.error(`[channel-manager] Failed to start channel id=${ch.id} type=${ch.type}:`, err);
+          }
+        }
+        return;
+      } catch (err) {
+        if (attempt === maxAttempts) {
+          console.error(`[channel-manager] Failed to boot channels after ${maxAttempts} attempts:`, err);
+          return;
+        }
+        const wait = Math.min(base * 2 ** (attempt - 1), base * 8);
+        console.warn(`[channel-manager] channel.list failed (attempt ${attempt}/${maxAttempts}), retrying in ${wait}ms:`, err instanceof Error ? err.message : err);
+        await new Promise<void>((r) => setTimeout(r, wait));
+      }
     }
   }
 
