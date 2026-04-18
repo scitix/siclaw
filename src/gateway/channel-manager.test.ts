@@ -87,11 +87,45 @@ describe("handlePairingCode", () => {
 // ── ChannelManager ──────────────────────────────────────────
 
 describe("ChannelManager.bootFromDb", () => {
-  it("skips booting when FrontendWsClient is not connected", async () => {
+  it("gives up after retries when FrontendWsClient is never connected", async () => {
     upstream.connected = false;
-    const mgr = new ChannelManager(fakeManager, undefined, upstream as unknown as FrontendWsClient);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mgr = new ChannelManager(fakeManager, undefined, upstream as unknown as FrontendWsClient, { bootRetryBaseMs: 1 });
     await mgr.bootFromDb();
     expect(upstream.calls).toHaveLength(0);
+    expect(mgr.size).toBe(0);
+  });
+
+  it("retries channel.list on startup race and succeeds on the second attempt", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    // First call throws (WS reconnected mid-request), second call returns data.
+    let calls = 0;
+    upstream.request = vi.fn(async (method: string) => {
+      upstream.calls.push({ method, params: undefined });
+      if (++calls === 1) throw new Error("FrontendWsClient disconnected");
+      return { data: [{ id: "c1", type: "lark", config: { app_id: "a", app_secret: "s" } }] };
+    }) as typeof upstream.request;
+    const mgr = new ChannelManager(fakeManager, undefined, upstream as unknown as FrontendWsClient, { bootRetryBaseMs: 1 });
+    await mgr.bootFromDb();
+    expect(calls).toBe(2);  // proves retry
+    expect(mgr.size).toBe(1);
+  });
+
+  it("gives up after all retries when channel.list keeps failing", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    upstream.nextError = new Error("list unavailable");
+    // Reset nextError each call so every attempt fails
+    const origRequest = upstream.request.bind(upstream);
+    upstream.request = vi.fn(async (method: string, params?: any) => {
+      upstream.nextError = new Error("still unavailable");
+      return origRequest(method, params);
+    }) as typeof upstream.request;
+    const mgr = new ChannelManager(fakeManager, undefined, upstream as unknown as FrontendWsClient, { bootRetryBaseMs: 1, bootRetryAttempts: 3 });
+    await mgr.bootFromDb();
+    expect((upstream.request as any).mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(mgr.size).toBe(0);
   });
 
@@ -124,14 +158,6 @@ describe("ChannelManager.bootFromDb", () => {
     warnSpy.mockRestore();
   });
 
-  it("does not throw when channel.list RPC itself fails", async () => {
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    upstream.nextError = new Error("list unavailable");
-    const mgr = new ChannelManager(fakeManager, undefined, upstream as unknown as FrontendWsClient);
-    await mgr.bootFromDb();
-    expect(errSpy).toHaveBeenCalled();
-    errSpy.mockRestore();
-  });
 });
 
 describe("ChannelManager.startChannel / stopChannel", () => {
