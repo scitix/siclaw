@@ -179,6 +179,39 @@ describe("handleLarkMessage — PAIR command", () => {
     expect(handlePairingCodeMock.mock.calls[0][0]).toBe("ABC123");
   });
 
+  it("PAIR success reply is Chinese for zh-CN (feishu domain)", async () => {
+    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
+    const lark = makeLarkClient();
+    await handleLarkMessage(
+      makeTextEvent("PAIR ABC123"),
+      lark,
+      "lark",
+      makeAgentBoxManager() as any,
+      undefined,
+      {} as any,
+      "zh-CN",
+    );
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    expect(replyArg.data.content).toContain("绑定成功");
+    expect(replyArg.data.content).toContain("SRE Bot");
+  });
+
+  it("PAIR success reply is English for en-US (lark domain)", async () => {
+    handlePairingCodeMock.mockResolvedValue({ success: true, agentName: "SRE Bot" });
+    const lark = makeLarkClient();
+    await handleLarkMessage(
+      makeTextEvent("PAIR ABC123"),
+      lark,
+      "lark",
+      makeAgentBoxManager() as any,
+      undefined,
+      {} as any,
+      "en-US",
+    );
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    expect(replyArg.data.content).toContain("Paired!");
+  });
+
   it("codes shorter or longer than 6 chars are not matched", async () => {
     const data5 = makeTextEvent("PAIR AB12E");      // 5 chars
     const data7 = makeTextEvent("PAIR AB12EF3");    // 7 chars
@@ -260,6 +293,178 @@ describe("handleLarkMessage — routing to AgentBox", () => {
 });
 
 // ── collectResponse ────────────────────────────────────────────────
+
+// ── handleLarkMessage × streaming card integration ────────────────
+
+describe("handleLarkMessage — streaming card flow", () => {
+  function makeCardAwareLarkClient() {
+    return {
+      im: { message: { reply: vi.fn().mockResolvedValue({}) } },
+      cardkit: {
+        v1: {
+          card: {
+            create: vi.fn().mockResolvedValue({ data: { card_id: "CARD-99" } }),
+            settings: vi.fn().mockResolvedValue({ code: 0 }),
+          },
+          cardElement: {
+            content: vi.fn().mockResolvedValue({ code: 0 }),
+          },
+        },
+      },
+    };
+  }
+
+  it("opens typing card before agent runs, then finalizes with the final assistant text", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-int" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "最终答复 **加粗**" }],
+        },
+      };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    // Card opened BEFORE reply (typing indicator path)
+    expect(lark.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    expect(replyArg.data.msg_type).toBe("interactive");
+    expect(JSON.parse(replyArg.data.content)).toMatchObject({
+      type: "card",
+      data: { card_id: "CARD-99" },
+    });
+
+    // Card finalized with the assistant text + streaming mode disabled
+    expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
+    expect(lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content).toContain("最终答复");
+    expect(lark.cardkit.v1.card.settings).toHaveBeenCalledTimes(1);
+    const settingsPayload = JSON.parse(lark.cardkit.v1.card.settings.mock.calls[0][0].data.settings);
+    expect(settingsPayload.config.streaming_mode).toBe(false);
+  });
+
+  it("falls back to plain text reply when card.create fails (preserves the pre-card UX)", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-fb" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "答复" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+    lark.cardkit.v1.card.create.mockRejectedValueOnce(new Error("403 cardkit forbidden"));
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    // No card finalize attempted
+    expect(lark.cardkit.v1.cardElement.content).not.toHaveBeenCalled();
+    expect(lark.cardkit.v1.card.settings).not.toHaveBeenCalled();
+    // Plain text reply instead
+    expect(lark.im.message.reply).toHaveBeenCalledTimes(1);
+    const replyArg = lark.im.message.reply.mock.calls[0][0];
+    expect(replyArg.data.msg_type).toBe("text");
+    expect(JSON.parse(replyArg.data.content).text).toBe("答复");
+  });
+
+  it("shows an error message in the card when the agent throws", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockRejectedValue(new Error("AgentBox unreachable"));
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    expect(lark.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(1);
+    const contentText = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(contentText).toContain("\u274C");
+    expect(contentText).toContain("AgentBox unreachable");
+  });
+
+  it("renders English placeholder when the channel domain is 'lark' (global)", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-en" });
+    streamEventsMock.mockImplementation(async function* () {
+      yield { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } };
+    });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hi"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "en-US",
+    );
+
+    const createArg = lark.cardkit.v1.card.create.mock.calls[0][0];
+    const cardJson = JSON.parse(createArg.data.data);
+    expect(cardJson.body.elements[0].content).toContain("Thinking");
+  });
+
+  it("renders English empty-result notice when agent returns nothing and locale is en-US", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-en-empty" });
+    streamEventsMock.mockImplementation(async function* () { /* empty */ });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hi"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+      "en-US",
+    );
+
+    const contentText = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(contentText).toMatch(/agent|response/i);
+  });
+
+  it("shows the empty-result notice when the agent returns no text", async () => {
+    resolveBindingMock.mockResolvedValue({ agentId: "a1", bindingId: "b" });
+    promptMock.mockResolvedValue({ sessionId: "s-empty" });
+    streamEventsMock.mockImplementation(async function* () { /* no assistant messages */ });
+    const lark = makeCardAwareLarkClient();
+
+    await handleLarkMessage(
+      makeTextEvent("hello"),
+      lark,
+      "lark",
+      makeAgentBoxManager("a1") as any,
+      undefined,
+      {} as any,
+    );
+
+    const contentText = lark.cardkit.v1.cardElement.content.mock.calls[0][0].data.content;
+    expect(contentText).toContain("\u26A0");  // warning emoji in EMPTY_RESULT_NOTICE
+  });
+});
 
 describe("collectResponse — SSE event flattening", () => {
   function fakeClient(events: unknown[]) {
