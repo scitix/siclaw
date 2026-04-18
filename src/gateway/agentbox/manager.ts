@@ -1,8 +1,10 @@
 /**
  * AgentBox Manager
  *
- * Manages the lifecycle of AgentBoxes and provides a high-level API:
- * - Get or create an AgentBox by userId + agentId
+ * Manages the lifecycle of AgentBoxes keyed on `agentId`. One AgentBox pod
+ * per agent serves every user who addresses that agent; per-user state is
+ * threaded in request-scoped `sessionId`, not in the pod identity.
+ *
  * - K8s: stateless, queries K8s API each time (no in-memory cache)
  * - Local dev: in-memory cache for fast lookups
  */
@@ -64,16 +66,13 @@ export class AgentBoxManager {
     }
   }
 
-  private boxKey(userId: string, agentId: string): string {
-    return `${userId}:${agentId}`;
-  }
-
-  private podName(userId: string, agentId: string): string {
-    const sanitizedUser = userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-    const agentSuffix = agentId
-      ? agentId.replace(/[^a-z0-9]/g, "").slice(0, 8)
-      : "default";
-    return `agentbox-${sanitizedUser}-${agentSuffix}`;
+  /**
+   * Pod / box name. One pod per agent — we trim agentId to keep under the 63-char
+   * K8s name limit and only sanitize forbidden characters.
+   */
+  private podName(agentId: string): string {
+    const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
+    return `agentbox-${sanitized}`;
   }
 
   private async runHealthCheck(): Promise<void> {
@@ -86,28 +85,28 @@ export class AgentBoxManager {
     }
   }
 
-  async getOrCreate(userId: string, agentId = "default", config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+  async getOrCreate(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    if (!agentId) throw new Error("AgentBoxManager.getOrCreate requires an agentId");
     if (this.isK8s) {
-      return this.getOrCreateK8s(userId, agentId, config);
+      return this.getOrCreateK8s(agentId, config);
     }
-    return this.getOrCreateLocal(userId, agentId, config);
+    return this.getOrCreateLocal(agentId, config);
   }
 
-  private async getOrCreateK8s(userId: string, agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
-    const name = this.podName(userId, agentId);
+  private async getOrCreateK8s(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    const name = this.podName(agentId);
 
     const info = await this.spawner.get(name);
     if (info && info.status === "running" && info.endpoint) {
-      return { boxId: name, userId, endpoint: info.endpoint, agentId };
+      return { boxId: name, endpoint: info.endpoint, agentId };
     }
 
-    console.log(`[agentbox-manager] Creating new AgentBox for user=${userId} agent=${agentId}`);
+    console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
     const resolvedEnv = this.resolveEnv(config?.env);
     const handle = await this.spawner.spawn({
-      userId,
-      agentId,
       ...config,
+      agentId,
       env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
     });
 
@@ -115,30 +114,27 @@ export class AgentBoxManager {
     return handle;
   }
 
-  private async getOrCreateLocal(userId: string, agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
-    const key = this.boxKey(userId, agentId);
-
-    const existing = this.boxes.get(key);
+  private async getOrCreateLocal(agentId: string, config?: Partial<AgentBoxConfig>): Promise<AgentBoxHandle> {
+    const existing = this.boxes.get(agentId);
     if (existing) {
       existing.lastActiveAt = new Date();
       const info = await this.spawner.get(existing.handle.boxId);
       if (info && info.status === "running") {
         return existing.handle;
       }
-      this.boxes.delete(key);
+      this.boxes.delete(agentId);
     }
 
-    console.log(`[agentbox-manager] Creating new AgentBox for user=${userId} agent=${agentId}`);
+    console.log(`[agentbox-manager] Creating new AgentBox for agent=${agentId}`);
 
     const resolvedEnv = this.resolveEnv(config?.env);
     const handle = await this.spawner.spawn({
-      userId,
-      agentId,
       ...config,
+      agentId,
       env: Object.keys(resolvedEnv).length > 0 ? resolvedEnv : undefined,
     });
 
-    this.boxes.set(key, { handle, lastActiveAt: new Date(), createdAt: new Date() });
+    this.boxes.set(agentId, { handle, lastActiveAt: new Date(), createdAt: new Date() });
     return handle;
   }
 
@@ -146,10 +142,9 @@ export class AgentBoxManager {
     return configEnv ?? {};
   }
 
-  get(userId: string, agentId = "default"): AgentBoxHandle | undefined {
+  get(agentId: string): AgentBoxHandle | undefined {
     if (this.isK8s) return undefined;
-    const key = this.boxKey(userId, agentId);
-    const managed = this.boxes.get(key);
+    const managed = this.boxes.get(agentId);
     if (managed) {
       managed.lastActiveAt = new Date();
       return managed.handle;
@@ -157,91 +152,54 @@ export class AgentBoxManager {
     return undefined;
   }
 
-  async getAsync(userId: string, agentId = "default"): Promise<AgentBoxHandle | undefined> {
+  async getAsync(agentId: string): Promise<AgentBoxHandle | undefined> {
     if (this.isK8s) {
-      const name = this.podName(userId, agentId);
+      const name = this.podName(agentId);
       const info = await this.spawner.get(name);
       if (info && info.status === "running" && info.endpoint) {
-        return { boxId: name, userId, endpoint: info.endpoint, agentId };
+        return { boxId: name, endpoint: info.endpoint, agentId };
       }
       return undefined;
     }
-    return this.get(userId, agentId);
+    return this.get(agentId);
   }
 
-  async stop(userId: string, agentId = "default"): Promise<void> {
+  async stop(agentId: string): Promise<void> {
     if (this.isK8s) {
-      const name = this.podName(userId, agentId);
+      const name = this.podName(agentId);
       console.log(`[agentbox-manager] Stopping AgentBox ${name}`);
       await this.spawner.stop(name);
       return;
     }
-    const key = this.boxKey(userId, agentId);
-    const managed = this.boxes.get(key);
+    const managed = this.boxes.get(agentId);
     if (!managed) return;
-    console.log(`[agentbox-manager] Stopping AgentBox for ${key}`);
+    console.log(`[agentbox-manager] Stopping AgentBox for agent=${agentId}`);
     await this.spawner.stop(managed.handle.boxId);
-    this.boxes.delete(key);
+    this.boxes.delete(agentId);
   }
 
-  async stopAll(userId: string): Promise<void> {
-    if (this.isK8s) {
-      const allBoxes = await this.spawner.list();
-      for (const box of allBoxes) {
-        if (box.userId === userId) {
-          await this.spawner.stop(box.boxId);
-        }
-      }
-      return;
-    }
-    const toRemove: string[] = [];
-    for (const [key, managed] of this.boxes) {
-      if (key.startsWith(userId + ":")) {
-        await this.spawner.stop(managed.handle.boxId);
-        toRemove.push(key);
-      }
-    }
-    for (const key of toRemove) this.boxes.delete(key);
-  }
-
-  activeUserIds(): string[] {
+  activeAgentIds(): string[] {
     if (this.isK8s) return [];
-    const userIds = new Set<string>();
-    for (const key of this.boxes.keys()) userIds.add(key.split(":")[0]);
-    return [...userIds];
-  }
-
-  getForUser(userId: string): AgentBoxHandle[] {
-    if (this.isK8s) return [];
-    const handles: AgentBoxHandle[] = [];
-    for (const [key, managed] of this.boxes) {
-      if (key.startsWith(userId + ":")) {
-        if (!managed.handle.agentId) {
-          managed.handle.agentId = key.slice(userId.length + 1);
-        }
-        handles.push(managed.handle);
-      }
-    }
-    return handles;
+    return Array.from(this.boxes.keys());
   }
 
   async list(): Promise<AgentBoxInfo[]> {
     return this.spawner.list();
   }
 
-  touch(userId: string, agentId = "default"): void {
+  touch(agentId: string): void {
     if (this.isK8s) return;
-    const managed = this.boxes.get(this.boxKey(userId, agentId));
+    const managed = this.boxes.get(agentId);
     if (managed) managed.lastActiveAt = new Date();
   }
 
-  stats(): { total: number; userIds: string[] } {
-    return { total: this.boxes.size, userIds: Array.from(this.boxes.keys()) };
+  stats(): { total: number; agentIds: string[] } {
+    return { total: this.boxes.size, agentIds: Array.from(this.boxes.keys()) };
   }
 
   async cleanup(): Promise<void> {
     this.stopHealthCheck();
-    for (const [key, managed] of this.boxes) {
+    for (const [, managed] of this.boxes) {
       await this.spawner.stop(managed.handle.boxId);
     }
     this.boxes.clear();

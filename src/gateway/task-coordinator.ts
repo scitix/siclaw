@@ -22,6 +22,7 @@ import { appendMessage, ensureChatSession, incrementMessageCount } from "./chat-
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
+import { sessionRegistry } from "./session-registry.js";
 
 /** Row shape needed by the scheduler — carries the task prompt out-of-band. */
 interface AgentTaskDbRow {
@@ -267,7 +268,10 @@ export class TaskCoordinator {
       const binding = await resolveAgentModelBinding(agentId, this.frontendClient);
       if (!binding) throw new Error(`Agent ${agentId} has no valid model binding`);
 
-      const handle = await this.manager.getOrCreate(userId, agentId);
+      // One pod per agent — shared across users who call the agent.
+      // Caller/task-owner attribution flows to Upstream via the session registry.
+      sessionRegistry.remember(sessionId, userId, agentId);
+      const handle = await this.manager.getOrCreate(agentId);
       const client = new AgentBoxClient(handle.endpoint, 30_000, this.tlsOptions);
 
       const promptOpts: PromptOptions = {

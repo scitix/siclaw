@@ -14,7 +14,7 @@ import type { AgentBoxConfig, AgentBoxInfo, AgentBoxHandle } from "./types.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 interface ProcessBox {
-  userId: string;
+  agentId: string;
   port: number;
   process: ChildProcess;
   createdAt: Date;
@@ -33,16 +33,16 @@ export class ProcessSpawner implements BoxSpawner {
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
-    const { userId } = config;
-    const agentId = config.agentId || "default";
-    const boxId = `proc-${userId}-${agentId}`;
+    const agentId = config.agentId;
+    if (!agentId) throw new Error("ProcessSpawner.spawn requires a non-empty agentId");
+    const boxId = `proc-${agentId}`;
 
     const existing = this.boxes.get(boxId);
     if (existing) {
       return {
         boxId,
         endpoint: `http://127.0.0.1:${existing.port}`,
-        userId,
+        agentId,
       };
     }
 
@@ -61,7 +61,7 @@ export class ProcessSpawner implements BoxSpawner {
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
       SICLAW_AGENTBOX_PORT: String(port),
-      USER_ID: userId,
+      SICLAW_AGENT_ID: agentId,
     };
 
     // Forward agent-specific env vars
@@ -69,10 +69,10 @@ export class ProcessSpawner implements BoxSpawner {
       Object.assign(env, config.env);
     }
 
-    // Set user data dir if not already set
+    // Agent-scoped user-data dir
     if (!env.SICLAW_USER_DATA_DIR) {
       const dataDir = process.env.SICLAW_DATA_DIR || process.cwd();
-      env.SICLAW_USER_DATA_DIR = path.join(dataDir, "user-data", userId);
+      env.SICLAW_USER_DATA_DIR = path.join(dataDir, "user-data", "agents", agentId);
     }
 
     const child = fork(entryScript, [], {
@@ -99,7 +99,7 @@ export class ProcessSpawner implements BoxSpawner {
     });
 
     const box: ProcessBox = {
-      userId,
+      agentId,
       port,
       process: child,
       createdAt: new Date(),
@@ -109,12 +109,12 @@ export class ProcessSpawner implements BoxSpawner {
     // Wait for the agentbox to become ready
     await this.waitForReady(port, boxId);
 
-    console.log(`[process-spawner] AgentBox for ${userId} started on port ${port} (pid=${child.pid})`);
+    console.log(`[process-spawner] AgentBox for agent=${agentId} started on port ${port} (pid=${child.pid})`);
 
     return {
       boxId,
       endpoint: `http://127.0.0.1:${port}`,
-      userId,
+      agentId,
     };
   }
 
@@ -151,7 +151,7 @@ export class ProcessSpawner implements BoxSpawner {
 
     return {
       boxId,
-      userId: box.userId,
+      agentId: box.agentId,
       status: "running",
       endpoint: `http://127.0.0.1:${box.port}`,
       createdAt: box.createdAt,
@@ -164,7 +164,7 @@ export class ProcessSpawner implements BoxSpawner {
     for (const [boxId, box] of this.boxes) {
       result.push({
         boxId,
-        userId: box.userId,
+        agentId: box.agentId,
         status: "running",
         endpoint: `http://127.0.0.1:${box.port}`,
         createdAt: box.createdAt,

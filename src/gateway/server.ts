@@ -65,6 +65,7 @@ import { registerMetricsRoutes } from "./metrics-api.js";
 import { registerSystemRoutes } from "./system-api.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
+import { sessionRegistry } from "./session-registry.js";
 
 export interface RuntimeServer {
   httpServer: http.Server;
@@ -128,14 +129,18 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       throw new Error("agentId, userId, and text are required");
     }
 
-    // Get or create AgentBox for this user+agent
-    const handle = await agentBoxManager.getOrCreate(userId, agentId);
+    // Get or create AgentBox for this agent — one pod per agent, shared by
+    // all callers. Caller identity travels as sessionId.
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
     // Pre-generate a UUID so the AgentBox doesn't fall back to the literal
     // "default" session id (LocalSpawner behaviour), which would merge every
     // caller's trace into one chat_sessions row.
     const sessionId = incomingSessionId ?? crypto.randomUUID();
+    // Record sessionId → userId so AgentBox → Runtime internal-api callbacks
+    // can recover user attribution for Upstream audit.
+    sessionRegistry.remember(sessionId, userId, agentId);
 
     // Build prompt options from params (Upstream sends full context)
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
@@ -202,51 +207,48 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   });
 
   rpcMethods.set("chat.abort", async (params) => {
-    const userId = params.userId as string;
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
-    if (!userId || !agentId || !sessionId) throw new Error("userId, agentId, sessionId required");
+    if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getOrCreate(userId, agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.abortSession(sessionId);
     return { ok: true };
   });
 
   rpcMethods.set("chat.steer", async (params) => {
-    const userId = params.userId as string;
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
     const text = params.text as string;
-    if (!userId || !agentId || !sessionId || !text) throw new Error("userId, agentId, sessionId, text required");
+    if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
 
-    const handle = await agentBoxManager.getOrCreate(userId, agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.steerSession(sessionId, text);
     return { ok: true };
   });
 
   rpcMethods.set("chat.clearQueue", async (params) => {
-    const userId = params.userId as string;
     const agentId = params.agentId as string;
     const sessionId = params.sessionId as string;
-    if (!userId || !agentId || !sessionId) throw new Error("userId, agentId, sessionId required");
+    if (!agentId || !sessionId) throw new Error("agentId, sessionId required");
 
-    const handle = await agentBoxManager.getOrCreate(userId, agentId);
+    const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     const cleared = await client.clearQueue(sessionId);
     return { ok: true, ...cleared };
   });
 
   rpcMethods.set("agent.clearMemory", async (params) => {
-    const userId = params.userId as string;
     const agentId = params.agentId as string;
-    if (!userId || !agentId) throw new Error("userId, agentId required");
+    if (!agentId) throw new Error("agentId required");
 
-    // Compute memory directory on PVC
-    const sanitize = (s: string) => s.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
+    // Memory is agent-scoped (one pod per agent). Path mirrors the k8s-spawner
+    // subPath layout: `/app/.siclaw/user-data/agents/{agentId}/memory`.
+    const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
     const userDataBase = "/app/.siclaw/user-data";
-    const memoryDir = path.resolve(userDataBase, "users", sanitize(userId), sanitize(agentId), "memory");
+    const memoryDir = path.resolve(userDataBase, "agents", sanitize(agentId), "memory");
 
     // Delete memory files
     let deletedFiles = 0;
@@ -271,7 +273,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
     // Notify AgentBox to reset indexer
     try {
-      const handle = await agentBoxManager.getAsync(userId, agentId);
+      const handle = await agentBoxManager.getAsync(agentId);
       if (handle) {
         const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
         await client.resetMemory();
@@ -296,7 +298,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const results = await Promise.all(
       targets.map(async (box) => {
         try {
-          await agentBoxManager.stop(box.userId, agentId);
+          await agentBoxManager.stop(box.agentId);
           return { ok: true, boxId: box.boxId };
         } catch (err: any) {
           console.warn(`[rpc] agent.terminate: failed to stop ${box.boxId}: ${err.message}`);

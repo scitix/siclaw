@@ -6,6 +6,7 @@ import {
 } from "./credential-service.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { Identity } from "../shared/credential-types.js";
+import { SessionRegistry } from "./session-registry.js";
 
 /**
  * Minimal fake FrontendWsClient that records every `request` invocation
@@ -31,18 +32,23 @@ class FakeFrontendWsClient {
 }
 
 const identity: Identity = {
-  userId: "u1",
   agentId: "a1",
   orgId: "o1",
   boxId: "b1",
+  sessionId: "sess-1",
 };
 
 let fake: FakeFrontendWsClient;
 let svc: CredentialService;
+let registry: SessionRegistry;
 
 beforeEach(() => {
   fake = new FakeFrontendWsClient();
-  svc = new CredentialService(fake as unknown as FrontendWsClient);
+  // Pre-seed a session → user mapping so we can assert audit attribution
+  // comes from the registry (not the cert).
+  registry = new SessionRegistry();
+  registry.remember("sess-1", "u1", "a1");
+  svc = new CredentialService(fake as unknown as FrontendWsClient, registry);
 });
 
 describe("CredentialService.listClusters", () => {
@@ -57,18 +63,25 @@ describe("CredentialService.listClusters", () => {
     expect(fake.calls[0].method).toBe("credential.list");
     expect(fake.calls[0].params).toEqual({
       kind: "cluster",
-      userId: "u1",
+      userId: "u1",       // resolved from session registry, not from cert
       agentId: "a1",
       orgId: "o1",
       boxId: "b1",
+      sessionId: "sess-1",
     });
   });
 
   it("defaults missing orgId/boxId to empty string", async () => {
     fake.responses.set("credential.list:cluster", { clusters: [] });
-    await svc.listClusters({ userId: "u", agentId: "a" });
+    await svc.listClusters({ agentId: "a" });
     expect(fake.calls[0].params.orgId).toBe("");
     expect(fake.calls[0].params.boxId).toBe("");
+  });
+
+  it("falls back to empty userId when sessionId is not registered", async () => {
+    fake.responses.set("credential.list:cluster", { clusters: [] });
+    await svc.listClusters({ agentId: "a", sessionId: "unknown-session" });
+    expect(fake.calls[0].params.userId).toBe("");
   });
 
   it("throws when adapter returns malformed payload (not an array)", async () => {

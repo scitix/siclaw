@@ -4,16 +4,18 @@
  * Architecture:
  * - Runtime acts as CA (Certificate Authority)
  * - CA cert + key loaded from environment or generated ephemerally
- * - Each AgentBox receives a unique client certificate
- * - Certificate contains identity: userId (CN), agentId (OU), orgId (O)
+ * - Each AgentBox receives a unique client certificate keyed on its agentId
  * - Runtime validates certificates and extracts identity for authorization
  *
- * Certificate subject fields (per integration spec §5.3):
- *   CN = userId
- *   OU = agentId          (was workspaceId)
- *   O  = orgId            (new)
+ * Certificate subject fields:
+ *   CN           = agentId
+ *   O            = orgId
  *   serialNumber = boxId
- *   L  = env              (prod | dev | test)
+ *   L            = env (prod | dev | test)
+ *
+ * AgentBox is user-unaware: userId is neither encoded in the cert nor
+ * transmitted in request payloads. User attribution is resolved at Runtime
+ * boundaries via sessionId.
  */
 
 import crypto from "node:crypto";
@@ -24,7 +26,6 @@ import forge from "node-forge";
 const CA_VALIDITY_DAYS = 3650;
 
 export interface CertificateIdentity {
-  userId: string;
   agentId: string;
   orgId: string;
   boxId: string;
@@ -112,10 +113,9 @@ export class CertificateManager {
    * Issue a client certificate for an AgentBox instance.
    *
    * Identity fields embedded in the certificate:
-   *   CN = userId, OU = agentId, O = orgId, serialNumber = boxId, L = env
+   *   CN = agentId, O = orgId, serialNumber = boxId, L = env
    */
   issueAgentBoxCertificate(
-    userId: string,
     agentId: string,
     orgId: string,
     boxId: string,
@@ -131,7 +131,7 @@ export class CertificateManager {
     const expiresAt = new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
-      subject: { CN: userId, OU: agentId, O: orgId, serialNumber: boxId, L: env },
+      subject: { CN: agentId, O: orgId, serialNumber: boxId, L: env },
       issuer: { CN: "Siclaw Runtime CA", O: "Siclaw", OU: "Security" },
       publicKey,
       signingKey: this.caKey,
@@ -140,13 +140,13 @@ export class CertificateManager {
       extendedKeyUsage: ["clientAuth", "serverAuth"],
     });
 
-    console.log(`[cert-manager] Issued certificate userId=${userId} agentId=${agentId} orgId=${orgId} boxId=${boxId} env=${env}`);
+    console.log(`[cert-manager] Issued certificate agentId=${agentId} orgId=${orgId} boxId=${boxId} env=${env}`);
 
     return {
       cert,
       key: privateKey,
       ca: this.caCert,
-      identity: { userId, agentId, orgId, boxId, env, issuedAt, expiresAt },
+      identity: { agentId, orgId, boxId, env, issuedAt, expiresAt },
     };
   }
 
@@ -176,19 +176,18 @@ export class CertificateManager {
       const getAttr = (name: string) =>
         subject.find((attr: any) => attr.name === name)?.value as string | undefined;
 
-      const userId = getAttr("commonName");
-      const agentId = getAttr("organizationalUnitName");
+      const agentId = getAttr("commonName");
       const orgId = getAttr("organizationName") || "";
       const boxId = getAttr("serialNumber");
       const envRaw = getAttr("localityName");
       const env = (envRaw === "dev" ? "dev" : envRaw === "test" ? "test" : "prod") as CertificateIdentity["env"];
 
-      if (!userId || !agentId || !boxId) {
+      if (!agentId || !boxId) {
         console.warn("[cert-manager] Certificate missing required identity fields");
         return null;
       }
 
-      return { userId, agentId, orgId, boxId, env, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
+      return { agentId, orgId, boxId, env, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
     } catch (err) {
       console.error("[cert-manager] Certificate verification error:", err);
       return null;

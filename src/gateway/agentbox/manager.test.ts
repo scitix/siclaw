@@ -4,16 +4,12 @@ import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 
 /**
- * Tests for AgentBoxManager — the high-level facade that knits userId + agentId
- * into BoxSpawner calls. Two branches to cover: K8s mode (stateless — queries
- * spawner each time) and Local mode (in-memory cache).
- *
- * The spawner's `name` is how the manager distinguishes modes:
- *   name === "k8s"   → K8s branch
- *   anything else    → Local branch
+ * Tests for AgentBoxManager — agent-scoped pod identity (see 2026-04-18 spec).
+ * Every AgentBox is keyed by `agentId` alone; callers do NOT pass userId.
+ * Two branches to cover: K8s (stateless) and Local (in-memory cache).
  */
 
-// ── Fake spawners ──────────────────────────────────────────────────────
+// ── Fake spawner ──────────────────────────────────────────────────────
 
 class FakeSpawner implements BoxSpawner {
   constructor(public readonly name: string) {}
@@ -26,9 +22,9 @@ class FakeSpawner implements BoxSpawner {
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
     this.spawnCalls.push(config);
     return {
-      boxId: `box-${config.userId}-${config.agentId ?? "default"}`,
+      boxId: `box-${config.agentId}`,
       endpoint: "http://127.0.0.1:4000",
-      userId: config.userId,
+      agentId: config.agentId,
     };
   }
   async stop(boxId: string): Promise<void> { this.stopCalls.push(boxId); }
@@ -48,98 +44,96 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// ── getOrCreate contract ──────────────────────────────────────────────
+
+describe("AgentBoxManager.getOrCreate — requires agentId", () => {
+  it("throws when called with an empty agentId", async () => {
+    const mgr = new AgentBoxManager(new FakeSpawner("local"));
+    await expect(mgr.getOrCreate("")).rejects.toThrow(/agentId/);
+  });
+});
+
 // ── Local-mode tests ───────────────────────────────────────────────────
 
 describe("AgentBoxManager — Local mode", () => {
-  it("getOrCreate spawns a new box the first time and caches it", async () => {
+  it("spawns a new box the first time and caches it by agentId", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    const handle = await mgr.getOrCreate("alice", "default");
-    expect(handle.boxId).toBe("box-alice-default");
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.boxId).toBe("box-agent-a");
     expect(spawner.spawnCalls).toHaveLength(1);
-    expect(mgr.stats()).toEqual({ total: 1, userIds: ["alice:default"] });
+    expect(mgr.stats()).toEqual({ total: 1, agentIds: ["agent-a"] });
   });
 
-  it("getOrCreate reuses the cached box on second call when still running", async () => {
+  it("reuses the cached box on second call for the same agent", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
+    await mgr.getOrCreate("agent-a");
 
-    const boxId = "box-alice-default";
-    spawner.getReturns.set(boxId, {
-      boxId, userId: "alice", status: "running", endpoint: "x",
-      createdAt: new Date(), lastActiveAt: new Date(),
+    // Simulate spawner.get reporting the cached pod is still running.
+    spawner.getReturns.set("box-agent-a", {
+      boxId: "box-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
     });
 
-    const handle2 = await mgr.getOrCreate("alice");
+    const h2 = await mgr.getOrCreate("agent-a");
     expect(spawner.spawnCalls).toHaveLength(1); // no re-spawn
-    expect(handle2.boxId).toBe(boxId);
+    expect(h2.boxId).toBe("box-agent-a");
   });
 
-  it("getOrCreate evicts and re-spawns when cached box is not running", async () => {
+  it("evicts and re-spawns when the cached box is gone", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    spawner.getReturns.set("box-alice-default", null); // gone
-    await mgr.getOrCreate("alice");
+    await mgr.getOrCreate("agent-a");
+    spawner.getReturns.set("box-agent-a", null);
+    await mgr.getOrCreate("agent-a");
     expect(spawner.spawnCalls).toHaveLength(2);
   });
 
-  it("activeUserIds returns unique userIds derived from cache keys", async () => {
+  it("different agents get different pods; same agent reuses the pod", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice", "agent-a");
-    await mgr.getOrCreate("alice", "agent-b");
-    await mgr.getOrCreate("bob");
-    expect(mgr.activeUserIds().sort()).toEqual(["alice", "bob"]);
-  });
-
-  it("getForUser returns handles whose key starts with userId:", async () => {
-    const spawner = new FakeSpawner("local");
-    const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice", "a1");
-    await mgr.getOrCreate("alicia", "a1"); // prefix collision
-    const handles = mgr.getForUser("alice");
-    expect(handles).toHaveLength(1);
-    expect(handles[0].boxId).toBe("box-alice-a1");
+    await mgr.getOrCreate("agent-a");
+    await mgr.getOrCreate("agent-b");
+    // Simulate both pods being alive so the cache-hit path is taken.
+    spawner.getReturns.set("box-agent-a", {
+      boxId: "box-agent-a", agentId: "agent-a", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    spawner.getReturns.set("box-agent-b", {
+      boxId: "box-agent-b", agentId: "agent-b", status: "running",
+      endpoint: "x", createdAt: new Date(), lastActiveAt: new Date(),
+    });
+    await mgr.getOrCreate("agent-a");  // cache hit — no new spawn
+    expect(spawner.spawnCalls).toHaveLength(2);
+    expect(mgr.activeAgentIds().sort()).toEqual(["agent-a", "agent-b"]);
   });
 
   it("stop removes the box from cache and calls spawner.stop", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    await mgr.stop("alice");
-    expect(spawner.stopCalls).toEqual(["box-alice-default"]);
+    await mgr.getOrCreate("agent-a");
+    await mgr.stop("agent-a");
+    expect(spawner.stopCalls).toEqual(["box-agent-a"]);
     expect(mgr.stats().total).toBe(0);
-  });
-
-  it("stopAll(userId) stops only the specified user's boxes", async () => {
-    const spawner = new FakeSpawner("local");
-    const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice", "a1");
-    await mgr.getOrCreate("alice", "a2");
-    await mgr.getOrCreate("bob", "a1");
-    await mgr.stopAll("alice");
-    expect(spawner.stopCalls.sort()).toEqual(["box-alice-a1", "box-alice-a2"]);
-    expect(mgr.activeUserIds()).toEqual(["bob"]);
   });
 
   it("touch updates lastActiveAt without spawning", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    const firstActive = (mgr as any).boxes.get("alice:default").lastActiveAt;
+    await mgr.getOrCreate("agent-a");
+    const first = (mgr as any).boxes.get("agent-a").lastActiveAt;
     await new Promise((r) => setTimeout(r, 5));
-    mgr.touch("alice");
-    const secondActive = (mgr as any).boxes.get("alice:default").lastActiveAt;
-    expect(secondActive.getTime()).toBeGreaterThanOrEqual(firstActive.getTime());
+    mgr.touch("agent-a");
+    const second = (mgr as any).boxes.get("agent-a").lastActiveAt;
+    expect(second.getTime()).toBeGreaterThanOrEqual(first.getTime());
   });
 
-  it("get returns cached handle and returns undefined for unknown keys", async () => {
+  it("get returns cached handle and returns undefined for unknown agents", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    expect(mgr.get("alice")?.boxId).toBe("box-alice-default");
+    await mgr.getOrCreate("agent-a");
+    expect(mgr.get("agent-a")?.boxId).toBe("box-agent-a");
     expect(mgr.get("nobody")).toBeUndefined();
   });
 });
@@ -147,75 +141,60 @@ describe("AgentBoxManager — Local mode", () => {
 // ── K8s-mode tests ─────────────────────────────────────────────────────
 
 describe("AgentBoxManager — K8s mode", () => {
-  it("getOrCreate returns existing pod info if already running", async () => {
+  it("returns existing pod info if already running", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    spawner.getReturns.set("agentbox-alice-default", {
-      boxId: "agentbox-alice-default", userId: "alice", status: "running",
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
       endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
     });
 
-    const handle = await mgr.getOrCreate("alice");
-    expect(handle.boxId).toBe("agentbox-alice-default");
+    const handle = await mgr.getOrCreate("agent-a");
+    expect(handle.boxId).toBe("agentbox-agent-a");
     expect(handle.endpoint).toBe("https://10.0.0.1:3000");
     expect(spawner.spawnCalls).toHaveLength(0);
   });
 
-  it("getOrCreate creates a new pod when none exists", async () => {
+  it("creates a new pod when none exists", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    // spawner.get returns null by default
-    await mgr.getOrCreate("alice", "a1");
+    await mgr.getOrCreate("agent-a");
     expect(spawner.spawnCalls).toHaveLength(1);
-    expect(spawner.spawnCalls[0].userId).toBe("alice");
-    expect(spawner.spawnCalls[0].agentId).toBe("a1");
+    expect(spawner.spawnCalls[0].agentId).toBe("agent-a");
   });
 
-  it("podName sanitizes userId and truncates agentId (matches K8sSpawner)", async () => {
+  it("podName sanitizes forbidden characters in agentId", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    spawner.getReturns.set("agentbox-user-name-abcdefgh", {
-      boxId: "agentbox-user-name-abcdefgh", userId: "User.Name",
-      status: "running", endpoint: "https://x", createdAt: new Date(), lastActiveAt: new Date(),
+    // Underscores and capitals → lowercase + dash. This is the exact class of
+    // input that broke the old design (Lark chat_ids prefixed "oc_").
+    spawner.getReturns.set("agentbox-agent-oc-xyz", {
+      boxId: "agentbox-agent-oc-xyz", agentId: "Agent_OC_XYZ",
+      status: "running", endpoint: "https://x",
+      createdAt: new Date(), lastActiveAt: new Date(),
     });
-    // Underscore sanitized to dash, agentId truncated to 8 chars, special chars stripped.
-    const handle = await mgr.getOrCreate("User.Name", "abcdefghXX");
-    // "User.Name" → lower → "user.name" → [^a-z0-9-] → "-" → "user-name"
-    // agent "abcdefghXX" → strip non-[a-z0-9] → "abcdefghXX" → slice(0,8) → "abcdefgh"
-    expect(handle.boxId).toBe("agentbox-user-name-abcdefgh");
+    const handle = await mgr.getOrCreate("Agent_OC_XYZ");
+    expect(handle.boxId).toBe("agentbox-agent-oc-xyz");
   });
 
-  it("activeUserIds, getForUser, get (sync), stats all return empty in K8s mode", async () => {
+  it("active* / get / stats return empty in K8s mode (stateless)", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    expect(mgr.activeUserIds()).toEqual([]);
-    expect(mgr.getForUser("alice")).toEqual([]);
-    expect(mgr.get("alice")).toBeUndefined();
+    await mgr.getOrCreate("agent-a");
+    expect(mgr.activeAgentIds()).toEqual([]);
+    expect(mgr.get("agent-a")).toBeUndefined();
     expect(mgr.stats().total).toBe(0);
-  });
-
-  it("stopAll(userId) enumerates all boxes from spawner.list and stops matching users", async () => {
-    const spawner = new FakeSpawner("k8s");
-    const mgr = new AgentBoxManager(spawner);
-    spawner.listReturns = [
-      { boxId: "agentbox-alice-a1", userId: "alice", status: "running", endpoint: "", createdAt: new Date(), lastActiveAt: new Date() },
-      { boxId: "agentbox-alice-a2", userId: "alice", status: "running", endpoint: "", createdAt: new Date(), lastActiveAt: new Date() },
-      { boxId: "agentbox-bob-a1", userId: "bob", status: "running", endpoint: "", createdAt: new Date(), lastActiveAt: new Date() },
-    ];
-    await mgr.stopAll("alice");
-    expect(spawner.stopCalls.sort()).toEqual(["agentbox-alice-a1", "agentbox-alice-a2"]);
   });
 
   it("getAsync returns a handle when the pod is running", async () => {
     const spawner = new FakeSpawner("k8s");
     const mgr = new AgentBoxManager(spawner);
-    spawner.getReturns.set("agentbox-alice-default", {
-      boxId: "agentbox-alice-default", userId: "alice", status: "running",
+    spawner.getReturns.set("agentbox-agent-a", {
+      boxId: "agentbox-agent-a", agentId: "agent-a", status: "running",
       endpoint: "https://10.0.0.1:3000", createdAt: new Date(), lastActiveAt: new Date(),
     });
-    const handle = await mgr.getAsync("alice");
-    expect(handle?.boxId).toBe("agentbox-alice-default");
+    const handle = await mgr.getAsync("agent-a");
+    expect(handle?.boxId).toBe("agentbox-agent-a");
   });
 
   it("getAsync returns undefined when the pod is absent", async () => {
@@ -223,6 +202,13 @@ describe("AgentBoxManager — K8s mode", () => {
     const mgr = new AgentBoxManager(spawner);
     const handle = await mgr.getAsync("ghost");
     expect(handle).toBeUndefined();
+  });
+
+  it("stop(agentId) stops the pod by podName", async () => {
+    const spawner = new FakeSpawner("k8s");
+    const mgr = new AgentBoxManager(spawner);
+    await mgr.stop("agent-a");
+    expect(spawner.stopCalls).toEqual(["agentbox-agent-a"]);
   });
 });
 
@@ -259,7 +245,6 @@ describe("AgentBoxManager — setCertManager passthrough", () => {
   it("silently no-ops when spawner lacks setCertManager", () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    // Should not throw
     mgr.setCertManager({ fake: true });
   });
 });
@@ -268,10 +253,10 @@ describe("AgentBoxManager — cleanup", () => {
   it("stops all cached boxes and calls spawner.cleanup", async () => {
     const spawner = new FakeSpawner("local");
     const mgr = new AgentBoxManager(spawner);
-    await mgr.getOrCreate("alice");
-    await mgr.getOrCreate("bob");
+    await mgr.getOrCreate("agent-a");
+    await mgr.getOrCreate("agent-b");
     await mgr.cleanup();
-    expect(spawner.stopCalls.sort()).toEqual(["box-alice-default", "box-bob-default"]);
+    expect(spawner.stopCalls.sort()).toEqual(["box-agent-a", "box-agent-b"]);
     expect(spawner.cleanupCalls).toBe(1);
     expect(mgr.stats().total).toBe(0);
   });

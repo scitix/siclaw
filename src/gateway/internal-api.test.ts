@@ -50,7 +50,6 @@ function asRes(r: FakeRes): http.ServerResponse {
 }
 
 const identity: CertificateIdentity = {
-  userId: "u1",
   agentId: "agent-1",
   orgId: "org-1",
   boxId: "box-1",
@@ -206,7 +205,24 @@ describe("handleAgentTasksCreate", () => {
     expect(JSON.parse(res.body).error).toMatch(/schedule|Invalid/i);
   });
 
-  it("201 on success, sends task.create with identity-derived ids", async () => {
+  it("201 on success, sends task.create with agent_id + user_id resolved from session registry", async () => {
+    const { sessionRegistry } = await import("./session-registry.js");
+    sessionRegistry.remember("sess-task", "u1", "agent-1");
+    upstream.responses.set("task.create", { id: "t-created" });
+    const res = new FakeRes();
+    await handleAgentTasksCreate(
+      asReq(new FakeReq(JSON.stringify({ name: "n", schedule: "*/5 * * * *", prompt: "p", session_id: "sess-task" }))),
+      asRes(res), identity, upstream as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(201);
+    expect(upstream.calls[0].method).toBe("task.create");
+    expect(upstream.calls[0].params.agent_id).toBe("agent-1");
+    expect(upstream.calls[0].params.user_id).toBe("u1");    // resolved from registry
+    expect(upstream.calls[0].params.status).toBe("active"); // default
+    sessionRegistry.forget("sess-task");
+  });
+
+  it("task.create falls back to empty user_id when session_id is missing", async () => {
     upstream.responses.set("task.create", { id: "t-created" });
     const res = new FakeRes();
     await handleAgentTasksCreate(
@@ -214,10 +230,7 @@ describe("handleAgentTasksCreate", () => {
       asRes(res), identity, upstream as unknown as FrontendWsClient,
     );
     expect(res.statusCode).toBe(201);
-    expect(upstream.calls[0].method).toBe("task.create");
-    expect(upstream.calls[0].params.agent_id).toBe("agent-1");
-    expect(upstream.calls[0].params.user_id).toBe("u1");
-    expect(upstream.calls[0].params.status).toBe("active"); // default
+    expect(upstream.calls[0].params.user_id).toBe("");
   });
 });
 
@@ -271,14 +284,29 @@ describe("handleAgentTasksUpdate", () => {
 // ── agent tasks: delete ──────────────────────────────────
 
 describe("handleAgentTasksDelete", () => {
-  it("200 on success", async () => {
+  it("200 on success, user_id falls back to empty when no session_id query param", async () => {
     upstream.responses.set("task.delete", { ok: true });
     const res = new FakeRes();
     await handleAgentTasksDelete(
       asReq(new FakeReq("")), asRes(res), identity, "t1", upstream as unknown as FrontendWsClient,
     );
     expect(res.statusCode).toBe(200);
-    expect(upstream.calls[0].params).toEqual({ task_id: "t1", agent_id: "agent-1", user_id: "u1" });
+    expect(upstream.calls[0].params).toEqual({ task_id: "t1", agent_id: "agent-1", user_id: "" });
+  });
+
+  it("resolves user_id from session_id query param when present", async () => {
+    const { sessionRegistry } = await import("./session-registry.js");
+    sessionRegistry.remember("sess-del", "u-owner", "agent-1");
+    upstream.responses.set("task.delete", { ok: true });
+    const res = new FakeRes();
+    const req = new FakeReq("") as FakeReq & { url?: string };
+    req.url = "/api/internal/agent-tasks/t1?session_id=sess-del";
+    await handleAgentTasksDelete(
+      asReq(req), asRes(res), identity, "t1", upstream as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(upstream.calls[0].params.user_id).toBe("u-owner");
+    sessionRegistry.forget("sess-del");
   });
 
   it("404 when RPC returns error field", async () => {

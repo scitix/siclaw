@@ -79,7 +79,7 @@ export function createMtlsMiddleware(options: MtlsMiddlewareOptions) {
       // Attach identity to request
       req.certIdentity = identity;
 
-      console.log(`[mtls] Authenticated ${req.method} ${url} - userId=${identity.userId} agentId=${identity.agentId} orgId=${identity.orgId} boxId=${identity.boxId}`);
+      console.log(`[mtls] Authenticated ${req.method} ${url} - agentId=${identity.agentId} orgId=${identity.orgId} boxId=${identity.boxId}`);
 
       // Continue to next handler
       next();
@@ -92,25 +92,6 @@ export function createMtlsMiddleware(options: MtlsMiddlewareOptions) {
       }));
     }
   };
-}
-
-/**
- * Authorization helper: Check if certificate identity matches requested userId
- */
-export function authorizeUserId(
-  identity: CertificateIdentity | undefined,
-  requestedUserId: string
-): boolean {
-  if (!identity) {
-    return false;
-  }
-
-  if (identity.userId !== requestedUserId) {
-    console.warn(`[mtls-authz] userId mismatch: cert=${identity.userId} requested=${requestedUserId}`);
-    return false;
-  }
-
-  return true;
 }
 
 /**
