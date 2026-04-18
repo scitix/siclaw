@@ -254,6 +254,22 @@ describe("FrontendWsClient", () => {
 
   // ── 7. Auto-reconnect on disconnect ───────────────────────
 
+  it("rejects all pending RPCs on WS close (so callers don't wait the full timeout)", async () => {
+    const client = await createClient();
+    const connectPromise = client.connect();
+    const ws = openLatestWs();
+    await connectPromise;
+
+    // Send an RPC — it stays pending until either response or close.
+    const rpcPromise = client.request("slow.method", {});
+    // Now the WS drops before the response arrives.
+    ws.emit("close");
+
+    await expect(rpcPromise).rejects.toThrow(/disconnected/);
+
+    client.close();
+  });
+
   it("schedules reconnect on close", async () => {
     const client = await createClient();
 
