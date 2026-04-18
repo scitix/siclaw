@@ -58,9 +58,9 @@ import { LocalSpawner } from "./local-spawner.js";
 // ── Test helpers ──────────────────────────────────────────────────────
 
 class FakeCertManager {
-  issuedFor: Array<{ agentId: string; podEnv: string }> = [];
-  issueAgentBoxCertificate(agentId: string, _orgId: string, _boxId: string, podEnv: string) {
-    this.issuedFor.push({ agentId, podEnv });
+  issuedFor: Array<{ agentId: string }> = [];
+  issueAgentBoxCertificate(agentId: string, _orgId: string, _boxId: string) {
+    this.issuedFor.push({ agentId });
     return { cert: `CERT-${agentId}`, key: `KEY-${agentId}`, ca: `CA-${agentId}` };
   }
 }
@@ -96,9 +96,9 @@ describe("LocalSpawner — spawn (happy path)", () => {
     expect(handle.agentId).toBe("a1");
     expect(handle.endpoint).toBe("http://127.0.0.1:5000");
 
-    // Cert bundle was issued — CN is agentId, no userId is embedded.
+    // Cert bundle was issued — CN is agentId, no userId / env embedded.
     expect(cm.issuedFor).toHaveLength(1);
-    expect(cm.issuedFor[0]).toEqual({ agentId: "a1", podEnv: "dev" });
+    expect(cm.issuedFor[0]).toEqual({ agentId: "a1" });
 
     // Cert files were written into .siclaw/certs/<boxId>
     const certDir = path.join(tmpDir, ".siclaw", "certs", "local-a1");

@@ -69,9 +69,7 @@ export class LocalSpawner implements BoxSpawner {
 
     const port = this.nextPort++;
 
-    const certBundle = this.certManager.issueAgentBoxCertificate(
-      agentId, "default", boxId, "dev",
-    );
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, "default", boxId);
 
     const certDir = path.resolve(process.cwd(), ".siclaw/certs", boxId);
     const fs = await import("node:fs");

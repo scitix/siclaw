@@ -7,15 +7,19 @@
  * - Each AgentBox receives a unique client certificate keyed on its agentId
  * - Runtime validates certificates and extracts identity for authorization
  *
- * Certificate subject fields:
- *   CN           = agentId
- *   O            = orgId
- *   serialNumber = boxId
- *   L            = env (prod | dev | test)
+ * Certificate subject fields (the zero-trust source of truth for agentbox
+ * identity — agentbox cannot self-report any of these):
+ *   CN           = agentId — primary identity, used for mTLS authz + routing
+ *   O            = orgId   — RBAC scope
+ *   serialNumber = boxId   — pod/process identifier for audit correlation
  *
- * AgentBox is user-unaware: userId is neither encoded in the cert nor
- * transmitted in request payloads. User attribution is resolved at Runtime
- * boundaries via sessionId.
+ * `is_production` is deliberately NOT encoded in the cert. The current
+ * value is looked up from the agents table on every authz decision in
+ * upstream (SQL join on agents.is_production = resource.is_production) —
+ * this way a toggle reflects immediately without requiring pod rebuild
+ * or cert re-issue. AgentBox is user-unaware end-to-end: no userId in
+ * cert, no userId in request payloads; user attribution is resolved at
+ * Runtime boundaries via sessionId.
  */
 
 import crypto from "node:crypto";
@@ -29,7 +33,6 @@ export interface CertificateIdentity {
   agentId: string;
   orgId: string;
   boxId: string;
-  env: "prod" | "dev" | "test";
   issuedAt: Date;
   expiresAt: Date;
 }
@@ -113,13 +116,12 @@ export class CertificateManager {
    * Issue a client certificate for an AgentBox instance.
    *
    * Identity fields embedded in the certificate:
-   *   CN = agentId, O = orgId, serialNumber = boxId, L = env
+   *   CN = agentId, O = orgId, serialNumber = boxId
    */
   issueAgentBoxCertificate(
     agentId: string,
     orgId: string,
     boxId: string,
-    env: "prod" | "dev" | "test" = "prod",
   ): CertificateBundle {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -131,7 +133,7 @@ export class CertificateManager {
     const expiresAt = new Date(issuedAt.getTime() + 30 * 24 * 60 * 60 * 1000);
 
     const cert = CertificateManager.createCertificateStatic({
-      subject: { CN: agentId, O: orgId, serialNumber: boxId, L: env },
+      subject: { CN: agentId, O: orgId, serialNumber: boxId },
       issuer: { CN: "Siclaw Runtime CA", O: "Siclaw", OU: "Security" },
       publicKey,
       signingKey: this.caKey,
@@ -140,13 +142,13 @@ export class CertificateManager {
       extendedKeyUsage: ["clientAuth", "serverAuth"],
     });
 
-    console.log(`[cert-manager] Issued certificate agentId=${agentId} orgId=${orgId} boxId=${boxId} env=${env}`);
+    console.log(`[cert-manager] Issued certificate agentId=${agentId} orgId=${orgId} boxId=${boxId}`);
 
     return {
       cert,
       key: privateKey,
       ca: this.caCert,
-      identity: { agentId, orgId, boxId, env, issuedAt, expiresAt },
+      identity: { agentId, orgId, boxId, issuedAt, expiresAt },
     };
   }
 
@@ -179,15 +181,13 @@ export class CertificateManager {
       const agentId = getAttr("commonName");
       const orgId = getAttr("organizationName") || "";
       const boxId = getAttr("serialNumber");
-      const envRaw = getAttr("localityName");
-      const env = (envRaw === "dev" ? "dev" : envRaw === "test" ? "test" : "prod") as CertificateIdentity["env"];
 
       if (!agentId || !boxId) {
         console.warn("[cert-manager] Certificate missing required identity fields");
         return null;
       }
 
-      return { agentId, orgId, boxId, env, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
+      return { agentId, orgId, boxId, issuedAt: cert.validity.notBefore, expiresAt: cert.validity.notAfter };
     } catch (err) {
       console.error("[cert-manager] Certificate verification error:", err);
       return null;
@@ -237,7 +237,6 @@ export class CertificateManager {
     if (opts.subject.O) subjectAttrs.push({ name: "organizationName", value: opts.subject.O });
     if (opts.subject.OU) subjectAttrs.push({ name: "organizationalUnitName", value: opts.subject.OU });
     if (opts.subject.serialNumber) subjectAttrs.push({ name: "serialNumber", value: opts.subject.serialNumber });
-    if (opts.subject.L) subjectAttrs.push({ name: "localityName", value: opts.subject.L });
     cert.setSubject(subjectAttrs);
 
     const issuerData = opts.issuer || opts.subject;
