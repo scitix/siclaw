@@ -96,7 +96,11 @@ export function createLarkHandler(
 
 // ── Message handler ────────────────────────────────────────────
 
-async function handleLarkMessage(
+/**
+ * Exported for unit tests. Consumes the already-flattened event payload
+ * produced by `@larksuiteoapi/node-sdk`'s EventDispatcher.
+ */
+export async function handleLarkMessage(
   data: any,
   larkClient: any,
   channelId: string,
@@ -104,7 +108,10 @@ async function handleLarkMessage(
   tlsOptions?: { cert: string; key: string; ca: string },
   frontendClient?: FrontendWsClient,
 ): Promise<void> {
-  const message = data?.event?.message;
+  // @larksuiteoapi/node-sdk EventDispatcher flattens the event payload before
+  // dispatching: `event.*` fields land on the top level and `data.event`
+  // disappears (see RequestHandle.parse in the SDK). Read `message` directly.
+  const message = data?.message;
   if (!message) return;
 
   const messageId: string = message.message_id;
@@ -183,16 +190,32 @@ async function replyToLark(larkClient: any, messageId: string, text: string): Pr
 
 // ── SSE response collector ─────────────────────────────────────
 
-async function collectResponse(client: AgentBoxClient, sessionId: string): Promise<string> {
+export async function collectResponse(client: AgentBoxClient, sessionId: string): Promise<string> {
   const parts: string[] = [];
+  // Track the latest assistant turn so we only reply with the *final* text
+  // (tool-use turns emit intermediate message_end events that aren't meant
+  // for the user). pi-agent's agent_end signals the last turn is complete.
+  let lastAssistantText = "";
   try {
     for await (const event of client.streamEvents(sessionId)) {
       const ev = event as Record<string, any>;
       if (ev.type === "content_block_delta" && ev.delta?.text) parts.push(ev.delta.text);
       if (ev.type === "text" && typeof ev.text === "string") parts.push(ev.text);
+      // pi-agent-brain emits the final assistant reply as message_end with
+      // a content array of blocks; collect the text blocks only.
+      if (ev.type === "message_end" && ev.message?.role === "assistant") {
+        const blocks = Array.isArray(ev.message.content) ? ev.message.content : [];
+        const turnText = blocks
+          .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+          .map((b: any) => b.text)
+          .join("");
+        if (turnText) lastAssistantText = turnText;
+      }
     }
   } catch (err) {
     console.error(`[lark] SSE collect error for session=${sessionId}:`, err);
   }
-  return parts.join("");
+  // Prefer the last full assistant turn; fall back to streamed deltas if the
+  // brain only emits content_block_delta events.
+  return lastAssistantText || parts.join("");
 }
