@@ -1,9 +1,10 @@
 /**
  * Local AgentBox Spawner
  *
- * Spawner for local development; runs the AgentBox HTTP server within the same process.
- * Each user gets an independent port. Uses the same mTLS certificate architecture
- * as K8s mode — gateway signs a client cert for each AgentBox instance.
+ * Spawner for local development; runs the AgentBox HTTP server within the
+ * same process. One instance per agent, shared by all callers of that agent.
+ * Uses the same mTLS cert architecture as K8s mode — gateway signs a client
+ * cert for each AgentBox instance (CN = agentId).
  */
 
 import http from "node:http";
@@ -16,7 +17,7 @@ import type { MemoryIndexer } from "../../memory/index.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 
 interface LocalBox {
-  userId: string;
+  agentId: string;
   port: number;
   httpServer: http.Server;
   sessionManager: AgentBoxSessionManager;
@@ -51,32 +52,27 @@ export class LocalSpawner implements BoxSpawner {
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
-    const { userId } = config;
     const agentId = config.agentId;
-    if (!userId || !agentId) {
-      throw new Error(`LocalSpawner.spawn requires non-empty userId and agentId; got userId=${userId} agentId=${agentId}`);
+    if (!agentId) {
+      throw new Error(`LocalSpawner.spawn requires a non-empty agentId`);
     }
-    const boxId = `local-${userId}-${agentId}`;
+    const boxId = `local-${agentId}`;
 
-    // Check if already exists
     const existing = this.boxes.get(boxId);
     if (existing) {
       return {
         boxId,
         endpoint: `http://127.0.0.1:${existing.port}`,
-        userId,
+        agentId,
       };
     }
 
-    // Allocate port
     const port = this.nextPort++;
 
-    // Sign a client certificate for this agentbox (same as K8s mode)
     const certBundle = this.certManager.issueAgentBoxCertificate(
-      userId, agentId, "default", boxId, "dev",
+      agentId, "default", boxId, "dev",
     );
 
-    // Write cert files to a temp dir so GatewayClient can use them
     const certDir = path.resolve(process.cwd(), ".siclaw/certs", boxId);
     const fs = await import("node:fs");
     fs.mkdirSync(certDir, { recursive: true });
@@ -84,38 +80,34 @@ export class LocalSpawner implements BoxSpawner {
     fs.writeFileSync(path.join(certDir, "key.pem"), certBundle.key);
     fs.writeFileSync(path.join(certDir, "ca.pem"), certBundle.ca);
 
-    // Set env vars so http-server.ts initializes HttpTransport (same as K8s)
     process.env.SICLAW_GATEWAY_URL = this.gatewayInternalUrl;
     process.env.SICLAW_TLS_CERT = path.join(certDir, "cert.pem");
     process.env.SICLAW_TLS_KEY = path.join(certDir, "key.pem");
     process.env.SICLAW_TLS_CA = path.join(certDir, "ca.pem");
 
-    // Create session manager and HTTP server
     const sessionManager = new AgentBoxSessionManager();
-    sessionManager.userId = userId;
     sessionManager.agentId = agentId;
     if (this.knowledgeIndexer) {
       sessionManager.knowledgeIndexer = this.knowledgeIndexer;
     }
-    // Each box gets its own credentials directory
+    // Agent-scoped credentials directory — shared across callers of this agent.
     sessionManager.credentialsDir = path.resolve(
       process.cwd(),
       ".siclaw/credentials",
-      `${userId}-${agentId}`,
+      agentId,
     );
     const httpServer = createHttpServer(sessionManager);
 
-    // Start server
     await new Promise<void>((resolve, reject) => {
       httpServer.listen(port, "127.0.0.1", () => {
-        console.log(`[local-spawner] AgentBox for ${userId} started on port ${port}`);
+        console.log(`[local-spawner] AgentBox for agent=${agentId} started on port ${port}`);
         resolve();
       });
       httpServer.on("error", reject);
     });
 
     const box: LocalBox = {
-      userId,
+      agentId,
       port,
       httpServer,
       sessionManager,
@@ -127,7 +119,7 @@ export class LocalSpawner implements BoxSpawner {
     return {
       boxId,
       endpoint: `http://127.0.0.1:${port}`,
-      userId,
+      agentId,
     };
   }
 
@@ -149,7 +141,7 @@ export class LocalSpawner implements BoxSpawner {
 
     return {
       boxId,
-      userId: box.userId,
+      agentId: box.agentId,
       status: "running",
       endpoint: `http://127.0.0.1:${box.port}`,
       createdAt: box.createdAt,
@@ -162,7 +154,7 @@ export class LocalSpawner implements BoxSpawner {
     for (const [boxId, box] of this.boxes) {
       result.push({
         boxId,
-        userId: box.userId,
+        agentId: box.agentId,
         status: "running",
         endpoint: `http://127.0.0.1:${box.port}`,
         createdAt: box.createdAt,
@@ -178,5 +170,4 @@ export class LocalSpawner implements BoxSpawner {
       await this.stop(boxId);
     }
   }
-
 }

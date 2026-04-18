@@ -6,11 +6,13 @@
  * Supports PAIR command for binding chat groups to agents.
  */
 
+import crypto from "node:crypto";
 import type { AgentBoxManager } from "../agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "../agentbox/client.js";
 import type { ChannelHandler } from "../channel-manager.js";
 import { resolveBinding, handlePairingCode } from "../channel-manager.js";
 import type { FrontendWsClient } from "../frontend-ws-client.js";
+import { sessionRegistry } from "../session-registry.js";
 
 export interface LarkChannelConfig {
   domain?: "feishu" | "lark";  // feishu = China (default), lark = Global
@@ -145,16 +147,21 @@ async function handleLarkMessage(
   }
 
   const agentId = binding.agentId;
-  // Use a deterministic userId scoped to channel + chat for session isolation
-  const userId = `lark-${chatId.slice(0, 12)}`;
+  // Tenant key for the group's conversational context — used as the "user" in
+  // chat_sessions and session registry. It does NOT travel to AgentBox (cert
+  // CN is agentId, payload carries only sessionId) but Runtime uses it to
+  // tag audit rows so outbound Upstream calls attribute correctly.
+  const conversationKey = `lark:${chatId}`;
+  const sessionId = crypto.randomUUID();
+  sessionRegistry.remember(sessionId, conversationKey, agentId);
 
   console.log(`[lark] Message channel=${channelId} chat=${chatId} \u2192 agent=${agentId}: "${text.slice(0, 80)}"`);
 
-  // Get or create AgentBox
-  const handle = await agentBoxManager.getOrCreate(userId, agentId);
+  // Get or create AgentBox for this agent (shared across all callers).
+  const handle = await agentBoxManager.getOrCreate(agentId);
   const client = new AgentBoxClient(handle.endpoint, 120_000, tlsOptions);
 
-  const promptOpts: PromptOptions = { text, agentId, mode: "channel" };
+  const promptOpts: PromptOptions = { text, agentId, mode: "channel", sessionId };
   const promptResult = await client.prompt(promptOpts);
   const resultText = await collectResponse(client, promptResult.sessionId);
 

@@ -3,7 +3,6 @@ import type http from "node:http";
 import forge from "node-forge";
 import {
   createMtlsMiddleware,
-  authorizeUserId,
   authorizeAgent,
 } from "./mtls-middleware.js";
 import { CertificateManager, type CertificateIdentity } from "./cert-manager.js";
@@ -50,7 +49,7 @@ let validCertDER: Buffer;
 
 beforeAll(async () => {
   manager = await CertificateManager.create();
-  const bundle = manager.issueAgentBoxCertificate("u-1", "a-1", "o-1", "b-1", "prod");
+  const bundle = manager.issueAgentBoxCertificate("a-1", "o-1", "b-1", "prod");
   const der = forge.asn1.toDer(
     forge.pki.certificateToAsn1(forge.pki.certificateFromPem(bundle.cert))
   ).getBytes();
@@ -122,7 +121,7 @@ describe("mTLS middleware — protected paths", () => {
   it("returns 403 when cert cannot be verified by this CA", async () => {
     // Cert from an independent CA
     const other = await CertificateManager.create();
-    const foreign = other.issueAgentBoxCertificate("x", "y", "z", "w");
+    const foreign = other.issueAgentBoxCertificate("y", "z", "w");
     const foreignDER = Buffer.from(
       forge.asn1.toDer(forge.pki.certificateToAsn1(forge.pki.certificateFromPem(foreign.cert))).getBytes(),
       "binary",
@@ -142,8 +141,8 @@ describe("mTLS middleware — protected paths", () => {
     expect(nextCalled).toBe(true);
     expect(res.ended).toBe(false);
     expect(req.certIdentity).toBeDefined();
-    expect(req.certIdentity!.userId).toBe("u-1");
     expect(req.certIdentity!.agentId).toBe("a-1");
+    expect((req.certIdentity as any).userId).toBeUndefined();
   });
 
   it("returns 500 when cert extraction throws", () => {
@@ -164,37 +163,10 @@ describe("mTLS middleware — protected paths", () => {
   });
 });
 
-// ── authorizeUserId ────────────────────────────────────────────────
-
-describe("authorizeUserId", () => {
-  const identity: CertificateIdentity = {
-    userId: "alice",
-    agentId: "ag-1",
-    orgId: "o",
-    boxId: "b",
-    env: "prod",
-    issuedAt: new Date(),
-    expiresAt: new Date(Date.now() + 10_000),
-  };
-
-  it("returns true when identity.userId matches requested", () => {
-    expect(authorizeUserId(identity, "alice")).toBe(true);
-  });
-
-  it("returns false when userIds mismatch", () => {
-    expect(authorizeUserId(identity, "bob")).toBe(false);
-  });
-
-  it("returns false when identity is undefined", () => {
-    expect(authorizeUserId(undefined, "alice")).toBe(false);
-  });
-});
-
 // ── authorizeAgent ─────────────────────────────────────────────────
 
 describe("authorizeAgent", () => {
   const identity: CertificateIdentity = {
-    userId: "alice",
     agentId: "agent-x",
     orgId: "",
     boxId: "box-1",

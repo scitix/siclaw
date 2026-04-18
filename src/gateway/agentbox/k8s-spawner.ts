@@ -60,14 +60,13 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Generate Pod name
+   * Generate Pod name — keyed on agentId only (one pod per agent, shared
+   * across callers). Sanitized to the K8s name charset and capped so the
+   * full name stays under 63 chars.
    */
-  private podName(userId: string, agentId?: string): string {
-    const sanitizedUser = userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-    const agentSuffix = agentId
-      ? agentId.replace(/[^a-z0-9]/g, "").slice(0, 8)
-      : "default";
-    return `agentbox-${sanitizedUser}-${agentSuffix}`;
+  private podName(agentId: string): string {
+    const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
+    return `agentbox-${sanitized}`;
   }
 
   /**
@@ -75,12 +74,12 @@ export class K8sSpawner implements BoxSpawner {
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { namespace, image, imagePullPolicy, labelPrefix } = this.config;
-    const podName = this.podName(boxConfig.userId, boxConfig.agentId);
-    const userId = boxConfig.userId;
-    const agentId = boxConfig.agentId || "default";
+    const agentId = boxConfig.agentId;
+    if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
+    const podName = this.podName(agentId);
     const orgId = boxConfig.orgId || "";
 
-    console.log(`[k8s-spawner] Creating pod: ${podName} for user: ${userId}`);
+    console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
 
     // Clean up any existing pod in non-running state (Failed, Succeeded, Error)
     // so we can recreate with the same name
@@ -95,7 +94,7 @@ export class K8sSpawner implements BoxSpawner {
       } else if (phase === "Running" || phase === "Pending") {
         console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
         const endpoint = await this.waitForPodReady(podName, namespace);
-        return { boxId: podName, userId: boxConfig.userId, endpoint };
+        return { boxId: podName, agentId, endpoint };
       }
     } catch (err: any) {
       if (err.code !== 404 && err.statusCode !== 404) {
@@ -107,23 +106,21 @@ export class K8sSpawner implements BoxSpawner {
     // Issue client certificate for mTLS authentication (env encoded in cert)
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
     const podEnv: "prod" | "dev" | "test" = boxConfig.podEnv ?? "prod";
-    const certBundle = this.certManager.issueAgentBoxCertificate(userId, agentId, orgId, podName, podEnv);
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName, podEnv);
     const certSecretName = `${podName}-cert`;
 
     // Create certificate Secret
+    const secretLabels = {
+      [`${labelPrefix}/app`]: "agentbox",
+      [`${labelPrefix}/agent`]: agentId,
+    };
     try {
       await this.coreApi.createNamespacedSecret({
         namespace,
         body: {
           apiVersion: "v1",
           kind: "Secret",
-          metadata: {
-            name: certSecretName,
-            labels: {
-              [`${labelPrefix}/app`]: "agentbox",
-              [`${labelPrefix}/user`]: userId,
-            },
-          },
+          metadata: { name: certSecretName, labels: secretLabels },
           type: "kubernetes.io/tls",
           data: {
             "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -142,13 +139,7 @@ export class K8sSpawner implements BoxSpawner {
           body: {
             apiVersion: "v1",
             kind: "Secret",
-            metadata: {
-              name: certSecretName,
-              labels: {
-                [`${labelPrefix}/app`]: "agentbox",
-                [`${labelPrefix}/user`]: userId,
-              },
-            },
+            metadata: { name: certSecretName, labels: secretLabels },
             type: "kubernetes.io/tls",
             data: {
               "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -168,7 +159,6 @@ export class K8sSpawner implements BoxSpawner {
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
       { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-runtime.${namespace}.svc.cluster.local:3002` },
       { name: "SICLAW_AGENT_ID", value: agentId },
-      { name: "USER_ID", value: userId },
     ];
 
     // Add custom environment variables
@@ -178,13 +168,13 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
-    // Ensure per-user subdirectory on shared PVC
-    const safeUserId = this.sanitizePathSegment(userId);
+    // Shared PVC is now scoped per-agent only — all users of the agent share
+    // this subdirectory (memory is agent-shared per the 2026-04-18 spec).
     const safeAgentId = this.sanitizePathSegment(agentId);
     if (this.config.persistence?.enabled) {
-      const subDir = `users/${safeUserId}/${safeAgentId}`;
+      const subDir = `agents/${safeAgentId}`;
       console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
-      this.ensureUserDir(safeUserId, safeAgentId);
+      this.ensureAgentDir(safeAgentId);
     }
 
     // Pod definition
@@ -196,8 +186,7 @@ export class K8sSpawner implements BoxSpawner {
         namespace,
         labels: {
           [`${labelPrefix}/app`]: "agentbox",
-          [`${labelPrefix}/user`]: boxConfig.userId,
-          [`${labelPrefix}/agent`]: boxConfig.agentId || "default",
+          [`${labelPrefix}/agent`]: agentId,
         },
       },
       spec: {
@@ -287,7 +276,7 @@ export class K8sSpawner implements BoxSpawner {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
                 ...(this.config.persistence?.enabled
-                  ? { subPath: `users/${safeUserId}/${safeAgentId}` }
+                  ? { subPath: `agents/${safeAgentId}` }
                   : {}),
               },
               {
@@ -341,7 +330,7 @@ export class K8sSpawner implements BoxSpawner {
 
     return {
       boxId: podName,
-      userId: boxConfig.userId,
+      agentId,
       endpoint,
     };
   }
@@ -352,17 +341,17 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Ensure per-user subdirectory exists on the shared PVC (synchronous, idempotent).
+   * Ensure per-agent subdirectory exists on the shared PVC (synchronous, idempotent).
    * Expects already-sanitized path segments.
-   * Directory layout: `/app/.siclaw/user-data/users/{safeUserId}/{safeAgentId}/`
+   * Directory layout: `/app/.siclaw/user-data/agents/{safeAgentId}/`
    */
-  private ensureUserDir(safeUserId: string, safeAgentId: string): void {
+  private ensureAgentDir(safeAgentId: string): void {
     const base = path.resolve("/app/.siclaw/user-data");
-    const userDir = path.join(base, "users", safeUserId, safeAgentId);
-    if (!userDir.startsWith(base)) {
-      throw new Error(`[k8s-spawner] Path traversal detected: ${userDir}`);
+    const dir = path.join(base, "agents", safeAgentId);
+    if (!dir.startsWith(base)) {
+      throw new Error(`[k8s-spawner] Path traversal detected: ${dir}`);
     }
-    fs.mkdirSync(userDir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
   }
 
   /**
@@ -459,14 +448,12 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
-      const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId,
-        userId,
         agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
@@ -495,14 +482,12 @@ export class K8sSpawner implements BoxSpawner {
     });
 
     return podList.items.map((pod: k8s.V1Pod) => {
-      const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId: pod.metadata?.name || "",
-        userId,
         agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",

@@ -126,7 +126,7 @@ describe("K8sSpawner — metadata + setCertManager", () => {
 
   it("spawn throws when setCertManager hasn't been called", async () => {
     const s = new K8sSpawner();
-    await expect(s.spawn({ userId: "alice" })).rejects.toThrow(/CertificateManager not initialized/);
+    await expect(s.spawn({ agentId: "default" })).rejects.toThrow(/CertificateManager not initialized/);
   });
 });
 
@@ -146,14 +146,15 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
       }
       return {
         status: { phase: "Running", podIP: "10.1.2.3", conditions: [{ type: "Ready", status: "True" }] },
-        metadata: { name: "agentbox-alice-default", labels: {} },
+        metadata: { name: "agentbox-default", labels: {} },
       };
     };
 
-    const handle = await s.spawn({ userId: "alice" });
+    const handle = await s.spawn({ agentId: "default" });
     expect(handle.endpoint).toBe("https://10.1.2.3:3000");
     expect(cm.issuedCalls).toHaveLength(1);
-    expect(cm.issuedCalls[0]).toEqual(["alice", "default", "", "agentbox-alice-default", "prod"]);
+    // CN=agentId (no userId leaked into cert) — see spec 2026-04-18.
+    expect(cm.issuedCalls[0]).toEqual(["default", "", "agentbox-default", "prod"]);
 
     // Secret created with kubernetes.io/tls type + base64 cert fields
     expect(calls.createNamespacedSecret).toHaveLength(1);
@@ -175,11 +176,12 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
       return { status: { phase: "Running", podIP: "10.0.0.1", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
-    await s.spawn({ userId: "bob", podEnv: "dev" });
-    expect(cm.issuedCalls[0][4]).toBe("dev");
+    await s.spawn({ agentId: "default", podEnv: "dev" });
+    // issueAgentBoxCertificate(agentId, orgId, boxId, env) → env is 4th arg
+    expect(cm.issuedCalls[0][3]).toBe("dev");
   });
 
-  it("sanitizes userId (lowercase, [^a-z0-9-]→'-', slice(0,30)) and agentId (strip non-alnum, slice(0,8))", async () => {
+  it("sanitizes forbidden chars in agentId and caps the pod name", async () => {
     const cm = new FakeCertManager();
     const s = new K8sSpawner();
     s.setCertManager(cm as any);
@@ -190,9 +192,9 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
       return { status: { phase: "Running", podIP: "10.0.0.1", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
-    const handle = await s.spawn({ userId: "User.Name", agentId: "a1-b2-c3-d4-extra" });
-    // "user.name" → "user-name"; "a1-b2-c3-d4-extra" → strip non-alnum → "a1b2c3d4extra" → slice 8 → "a1b2c3d4"
-    expect(handle.boxId).toBe("agentbox-user-name-a1b2c3d4");
+    // Uppercase → lowercase; "_" → "-"; 50-char cap keeps full name ≤ 63 chars.
+    const handle = await s.spawn({ agentId: "Agent_With.Weird/Chars" });
+    expect(handle.boxId).toBe("agentbox-agent-with-weird-chars");
   });
 });
 
@@ -207,7 +209,7 @@ describe("K8sSpawner — spawn branches", () => {
       metadata: { labels: {} },
     });
 
-    const handle = await s.spawn({ userId: "alice" });
+    const handle = await s.spawn({ agentId: "default" });
     expect(handle.endpoint).toBe("https://10.9.9.9:3000");
     expect(calls.createNamespacedPod).toHaveLength(0);
     expect(calls.createNamespacedSecret).toHaveLength(0);
@@ -232,7 +234,7 @@ describe("K8sSpawner — spawn branches", () => {
       return { status: { phase: "Running", podIP: "10.0.0.5", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
     };
 
-    const handle = await s.spawn({ userId: "alice" });
+    const handle = await s.spawn({ agentId: "default" });
     expect(calls.deleteNamespacedPod).toHaveLength(1);
     expect(calls.createNamespacedPod).toHaveLength(1);
     expect(handle.endpoint).toBe("https://10.0.0.5:3000");
@@ -255,7 +257,7 @@ describe("K8sSpawner — spawn branches", () => {
       return {};
     };
 
-    await s.spawn({ userId: "alice" });
+    await s.spawn({ agentId: "default" });
     expect(calls.deleteNamespacedSecret).toHaveLength(1);
     expect(calls.createNamespacedSecret).toHaveLength(2); // retry after delete
   });
@@ -272,7 +274,7 @@ describe("K8sSpawner — spawn branches", () => {
     };
     createPodImpl.fn = async () => { throw Object.assign(new Error("conflict"), { code: 409 }); };
 
-    const handle = await s.spawn({ userId: "alice" });
+    const handle = await s.spawn({ agentId: "default" });
     expect(handle.endpoint).toBe("https://10.0.0.7:3000");
   });
 
@@ -281,7 +283,7 @@ describe("K8sSpawner — spawn branches", () => {
     const s = new K8sSpawner();
     s.setCertManager(cm as any);
     readPodImpl.fn = async () => { throw Object.assign(new Error("bad"), { code: 500 }); };
-    await expect(s.spawn({ userId: "alice" })).rejects.toThrow(/bad/);
+    await expect(s.spawn({ agentId: "default" })).rejects.toThrow(/bad/);
   });
 
   it("throws when waitForPodReady observes a Failed phase", async () => {
@@ -294,18 +296,18 @@ describe("K8sSpawner — spawn branches", () => {
       if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
       return { status: { phase: "Failed" }, metadata: { labels: {} } };
     };
-    await expect(s.spawn({ userId: "alice" })).rejects.toThrow(/failed to start: Failed/);
+    await expect(s.spawn({ agentId: "default" })).rejects.toThrow(/failed to start: Failed/);
   });
 });
 
 describe("K8sSpawner — stop", () => {
   it("deletes pod + cert Secret", async () => {
     const s = new K8sSpawner();
-    await s.stop("agentbox-alice-default");
+    await s.stop("agentbox-default");
     expect(calls.deleteNamespacedPod).toHaveLength(1);
-    expect(calls.deleteNamespacedPod[0].name).toBe("agentbox-alice-default");
+    expect(calls.deleteNamespacedPod[0].name).toBe("agentbox-default");
     expect(calls.deleteNamespacedSecret).toHaveLength(1);
-    expect(calls.deleteNamespacedSecret[0].name).toBe("agentbox-alice-default-cert");
+    expect(calls.deleteNamespacedSecret[0].name).toBe("agentbox-default-cert");
   });
 
   it("swallows 404 on stop (pod already gone)", async () => {
@@ -322,15 +324,14 @@ describe("K8sSpawner — stop", () => {
 });
 
 describe("K8sSpawner — get", () => {
-  it("maps Running+Ready → status='running'", async () => {
+  it("maps Running+Ready → status='running' and reads agentId from the pod label", async () => {
     readPodImpl.fn = async () => ({
       status: { phase: "Running", podIP: "1.2.3.4", conditions: [{ type: "Ready", status: "True" }] },
-      metadata: { labels: { "siclaw.io/user": "alice", "siclaw.io/agent": "a1" }, creationTimestamp: "2025-01-01T00:00:00Z" },
+      metadata: { labels: { "siclaw.io/agent": "a1" }, creationTimestamp: "2025-01-01T00:00:00Z" },
     });
     const s = new K8sSpawner();
     const info = await s.get("box-1");
     expect(info?.status).toBe("running");
-    expect(info?.userId).toBe("alice");
     expect(info?.agentId).toBe("a1");
     expect(info?.endpoint).toBe("https://1.2.3.4:3000");
   });
@@ -376,11 +377,11 @@ describe("K8sSpawner — list + cleanup", () => {
       items: [
         {
           status: { phase: "Running", podIP: "1.1.1.1", conditions: [{ type: "Ready", status: "True" }] },
-          metadata: { name: "p1", labels: { "siclaw.io/user": "alice" }, creationTimestamp: "2025-01-01T00:00:00Z" },
+          metadata: { name: "p1", labels: { "siclaw.io/agent": "a1" }, creationTimestamp: "2025-01-01T00:00:00Z" },
         },
         {
           status: { phase: "Pending" },
-          metadata: { name: "p2", labels: { "siclaw.io/user": "bob" } },
+          metadata: { name: "p2", labels: { "siclaw.io/agent": "a2" } },
         },
       ],
     });

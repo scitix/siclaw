@@ -18,6 +18,7 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
+import { sessionRegistry } from "./session-registry.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 
 /** Read + JSON-parse an HTTP request body. */
@@ -165,15 +166,18 @@ export async function handleKnowledgeBundle(
  * Returns the scheduled tasks for the agent identified by the mTLS certificate.
  */
 export async function handleAgentTasksList(
-  _req: http.IncomingMessage,
+  req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
   frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
+    // Session may be threaded via query param for GET; resolve → userId for audit.
+    const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
+    const userId = sessionRegistry.resolveUser(sessionId);
     const data = await frontendClient.request("task.list", {
       agent_id: identity.agentId,
-      user_id: identity.userId,
+      user_id: userId,
     });
 
     const tasks = (data.tasks as any[]).map((row: any) => ({
@@ -214,6 +218,7 @@ export async function handleAgentTasksCreate(
       schedule?: string;
       prompt?: string;
       status?: "active" | "paused";
+      session_id?: string;
     };
     if (!body.name || !body.schedule || !body.prompt) {
       sendJson(res, 400, { error: "name, schedule, prompt are required" });
@@ -222,10 +227,11 @@ export async function handleAgentTasksCreate(
     const invalid = validateSchedule(body.schedule);
     if (invalid) { sendJson(res, 400, { error: invalid }); return; }
 
+    const userId = sessionRegistry.resolveUser(body.session_id);
     const data = await frontendClient.request("task.create", {
       id: randomUUID(),
       agent_id: identity.agentId,
-      user_id: identity.userId,
+      user_id: userId,
       name: body.name,
       description: body.description ?? null,
       schedule: body.schedule,
@@ -259,10 +265,12 @@ export async function handleAgentTasksUpdate(
       if (invalid) { sendJson(res, 400, { error: invalid }); return; }
     }
 
+    const sessionId = typeof body.session_id === "string" ? body.session_id : undefined;
+    const userId = sessionRegistry.resolveUser(sessionId);
     const data = await frontendClient.request("task.update", {
       task_id: taskId,
       agent_id: identity.agentId,
-      user_id: identity.userId,
+      user_id: userId,
       name: typeof body.name === "string" ? body.name : undefined,
       description: typeof body.description === "string" ? body.description : undefined,
       schedule: typeof body.schedule === "string" ? body.schedule : undefined,
@@ -280,17 +288,19 @@ export async function handleAgentTasksUpdate(
  * DELETE /api/internal/agent-tasks/:id
  */
 export async function handleAgentTasksDelete(
-  _req: http.IncomingMessage,
+  req: http.IncomingMessage,
   res: http.ServerResponse,
   identity: CertificateIdentity,
   taskId: string,
   frontendClient: FrontendWsClient,
 ): Promise<void> {
   try {
+    const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
+    const userId = sessionRegistry.resolveUser(sessionId);
     const data = await frontendClient.request("task.delete", {
       task_id: taskId,
       agent_id: identity.agentId,
-      user_id: identity.userId,
+      user_id: userId,
     });
     sendJson(res, data.error ? 404 : 200, data);
   } catch (err) {

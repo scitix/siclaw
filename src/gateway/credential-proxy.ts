@@ -19,10 +19,12 @@ interface CredentialRequestBody {
   source?: string;
   source_id?: string;
   purpose?: string;
+  session_id?: string;
 }
 
 interface CredentialListBody {
   kind?: string;
+  session_id?: string;
 }
 
 // Keep identity fields to a safe charset before they land in SQL params or
@@ -37,16 +39,22 @@ function assertSafeIdField(value: string, field: string): void {
   }
 }
 
-function toIdentity(cert: CertificateIdentity): Identity {
-  assertSafeIdField(cert.userId, "userId");
+/**
+ * Turn an mTLS-verified cert identity into the `Identity` shape used by
+ * `CredentialService`. `sessionId` (if provided in the request body) is
+ * attached by the caller so the runtime can resolve it to an actual user
+ * for audit attribution before calling Upstream.
+ */
+function toIdentity(cert: CertificateIdentity, sessionId?: string): Identity {
   assertSafeIdField(cert.agentId, "agentId");
   if (cert.orgId) assertSafeIdField(cert.orgId, "orgId");
   if (cert.boxId) assertSafeIdField(cert.boxId, "boxId");
+  if (sessionId) assertSafeIdField(sessionId, "sessionId");
   return {
-    userId: cert.userId,
     agentId: cert.agentId,
     orgId: cert.orgId,
     boxId: cert.boxId,
+    sessionId,
   };
 }
 
@@ -91,7 +99,7 @@ export async function handleCredentialRequest(
   }
 
   try {
-    const id = toIdentity(identity);
+    const id = toIdentity(identity, body.session_id);
     const payload = body.source === "cluster"
       ? await service.getClusterCredential(id, body.source_id, body.purpose ?? "")
       : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
@@ -127,7 +135,7 @@ export async function handleCredentialList(
   }
 
   try {
-    const id = toIdentity(identity);
+    const id = toIdentity(identity, body.session_id);
     if (body.kind === "cluster") {
       const clusters = await service.listClusters(id);
       sendJson(res, 200, { clusters });

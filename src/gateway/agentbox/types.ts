@@ -1,5 +1,9 @@
 /**
- * AgentBox type definitions
+ * AgentBox type definitions.
+ *
+ * One AgentBox pod per agent. The pod is shared by every user who addresses
+ * that agent; per-user state is carried in the request's sessionId, not in
+ * the pod identity. No userId here.
  */
 
 /** AgentBox status */
@@ -7,9 +11,8 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 
 /** AgentBox configuration */
 export interface AgentBoxConfig {
-  userId: string;
-  /** Agent ID — each AgentBox serves one agent (composite cache key with userId) */
-  agentId?: string;
+  /** Agent ID — the pod identity; also the cert CN. */
+  agentId: string;
   /** Organization ID — for RBAC scoping in Upstream Adapter */
   orgId?: string;
   /** Allowed tools list for this agent (null = all) */
@@ -28,9 +31,7 @@ export interface AgentBoxConfig {
 /** AgentBox information */
 export interface AgentBoxInfo {
   boxId: string;
-  userId: string;
-  /** Agent ID this box serves (from K8s label or cache key) */
-  agentId?: string;
+  agentId: string;
   status: AgentBoxStatus;
   endpoint: string;
   createdAt: Date;
@@ -40,8 +41,6 @@ export interface AgentBoxInfo {
 /** AgentBox handle, used for subsequent operations */
 export interface AgentBoxHandle {
   boxId: string;
-  userId: string;
   endpoint: string;
-  /** Agent ID this box serves */
-  agentId?: string;
+  agentId: string;
 }

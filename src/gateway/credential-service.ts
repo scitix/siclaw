@@ -13,20 +13,34 @@ import type {
   HostMeta,
   CredentialPayload,
 } from "../shared/credential-types.js";
+import { sessionRegistry, type SessionRegistry } from "./session-registry.js";
 
 export class CredentialService {
   constructor(
     private readonly frontendClient: FrontendWsClient,
+    private readonly registry: SessionRegistry = sessionRegistry,
   ) {}
 
-  async listClusters(identity: Identity): Promise<ClusterMeta[]> {
-    const data = await this.frontendClient.request("credential.list", {
-      kind: "cluster",
-      userId: identity.userId,
+  private rpcParams(identity: Identity, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    // AgentBox is user-unaware — it doesn't know the caller's userId. Runtime
+    // recovers the attribution from the session registry (populated at chat
+    // entry) so Upstream still sees a concrete userId for audit purposes.
+    const userId = this.registry.resolveUser(identity.sessionId);
+    return {
+      userId,
       agentId: identity.agentId,
       orgId: identity.orgId ?? "",
       boxId: identity.boxId ?? "",
-    }) as { clusters?: ClusterMeta[] };
+      sessionId: identity.sessionId ?? "",
+      ...extra,
+    };
+  }
+
+  async listClusters(identity: Identity): Promise<ClusterMeta[]> {
+    const data = await this.frontendClient.request(
+      "credential.list",
+      this.rpcParams(identity, { kind: "cluster" }),
+    ) as { clusters?: ClusterMeta[] };
     if (!Array.isArray(data.clusters)) {
       throw new Error("Adapter credential-list returned malformed cluster list response");
     }
@@ -34,13 +48,10 @@ export class CredentialService {
   }
 
   async listHosts(identity: Identity): Promise<HostMeta[]> {
-    const data = await this.frontendClient.request("credential.list", {
-      kind: "host",
-      userId: identity.userId,
-      agentId: identity.agentId,
-      orgId: identity.orgId ?? "",
-      boxId: identity.boxId ?? "",
-    }) as { hosts?: HostMeta[] };
+    const data = await this.frontendClient.request(
+      "credential.list",
+      this.rpcParams(identity, { kind: "host" }),
+    ) as { hosts?: HostMeta[] };
     if (!Array.isArray(data.hosts)) {
       throw new Error("Adapter credential-list returned malformed host list response");
     }
@@ -48,23 +59,17 @@ export class CredentialService {
   }
 
   async getClusterCredential(identity: Identity, clusterName: string, purpose: string): Promise<CredentialPayload> {
-    return this.frontendClient.request("credential.get", {
-      source: "cluster", source_id: clusterName, purpose,
-      userId: identity.userId,
-      agentId: identity.agentId,
-      orgId: identity.orgId ?? "",
-      boxId: identity.boxId ?? "",
-    }) as Promise<CredentialPayload>;
+    return this.frontendClient.request(
+      "credential.get",
+      this.rpcParams(identity, { source: "cluster", source_id: clusterName, purpose }),
+    ) as Promise<CredentialPayload>;
   }
 
   async getHostCredential(identity: Identity, hostName: string, purpose: string): Promise<CredentialPayload> {
-    return this.frontendClient.request("credential.get", {
-      source: "host", source_id: hostName, purpose,
-      userId: identity.userId,
-      agentId: identity.agentId,
-      orgId: identity.orgId ?? "",
-      boxId: identity.boxId ?? "",
-    }) as Promise<CredentialPayload>;
+    return this.frontendClient.request(
+      "credential.get",
+      this.rpcParams(identity, { source: "host", source_id: hostName, purpose }),
+    ) as Promise<CredentialPayload>;
   }
 }
 

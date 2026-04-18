@@ -40,7 +40,6 @@ function asHttpRes(r: FakeRes): http.ServerResponse {
 }
 
 const goodIdentity: CertificateIdentity = {
-  userId: "u1",
   agentId: "a1",
   orgId: "o1",
   boxId: "b1",
@@ -127,14 +126,13 @@ describe("handleCredentialRequest", () => {
     errSpy.mockRestore();
   });
 
-  it("rejects an identity with CRLF in userId (character whitelist)", async () => {
+  it("rejects a sessionId containing control characters (charset whitelist)", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const bad: CertificateIdentity = { ...goodIdentity, userId: "u\r\nX" };
-    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x", session_id: "s\r\nX" }));
     const res = new FakeRes();
-    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), bad, service as unknown as CredentialService);
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
     expect(res.statusCode).toBe(502);
-    expect(JSON.parse(res.body).error).toMatch(/Invalid userId/);
+    expect(JSON.parse(res.body).error).toMatch(/Invalid sessionId/);
     errSpy.mockRestore();
   });
 

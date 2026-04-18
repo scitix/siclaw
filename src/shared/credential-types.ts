@@ -10,10 +10,15 @@
  */
 
 export interface Identity {
-  userId: string;
   agentId: string;
   orgId?: string;
   boxId?: string;
+  /**
+   * Opaque per-request tenant key for downstream audit / scoping. Runtime
+   * resolves it to a concrete user via its session registry before calling
+   * Upstream. AgentBox and its transports treat this as an opaque string.
+   */
+  sessionId?: string;
 }
 
 export type ResourceKind = "cluster" | "host";

@@ -58,10 +58,10 @@ import { LocalSpawner } from "./local-spawner.js";
 // ── Test helpers ──────────────────────────────────────────────────────
 
 class FakeCertManager {
-  issuedFor: Array<{ userId: string; agentId: string; podEnv: string }> = [];
-  issueAgentBoxCertificate(userId: string, agentId: string, _orgId: string, _boxId: string, podEnv: string) {
-    this.issuedFor.push({ userId, agentId, podEnv });
-    return { cert: `CERT-${userId}`, key: `KEY-${userId}`, ca: `CA-${userId}` };
+  issuedFor: Array<{ agentId: string; podEnv: string }> = [];
+  issueAgentBoxCertificate(agentId: string, _orgId: string, _boxId: string, podEnv: string) {
+    this.issuedFor.push({ agentId, podEnv });
+    return { cert: `CERT-${agentId}`, key: `KEY-${agentId}`, ca: `CA-${agentId}` };
   }
 }
 
@@ -90,57 +90,56 @@ describe("LocalSpawner — spawn (happy path)", () => {
   it("issues a cert, writes cert files, and starts an HTTP server", async () => {
     const cm = new FakeCertManager();
     const spawner = new LocalSpawner(cm as any, "https://127.0.0.1:3002", 5000);
-    const handle = await spawner.spawn({ userId: "alice", agentId: "a1" });
+    const handle = await spawner.spawn({ agentId: "a1" });
 
-    expect(handle.boxId).toBe("local-alice-a1");
-    expect(handle.userId).toBe("alice");
+    expect(handle.boxId).toBe("local-a1");
+    expect(handle.agentId).toBe("a1");
     expect(handle.endpoint).toBe("http://127.0.0.1:5000");
 
-    // Cert bundle was issued
+    // Cert bundle was issued — CN is agentId, no userId is embedded.
     expect(cm.issuedFor).toHaveLength(1);
-    expect(cm.issuedFor[0]).toEqual({ userId: "alice", agentId: "a1", podEnv: "dev" });
+    expect(cm.issuedFor[0]).toEqual({ agentId: "a1", podEnv: "dev" });
 
     // Cert files were written into .siclaw/certs/<boxId>
-    const certDir = path.join(tmpDir, ".siclaw", "certs", "local-alice-a1");
-    expect(fs.readFileSync(path.join(certDir, "cert.pem"), "utf-8")).toBe("CERT-alice");
-    expect(fs.readFileSync(path.join(certDir, "key.pem"), "utf-8")).toBe("KEY-alice");
-    expect(fs.readFileSync(path.join(certDir, "ca.pem"), "utf-8")).toBe("CA-alice");
+    const certDir = path.join(tmpDir, ".siclaw", "certs", "local-a1");
+    expect(fs.readFileSync(path.join(certDir, "cert.pem"), "utf-8")).toBe("CERT-a1");
+    expect(fs.readFileSync(path.join(certDir, "key.pem"), "utf-8")).toBe("KEY-a1");
+    expect(fs.readFileSync(path.join(certDir, "ca.pem"), "utf-8")).toBe("CA-a1");
 
     // ENV propagated for http-server to pick up
     expect(process.env.SICLAW_GATEWAY_URL).toBe("https://127.0.0.1:3002");
     expect(process.env.SICLAW_TLS_CERT).toBe(path.join(certDir, "cert.pem"));
   });
 
-  it("returns the existing handle on a second spawn (idempotent)", async () => {
+  it("returns the existing handle on a second spawn for the same agent (idempotent)", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const h1 = await spawner.spawn({ userId: "alice", agentId: "a1" });
-    const h2 = await spawner.spawn({ userId: "alice", agentId: "a1" });
+    const h1 = await spawner.spawn({ agentId: "a1" });
+    const h2 = await spawner.spawn({ agentId: "a1" });
     expect(h1).toEqual(h2);
     expect(h1.endpoint).toBe("http://127.0.0.1:5000");
   });
 
-  it("allocates sequential ports for different users", async () => {
+  it("allocates sequential ports for different agents", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const h1 = await spawner.spawn({ userId: "alice", agentId: "a1" });
-    const h2 = await spawner.spawn({ userId: "bob", agentId: "a1" });
+    const h1 = await spawner.spawn({ agentId: "a1" });
+    const h2 = await spawner.spawn({ agentId: "a2" });
     expect(h1.endpoint).toBe("http://127.0.0.1:5000");
     expect(h2.endpoint).toBe("http://127.0.0.1:5001");
   });
 
-  it("throws when userId or agentId is empty", async () => {
+  it("throws when agentId is empty", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002");
-    await expect(spawner.spawn({ userId: "", agentId: "a1" })).rejects.toThrow(/non-empty/);
-    await expect(spawner.spawn({ userId: "u", agentId: "" })).rejects.toThrow(/non-empty/);
+    await expect(spawner.spawn({ agentId: "" })).rejects.toThrow(/non-empty agentId/);
   });
 });
 
 describe("LocalSpawner — list, get, stop, cleanup", () => {
   it("list() returns all running boxes", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    await spawner.spawn({ userId: "alice", agentId: "a1" });
-    await spawner.spawn({ userId: "bob", agentId: "a1" });
+    await spawner.spawn({ agentId: "a1" });
+    await spawner.spawn({ agentId: "a2" });
     const all = await spawner.list();
-    expect(all.map((b) => b.boxId).sort()).toEqual(["local-alice-a1", "local-bob-a1"]);
+    expect(all.map((b) => b.boxId).sort()).toEqual(["local-a1", "local-a2"]);
     expect(all.every((b) => b.status === "running")).toBe(true);
   });
 
@@ -151,7 +150,7 @@ describe("LocalSpawner — list, get, stop, cleanup", () => {
 
   it("stop() removes the box, closes HTTP + session, disposes broker", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const handle = await spawner.spawn({ userId: "alice", agentId: "a1" });
+    const handle = await spawner.spawn({ agentId: "a1" });
     await spawner.stop(handle.boxId);
 
     expect(await spawner.get(handle.boxId)).toBeNull();
@@ -166,8 +165,8 @@ describe("LocalSpawner — list, get, stop, cleanup", () => {
 
   it("cleanup() stops all boxes", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    await spawner.spawn({ userId: "alice", agentId: "a1" });
-    await spawner.spawn({ userId: "bob", agentId: "a1" });
+    await spawner.spawn({ agentId: "a1" });
+    await spawner.spawn({ agentId: "a2" });
     await spawner.cleanup();
     expect(await spawner.list()).toEqual([]);
   });
@@ -178,29 +177,28 @@ describe("LocalSpawner — knowledge indexer injection", () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const fakeIndexer = { id: "ki" };
     spawner.setKnowledgeIndexer(fakeIndexer as any);
-    const handle = await spawner.spawn({ userId: "alice", agentId: "a1" });
-    // The internal box.sessionManager.knowledgeIndexer should be set.
+    const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(box.sessionManager.knowledgeIndexer).toBe(fakeIndexer);
   });
 
   it("does NOT set knowledgeIndexer on sessionManager when none injected", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const handle = await spawner.spawn({ userId: "alice", agentId: "a1" });
+    const handle = await spawner.spawn({ agentId: "a1" });
     const box = (spawner as any).boxes.get(handle.boxId);
     expect(box.sessionManager.knowledgeIndexer).toBeUndefined();
   });
 });
 
-describe("LocalSpawner — per-user credential isolation", () => {
-  it("uses a per-user credentialsDir so multiple AgentBoxes don't collide", async () => {
+describe("LocalSpawner — per-agent credential isolation", () => {
+  it("uses a per-agent credentialsDir (one dir per agent, shared by callers)", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const h1 = await spawner.spawn({ userId: "alice", agentId: "a1" });
-    const h2 = await spawner.spawn({ userId: "bob", agentId: "a1" });
+    const h1 = await spawner.spawn({ agentId: "a1" });
+    const h2 = await spawner.spawn({ agentId: "a2" });
     const b1 = (spawner as any).boxes.get(h1.boxId);
     const b2 = (spawner as any).boxes.get(h2.boxId);
-    expect(b1.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "alice-a1"));
-    expect(b2.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "bob-a1"));
+    expect(b1.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "a1"));
+    expect(b2.sessionManager.credentialsDir).toContain(path.join(".siclaw", "credentials", "a2"));
     expect(b1.sessionManager.credentialsDir).not.toBe(b2.sessionManager.credentialsDir);
   });
 });

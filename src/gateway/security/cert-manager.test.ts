@@ -106,11 +106,10 @@ describe("CertificateManager.create — loading priority", () => {
 
 describe("CertificateManager — issue + verify round-trip", () => {
   it("issues a client cert with the given identity and verifies back the same fields", () => {
-    const bundle = manager.issueAgentBoxCertificate("user-1", "agent-9", "org-42", "box-7", "dev");
+    const bundle = manager.issueAgentBoxCertificate("agent-9", "org-42", "box-7", "dev");
     expect(bundle.cert).toContain("BEGIN CERTIFICATE");
     expect(bundle.key).toContain("PRIVATE KEY");
     expect(bundle.ca).toBe(manager.getCACertificate());
-    expect(bundle.identity.userId).toBe("user-1");
     expect(bundle.identity.agentId).toBe("agent-9");
     expect(bundle.identity.orgId).toBe("org-42");
     expect(bundle.identity.boxId).toBe("box-7");
@@ -118,7 +117,6 @@ describe("CertificateManager — issue + verify round-trip", () => {
 
     const verified = manager.verifyCertificate(bundle.cert);
     expect(verified).not.toBeNull();
-    expect(verified!.userId).toBe("user-1");
     expect(verified!.agentId).toBe("agent-9");
     expect(verified!.orgId).toBe("org-42");
     expect(verified!.boxId).toBe("box-7");
@@ -126,16 +124,28 @@ describe("CertificateManager — issue + verify round-trip", () => {
   }, 60_000);
 
   it("defaults env to 'prod' when not specified", () => {
-    const bundle = manager.issueAgentBoxCertificate("u", "a", "o", "b");
+    const bundle = manager.issueAgentBoxCertificate("a", "o", "b");
     expect(bundle.identity.env).toBe("prod");
     const v = manager.verifyCertificate(bundle.cert);
     expect(v!.env).toBe("prod");
   }, 60_000);
 
   it("round-trips env=test", () => {
-    const bundle = manager.issueAgentBoxCertificate("u", "a", "o", "b", "test");
+    const bundle = manager.issueAgentBoxCertificate("a", "o", "b", "test");
     const v = manager.verifyCertificate(bundle.cert);
     expect(v!.env).toBe("test");
+  }, 60_000);
+
+  it("encodes agentId as CN (not userId) — AgentBox is user-unaware", () => {
+    const bundle = manager.issueAgentBoxCertificate("agent-cn-test", "o", "b");
+    const parsed = forge.pki.certificateFromPem(bundle.cert);
+    const cn = parsed.subject.attributes.find(a => a.name === "commonName")?.value;
+    expect(cn).toBe("agent-cn-test");
+    // OU should not carry agentId anymore
+    const ou = parsed.subject.attributes.find(a => a.name === "organizationalUnitName")?.value;
+    expect(ou).toBeUndefined();
+    // Identity has no userId field
+    expect((bundle.identity as any).userId).toBeUndefined();
   }, 60_000);
 });
 
@@ -149,7 +159,7 @@ describe("CertificateManager.verifyCertificate — rejections", () => {
   it("returns null for a cert not signed by this CA", async () => {
     // Generate an independent CA and issue a cert under it.
     const other = await CertificateManager.create();
-    const bundle = other.issueAgentBoxCertificate("u", "a", "o", "b");
+    const bundle = other.issueAgentBoxCertificate("a", "o", "b");
     expect(manager.verifyCertificate(bundle.cert)).toBeNull();
   }, 60_000);
 
