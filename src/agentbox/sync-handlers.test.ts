@@ -523,6 +523,64 @@ describe("skillsHandler", () => {
     expect(resolvedExists("empty-specs")).toBe(true);
     expect(fs.existsSync(path.join(resolvedDir(), "empty-specs", "SKILL.md"))).toBe(false);
   });
+
+  // ── defense: upstream null scripts must not crash the whole reload ──
+  it("tolerates scripts=null (upstream's NULL column serializes as JSON null)", async () => {
+    // Regression: upstream's GetSkillsBundle returned `scripts: null` for any
+    // skill whose DB scripts column was NULL. The old writeSkillToDir read
+    // `skill.scripts.length` and threw "Cannot read properties of null
+    // (reading 'length')" on the FIRST such skill, killing the entire
+    // materialize run — no skill in the bundle was written.
+    const payload = {
+      version: "v1",
+      skills: [
+        // Typed as `any` so we can pass null into a field TS types as array.
+        { dirName: "no-scripts", scope: "global", specs: "---\n---\n", scripts: null } as any,
+        { dirName: "with-scripts", scope: "global" as const, specs: "---\n---\n", scripts: [{ name: "run.sh", content: "echo hi" }] },
+      ],
+    };
+
+    const count = await skillsHandler.materialize(payload);
+    expect(count).toBe(2);
+    expect(resolvedExists("no-scripts")).toBe(true);
+    expect(fs.existsSync(path.join(resolvedDir(), "no-scripts", "scripts"))).toBe(false);
+    expect(resolvedExists("with-scripts")).toBe(true);
+    expect(fs.existsSync(path.join(resolvedDir(), "with-scripts", "scripts", "run.sh"))).toBe(true);
+  });
+
+  // ── defense: unknown scope values must still be materialized ──
+  it("materializes skills with non-standard scope values (lowest priority), rather than dropping them", async () => {
+    // Regression: upstream currently serializes `scope` as the skill's own
+    // name (e.g. "csi-diag") instead of "global"/"builtin". The old filter
+    // `s.scope === "global" || s.scope === "builtin"` dropped every such
+    // skill silently. Keep writing them so operators see the skills they
+    // bound, even while upstream is still shipping the wrong scope value.
+    const payload = {
+      version: "v1",
+      skills: [
+        { dirName: "unknown-scope", scope: "csi-diag" as any, specs: "---\nname: u\n---\n", scripts: [] },
+        { dirName: "global-skill", scope: "global" as const, specs: "---\nname: g\n---\n", scripts: [] },
+      ],
+    };
+    const count = await skillsHandler.materialize(payload);
+    expect(count).toBe(2);
+    expect(resolvedExists("unknown-scope")).toBe(true);
+    expect(resolvedExists("global-skill")).toBe(true);
+  });
+
+  it("dedup priority: global > builtin > other when dirName collides", async () => {
+    const payload = {
+      version: "v1",
+      skills: [
+        { dirName: "dup", scope: "other" as any, specs: "---\nname: dup\n---\nfrom-other", scripts: [] },
+        { dirName: "dup", scope: "builtin" as const, specs: "---\nname: dup\n---\nfrom-builtin", scripts: [] },
+        { dirName: "dup", scope: "global" as const, specs: "---\nname: dup\n---\nfrom-global", scripts: [] },
+      ],
+    };
+    const count = await skillsHandler.materialize(payload);
+    expect(count).toBe(1);
+    expect(readResolved("dup")).toBe("---\nname: dup\n---\nfrom-global");
+  });
 });
 
 // =========================================================================
