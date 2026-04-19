@@ -259,12 +259,35 @@ describe("skillsHandler", () => {
   });
 
   // ── 5. empty payload ─────────────────────────────────────────────
-  it("returns 0 and resolved/ is empty with no skills in payload", async () => {
+  it("returns 0 and resolved/ is empty with no skills in payload (first spawn)", async () => {
     const payload = { version: new Date().toISOString(), skills: [] };
     const count = await skillsHandler.materialize(payload);
     expect(count).toBe(0);
     const entries = fs.readdirSync(resolvedDir());
     expect(entries).toEqual([]);
+  });
+
+  // ── 5b. defense: empty payload does NOT wipe existing skills ─────
+  it("preserves resolved/ contents when an empty bundle arrives but skills already exist", async () => {
+    // First materialize: real skills
+    await skillsHandler.materialize({
+      version: "v1",
+      skills: [
+        { dirName: "skill-a", scope: "global" as const, specs: "---\nname: a\n---\n", scripts: [] },
+        { dirName: "skill-b", scope: "global" as const, specs: "---\nname: b\n---\n", scripts: [] },
+      ],
+    });
+    expect(resolvedExists("skill-a")).toBe(true);
+    expect(resolvedExists("skill-b")).toBe(true);
+
+    // Then a transient-error empty bundle arrives — must NOT wipe the dir.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const count = await skillsHandler.materialize({ version: "v2", skills: [] });
+    expect(count).toBe(2); // reports what it kept, not 0
+    expect(resolvedExists("skill-a")).toBe(true);
+    expect(resolvedExists("skill-b")).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("skipping wipe"));
+    warnSpy.mockRestore();
   });
 
   // ── 6. multiple skills, different names ───────────────────────────

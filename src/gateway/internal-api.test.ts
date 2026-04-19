@@ -136,6 +136,18 @@ describe("handleMcpServers", () => {
     expect(res.statusCode).toBe(500);
     errSpy.mockRestore();
   });
+
+  it("returns 500 when config.getResources itself fails (regression guard: no silent empty)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    upstream.request = vi.fn(async (m: string) => {
+      if (m === "config.getResources") throw new Error("FrontendWsClient disconnected");
+      return {};
+    }) as typeof upstream.request;
+    const res = new FakeRes();
+    await handleMcpServers(asReq(new FakeReq("")), asRes(res), identity, upstream as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(500);
+    errSpy.mockRestore();
+  });
 });
 
 // ── handleSkillsBundle ────────────────────────────────────
@@ -149,6 +161,24 @@ describe("handleSkillsBundle", () => {
     expect(res.statusCode).toBe(200);
     const call = upstream.calls.find((c) => c.method === "config.getSkillBundle");
     expect(call!.params).toEqual({ skill_ids: ["s1", "s2"], is_production: false });
+  });
+
+  it("returns 500 — NOT an empty bundle — when config.getResources fails (regression guard)", async () => {
+    // Historic silent-failure: a catch returned { skillIds: [] } on any RPC
+    // error, so a momentary WS blip wiped the agentbox's resolved/ skills dir
+    // via an empty config.getSkillBundle response. Handler must propagate the
+    // error so agentbox's reload handler leaves resolved/ untouched.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    upstream.request = vi.fn(async (m: string) => {
+      if (m === "config.getResources") throw new Error("FrontendWsClient disconnected");
+      return {};
+    }) as typeof upstream.request;
+    const res = new FakeRes();
+    await handleSkillsBundle(asReq(new FakeReq("")), asRes(res), identity, upstream as unknown as FrontendWsClient);
+    expect(res.statusCode).toBe(500);
+    // Must NOT have called config.getSkillBundle with empty ids after failure.
+    expect((upstream.request as any).mock.calls.find((c: any[]) => c[0] === "config.getSkillBundle")).toBeUndefined();
+    errSpy.mockRestore();
   });
 });
 

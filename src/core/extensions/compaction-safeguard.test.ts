@@ -303,11 +303,16 @@ describe("compactionSafeguardExtension", () => {
   });
 
   describe("empty conversation guard", () => {
-    it("returns fallback compaction when no real messages", async () => {
+    it("cancels compaction when no real messages AND no prior summary (no empty-skeleton leak)", async () => {
+      // Previously this returned a "Decisions: None / Open TODOs: None / ..."
+      // skeleton, which subsequent compactions read back as `previousSummary`
+      // and preserved verbatim — the agent then "forgot everything" because
+      // the skeleton overrode its live memory. We now cancel instead so no
+      // fake summary is appended to the session.
       const handler = handlers.get("session_before_compact")!;
       const event = {
         preparation: {
-          messagesToSummarize: [], // no messages
+          messagesToSummarize: [],
           turnPrefixMessages: [],
           firstKeptEntryId: "entry-1",
           tokensBefore: 50000,
@@ -322,19 +327,16 @@ describe("compactionSafeguardExtension", () => {
 
       const result = await handler(event, ctx);
 
-      expect(result).toBeDefined();
-      expect(result.compaction).toBeDefined();
-      expect(result.compaction.summary).toContain("## Decisions");
-      expect(result.compaction.summary).toContain("## Open TODOs");
-      expect(result.compaction.summary).toContain("## Exact identifiers");
-      expect(result.compaction.firstKeptEntryId).toBe("entry-1");
-      // Crucially: no sendUserMessage was called
+      expect(result).toEqual({ cancel: true });
       expect(mockApi.sendUserMessage).not.toHaveBeenCalled();
     });
 
-    it("returns fallback compaction when only non-real messages (e.g. compaction entries)", async () => {
+    it("cancels when only non-real messages and prior summary is unstructured (refuses to wrap in skeleton)", async () => {
+      // Historically we wrapped unstructured prior summaries into the
+      // "Decisions: <text> / Open TODOs: None" skeleton. Now we prefer
+      // cancel — the unstructured text remains on the prior compaction
+      // entry in the session file and is unaffected.
       const handler = handlers.get("session_before_compact")!;
-      // Messages with roles that aren't user/assistant/toolResult
       const nonRealMsg = { role: "system", content: "system message", timestamp: Date.now() } as AgentMessage;
       const event = {
         preparation: {
@@ -353,8 +355,47 @@ describe("compactionSafeguardExtension", () => {
 
       const result = await handler(event, ctx);
 
+      expect(result).toEqual({ cancel: true });
+    });
+
+    it("passes through a structured prior summary verbatim when current messages are empty", async () => {
+      const handler = handlers.get("session_before_compact")!;
+      const prevSummary = [
+        "## Decisions",
+        "Chose to use StatefulSet for Redis.",
+        "",
+        "## Open TODOs",
+        "Check PVC binding.",
+        "",
+        "## Constraints/Rules",
+        "None.",
+        "",
+        "## Pending user asks",
+        "None.",
+        "",
+        "## Exact identifiers",
+        "redis-master-0",
+      ].join("\n");
+      const event = {
+        preparation: {
+          messagesToSummarize: [],
+          turnPrefixMessages: [],
+          firstKeptEntryId: "entry-3",
+          tokensBefore: 50000,
+          previousSummary: prevSummary,
+          fileOps: createFileOps(),
+          isSplitTurn: false,
+          settings: { enabled: true, reserveTokens: 16384, keepRecentTokens: 20000 },
+        },
+        signal: new AbortController().signal,
+      };
+      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+
+      const result = await handler(event, ctx);
+
       expect(result.compaction).toBeDefined();
-      expect(result.compaction.summary).toContain("## Decisions");
+      expect(result.compaction.summary).toBe(prevSummary);
+      expect(result.compaction.firstKeptEntryId).toBe("entry-3");
     });
   });
 
@@ -411,11 +452,11 @@ describe("compactionSafeguardExtension", () => {
   });
 
   describe("tool failure tracking", () => {
-    it("returns fallback with no tool failures section when no errors", async () => {
+    it("cancel path for empty conversations bypasses tool-failure extraction", async () => {
       const handler = handlers.get("session_before_compact")!;
       const event = {
         preparation: {
-          messagesToSummarize: [], // empty → hits fallback path
+          messagesToSummarize: [],
           turnPrefixMessages: [],
           firstKeptEntryId: "entry-1",
           tokensBefore: 50000,
@@ -429,16 +470,17 @@ describe("compactionSafeguardExtension", () => {
       const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
 
       const result = await handler(event, ctx);
-      expect(result.compaction.summary).not.toContain("## Tool Failures");
+      // Empty → cancel; tool-failure section only matters for the real summary path.
+      expect(result).toEqual({ cancel: true });
     });
   });
 
   describe("file operations tracking", () => {
-    it("returns fallback with file ops in summary", async () => {
+    it("cancel path for empty conversations skips file-ops aggregation", async () => {
       const handler = handlers.get("session_before_compact")!;
       const event = {
         preparation: {
-          messagesToSummarize: [], // empty → hits fallback path
+          messagesToSummarize: [],
           turnPrefixMessages: [],
           firstKeptEntryId: "entry-1",
           tokensBefore: 50000,
@@ -456,9 +498,8 @@ describe("compactionSafeguardExtension", () => {
       const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
 
       const result = await handler(event, ctx);
-      // Empty conversation → fallback, but file ops are NOT appended in fallback path
-      // (they're only appended in the main summarization path)
-      expect(result.compaction.summary).toContain("## Decisions");
+      // Empty → cancel; file-ops only land in the real summary path.
+      expect(result).toEqual({ cancel: true });
     });
   });
 
@@ -503,7 +544,12 @@ describe("compactionSafeguardExtension", () => {
       expect(result.compaction.summary).toBe(prevSummary);
     });
 
-    it("wraps previousSummary in sections when it lacks structure", async () => {
+    it("cancels when previousSummary lacks the required sections (refuses to fabricate a skeleton around it)", async () => {
+      // Historically we wrapped the unstructured string into the "Decisions"
+      // slot of the skeleton — that produced a broken-looking summary that
+      // still passed hasRequiredSummarySections and stuck across future
+      // compactions. Cancelling leaves the unstructured prior text in place
+      // as an unchanged compaction entry in the session file.
       const handler = handlers.get("session_before_compact")!;
       const event = {
         preparation: {
@@ -522,9 +568,7 @@ describe("compactionSafeguardExtension", () => {
 
       const result = await handler(event, ctx);
 
-      expect(result.compaction.summary).toContain("## Decisions");
-      expect(result.compaction.summary).toContain("User was debugging OOM in redis pod.");
-      expect(result.compaction.summary).toContain("## Exact identifiers");
+      expect(result).toEqual({ cancel: true });
     });
   });
 });
