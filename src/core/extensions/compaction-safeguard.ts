@@ -561,16 +561,40 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
     const { preparation, customInstructions: eventInstructions, signal } = event;
 
     // ── Empty conversation guard ──
+    //
+    // If prepareCompaction surfaced a request with zero summarizable content,
+    // writing the empty-skeleton fallback is actively harmful: the skeleton
+    // passes `hasRequiredSummarySections()`, so future compactions read it
+    // back as `previousSummary` and preserve it verbatim — the agent then
+    // sees a "Decisions: None / Pending asks: None / ..." system block that
+    // overrides whatever it should have remembered. User-visible symptom:
+    // "agent forgets everything after a few turns."
+    //
+    // Paths:
+    //   - No prior summary either → cancel; there is genuinely nothing to
+    //     summarize and pi-agent won't re-trigger immediately (context still
+    //     fits or the reserve-tokens threshold hasn't moved).
+    //   - Prior summary exists → keep it verbatim. It was already a real
+    //     summary from an earlier compaction; overwriting it with "None."
+    //     placeholders would erase live memory.
     const hasRealSummarizable = preparation.messagesToSummarize.some(isRealConversationMessage);
     const hasRealTurnPrefix = preparation.turnPrefixMessages.some(isRealConversationMessage);
     if (!hasRealSummarizable && !hasRealTurnPrefix) {
+      const prevTrimmed = preparation.previousSummary?.trim() ?? "";
+      const hasPriorSummary = prevTrimmed.length > 0 && hasRequiredSummarySections(prevTrimmed);
       console.log(
-        "[compaction-safeguard] No real conversation messages to summarize; writing compaction boundary to suppress re-trigger loop.",
+        `[compaction-safeguard] No real conversation messages to summarize ` +
+          `(messagesToSummarize=${preparation.messagesToSummarize.length}, ` +
+          `turnPrefixMessages=${preparation.turnPrefixMessages.length}, ` +
+          `hasPriorSummary=${hasPriorSummary}).`,
       );
-      const fallbackSummary = buildStructuredFallbackSummary(preparation.previousSummary);
+      if (!hasPriorSummary) {
+        // No prior summary — cancel instead of inventing an empty one.
+        return { cancel: true };
+      }
       return {
         compaction: {
-          summary: fallbackSummary,
+          summary: prevTrimmed,
           firstKeptEntryId: preparation.firstKeptEntryId,
           tokensBefore: preparation.tokensBefore,
         },

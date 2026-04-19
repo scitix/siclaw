@@ -118,6 +118,28 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
     // All scopes come from the bundle payload (including builtin, synced to DB at startup).
     const resolvedDir = path.join(skillsDir, "resolved");
 
+    // Defense against empty-bundle erasure (belt-and-suspenders; the primary
+    // fix is Gateway-side so empty-bundles only arrive when the agent is
+    // genuinely unbound). If an empty payload arrives but we already have
+    // skills materialized, keep what we have and let the next reload retry.
+    // Legitimate "unbind-all" admin operations can force a fresh wipe by
+    // restarting the pod — which is cheap and explicit.
+    const incomingCount = Array.isArray(payload?.skills) ? payload.skills.length : 0;
+    if (incomingCount === 0 && fs.existsSync(resolvedDir)) {
+      const existing = fs.readdirSync(resolvedDir).filter((name) => {
+        try { return fs.statSync(path.join(resolvedDir, name)).isDirectory(); }
+        catch { return false; }
+      });
+      if (existing.length > 0) {
+        console.warn(
+          `[sync-handlers.skills] Empty bundle received but resolved/ has ` +
+          `${existing.length} skill(s); skipping wipe to preserve state. ` +
+          `Next non-empty reload will refresh normally.`,
+        );
+        return existing.length;
+      }
+    }
+
     // Clear and recreate resolved/
     if (fs.existsSync(resolvedDir)) {
       fs.rmSync(resolvedDir, { recursive: true });

@@ -39,25 +39,34 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
  * Fetch agent resource bindings from Portal via RPC.
  * Returns skill_ids and mcp_server_ids bound to the agent.
  */
+/**
+ * Fetch the agent's bound skill/mcp ids from Upstream.
+ *
+ * Errors are propagated intentionally. An earlier version swallowed every
+ * error and returned `{ skillIds: [] }`, which was ambiguous with "agent
+ * truly has no skills bound" — any transient RPC failure (WSClient
+ * mid-reconnect, Upstream restart, etc.) then caused `handleSkillsBundle` to
+ * return an empty bundle, AgentBox wiped `resolved/`, and the pod lost its
+ * entire skill set until a manual restart.
+ *
+ * With the current behaviour, upstream handlers return HTTP 500; AgentBox's
+ * reload handler treats that as "leave current state, retry next time" and
+ * the materialized `resolved/` is preserved.
+ */
 async function fetchAgentResources(
   frontendClient: FrontendWsClient,
   orgId: string,
   agentId: string,
 ): Promise<{ skillIds: string[]; mcpServerIds: string[]; isProduction: boolean }> {
-  try {
-    const data = await frontendClient.request("config.getResources", {
-      agentId,
-      orgId,
-    });
-    return {
-      skillIds: data.skill_ids ?? [],
-      mcpServerIds: data.mcp_server_ids ?? [],
-      isProduction: data.is_production ?? true,
-    };
-  } catch (err) {
-    console.warn("[internal-api] Error fetching agent resources:", err);
-    return { skillIds: [], mcpServerIds: [], isProduction: true };
-  }
+  const data = await frontendClient.request("config.getResources", {
+    agentId,
+    orgId,
+  });
+  return {
+    skillIds: data.skill_ids ?? [],
+    mcpServerIds: data.mcp_server_ids ?? [],
+    isProduction: data.is_production ?? true,
+  };
 }
 
 /**
