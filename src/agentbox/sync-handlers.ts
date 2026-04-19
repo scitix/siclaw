@@ -65,17 +65,21 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
 /** Write a single skill (specs + scripts) into the resolved directory */
 function writeSkillToDir(
   resolvedDir: string,
-  skill: { dirName: string; specs: string; scripts: Array<{ name: string; content: string }> },
+  skill: { dirName: string; specs: string; scripts: Array<{ name: string; content: string }> | null | undefined },
 ): void {
   const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
   fs.mkdirSync(skillDir, { recursive: true });
   if (skill.specs) {
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
   }
-  if (skill.scripts.length > 0) {
+  // Some upstreams (notably upstream's GetSkillsBundle) serialize a missing
+  // scripts column as JSON `null` rather than `[]`. Treat null as "no scripts"
+  // instead of crashing on `.length` and taking down the whole reload.
+  const scripts = Array.isArray(skill.scripts) ? skill.scripts : [];
+  if (scripts.length > 0) {
     const scriptsDir = path.join(skillDir, "scripts");
     fs.mkdirSync(scriptsDir, { recursive: true });
-    for (const script of skill.scripts) {
+    for (const script of scripts) {
       const scriptPath = resolveUnderDir(scriptsDir, script.name);
       fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
     }
@@ -146,15 +150,26 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
     }
     fs.mkdirSync(resolvedDir, { recursive: true });
 
+    // Write every skill in the bundle, deduping by `dirName` in priority
+    // order: "global" > "builtin" > anything else. Upstreams that don't set
+    // scope correctly (upstream currently serializes scope as the skill's own
+    // name) fall into the "other" bucket — they still get materialized,
+    // just at lower priority so a genuine "global" overlay can win the
+    // dirName collision.
+    const priority = (scope: string | undefined): number => {
+      if (scope === "global") return 0;
+      if (scope === "builtin") return 1;
+      return 2;
+    };
+    const sortedSkills = [...payload.skills].sort(
+      (a, b) => priority(a?.scope) - priority(b?.scope),
+    );
     const seen = new Set<string>();
-
-    // Write in priority order: global > builtin
-    for (const scope of ["global", "builtin"] as const) {
-      for (const skill of payload.skills.filter(s => s.scope === scope)) {
-        if (seen.has(skill.dirName)) continue;
-        seen.add(skill.dirName);
-        writeSkillToDir(resolvedDir, skill);
-      }
+    for (const skill of sortedSkills) {
+      if (!skill?.dirName) continue;
+      if (seen.has(skill.dirName)) continue;
+      seen.add(skill.dirName);
+      writeSkillToDir(resolvedDir, skill);
     }
 
     return seen.size;
