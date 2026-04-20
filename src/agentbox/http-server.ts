@@ -321,7 +321,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
       if (!managed._promptDone) {
-        managed._eventBuffer.push(event);
+        // Stamp with server time when emitted so replayed events have accurate timestamps
+        const tsEvent = typeof event === "object" && event !== null
+          ? { ...(event as object), ts: Date.now() }
+          : event;
+        managed._eventBuffer.push(tsEvent);
       }
       // Null dpState.checklist when deep_search completes — this is the exit signal
       // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
@@ -343,6 +347,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           type: "tool_progress",
           toolName: "deep_search",
           progress: event,
+          ts: Date.now(),
         });
       }
       // Sync phase events to SDK brain's dpState so the auto-continue loop
@@ -551,7 +556,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (closed || res.writableEnded) return;
       try {
         sseEventCount++;
-        const data = JSON.stringify(event);
+        // Add server timestamp if not already present (buffered events carry their original ts)
+        const out = typeof event === "object" && event !== null && !("ts" in (event as object))
+          ? { ...(event as object), ts: Date.now() }
+          : event;
+        const data = JSON.stringify(out);
         res.write(`data: ${data}\n\n`);
       } catch (err) {
         console.warn(`[agentbox-http] SSE write error for session ${sessionId}:`, err);

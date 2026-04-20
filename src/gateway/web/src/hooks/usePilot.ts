@@ -34,6 +34,14 @@ export interface PilotMessage {
     isStreaming?: boolean;
     /** Hidden from chat bubbles (e.g. update_plan tool messages) */
     hidden?: boolean;
+    /** performance.now() when tool_execution_start was received — drives live stopwatch */
+    startedAt?: number;
+    /** Elapsed ms from tool_execution_start to tool_execution_end */
+    durationMs?: number;
+    /** Elapsed ms for LLM thinking (message_start to message_end) — on assistant messages */
+    llmDurationMs?: number;
+    /** ms from last anchor event (tool_execution_end or send) to message_start — TTFT approximation */
+    waitMs?: number;
 }
 
 export interface Session {
@@ -155,6 +163,17 @@ function reduceInvestigationProgress(
 }
 
 const SESSION_KEY_STORAGE = 'siclaw_current_session';
+
+const TIMING_MAX_SAMPLES = 200;
+function appendTimingSample(key: string, ms: number): void {
+    try {
+        const arr = JSON.parse(localStorage.getItem(key) ?? '[]') as number[];
+        arr.push(Math.round(ms));
+        if (arr.length > TIMING_MAX_SAMPLES) arr.splice(0, arr.length - TIMING_MAX_SAMPLES);
+        localStorage.setItem(key, JSON.stringify(arr));
+        window.dispatchEvent(new CustomEvent('siclaw_timing_update'));
+    } catch { /* ignore storage errors */ }
+}
 const SESSION_WORKSPACE_STORAGE = 'siclaw_session_workspace';
 const SELECTED_BRAIN_STORAGE = 'siclaw_selected_brain';
 
@@ -300,6 +319,20 @@ export function usePilot() {
     // The actual brain type of the current active session (from backend), null = no session / unknown
     const [sessionBrainType, setSessionBrainType] = useState<BrainType | null>(null);
 
+    // Timing: performance.now() when the current prompt was sent (drives ThinkingIndicator stopwatch)
+    const [loadingStartedAt, setLoadingStartedAt] = useState<number | null>(null);
+    // Ref tracks performance.now() of last message_start for LLM duration calculation
+    const llmStartRef = useRef<number>(0);
+    // When LLM only emits tool calls (no text), llmDurationMs has nowhere to attach —
+    // park it here until the next tool_execution_start claims it
+    const pendingLlmDurationMsRef = useRef<number>(0);
+    // Server-side Date.now() of last anchor event (sendMessage or tool_execution_end) — for TTFT calc
+    const lastServerTsRef = useRef<number>(0);
+    // Parked TTFT value (message_start.ts - lastServerTsRef) awaiting attachment to a message
+    const pendingWaitMsRef = useRef<number>(0);
+
+    // Ref for sendRpc — handleWsMessage has [] deps and can't close over sendRpc directly
+    const sendRpcRef = useRef<(<T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>) | null>(null);
     // Ref to allow loadSessions calls from event handler without stale closures
     const loadSessionsRef = useRef<() => void>(() => {});
     // Ref for fetching context usage from event handler
@@ -415,6 +448,14 @@ export function usePilot() {
                         setInvestigationProgress(prev => prev ?? { hypotheses: [] });
                         // Checklist creation now handled by dp_status event from gateway.
                     }
+                    // Claim pending LLM thinking duration (set when LLM only emitted tool calls, no text)
+                    const thinkMs = pendingLlmDurationMsRef.current || undefined;
+                    pendingLlmDurationMsRef.current = 0;
+                    // Claim pending TTFT (set at message_start when LLM only emitted tool calls)
+                    const waitMs = pendingWaitMsRef.current || undefined;
+                    pendingWaitMsRef.current = 0;
+                    if (waitMs != null) appendTimingSample('siclaw_timing_ttft', waitMs);
+                    if (thinkMs != null) appendTimingSample('siclaw_timing_llm', thinkMs);
                     // end_investigation cleanup now driven by dp_status "completed" event from gateway.
                     setMessages(prev => [...prev, {
                         id: `tool-${Date.now()}`,
@@ -426,11 +467,16 @@ export function usePilot() {
                         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                         isStreaming: true,
                         hidden,
+                        startedAt: performance.now(),
+                        llmDurationMs: thinkMs,
+                        waitMs,
                     }]);
                     break;
                 }
 
                 case 'tool_execution_end': {
+                    // Update anchor timestamp for next TTFT calculation
+                    if (payload.ts) lastServerTsRef.current = payload.ts as number;
                     const result = payload.result as { content?: Array<{ type: string; text?: string }>; details?: Record<string, unknown> } | undefined;
                     const resultText = result?.content
                         ?.filter((c: { type: string }) => c.type === 'text')
@@ -443,6 +489,12 @@ export function usePilot() {
                     // Check toolName before entering setMessages to avoid side effects
                     // inside the state updater (React StrictMode calls updaters twice).
                     const endedToolName = payload.toolName as string | undefined;
+                    const endPerfNow = performance.now();
+                    // Capture timing from the running tool BEFORE setMessages (messagesRef is last committed state)
+                    const runningTool = [...messagesRef.current].reverse().find(m => m.role === 'tool' && m.isStreaming);
+                    const durationMsSnap = runningTool?.startedAt != null ? Math.round(endPerfNow - runningTool.startedAt) : undefined;
+                    const toolWaitMs = runningTool?.waitMs;
+                    const toolLlmDurationMs = runningTool?.llmDurationMs;
                     // When deep_search completes, mark all remaining checklist items
                     // as done and auto-clear after 3s. This replaces the old
                     // manage_checklist(conclusion=done) trigger.
@@ -463,6 +515,9 @@ export function usePilot() {
                     setMessages(prev => {
                         const last = prev[prev.length - 1];
                         if (last?.role === 'tool' && last.isStreaming) {
+                            const durationMs = last.startedAt != null
+                                ? Math.round(endPerfNow - last.startedAt)
+                                : undefined;
                             return [
                                 ...prev.slice(0, -1),
                                 {
@@ -470,6 +525,7 @@ export function usePilot() {
                                     content: resultText,
                                     toolStatus: isError ? 'error' as const : 'success' as const,
                                     isStreaming: false,
+                                    durationMs,
                                     ...(toolDetails ? { toolDetails } : {}),
                                     ...(dbMessageId ? { id: dbMessageId } : {}),
                                 }
@@ -477,6 +533,17 @@ export function usePilot() {
                         }
                         return prev;
                     });
+                    // Collect tool execution time sample for dashboard statistics
+                    if (durationMsSnap != null) appendTimingSample('siclaw_timing_tool', durationMsSnap);
+                    // Persist timing + toolStatus to DB via metadata so they survive navigation and session reload
+                    if (dbMessageId && sendRpcRef.current) {
+                        const meta: Record<string, unknown> = {};
+                        meta.toolStatus = isError ? 'error' : 'success';
+                        if (durationMsSnap != null) meta.durationMs = durationMsSnap;
+                        if (toolWaitMs != null) meta.waitMs = toolWaitMs;
+                        if (toolLlmDurationMs != null) meta.llmDurationMs = toolLlmDurationMs;
+                        sendRpcRef.current('message.updateMeta', { id: dbMessageId, metadata: meta }).catch(() => {});
+                    }
                     break;
                 }
 
@@ -515,6 +582,13 @@ export function usePilot() {
                 }
 
                 case 'message_start': {
+                    llmStartRef.current = performance.now();
+                    // Compute TTFT: server ts of this event minus server ts of last anchor
+                    if (payload.ts && lastServerTsRef.current > 0) {
+                        pendingWaitMsRef.current = Math.max(0, Math.round((payload.ts as number) - lastServerTsRef.current));
+                    } else {
+                        pendingWaitMsRef.current = 0;
+                    }
                     const msg = payload.message as { role?: string; customType?: string; details?: Record<string, unknown>; content?: string | Array<{ type: string; text?: string }> } | undefined;
 
                     // Show steer (user) messages injected mid-conversation.
@@ -542,6 +616,36 @@ export function usePilot() {
 
                 case 'message_end': {
                     const endMsg = payload.message as { role?: string; toolName?: string; details?: Record<string, unknown> } | undefined;
+                    // Stamp LLM duration + TTFT onto the last streaming assistant message.
+                    // If LLM only emitted tool calls (no text), no streaming assistant message exists —
+                    // park both in pending refs so tool_execution_start can claim them.
+                    if (endMsg?.role === 'assistant' && llmStartRef.current > 0) {
+                        const llmDurationMs = Math.round(performance.now() - llmStartRef.current);
+                        llmStartRef.current = 0;
+                        const waitMs = pendingWaitMsRef.current || undefined;
+                        pendingWaitMsRef.current = 0;
+                        const hasStreamingAssistant = messagesRef.current.some(
+                            m => m.role === 'assistant' && m.isStreaming
+                        );
+                        if (hasStreamingAssistant) {
+                            if (waitMs != null) appendTimingSample('siclaw_timing_ttft', waitMs);
+                            appendTimingSample('siclaw_timing_llm', llmDurationMs);
+                            setMessages(prev => {
+                                for (let i = prev.length - 1; i >= 0; i--) {
+                                    if (prev[i].role === 'assistant' && prev[i].isStreaming) {
+                                        const updated = [...prev];
+                                        updated[i] = { ...prev[i], llmDurationMs, waitMs };
+                                        return updated;
+                                    }
+                                }
+                                return prev;
+                            });
+                        } else {
+                            pendingLlmDurationMsRef.current = llmDurationMs;
+                            // waitMs stays in pendingWaitMsRef — already cleared above, restore it
+                            pendingWaitMsRef.current = waitMs ?? 0;
+                        }
+                    }
                     if (endMsg?.role === 'toolResult' && endMsg.details && Object.keys(endMsg.details).length > 0) {
                         // Pi-agent brain: tool result details arrive via message_end (not tool_execution_end).
                         // Backfill toolDetails onto the matching tool message.
@@ -601,12 +705,40 @@ export function usePilot() {
                     // During abort, don't unlock here — abortResponse will do it after RPC completes
                     if (!isAbortingRef.current) {
                         setIsLoading(false);
+                        setLoadingStartedAt(null);
                     }
                     setPendingMessages([]);
                     loadSessionsRef.current();
                     fetchContextRef.current();
                     loadModelsRef.current();
                     fetchModelRef.current();
+
+                    // Persist timing for assistant messages — they have no dbMessageId during streaming,
+                    // so we fetch the just-saved DB messages and match by role+content to update metadata.
+                    if (!isAbortingRef.current && sendRpcRef.current && currentSessionKeyRef.current) {
+                        const sessionId = currentSessionKeyRef.current;
+                        const rpc = sendRpcRef.current;
+                        const assistantsToSave = messagesRef.current.filter(m =>
+                            m.role === 'assistant' && (m.llmDurationMs != null || m.waitMs != null)
+                        );
+                        if (assistantsToSave.length > 0) {
+                            setTimeout(async () => {
+                                try {
+                                    const res = await rpc<{ messages: PilotMessage[] }>('chat.history', { sessionId });
+                                    const dbMessages = res.messages ?? [];
+                                    for (const m of assistantsToSave) {
+                                        const match = dbMessages.find(d => d.role === 'assistant' && d.content === m.content);
+                                        if (match) {
+                                            const meta: Record<string, unknown> = {};
+                                            if (m.llmDurationMs != null) meta.llmDurationMs = m.llmDurationMs;
+                                            if (m.waitMs != null) meta.waitMs = m.waitMs;
+                                            await rpc('message.updateMeta', { id: match.id, metadata: meta });
+                                        }
+                                    }
+                                } catch { /* best-effort */ }
+                            }, 800);
+                        }
+                    }
 
                     // DP checklist completion now handled by dp_status "completed" event from gateway.
                     // No safety-net needed — gateway emits dp_status on agent_end when status is concluding.
@@ -688,7 +820,8 @@ export function usePilot() {
         }
     }, [isConnected, sendRpc, workspaceId]);
 
-    // Keep ref in sync
+    // Keep refs in sync
+    sendRpcRef.current = sendRpc;
     loadSessionsRef.current = loadSessions;
     loadModelsRef.current = loadModels;
     fetchModelRef.current = fetchCurrentModel;
@@ -718,6 +851,11 @@ export function usePilot() {
 
     const mapMessages = (raw: PilotMessage[]) => raw.map(m => ({
         ...m,
+        // Restore timing + toolStatus from metadata (persisted at runtime; absent on first load before any conversation)
+        toolStatus: m.toolStatus ?? (m.metadata?.toolStatus as ToolStatus | undefined) ?? (m.role === 'tool' && m.content ? 'success' as ToolStatus : undefined),
+        durationMs: m.durationMs ?? (m.metadata?.durationMs as number | undefined),
+        llmDurationMs: m.llmDurationMs ?? (m.metadata?.llmDurationMs as number | undefined),
+        waitMs: m.waitMs ?? (m.metadata?.waitMs as number | undefined),
         toolInput: m.role === 'tool' && m.toolInput
             ? parseToolInput(m.toolName ?? '', m.toolInput)
             : undefined,
@@ -811,6 +949,9 @@ export function usePilot() {
         };
         setMessages(prev => [...prev, userMsg]);
         setIsLoading(true);
+        setLoadingStartedAt(performance.now());
+        lastServerTsRef.current = Date.now();
+        pendingWaitMsRef.current = 0;
 
         try {
             const result = await sendRpc<{ sessionId: string; brainType?: BrainType }>('chat.send', {
@@ -1278,5 +1419,6 @@ export function usePilot() {
         selectedBrain,
         selectBrain,
         sessionBrainType,
+        loadingStartedAt,
     };
 }
