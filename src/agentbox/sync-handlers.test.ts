@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   createClusterHandler,
   createHostHandler,
+  knowledgeHandler,
   skillsHandler,
 } from "./sync-handlers.js";
 import { CredentialBroker } from "./credential-broker.js";
@@ -22,13 +23,14 @@ import type {
 // ---------------------------------------------------------------------------
 
 let _mockSkillsDir = "";
+let _mockKnowledgeDir = "";
 
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
-    paths: { skillsDir: _mockSkillsDir },
+    paths: { skillsDir: _mockSkillsDir, knowledgeDir: _mockKnowledgeDir },
   }),
   reloadConfig: () => ({
-    paths: { skillsDir: _mockSkillsDir },
+    paths: { skillsDir: _mockSkillsDir, knowledgeDir: _mockKnowledgeDir },
   }),
   writeConfig: () => {},
 }));
@@ -723,5 +725,54 @@ describe("skill directory resolution", () => {
     expect(fs.existsSync(path.join(resolvedDir, "skill-authoring"))).toBe(false);
     expect(fs.existsSync(path.join(platformDir, "skill-authoring", "SKILL.md"))).toBe(true);
     expect(fs.existsSync(path.join(platformDir, "k8s-debug"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// knowledgeHandler — empty-bundle preservation guard (symmetric to skills)
+// ---------------------------------------------------------------------------
+
+describe("knowledgeHandler empty-bundle guard", () => {
+  let knowledgeTmpDir: string;
+
+  beforeEach(() => {
+    knowledgeTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "knowledge-handler-test-"));
+    _mockKnowledgeDir = knowledgeTmpDir;
+  });
+
+  afterEach(() => {
+    fs.rmSync(knowledgeTmpDir, { recursive: true, force: true });
+  });
+
+  it("wipes and returns 0 when empty bundle arrives and knowledgeDir is empty (first spawn)", async () => {
+    const count = await knowledgeHandler.materialize({ version: "v1", repos: [] });
+    expect(count).toBe(0);
+    expect(fs.readdirSync(knowledgeTmpDir)).toEqual([]);
+  });
+
+  it("preserves knowledgeDir contents when empty bundle arrives but content already materialized", async () => {
+    // Seed the dir as if a previous successful sync had happened.
+    fs.writeFileSync(path.join(knowledgeTmpDir, "index.md"), "# Seeded");
+    fs.mkdirSync(path.join(knowledgeTmpDir, "repos", "alpha"), { recursive: true });
+    fs.writeFileSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"), "# alpha");
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const count = await knowledgeHandler.materialize({ version: "v2", repos: [] });
+
+    // Reports what it kept (top-level entries: index.md + repos/)
+    expect(count).toBe(2);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "index.md"))).toBe(true);
+    expect(fs.existsSync(path.join(knowledgeTmpDir, "repos", "alpha", "index.md"))).toBe(true);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("skipping wipe"));
+    warnSpy.mockRestore();
+  });
+
+  it("ignores stale .sync-staging-* leftovers when deciding whether to preserve", async () => {
+    // Only a leftover staging dir — not meaningful content.
+    fs.mkdirSync(path.join(knowledgeTmpDir, ".sync-staging-9999-99"), { recursive: true });
+
+    const count = await knowledgeHandler.materialize({ version: "v1", repos: [] });
+    // No meaningful content → falls through to wipe path → reports 0.
+    expect(count).toBe(0);
   });
 });
