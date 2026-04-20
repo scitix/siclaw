@@ -1128,6 +1128,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
 
+    // Notify BEFORE delete — agent_mcp_servers cascades, so bindings
+    // must still be resolvable when the notifier looks them up.
+    ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
+
     await db.query("DELETE FROM mcp_servers WHERE id = ?", [params.id]);
     sendJson(res, 200, { ok: true });
   });
@@ -1156,6 +1160,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [params.id]) as any;
     sendJson(res, 200, rows[0]);
+
+    // Notify bound agents to reload MCP config
+    ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
   });
 
   // ================================================================
