@@ -285,8 +285,11 @@ export class TaskCoordinator {
       };
       await client.prompt(promptOpts);
 
-      // Seed chat_sessions + user message via RPC
-      await ensureChatSession(sessionId, agentId, userId, job.name, prompt);
+      // Seed chat_sessions + user message via RPC. `origin: "task"` is the
+      // one signal that lets upstream's Metrics dashboard split scheduled cron
+      // activity from interactive chat — without it every cron-triggered
+      // session collapses into the default Interactive world.
+      await ensureChatSession(sessionId, agentId, userId, job.name, prompt, "task");
       await appendMessage({ sessionId, role: "user", content: prompt });
       await incrementMessageCount(sessionId);
 
