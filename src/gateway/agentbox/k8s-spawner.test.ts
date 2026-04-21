@@ -356,24 +356,51 @@ describe("K8sSpawner — get", () => {
 });
 
 describe("K8sSpawner — list + cleanup", () => {
-  it("list() maps pod items through the same status mapper", async () => {
+  it("list() returns every pod and maps status correctly (including terminating → stopped)", async () => {
+    // list() must NOT pre-filter — callers like agent.terminate need to see
+    // zombie pods so they can reap them. Callers like agent.reload filter on
+    // status === "running" at the call site instead. Terminating pods are
+    // mapped to "stopped" because their podIP is already draining.
+    // See bug report siclaw-agent-reload-stale-pods-and-serial-blocking.
     listPodImpl.fn = async () => ({
       items: [
         {
           status: { phase: "Running", podIP: "1.1.1.1", conditions: [{ type: "Ready", status: "True" }] },
-          metadata: { name: "p1", labels: { "siclaw.io/agent": "a1" }, creationTimestamp: "2025-01-01T00:00:00Z" },
+          metadata: { name: "p-live", labels: { "siclaw.io/agent": "a1" }, creationTimestamp: "2025-01-01T00:00:00Z" },
         },
         {
           status: { phase: "Pending" },
-          metadata: { name: "p2", labels: { "siclaw.io/agent": "a2" } },
+          metadata: { name: "p-pending", labels: { "siclaw.io/agent": "a2" } },
+        },
+        {
+          status: { phase: "Succeeded", podIP: "1.1.1.3" },
+          metadata: { name: "p-completed", labels: { "siclaw.io/agent": "a3" } },
+        },
+        {
+          status: { phase: "Failed", podIP: "1.1.1.4" },
+          metadata: { name: "p-failed", labels: { "siclaw.io/agent": "a4" } },
+        },
+        {
+          status: { phase: "Running", podIP: "1.1.1.5", conditions: [{ type: "Ready", status: "False" }] },
+          metadata: { name: "p-not-ready", labels: { "siclaw.io/agent": "a5" } },
+        },
+        {
+          // Running + Ready but Terminating — must map to "stopped"
+          status: { phase: "Running", podIP: "1.1.1.6", conditions: [{ type: "Ready", status: "True" }] },
+          metadata: { name: "p-terminating", labels: { "siclaw.io/agent": "a6" }, deletionTimestamp: "2025-01-01T00:00:00Z" },
         },
       ],
     });
     const s = new K8sSpawner();
     const all = await s.list();
-    expect(all).toHaveLength(2);
-    expect(all[0].status).toBe("running");
-    expect(all[1].status).toBe("starting");
+    expect(all).toHaveLength(6);
+    const byId = Object.fromEntries(all.map((b) => [b.boxId, b.status]));
+    expect(byId["p-live"]).toBe("running");
+    expect(byId["p-pending"]).toBe("starting");
+    expect(byId["p-completed"]).toBe("stopped");
+    expect(byId["p-failed"]).toBe("stopped");
+    expect(byId["p-not-ready"]).toBe("starting");
+    expect(byId["p-terminating"]).toBe("stopped");
   });
 
   it("cleanup() deletes pod + secret collections", async () => {
