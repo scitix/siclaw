@@ -91,7 +91,16 @@ export interface GatewaySyncClientLike {
  */
 export interface ReloadContext {
   /** Active brain sessions that may need to be refreshed after reload. */
-  sessions?: Array<{ id: string; brain: { reload(): Promise<void> } }>;
+  sessions?: Array<{
+    id: string;
+    brain: { reload(): Promise<void> };
+    /**
+     * Force the session to be rebuilt on its next prompt. If a prompt is in
+     * flight, the release is deferred to the prompt's completion callback so
+     * tool execution is not torn down mid-turn. No-op if session already gone.
+     */
+    invalidate?: () => void;
+  }>;
 }
 
 /**

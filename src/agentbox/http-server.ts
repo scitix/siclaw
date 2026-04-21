@@ -735,10 +735,28 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         const payload = await handler.fetch(client ? client.toClientLike() : null);
         const count = await handler.materialize(payload);
 
-        // Build session list for postReload (skills needs brain.reload())
+        // Build session list for postReload. Handlers choose whether to call
+        // brain.reload() (skills/knowledge — in-session hot-reload is safe) or
+        // invalidate() (mcp — session must be rebuilt to pick up the new
+        // toolset). invalidate() defers the release until any in-flight prompt
+        // completes so tool execution is not torn down mid-turn.
         const sessions = sessionManager.list().map((s) => ({
           id: s.id,
           brain: s.brain,
+          invalidate: () => {
+            // Use scheduleRelease(0) instead of release() directly: the 0ms
+            // timer yields to the event loop, so any concurrent getOrCreate
+            // (e.g. user's next message arriving mid-invalidate) can cleanly
+            // clearTimeout() and keep the session alive. Calling release()
+            // synchronously would start an un-cancelable async shutdown that
+            // could tear down mcpManager out from under an in-flight prompt.
+            const doRelease = () => sessionManager.scheduleRelease(s.id, 0);
+            if (s._promptDone) {
+              doRelease();
+            } else {
+              s._promptDoneCallbacks.add(doRelease);
+            }
+          },
         }));
 
         if (handler.postReload) {

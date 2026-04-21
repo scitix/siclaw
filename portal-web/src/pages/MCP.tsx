@@ -284,6 +284,11 @@ export function MCP() {
       setServers((prev) =>
         prev.map((s) => (s.id === server.id ? { ...s, enabled: s.enabled ? 0 : 1 } : s)),
       )
+      toast.success(
+        server.enabled
+          ? "Server disabled — open chats will stop using it on the next message"
+          : "Server enabled — open chats will pick it up on the next message",
+      )
     } catch (err: any) {
       toast.error(err.message)
     } finally {
@@ -302,7 +307,7 @@ export function MCP() {
       await api(`/siclaw/mcp/${server.id}`, { method: "DELETE" })
       setServers((prev) => prev.filter((s) => s.id !== server.id))
       if (editingServer?.id === server.id) setEditingServer(null)
-      toast.success("MCP server deleted")
+      toast.success("MCP server deleted — open chats will stop using it on the next message")
     } catch (err: any) {
       toast.error(err.message)
     }
@@ -316,7 +321,9 @@ export function MCP() {
       <div className="flex items-center justify-between px-6 py-4 border-b border-border">
         <div>
           <h1 className="text-lg font-semibold">MCP Servers</h1>
-          <p className="text-sm text-muted-foreground">Manage Model Context Protocol server connections</p>
+          <p className="text-sm text-muted-foreground">
+            Manage Model Context Protocol server connections · changes apply to the next message in any open chat
+          </p>
         </div>
         {isAdmin && (
           <button onClick={() => { setShowCreate(true); setEditingServer(null) }} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">

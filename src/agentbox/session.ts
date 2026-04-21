@@ -447,10 +447,15 @@ export class AgentBoxSessionManager {
 
   /**
    * Schedule a delayed release for a session.
-   * The release happens after SESSION_RELEASE_TTL_MS of idle time.
-   * If a new prompt arrives before the TTL expires, getOrCreate() cancels the timer.
+   *
+   * Defaults to SESSION_RELEASE_TTL_MS (idle-release grace window). Callers can
+   * pass `ttlMs=0` for a "next-tick" release — the timer still goes through
+   * setTimeout, which means a getOrCreate() landing on the same session before
+   * the timer fires can cleanly clearTimeout() and avoid the shutdown. This
+   * cancel-window matters for reload-triggered invalidate(): see
+   * docs/design/mcp-session-lifecycle.md.
    */
-  scheduleRelease(sessionId: string): void {
+  scheduleRelease(sessionId: string, ttlMs: number = SESSION_RELEASE_TTL_MS): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
 
@@ -459,13 +464,13 @@ export class AgentBoxSessionManager {
       clearTimeout(managed._releaseTimer);
     }
 
-    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${SESSION_RELEASE_TTL_MS / 1000}s`);
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${ttlMs}ms`);
     managed._releaseTimer = setTimeout(() => {
       managed._releaseTimer = null;
       this.release(sessionId).catch((err) => {
         console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
       });
-    }, SESSION_RELEASE_TTL_MS);
+    }, ttlMs);
   }
 
   /**

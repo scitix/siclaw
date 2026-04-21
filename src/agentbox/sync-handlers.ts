@@ -54,9 +54,25 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
     return Object.keys(mcpServers).length;
   },
 
-  async postReload(): Promise<void> {
-    // Reload the in-memory config so subsequent sessions see the new MCP servers.
+  async postReload(context: ReloadContext): Promise<void> {
+    // MCP tool-set is immutable within a session's in-memory lifetime — a running
+    // session holds an McpClientManager with long-lived transports and tool
+    // closures built at session creation time. Hot-swapping the toolset mid-turn
+    // would desync the LLM's tool schema view and strand in-flight tool calls.
+    //
+    // Instead we:
+    //   1. Refresh the in-memory config so the next getOrCreate() builds a
+    //      fresh McpClientManager with current bindings.
+    //   2. Invalidate all active sessions so the rebuild happens on their next
+    //      prompt rather than waiting out the 30s idle release TTL. Invalidate
+    //      is in-flight-safe: it defers the release until the prompt completes.
+    //
+    // See docs/design/mcp-session-lifecycle.md for the full contract.
     reloadConfig();
+    if (!context.sessions?.length) return;
+    for (const session of context.sessions) {
+      session.invalidate?.();
+    }
   },
 };
 

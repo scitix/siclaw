@@ -6,6 +6,7 @@ import {
   createClusterHandler,
   createHostHandler,
   knowledgeHandler,
+  mcpHandler,
   skillsHandler,
 } from "./sync-handlers.js";
 import { CredentialBroker } from "./credential-broker.js";
@@ -135,6 +136,41 @@ describe("per-broker isolation", () => {
       broker2.dispose();
       fs.rmSync(dir2, { recursive: true, force: true });
     }
+  });
+});
+
+// =========================================================================
+// mcpHandler — postReload invalidation contract
+// =========================================================================
+
+describe("mcpHandler.postReload", () => {
+  const dummyBrain = { reload: async () => {} };
+
+  it("invalidates every session in the context", async () => {
+    const inv1 = vi.fn();
+    const inv2 = vi.fn();
+    await mcpHandler.postReload!({
+      sessions: [
+        { id: "s1", brain: dummyBrain, invalidate: inv1 },
+        { id: "s2", brain: dummyBrain, invalidate: inv2 },
+      ],
+    });
+    expect(inv1).toHaveBeenCalledOnce();
+    expect(inv2).toHaveBeenCalledOnce();
+  });
+
+  it("is a no-op when sessions is empty or missing", async () => {
+    await expect(mcpHandler.postReload!({})).resolves.toBeUndefined();
+    await expect(mcpHandler.postReload!({ sessions: [] })).resolves.toBeUndefined();
+  });
+
+  it("tolerates sessions without an invalidate callback", async () => {
+    // Older code paths (or a handler mis-wiring) may omit invalidate — must
+    // not throw, since postReload is called for every reload and a crash here
+    // would poison the whole fan-out.
+    await expect(
+      mcpHandler.postReload!({ sessions: [{ id: "s1", brain: dummyBrain }] }),
+    ).resolves.toBeUndefined();
   });
 });
 
