@@ -502,6 +502,12 @@ export class K8sSpawner implements BoxSpawner {
    * Map Pod phase to AgentBoxStatus
    */
   private mapPodStatus(pod: k8s.V1Pod): AgentBoxStatus {
+    // Terminating pods (deletionTimestamp set) may still report
+    // phase=Running and Ready=True during the grace period, but their
+    // podIP is on its way out — treat them as stopped so callers that
+    // filter on status="running" (e.g. agent.reload) skip them.
+    if (pod.metadata?.deletionTimestamp) return "stopped";
+
     const phase = pod.status?.phase;
     const ready = pod.status?.conditions?.find((c) => c.type === "Ready")?.status === "True";
 

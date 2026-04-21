@@ -324,29 +324,41 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const resourceTypes = (params.resources as string[] | undefined) ?? ["skills", "mcp", "cluster", "host", "knowledge"];
 
     const boxes = await agentBoxManager.list();
-    const targets = boxes.filter((b) => b.agentId === agentId);
+    // Only "running" boxes are reachable — Pending/Terminating/Succeeded/Failed
+    // pods either have no podIP yet or a stale one, and RPCs to them would
+    // ETIMEDOUT and slow the whole fan-out. See bug report
+    // "siclaw-agent-reload-stale-pods-and-serial-blocking".
+    const targets = boxes.filter((b) => b.agentId === agentId && b.status === "running");
 
     if (targets.length === 0) {
       console.log(`[rpc] agent.reload: no active boxes for agent=${agentId}, skipping`);
       return { ok: true, reloaded: [], skipped: resourceTypes, boxes: 0 };
     }
 
-    const reloaded: string[] = [];
-    const failed: string[] = [];
+    // Fan out across boxes AND resource types concurrently so one slow box
+    // (network hiccup, etc.) cannot serially block the reload on others.
+    const reloadedSet = new Set<string>();
+    const failedSet = new Set<string>();
 
-    for (const box of targets) {
-      const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
-      for (const rt of resourceTypes) {
-        try {
-          await client.reloadResource(rt as import("../shared/gateway-sync.js").GatewaySyncType);
-          if (!reloaded.includes(rt)) reloaded.push(rt);
-        } catch (err: any) {
-          console.warn(`[rpc] agent.reload: ${rt} failed for box=${box.boxId}: ${err.message}`);
-          if (!failed.includes(rt)) failed.push(rt);
-        }
-      }
-    }
+    await Promise.all(
+      targets.map(async (box) => {
+        const client = new AgentBoxClient(box.endpoint, 15_000, agentBoxTlsOptions);
+        await Promise.all(
+          resourceTypes.map(async (rt) => {
+            try {
+              await client.reloadResource(rt as import("../shared/gateway-sync.js").GatewaySyncType);
+              reloadedSet.add(rt);
+            } catch (err: any) {
+              console.warn(`[rpc] agent.reload: ${rt} failed for box=${box.boxId}: ${err.message}`);
+              failedSet.add(rt);
+            }
+          }),
+        );
+      }),
+    );
 
+    const reloaded = Array.from(reloadedSet);
+    const failed = Array.from(failedSet);
     console.log(`[rpc] agent.reload: agent=${agentId} boxes=${targets.length} reloaded=[${reloaded}] failed=[${failed}]`);
     return { ok: true, reloaded, failed, boxes: targets.length };
   });
