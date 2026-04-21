@@ -395,6 +395,12 @@ describe("TaskCoordinator execution", () => {
     await coord.fireNow("t1");
     await new Promise((r) => setTimeout(r, 20));
     expect(ensureCalls).toHaveLength(1);
+    // ensureChatSession signature: (sessionId, agentId, userId, title, preview, origin)
+    // The 6th argument MUST be "task" — that's the single signal upstream's
+    // Metrics dashboard uses to separate scheduled cron activity from
+    // interactive chat. Dropping it silently collapses every cron session
+    // into the Interactive world.
+    expect(ensureCalls[0][5]).toBe("task");
     const userMsg = appendCalls.find((m) => m.role === "user");
     expect(userMsg).toBeDefined();
     expect(userMsg.content).toBe("Check everything");
