@@ -17,7 +17,10 @@ interface ManageScheduleParams {
   status?: "active" | "paused";
 }
 
-export function createManageScheduleTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createManageScheduleTool(
+  kubeconfigRef?: KubeconfigRef,
+  sessionIdRef?: { current: string },
+): ToolDefinition {
   return {
     name: "manage_schedule",
     label: "Manage Schedule",
@@ -108,7 +111,11 @@ Common cron patterns:
 
       const cfg = loadConfig();
       const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
-      const client = new GatewayClient({ gatewayUrl });
+      // Thread current chat sessionId so the Gateway can resolve the task
+      // owner (userId) via sessionRegistry. Without this, task rows land
+      // with empty created_by and downstream cron-task notifications
+      // silently drop at upstream's TaskNotify (empty-userID guard).
+      const client = new GatewayClient({ gatewayUrl, sessionId: sessionIdRef?.current });
 
       const fail = (msg: string) => ({
         content: [{ type: "text" as const, text: JSON.stringify({ error: msg }) }],
@@ -227,7 +234,7 @@ Common cron patterns:
 
 export const registration: ToolEntry = {
   category: "workflow",
-  create: (refs) => createManageScheduleTool(refs.kubeconfigRef),
+  create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef),
   modes: ["web", "channel"],
   platform: true,
 };

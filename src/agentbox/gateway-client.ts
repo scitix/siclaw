@@ -13,6 +13,15 @@ import path from "node:path";
 export interface GatewayClientOptions {
   gatewayUrl: string;
   certPath?: string; // Directory containing tls.crt, tls.key, ca.crt
+  /**
+   * Chat session ID threaded through to the Gateway's internal-api so it can
+   * resolve the user identity via sessionRegistry. Required on task mutation
+   * calls (create/update/delete) if the task's `created_by` should be attributed
+   * to the chat user rather than left blank — without it, the Runtime-side
+   * sessionRegistry.resolveUser falls back to empty string and downstream
+   * cron-task notifications can't route to a user.
+   */
+  sessionId?: string;
 }
 
 export interface AgentTask {
@@ -30,9 +39,11 @@ export interface AgentTask {
 export class GatewayClient {
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
+  private sessionId?: string;
 
   constructor(options: GatewayClientOptions) {
     this.gatewayUrl = options.gatewayUrl.replace(/\/$/, ""); // Remove trailing slash
+    this.sessionId = options.sessionId;
 
     // Load client certificates if certPath provided
     const certPath = options.certPath || process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
@@ -78,7 +89,7 @@ export class GatewayClient {
     description?: string;
     status?: "active" | "paused";
   }): Promise<AgentTask> {
-    return this.request("/api/internal/agent-tasks", "POST", input);
+    return this.request("/api/internal/agent-tasks", "POST", this.withSession(input));
   }
 
   async updateAgentTask(
@@ -91,11 +102,24 @@ export class GatewayClient {
       status: "active" | "paused";
     }>,
   ): Promise<AgentTask> {
-    return this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}`, "PUT", updates);
+    return this.request(
+      `/api/internal/agent-tasks/${encodeURIComponent(taskId)}`,
+      "PUT",
+      this.withSession(updates),
+    );
   }
 
   async deleteAgentTask(taskId: string): Promise<void> {
-    await this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}`, "DELETE");
+    // DELETE has no body; the internal-api handler reads session_id from the
+    // URL query string (see src/gateway/internal-api.ts handleAgentTasksDelete).
+    const qs = this.sessionId ? `?session_id=${encodeURIComponent(this.sessionId)}` : "";
+    await this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}${qs}`, "DELETE");
+  }
+
+  /** Spread the current session_id into a request body (no-op if not set). */
+  private withSession<T extends object>(body: T): T & { session_id?: string } {
+    if (!this.sessionId) return body;
+    return { ...body, session_id: this.sessionId };
   }
 
   /**
