@@ -145,6 +145,80 @@ describe("consumeAgentSse — tool execution", () => {
     expect(appendCalls.find((r) => r.role === "tool").outcome).toBe("error");
   });
 
+  it("persists tool details as metadata (dropping blocked/error flags that are surfaced via outcome)", async () => {
+    // deep_search returns a rich `details` object the UI needs to rebuild
+    // InvestigationCard on history reload. Verify the structured payload
+    // survives the sse-consumer → appendMessage boundary intact.
+    const hypotheses = [
+      { id: "H1", text: "Secret missing", status: "validated", confidence: 80, toolCallsUsed: 6 },
+      { id: "H2", text: "DNS failure", status: "invalidated", confidence: 20, toolCallsUsed: 4 },
+    ];
+    const events = [
+      { type: "tool_execution_start", toolName: "deep_search", args: { question: "why?" } },
+      { type: "tool_execution_end", toolName: "deep_search",
+        result: {
+          content: [{ type: "text", text: "## Summary\n..." }],
+          details: {
+            dpStatus: "concluding",
+            hypothesesTotal: 2,
+            hypothesesValidated: 1,
+            hypotheses,
+          },
+        } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const toolRow = appendCalls.find((r) => r.role === "tool");
+    expect(toolRow.metadata).toBeDefined();
+    expect(toolRow.metadata.hypotheses).toEqual(hypotheses);
+    expect(toolRow.metadata.hypothesesTotal).toBe(2);
+    expect(toolRow.metadata.dpStatus).toBe("concluding");
+  });
+
+  it("skips metadata when details contains only blocked/error (already captured by outcome)", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "bash", args: {} },
+      { type: "tool_execution_end", toolName: "bash",
+        result: { content: [{ type: "text", text: "fail" }], details: { error: true } } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const toolRow = appendCalls.find((r) => r.role === "tool");
+    expect(toolRow.metadata).toBeNull();
+  });
+
+  it("skips metadata when details is absent", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "kubectl", args: {} },
+      { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const toolRow = appendCalls.find((r) => r.role === "tool");
+    expect(toolRow.metadata).toBeNull();
+  });
+
+  it("redacts secrets inside persisted metadata via JSON round-trip", async () => {
+    const redactionConfig = { patterns: [/sk-[a-z0-9]+/g] };
+    const events = [
+      { type: "tool_execution_start", toolName: "deep_search", args: {} },
+      { type: "tool_execution_end", toolName: "deep_search",
+        result: {
+          content: [{ type: "text", text: "ok" }],
+          details: {
+            evidence: [{ output: "saw token sk-abcdef in log" }],
+          },
+        } },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "s", userId: "u",
+      persistMessages: true,
+      redactionConfig,
+    });
+    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const evidence = (toolRow.metadata.evidence as Array<{ output: string }>)[0];
+    expect(evidence.output).not.toContain("sk-abcdef");
+    expect(evidence.output).toContain("[REDACTED]");
+  });
+
   it("extracts task_report into taskReportText and prioritises it over resultText", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "task_report", args: { summary: "done" } },
