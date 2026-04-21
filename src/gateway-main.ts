@@ -126,6 +126,7 @@ const taskCoordinator = new TaskCoordinator({
           status: evt.status,
           title,
           message,
+          durationMs: evt.durationMs,
         }).catch((err) => {
           console.warn(`[runtime] task-notify RPC failed: ${err instanceof Error ? err.message : String(err)}`);
         });
