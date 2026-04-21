@@ -92,7 +92,7 @@ describe("appendMessage", () => {
     });
   });
 
-  it("passes all optional fields straight through to the RPC", async () => {
+  it("passes all optional fields straight through to the RPC, stringifying metadata", async () => {
     fake.responses.set("chat.appendMessage", { id: "id-x" });
     await appendMessage({
       sessionId: "sid",
@@ -104,13 +104,15 @@ describe("appendMessage", () => {
       outcome: "success",
       durationMs: 42,
     });
+    // metadata is JSON-stringified so upstream's Go ptrStr handler (string-only)
+    // accepts it; the object contract is still the public API for callers.
     expect(fake.calls[0].params).toEqual({
       session_id: "sid",
       role: "tool",
       content: "result",
       tool_name: "kube",
       tool_input: "get pods",
-      metadata: { a: 1 },
+      metadata: "{\"a\":1}",
       outcome: "success",
       duration_ms: 42,
     });

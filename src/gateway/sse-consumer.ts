@@ -71,6 +71,41 @@ function stripEmptyResponseMarkers(text: string): string {
   return text.replace(/\s*\(Empty response:\s*\{[\s\S]*?\}\)\s*/g, "").trimEnd();
 }
 
+/**
+ * Pick the subset of tool-result `details` worth persisting as message
+ * metadata. The `blocked`/`error` flags are already surfaced via the message's
+ * `outcome` column — dropping them here avoids duplicate storage. Anything
+ * else (e.g. `propose_hypotheses`'s `hypotheses` array, `deep_search`'s rich
+ * per-hypothesis validation results) is passed through so the UI can rebuild
+ * cards like InvestigationCard on history reload without the ephemeral live
+ * stream.
+ *
+ * Redaction is applied via a JSON round-trip so patterns hit string values
+ * nested inside arrays/objects. If redaction somehow produces invalid JSON
+ * (defensive only — current redactText just substitutes `[REDACTED]` which is
+ * safe inside JSON strings), the metadata is dropped rather than persisted
+ * corrupt.
+ */
+function extractPersistableDetails(
+  details: Record<string, unknown> | undefined,
+  redactionConfig: RedactionConfig,
+): Record<string, unknown> | null {
+  if (!details) return null;
+
+  const { blocked: _blocked, error: _error, ...rest } = details;
+  if (Object.keys(rest).length === 0) return null;
+
+  if (redactionConfig.patterns.length === 0) return rest;
+
+  const serialized = JSON.stringify(rest);
+  const redacted = redactText(serialized, redactionConfig);
+  try {
+    return JSON.parse(redacted) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
   const { client, sessionId, userId, onEvent, signal } = opts;
   const persist = opts.persistMessages === true;
@@ -111,7 +146,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "tool_execution_end") {
       const toolResult = evt.result as {
         content?: Array<{ type: string; text?: string }>;
-        details?: { blocked?: boolean; error?: boolean };
+        details?: Record<string, unknown>;
       } | undefined;
       const text =
         toolResult?.content
@@ -127,6 +162,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       const toolStartTime = pendingToolStartTimes.get(toolName);
       const durationMs = toolStartTime != null ? Date.now() - toolStartTime : undefined;
       const toolInput = pendingToolInputs.get(toolName) || "";
+      const metadata = extractPersistableDetails(toolResult?.details, redactionConfig);
 
       if (persist) {
         dbMessageId = await appendMessage({
@@ -137,6 +173,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
           outcome,
           durationMs: durationMs ?? null,
+          metadata,
         });
         await incrementMessageCount(sessionId);
       }

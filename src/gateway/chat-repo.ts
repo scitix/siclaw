@@ -59,6 +59,11 @@ export async function ensureChatSession(
 
 /**
  * Insert a single message row via RPC. Returns the generated id.
+ *
+ * `metadata` is JSON-stringified before sending because upstream's Go RPC
+ * handler extracts it with `ptrStr(...)` which only accepts string values;
+ * passing a bare object would silently drop to nil on the wire. The read
+ * path in `getMessages` below reverses the transformation.
  */
 export async function appendMessage(msg: AppendMessageInput): Promise<string> {
   const result = await getClient().request("chat.appendMessage", {
@@ -67,7 +72,7 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     content: msg.content,
     tool_name: msg.toolName ?? null,
     tool_input: msg.toolInput ?? null,
-    metadata: msg.metadata ?? null,
+    metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
     outcome: msg.outcome ?? null,
     duration_ms: msg.durationMs ?? null,
   });
