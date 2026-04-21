@@ -16,13 +16,21 @@ import {
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
-import { InputArea } from "./InputArea"
+import { InputArea, type PrefixChip } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
 import { InvestigationCard } from "./InvestigationCard"
 import { HypothesesCard } from "./HypothesesCard"
 import { DpChecklistCard } from "./DpChecklistCard"
 import type { PilotMessage, ContextUsage, InvestigationProgress, DpChecklistItem } from "./types"
+
+const DIG_DEEPER_CHIP: PrefixChip = {
+  id: "dig-deeper",
+  label: "Dig deeper",
+  fullPrompt:
+    "Your conclusion may not be the root cause. Please dig deeper — trace where the problematic values, configurations, or states come from. Check the upstream resources, dependencies, and configuration sources until you find the original cause.",
+  placeholder: "Add detail for deeper investigation (optional)",
+}
 
 const THINKING_TIPS = [
   "Thinking...",
@@ -99,6 +107,12 @@ export function PilotArea({
   const [chipSeq, setChipSeq] = useState(0)
   const [chipDraft, setChipDraft] = useState<string | null>(null)
 
+  // Active prefix chip (e.g. "Dig deeper") shown as atomic pill in the input
+  const [activePrefix, setActivePrefix] = useState<PrefixChip | null>(null)
+  useEffect(() => {
+    setActivePrefix(null)
+  }, [sessionKey])
+
   const lastSentRef = useRef<string | null>(null)
   const wrappedSendMessage = useCallback(
     (text: string) => {
@@ -141,6 +155,25 @@ export function PilotArea({
     }
     return null
   }, [messages])
+
+  // Dig deeper button visibility — intentionally permissive.
+  // Show whenever a non-streaming assistant reply exists in the current turn
+  // outside Deep Investigation. Agency is with the user; no click-count cap.
+  const showTraceButton = useMemo(() => {
+    if (isLoading) return false
+    if (dpActive || (dpChecklist && dpChecklist.length > 0)) return false
+    let turnStart = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        turnStart = i
+        break
+      }
+    }
+    if (turnStart < 0) return false
+    return messages
+      .slice(turnStart + 1)
+      .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
+  }, [messages, isLoading, dpActive, dpChecklist])
 
   // Check if latest hypotheses were already confirmed
   const latestHypothesesConfirmed = useMemo(() => {
@@ -249,6 +282,22 @@ export function PilotArea({
                   />
                 ))}
 
+              {/* Dig deeper — shown when agent produced a conclusion and user may want
+                  to trace the root cause upstream. Hidden while a prefix chip is active. */}
+              {showTraceButton && !activePrefix && (
+                <div className="flex justify-start pl-12 my-2">
+                  <button
+                    type="button"
+                    disabled={isLoading}
+                    onClick={() => setActivePrefix(DIG_DEEPER_CHIP)}
+                    className="flex items-center gap-2 px-5 py-2 rounded-full bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white text-sm font-medium shadow-sm hover:shadow-md transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <SearchCode className="w-4 h-4" />
+                    Dig deeper
+                  </button>
+                </div>
+              )}
+
               {/* DP Checklist Card */}
               {dpChecklist && dpChecklist.length > 0 && (
                 <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
@@ -274,6 +323,8 @@ export function PilotArea({
         hasMessages={messages.length > 0}
         draft={chipDraft}
         draftSeq={chipSeq}
+        activePrefix={activePrefix}
+        onClearPrefix={() => setActivePrefix(null)}
       />
     </div>
   )

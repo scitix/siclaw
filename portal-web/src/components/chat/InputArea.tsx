@@ -17,6 +17,18 @@ function formatCost(cost: number): string {
   return "$" + cost.toFixed(2)
 }
 
+/**
+ * A canned prompt presented as an atomic pill in the input area.
+ * The user cannot edit label text; they type follow-up detail after it and
+ * fullPrompt is expanded on send.
+ */
+export interface PrefixChip {
+  id: string
+  label: string
+  fullPrompt: string
+  placeholder?: string
+}
+
 interface InputAreaProps {
   onSend: (message: string) => void
   onAbort?: () => void
@@ -31,6 +43,8 @@ interface InputAreaProps {
   hasMessages?: boolean
   draft?: string | null
   draftSeq?: number
+  activePrefix?: PrefixChip | null
+  onClearPrefix?: () => void
 }
 
 export function InputArea({
@@ -47,6 +61,8 @@ export function InputArea({
   hasMessages,
   draft,
   draftSeq,
+  activePrefix,
+  onClearPrefix,
 }: InputAreaProps) {
   const [value, setValue] = useState("")
   const [isFocused, setIsFocused] = useState(false)
@@ -81,29 +97,45 @@ export function InputArea({
 
   const handleSend = useCallback(async () => {
     const text = value.trim()
-    if (!text || disabled) return
+    if (disabled) return
+    if (!text && !activePrefix) return
 
     let fullMessage = ""
     if (deepInvestigation) {
       fullMessage += "[Deep Investigation]\n"
     }
-    fullMessage += text
+    if (activePrefix) {
+      fullMessage += activePrefix.fullPrompt
+      if (text) fullMessage += `\n\nAdditional direction from user: ${text}`
+    } else {
+      fullMessage += text
+    }
 
     onSend(fullMessage.trim())
     setValue("")
-  }, [value, disabled, onSend, deepInvestigation])
+    onClearPrefix?.()
+  }, [value, disabled, onSend, deepInvestigation, activePrefix, onClearPrefix])
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // Backspace at cursor=0 with active prefix → atomic delete of the pill
+      if (e.key === "Backspace" && activePrefix && !isComposingRef.current) {
+        const el = textareaRef.current
+        if (el && el.selectionStart === 0 && el.selectionEnd === 0) {
+          e.preventDefault()
+          onClearPrefix?.()
+          return
+        }
+      }
       if (e.key === "Enter" && !e.shiftKey && !isComposingRef.current && !e.nativeEvent.isComposing) {
         e.preventDefault()
         handleSend()
       }
     },
-    [handleSend],
+    [handleSend, activePrefix, onClearPrefix],
   )
 
-  const hasContent = value.trim()
+  const hasContent = value.trim() || !!activePrefix
 
   return (
     <>
@@ -180,6 +212,24 @@ export function InputArea({
               </div>
             )}
 
+            {/* Prefix chip — canned prompt presented as atomic pill */}
+            {activePrefix && (
+              <div className="flex flex-wrap gap-2 px-4 pb-1">
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-purple-500/10 border-purple-500/30 text-purple-400">
+                  <SearchCode className="w-3.5 h-3.5 text-purple-500" />
+                  <span>{activePrefix.label}</span>
+                  <button
+                    type="button"
+                    className="ml-0.5 p-0.5 rounded hover:bg-purple-500/20 transition-colors"
+                    onClick={() => onClearPrefix?.()}
+                    title="Remove"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Pending steer messages */}
             {pendingMessages && pendingMessages.length > 0 && (
               <div className="flex flex-col gap-1 px-4 pb-1">
@@ -216,7 +266,11 @@ export function InputArea({
                 onCompositionEnd={() => {
                   isComposingRef.current = false
                 }}
-                placeholder={disabled ? "Connecting..." : "Reply..."}
+                placeholder={
+                  disabled
+                    ? "Connecting..."
+                    : activePrefix?.placeholder ?? "Reply..."
+                }
                 disabled={disabled}
                 className="w-full bg-transparent border-none outline-none px-6 py-3 pr-14 text-[15px] text-foreground placeholder:text-muted-foreground/70 focus:ring-0 focus:outline-none resize-none min-h-[48px] max-h-[200px] disabled:cursor-not-allowed"
                 rows={1}
