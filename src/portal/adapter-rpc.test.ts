@@ -427,7 +427,7 @@ describe("credential.get", () => {
 
   it("returns SSH key file for host credential with key auth", async () => {
     mockQuery(
-      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----" }],
+      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----", is_production: 1, description: "db node" }],
       [{ "1": 1 }],  // binding check
     );
 
@@ -435,10 +435,14 @@ describe("credential.get", () => {
       { source: "host", source_id: "web-1" }, "agent-1",
     );
     expect(result.credential.type).toBe("ssh");
-    expect(result.credential.host).toBe("10.0.0.1");
-    expect(result.credential.port).toBe(22);
-    expect(result.credential.username).toBe("root");
-    expect(result.credential.auth_type).toBe("key");
+    expect(result.credential.metadata).toEqual({
+      ip: "10.0.0.1",
+      port: 22,
+      username: "root",
+      auth_type: "key",
+      is_production: true,
+      description: "db node",
+    });
     expect(result.credential.files).toEqual([
       { name: "host.key", content: "-----BEGIN RSA-----", mode: 0o600 },
     ]);
