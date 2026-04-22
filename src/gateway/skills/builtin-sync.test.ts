@@ -53,10 +53,12 @@ describe("parseSkillsDir", () => {
   });
 
   // ── 2. nonexistent directory ────────────────────────────────────────
-  it("throws when the directory does not exist", () => {
-    // readdirSync throws ENOENT — parseSkillsDir does not catch it
+  it("returns [] when the directory does not exist", () => {
+    // Missing directory is a valid state (e.g. slim deployment that stripped
+    // skills/); parseSkillsDir returns [] so callers can fall through their
+    // own empty-result guard rather than crash on ENOENT.
     const bogus = path.join(tmpDir, "does-not-exist");
-    expect(() => parseSkillsDir(bogus)).toThrow();
+    expect(parseSkillsDir(bogus)).toEqual([]);
   });
 
   // ── 3. basic frontmatter ────────────────────────────────────────────

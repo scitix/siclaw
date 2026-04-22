@@ -18,11 +18,18 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getDb } from "../db.js";
 
-// Resolve skills/core/ relative to CWD (project root in both dev and Docker).
-const SKILLS_CORE_DIR = resolve(process.cwd(), "skills/core");
+/**
+ * Resolve skills/core/ relative to the installed package, not process.cwd().
+ * This file lives at `<pkg>/dist/gateway/skills/builtin-sync.js` (or
+ * `<pkg>/src/gateway/skills/builtin-sync.ts` during dev), so walking three
+ * directories up always lands at the package root regardless of where the
+ * user invoked the CLI from.
+ */
+export const SKILLS_CORE_DIR = fileURLToPath(new URL("../../../skills/core", import.meta.url));
 
 interface ScriptEntry {
   name: string;
@@ -144,6 +151,11 @@ function computeHash(specs: string, scripts: ScriptEntry[]): string {
  *       scripts/         (optional) — .sh and .py files
  */
 export function parseSkillsDir(skillsDir: string): ParsedSkill[] {
+  // Called with paths computed relative to the package — if the directory
+  // is missing (e.g. a minimal deployment that stripped skills/), return
+  // an empty list so callers can fall through their own empty-result guard.
+  if (!existsSync(skillsDir)) return [];
+
   // Load label map from meta.json if present
   const metaPath = join(skillsDir, "meta.json");
   let labelsMap: Record<string, string[]> = {};
