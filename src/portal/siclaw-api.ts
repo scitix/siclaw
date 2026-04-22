@@ -1323,7 +1323,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // ================================================================
   // Tasks (Agent sub-resource) — scheduled cron jobs
   //
-  // Runtime owns scheduling + execution. Clients (Portal / future upstream)
+  // Runtime owns scheduling + execution. Clients (Portal / future frontend)
   // hit these over REST; the TaskCoordinator inside Runtime picks up changes
   // on its next DB sync (≤60s) and fires runs via AgentBoxClient directly.
   // ================================================================

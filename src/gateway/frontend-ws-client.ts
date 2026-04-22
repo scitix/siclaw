@@ -178,7 +178,7 @@ export class FrontendWsClient {
     });
 
     ws.on("open", () => {
-      console.log(`[upstream-ws] connected to ${url}`);
+      console.log(`[frontend-ws] connected to ${url}`);
       this._connected = true;
       this.ws = ws;
       this.reconnectAttempt = 0;
@@ -196,7 +196,7 @@ export class FrontendWsClient {
     });
 
     ws.on("close", () => {
-      console.log("[upstream-ws] connection closed");
+      console.log("[frontend-ws] connection closed");
       this._connected = false;
       this.ws = null;
       // Reject any in-flight RPCs immediately — the WS that would have
@@ -209,7 +209,7 @@ export class FrontendWsClient {
     });
 
     ws.on("error", (err: Error) => {
-      console.error("[upstream-ws] connection error:", err.message);
+      console.error("[frontend-ws] connection error:", err.message);
       // If we haven't connected yet, reject the connect() promise
       if (this.connectReject) {
         this.connectReject(err);
@@ -288,7 +288,7 @@ export class FrontendWsClient {
     const jitter = Math.random() * JITTER_MAX_MS;
     const delay = backoff + jitter;
 
-    console.log(`[upstream-ws] reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt + 1})`);
+    console.log(`[frontend-ws] reconnecting in ${Math.round(delay)}ms (attempt ${this.reconnectAttempt + 1})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

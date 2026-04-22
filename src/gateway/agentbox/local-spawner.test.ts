@@ -74,7 +74,7 @@ beforeEach(() => {
   sessionManagerShutdownCalls.length = 0;
 
   origCwd = process.cwd();
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "local-spawner-"));
+  tmpDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "local-spawner-")));
   process.chdir(tmpDir);
 });
 

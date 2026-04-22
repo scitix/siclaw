@@ -15,7 +15,7 @@ vi.mock("../agentbox/client.js", () => ({
   },
 }));
 
-// Stub channel-manager RPCs so we don't hit upstream-ws in unit tests.
+// Stub channel-manager RPCs so we don't hit frontend-ws in unit tests.
 const resolveBindingMock = vi.fn();
 const handlePairingCodeMock = vi.fn();
 

@@ -29,9 +29,9 @@ if (!config.runtimeSecret) {
 }
 
 // Runtime no longer accesses the database directly — all persistence
-// goes through Portal via FrontendWsClient RPC.
+// goes through Portal/Upstream via FrontendWsClient RPC.
 
-// ── FrontendWsClient — persistent WS connection to Portal ───
+// ── FrontendWsClient — persistent WS connection to Portal/Upstream ───
 const frontendClient = new FrontendWsClient({
   serverUrl: config.serverUrl,
   portalSecret: config.portalSecret,
@@ -107,7 +107,7 @@ const taskCoordinator = new TaskCoordinator({
   agentBoxManager,
   agentBoxTlsOptions: runtime.agentBoxTlsOptions,
   retentionDays,
-  // Best-effort fire-and-forget: if Portal is down or rejects, this fire's
+  // Best-effort fire-and-forget: if Portal/Upstream is down or rejects, this fire's
   // notification is lost. Acceptable for a low-frequency task-alert channel
   // — the run record is already durable in agent_task_runs so users can
   // still find the result through the UI.
