@@ -1437,7 +1437,7 @@ export function createRpcMethods(
 
     // Send prompt
     const systemPromptTemplate = workspace?.configJson?.systemPrompt || undefined;
-    const result = await client.prompt({ sessionId, text: promptText, modelProvider, modelId, brainType, systemPromptTemplate, modelConfig, credentials });
+    const result = await client.prompt({ sessionId, text: promptText, modelProvider, modelId, brainType, systemPromptTemplate, modelConfig, credentials, username });
     console.log(`[rpc] prompt sent → sessionId=${result.sessionId}`);
 
     // Build redaction config from credential payload + model secrets (sanitize outbound WS stream)

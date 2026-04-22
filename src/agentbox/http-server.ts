@@ -241,7 +241,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> }; username?: string };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -321,7 +321,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
       if (!managed._promptDone) {
-        managed._eventBuffer.push(event);
+        // Stamp with server time when emitted so replayed events have accurate timestamps
+        const tsEvent = typeof event === "object" && event !== null
+          ? { ...(event as object), ts: Date.now() }
+          : event;
+        managed._eventBuffer.push(tsEvent);
       }
       // Null dpState.checklist when deep_search completes — this is the exit signal
       // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
@@ -343,6 +347,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           type: "tool_progress",
           toolName: "deep_search",
           progress: event,
+          ts: Date.now(),
         });
       }
       // Sync phase events to SDK brain's dpState so the auto-continue loop
@@ -436,6 +441,19 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       } catch { /* best-effort, don't block prompt */ }
     }
 
+    // Mark the explicit trace boundary: ONE user prompt = ONE trace file, even
+    // if pi-agent internally fires multiple agent_start/end cycles (retry or
+    // auto-compaction). beginPrompt is the start, endPrompt is called below in
+    // actuallyFinish() after the whole prompt (including any retries) settles.
+    // Also forward the displayable username so filenames use "admin" instead of
+    // the internal hex userId.
+    if (managed._traceRecorder) {
+      try {
+        if (typeof body.username === "string" && body.username) managed._traceRecorder.setUsername(body.username);
+        if (typeof body.text === "string") managed._traceRecorder.beginPrompt(body.text);
+      } catch { /* best-effort */ }
+    }
+
     // Execute prompt asynchronously; notify SSE to close on completion
     console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
 
@@ -460,6 +478,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         outcome: promptOutcome,
         userId: sessionManager.userId,
       });
+
+      // Flush the explicit trace — fires ONCE per user prompt, even if pi-agent
+      // internally executed multiple agent_start/end cycles (retry, compaction).
+      // actuallyFinish() is the definitive "prompt is truly done" point (it waits
+      // for auto_compaction_end / auto_retry_end before firing).
+      if (managed._traceRecorder) {
+        try { managed._traceRecorder.endPrompt(promptOutcome); } catch { /* best-effort */ }
+      }
 
       // Stop buffering
       if (managed._bufferUnsub) {
@@ -551,7 +577,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (closed || res.writableEnded) return;
       try {
         sseEventCount++;
-        const data = JSON.stringify(event);
+        // Add server timestamp if not already present (buffered events carry their original ts)
+        const out = typeof event === "object" && event !== null && !("ts" in (event as object))
+          ? { ...(event as object), ts: Date.now() }
+          : event;
+        const data = JSON.stringify(out);
         res.write(`data: ${data}\n\n`);
       } catch (err) {
         console.warn(`[agentbox-http] SSE write error for session ${sessionId}:`, err);
@@ -674,6 +704,13 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
+    // Record a standalone trace row for this steer BEFORE the brain consumes
+    // it. Steer messages bypass the /api/prompt path that normally triggers
+    // beginPrompt(), so without this the DP button clicks ([DP_CONFIRM],
+    // [DP_ADJUST], [DP_SKIP], [DP_REINVESTIGATE]) leave zero audit trail.
+    if (managed._traceRecorder) {
+      try { managed._traceRecorder.recordSteerEvent(body.text); } catch { /* best-effort */ }
+    }
     try {
       await managed.brain.steer(body.text);
       sendJson(res, 200, { ok: true });
@@ -992,6 +1029,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       sendJson(res, 500, { error: `Memory reset failed: ${err.message}` });
     }
   });
+
+  // NOTE: /api/traces routes are intentionally NOT registered here.
+  // They live on the Gateway (src/gateway/server.ts) because querying the
+  // trace DB is a pure read that must not depend on the lazy-spawned
+  // AgentBox — you shouldn't have to send a prompt before you can query.
 
   // ==================== Server ====================
 

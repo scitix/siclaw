@@ -170,6 +170,7 @@ export function PilotPage() {
                         onNavigateCredentials={() => navigate('/credentials')}
                         sessionKey={pilot.currentSessionKey}
                         isAdmin={isAdmin}
+                        loadingStartedAt={pilot.loadingStartedAt}
                     />
                 </div>
             </div>

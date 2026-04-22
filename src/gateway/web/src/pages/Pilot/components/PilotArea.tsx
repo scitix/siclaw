@@ -60,6 +60,8 @@ export interface PilotAreaProps {
     /** Current workspace ID for cron job operations */
     selectedWorkspaceId?: string | null;
     isAdmin?: boolean;
+    /** performance.now() when the current prompt was sent — drives the top-level stopwatch */
+    loadingStartedAt?: number | null;
 }
 
 /** Compute superseded status for schedule messages */
@@ -108,7 +110,7 @@ function computeScheduleStatuses(messages: PilotMessage[]): Map<string, Schedule
     return statuses;
 }
 
-export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, isRetrying, onOpenSchedulePanel, onOpenSkillPanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin }: PilotAreaProps) {
+export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isConnected, hasMore, isLoadingMore, sendMessage, abortResponse, loadMoreHistory, sendRpc, contextUsage, isCompacting, isRetrying, onOpenSchedulePanel, onOpenSkillPanel, updateMessageMeta, pendingMessages, onRemovePending, investigationProgress, dpActive, onSetDpActive, dpFocus, dpChecklist, onHypothesesConfirmed, onExitDp, systemStatus, onNavigateModels, onNavigateCredentials, sessionKey, selectedWorkspaceId, isAdmin, loadingStartedAt }: PilotAreaProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const prevScrollHeightRef = useRef(0);
@@ -501,7 +503,7 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
                                 <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
                             )}
 
-                            {isLoading && <ThinkingIndicator />}
+                            {isLoading && <ThinkingIndicator startedAt={loadingStartedAt ?? undefined} />}
 
                             {showFeedbackHint && (
                                 <div className={cn(
@@ -536,9 +538,10 @@ export function PilotArea({ messages, isLoading, isLoadingHistory, wsStatus, isC
     );
 }
 
-function ThinkingIndicator() {
+function ThinkingIndicator({ startedAt }: { startedAt?: number }) {
     const [tipIndex, setTipIndex] = useState(0);
     const [visible, setVisible] = useState(true);
+    const [elapsed, setElapsed] = useState(0);
 
     useEffect(() => {
         const interval = setInterval(() => {
@@ -550,6 +553,12 @@ function ThinkingIndicator() {
         }, 8000);
         return () => clearInterval(interval);
     }, []);
+
+    useEffect(() => {
+        if (!startedAt) return;
+        const tick = setInterval(() => setElapsed(Math.floor((performance.now() - startedAt) / 1000)), 1000);
+        return () => clearInterval(tick);
+    }, [startedAt]);
 
     return (
         <div className="flex gap-4">
@@ -564,6 +573,9 @@ function ThinkingIndicator() {
                 )}>
                     {THINKING_TIPS[tipIndex]}
                 </span>
+                {startedAt != null && elapsed > 0 && (
+                    <span className="text-xs font-mono text-gray-400">{elapsed}s</span>
+                )}
             </div>
         </div>
     );
@@ -761,6 +773,12 @@ function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, onOpenSkill
                     {message.isStreaming && !isUser && (
                         <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
                     )}
+                    {!message.isStreaming && !isUser && message.waitMs != null && message.waitMs > 100 && (
+                        <span className="text-xs font-mono text-gray-400">⏳{formatDuration(message.waitMs)}</span>
+                    )}
+                    {!message.isStreaming && !isUser && message.llmDurationMs != null && (
+                        <span className="text-xs font-mono text-gray-400">💭{formatDuration(message.llmDurationMs)}</span>
+                    )}
                 </div>
 
                 {/* Reference chips (user messages only) */}
@@ -828,12 +846,38 @@ function MessageItem({ message, scheduleStatus, onOpenSchedulePanel, onOpenSkill
     );
 }
 
+function ToolItemTimer({ startedAt }: { startedAt: number }) {
+    const [elapsed, setElapsed] = useState(0);
+    useEffect(() => {
+        const tick = setInterval(() => setElapsed(Math.floor((performance.now() - startedAt) / 1000)), 1000);
+        return () => clearInterval(tick);
+    }, [startedAt]);
+    return <span className="text-xs font-mono text-blue-400 ml-auto shrink-0">{elapsed}s</span>;
+}
+
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(1)}s`;
+}
+
 function ToolItem({ message }: { message: PilotMessage }) {
     const [expanded, setExpanded] = useState(false);
     const isOpen = message.isStreaming || expanded;
 
     return (
         <div className="pl-12 min-w-0">
+            {message.waitMs != null && message.waitMs > 100 && (
+                <div className="flex items-center gap-1.5 px-3 py-1 text-xs text-gray-400 font-mono">
+                    <span>⏳</span>
+                    <span>Waiting {formatDuration(message.waitMs)}</span>
+                </div>
+            )}
+            {message.llmDurationMs != null && (
+                <div className="flex items-center gap-1.5 px-3 py-1 text-xs text-gray-400 font-mono">
+                    <span>💭</span>
+                    <span>Thinking {formatDuration(message.llmDurationMs)}</span>
+                </div>
+            )}
             <div className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
                 <button
                     type="button"
@@ -849,14 +893,27 @@ function ToolItem({ message }: { message: PilotMessage }) {
                     {message.toolInput && (
                         <span className="font-mono text-xs text-gray-500 truncate min-w-0">{message.toolInput}</span>
                     )}
-                    {message.toolStatus === 'running' && (
+                    {message.toolStatus === 'running' && message.startedAt != null && (
+                        <ToolItemTimer startedAt={message.startedAt} />
+                    )}
+                    {message.toolStatus === 'running' && message.startedAt == null && (
                         <Loader2 className="w-3 h-3 animate-spin text-blue-400 ml-auto shrink-0" />
                     )}
                     {message.toolStatus === 'success' && (
-                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500 ml-auto shrink-0" />
+                        <span className="flex items-center gap-1 ml-auto shrink-0">
+                            {message.durationMs != null && (
+                                <span className="text-xs font-mono text-gray-400">{formatDuration(message.durationMs)}</span>
+                            )}
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                        </span>
                     )}
                     {message.toolStatus === 'error' && (
-                        <XCircle className="w-3.5 h-3.5 text-red-500 ml-auto shrink-0" />
+                        <span className="flex items-center gap-1 ml-auto shrink-0">
+                            {message.durationMs != null && (
+                                <span className="text-xs font-mono text-gray-400">{formatDuration(message.durationMs)}</span>
+                            )}
+                            <XCircle className="w-3.5 h-3.5 text-red-500" />
+                        </span>
                     )}
                     {message.toolStatus === 'aborted' && (
                         <Ban className="w-3.5 h-3.5 text-amber-500 ml-auto shrink-0" />

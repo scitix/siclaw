@@ -191,6 +191,93 @@ export interface StartGatewayOptions {
   extraHttpHandlers?: Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>;
 }
 
+/** Format unix-ms as Beijing "YYYY-MM-DD HH:mm:ss.SSS" for trace query filters. */
+function formatBeijingMs(ms: number): string {
+  const d = new Date(ms + 8 * 3600_000);
+  const p2 = (n: number) => (n < 10 ? `0${n}` : String(n));
+  const p3 = (n: number) => (n < 10 ? `00${n}` : n < 100 ? `0${n}` : String(n));
+  return `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ` +
+         `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}.${p3(d.getUTCMilliseconds())}`;
+}
+
+/**
+ * GET /api/traces           — list persisted traces (keyset paginated)
+ * GET /api/traces/:traceKey — full trace JSON body (identical to trace-*.json file)
+ *
+ * Served by Gateway because it's a pure DB read, independent of agent
+ * runtime. AgentBox is lazy-spawned — we do NOT want this to block on that.
+ */
+async function handleTracesQuery(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const { getTraceStore } = await import("../core/trace-store.js");
+  const store = getTraceStore();
+  if (!store) {
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Trace store unavailable (node:sqlite missing or SICLAW_TRACE_DISABLE set)" }));
+    return;
+  }
+
+  const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  // GET /api/traces/:traceKey — single trace body
+  if (pathname !== "/api/traces") {
+    const m = pathname.match(/^\/api\/traces\/([^/]+)$/);
+    if (!m) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+    const traceKey = decodeURIComponent(m[1]);
+    const rec = store.getById(traceKey);
+    if (!rec) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Trace not found" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(rec.bodyJson);
+    return;
+  }
+
+  // GET /api/traces — paginated list
+  const q = url.searchParams;
+  const num = (k: string): number | undefined => {
+    const v = q.get(k);
+    if (v === null || v === "") return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const beijingStr = (k: string): string | undefined => {
+    const v = q.get(k);
+    if (!v) return undefined;
+    const asNum = Number(v);
+    if (Number.isFinite(asNum) && String(asNum) === v.trim()) return formatBeijingMs(asNum);
+    return v;
+  };
+
+  const nowMs = Date.now();
+  let from = beijingStr("from");
+  const to = beijingStr("to");
+  const lastHours = num("lastHours");
+  const lastDays = num("lastDays");
+  if (from === undefined && lastHours !== undefined) from = formatBeijingMs(nowMs - lastHours * 3600_000);
+  if (from === undefined && lastDays !== undefined)  from = formatBeijingMs(nowMs - lastDays * 86400_000);
+
+  const result = store.list({
+    userId: q.get("userId") ?? undefined,
+    username: q.get("username") ?? undefined,
+    from,
+    to,
+    minDurationMs: num("minDurationMs"),
+    outcome: q.get("outcome") ?? undefined,
+    limit: num("limit"),
+    cursorStartedAt: q.get("cursorStartedAt") ?? undefined,
+    cursorId: q.get("cursorId") ?? undefined,
+  });
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(result));
+}
+
 export async function startGateway(opts: StartGatewayOptions): Promise<GatewayServer> {
   const { config, agentBoxManager, spawner, extraRpcMethods, extraHttpHandlers } = opts;
 
@@ -677,6 +764,15 @@ export async function startGateway(opts: StartGatewayOptions): Promise<GatewaySe
     if (url === "/api/sso/config") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ enabled: cachedSsoEnabled }));
+      return;
+    }
+
+    // ── Trace query API ───────────────────────────────────
+    // Pure DB read; intentionally served by Gateway (always-on) rather than
+    // AgentBox (lazy-spawned) so queries work immediately after dev:gateway
+    // starts, with zero dependency on agent runtime state.
+    if (url.startsWith("/api/traces") && method === "GET") {
+      handleTracesQuery(req, res);
       return;
     }
 

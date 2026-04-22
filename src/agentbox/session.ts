@@ -24,6 +24,7 @@ import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import type { DpState } from "../tools/workflow/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { maybeCreateTraceRecorder, type TraceRecorder } from "../core/trace-recorder.js";
 // topic-consolidator import removed — consolidation disabled
 
 export interface ManagedSession {
@@ -70,6 +71,10 @@ export interface ManagedSession {
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
+  /** Trace recorder — writes per-prompt JSON to .siclaw/traces. null when disabled. */
+  _traceRecorder?: TraceRecorder | null;
+  /** Unsubscribe fn for trace recorder's brain subscription. */
+  _traceUnsub?: (() => void) | null;
 }
 
 export interface PersistedDpStateSnapshot {
@@ -261,6 +266,27 @@ export class AgentBoxSessionManager {
 
     this.sessions.set(id, managed);
     emitDiagnostic({ type: "session_created", sessionId: id });
+
+    // Trace recorder — writes per-prompt JSON traces to .siclaw/traces for
+    // offline retrospective. Filesystem only, not exposed via HTTP/SSE/WS.
+    // Disable with SICLAW_TRACE_DISABLE=1; override path with SICLAW_TRACE_DIR.
+    try {
+      const recorder = maybeCreateTraceRecorder({
+        sessionId: id,
+        userId: this.userId,
+        mode: effectiveMode,
+        brainType: effectiveBrainType,
+        getSessionStats: () => managed!.brain.getSessionStats(),
+        getModel: () => managed!.brain.getModel(),
+        dpStateRef: result.dpStateRef,
+      });
+      if (recorder) {
+        managed._traceRecorder = recorder;
+        managed._traceUnsub = recorder.attach(managed.brain);
+      }
+    } catch (err) {
+      console.warn(`[agentbox-session] Trace recorder setup failed for ${id}:`, err);
+    }
 
     // Tool execution timing (for tool_call diagnostic events).
     // NOTE: tool_execution_start/end events depend on the brain implementation.
@@ -489,6 +515,18 @@ export class AgentBoxSessionManager {
       }
     } catch (err) {
       console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
+    }
+
+    // 1b. Close trace recorder — flushes any in-flight trace to disk.
+    if (managed._traceUnsub) {
+      try { managed._traceUnsub(); } catch { /* ignore */ }
+      managed._traceUnsub = null;
+    }
+    if (managed._traceRecorder) {
+      try { managed._traceRecorder.close(); } catch (err) {
+        console.warn(`[agentbox-session] Trace recorder close failed for ${sessionId}:`, err);
+      }
+      managed._traceRecorder = null;
     }
 
     // 2. Shutdown per-session MCP connections

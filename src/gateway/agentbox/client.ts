@@ -29,6 +29,8 @@ export interface PromptOptions {
   brainType?: string;
   /** Workspace ID (for logging/context) */
   workspaceId?: string;
+  /** Displayable username of the caller (for human-readable trace filenames). */
+  username?: string;
   /** Credential payload — agentbox materializes files locally from this data */
   credentials?: {
     manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>;

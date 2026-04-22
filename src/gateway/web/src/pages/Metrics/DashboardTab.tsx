@@ -6,6 +6,7 @@ import { SessionsChart } from './SessionsChart';
 import { ToolCallsPanel } from './ToolCallsPanel';
 import { SkillCallsPanel } from './SkillCallsPanel';
 import { CumulativePanel } from './CumulativePanel';
+import { TimingStatsPanel } from './TimingStatsPanel';
 
 interface DashboardTabProps {
     data: TimeseriesResponse | null;
@@ -48,7 +49,10 @@ export function DashboardTab({ data, range, loading }: DashboardTabProps) {
                 {/* Row 4: Sessions & Connections (full width) */}
                 <SessionsChart buckets={buckets} />
 
-                {/* Row 5: Cumulative Statistics (full width) */}
+                {/* Row 5: Response Timing Distribution (full width) */}
+                <TimingStatsPanel />
+
+                {/* Row 6: Cumulative Statistics (full width) */}
                 <CumulativePanel />
             </div>
         </div>
