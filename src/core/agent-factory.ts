@@ -247,6 +247,19 @@ export async function createSiclawSession(
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
 
+  // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
+  // opens its sqlite DB inside memoryDir, and before buildAppendSystemPrompt
+  // reads PROFILE.md below. Previously the mkdir happened later in the function,
+  // so a fresh install saw ERR_SQLITE_ERROR on first run and lost memory tools
+  // for that session.
+  if (!fs.existsSync(memoryDir)) {
+    fs.mkdirSync(memoryDir, { recursive: true });
+  }
+  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
+  if (!fs.existsSync(skeletonProfilePath)) {
+    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+  }
+
   // ── Memory indexer init (before resolve — memory tools use `available` guard) ──
   // TIMING: must run before DefaultResourceLoader construction (L~478) so that
   // the memoryFlushExtension lambda captures the initialized .current value.
@@ -451,15 +464,6 @@ export async function createSiclawSession(
   }
   if (skillDiagnostics.length > 0) {
     console.log(`[agent-factory] Skill diagnostics: ${JSON.stringify(skillDiagnostics)}`);
-  }
-
-  // Ensure memoryDir and skeleton PROFILE.md exist (both brain paths need this)
-  if (!fs.existsSync(memoryDir)) {
-    fs.mkdirSync(memoryDir, { recursive: true });
-  }
-  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
-  if (!fs.existsSync(skeletonProfilePath)) {
-    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
   }
 
   const sessionManager =
