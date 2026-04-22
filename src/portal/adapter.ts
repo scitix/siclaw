@@ -197,7 +197,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     if (body.source === "host") {
       // source_id is the host's NAME — see cluster branch above for rationale.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key FROM hosts WHERE name = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, is_production, description FROM hosts WHERE name = ?",
         [body.source_id],
       ) as any;
       if (rows.length === 0) {
@@ -225,21 +225,36 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       const host = rows[0];
       const files: { name: string; content: string; mode?: number }[] = [];
 
-      if (host.auth_type === "key" && host.private_key) {
+      if (host.auth_type === "key") {
+        if (!host.private_key) {
+          sendJson(res, 400, { error: `Host "${host.name}" has auth_type="key" but private_key is empty` });
+          return;
+        }
         files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
-      } else if (host.password) {
+      } else if (host.auth_type === "password") {
+        if (!host.password) {
+          sendJson(res, 400, { error: `Host "${host.name}" has auth_type="password" but password is empty` });
+          return;
+        }
         files.push({ name: "host.password", content: host.password });
+      } else {
+        sendJson(res, 400, { error: `Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}` });
+        return;
       }
 
       sendJson(res, 200, {
         credential: {
           name: host.name,
           type: "ssh",
-          host: host.ip,
-          port: host.port,
-          username: host.username,
-          auth_type: host.auth_type,
           files,
+          metadata: {
+            ip: host.ip,
+            port: host.port,
+            username: host.username,
+            auth_type: host.auth_type,
+            is_production: !!host.is_production,
+            ...(host.description ? { description: host.description } : {}),
+          },
           ttl_seconds: 300,
         },
       });
@@ -1713,7 +1728,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     if (params.source === "host") {
       // source_id is the host's NAME — see cluster branch above.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key FROM hosts WHERE name = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, is_production, description FROM hosts WHERE name = ?",
         [params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Host not found");
@@ -1727,20 +1742,32 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         if (binding.length === 0) throw new Error("Agent not bound to this host");
       }
       const files: { name: string; content: string; mode?: number }[] = [];
-      if (host.auth_type === "key" && host.private_key) {
+      if (host.auth_type === "key") {
+        if (!host.private_key) {
+          throw new Error(`Host "${host.name}" has auth_type="key" but private_key is empty`);
+        }
         files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
-      } else if (host.password) {
+      } else if (host.auth_type === "password") {
+        if (!host.password) {
+          throw new Error(`Host "${host.name}" has auth_type="password" but password is empty`);
+        }
         files.push({ name: "host.password", content: host.password });
+      } else {
+        throw new Error(`Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}`);
       }
       return {
         credential: {
           name: host.name,
           type: "ssh",
-          host: host.ip,
-          port: host.port,
-          username: host.username,
-          auth_type: host.auth_type,
           files,
+          metadata: {
+            ip: host.ip,
+            port: host.port,
+            username: host.username,
+            auth_type: host.auth_type,
+            is_production: !!host.is_production,
+            ...(host.description ? { description: host.description } : {}),
+          },
           ttl_seconds: 300,
         },
       };
