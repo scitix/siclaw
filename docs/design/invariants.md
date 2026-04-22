@@ -23,7 +23,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 |--------|-----|------------------------|----------------------|
 | Process | Single monolithic | Gateway + in-process AgentBoxes | Gateway Pod + one Pod per user |
 | Filesystem | Shared (single user) | **ALL users share one filesystem** | Each pod has isolated filesystem |
-| Database | SQLite only | SQLite (default) or MySQL | MySQL (required) |
+| Database | None (file-based) | SQLite via node:sqlite (default) or MySQL | MySQL (required) |
 | Auth | None | JWT | mTLS (cert per pod) + JWT |
 | Skills source | Local `./skills/` | DB → shared `./skills/` | DB → pod-local emptyDir |
 | MCP source | Local file | DB merge + local file | DB merge |
@@ -36,7 +36,7 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 - Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
 - `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
 - Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (global + personal skills from the bundle are both written into the user's directory)
-- The sql.js SQLite lockfile prevents multi-process access; local mode is single-process by design
+- Local SQLite (via `node:sqlite`) uses WAL mode with a shared process — local mode is single-process by design; production K8s uses MySQL and has no such constraint
 
 **Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:82-97`
 
@@ -191,34 +191,43 @@ Blocked:       credentials dir, config dir, system dirs (/etc, /var, etc.)
 
 ### 5.1 Two Separate Databases
 
-Siclaw maintains **two independent SQLite databases** with completely different schemas:
+Siclaw maintains **two independent databases** with completely different schemas and different driver stacks:
 
 | Database | Purpose | Engine | Location |
 |----------|---------|--------|----------|
-| Gateway DB | Users, sessions, skills, channels, cron, MCP config | sql.js (WASM) | `.siclaw/data.sqlite` |
+| Portal DB | Users, sessions, skills, channels, tasks, MCP, chat history | **MySQL (prod) or node:sqlite (local)** via `DATABASE_URL` | Local default: `.siclaw/data/portal.db` |
 | Memory DB | Embeddings, chunks, investigation records, FTS index | node:sqlite (native) | `<memoryDir>/.memory.db` |
 
 These are never merged. Do not confuse them.
 
-### 5.2 sql.js Single-Process Lock
+### 5.2 One DDL Two Drivers
 
-**Invariant**: sql.js loads the entire SQLite file into memory. **Only one process can hold the database at a time.** A PID-based lockfile (`.siclaw/data.sqlite.lock`) prevents concurrent access.
+The Portal schema is written once (`src/portal/migrate.ts`) using the MySQL + SQLite intersection of SQL syntax. Trade-offs accepted:
+- Timestamps are second precision (no `TIMESTAMP(3)`)
+- `updated_at` is maintained by the application layer (no `ON UPDATE CURRENT_TIMESTAMP`)
+- JSON payloads stored as `TEXT` with application-level `JSON.stringify` / `safeParseJson()`
+- No `ENGINE=InnoDB` / `CHARSET` / `COLLATE` clauses (MySQL server defaults apply)
 
-**Consequences**:
-- Local mode is single-process by design — do not attempt to run multiple Gateway instances against the same SQLite file
-- `flushSqliteDb()` must be called before process exit to persist in-memory state to disk
-- Periodic auto-flush runs every 30 seconds
-- In containers (PID 1 always), the lock reclaim logic handles stale locks from previous container instances
+Legacy MySQL production databases are preserved byte-for-byte via `CREATE TABLE IF NOT EXISTS`. Three data states coexist safely: **legacy MySQL with `JSON` + ms precision**, **new MySQL with TEXT + second precision**, **SQLite with TEXT + second precision**. All business reads of JSON columns must go through `safeParseJson()` (`src/gateway/dialect-helpers.ts`).
 
-**Source**: `src/gateway/db/index.ts`
+### 5.3 SQLite Single-Process Design
 
-### 5.3 SQLite DDL in Two Places
+Local mode (`siclaw local`) is single-process by design. `node:sqlite` is used via `better-sqlite3`-style synchronous API with:
+- `PRAGMA journal_mode = WAL` — readers don't block writers
+- `PRAGMA busy_timeout = 5000` — graceful contention handling
+- `AsyncMutex` around `getConnection()` — serialises transactions on the single underlying connection
 
-When adding a new table, it must be declared in **both**:
-1. `src/gateway/db/schema-sqlite.ts` — Drizzle ORM table definition
-2. `src/gateway/db/migrate-sqlite.ts` — `DDL_STATEMENTS` array (idempotent `CREATE TABLE IF NOT EXISTS`)
+Production K8s uses MySQL pools; none of the above SQLite constraints apply there.
 
-MySQL only needs `src/gateway/db/schema-mysql.ts` and is handled by Drizzle migrations.
+### 5.4 Dialect differences behind helpers
+
+Four runtime SQL dialect differences are encapsulated in `src/gateway/dialect-helpers.ts`:
+1. `buildUpsert(db, ...)` — MySQL `ON DUPLICATE KEY UPDATE` vs SQLite `ON CONFLICT(...) DO UPDATE`
+2. `insertIgnorePrefix(db)` — `INSERT IGNORE` vs `INSERT OR IGNORE`
+3. `jsonArrayContains(db, col)` / `jsonArrayFlattenSql(db, ...)` — `JSON_CONTAINS` / `JSON_TABLE` vs `json_each`
+4. `safeParseJson(value, fallback)` — defensive JSON read for the three-state problem
+
+MySQL-specific date functions (`NOW()`, `DATE_SUB`, `CURDATE`, `INTERVAL ... DAY`) are **not** wrapped — those 9 call sites compute ISO strings in JavaScript and pass them as bound parameters. `schema-invariants.test.ts` enforces this.
 
 ---
 

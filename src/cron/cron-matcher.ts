@@ -75,18 +75,13 @@ export function parseCronExpression(expr: string): CronFields {
 export function getNextCronTime(expr: string, after?: Date): Date {
   const fields = parseCronExpression(expr);
   const parts = expr.trim().split(/\s+/);
-  // Per POSIX cron: if both DOM and DOW are restricted (not *), match EITHER.
-  // If only one is restricted, match just that one (AND with month/hour/min).
   const domRestricted = parts[2] !== "*";
   const dowRestricted = parts[4] !== "*";
 
   const start = after ? new Date(after.getTime()) : new Date();
-
-  // Start from next minute
   start.setSeconds(0, 0);
   start.setMinutes(start.getMinutes() + 1);
 
-  // Search up to 4 years ahead (handles leap years)
   const maxDate = new Date(start.getTime() + 4 * 365 * 24 * 60 * 60 * 1000);
 
   const d = new Date(start);
@@ -98,15 +93,12 @@ export function getNextCronTime(expr: string, after?: Date): Date {
       continue;
     }
 
-    // DOM/DOW matching per POSIX cron spec
     const domMatch = fields.daysOfMonth.includes(d.getDate());
     const dowMatch = fields.daysOfWeek.includes(d.getDay());
     let dayMatch: boolean;
     if (domRestricted && dowRestricted) {
-      // Both restricted → match EITHER (OR)
       dayMatch = domMatch || dowMatch;
     } else {
-      // One or neither restricted → match both (AND)
       dayMatch = domMatch && dowMatch;
     }
 
@@ -142,12 +134,6 @@ export function getNextCronDelay(expr: string, after?: Date): number {
 /**
  * Estimate the average interval (in ms) between consecutive fires
  * by sampling `sampleCount` successive trigger times.
- *
- * Uses average to avoid penalising cron boundary artifacts
- * (e.g. *​/16 has gaps 16-16-16-12, average 15 min not min 12 min).
- *
- * Also tracks the minimum gap to catch burst patterns
- * (e.g. 0,1,2,3 0 * * * fires 4 times in 3 min then idles 24h).
  */
 export function getAverageIntervalMs(
   expr: string,

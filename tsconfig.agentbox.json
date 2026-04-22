@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/agentbox-main.ts",
+    "src/agentbox/**/*.ts",
+    "src/core/**/*.ts",
+    "src/cron/**/*.ts",
+    "src/memory/**/*.ts",
+    "src/shared/**/*.ts",
+    "src/tools/**/*.ts",
+    "src/gateway/agentbox/**/*.ts",
+    "src/gateway/security/**/*.ts",
+    "src/gateway/config.ts",
+    "src/gateway/jwt.ts",
+    "src/gateway/metrics-aggregator.ts",
+    "src/gateway/ws-protocol.ts"
+  ],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}

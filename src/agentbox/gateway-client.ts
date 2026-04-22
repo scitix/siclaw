@@ -2,7 +2,7 @@
  * Gateway Client for AgentBox
  *
  * HTTP client that uses mTLS client certificates to call Gateway's internal APIs.
- * Used by AgentBox to query metadata (settings, cron jobs, etc.)
+ * Used by AgentBox to query metadata (settings, agent tasks, etc.)
  */
 
 import http from "node:http";
@@ -13,25 +13,37 @@ import path from "node:path";
 export interface GatewayClientOptions {
   gatewayUrl: string;
   certPath?: string; // Directory containing tls.crt, tls.key, ca.crt
+  /**
+   * Chat session ID threaded through to the Gateway's internal-api so it can
+   * resolve the user identity via sessionRegistry. Required on task mutation
+   * calls (create/update/delete) if the task's `created_by` should be attributed
+   * to the chat user rather than left blank — without it, the Runtime-side
+   * sessionRegistry.resolveUser falls back to empty string and downstream
+   * cron-task notifications can't route to a user.
+   */
+  sessionId?: string;
 }
 
-export interface CronJob {
+export interface AgentTask {
   id: string;
   name: string;
   schedule: string;
   status: string;
   description?: string | null;
+  prompt?: string | null;
   lastRunAt?: string | null;
   lastResult?: string | null;
-  workspaceId?: string | null;
+  agentId?: string | null;
 }
 
 export class GatewayClient {
   private gatewayUrl: string;
   private tlsOptions: https.RequestOptions | null = null;
+  private sessionId?: string;
 
   constructor(options: GatewayClientOptions) {
     this.gatewayUrl = options.gatewayUrl.replace(/\/$/, ""); // Remove trailing slash
+    this.sessionId = options.sessionId;
 
     // Load client certificates if certPath provided
     const certPath = options.certPath || process.env.SICLAW_CERT_PATH || "/etc/siclaw/certs";
@@ -62,15 +74,52 @@ export class GatewayClient {
   }
 
   /**
-   * List cron jobs for a user
+   * List the agent's scheduled tasks. Agent identity is derived from the
+   * mTLS client certificate by the Gateway — no userId/agentId needed here.
    */
-  async listCronJobs(userId: string, workspaceId?: string): Promise<CronJob[]> {
-    let url = `/api/internal/cron-list?userId=${encodeURIComponent(userId)}`;
-    if (workspaceId) {
-      url += `&workspaceId=${encodeURIComponent(workspaceId)}`;
-    }
-    const data = await this.request(url, "GET");
-    return data.jobs || [];
+  async listAgentTasks(): Promise<AgentTask[]> {
+    const data = await this.request("/api/internal/agent-tasks", "GET");
+    return data.tasks || [];
+  }
+
+  async createAgentTask(input: {
+    name: string;
+    schedule: string;
+    prompt: string;
+    description?: string;
+    status?: "active" | "paused";
+  }): Promise<AgentTask> {
+    return this.request("/api/internal/agent-tasks", "POST", this.withSession(input));
+  }
+
+  async updateAgentTask(
+    taskId: string,
+    updates: Partial<{
+      name: string;
+      schedule: string;
+      prompt: string;
+      description: string;
+      status: "active" | "paused";
+    }>,
+  ): Promise<AgentTask> {
+    return this.request(
+      `/api/internal/agent-tasks/${encodeURIComponent(taskId)}`,
+      "PUT",
+      this.withSession(updates),
+    );
+  }
+
+  async deleteAgentTask(taskId: string): Promise<void> {
+    // DELETE has no body; the internal-api handler reads session_id from the
+    // URL query string (see src/gateway/internal-api.ts handleAgentTasksDelete).
+    const qs = this.sessionId ? `?session_id=${encodeURIComponent(this.sessionId)}` : "";
+    await this.request(`/api/internal/agent-tasks/${encodeURIComponent(taskId)}${qs}`, "DELETE");
+  }
+
+  /** Spread the current session_id into a request body (no-op if not set). */
+  private withSession<T extends object>(body: T): T & { session_id?: string } {
+    if (!this.sessionId) return body;
+    return { ...body, session_id: this.sessionId };
   }
 
   /**
@@ -82,19 +131,19 @@ export class GatewayClient {
   }
 
   /**
-   * Return a GatewayClientLike adapter for use with resource handlers.
+   * Return a GatewaySyncClientLike adapter for use with sync handlers.
    * Keeps `request()` private while exposing a minimal interface.
    */
-  toClientLike(): import("../shared/resource-sync.js").GatewayClientLike {
+  toClientLike(): import("../shared/gateway-sync.js").GatewaySyncClientLike {
     return {
-      request: (p: string, m: "GET" | "POST", b?: unknown) => this.request(p, m, b),
+      request: (p: string, m: "GET" | "POST" | "PUT" | "DELETE", b?: unknown) => this.request(p, m, b),
     };
   }
 
   /**
    * Make HTTP(S) request to Gateway with mTLS authentication
    */
-  private request(path: string, method: "GET" | "POST" = "GET", body?: any): Promise<any> {
+  private request(path: string, method: "GET" | "POST" | "PUT" | "DELETE" = "GET", body?: any): Promise<any> {
     return new Promise((resolve, reject) => {
       const url = new URL(path, this.gatewayUrl);
       const isHttps = url.protocol === "https:";
@@ -119,7 +168,11 @@ export class GatewayClient {
         });
 
         res.on("end", () => {
-          if (res.statusCode === 200) {
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            if (res.statusCode === 204 || !data) {
+              resolve(undefined);
+              return;
+            }
             try {
               const json = JSON.parse(data);
               resolve(json);

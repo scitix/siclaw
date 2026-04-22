@@ -1,76 +1,87 @@
-# -- Global
-nameOverride: ""
-fullnameOverride: ""
-namespace: siclaw
-
 # -- Container images
 image:
-  registry: ""          # e.g. "siclaw" -> siclaw/siclaw-gateway:latest; empty -> siclaw-gateway:latest
+  registry: ""          # e.g. "siclaw" -> siclaw/siclaw-runtime:latest
   pullPolicy: Always
   tag: "latest"
 
-# -- Gateway
-gateway:
+# -- Demo MySQL (testing only, not for production)
+mysql:
+  enabled: false
+  image: mysql:8.0
+  database: siclaw
+  username: siclaw
+  password: ""
+
+# -- Database (MySQL, Portal only — Runtime uses adapter API)
+database:
+  url: ""               # mysql://user:pass@host:3306/siclaw
+
+# -- Agent Runtime
+runtime:
   replicas: 1
-  service:
-    type: NodePort
-    port: 80
-    nodePort: 31000
+  jwtSecret: ""         # shared JWT secret (same as Portal/Upstream)
+  runtimeSecret: ""       # Portal/Upstream → Runtime WS auth
+  portalSecret: ""      # Runtime → Portal/Upstream API auth
+  # Where Runtime gets Agent/Credential info from:
+  #   Standalone mode: http://siclaw-portal:3003
+  #   Upstream mode:     http://upstream-apiserver:8080
+  serverUrl: "http://siclaw-portal:3003"
   resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
     limits:
       cpu: "2"
-      memory: "4Gi"
-  env: {}               # extra env vars
+      memory: "2Gi"
+  env: {}
 
-# -- AgentBox (spawned at runtime by gateway)
+# -- Portal (standalone web UI, replaces Upstream)
+portal:
+  enabled: true
+  replicas: 1
+  jwtSecret: ""         # same as runtime.jwtSecret
+  runtimeSecret: ""       # same as runtime.runtimeSecret
+  portalSecret: ""      # same as runtime.portalSecret
+  service:
+    type: NodePort
+    port: 3003
+    nodePort: 31003
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  env: {}
+
+# -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:
-  debugImage: ""        # Debug pod image for node_exec/node_script (default: "busybox:1.36")
-  # User data persistence (memory, investigations, sessions).
-  # Uses a single shared PVC; gateway creates per-user subdirectories,
-  # AgentBox pods mount via subPath. No dynamic provisioning required.
+  debugImage: ""
   persistence:
-    enabled: false          # set to true to persist user memory across pod restarts
-    claimName: "siclaw-data"  # name of pre-existing shared PVC (must support ReadWriteMany)
-
-# -- Database (MySQL — SQLite is not supported in K8s mode)
-database:
-  # Provide URL directly or reference an existing secret
-  url: ""
-  existingSecret:
-    name: ""
-    key: "database-url"
+    enabled: false
+    claimName: "siclaw-data"
 
 # -- Metrics & Observability
 metrics:
   enabled: true
-
-  # ServiceMonitor for Gateway (Prometheus Operator)
   serviceMonitor:
     enabled: true
     interval: 15s
-    namespace: ""             # defaults to .Values.namespace
-    namespaceSelector: {}     # override to { any: true } for cross-namespace
+    namespace: ""
+    namespaceSelector: {}
     additionalLabels: {}
-
-  # PodMonitor for AgentBox pods (Prometheus Operator)
   podMonitor:
     enabled: true
     interval: 15s
-    namespace: ""             # defaults to .Values.namespace; set to "monitoring" for cross-namespace
+    namespace: ""
     additionalLabels: {}
-
-  # Grafana dashboard (auto-imported via sidecar with grafana_dashboard: "1" label)
   grafanaDashboard:
     enabled: true
-    namespace: ""             # defaults to .Values.namespace
+    namespace: ""
     additionalLabels: {}
-
-  # PrometheusRule alert rules
   prometheusRule:
-    enabled: false            # opt-in — enable for production
-    namespace: ""             # defaults to .Values.namespace
+    enabled: false
+    namespace: ""
     additionalLabels: {}
-    costThresholdPerHour: 10  # USD — alert when hourly cost exceeds this
+    costThresholdPerHour: 10

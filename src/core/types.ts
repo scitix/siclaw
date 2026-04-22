@@ -9,12 +9,14 @@ import type { MemoryIndexer } from "../memory/indexer.js";
 
 // ── Session mode ──
 
-export type SessionMode = "web" | "channel" | "cli" | "cron";
+export type SessionMode = "web" | "channel" | "cli" | "task";
 
 // ── Mutable ref types ──
 
 export interface KubeconfigRef {
   credentialsDir?: string; // path to credentials directory (e.g. /home/agentbox/.credentials)
+  /** On-demand credential broker — if set, tools can acquire credentials from Upstream Adapter */
+  credentialBroker?: import("../agentbox/credential-broker.js").CredentialBroker;
 }
 
 /** Mutable ref to LLM config for deep_search sub-agents (updated by gateway prompt handler) */

@@ -60,15 +60,13 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Generate Pod name
+   * Generate Pod name — keyed on agentId only (one pod per agent, shared
+   * across callers). Sanitized to the K8s name charset and capped so the
+   * full name stays under 63 chars.
    */
-  private podName(userId: string, workspaceId?: string): string {
-    // Sanitize userId — keep only lowercase letters, digits, and hyphens
-    const sanitizedUser = userId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30);
-    const wsSuffix = workspaceId
-      ? workspaceId.replace(/[^a-z0-9]/g, "").slice(0, 8)
-      : "default";
-    return `agentbox-${sanitizedUser}-${wsSuffix}`;
+  private podName(agentId: string): string {
+    const sanitized = agentId.toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 50);
+    return `agentbox-${sanitized}`;
   }
 
   /**
@@ -76,11 +74,12 @@ export class K8sSpawner implements BoxSpawner {
    */
   async spawn(boxConfig: AgentBoxConfig): Promise<AgentBoxHandle> {
     const { namespace, image, imagePullPolicy, labelPrefix } = this.config;
-    const podName = this.podName(boxConfig.userId, boxConfig.workspaceId);
-    const userId = boxConfig.userId;
-    const workspaceId = boxConfig.workspaceId || "default";
+    const agentId = boxConfig.agentId;
+    if (!agentId) throw new Error("K8sSpawner.spawn requires a non-empty agentId");
+    const podName = this.podName(agentId);
+    const orgId = boxConfig.orgId || "";
 
-    console.log(`[k8s-spawner] Creating pod: ${podName} for user: ${userId}`);
+    console.log(`[k8s-spawner] Creating pod: ${podName} for agent: ${agentId}`);
 
     // Clean up any existing pod in non-running state (Failed, Succeeded, Error)
     // so we can recreate with the same name
@@ -95,7 +94,7 @@ export class K8sSpawner implements BoxSpawner {
       } else if (phase === "Running" || phase === "Pending") {
         console.log(`[k8s-spawner] Pod ${podName} already exists (phase: ${phase}), reusing`);
         const endpoint = await this.waitForPodReady(podName, namespace);
-        return { boxId: podName, userId: boxConfig.userId, endpoint };
+        return { boxId: podName, agentId, endpoint };
       }
     } catch (err: any) {
       if (err.code !== 404 && err.statusCode !== 404) {
@@ -104,26 +103,23 @@ export class K8sSpawner implements BoxSpawner {
       // Pod doesn't exist, proceed to create
     }
 
-    // Issue client certificate for mTLS authentication (env encoded in cert)
+    // Issue client certificate for mTLS authentication.
     if (!this.certManager) throw new Error("CertificateManager not initialized — call setCertManager() first");
-    const podEnv: "prod" | "dev" | "test" = boxConfig.podEnv ?? "prod";
-    const certBundle = this.certManager.issueAgentBoxCertificate(userId, workspaceId, podName, podEnv);
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, orgId, podName);
     const certSecretName = `${podName}-cert`;
 
     // Create certificate Secret
+    const secretLabels = {
+      [`${labelPrefix}/app`]: "agentbox",
+      [`${labelPrefix}/agent`]: agentId,
+    };
     try {
       await this.coreApi.createNamespacedSecret({
         namespace,
         body: {
           apiVersion: "v1",
           kind: "Secret",
-          metadata: {
-            name: certSecretName,
-            labels: {
-              [`${labelPrefix}/app`]: "agentbox",
-              [`${labelPrefix}/user`]: userId,
-            },
-          },
+          metadata: { name: certSecretName, labels: secretLabels },
           type: "kubernetes.io/tls",
           data: {
             "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -142,13 +138,7 @@ export class K8sSpawner implements BoxSpawner {
           body: {
             apiVersion: "v1",
             kind: "Secret",
-            metadata: {
-              name: certSecretName,
-              labels: {
-                [`${labelPrefix}/app`]: "agentbox",
-                [`${labelPrefix}/user`]: userId,
-              },
-            },
+            metadata: { name: certSecretName, labels: secretLabels },
             type: "kubernetes.io/tls",
             data: {
               "tls.crt": Buffer.from(certBundle.cert).toString("base64"),
@@ -166,8 +156,8 @@ export class K8sSpawner implements BoxSpawner {
     // Environment variables — only bootstrap deps that cannot come from settings.json
     const env: k8s.V1EnvVar[] = [
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
-      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-gateway.${namespace}.svc.cluster.local:3002` },
-      { name: "SICLAW_WORKSPACE_ID", value: workspaceId },
+      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-runtime.${namespace}.svc.cluster.local:3002` },
+      { name: "SICLAW_AGENT_ID", value: agentId },
     ];
 
     // Add custom environment variables
@@ -177,13 +167,13 @@ export class K8sSpawner implements BoxSpawner {
       }
     }
 
-    // Ensure per-user subdirectory on shared PVC
-    const safeUserId = this.sanitizePathSegment(userId);
-    const safeWorkspaceId = this.sanitizePathSegment(workspaceId);
+    // Shared PVC is now scoped per-agent only — all users of the agent share
+    // this subdirectory (memory is agent-shared per the 2026-04-18 spec).
+    const safeAgentId = this.sanitizePathSegment(agentId);
     if (this.config.persistence?.enabled) {
-      const subDir = `users/${safeUserId}/${safeWorkspaceId}`;
+      const subDir = `agents/${safeAgentId}`;
       console.log(`[k8s-spawner] Persistence enabled: shared PVC "${this.config.persistence.claimName}", subPath "${subDir}"`);
-      this.ensureUserDir(safeUserId, safeWorkspaceId);
+      this.ensureAgentDir(safeAgentId);
     }
 
     // Pod definition
@@ -195,8 +185,7 @@ export class K8sSpawner implements BoxSpawner {
         namespace,
         labels: {
           [`${labelPrefix}/app`]: "agentbox",
-          [`${labelPrefix}/user`]: boxConfig.userId,
-          [`${labelPrefix}/workspace`]: boxConfig.workspaceId || "default",
+          [`${labelPrefix}/agent`]: agentId,
         },
       },
       spec: {
@@ -224,6 +213,10 @@ export class K8sSpawner implements BoxSpawner {
           },
           {
             name: "skills-local",
+            emptyDir: {},
+          },
+          {
+            name: "knowledge-local",
             emptyDir: {},
           },
           this.config.persistence?.enabled
@@ -275,10 +268,14 @@ export class K8sSpawner implements BoxSpawner {
                 mountPath: "/app/.siclaw/skills",
               },
               {
+                name: "knowledge-local",
+                mountPath: "/app/.siclaw/knowledge",
+              },
+              {
                 name: "user-data",
                 mountPath: "/app/.siclaw/user-data",
                 ...(this.config.persistence?.enabled
-                  ? { subPath: `users/${safeUserId}/${safeWorkspaceId}` }
+                  ? { subPath: `agents/${safeAgentId}` }
                   : {}),
               },
               {
@@ -332,7 +329,7 @@ export class K8sSpawner implements BoxSpawner {
 
     return {
       boxId: podName,
-      userId: boxConfig.userId,
+      agentId,
       endpoint,
     };
   }
@@ -343,17 +340,17 @@ export class K8sSpawner implements BoxSpawner {
   }
 
   /**
-   * Ensure per-user subdirectory exists on the shared PVC (synchronous, idempotent).
+   * Ensure per-agent subdirectory exists on the shared PVC (synchronous, idempotent).
    * Expects already-sanitized path segments.
-   * Directory layout: `/app/.siclaw/user-data/users/{safeUserId}/{safeWorkspaceId}/`
+   * Directory layout: `/app/.siclaw/user-data/agents/{safeAgentId}/`
    */
-  private ensureUserDir(safeUserId: string, safeWorkspaceId: string): void {
+  private ensureAgentDir(safeAgentId: string): void {
     const base = path.resolve("/app/.siclaw/user-data");
-    const userDir = path.join(base, "users", safeUserId, safeWorkspaceId);
-    if (!userDir.startsWith(base)) {
-      throw new Error(`[k8s-spawner] Path traversal detected: ${userDir}`);
+    const dir = path.join(base, "agents", safeAgentId);
+    if (!dir.startsWith(base)) {
+      throw new Error(`[k8s-spawner] Path traversal detected: ${dir}`);
     }
-    fs.mkdirSync(userDir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
   }
 
   /**
@@ -450,15 +447,13 @@ export class K8sSpawner implements BoxSpawner {
     try {
       const pod = await this.coreApi.readNamespacedPod({ name: boxId, namespace });
 
-      const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId,
-        userId,
-        workspaceId,
+        agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
@@ -486,15 +481,13 @@ export class K8sSpawner implements BoxSpawner {
     });
 
     return podList.items.map((pod: k8s.V1Pod) => {
-      const userId = pod.metadata?.labels?.[`${labelPrefix}/user`] || "unknown";
-      const workspaceId = pod.metadata?.labels?.[`${labelPrefix}/workspace`];
+      const agentId = pod.metadata?.labels?.[`${labelPrefix}/agent`] || "";
       const status = this.mapPodStatus(pod);
       const podIP = pod.status?.podIP;
 
       return {
         boxId: pod.metadata?.name || "",
-        userId,
-        workspaceId,
+        agentId,
         status,
         endpoint: podIP ? `https://${podIP}:3000` : "",
         createdAt: pod.metadata?.creationTimestamp
@@ -509,6 +502,12 @@ export class K8sSpawner implements BoxSpawner {
    * Map Pod phase to AgentBoxStatus
    */
   private mapPodStatus(pod: k8s.V1Pod): AgentBoxStatus {
+    // Terminating pods (deletionTimestamp set) may still report
+    // phase=Running and Ready=True during the grace period, but their
+    // podIP is on its way out — treat them as stopped so callers that
+    // filter on status="running" (e.g. agent.reload) skip them.
+    if (pod.metadata?.deletionTimestamp) return "stopped";
+
     const phase = pod.status?.phase;
     const ready = pod.status?.conditions?.find((c) => c.type === "Ready")?.status === "True";
 

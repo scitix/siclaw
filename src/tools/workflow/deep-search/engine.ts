@@ -383,7 +383,7 @@ export async function investigate(
 ): Promise<InvestigationResult> {
   const budget = options?.budget ?? NORMAL_BUDGET;
   const onProgress = options?.onProgress;
-  const kubeconfigPath = resolveKubeconfigPath(options?.kubeconfigRef?.credentialsDir) ?? undefined;
+  const kubeconfigPath = resolveKubeconfigPath({ broker: options?.kubeconfigRef?.credentialBroker }) ?? undefined;
   const startTime = Date.now();
   let globalCallsUsed = 0;
 

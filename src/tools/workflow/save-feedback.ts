@@ -61,7 +61,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
       const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
       const userId = cfg.userId;
       const sessionId = sessionIdRef.current;
-      const workspaceId = process.env.SICLAW_WORKSPACE_ID;
+      const agentId = process.env.SICLAW_AGENT_ID;
 
       if (!userId) {
         return {
@@ -118,7 +118,7 @@ The report includes overall rating, decision point evaluations, strengths, impro
           {
             sessionId,
             userId,
-            workspaceId,
+            agentId,
             overallRating: params.overallRating,
             summary: params.summary,
             decisionPoints,

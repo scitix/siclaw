@@ -4,8 +4,9 @@
 #
 # Security: dual-user model (ADR-010, docs/design/security.md)
 #   agentbox — main Node.js process, owns credentials
-#   sandbox  — all child processes (shell commands), no credential access
+#   sandbox  — all child processes (shell commands), reads credentials via shared groups
 #   kubectl  — setgid kubecred group, reads kubeconfig via group permission
+#   ssh (future host_exec) — will be setgid hostcred group, reads SSH credentials via group permission
 
 # ── Build stage ──────────────────────────────────────────────────
 FROM node:22-slim AS builder
@@ -16,8 +17,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Copy backend source only (exclude src/gateway/web — frontend not needed)
-COPY tsconfig.json ./
+# Copy backend source only (AgentBox + core + tools + minimal gateway modules)
+COPY tsconfig.json tsconfig.agentbox.json ./
 COPY src/agentbox-main.ts ./src/
 COPY src/agentbox/ ./src/agentbox/
 COPY src/core/ ./src/core/
@@ -25,18 +26,13 @@ COPY src/cron/ ./src/cron/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
 COPY src/tools/ ./src/tools/
-COPY src/gateway/*.ts ./src/gateway/
+COPY src/gateway/config.ts src/gateway/jwt.ts \
+     src/gateway/metrics-aggregator.ts src/gateway/ws-protocol.ts ./src/gateway/
 COPY src/gateway/agentbox/ ./src/gateway/agentbox/
-COPY src/gateway/auth/ ./src/gateway/auth/
-COPY src/gateway/channels/ ./src/gateway/channels/
-COPY src/gateway/cron/ ./src/gateway/cron/
-COPY src/gateway/db/ ./src/gateway/db/
-COPY src/gateway/plugins/ ./src/gateway/plugins/
 COPY src/gateway/security/ ./src/gateway/security/
-COPY src/gateway/skills/ ./src/gateway/skills/
 
-# Backend build (tsc)
-RUN npx tsc
+# Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
+RUN npx tsc -p tsconfig.agentbox.json
 
 # ── Production stage ─────────────────────────────────────────────
 FROM node:22-slim
@@ -52,8 +48,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # node:22-slim has UID 1000 (node user) — remove it first to avoid conflicts
 RUN userdel -r node 2>/dev/null || true \
     && groupadd --gid 1002 kubecred \
-    && useradd --uid 1000 -m -s /bin/bash -G kubecred agentbox \
-    && useradd --uid 1001 -M -s /bin/false sandbox \
+    && groupadd --gid 1003 hostcred \
+    && useradd --uid 1000 -m -s /bin/bash -G kubecred,hostcred agentbox \
+    && useradd --uid 1001 -M -s /bin/false -G kubecred,hostcred sandbox \
     && echo 'agentbox ALL=(sandbox) NOPASSWD:SETENV: ALL' > /etc/sudoers.d/sandbox-exec \
     && chmod 440 /etc/sudoers.d/sandbox-exec \
     && chgrp kubecred /usr/local/bin/kubectl \
@@ -65,18 +62,23 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# Copy compiled JS + skills + entrypoint
+# Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/
 COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
+COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
 
 # Directory structure, permissions, SUID/SGID cleanup — single layer
 RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
-    && mkdir -p ./.siclaw/skills ./.siclaw/credentials ./.siclaw/config ./.siclaw/user-data \
+    && mkdir -p ./.siclaw/skills ./.siclaw/credentials/clusters ./.siclaw/credentials/hosts ./.siclaw/config ./.siclaw/user-data \
     && chown -R agentbox:agentbox . \
-    && chown agentbox:kubecred ./.siclaw/credentials \
+    && chown agentbox:agentbox ./.siclaw/credentials \
     && chmod 0750 ./.siclaw/credentials \
+    && chown agentbox:kubecred ./.siclaw/credentials/clusters \
+    && chmod 2750 ./.siclaw/credentials/clusters \
+    && chown agentbox:hostcred ./.siclaw/credentials/hosts \
+    && chmod 2750 ./.siclaw/credentials/hosts \
     && chmod 0700 ./.siclaw/config \
     && chmod 0755 ./.siclaw/skills \
     && chmod 0777 ./.siclaw/user-data \

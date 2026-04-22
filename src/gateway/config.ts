@@ -1,27 +1,32 @@
-export interface ChannelConfig {
-  enabled: boolean;
-  [key: string]: unknown;
-}
+/**
+ * Siclaw Agent Runtime configuration.
+ */
 
-export interface GatewayConfig {
+export interface RuntimeConfig {
+  /** HTTP port for WS RPC + health/metrics (default: 3001) */
   port: number;
-  internalPort?: number; // HTTPS port for internal mTLS API (default: 3002)
+  /** HTTPS port for internal mTLS API (AgentBox ↔ Runtime) (default: 3002) */
+  internalPort: number;
+  /** Bind host */
   host: string;
-  plugins: {
-    paths: string[];
-  };
-  channels: Record<string, ChannelConfig>;
+  /** Runtime's own secret — Portal/Upstream must present this to connect via WS */
+  runtimeSecret: string;
+  /** Management server URL (Portal or Upstream) — provides Agent info, credentials, permissions */
+  serverUrl: string;
+  /** Portal/Upstream's secret — Runtime presents this when calling the management server */
+  portalSecret: string;
+  /** Shared JWT secret for token verification */
+  jwtSecret: string;
 }
 
-const DEFAULT_CONFIG: GatewayConfig = {
-  port: 3000,
-  host: "0.0.0.0",
-  plugins: {
-    paths: ["./node_modules"],
-  },
-  channels: {},
-};
-
-export function loadGatewayConfig(): GatewayConfig {
-  return { ...DEFAULT_CONFIG };
+export function loadRuntimeConfig(): RuntimeConfig {
+  return {
+    port: parseInt(process.env.SICLAW_PORT || "3001", 10),
+    internalPort: parseInt(process.env.SICLAW_INTERNAL_PORT || "3002", 10),
+    host: process.env.SICLAW_HOST || "0.0.0.0",
+    runtimeSecret: process.env.SICLAW_RUNTIME_SECRET || "",
+    serverUrl: process.env.SICLAW_SERVER_URL || "",
+    portalSecret: process.env.SICLAW_PORTAL_SECRET || "",
+    jwtSecret: process.env.JWT_SECRET || "",
+  };
 }

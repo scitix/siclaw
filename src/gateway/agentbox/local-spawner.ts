@@ -1,40 +1,28 @@
 /**
  * Local AgentBox Spawner
  *
- * Spawner for local development; runs the AgentBox HTTP server within the same process.
- * Each user gets an independent port.
+ * Spawner for local development; runs the AgentBox HTTP server within the
+ * same process. One instance per agent, shared by all callers of that agent.
+ * Uses the same mTLS cert architecture as K8s mode — gateway signs a client
+ * cert for each AgentBox instance (CN = agentId).
  */
 
-import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
-// local-only shortcut: same process, import agentbox resource handlers directly
-// to avoid HTTP + mTLS round-trip that is only needed for cross-process (K8s) mode.
-import { mcpHandler, skillsHandler } from "../../agentbox/resource-handlers.js";
-import { buildMergedMcpConfig } from "../mcp-config-builder.js";
-import { loadConfig } from "../../core/config.js";
-import type { McpServerRepository } from "../db/repositories/mcp-server-repo.js";
-import type { ResourceType } from "../../shared/resource-sync.js";
-import { resolveUnderDir } from "../../shared/path-utils.js";
 import type { MemoryIndexer } from "../../memory/index.js";
+import type { CertificateManager } from "../security/cert-manager.js";
 
 interface LocalBox {
-  userId: string;
+  agentId: string;
   port: number;
   httpServer: http.Server;
   sessionManager: AgentBoxSessionManager;
   createdAt: Date;
 }
-
-/** Function type for fetching a skill bundle for a given user */
-export type SkillBundleProvider = (userId: string, env: "prod" | "dev" | "test") => Promise<{
-  version: string;
-  skills: Array<{ dirName: string; scope: string; specs: string; scripts: Array<{ name: string; content: string }> }>;
-}>;
 
 export class LocalSpawner implements BoxSpawner {
   readonly name = "local";
@@ -43,26 +31,19 @@ export class LocalSpawner implements BoxSpawner {
   private basePort: number;
   private nextPort: number;
 
-  /** Injected DB-backed MCP repository (set via setMcpRepo) */
-  private mcpRepo: McpServerRepository | null = null;
-  /** Injected skill bundle provider (set via setSkillBundleProvider) */
-  private skillBundleProvider: SkillBundleProvider | null = null;
   /** Injected knowledge base indexer (set via setKnowledgeIndexer) */
   private knowledgeIndexer: MemoryIndexer | null = null;
 
-  constructor(basePort = 4000) {
+  /** Certificate manager for signing agentbox client certs */
+  private readonly certManager: CertificateManager;
+  /** Gateway internal mTLS URL (e.g. https://127.0.0.1:3002) */
+  private readonly gatewayInternalUrl: string;
+
+  constructor(certManager: CertificateManager, gatewayInternalUrl: string, basePort = 4000) {
+    this.certManager = certManager;
+    this.gatewayInternalUrl = gatewayInternalUrl;
     this.basePort = basePort;
     this.nextPort = basePort;
-  }
-
-  /** Inject McpServerRepository for local resource sync */
-  setMcpRepo(repo: McpServerRepository | null): void {
-    this.mcpRepo = repo;
-  }
-
-  /** Inject skill bundle provider for local resource sync */
-  setSkillBundleProvider(provider: SkillBundleProvider): void {
-    this.skillBundleProvider = provider;
   }
 
   /** Inject knowledge base indexer for local knowledge_search */
@@ -71,47 +52,61 @@ export class LocalSpawner implements BoxSpawner {
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
-    const { userId } = config;
-    const workspaceId = config.workspaceId || "default";
-    const boxId = `local-${userId}-${workspaceId}`;
+    const agentId = config.agentId;
+    if (!agentId) {
+      throw new Error(`LocalSpawner.spawn requires a non-empty agentId`);
+    }
+    const boxId = `local-${agentId}`;
 
-    // Check if already exists
     const existing = this.boxes.get(boxId);
     if (existing) {
       return {
         boxId,
-        endpoint: `http://127.0.0.1:${existing.port}`,
-        userId,
+        endpoint: `https://127.0.0.1:${existing.port}`,
+        agentId,
       };
     }
 
-    // Allocate port
     const port = this.nextPort++;
 
-    // Sync resources from DB before starting the AgentBox
-    await this.syncResources(userId);
+    const certBundle = this.certManager.issueAgentBoxCertificate(agentId, "default", boxId);
 
-    // Create session manager and HTTP server
+    // Use the K8s-convention filenames (tls.crt / tls.key / ca.crt) so that
+    // GatewayClient and the agentbox http-server can pick them up via the
+    // single SICLAW_CERT_PATH env var — the same code path as K8s mode.
+    const certDir = path.resolve(process.cwd(), ".siclaw/certs", boxId);
+    const fs = await import("node:fs");
+    fs.mkdirSync(certDir, { recursive: true });
+    fs.writeFileSync(path.join(certDir, "tls.crt"), certBundle.cert);
+    fs.writeFileSync(path.join(certDir, "tls.key"), certBundle.key);
+    fs.writeFileSync(path.join(certDir, "ca.crt"), certBundle.ca);
+
+    process.env.SICLAW_GATEWAY_URL = this.gatewayInternalUrl;
+    process.env.SICLAW_CERT_PATH = certDir;
+
     const sessionManager = new AgentBoxSessionManager();
-    // Set userId so sessions created in this box use per-user skill directories
-    sessionManager.userId = userId;
-    // Pass knowledge indexer for knowledge_search tool
+    sessionManager.agentId = agentId;
     if (this.knowledgeIndexer) {
       sessionManager.knowledgeIndexer = this.knowledgeIndexer;
     }
+    // Agent-scoped credentials directory — shared across callers of this agent.
+    sessionManager.credentialsDir = path.resolve(
+      process.cwd(),
+      ".siclaw/credentials",
+      agentId,
+    );
     const httpServer = createHttpServer(sessionManager);
 
-    // Start server
     await new Promise<void>((resolve, reject) => {
       httpServer.listen(port, "127.0.0.1", () => {
-        console.log(`[local-spawner] AgentBox for ${userId} started on port ${port}`);
+        console.log(`[local-spawner] AgentBox for agent=${agentId} started on port ${port}`);
         resolve();
       });
       httpServer.on("error", reject);
     });
 
     const box: LocalBox = {
-      userId,
+      agentId,
       port,
       httpServer,
       sessionManager,
@@ -122,8 +117,11 @@ export class LocalSpawner implements BoxSpawner {
 
     return {
       boxId,
-      endpoint: `http://127.0.0.1:${port}`,
-      userId,
+      // The AgentBox http-server detects TLS certs via SICLAW_CERT_PATH and
+      // upgrades to HTTPS. LocalSpawner always provides certs, so endpoint
+      // must be https for the Runtime's AgentBoxClient to handshake correctly.
+      endpoint: `https://127.0.0.1:${port}`,
+      agentId,
     };
   }
 
@@ -134,6 +132,7 @@ export class LocalSpawner implements BoxSpawner {
     console.log(`[local-spawner] Stopping AgentBox: ${boxId}`);
 
     await box.sessionManager.closeAll();
+    box.sessionManager.credentialBroker?.dispose();
     box.httpServer.close();
     this.boxes.delete(boxId);
   }
@@ -144,7 +143,7 @@ export class LocalSpawner implements BoxSpawner {
 
     return {
       boxId,
-      userId: box.userId,
+      agentId: box.agentId,
       status: "running",
       endpoint: `http://127.0.0.1:${box.port}`,
       createdAt: box.createdAt,
@@ -157,7 +156,7 @@ export class LocalSpawner implements BoxSpawner {
     for (const [boxId, box] of this.boxes) {
       result.push({
         boxId,
-        userId: box.userId,
+        agentId: box.agentId,
         status: "running",
         endpoint: `http://127.0.0.1:${box.port}`,
         createdAt: box.createdAt,
@@ -173,121 +172,4 @@ export class LocalSpawner implements BoxSpawner {
       await this.stop(boxId);
     }
   }
-
-  // ── Local resource sync (bypasses HTTP + mTLS) ─────────────────────
-
-  /**
-   * Sync MCP + Skills from DB directly into the AgentBox filesystem.
-   * Called on spawn (initial sync) and on reload (hot update).
-   */
-  private async syncResources(userId: string): Promise<void> {
-    await this.syncMcp();
-    await this.syncSkills(userId);
-  }
-
-  /** Sync MCP servers: read DB-only config, let materialize merge with local seed */
-  private async syncMcp(): Promise<void> {
-    try {
-      // Pass null as localConfig so buildMergedMcpConfig returns DB entries only.
-      // mcpHandler.materialize() will merge local seed internally.
-      const dbOnly = await buildMergedMcpConfig(null, this.mcpRepo);
-      const count = await mcpHandler.materialize({ mcpServers: dbOnly });
-      if (count > 0) {
-        console.log(`[local-spawner] MCP sync: ${count} servers materialized`);
-      }
-    } catch (err: any) {
-      console.warn(`[local-spawner] MCP sync failed: ${err.message}`);
-    }
-  }
-
-  /**
-   * Sync skills for a user into a per-user directory.
-   *
-   * Unlike skillsHandler.materialize() which clears the entire skillsDir,
-   * this writes to {skillsBase}/user/{userId}/ so multiple users don't
-   * overwrite each other's skills in local (shared-process) mode.
-   */
-  /**
-   * Build a flat resolved/ directory per user with priority-based merging:
-   *   personal > skillset > global > builtin (symlinked)
-   * Same logic as K8s materialize() but scoped per-user for local mode.
-   */
-  private async syncSkills(userId: string): Promise<void> {
-    if (!this.skillBundleProvider) {
-      console.warn(`[local-spawner] Skills sync skipped: no bundle provider configured`);
-      return;
-    }
-    try {
-      // Local mode is always dev — users need to see their working drafts
-      const bundle = await this.skillBundleProvider(userId, "dev");
-      const config = loadConfig();
-      const skillsBase = path.resolve(process.cwd(), config.paths.skillsDir);
-      // Per-user resolved directory (local mode has multiple users sharing one process)
-      const resolvedDir = path.join(skillsBase, "user", userId, "resolved");
-
-      // Clear and recreate
-      if (fs.existsSync(resolvedDir)) {
-        fs.rmSync(resolvedDir, { recursive: true });
-      }
-      fs.mkdirSync(resolvedDir, { recursive: true });
-
-      const seen = new Set<string>();
-
-      // All scopes from bundle, priority: personal > skillset > global > builtin
-      for (const scope of ["personal", "skillset", "global", "builtin"] as const) {
-        for (const skill of bundle.skills.filter(s => s.scope === scope)) {
-          if (seen.has(skill.dirName)) continue;
-          seen.add(skill.dirName);
-          const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
-          fs.mkdirSync(skillDir, { recursive: true });
-          if (skill.specs) {
-            fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
-          }
-          if (skill.scripts.length > 0) {
-            const scriptsDir = path.join(skillDir, "scripts");
-            fs.mkdirSync(scriptsDir, { recursive: true });
-            for (const script of skill.scripts) {
-              const scriptPath = resolveUnderDir(scriptsDir, script.name);
-              fs.writeFileSync(scriptPath, script.content, { mode: 0o755 });
-            }
-          }
-        }
-      }
-
-      if (seen.size > 0) {
-        console.log(`[local-spawner] Skills sync for ${userId}: ${seen.size} skills → ${resolvedDir}`);
-      }
-    } catch (err: any) {
-      console.warn(`[local-spawner] Skills sync failed for ${userId}: ${err.message}`);
-    }
-  }
-
-  /**
-   * Reload a resource type across all local boxes.
-   * Called by the resource notifier's localReloader callback.
-   */
-  async reloadResource(type: ResourceType, userId?: string): Promise<void> {
-    if (type === "mcp") {
-      // MCP is a global resource (not user-scoped), so userId is intentionally ignored.
-      await this.syncMcp();
-      // postReload: reloadConfig so next session creation uses new MCP config
-      await mcpHandler.postReload?.({});
-    } else if (type === "skills") {
-      // Skills are user-scoped: sync for specific user or all users
-      const targetBoxes = userId
-        ? [...this.boxes.values()].filter((b) => b.userId === userId)
-        : [...this.boxes.values()];
-
-      for (const box of targetBoxes) {
-        await this.syncSkills(box.userId);
-        // postReload: tell active sessions to brain.reload()
-        const sessions = box.sessionManager.list().map((s) => ({
-          id: s.id,
-          brain: s.brain,
-        }));
-        await skillsHandler.postReload?.({ sessions });
-      }
-    }
-  }
-
 }

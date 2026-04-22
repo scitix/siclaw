@@ -11,18 +11,16 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
-import type { BrainType } from "../core/brain-session.js";
-import { hasOpenAIProvider, ensureProxy } from "../core/llm-proxy.js";
 import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";
-import { createChecklist, buildActivationMessage, applyPhaseToChecklist, parsePhaseNum } from "../tools/workflow/dp-tools.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
-import { getResourceHandler } from "./resource-handlers.js";
-import { RESOURCE_DESCRIPTORS } from "../shared/resource-sync.js";
+import { CredentialBroker } from "./credential-broker.js";
+import { HttpTransport } from "./credential-transport.js";
+import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
+import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
-import { resolveUnderDir } from "../shared/path-utils.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -95,9 +93,32 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
  * Create HTTP or HTTPS server (auto-detects certificates)
  */
 export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server | https.Server {
-  // Pre-start LLM proxy (fire-and-forget, ready before first prompt)
-  if (hasOpenAIProvider()) {
-    ensureProxy().catch(err => console.warn("[agentbox] LLM proxy pre-start failed:", err));
+  // Initialize credential broker synchronously before any session is created.
+  // The broker reference is captured by value into each session's KubeconfigRef,
+  // so we cannot defer initialization — a late-arriving broker would never be
+  // seen by sessions created before it landed.
+  // Credential broker: both K8s and Local mode use HTTP to call gateway.
+  // SICLAW_GATEWAY_URL is set by K8s env or LocalSpawner process.env injection.
+  if (!sessionManager.credentialBroker) {
+    const credentialsDir = sessionManager.credentialsDir;
+    const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
+    if (gatewayUrl) {
+      const client = new GatewayClient({ gatewayUrl });
+      sessionManager.credentialBroker = new CredentialBroker(new HttpTransport(client), credentialsDir);
+      console.log(`[agentbox-http] Credential broker initialized (${gatewayUrl})`);
+    }
+  }
+
+  // cluster/host handlers close over this server's broker. In Local mode,
+  // LocalSpawner runs multiple AgentBoxes in the SAME process — if we had
+  // used the module-level sync-handlers registry (as mcp/skills do), each
+  // spawn() would overwrite the previous registration and cross-tenant
+  // request routing would silently pick the wrong broker. We instead bind
+  // these handlers per-httpServer and hand them to the route loop below.
+  const perServerHandlers: Partial<Record<GatewaySyncType, AgentBoxSyncHandler<any>>> = {};
+  if (sessionManager.credentialBroker) {
+    perServerHandlers.cluster = createClusterHandler(sessionManager.credentialBroker);
+    perServerHandlers.host = createHostHandler(sessionManager.credentialBroker);
   }
 
   // ── Idle self-destruct: exit when no SSE connections and no sessions for 5 min ──
@@ -148,45 +169,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       paramNames,
       handler,
     });
-  }
-
-  // ── Credential materialization helper (shared by prompt and reload-credentials) ──
-  // Writes new files with .new suffix first, then atomically renames them into place.
-  // This prevents data loss if the process crashes between delete and write.
-  function materializeCredentials(
-    payload: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> },
-    kubeconfigRef: { credentialsDir?: string },
-  ): number {
-    const credDir = path.resolve(process.cwd(), loadConfig().paths.credentialsDir);
-    fs.mkdirSync(credDir, { recursive: true });
-
-    // Phase 1: Write new files with .new suffix (staging)
-    const stagedFiles: string[] = [];
-    for (const file of payload.files) {
-      const resolved = resolveUnderDir(credDir, file.name);
-      const staged = resolved + ".new";
-      fs.writeFileSync(staged, file.content, file.mode ? { mode: file.mode } : undefined);
-      stagedFiles.push(file.name);
-    }
-    // Stage manifest
-    const manifestPath = path.join(credDir, "manifest.json");
-    fs.writeFileSync(manifestPath + ".new", JSON.stringify(payload.manifest, null, 2));
-
-    // Phase 2: Remove old files
-    for (const entry of fs.readdirSync(credDir)) {
-      if (entry.endsWith(".new")) continue; // skip staged files
-      fs.rmSync(path.join(credDir, entry), { recursive: true });
-    }
-
-    // Phase 3: Rename staged files into place (atomic per-file on same filesystem)
-    for (const file of payload.files) {
-      const resolved = resolveUnderDir(credDir, file.name);
-      fs.renameSync(resolved + ".new", resolved);
-    }
-    fs.renameSync(manifestPath + ".new", manifestPath);
-
-    kubeconfigRef.credentialsDir = credDir;
-    return payload.files.length;
   }
 
   // ==================== Routes ====================
@@ -241,30 +223,14 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; brainType?: BrainType; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; credentials?: { manifest: Array<Record<string, unknown>>; files: Array<{ name: string; content: string; mode?: number }> } };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.brainType, body.systemPromptTemplate);
-
-    // Materialize credential files from payload (sent by gateway in prompt body).
-    // Always call when credentials payload is present — even with empty files —
-    // so stale credential files from prior sessions are cleaned up.
-    if (body.credentials) {
-      try {
-        const count = materializeCredentials(body.credentials, managed.kubeconfigRef);
-        if (count > 0) {
-          console.log(`[agentbox-http] Materialized ${count} credential files`);
-        }
-      } catch (err) {
-        console.error(`[agentbox-http] Failed to materialize credentials for session ${managed.id}:`, err);
-        sendJson(res, 500, { error: "Failed to materialize credentials" });
-        return;
-      }
-    }
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
 
     // Dynamically register provider config from gateway DB (before findModel)
     if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
@@ -323,17 +289,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       if (!managed._promptDone) {
         managed._eventBuffer.push(event);
       }
-      // Null dpState.checklist when deep_search completes — this is the exit signal
-      // for the SDK brain's auto-continue loop in claude-sdk-brain.ts.
-      const ev = event as Record<string, unknown>;
-      if (ev.type === "tool_execution_end" && managed.dpState?.checklist) {
-        // Find the matching tool_execution_start to get toolName
-        // (tool_execution_end doesn't carry toolName directly in all brain types)
-        const toolName = (ev.toolName as string) ?? "";
-        if (toolName === "deep_search") {
-          managed.dpState.checklist = null;
-        }
-      }
     });
 
     // Also buffer deep_search progress events (same stream as session events)
@@ -345,19 +300,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
           progress: event,
         });
       }
-      // Sync phase events to SDK brain's dpState so the auto-continue loop
-      // sees correct phase progression without relying on LLM tool calls.
-      // Guard with _promptDone to avoid stale events mutating state after completion.
-      if (!managed._promptDone && managed.dpState?.checklist) {
-        const ev = event as Record<string, unknown>;
-        if (ev.type === "phase") {
-          const phaseStr = typeof ev.phase === "string" ? ev.phase : "";
-          const phaseNum = parsePhaseNum(phaseStr);
-          if (phaseNum >= 1) {
-            applyPhaseToChecklist(managed.dpState.checklist.items, phaseNum);
-          }
-        }
-      }
     };
     deepSearchEvents.on("progress", deepProgressBufHandler);
 
@@ -366,35 +308,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       deepSearchEvents.off("progress", deepProgressBufHandler);
     };
 
-    // --- DP input transformation (SDK brain only — pi-agent uses extension input handlers) ---
     let promptText = body.text;
-    if (managed.dpState) {
-      const dpState = managed.dpState;
-      const DP_MARKER = "[Deep Investigation]\n";
-      const EXIT_MARKER = "[DP_EXIT]\n";
-
-      if (promptText.startsWith(DP_MARKER)) {
-        const question = promptText.slice(DP_MARKER.length).trim();
-        if (question) {
-          dpState.checklist = createChecklist(question);
-          promptText = buildActivationMessage(question);
-          console.log(`[agentbox-http] DP activated for SDK brain, session ${managed.id}`);
-        }
-      } else if (promptText.startsWith(EXIT_MARKER)) {
-        const userText = promptText.slice(EXIT_MARKER.length).trim();
-        if (dpState.checklist) {
-          for (const item of dpState.checklist.items) {
-            if (item.status === "pending" || item.status === "in_progress") {
-              item.status = "skipped";
-              item.summary = "User exited investigation";
-            }
-          }
-        }
-        dpState.checklist = null;
-        promptText = `The user has exited deep investigation mode. ${userText}`;
-        console.log(`[agentbox-http] DP exited for SDK brain, session ${managed.id}`);
-      }
-    }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
     // IMPORTANT: append after DP markers, not prepend before them.
@@ -509,7 +423,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       onPromptFinish();
     });
 
-    sendJson(res, 200, { ok: true, sessionId: managed.id, brainType: managed.brainType });
+    sendJson(res, 200, { ok: true, sessionId: managed.id });
   });
 
   /**
@@ -580,7 +494,28 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     // Subscribe to Agent events (live, after buffer replay)
-    const unsubscribe = managed.brain.subscribe((event) => {
+    const unsubscribe = managed.brain.subscribe((event: any) => {
+      // Enrich agent_end with context usage so frontend can display token stats
+      if (event?.type === "agent_end") {
+        const usage = managed.brain.getContextUsage?.();
+        const stats = managed.brain.getSessionStats?.();
+        if (usage || stats) {
+          writeEvent({
+            ...event,
+            contextUsage: {
+              tokens: usage?.tokens ?? 0,
+              contextWindow: usage?.contextWindow ?? 0,
+              percent: usage?.percent ?? 0,
+              inputTokens: stats?.tokens?.input ?? 0,
+              outputTokens: stats?.tokens?.output ?? 0,
+              cacheReadTokens: stats?.tokens?.cacheRead ?? 0,
+              cacheWriteTokens: stats?.tokens?.cacheWrite ?? 0,
+              cost: stats?.cost ?? 0,
+            },
+          });
+          return;
+        }
+      }
       writeEvent(event);
     });
 
@@ -694,24 +629,12 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const managed = sessionManager.get(sessionId);
 
     if (managed) {
-      // pi-agent brain: read from dpStateRef (updated by extension on every state change)
       if (managed.dpStateRef) {
         sendJson(res, 200, {
           dpStatus: managed.dpStateRef.status,
           question: managed.dpStateRef.question,
           round: managed.dpStateRef.round,
           confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
-        });
-        return;
-      }
-
-      // SDK brain: read from dpState
-      if (managed.dpState) {
-        sendJson(res, 200, {
-          dpStatus: managed.dpState.status,
-          question: managed.dpState.question,
-          round: managed.dpState.round,
-          confirmedHypotheses: managed.dpState.confirmedHypotheses,
         });
         return;
       }
@@ -770,7 +693,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   /**
    * POST /api/reload-{mcp,skills} — unified resource reload endpoints
    *
-   * Each endpoint delegates to the matching AgentBoxResourceHandler:
+   * Each endpoint delegates to the matching AgentBoxSyncHandler:
    * fetch → materialize → postReload.
    * URL paths are preserved for backward compatibility.
    */
@@ -782,32 +705,58 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     return _reloadGatewayClient;
   }
 
-  for (const descriptor of Object.values(RESOURCE_DESCRIPTORS)) {
+  for (const descriptor of Object.values(GATEWAY_SYNC_DESCRIPTORS)) {
     addRoute("POST", descriptor.reloadPath, async (_req, res) => {
       const resourceType = descriptor.type;
       console.log(`[agentbox-http] Reloading ${resourceType} configuration`);
 
       const client = getReloadGatewayClient();
-      if (!client) {
+      // Only skip for handlers that actually need the HTTP client. Handlers
+      // with requiresGatewayClient=false (cluster/host) bring their own
+      // transport via the broker and run fine even when SICLAW_GATEWAY_URL
+      // is unset (Local mode).
+      if (descriptor.requiresGatewayClient && !client) {
         console.warn(`[agentbox-http] No SICLAW_GATEWAY_URL configured, skipping ${resourceType} reload`);
         sendJson(res, 200, { ok: true, count: 0, type: resourceType });
         return;
       }
 
-      const handler = getResourceHandler(resourceType);
+      // Prefer the per-server handler (cluster/host) to guarantee the
+      // closure binds to THIS httpServer's broker (Local mode isolation);
+      // fall back to the module-level registry for mcp/skills which are
+      // process-global and carry no per-session state.
+      const handler = perServerHandlers[resourceType] ?? getSyncHandler(resourceType);
       if (!handler) {
-        sendJson(res, 500, { error: `No handler for resource type "${resourceType}"` });
+        sendJson(res, 500, { error: `No handler for sync type "${resourceType}"` });
         return;
       }
 
       try {
-        const payload = await handler.fetch(client.toClientLike());
+        const payload = await handler.fetch(client ? client.toClientLike() : null);
         const count = await handler.materialize(payload);
 
-        // Build session list for postReload (skills needs brain.reload())
+        // Build session list for postReload. Handlers choose whether to call
+        // brain.reload() (skills/knowledge — in-session hot-reload is safe) or
+        // invalidate() (mcp — session must be rebuilt to pick up the new
+        // toolset). invalidate() defers the release until any in-flight prompt
+        // completes so tool execution is not torn down mid-turn.
         const sessions = sessionManager.list().map((s) => ({
           id: s.id,
           brain: s.brain,
+          invalidate: () => {
+            // Use scheduleRelease(0) instead of release() directly: the 0ms
+            // timer yields to the event loop, so any concurrent getOrCreate
+            // (e.g. user's next message arriving mid-invalidate) can cleanly
+            // clearTimeout() and keep the session alive. Calling release()
+            // synchronously would start an un-cancelable async shutdown that
+            // could tear down mcpManager out from under an in-flight prompt.
+            const doRelease = () => sessionManager.scheduleRelease(s.id, 0);
+            if (s._promptDone) {
+              doRelease();
+            } else {
+              s._promptDoneCallbacks.add(doRelease);
+            }
+          },
         }));
 
         if (handler.postReload) {
@@ -822,57 +771,6 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
       }
     });
   }
-
-  /**
-   * POST /api/reload-credentials — push-based credential update from Gateway
-   *
-   * Accepts the same {manifest, files} payload as the prompt body's credentials
-   * field and re-materializes credential files on disk. This allows the Gateway
-   * to push credential changes (kubeconfig upload/delete, credential CRUD)
-   * without waiting for the next prompt.
-   */
-  addRoute("POST", "/api/reload-credentials", async (req, res) => {
-    const body = (await parseJsonBody(req)) as {
-      manifest?: Array<Record<string, unknown>>;
-      files?: Array<{ name: string; content: string; mode?: number }>;
-    };
-
-    if (!body.manifest) {
-      sendJson(res, 400, { error: "Missing 'manifest' field" });
-      return;
-    }
-
-    // Each AgentBox pod serves exactly one user (one-pod-per-workspace in K8s mode,
-    // one in-process instance per user in local mode). All sessions within this
-    // AgentBox belong to the same user, so updating any session's kubeconfigRef is correct.
-    const sessions = sessionManager.list();
-    const kubeconfigRef = sessions.length > 0
-      ? sessions[0].kubeconfigRef
-      : { credentialsDir: undefined as string | undefined };
-
-    const payload = { manifest: body.manifest, files: body.files ?? [] };
-
-    try {
-      // Use atomic materializeCredentials for both populate and clear paths
-      const count = materializeCredentials(payload, kubeconfigRef);
-      if (count > 0) {
-        console.log(`[agentbox-http] Credentials reloaded: ${count} files materialized`);
-      } else {
-        console.log("[agentbox-http] Credentials cleared (empty payload)");
-      }
-    } catch (err) {
-      console.error("[agentbox-http] Failed to reload credentials:", err);
-      sendJson(res, 500, { error: "Failed to materialize credentials" });
-      return;
-    }
-
-    // Update kubeconfigRef on all active sessions
-    for (const session of sessions) {
-      session.kubeconfigRef.credentialsDir = kubeconfigRef.credentialsDir;
-    }
-
-    sendJson(res, 200, { ok: true, count: payload.files.length });
-  });
 
   /**
    * GET /api/models - list available models (read from settings.json)
@@ -910,14 +808,13 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     const model = managed.brain.getModel();
     sendJson(res, 200, {
       model: model ?? null,
-      brainType: managed.brainType,
     });
   });
 
   /**
-   * POST /api/sessions/:sessionId/model - switch model
+   * PUT /api/sessions/:sessionId/model - switch model
    */
-  addRoute("POST", "/api/sessions/:sessionId/model", async (req, res, params) => {
+  addRoute("PUT", "/api/sessions/:sessionId/model", async (req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
 
@@ -971,18 +868,18 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   });
 
   /**
-   * POST /api/sessions/:sessionId/close - close session
+   * DELETE /api/sessions/:sessionId - close session
    */
-  addRoute("POST", "/api/sessions/:sessionId/close", async (_req, res, params) => {
+  addRoute("DELETE", "/api/sessions/:sessionId", async (_req, res, params) => {
     const { sessionId } = params;
     await sessionManager.close(sessionId);
     sendJson(res, 200, { ok: true });
   });
 
   /**
-   * POST /api/reset-memory - reset memory indexer after Gateway clears PVC files
+   * DELETE /api/memory - reset memory indexer after Gateway clears PVC files
    */
-  addRoute("POST", "/api/reset-memory", async (_req, res) => {
+  addRoute("DELETE", "/api/memory", async (_req, res) => {
     console.log(`[agentbox-http] Resetting memory indexer`);
     try {
       await sessionManager.resetMemory();
@@ -1005,7 +902,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     if (method === "OPTIONS") {
       res.writeHead(200, {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
       });
       res.end();
@@ -1020,9 +917,9 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
         sendJson(res, 403, { error: "Client certificate required" });
         return;
       }
-      if (peerCert.subject.OU !== "Gateway") {
-        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway)`);
-        sendJson(res, 403, { error: "Forbidden: only Gateway can access this API" });
+      if (peerCert.subject.OU !== "Gateway" && peerCert.subject.OU !== "Runtime") {
+        console.warn(`[agentbox-http] Rejected request from OU=${peerCert.subject.OU} (expected Gateway or Runtime)`);
+        sendJson(res, 403, { error: "Forbidden: only Gateway/Runtime can access this API" });
         return;
       }
     }

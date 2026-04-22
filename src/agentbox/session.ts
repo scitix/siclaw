@@ -17,11 +17,10 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef, DpStatus } from "../core/types.js";
-import type { BrainSession, BrainType } from "../core/brain-session.js";
+import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import type { DpState } from "../tools/workflow/dp-tools.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 // topic-consolidator import removed — consolidation disabled
@@ -56,14 +55,10 @@ export interface ManagedSession {
   skillsDirs: string[];
   /** Session mode — determines which system skills are loaded */
   mode: SessionMode;
-  /** Brain type used by this session */
-  brainType: BrainType;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
   memoryIndexer?: MemoryIndexer;
-  /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
-  dpState?: DpState;
   /** Read-only DP state ref — pi-agent extension writes to this, agentbox exposes it for recovery */
   dpStateRef?: DpStateRef;
   /** Number of JSONL message entries at the time of last memory auto-save (dedup) */
@@ -89,8 +84,22 @@ export class AgentBoxSessionManager {
   /** Optional userId — set by LocalSpawner for per-user skill directory isolation */
   userId?: string;
 
+  /** Optional agentId — set by LocalSpawner / K8s spawner; used for metrics labeling */
+  agentId?: string;
+
   /** Optional knowledge base indexer — set by LocalSpawner for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
+
+  /** Optional credential broker — set by http-server for on-demand credential acquisition */
+  credentialBroker?: import("./credential-broker.js").CredentialBroker;
+
+  /**
+   * Optional override for the directory where the broker materializes credential
+   * files. LocalSpawner sets this to a per-user path so multiple
+   * AgentBoxes don't collide on a shared credentialsDir. When undefined the
+   * broker falls back to `<cwd>/.siclaw/credentials`.
+   */
+  credentialsDir?: string;
 
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
@@ -168,7 +177,7 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
-  async getOrCreate(sessionId?: string, mode?: SessionMode, brainType?: BrainType, systemPromptTemplate?: string): Promise<ManagedSession> {
+  async getOrCreate(sessionId?: string, mode?: SessionMode, systemPromptTemplate?: string): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
 
     let managed = this.sessions.get(id);
@@ -205,17 +214,19 @@ export class AgentBoxSessionManager {
 
     const config = loadConfig();
     const kubeconfigRef: KubeconfigRef = {
-      credentialsDir: path.resolve(process.cwd(), config.paths.credentialsDir),
+      // Prefer the per-user dir set by LocalSpawner; fall back to the
+      // config-driven global path (K8s mode and TUI both use this).
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
     };
     const effectiveMode = mode ?? "web";
-    const effectiveBrainType = brainType ?? "pi-agent";
     const result = await createSiclawSession({
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
-      brainType: effectiveBrainType,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
+      agentId: this.agentId ?? null,
       knowledgeIndexer: this.knowledgeIndexer,
       systemPromptTemplate,
     });
@@ -249,11 +260,9 @@ export class AgentBoxSessionManager {
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
-      brainType: effectiveBrainType,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
-      dpState: result.dpState,
       dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
@@ -289,6 +298,8 @@ export class AgentBoxSessionManager {
           toolName: event.toolName ?? entry?.name ?? "unknown",
           outcome: event.isError ? "error" : "success",
           durationMs: entry ? Date.now() - entry.startMs : 0,
+          userId: this.userId ?? "unknown",
+          agentId: this.agentId ?? null,
         });
       }
       if (event.type === "agent_start") {
@@ -436,10 +447,15 @@ export class AgentBoxSessionManager {
 
   /**
    * Schedule a delayed release for a session.
-   * The release happens after SESSION_RELEASE_TTL_MS of idle time.
-   * If a new prompt arrives before the TTL expires, getOrCreate() cancels the timer.
+   *
+   * Defaults to SESSION_RELEASE_TTL_MS (idle-release grace window). Callers can
+   * pass `ttlMs=0` for a "next-tick" release — the timer still goes through
+   * setTimeout, which means a getOrCreate() landing on the same session before
+   * the timer fires can cleanly clearTimeout() and avoid the shutdown. This
+   * cancel-window matters for reload-triggered invalidate(): see
+   * docs/design/mcp-session-lifecycle.md.
    */
-  scheduleRelease(sessionId: string): void {
+  scheduleRelease(sessionId: string, ttlMs: number = SESSION_RELEASE_TTL_MS): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
 
@@ -448,13 +464,13 @@ export class AgentBoxSessionManager {
       clearTimeout(managed._releaseTimer);
     }
 
-    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${SESSION_RELEASE_TTL_MS / 1000}s`);
+    console.log(`[agentbox-session] Scheduling release for session ${sessionId} in ${ttlMs}ms`);
     managed._releaseTimer = setTimeout(() => {
       managed._releaseTimer = null;
       this.release(sessionId).catch((err) => {
         console.warn(`[agentbox-session] Scheduled release failed for ${sessionId}:`, err);
       });
-    }, SESSION_RELEASE_TTL_MS);
+    }, ttlMs);
   }
 
   /**
@@ -511,17 +527,8 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({
-        type: "session_released",
-        sessionId,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);
       // Notify http-server to check idle status
       this.onSessionRelease?.();
@@ -597,17 +604,8 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] Memory sync on close failed:`, err);
         }
       }
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
       this.sessions.delete(sessionId);
-      emitDiagnostic({
-        type: "session_released",
-        sessionId,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId });
     }
   }
 
@@ -635,16 +633,7 @@ export class AgentBoxSessionManager {
           console.warn(`[agentbox-session] MCP shutdown failed for ${id} during closeAll:`, err);
         }
       }
-      const stats = managed.brain.getSessionStats();
-      const model = managed.brain.getModel();
-      emitDiagnostic({
-        type: "session_released",
-        sessionId: id,
-        stats,
-        userId: this.userId,
-        model,
-        createdAt: managed.createdAt.getTime(),
-      });
+      emitDiagnostic({ type: "session_released", sessionId: id });
     }
 
     // Close shared memory indexer

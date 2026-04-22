@@ -418,6 +418,12 @@ describe("createRestrictedBashTool", () => {
       { cmd: "node -e 'process.exit(1)'", bin: "node" },
       { cmd: "kubectl get pods | python3 -c 'import sys'", bin: "python3" },
       { cmd: "find . -name '*.log' | xargs rm", bin: "xargs" },
+      // Regression: prevent LLM from doing its own SSH outside of host_exec / host_script.
+      // The COMMANDS registry deliberately has no ssh / scp / sftp / sshpass entries.
+      { cmd: "ssh user@10.0.0.1 true", bin: "ssh" },
+      { cmd: "scp file user@10.0.0.1:/tmp/", bin: "scp" },
+      { cmd: "sftp user@10.0.0.1", bin: "sftp" },
+      { cmd: "sshpass -p secret ssh user@10.0.0.1 true", bin: "sshpass" },
     ];
 
     for (const { cmd, bin } of blockedCmds) {

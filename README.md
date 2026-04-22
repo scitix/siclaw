@@ -134,6 +134,10 @@ On first startup, Siclaw creates a local admin account:
 
 Set `SICLAW_ADMIN_PASSWORD` before first launch if you want a different bootstrap password.
 
+**Data locations (defaults, override with env vars):**
+- Database: `.siclaw/data/portal.db` — override with `DATABASE_URL=sqlite:///custom/path.db` or `DATABASE_URL=mysql://...`
+- Secrets: `.siclaw/local-secrets.json` — auto-generated JWT / Runtime / Portal secrets, 0600 perms
+
 ### 3. Kubernetes — Team / enterprise
 
 Production deployment uses Helm plus three container images: `gateway`, `agentbox`, and `cron`.
@@ -205,7 +209,7 @@ Minimal example:
 | Runtime | Node.js 22+ (ESM-only) |
 | Language | TypeScript 5.9 |
 | Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) / [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk) |
-| Database (gateway) | MySQL or SQLite (via [sql.js](https://github.com/sql-js/sql.js)) + Drizzle ORM |
+| Database (portal) | MySQL (prod) or SQLite (local, via [node:sqlite](https://nodejs.org/api/sqlite.html)) — single DDL, driver chosen by `DATABASE_URL` scheme |
 | Database (memory) | node:sqlite + FTS5 + bge-m3 embeddings |
 | Frontend | React + Vite + Tailwind CSS |
 | K8s Client | @kubernetes/client-node |

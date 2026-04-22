@@ -11,7 +11,6 @@ import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
-import type { BrainType } from "./core/brain-session.js";
 import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
 
 
@@ -21,9 +20,6 @@ const promptIndex = args.indexOf("--prompt");
 const initialMessage = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
 const isPrintMode = args.includes("--print") || !!initialMessage;
 const continueSession = args.includes("--continue");
-const brainIndex = args.indexOf("--brain");
-const brainArg = brainIndex >= 0 ? args[brainIndex + 1] : undefined;
-const brainType: BrainType | undefined = brainArg === "claude-sdk" ? "claude-sdk" : undefined;
 
 // P0: First-run setup — if no LLM config, run interactive wizard
 if (needsSetup()) {
@@ -60,7 +56,6 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
   await createSiclawSession({
     sessionManager,
     mode: "cli",
-    brainType,
     kubeconfigRef: { credentialsDir },
   });
 
@@ -97,7 +92,6 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
     memoryActive ? "Memory: active" : "Memory: off",
     `Credentials: ${credCount}`,
   ];
-  if (brainType) parts.push(`Brain: ${brainType}`);
   console.log(parts.join(" | "));
 
   if (credCount === 0) {

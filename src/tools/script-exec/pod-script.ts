@@ -10,6 +10,7 @@ import { checkPodRunning } from "../infra/k8s-checks.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validatePodName, prepareExecEnv, spawnAsync, stdinExecCmd } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 interface PodScriptParams {
   pod: string;
@@ -80,7 +81,7 @@ Examples:
       ),
       kubeconfig: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -92,7 +93,16 @@ Examples:
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as PodScriptParams;
 
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "pod_script");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
