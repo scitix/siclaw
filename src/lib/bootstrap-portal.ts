@@ -6,7 +6,6 @@
  */
 
 import type http from "node:http";
-import path from "node:path";
 import { initDb, closeDb, getDb, type Db } from "../gateway/db.js";
 import { runPortalMigrations } from "../portal/migrate.js";
 import { syncBuiltinKnowledge } from "../portal/knowledge-sync.js";
@@ -60,12 +59,11 @@ async function autoInitBuiltinSkillsIfEmpty(): Promise<void> {
   if (Number(rows[0]?.c ?? 0) !== 0) return;
 
   console.log("[portal] No builtin skills found — initializing from image...");
-  const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
+  const { parseSkillsDir, SKILLS_CORE_DIR } = await import("../gateway/skills/builtin-sync.js");
   const { executeImport } = await import("../portal/skill-import.js");
-  const skillsDir = path.join(process.cwd(), "skills", "core");
-  const skills = parseSkillsDir(skillsDir);
+  const skills = parseSkillsDir(SKILLS_CORE_DIR);
   if (skills.length === 0) {
-    console.log("[portal] No skills/core/ directory found — skipping");
+    console.log(`[portal] No skills/core/ directory at ${SKILLS_CORE_DIR} — skipping`);
     return;
   }
   const result = await executeImport("default", skills, "system", "Initial builtin import");
