@@ -56,7 +56,15 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
     agentId: process.env.SICLAW_AGENT_ID || "runtime",
   });
   if (config.serverUrl) {
-    await frontendClient.connect();
+    try {
+      await frontendClient.connect();
+    } catch (err) {
+      const cause = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `[runtime] Failed to connect to Portal at ${config.serverUrl}: ${cause}. ` +
+        `Check that Portal is running and SICLAW_SERVER_URL points at its WS endpoint.`,
+      );
+    }
   }
 
   initChatRepo(frontendClient);
