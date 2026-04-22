@@ -8,6 +8,7 @@
 
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
+import { safeParseJson } from "../gateway/dialect-helpers.js";
 import {
   sendJson,
   parseBody,
@@ -23,7 +24,7 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, name, type, status, created_by, created_at, updated_at FROM channels ORDER BY created_at DESC",
+      "SELECT id, name, type, status, created_by, created_at, updated_at FROM channels ORDER BY created_at DESC, id DESC",
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -71,7 +72,9 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    const ch = rows[0];
+    if (ch.config !== undefined) ch.config = safeParseJson(ch.config, null);
+    sendJson(res, 200, ch);
   });
 
   // PUT /api/v1/channels/:id — update
@@ -102,7 +105,7 @@ export function registerChannelRoutes(router: RestRouter, jwtSecret: string): vo
       return;
     }
 
-    setClauses.push("updated_at = NOW(3)");
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     values.push(params.id);
 
     await db.query(`UPDATE channels SET ${setClauses.join(", ")} WHERE id = ?`, values);

@@ -197,7 +197,7 @@ export async function executeImport(
       const nextVersion = (vRows[0]?.v ?? 0) + 1;
       // Update skills row
       await conn.query(
-        `UPDATE skills SET description = ?, labels = ?, specs = ?, scripts = ?, version = ?, updated_at = CURRENT_TIMESTAMP(3)
+        `UPDATE skills SET description = ?, labels = ?, specs = ?, scripts = ?, version = ?, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [skill.description, JSON.stringify(skill.labels), skill.specs, JSON.stringify(skill.scripts), nextVersion, existingId],
       );
@@ -220,7 +220,7 @@ export async function executeImport(
       ) as any;
       if (overlayRows.length > 0) {
         // Promote overlay: clear overlay_of, keep as regular skill
-        await conn.query("UPDATE skills SET overlay_of = NULL WHERE overlay_of = ?", [existingId]);
+        await conn.query("UPDATE skills SET overlay_of = NULL, updated_at = CURRENT_TIMESTAMP WHERE overlay_of = ?", [existingId]);
         // Migrate agent bindings from builtin → overlay
         for (const ov of overlayRows) {
           await conn.query(

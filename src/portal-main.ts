@@ -1,13 +1,10 @@
 /**
  * Entry point for the Siclaw Portal — lightweight standalone replacement for Upstream.
  *
- * Initializes the database, runs migrations, and starts the HTTP server.
+ * Reads env, delegates all assembly to `bootstrapPortal`, and handles shutdown.
  */
 
-import { initDb, closeDb, getDb } from "./gateway/db.js";
-import { runPortalMigrations } from "./portal/migrate.js";
-import { syncBuiltinKnowledge } from "./portal/knowledge-sync.js";
-import { startPortal } from "./portal/server.js";
+import { bootstrapPortal } from "./lib/bootstrap-portal.js";
 
 const config = {
   port: parseInt(process.env.PORTAL_PORT || "3003", 10),
@@ -24,46 +21,14 @@ if (!config.databaseUrl) {
   process.exit(1);
 }
 
-// Initialize DB
-initDb(config.databaseUrl);
-
-// Run migrations (Portal owns all tables)
-await runPortalMigrations();
-
-// Auto-init builtin skills on first startup
-{
-  const db = getDb();
-  const [countRows] = await db.query("SELECT COUNT(*) AS c FROM skills WHERE is_builtin = 1") as any;
-  if (Number(countRows[0]?.c ?? 0) === 0) {
-    console.log("[portal] No builtin skills found — initializing from image...");
-    const { parseSkillsDir } = await import("./gateway/skills/builtin-sync.js");
-    const { executeImport } = await import("./portal/skill-import.js");
-    const path = await import("node:path");
-    const skillsDir = path.join(process.cwd(), "skills", "core");
-    const skills = parseSkillsDir(skillsDir);
-    if (skills.length > 0) {
-      const result = await executeImport("default", skills, "system", "Initial builtin import");
-      console.log(`[portal] Imported ${skills.length} builtin skills (added=${result.added.length})`);
-    } else {
-      console.log("[portal] No skills/core/ directory found — skipping");
-    }
-  }
-}
-// Sync knowledge baseline from image
-await syncBuiltinKnowledge();
-console.log("[portal] Database ready");
-
-// Start server
-const server = startPortal(config);
+const handle = await bootstrapPortal(config);
 
 // Task scheduling + execution now lives in Runtime (TaskCoordinator).
 // Portal proxies /api/v1/siclaw/agents/:id/tasks/* through to Runtime.
 
-// Graceful shutdown
 async function shutdown(): Promise<void> {
   console.log("\n[portal] Shutting down...");
-  server.close();
-  await closeDb();
+  await handle.close();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

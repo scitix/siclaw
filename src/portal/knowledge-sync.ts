@@ -62,7 +62,7 @@ export async function syncBuiltinKnowledge(): Promise<void> {
   await db.query(
     `INSERT INTO knowledge_versions
      (id, repo_id, version, message, data, size_bytes, sha256, file_count, is_active, status, uploaded_by, activated_by, activated_at)
-     VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1, 'active', ?, ?, CURRENT_TIMESTAMP(3))`,
+     VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1, 'active', ?, ?, CURRENT_TIMESTAMP)`,
     [
       versionId,
       repoId,

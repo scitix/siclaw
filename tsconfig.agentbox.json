@@ -11,7 +11,6 @@
     "src/gateway/agentbox/**/*.ts",
     "src/gateway/security/**/*.ts",
     "src/gateway/config.ts",
-    "src/gateway/db.ts",
     "src/gateway/jwt.ts",
     "src/gateway/metrics-aggregator.ts",
     "src/gateway/ws-protocol.ts"

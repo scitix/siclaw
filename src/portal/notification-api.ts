@@ -159,7 +159,7 @@ export function registerNotificationRoutes(
       `SELECT id, user_id, type, title, message, related_agent_id, related_task_id,
               related_run_id, read_at, created_at
        FROM notifications WHERE ${where}
-       ORDER BY created_at DESC LIMIT ?`,
+       ORDER BY created_at DESC, id DESC LIMIT ?`,
       [auth.userId, limit],
     )) as any;
 
@@ -181,7 +181,7 @@ export function registerNotificationRoutes(
 
     const db = getDb();
     await db.query(
-      "UPDATE notifications SET read_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND user_id = ? AND read_at IS NULL",
+      "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ? AND read_at IS NULL",
       [params.id, auth.userId],
     );
     sendJson(res, 200, { ok: true });
@@ -194,7 +194,7 @@ export function registerNotificationRoutes(
 
     const db = getDb();
     await db.query(
-      "UPDATE notifications SET read_at = CURRENT_TIMESTAMP(3) WHERE user_id = ? AND read_at IS NULL",
+      "UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE user_id = ? AND read_at IS NULL",
       [auth.userId],
     );
     sendJson(res, 200, { ok: true });

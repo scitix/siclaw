@@ -26,7 +26,7 @@ COPY src/cron/ ./src/cron/
 COPY src/memory/ ./src/memory/
 COPY src/shared/ ./src/shared/
 COPY src/tools/ ./src/tools/
-COPY src/gateway/config.ts src/gateway/db.ts src/gateway/jwt.ts \
+COPY src/gateway/config.ts src/gateway/jwt.ts \
      src/gateway/metrics-aggregator.ts src/gateway/ws-protocol.ts ./src/gateway/
 COPY src/gateway/agentbox/ ./src/gateway/agentbox/
 COPY src/gateway/security/ ./src/gateway/security/
