@@ -704,6 +704,13 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
 
     console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
+    // Record a standalone trace row for this steer BEFORE the brain consumes
+    // it. Steer messages bypass the /api/prompt path that normally triggers
+    // beginPrompt(), so without this the DP button clicks ([DP_CONFIRM],
+    // [DP_ADJUST], [DP_SKIP], [DP_REINVESTIGATE]) leave zero audit trail.
+    if (managed._traceRecorder) {
+      try { managed._traceRecorder.recordSteerEvent(body.text); } catch { /* best-effort */ }
+    }
     try {
       await managed.brain.steer(body.text);
       sendJson(res, 200, { ok: true });

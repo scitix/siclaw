@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: siclaw-trace-db-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-hostpath
+  volumeName: siclaw-trace-db-pv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: siclaw-trace-db
+  labels:
+    app: siclaw-trace-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: siclaw-trace-db
+  template:
+    metadata:
+      labels:
+        app: siclaw-trace-db
+    spec:
+      nodeName: cpu-10-208-55-85
+      initContainers:
+      - name: init-mkdir
+        image: busybox
+        command: ["sh", "-c", "mkdir -p /data/siclaw-trace-db && chmod 777 /data/siclaw-trace-db"]
+        volumeMounts:
+        - name: host-data
+          mountPath: /data
+        securityContext:
+          privileged: true
+      containers:
+      - name: siclaw-trace-db
+        image: mysql:8.0
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-trace-db-secret
+              key: mysql-root-password
+        - name: MYSQL_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-trace-db-secret
+              key: mysql-database
+        - name: MYSQL_USER
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-trace-db-secret
+              key: mysql-user
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: siclaw-trace-db-secret
+              key: mysql-password
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        livenessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - mysqladmin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 15
+          periodSeconds: 5
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: siclaw-trace-db-pvc
+      - name: host-data
+        hostPath:
+          path: /data
+          type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: siclaw-trace-db
+spec:
+  selector:
+    app: siclaw-trace-db
+  ports:
+  - protocol: TCP
+    port: 3306
+    targetPort: 3306
+  type: ClusterIP

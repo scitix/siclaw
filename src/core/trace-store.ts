@@ -77,6 +77,14 @@ export interface TraceRow {
   schemaVersion: string;
   /** Beijing time string. Set by DB DEFAULT on insert, populated on read. */
   createdAt?: string;
+  /** True when userMessage starts with one of the UI-button injection prefixes
+   *  (dig-deeper / DP_* / Feedback etc.). Computed once at beginPrompt(). Lets
+   *  analytics exclude button-triggered prompts from real-user-intent stats. */
+  isInjectedPrompt: boolean;
+  /** DP (Deep Probe) workflow status at the moment the trace was flushed.
+   *  One of: idle | investigating | awaiting_confirmation | validating |
+   *  concluding | completed. "idle" when DP isn't tracked for this session. */
+  dpStatusEnd: string;
 }
 
 export interface TraceListOpts {
@@ -106,6 +114,7 @@ export interface TraceRecord extends TraceRow {
 export class TraceStore {
   private db: DatabaseSync;
   private insertStmt: StatementSync;
+  private upsertStmt: StatementSync;
   private getBodyStmt: StatementSync;
 
   constructor(dbPath: string) {
@@ -117,36 +126,102 @@ export class TraceStore {
     this.db.exec("PRAGMA synchronous=NORMAL");
 
     // Schema management — v1 used TEXT PK; v2 added INTEGER PK + UNIQUE
-    // trace_key; v3 switched *_at fields from INTEGER ms to TEXT Beijing time.
+    // trace_key; v3 switched *_at fields from INTEGER ms to TEXT Beijing time;
+    // v4 added is_injected_prompt + dp_status_end.
     ensureSchema(this.db);
 
-    // INSERT — UNIQUE(trace_key) surfaces collisions as hard errors instead of
-    // silently overwriting. created_at defaults to Beijing "now" via strftime.
+    // INSERT — hard fails on UNIQUE(trace_key) collision. Use this when the
+    // caller wants "fail loudly on duplicate id" semantics.
     this.insertStmt = this.db.prepare(`
       INSERT INTO agent_traces (
         trace_key, session_id, prompt_idx, user_id, username, mode, brain_type, model_name,
         user_message, outcome, started_at, ended_at, duration_ms,
         step_count, tool_call_count, tokens_total, cost_usd,
-        schema_version, body_json, body_bytes
+        schema_version, body_json, body_bytes,
+        is_injected_prompt, dp_status_end
       ) VALUES (
         ?, ?, ?, ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?,
+        ?, ?
       )
+    `);
+
+    // UPSERT — used by the trace-recorder's two-phase persistence:
+    //   1. beginPrompt() writes a stub row with outcome='in_progress' so that
+    //      a prompt which later HANGS (propose_hypotheses infinite loop,
+    //      network stall, pod killed mid-run …) still has a DB record.
+    //   2. flush() writes again with the same trace_key once the prompt
+    //      genuinely finishes — ON CONFLICT overwrites the stub with the
+    //      complete data. Normal-completion path therefore still has full
+    //      duration / steps / body_json in the final row.
+    // Columns excluded from the UPDATE: id (auto PK), trace_key (the conflict
+    // target itself), created_at (set once by DB DEFAULT when the stub was
+    // inserted; we want it to reflect FIRST-seen time, not last-flush time).
+    this.upsertStmt = this.db.prepare(`
+      INSERT INTO agent_traces (
+        trace_key, session_id, prompt_idx, user_id, username, mode, brain_type, model_name,
+        user_message, outcome, started_at, ended_at, duration_ms,
+        step_count, tool_call_count, tokens_total, cost_usd,
+        schema_version, body_json, body_bytes,
+        is_injected_prompt, dp_status_end
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?
+      )
+      ON CONFLICT(trace_key) DO UPDATE SET
+        session_id         = excluded.session_id,
+        prompt_idx         = excluded.prompt_idx,
+        user_id            = excluded.user_id,
+        username           = excluded.username,
+        mode               = excluded.mode,
+        brain_type         = excluded.brain_type,
+        model_name         = excluded.model_name,
+        user_message       = excluded.user_message,
+        outcome            = excluded.outcome,
+        started_at         = excluded.started_at,
+        ended_at           = excluded.ended_at,
+        duration_ms        = excluded.duration_ms,
+        step_count         = excluded.step_count,
+        tool_call_count    = excluded.tool_call_count,
+        tokens_total       = excluded.tokens_total,
+        cost_usd           = excluded.cost_usd,
+        schema_version     = excluded.schema_version,
+        body_json          = excluded.body_json,
+        body_bytes         = excluded.body_bytes,
+        is_injected_prompt = excluded.is_injected_prompt,
+        dp_status_end      = excluded.dp_status_end
     `);
 
     this.getBodyStmt = this.db.prepare(
       `SELECT trace_key AS id, session_id, prompt_idx, user_id, username, mode, brain_type, model_name,
               user_message, outcome, started_at, ended_at, duration_ms,
               step_count, tool_call_count, tokens_total, cost_usd, schema_version,
-              created_at, body_json
+              created_at, is_injected_prompt, dp_status_end, body_json
          FROM agent_traces WHERE trace_key = ?`,
     );
   }
 
   insert(row: TraceRow & { bodyJson: string }): void {
-    this.insertStmt.run(
+    this.insertStmt.run(...this.rowToParams(row));
+  }
+
+  /**
+   * UPSERT — insert if trace_key is new, otherwise UPDATE all mutable columns.
+   * Used by the two-phase persistence in TraceRecorder: stub at beginPrompt,
+   * full body at flush. Safe to call repeatedly for the same trace_key.
+   */
+  upsert(row: TraceRow & { bodyJson: string }): void {
+    this.upsertStmt.run(...this.rowToParams(row));
+  }
+
+  /** Shared positional-parameter builder for insert/upsert (same column order). */
+  private rowToParams(row: TraceRow & { bodyJson: string }): Array<string | number | null> {
+    return [
       row.id,
       row.sessionId,
       row.promptIdx,
@@ -167,7 +242,9 @@ export class TraceStore {
       row.schemaVersion,
       row.bodyJson,
       Buffer.byteLength(row.bodyJson, "utf8"),
-    );
+      row.isInjectedPrompt ? 1 : 0,
+      row.dpStatusEnd,
+    ];
   }
 
   list(opts: TraceListOpts): TraceListResult {
@@ -210,7 +287,8 @@ export class TraceStore {
     const sql = `
       SELECT trace_key AS id, session_id, prompt_idx, user_id, username, mode, brain_type, model_name,
              user_message, outcome, started_at, ended_at, duration_ms,
-             step_count, tool_call_count, tokens_total, cost_usd, schema_version, created_at
+             step_count, tool_call_count, tokens_total, cost_usd, schema_version, created_at,
+             is_injected_prompt, dp_status_end
         FROM agent_traces
         ${whereSql}
        ORDER BY started_at DESC, trace_key DESC
@@ -238,63 +316,67 @@ export class TraceStore {
 // ── Schema management + migration ────────────────────────
 
 /** Current schema version. Bumped when a destructive change requires migration. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
- * Canonical v3 DDL.
- *   - `id INTEGER PRIMARY KEY AUTOINCREMENT` — clustered integer key.
- *   - `trace_key TEXT NOT NULL UNIQUE` — business key.
- *   - `started_at` / `ended_at` / `created_at` — TEXT, Beijing
- *     "YYYY-MM-DD HH:mm:ss.SSS". Zero-padded so lex sort matches chrono sort;
- *     range filters work on index.
- *   - `duration_ms INTEGER` — kept numeric for filtering (`minDurationMs=...`);
- *     formatted as `duration` (HH:mm:ss.SSS) at read time.
+ * Canonical v4 DDL.
+ *   - Clustered INTEGER PK + UNIQUE trace_key (since v2).
+ *   - Beijing-time TEXT timestamps (since v3).
+ *   - `is_injected_prompt INTEGER NOT NULL DEFAULT 0` — 0/1 (boolean). True
+ *     when userMessage starts with a UI-button injection prefix.
+ *   - `dp_status_end TEXT NOT NULL DEFAULT 'idle'` — DP workflow status at
+ *     the moment the trace was flushed (idle / investigating /
+ *     awaiting_confirmation / validating / concluding / completed).
+ *   NOT NULL + DEFAULT so that legacy rows copied during migration get safe
+ *   values without touching every migration branch's SELECT list.
  */
-const DDL_V3_TABLE = `
+const DDL_V4_TABLE = `
   CREATE TABLE IF NOT EXISTS agent_traces (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    trace_key        TEXT NOT NULL UNIQUE,
-    session_id       TEXT NOT NULL,
-    prompt_idx       INTEGER NOT NULL,
-    user_id          TEXT,
-    username         TEXT,
-    mode             TEXT NOT NULL,
-    brain_type       TEXT,
-    model_name       TEXT,
-    user_message     TEXT,
-    outcome          TEXT NOT NULL,
-    started_at       TEXT NOT NULL,
-    ended_at         TEXT NOT NULL,
-    duration_ms      INTEGER NOT NULL,
-    step_count       INTEGER NOT NULL DEFAULT 0,
-    tool_call_count  INTEGER NOT NULL DEFAULT 0,
-    tokens_total     INTEGER,
-    cost_usd         REAL,
-    schema_version   TEXT NOT NULL,
-    body_json        TEXT NOT NULL,
-    body_bytes       INTEGER NOT NULL,
-    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now', '+8 hours'))
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trace_key           TEXT NOT NULL UNIQUE,
+    session_id          TEXT NOT NULL,
+    prompt_idx          INTEGER NOT NULL,
+    user_id             TEXT,
+    username            TEXT,
+    mode                TEXT NOT NULL,
+    brain_type          TEXT,
+    model_name          TEXT,
+    user_message        TEXT,
+    outcome             TEXT NOT NULL,
+    started_at          TEXT NOT NULL,
+    ended_at            TEXT NOT NULL,
+    duration_ms         INTEGER NOT NULL,
+    step_count          INTEGER NOT NULL DEFAULT 0,
+    tool_call_count     INTEGER NOT NULL DEFAULT 0,
+    tokens_total        INTEGER,
+    cost_usd            REAL,
+    schema_version      TEXT NOT NULL,
+    body_json           TEXT NOT NULL,
+    body_bytes          INTEGER NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now', '+8 hours')),
+    is_injected_prompt  INTEGER NOT NULL DEFAULT 0,
+    dp_status_end       TEXT NOT NULL DEFAULT 'idle'
   );
 `;
 
-const DDL_V3_INDEXES = `
+const DDL_V4_INDEXES = `
   CREATE INDEX IF NOT EXISTS idx_traces_user_time ON agent_traces(user_id, started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_traces_time      ON agent_traces(started_at DESC);
   CREATE INDEX IF NOT EXISTS idx_traces_session   ON agent_traces(session_id, prompt_idx);
 `;
 
 /**
- * Create or migrate the schema to v3.
- *   fresh DB                           → create v3 directly
- *   v1 DB (TEXT PK, integer ms)        → v1→v2→v3 in sequence
- *   v2 DB (INTEGER PK, integer ms)     → v2→v3
- *   v3 DB                              → no-op (plus idempotent index reassert)
+ * Create or migrate the schema to v4.
+ *   fresh DB                              → create v4 directly
+ *   v1 (TEXT PK, integer ms) / v2         → rebuild to v4 (new-columns get DEFAULT)
+ *   v3 (missing isInjectedPrompt/dpStatus)→ cheap ALTER TABLE ADD COLUMN
+ *   v4                                    → no-op (idempotent index reassert)
  */
 function ensureSchema(db: DatabaseSync): void {
   const currentVersion =
     (db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined)?.user_version ?? 0;
   if (currentVersion >= SCHEMA_VERSION) {
-    db.exec(DDL_V3_INDEXES);
+    db.exec(DDL_V4_INDEXES);
     return;
   }
 
@@ -303,8 +385,8 @@ function ensureSchema(db: DatabaseSync): void {
     .get() !== undefined;
 
   if (!tableExists) {
-    db.exec(DDL_V3_TABLE);
-    db.exec(DDL_V3_INDEXES);
+    db.exec(DDL_V4_TABLE);
+    db.exec(DDL_V4_INDEXES);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }
@@ -313,25 +395,51 @@ function ensureSchema(db: DatabaseSync): void {
   const hasTraceKey = cols.some((c) => c.name === "trace_key");
   const hasStartedAt = cols.some((c) => c.name === "started_at");
   const hasStartedAtMs = cols.some((c) => c.name === "started_at_ms");
+  const hasIsInjected = cols.some((c) => c.name === "is_injected_prompt");
+  const hasDpStatusEnd = cols.some((c) => c.name === "dp_status_end");
 
-  // Branch 1: v1 schema (TEXT PK, started_at_ms). Go v1→v3 directly in one pass.
+  // Branch 1: v1 schema (TEXT PK, started_at_ms). Full rebuild → v4.
   if (!hasTraceKey && hasStartedAtMs) {
-    console.log("[trace-store] Migrating agent_traces v1 → v3 (INTEGER PK + Beijing TEXT timestamps)...");
+    console.log("[trace-store] Migrating agent_traces v1 → v4...");
     rebuildFromLegacy(db, "v1");
     return;
   }
 
-  // Branch 2: v2 schema (INTEGER PK + trace_key, but still started_at_ms). Go v2→v3.
+  // Branch 2: v2 schema (INTEGER PK + trace_key, but still started_at_ms). Full rebuild → v4.
   if (hasTraceKey && hasStartedAtMs && !hasStartedAt) {
-    console.log("[trace-store] Migrating agent_traces v2 → v3 (Beijing TEXT timestamps)...");
+    console.log("[trace-store] Migrating agent_traces v2 → v4...");
     rebuildFromLegacy(db, "v2");
     return;
   }
 
-  // Branch 3: already looks like v3 but missing version stamp — just stamp.
-  if (hasTraceKey && hasStartedAt) {
+  // Branch 3: v3 schema (TEXT timestamps, missing the two new columns).
+  // Non-destructive additive migration — no rebuild, keeps existing rows untouched.
+  if (hasTraceKey && hasStartedAt && (!hasIsInjected || !hasDpStatusEnd)) {
+    console.log("[trace-store] Migrating agent_traces v3 → v4 (adding is_injected_prompt + dp_status_end)...");
+    db.exec("BEGIN");
+    try {
+      if (!hasIsInjected) {
+        db.exec(`ALTER TABLE agent_traces ADD COLUMN is_injected_prompt INTEGER NOT NULL DEFAULT 0`);
+      }
+      if (!hasDpStatusEnd) {
+        db.exec(`ALTER TABLE agent_traces ADD COLUMN dp_status_end TEXT NOT NULL DEFAULT 'idle'`);
+      }
+      db.exec(DDL_V4_INDEXES);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+      db.exec("COMMIT");
+      const count = (db.prepare("SELECT COUNT(*) AS n FROM agent_traces").get() as { n: number }).n;
+      console.log(`[trace-store] Migration complete. ${count} existing row(s) kept, new columns defaulted.`);
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    return;
+  }
+
+  // Branch 4: already looks like v4 but missing version stamp — just stamp.
+  if (hasTraceKey && hasStartedAt && hasIsInjected && hasDpStatusEnd) {
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-    db.exec(DDL_V3_INDEXES);
+    db.exec(DDL_V4_INDEXES);
     return;
   }
 
@@ -339,19 +447,19 @@ function ensureSchema(db: DatabaseSync): void {
 }
 
 /**
- * Shared in-place rebuild: rename old → create v3 → copy+convert → drop old →
- * rebuild indexes → stamp version. One transaction, so the file is never
- * observed half-migrated.
+ * Shared in-place rebuild used when migrating v1 or v2 directly to v4.
+ * Rename old → create v4 → copy+convert → drop old → rebuild indexes.
+ * One transaction, so the file is never observed half-migrated.
  *
- * Legacy mode determines how timestamps are converted:
- *   - v1/v2 store integer ms in started_at_ms / ended_at_ms and integer seconds
- *     in created_at (DEFAULT unixepoch()). We convert both to Beijing strings.
+ * SELECT list intentionally omits the two new v4 columns
+ * (`is_injected_prompt`, `dp_status_end`) — their NOT NULL DEFAULT fills them
+ * in automatically for legacy rows. Safe defaults: not injected, idle.
  */
 function rebuildFromLegacy(db: DatabaseSync, legacy: "v1" | "v2"): void {
   db.exec("BEGIN");
   try {
     db.exec(`ALTER TABLE agent_traces RENAME TO agent_traces_legacy`);
-    db.exec(DDL_V3_TABLE);
+    db.exec(DDL_V4_TABLE);
 
     // trace_key source column differs: v1 had `id TEXT` (the old business id);
     // v2 already has `trace_key`.
@@ -376,7 +484,7 @@ function rebuildFromLegacy(db: DatabaseSync, legacy: "v1" | "v2"): void {
        ORDER BY started_at_ms ASC, rowid ASC
     `);
     db.exec(`DROP TABLE agent_traces_legacy`);
-    db.exec(DDL_V3_INDEXES);
+    db.exec(DDL_V4_INDEXES);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");
     const count = (db.prepare("SELECT COUNT(*) AS n FROM agent_traces").get() as { n: number }).n;
@@ -410,6 +518,8 @@ function rowToTraceRow(r: Record<string, unknown>): TraceRow {
     costUsd: (r.cost_usd as number | null) ?? null,
     schemaVersion: r.schema_version as string,
     createdAt: r.created_at as string,
+    isInjectedPrompt: Boolean(r.is_injected_prompt),
+    dpStatusEnd: (r.dp_status_end as string | null) ?? "idle",
   };
 }
 

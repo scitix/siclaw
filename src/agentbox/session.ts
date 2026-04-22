@@ -278,6 +278,7 @@ export class AgentBoxSessionManager {
         brainType: effectiveBrainType,
         getSessionStats: () => managed!.brain.getSessionStats(),
         getModel: () => managed!.brain.getModel(),
+        dpStateRef: result.dpStateRef,
       });
       if (recorder) {
         managed._traceRecorder = recorder;
