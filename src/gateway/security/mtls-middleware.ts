@@ -79,7 +79,7 @@ export function createMtlsMiddleware(options: MtlsMiddlewareOptions) {
       // Attach identity to request
       req.certIdentity = identity;
 
-      console.log(`[mtls] Authenticated ${req.method} ${url} - userId=${identity.userId} workspaceId=${identity.workspaceId} boxId=${identity.boxId}`);
+      console.log(`[mtls] Authenticated ${req.method} ${url} - agentId=${identity.agentId} orgId=${identity.orgId} boxId=${identity.boxId}`);
 
       // Continue to next handler
       next();
@@ -95,37 +95,18 @@ export function createMtlsMiddleware(options: MtlsMiddlewareOptions) {
 }
 
 /**
- * Authorization helper: Check if certificate identity matches requested userId
+ * Authorization helper: Check if certificate identity matches requested agent
  */
-export function authorizeUserId(
+export function authorizeAgent(
   identity: CertificateIdentity | undefined,
-  requestedUserId: string
+  requestedAgentId: string
 ): boolean {
   if (!identity) {
     return false;
   }
 
-  if (identity.userId !== requestedUserId) {
-    console.warn(`[mtls-authz] userId mismatch: cert=${identity.userId} requested=${requestedUserId}`);
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Authorization helper: Check if certificate identity matches requested workspace
- */
-export function authorizeWorkspace(
-  identity: CertificateIdentity | undefined,
-  requestedWorkspaceId: string
-): boolean {
-  if (!identity) {
-    return false;
-  }
-
-  if (identity.workspaceId !== requestedWorkspaceId) {
-    console.warn(`[mtls-authz] workspaceId mismatch: cert=${identity.workspaceId} requested=${requestedWorkspaceId}`);
+  if (identity.agentId !== requestedAgentId) {
+    console.warn(`[mtls-authz] agentId mismatch: cert=${identity.agentId} requested=${requestedAgentId}`);
     return false;
   }
 

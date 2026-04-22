@@ -17,15 +17,18 @@ interface ManageScheduleParams {
   status?: "active" | "paused";
 }
 
-export function createManageScheduleTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createManageScheduleTool(
+  kubeconfigRef?: KubeconfigRef,
+  sessionIdRef?: { current: string },
+): ToolDefinition {
   return {
     name: "manage_schedule",
     label: "Manage Schedule",
     description: `Create, update, delete, pause, resume, rename, or list cron schedules for automated task execution.
 This tool outputs a structured schedule definition. ALL actions are AUTO-EXECUTED immediately — no user confirmation needed.
 
-NOTE: The "list" action returns schedules scoped to the current workspace.
-For mutation actions (create, update, delete, pause, resume, rename), the frontend handles workspace binding automatically.
+NOTE: The "list" action returns schedules scoped to the current agent.
+For mutation actions (create, update, delete, pause, resume, rename), the frontend handles agent binding automatically.
 
 CRITICAL — LANGUAGE: The "name" and "description" fields MUST be written in the SAME language the user is speaking.
 If the user speaks Korean, write in Korean. If Japanese, write in Japanese. Match the user's language exactly. This directly controls the language of the scheduled task's output.
@@ -106,116 +109,43 @@ Common cron patterns:
     async execute(_toolCallId, rawParams) {
       const params = rawParams as ManageScheduleParams;
 
-      // List action: query Gateway for current schedules
-      if (params.action === "list") {
-        const cfg = loadConfig();
-        const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
-        const userId = cfg.userId;
-        const workspaceId = process.env.SICLAW_WORKSPACE_ID;
-        try {
-          // Use GatewayClient with mTLS authentication
-          const gatewayClient = new GatewayClient({ gatewayUrl });
-          const jobs = await gatewayClient.listCronJobs(userId, workspaceId);
-          if (jobs.length === 0) {
-            return {
-              content: [{ type: "text" as const, text: "No scheduled tasks currently." }],
-              details: {},
-            };
-          }
-          const lines = jobs.map((j, i) => {
-            const status = j.status === "active" ? "🟢 Running" : "⏸️ Paused";
-            return `${i + 1}. **${j.name}** — ${status}\n   Cron: \`${j.schedule}\`${j.description ? `\n   Description: ${j.description}` : ""}${j.lastResult ? `\n   Last result: ${j.lastResult}` : ""}`;
-          });
-          return {
-            content: [{ type: "text" as const, text: `Total ${jobs.length} scheduled task(s):\n\n${lines.join("\n\n")}` }],
-            details: {},
-          };
-        } catch (err) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to query scheduled tasks: ${err instanceof Error ? err.message : String(err)}` }],
-            details: { error: true },
-          };
+      const cfg = loadConfig();
+      const gatewayUrl = cfg.server.gatewayUrl || `http://localhost:${cfg.server.port}`;
+      // Thread current chat sessionId so the Gateway can resolve the task
+      // owner (userId) via sessionRegistry. Without this, task rows land
+      // with empty created_by and downstream cron-task notifications
+      // silently drop at Upstream's TaskNotify (empty-userID guard).
+      const client = new GatewayClient({ gatewayUrl, sessionId: sessionIdRef?.current });
+
+      const fail = (msg: string) => ({
+        content: [{ type: "text" as const, text: JSON.stringify({ error: msg }) }],
+        details: { error: true },
+      });
+      const ok = (summary: string) => ({
+        content: [{ type: "text" as const, text: JSON.stringify({ summary }) }],
+        details: {},
+      });
+
+      // Resolve an id either from params.id or by looking up by name via list.
+      const resolveId = async (): Promise<{ id: string; name: string } | null> => {
+        if (params.id) {
+          // We still need the name for the summary message — list once to find it.
+          try {
+            const list = await client.listAgentTasks();
+            const hit = list.find((t) => t.id === params.id);
+            if (hit) return { id: hit.id, name: hit.name };
+            return { id: params.id, name: params.id };
+          } catch { return { id: params.id, name: params.id }; }
         }
-      }
+        if (!params.name) return null;
+        const list = await client.listAgentTasks();
+        const match = list.find((t) => t.name === params.name);
+        return match ? { id: match.id, name: match.name } : null;
+      };
 
-      // Simple actions: delete, pause, resume, rename — just need id or name to locate
-      if (params.action === "delete" || params.action === "pause" || params.action === "resume") {
-        if (!params.id && !params.name) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: `Schedule ID or name is required for ${params.action}.` }) }],
-            details: { error: true },
-          };
-        }
-        const labels: Record<string, string> = { delete: "Deleted", pause: "Paused", resume: "Resumed" };
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              action: params.action,
-              id: params.id,
-              name: params.name,
-              summary: `${labels[params.action]} scheduled task "${params.name || params.id}".`,
-            }),
-          }],
-          details: {},
-        };
-      }
-
-      if (params.action === "rename") {
-        if (!params.id && !params.name) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: "Schedule ID or current name is required for rename." }) }],
-            details: { error: true },
-          };
-        }
-        if (!params.newName?.trim()) {
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: "New name is required for rename." }) }],
-            details: { error: true },
-          };
-        }
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              action: "rename",
-              id: params.id,
-              name: params.name,
-              newName: params.newName.trim(),
-              summary: `Renamed scheduled task "${params.name || params.id}" → "${params.newName.trim()}".`,
-            }),
-          }],
-          details: {},
-        };
-      }
-
-      // create / update — need full schedule info
-      if (params.action === "update" && !params.id && !params.name) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Schedule ID or name is required for update." }) }],
-          details: { error: true },
-        };
-      }
-
-      if (!params.name?.trim()) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Schedule name is required." }) }],
-          details: { error: true },
-        };
-      }
-
-      if (!params.schedule?.trim()) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: "Cron schedule expression is required." }) }],
-          details: { error: true },
-        };
-      }
-
-      // Pre-validate cron expression + interval so the model sees errors
-      // before the frontend RPC call (which the model never observes)
-      try {
-        parseCronExpression(params.schedule.trim());
-        const { avg, min } = getAverageIntervalMs(params.schedule.trim(), CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
+      const validateSchedule = (schedule: string) => {
+        parseCronExpression(schedule);
+        const { avg, min } = getAverageIntervalMs(schedule, CRON_LIMITS.INTERVAL_SAMPLE_COUNT);
         const limitMin = Math.round(CRON_LIMITS.MIN_INTERVAL_MS / 60_000);
         if (avg < CRON_LIMITS.MIN_INTERVAL_MS) {
           throw new Error(`Schedule interval too short: minimum ${limitMin} minutes between executions`);
@@ -224,38 +154,87 @@ Common cron patterns:
           const floorMin = Math.round(CRON_LIMITS.ABSOLUTE_MIN_GAP_MS / 60_000);
           throw new Error(`Schedule has burst firing: minimum gap between executions must be at least ${floorMin} minutes (average interval must be at least ${limitMin} minutes)`);
         }
+      };
+
+      try {
+        if (params.action === "list") {
+          const tasks = await client.listAgentTasks();
+          if (tasks.length === 0) {
+            return { content: [{ type: "text", text: "No scheduled tasks currently." }], details: {} };
+          }
+          const lines = tasks.map((t, i) => {
+            const status = t.status === "active" ? "🟢 Running" : "⏸️ Paused";
+            return `${i + 1}. **${t.name}** — ${status}\n   Cron: \`${t.schedule}\`${t.description ? `\n   Description: ${t.description}` : ""}${t.lastResult ? `\n   Last result: ${t.lastResult}` : ""}`;
+          });
+          return {
+            content: [{ type: "text", text: `Total ${tasks.length} scheduled task(s):\n\n${lines.join("\n\n")}` }],
+            details: {},
+          };
+        }
+
+        if (params.action === "create") {
+          if (!params.name?.trim()) return fail("Schedule name is required.");
+          if (!params.schedule?.trim()) return fail("Cron schedule expression is required.");
+          validateSchedule(params.schedule.trim());
+          await client.createAgentTask({
+            name: params.name.trim(),
+            schedule: params.schedule.trim(),
+            prompt: params.description?.trim() || params.name.trim(),
+            description: params.description?.trim(),
+            status: params.status ?? "active",
+          });
+          return ok(`Created scheduled task "${params.name.trim()}" (${params.schedule.trim()}).`);
+        }
+
+        if (params.action === "update") {
+          const target = await resolveId();
+          if (!target) return fail("Schedule ID or name is required for update.");
+          if (params.schedule?.trim()) validateSchedule(params.schedule.trim());
+          await client.updateAgentTask(target.id, {
+            name: params.name?.trim(),
+            schedule: params.schedule?.trim(),
+            prompt: params.description?.trim(),
+            description: params.description?.trim(),
+            status: params.status,
+          });
+          return ok(`Updated scheduled task "${target.name}".`);
+        }
+
+        if (params.action === "delete") {
+          const target = await resolveId();
+          if (!target) return fail("Schedule ID or name is required for delete.");
+          await client.deleteAgentTask(target.id);
+          return ok(`Deleted scheduled task "${target.name}".`);
+        }
+
+        if (params.action === "pause" || params.action === "resume") {
+          const target = await resolveId();
+          if (!target) return fail(`Schedule ID or name is required for ${params.action}.`);
+          await client.updateAgentTask(target.id, {
+            status: params.action === "pause" ? "paused" : "active",
+          });
+          return ok(`${params.action === "pause" ? "Paused" : "Resumed"} scheduled task "${target.name}".`);
+        }
+
+        if (params.action === "rename") {
+          const target = await resolveId();
+          if (!target) return fail("Schedule ID or current name is required for rename.");
+          if (!params.newName?.trim()) return fail("New name is required for rename.");
+          await client.updateAgentTask(target.id, { name: params.newName.trim() });
+          return ok(`Renamed scheduled task "${target.name}" → "${params.newName.trim()}".`);
+        }
+
+        return fail(`Unknown action: ${params.action}`);
       } catch (err) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) }],
-          details: { error: true },
-        };
+        return fail(err instanceof Error ? err.message : String(err));
       }
-
-      const result = {
-        action: params.action,
-        id: params.id,
-        schedule: {
-          name: params.name.trim(),
-          description: params.description?.trim() || "",
-          schedule: params.schedule.trim(),
-          status: params.status || "active",
-        },
-        summary: params.action === "create"
-          ? `Created scheduled task "${params.name.trim()}" (${params.schedule.trim()}).`
-          : `Updated scheduled task "${params.name.trim()}" (${params.schedule.trim()}).`,
-      };
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result) }],
-        details: {},
-      };
     },
   };
 }
 
 export const registration: ToolEntry = {
   category: "workflow",
-  create: (refs) => createManageScheduleTool(refs.kubeconfigRef),
+  create: (refs) => createManageScheduleTool(refs.kubeconfigRef, refs.sessionIdRef),
   modes: ["web", "channel"],
   platform: true,
 };

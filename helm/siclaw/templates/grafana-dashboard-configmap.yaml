@@ -3,7 +3,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "siclaw.fullname" . }}-grafana-dashboard
-  namespace: {{ .Values.metrics.grafanaDashboard.namespace | default .Values.namespace }}
+  namespace: {{ .Values.metrics.grafanaDashboard.namespace | default .Release.Namespace }}
   labels:
     {{- include "siclaw.labels" (dict "ctx" . "component" "gateway") | nindent 4 }}
     grafana_dashboard: "1"

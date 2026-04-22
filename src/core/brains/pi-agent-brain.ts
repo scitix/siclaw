@@ -66,8 +66,18 @@ export class PiAgentBrain implements BrainSession {
       // Empty response guard: some models (e.g. Kimi-K2.5) occasionally return
       // a completely empty response (0 content blocks) on the final turn after
       // tool results. Retry up to MAX_EMPTY_RETRIES times with backoff.
+      //
+      // Skip retry when stopReason === "aborted": the empty turn was produced
+      // by an intentional abort (user Stop, or an extension force-aborting a
+      // turn — e.g. DP extension waits for user confirmation after
+      // propose_hypotheses). Re-prompting the original text in that case
+      // re-runs input handlers and can corrupt extension state machines.
       let retries = 0;
-      while (!lastAssistantHadContent && retries < PiAgentBrain.MAX_EMPTY_RETRIES) {
+      while (
+        !lastAssistantHadContent &&
+        lastAssistantMessage?.stopReason !== "aborted" &&
+        retries < PiAgentBrain.MAX_EMPTY_RETRIES
+      ) {
         retries++;
         const msg = lastAssistantMessage;
         const delayMs = PiAgentBrain.RETRY_DELAY_MS * retries;

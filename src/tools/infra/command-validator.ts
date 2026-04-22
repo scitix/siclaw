@@ -11,7 +11,7 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type ExecContext = "local" | "node" | "pod";
+export type ExecContext = "local" | "node" | "pod" | "host";
 
 export interface ValidateCommandOptions {
   /** Determines the base whitelist. Default: "node". */

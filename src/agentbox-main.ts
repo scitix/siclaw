@@ -78,8 +78,11 @@ async function main() {
     }
   }
 
-  // Create session manager
+  // Create session manager. userId / agentId come from spawner env vars
+  // (K8s: SICLAW_AGENT_ID + USER_ID; process-spawner: USER_ID + SICLAW_AGENT_ID).
   const sessionManager = new AgentBoxSessionManager();
+  if (process.env.USER_ID) sessionManager.userId = process.env.USER_ID;
+  if (process.env.SICLAW_AGENT_ID) sessionManager.agentId = process.env.SICLAW_AGENT_ID;
 
   // Start HTTP server
   const server = createHttpServer(sessionManager);

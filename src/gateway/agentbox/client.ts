@@ -6,7 +6,7 @@
  */
 
 import https from "node:https";
-import { RESOURCE_DESCRIPTORS, type ResourceType } from "../../shared/resource-sync.js";
+import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -25,16 +25,9 @@ export interface PromptOptions {
   modelProvider?: string;
   /** Model ID to use for this prompt */
   modelId?: string;
-  /** Brain type — "pi-agent" | "claude-sdk" */
-  brainType?: string;
-  /** Workspace ID (for logging/context) */
-  workspaceId?: string;
-  /** Credential payload — agentbox materializes files locally from this data */
-  credentials?: {
-    manifest: Array<{ name: string; type: string; description?: string | null; files: string[]; metadata?: Record<string, unknown> }>;
-    files: Array<{ name: string; content: string; mode?: number }>;
-  };
-  /** Custom system prompt template from workspace settings */
+  /** Agent ID (for logging/context) */
+  agentId?: string;
+  /** Custom system prompt template from agent settings */
   systemPromptTemplate?: string;
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {
@@ -59,7 +52,6 @@ export interface PromptOptions {
 export interface PromptResponse {
   ok: boolean;
   sessionId: string;
-  brainType?: string;
 }
 
 export interface SessionInfo {
@@ -155,10 +147,10 @@ export class AgentBoxClient {
   }
 
   /**
-   * Generic resource reload — POST to the descriptor's reloadPath.
+   * Generic sync reload — POST to the descriptor's reloadPath.
    */
-  async reloadResource(type: ResourceType): Promise<unknown> {
-    const descriptor = RESOURCE_DESCRIPTORS[type];
+  async reloadResource(type: GatewaySyncType): Promise<unknown> {
+    const descriptor = GATEWAY_SYNC_DESCRIPTORS[type];
     const resp = await this.fetch(descriptor.reloadPath, {
       method: "POST",
     });
@@ -166,14 +158,10 @@ export class AgentBoxClient {
   }
 
   /**
-   * Push updated credentials to AgentBox (re-materializes credential files)
+   * POST to an arbitrary path on the AgentBox.
    */
-  async reloadCredentials(payload: PromptOptions["credentials"]): Promise<{ ok: boolean; count: number }> {
-    const resp = await this.fetch("/api/reload-credentials", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+  async post(path: string): Promise<unknown> {
+    const resp = await this.fetch(path, { method: "POST" });
     return resp.json();
   }
 
@@ -220,8 +208,8 @@ export class AgentBoxClient {
    * Close a session
    */
   async closeSession(sessionId: string): Promise<void> {
-    await this.fetch(`/api/sessions/${sessionId}/close`, {
-      method: "POST",
+    await this.fetch(`/api/sessions/${sessionId}`, {
+      method: "DELETE",
     });
   }
 
@@ -229,8 +217,8 @@ export class AgentBoxClient {
    * Reset memory indexer after Gateway has cleared PVC files.
    */
   async resetMemory(): Promise<{ ok: boolean }> {
-    const resp = await this.fetch("/api/reset-memory", {
-      method: "POST",
+    const resp = await this.fetch("/api/memory", {
+      method: "DELETE",
     });
     return resp.json();
   }
@@ -255,7 +243,7 @@ export class AgentBoxClient {
   /**
    * Get the current model
    */
-  async getModel(sessionId: string): Promise<{ model: ModelInfo | null; brainType?: string }> {
+  async getModel(sessionId: string): Promise<{ model: ModelInfo | null }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/model`);
     return resp.json();
   }
@@ -265,7 +253,7 @@ export class AgentBoxClient {
    */
   async setModel(sessionId: string, provider: string, modelId: string): Promise<{ ok: boolean; model: ModelInfo }> {
     const resp = await this.fetch(`/api/sessions/${sessionId}/model`, {
-      method: "POST",
+      method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider, modelId }),
     });

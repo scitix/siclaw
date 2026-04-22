@@ -1,5 +1,9 @@
 /**
- * AgentBox type definitions
+ * AgentBox type definitions.
+ *
+ * One AgentBox pod per agent. The pod is shared by every user who addresses
+ * that agent; per-user state is carried in the request's sessionId, not in
+ * the pod identity. No userId here.
  */
 
 /** AgentBox status */
@@ -7,10 +11,11 @@ export type AgentBoxStatus = "starting" | "running" | "stopping" | "stopped" | "
 
 /** AgentBox configuration */
 export interface AgentBoxConfig {
-  userId: string;
-  /** Workspace ID (composite cache key with userId) */
-  workspaceId?: string;
-  /** Allowed tools list for this workspace (null = all) */
+  /** Agent ID — the pod identity; also the cert CN. */
+  agentId: string;
+  /** Organization ID — for RBAC scoping in Upstream Adapter */
+  orgId?: string;
+  /** Allowed tools list for this agent (null = all) */
   allowedTools?: string[] | null;
   /** Environment variables */
   env?: Record<string, string>;
@@ -19,16 +24,12 @@ export interface AgentBoxConfig {
     cpu?: string;
     memory?: string;
   };
-  /** Pod environment type — encoded in mTLS cert, determines credential/skill scoping */
-  podEnv?: "prod" | "dev" | "test";
 }
 
 /** AgentBox information */
 export interface AgentBoxInfo {
   boxId: string;
-  userId: string;
-  /** Workspace ID this box serves (from K8s label or cache key) */
-  workspaceId?: string;
+  agentId: string;
   status: AgentBoxStatus;
   endpoint: string;
   createdAt: Date;
@@ -38,8 +39,6 @@ export interface AgentBoxInfo {
 /** AgentBox handle, used for subsequent operations */
 export interface AgentBoxHandle {
   boxId: string;
-  userId: string;
   endpoint: string;
-  /** Workspace ID this box serves (used for credential push) */
-  workspaceId?: string;
+  agentId: string;
 }

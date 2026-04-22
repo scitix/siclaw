@@ -3,25 +3,28 @@
  *
  * Pure timer manager. Each active job gets its own timer.
  * CRUD operations update timers in real-time.
- * DB coordination is handled by CronCoordinator.
  */
 
 import { getNextCronDelay, getNextCronTime } from "./cron-matcher.js";
 
 export interface CronJobRow {
   id: string;
-  userId: string;
   name: string;
   description: string | null;
   schedule: string;
-  skillId: string | null;
   status: "active" | "paused";
   lastRunAt: Date | null;
   lastResult: string | null;
-  assignedTo: string | null;
-  lockedBy: string | null;
-  lockedAt: Date | null;
-  workspaceId: string | null;
+  // Gateway uses these:
+  userId?: string;
+  skillId?: string | null;
+  assignedTo?: string | null;
+  lockedBy?: string | null;
+  lockedAt?: Date | null;
+  workspaceId?: string | null;
+  agentId?: string | null;
+  // Portal uses these:
+  prompt?: string;
 }
 
 export type OnFireFn = (job: CronJobRow) => Promise<void>;
@@ -71,7 +74,6 @@ export class CronScheduler {
       const timer = setTimeout(async () => {
         this.timers.delete(job.id);
 
-        // Guard against concurrent execution from race with addOrUpdate
         if (this.executing.has(job.id)) return;
         this.executing.add(job.id);
 
@@ -84,7 +86,6 @@ export class CronScheduler {
           this.executing.delete(job.id);
         }
 
-        // Reschedule if still in our job list and active
         const current = this.jobs.get(job.id);
         if (current && current.status === "active") {
           this.scheduleNext(current);
@@ -108,7 +109,6 @@ export class CronScheduler {
     console.log("[cron-scheduler] Stopped all timers");
   }
 
-  /** Get current job count */
   get jobCount(): number {
     return this.timers.size;
   }

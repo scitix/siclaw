@@ -19,12 +19,6 @@ import {
   type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
-import {
-  type DpState,
-  createDpState,
-  createProposeHypothesesTool,
-  createEndInvestigationTool,
-} from "../tools/workflow/dp-tools.js";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { ToolRegistry } from "./tool-registry.js";
 import { allToolEntries } from "../tools/all-entries.js";
@@ -35,12 +29,9 @@ import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
-import { ClaudeSdkBrain } from "./brains/claude-sdk-brain.js";
-import type { BrainSession, BrainType } from "./brain-session.js";
-import { hasOpenAIProvider, ensureProxy } from "./llm-proxy.js";
+import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
-import { sanitizeToolCallIdsForCloudCodeAssist } from "./tool-call-id.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -49,12 +40,11 @@ export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
-  brainType?: BrainType;
-  /** Workspace tool allow-list: null = all tools, string[] = only these tools */
+  /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
-  /** Extra system prompt content appended for workspace customization */
+  /** Extra system prompt content appended for agent customization */
   systemPromptAppend?: string;
-  /** Custom system prompt template from workspace settings (overrides DEFAULT_TEMPLATE) */
+  /** Custom system prompt template from agent settings (overrides DEFAULT_TEMPLATE) */
   systemPromptTemplate?: string;
   /** Pre-initialized shared memory indexer (AgentBox level) — skips per-session creation */
   memoryIndexer?: MemoryIndexer;
@@ -64,6 +54,8 @@ export interface CreateSiclawSessionOpts {
   mcpTools?: ToolDefinition[];
   /** User ID for per-user skill directory isolation (local spawner mode) */
   userId?: string;
+  /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
+  agentId?: string | null;
   /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
 }
@@ -82,8 +74,6 @@ export interface SiclawSessionResult {
   /** MCP client manager — call shutdown() on session close */
   mcpManager?: McpClientManager;
   memoryIndexer?: MemoryIndexer;
-  /** Mutable DP state — only set for SDK brain (pi-agent uses extension state) */
-  dpState?: DpState;
   /** Read-only DP state ref — pi-agent extension writes, agentbox reads for recovery */
   dpStateRef?: DpStateRef;
   /** Mutable ref — populated when session ID is assigned (for skill_call events) */
@@ -129,7 +119,6 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string,
-  memoryIndexerRef?: { current?: MemoryIndexer },
 ): string[] {
   const parts: string[] = [];
 
@@ -179,18 +168,12 @@ This is a new user (profile has only defaults).
     }
   }
 
-  // Knowledge Overview (between PROFILE and MEMORY)
+  // Knowledge Overview (repos/docs summary — past DP investigations are NOT
+  // auto-injected here; the agent pulls them on demand via `memory_search`).
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  let investigationPatterns: Array<{ category: string; count: number }> | undefined;
-  if (memoryIndexerRef?.current) {
-    try {
-      investigationPatterns = memoryIndexerRef.current.getInvestigationPatterns(3)
-        .map(p => ({ category: p.rootCauseCategory, count: p.count }));
-    } catch { /* ignore — patterns are a nice-to-have */ }
-  }
-  const overview = buildKnowledgeOverview({ memoryDir, reposDir: reposDir_, docsDir: docsDir_, investigationPatterns });
+  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_ });
   if (overview) {
     parts.push(overview);
   }
@@ -239,6 +222,7 @@ export async function createSiclawSession(
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
+  const agentId: string | null = opts?.agentId ?? null;
   // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
   // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
   // a model-change notification — so this initialization does not conflict with that path.
@@ -295,7 +279,7 @@ export async function createSiclawSession(
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, sessionIdRef, llmConfigRef,
+      kubeconfigRef, userId, agentId, sessionIdRef, llmConfigRef,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer,
@@ -304,9 +288,9 @@ export async function createSiclawSession(
     allowedTools,
   });
 
-  // Log workspace tool filter result (diagnostic — original behavior from L365-367)
+  // Log agent tool filter result (diagnostic — original behavior from L365-367)
   if (Array.isArray(allowedTools)) {
-    console.log(`[agent-factory] Workspace tool filter: ${allToolEntries.length} registered → ${customTools.length} resolved`);
+    console.log(`[agent-factory] Agent tool filter: ${allToolEntries.length} registered → ${customTools.length} resolved`);
   }
 
   // -- MCP external tools (dynamic discovery, not in registry) --
@@ -406,43 +390,49 @@ export async function createSiclawSession(
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
 
-  // Skill directory: single "resolved/" directory built by materialize (K8s)
-  // or syncSkills (local). Contains all skills flattened with priority:
-  //   personal > skillset > global > builtin (symlinked)
-  // Local mode: per-user resolved dir at {skillsBase}/user/{userId}/resolved/
-  // K8s mode: {skillsBase}/resolved/
-  const resolvedSkillsDir = opts?.userId
-    ? path.join(skillsBase, "user", opts.userId, "resolved")
-    : path.join(skillsBase, "resolved");
+  // Skill directory: single "resolved/" built by sync-handlers.ts materialize
+  // at {skillsBase}/resolved/. Contains every skill this agent is bound to,
+  // flattened (bundle from Gateway is already priority-merged: global > builtin).
+  //
+  // Note: there is intentionally no per-user segment here. Earlier drafts
+  // picked {skillsBase}/user/{userId}/resolved when userId was set, but no
+  // writer ever materialized to that path — materialize always writes the
+  // shared location — so agent-factory would miss every synced skill the
+  // moment mtls cert provided a userId. Both paths now align on the shared
+  // location; LocalSpawner's multi-tenant safety is handled upstream
+  // (materialize is gated in local mode per the invariants doc).
+  const resolvedSkillsDir = path.join(skillsBase, "resolved");
 
-  // Fallback: if resolved/ doesn't exist yet (first boot, TUI mode),
-  // use builtin directories directly.
+  // Fallback: only when resolved/ doesn't exist (TUI mode where Gateway sync
+  // never runs). Server modes always have resolved/ created by materialize.
   const builtinPath = path.resolve(cwd, "skills", "core");
   const extensionPath = path.resolve(cwd, "skills", "extension");
+  const platformPath = path.resolve(cwd, "skills", "platform");
 
   const skillsDirs: string[] = [];
   if (fs.existsSync(resolvedSkillsDir)) {
     skillsDirs.push(resolvedSkillsDir);
   } else {
-    // Pre-materialize fallback: load builtins directly
     for (const bDir of [builtinPath, extensionPath]) {
       if (fs.existsSync(bDir)) skillsDirs.push(bDir);
     }
   }
+  // Platform skills are always loaded (system-level, not user-managed)
+  if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
 
   // Resolve credentials directory for tools and /setup extension
   const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
 
-  // Workspace system prompt append (shared between pi-agent and SDK brain)
-  const workspaceSystemPromptAppend = opts?.systemPromptAppend;
+  // Agent system prompt append (shared between pi-agent and SDK brain)
+  const agentSystemPromptAppend = opts?.systemPromptAppend;
 
   const loader = new DefaultResourceLoader({
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(memoryDir, memoryIndexerRef);
-      if (workspaceSystemPromptAppend) {
-        parts.push("\n\n" + workspaceSystemPromptAppend);
+      const parts = buildAppendSystemPrompt(memoryDir);
+      if (agentSystemPromptAppend) {
+        parts.push("\n\n" + agentSystemPromptAppend);
       }
       return parts;
     },
@@ -471,71 +461,6 @@ export async function createSiclawSession(
   if (!fs.existsSync(skeletonProfilePath)) {
     fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
   }
-
-  // -- Claude SDK brain path --
-  if (opts?.brainType === "claude-sdk") {
-    console.log(`[agent-factory] Creating Claude SDK brain`);
-
-    // Restricted file tools are already in customTools (pushed above)
-    const sdkTools = [...customTools];
-
-    // DP tools are NOT registered for SDK brain — the interactive DP workflow
-    // (propose_hypotheses → user confirm → deep_search) requires pi-agent extension
-    // handlers for [DP_CONFIRM]/[DP_ADJUST]/[DP_SKIP] markers. Without those,
-    // SDK brain DP gets stuck at awaiting_confirmation. Tracked for future work.
-    const dpState: DpState = createDpState();
-
-    const systemPrompt = buildSreSystemPrompt(mode, opts?.systemPromptTemplate);
-
-    // Build the same append content that pi-agent gets via appendSystemPromptOverride
-    const appendParts = buildAppendSystemPrompt(memoryDir);
-    let systemPromptAppend = appendParts.join("\n") || undefined;
-
-    // Investigation Capability prompt removed — deep_search is now DP-mode-only.
-    // The workflow instructions are injected via buildActivationMessage() when
-    // the user explicitly triggers DP mode.
-
-    // Append workspace custom prompt
-    if (opts?.systemPromptAppend) {
-      systemPromptAppend = (systemPromptAppend ?? "") + "\n\n" + opts.systemPromptAppend;
-    }
-
-    // Start LLM proxy if an OpenAI-compatible provider is configured
-    let proxyUrl: string | undefined;
-    if (hasOpenAIProvider()) {
-      try {
-        proxyUrl = await ensureProxy();
-        console.log(`[agent-factory] LLM proxy active at ${proxyUrl}`);
-      } catch (err) {
-        console.warn(`[agent-factory] LLM proxy failed to start, falling back to direct Anthropic API:`, err);
-      }
-    }
-
-    const brain: BrainSession = new ClaudeSdkBrain({
-      systemPrompt,
-      systemPromptAppend,
-      cwd,
-      customTools: sdkTools,
-      proxyUrl,
-      externalMcpServers: mcpServers && Object.keys(mcpServers).length > 0 ? mcpServers : undefined,
-      dpState,
-    });
-
-    return {
-      brain,
-      session: null as any,  // No pi-agent session for SDK brain
-      customTools: sdkTools,
-      kubeconfigRef,
-      llmConfigRef,
-      skillsDirs,
-      mode,
-      mcpManager,
-      dpState,
-      sessionIdRef,
-    };
-  }
-
-  // -- Pi-agent brain path (default) --
 
   const sessionManager =
     opts?.sessionManager ?? SessionManager.create(process.cwd());

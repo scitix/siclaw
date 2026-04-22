@@ -1,8 +1,7 @@
 # Shared data PVC — user memory, investigations, sessions.
-# Also used for gateway SQLite database in non-MySQL deployments.
 #
-# This single PVC is shared by gateway and all AgentBox pods.
-# Gateway creates per-user subdirectories (users/{userId}/{workspaceId}/);
+# This single PVC is shared by Runtime and all AgentBox pods.
+# Runtime creates per-user subdirectories (users/{userId}/{agentId}/);
 # AgentBox pods mount via subPath for isolation.
 #
 # Requirements:

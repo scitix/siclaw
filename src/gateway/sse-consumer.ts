@@ -2,13 +2,17 @@
  * Shared SSE consumer — extracts tool call persistence and result text from
  * an AgentBox event stream.
  *
- * Used by both `chat.send` (pilot) and CronService (via agent-prompt).
- * Callers add their own behaviour via the `onEvent` callback (e.g. WS
- * forwarding for pilot, no-op for cron).
+ * Used by both Portal chat-gateway (web chat) and CronCoordinator (scheduled
+ * tasks). Callers add their own behaviour via the `onEvent` callback (e.g.
+ * forwarding events to an SSE client).
+ *
+ * When `persistMessages` is true, every tool call and assistant message is
+ * written to chat_messages. The caller is responsible for creating the
+ * chat_sessions row before invoking.
  */
 
 import { AgentBoxClient } from "./agentbox/client.js";
-import { ChatRepository } from "./db/repositories/chat-repo.js";
+import { appendMessage, incrementMessageCount } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
 
 // ── Public types ────────────────────────────────────
@@ -30,8 +34,11 @@ export interface ConsumeAgentSseOptions {
   client: AgentBoxClient;
   sessionId: string;
   userId: string;
-  /** Pass null/undefined to skip DB persistence (text extraction still works). */
-  chatRepo?: ChatRepository | null;
+  /**
+   * When true, persist tool calls and assistant messages to chat_messages.
+   * Caller must ensure chat_sessions row for sessionId exists (FK constraint).
+   */
+  persistMessages?: boolean;
   redactionConfig?: RedactionConfig;
   /** Called for every SSE event after DB writes (so dbMessageId is available). */
   onEvent?: OnEventCallback;
@@ -54,8 +61,54 @@ export interface SseConsumptionResult {
 
 const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
 
+/**
+ * Strip pi-agent's `(Empty response: {...})` diagnostic markers that get
+ * appended to an assistant message when the model returns content=[]. These
+ * are useful in server logs but pollute the persisted trace shown to users.
+ * Match uses greedy balanced-brace detection inside the wrapper.
+ */
+function stripEmptyResponseMarkers(text: string): string {
+  return text.replace(/\s*\(Empty response:\s*\{[\s\S]*?\}\)\s*/g, "").trimEnd();
+}
+
+/**
+ * Pick the subset of tool-result `details` worth persisting as message
+ * metadata. The `blocked`/`error` flags are already surfaced via the message's
+ * `outcome` column — dropping them here avoids duplicate storage. Anything
+ * else (e.g. `propose_hypotheses`'s `hypotheses` array, `deep_search`'s rich
+ * per-hypothesis validation results) is passed through so the UI can rebuild
+ * cards like InvestigationCard on history reload without the ephemeral live
+ * stream.
+ *
+ * Redaction is applied via a JSON round-trip so patterns hit string values
+ * nested inside arrays/objects. If redaction somehow produces invalid JSON
+ * (defensive only — current redactText just substitutes `[REDACTED]` which is
+ * safe inside JSON strings), the metadata is dropped rather than persisted
+ * corrupt.
+ */
+function extractPersistableDetails(
+  details: Record<string, unknown> | undefined,
+  redactionConfig: RedactionConfig,
+): Record<string, unknown> | null {
+  if (!details) return null;
+
+  const { blocked: _blocked, error: _error, ...rest } = details;
+  if (Object.keys(rest).length === 0) return null;
+
+  if (redactionConfig.patterns.length === 0) return rest;
+
+  const serialized = JSON.stringify(rest);
+  const redacted = redactText(serialized, redactionConfig);
+  try {
+    return JSON.parse(redacted) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
-  const { client, sessionId, userId, chatRepo, onEvent, signal } = opts;
+  const { client, sessionId, userId, onEvent, signal } = opts;
+  const persist = opts.persistMessages === true;
   const redactionConfig = opts.redactionConfig ?? EMPTY_REDACTION;
 
   let assistantContent = "";
@@ -93,14 +146,13 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "tool_execution_end") {
       const toolResult = evt.result as {
         content?: Array<{ type: string; text?: string }>;
-        details?: { blocked?: boolean; error?: boolean };
+        details?: Record<string, unknown>;
       } | undefined;
       const text =
         toolResult?.content
           ?.filter((c) => c.type === "text")
           .map((c) => c.text ?? "")
           .join("") ?? "";
-      // Normalize key: pi-agent uses toolName, claude-sdk may use name
       const toolName = (evt.toolName as string) || (evt.name as string) || "tool";
 
       let outcome: "success" | "error" | "blocked" = "success";
@@ -110,19 +162,20 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       const toolStartTime = pendingToolStartTimes.get(toolName);
       const durationMs = toolStartTime != null ? Date.now() - toolStartTime : undefined;
       const toolInput = pendingToolInputs.get(toolName) || "";
+      const metadata = extractPersistableDetails(toolResult?.details, redactionConfig);
 
-      if (chatRepo) {
-        dbMessageId = await chatRepo.appendMessage({
+      if (persist) {
+        dbMessageId = await appendMessage({
           sessionId,
           role: "tool",
           content: redactText(text, redactionConfig),
           toolName,
-          toolInput: toolInput ? redactText(toolInput, redactionConfig) : undefined,
-          userId,
+          toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
           outcome,
-          durationMs,
+          durationMs: durationMs ?? null,
+          metadata,
         });
-        await chatRepo.incrementMessageCount(sessionId);
+        await incrementMessageCount(sessionId);
       }
       pendingToolInputs.delete(toolName);
       pendingToolStartTimes.delete(toolName);
@@ -179,18 +232,22 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
         resultText = extracted || currentMsgText || resultText;
 
-        // Persist assistant message
-        if (chatRepo && assistantContent) {
-          await chatRepo.appendMessage({
-            sessionId,
-            role: "assistant",
-            content: redactText(assistantContent, redactionConfig),
-          });
-          await chatRepo.incrementMessageCount(sessionId);
+        // Persist assistant message (skip entirely if it's purely an empty-
+        // response marker — keeps the trace free of pi-agent diagnostics)
+        if (persist && assistantContent) {
+          const cleaned = stripEmptyResponseMarkers(assistantContent);
+          if (cleaned.length > 0) {
+            await appendMessage({
+              sessionId,
+              role: "assistant",
+              content: redactText(cleaned, redactionConfig),
+            });
+            await incrementMessageCount(sessionId);
+          }
           assistantContent = "";
         }
       } else if (message?.role === "toolResult" && lastToolName === "task_report") {
-        // task_report via turn_end (claude-sdk path)
+        // task_report via turn_end (alternative emission path)
         const content = message.content;
         const text = typeof content === "string" ? content
           : Array.isArray(content)
@@ -224,15 +281,17 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   console.log(`[sse-consumer] ${userId} session=${sessionId}: ${eventCount} events, ${durationMs}ms`);
 
   // Redact secrets from returned text. Tool results and assistant messages
-  // are already redacted before being written to chatRepo above, but the
-  // return values (resultText / taskReportText / errorMessage) are used by
-  // cron-service to populate cron_job_runs.result_text and notifications,
-  // both of which bypass the message persistence redaction. Match the
-  // per-message redaction to keep the run summary and trace view consistent.
-  const finalResultText = redactText(taskReportText || resultText, redactionConfig);
+  // are already redacted before being written to chat_messages above, but the
+  // return values (resultText / taskReportText / errorMessage) are consumed by
+  // task-coordinator / chat-gateway for agent_task_runs.result_text and
+  // user-facing notifications, both of which bypass the per-message redaction.
+  // Match the per-message redaction to keep the run summary and trace view
+  // consistent.
+  const cleanedResult = stripEmptyResponseMarkers(taskReportText || resultText);
+  const finalResultText = redactText(cleanedResult, redactionConfig);
   return {
     resultText: finalResultText,
-    taskReportText: redactText(taskReportText, redactionConfig),
+    taskReportText: redactText(stripEmptyResponseMarkers(taskReportText), redactionConfig),
     errorMessage: redactText(errorMessage, redactionConfig),
     eventCount,
     durationMs,

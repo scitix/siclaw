@@ -1,286 +1,308 @@
 /**
- * Builtin Skill Sync — scans Docker-baked skill directories and upserts into DB.
+ * Builtin skill sync — runs on gateway startup.
  *
- * Runs once on gateway startup, after initSchema. After sync, builtin skills
- * are regular DB records (scope="builtin") with content in skill_contents.
- * All downstream code reads from DB, not disk.
+ * Scans skills/core/ on the filesystem (baked into the Docker image) and
+ * syncs each skill into the DB skills + skill_versions tables.
  *
- * DB id format: "builtin:<dirName>" (deterministic, backward-compatible with
- * forkedFromId chains and workspace composer refs).
+ * Sync rules:
+ *   - New skill:                    INSERT with status='installed', author_id='system', is_approved=1
+ *   - Existing, hash unchanged:     SKIP
+ *   - Existing, user hasn't edited  UPDATE from image, new version row, is_approved=1
+ *     (current hash == v1 hash):
+ *   - Existing, user has edited     SKIP
+ *     (current hash != v1 hash):
+ *
+ * "Hash" is SHA-256 of (specs + JSON-sorted scripts), providing a stable
+ * content fingerprint independent of insertion order.
  */
 
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import type { Database } from "../db/index.js";
-import { SkillFileWriter } from "./file-writer.js";
-import { SkillRepository } from "../db/repositories/skill-repo.js";
-import { SkillContentRepository, type SkillContentTag } from "../db/repositories/skill-content-repo.js";
-import { SkillVersionRepository } from "../db/repositories/skill-version-repo.js";
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { getDb } from "../db.js";
 
-// ── Label loading (moved from skill-labels.ts) ──────────────────────
+/**
+ * Resolve skills/core/ relative to the installed package, not process.cwd().
+ * This file lives at `<pkg>/dist/gateway/skills/builtin-sync.js` (or
+ * `<pkg>/src/gateway/skills/builtin-sync.ts` during dev), so walking three
+ * directories up always lands at the package root regardless of where the
+ * user invoked the CLI from.
+ */
+export const SKILLS_CORE_DIR = fileURLToPath(new URL("../../../skills/core", import.meta.url));
 
-interface MetaJson {
-  labels?: Record<string, string[]>;
+interface ScriptEntry {
+  name: string;
+  content: string;
 }
 
-function loadLabelsFromMetaJson(skillsDir: string): Map<string, string[]> {
-  const labels = new Map<string, string[]>();
-  for (const tier of ["core", "extension"]) {
-    const metaPath = path.join(skillsDir, tier, "meta.json");
-    if (!fs.existsSync(metaPath)) continue;
-    try {
-      const raw = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as MetaJson;
-      if (raw.labels) {
-        for (const [dirName, skillLabels] of Object.entries(raw.labels)) {
-          // Merge labels across tiers (core + extension)
-          const existing = labels.get(dirName) ?? [];
-          labels.set(dirName, [...new Set([...existing, ...skillLabels])]);
-        }
-      }
-    } catch (err) {
-      console.warn(`[builtin-sync] Failed to load ${metaPath}:`, err instanceof Error ? err.message : err);
-    }
-  }
-  return labels;
-}
-
-// ── Scanning ─────────────────────────────────────────────────────────
-
-interface ScannedBuiltinSkill {
+interface BuiltinSkillData {
   dirName: string;
   name: string;
   description: string;
   specs: string;
-  scripts: Array<{ name: string; content: string }>;
+  scripts: ScriptEntry[];
   labels: string[];
-  contentHash: string;
 }
 
-// Reuse SkillFileWriter's parseFrontmatter for consistent YAML quote handling
-const _fmParser = new SkillFileWriter(".");
-function parseFrontmatter(specs: string): { name: string; description: string } {
-  return _fmParser.parseFrontmatter(specs);
+// ---------------------------------------------------------------------------
+// Public parsed skill type
+// ---------------------------------------------------------------------------
+
+export interface ParsedSkill {
+  dirName: string;
+  name: string;
+  description: string;
+  labels: string[];
+  specs: string;
+  scripts: Array<{ name: string; content: string }>;
 }
 
-function scanBuiltinDir(dir: string, labelMap: Map<string, string[]>): ScannedBuiltinSkill[] {
-  if (!fs.existsSync(dir)) return [];
-  const results: ScannedBuiltinSkill[] = [];
+// ---------------------------------------------------------------------------
+// Filesystem helpers
+// ---------------------------------------------------------------------------
 
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (!entry.isDirectory() || entry.name.startsWith("_")) continue;
+/**
+ * Parse a skill's YAML frontmatter and return its `name` and `description`.
+ * Handles inline values and block scalars (`>-`, `>`, `|`, `|-`) — built-in
+ * skills rely on `description: >-` for multi-line text.
+ */
+export function parseFrontmatter(md: string): { name: string; description: string } {
+  const match = md.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return { name: "", description: "" };
 
-    const skillMdPath = path.join(dir, entry.name, "SKILL.md");
-    if (!fs.existsSync(skillMdPath)) continue;
+  const block = match[1];
 
-    const specs = fs.readFileSync(skillMdPath, "utf-8");
-    const { name, description } = parseFrontmatter(specs);
+  // name: single-line value
+  const nameMatch = block.match(/^name:\s*(.+)$/m);
+  const name = nameMatch ? nameMatch[1].trim() : "";
 
-    // Read scripts
-    const scripts: Array<{ name: string; content: string }> = [];
-    const scriptsDir = path.join(dir, entry.name, "scripts");
-    if (fs.existsSync(scriptsDir)) {
-      for (const scriptName of fs.readdirSync(scriptsDir).filter(f => !f.startsWith("."))) {
-        scripts.push({
-          name: scriptName,
-          content: fs.readFileSync(path.join(scriptsDir, scriptName), "utf-8"),
-        });
+  // description: may be a YAML block scalar (>-, >, |) or inline
+  let description = "";
+  const lines = block.split("\n");
+  const descIdx = lines.findIndex(l => l.match(/^description:\s/));
+  if (descIdx >= 0) {
+    const firstLine = lines[descIdx].replace(/^description:\s*/, "").trim();
+    if (firstLine === ">-" || firstLine === ">" || firstLine === "|" || firstLine === "|-") {
+      // Block scalar: collect indented continuation lines
+      const contLines: string[] = [];
+      for (let i = descIdx + 1; i < lines.length; i++) {
+        if (lines[i].match(/^\s+/)) {
+          contLines.push(lines[i].trim());
+        } else {
+          break;
+        }
       }
-    }
-
-    // Content hash for change detection
-    const hash = crypto.createHash("sha256");
-    hash.update(specs);
-    for (const s of scripts.sort((a, b) => a.name.localeCompare(b.name))) {
-      hash.update(s.name);
-      hash.update(s.content);
-    }
-    const contentHash = hash.digest("hex").slice(0, 16);
-
-    results.push({
-      dirName: entry.name,
-      name: name || entry.name,
-      description,
-      specs,
-      scripts,
-      labels: labelMap.get(entry.name) ?? [],
-      contentHash,
-    });
-  }
-
-  return results;
-}
-
-// ── Sync entry point ─────────────────────────────────────────────────
-
-export async function syncBuiltinSkills(db: Database): Promise<number> {
-  const skillRepo = new SkillRepository(db);
-  const contentRepo = new SkillContentRepository(db);
-  const versionRepo = new SkillVersionRepository(db);
-
-  // Scan disk
-  const builtinDir = path.join(process.cwd(), "skills");
-  const labelMap = loadLabelsFromMetaJson(builtinDir);
-
-  const scanned: ScannedBuiltinSkill[] = [];
-  const seen = new Set<string>();
-  for (const tier of ["core", "extension"]) {
-    for (const skill of scanBuiltinDir(path.join(builtinDir, tier), labelMap)) {
-      if (!seen.has(skill.dirName)) {
-        seen.add(skill.dirName);
-        scanned.push(skill);
-      }
-    }
-  }
-
-  // Get existing builtin records from DB
-  const existingBuiltins = await skillRepo.list({ scope: "builtin" });
-  const existingMap = new Map(existingBuiltins.map((s: any) => [s.id as string, s]));
-
-  let upserted = 0;
-  const scannedIds = new Set<string>();
-
-  for (const skill of scanned) {
-    const id = `builtin:${skill.dirName}`;
-    scannedIds.add(id);
-
-    const existing = existingMap.get(id);
-    if (existing) {
-      // Compare content hash — skip if unchanged
-      if ((existing as any).contentHash === skill.contentHash) continue;
-
-      // Update changed skill
-      await skillRepo.update(id, {
-        name: skill.name,
-        description: skill.description,
-        labels: skill.labels.length > 0 ? skill.labels : null,
-        contentHash: skill.contentHash,
-      });
-      await contentRepo.save(id, "published" as SkillContentTag, {
-        specs: skill.specs,
-        scripts: skill.scripts,
-      });
-      // Bump version + create version record for the update
-      await skillRepo.bumpVersion(id);
-      const updated = await skillRepo.getById(id);
-      const ver = updated?.version ?? 1;
-      try {
-        await versionRepo.create({
-          skillId: id, version: ver, tag: "published",
-          commitMessage: `builtin update`,
-          specs: skill.specs, scriptsJson: skill.scripts,
-          files: { metadata: { name: skill.name, description: skill.description ?? null, type: "BuiltIn", labels: skill.labels.length > 0 ? skill.labels : null } },
-        });
-      } catch { /* ignore if skill_versions schema incomplete */ }
-      await skillRepo.update(id, { publishedVersion: ver });
-      upserted++;
-      console.log(`[builtin-sync] Updated: ${skill.name} (${id})`);
+      description = contLines.join(" ");
     } else {
-      // Insert new builtin skill with deterministic id
-      await skillRepo.createWithId(id, {
-        name: skill.name,
-        description: skill.description,
-        type: "BuiltIn",
-        scope: "builtin" as any,
-        dirName: skill.dirName,
-        originId: id,
-        contentHash: skill.contentHash,
-        labels: skill.labels.length > 0 ? skill.labels : undefined,
-      });
-      // Mark as approved (builtin is always approved)
-      await skillRepo.update(id, { reviewStatus: "approved", publishedVersion: 1 });
-      await contentRepo.save(id, "published" as SkillContentTag, {
-        specs: skill.specs,
-        scripts: skill.scripts,
-      });
-      // Create base version record (v1)
-      try {
-        await versionRepo.create({
-          skillId: id, version: 1, tag: "published",
-          commitMessage: `base version`,
-          specs: skill.specs, scriptsJson: skill.scripts,
-          files: { metadata: { name: skill.name, description: skill.description ?? null, type: "BuiltIn", labels: skill.labels.length > 0 ? skill.labels : null } },
-        });
-      } catch { /* ignore if skill_versions schema incomplete */ }
-      upserted++;
-      console.log(`[builtin-sync] Inserted: ${skill.name} (${id})`);
+      // Inline scalar
+      description = firstLine;
     }
   }
 
-  // Remove stale builtin records (skill removed from Docker image)
-  for (const [existingId] of existingMap) {
-    if (!scannedIds.has(existingId)) {
-      // Re-link forkedFromId chain before deleting
-      await skillRepo.relinkForkedFrom(existingId, null);
-      await skillRepo.deleteById(existingId);
-      console.log(`[builtin-sync] Removed stale: ${existingId}`);
+  return { name, description };
+}
+
+function readSkillDir(dirName: string, dirPath: string, labelsMap: Record<string, string[]>): BuiltinSkillData | null {
+  const skillMdPath = join(dirPath, "SKILL.md");
+  if (!existsSync(skillMdPath)) return null;
+
+  const specs = readFileSync(skillMdPath, "utf8");
+  const { name, description } = parseFrontmatter(specs);
+  if (!name) return null;
+
+  // Collect scripts (sorted by name for deterministic hashing)
+  const scripts: ScriptEntry[] = [];
+  const scriptsDir = join(dirPath, "scripts");
+  if (existsSync(scriptsDir)) {
+    const files = readdirSync(scriptsDir).filter((f) => f.endsWith(".sh") || f.endsWith(".py")).sort();
+    for (const file of files) {
+      const content = readFileSync(join(scriptsDir, file), "utf8");
+      scripts.push({ name: file, content });
     }
   }
 
-  // Fix-up: ensure all builtins have at least one version record (base version)
-  for (const skill of scanned) {
-    const id = `builtin:${skill.dirName}`;
-    const versions = await versionRepo.listForSkill(id, { limit: 1 });
-    if (versions.length === 0) {
-      const meta = await skillRepo.getById(id);
-      const ver = meta?.version ?? 1;
-      try {
-        await versionRepo.create({
-          skillId: id, version: ver, tag: "published",
-          commitMessage: `base version`,
-          specs: skill.specs, scriptsJson: skill.scripts,
-          files: { metadata: { name: skill.name, description: skill.description ?? null, type: "BuiltIn", labels: skill.labels.length > 0 ? skill.labels : null } },
-        });
-        if (!meta?.publishedVersion) await skillRepo.update(id, { publishedVersion: ver });
-      } catch { /* ignore */ }
+  const labels = labelsMap[dirName] ?? [];
+
+  return { dirName, name, description, specs, scripts, labels };
+}
+
+function computeHash(specs: string, scripts: ScriptEntry[]): string {
+  const h = createHash("sha256");
+  h.update(specs);
+  // Scripts are already sorted by name; stringify produces a stable string
+  h.update(JSON.stringify(scripts));
+  return h.digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Public API — parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a skills directory into structured skill objects.
+ * Pure filesystem → data transform. Does NOT touch the database.
+ *
+ * Expects the directory to follow the standard layout:
+ *   <skillsDir>/
+ *     meta.json          (optional) — { labels: { [dirName]: string[] } }
+ *     <dirName>/
+ *       SKILL.md         (required) — frontmatter with name + description
+ *       scripts/         (optional) — .sh and .py files
+ */
+export function parseSkillsDir(skillsDir: string): ParsedSkill[] {
+  // Called with paths computed relative to the package — if the directory
+  // is missing (e.g. a minimal deployment that stripped skills/), return
+  // an empty list so callers can fall through their own empty-result guard.
+  if (!existsSync(skillsDir)) return [];
+
+  // Load label map from meta.json if present
+  const metaPath = join(skillsDir, "meta.json");
+  let labelsMap: Record<string, string[]> = {};
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { labels?: Record<string, string[]> };
+      labelsMap = meta.labels ?? {};
+    } catch {
+      // labels will be empty — caller may warn if needed
     }
   }
 
-  // Also fix global skills without version records (contributed before version tracking)
-  const globalSkills = await skillRepo.list({ scope: "global" });
-  for (const g of globalSkills) {
-    const versions = await versionRepo.listForSkill(g.id, { limit: 1 });
-    if (versions.length === 0) {
-      const content = await contentRepo.read(g.id, "published" as SkillContentTag);
-      if (content) {
-        const ver = g.version ?? 1;
-        try {
-          await versionRepo.create({
-            skillId: g.id, version: ver, tag: "published",
-            commitMessage: `initial version`,
-            specs: content.specs, scriptsJson: content.scripts,
-            files: { metadata: { name: g.name, description: g.description ?? null, type: g.type ?? null, labels: (g as any).labelsJson ?? null } },
-          });
-          if (!(g as any).publishedVersion) await skillRepo.update(g.id, { publishedVersion: ver });
-        } catch { /* ignore */ }
+  return readdirSync(skillsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => readSkillDir(d.name, join(skillsDir, d.name), labelsMap))
+    .filter((s): s is BuiltinSkillData => s !== null);
+}
+
+// ---------------------------------------------------------------------------
+// Public API — database sync
+// ---------------------------------------------------------------------------
+
+export async function syncBuiltinSkills(
+  orgId: string,
+): Promise<{ inserted: number; updated: number; skipped: number }> {
+  if (!existsSync(SKILLS_CORE_DIR)) {
+    console.warn(`[builtin-sync] skills/core/ not found at ${SKILLS_CORE_DIR} — skipping`);
+    return { inserted: 0, updated: 0, skipped: 0 };
+  }
+
+  // Load label map (also needed for warning on parse failure)
+  const metaPath = join(SKILLS_CORE_DIR, "meta.json");
+  if (existsSync(metaPath)) {
+    try {
+      JSON.parse(readFileSync(metaPath, "utf8"));
+    } catch {
+      console.warn("[builtin-sync] Failed to parse meta.json — labels will be empty");
+    }
+  }
+
+  // Read all skill directories via shared parser
+  const entries = parseSkillsDir(SKILLS_CORE_DIR);
+
+  const db = getDb();
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+
+  for (const skill of entries) {
+    const hash = computeHash(skill.specs, skill.scripts);
+    // specs is MEDIUMTEXT — store raw string, not JSON-encoded
+    const specsRaw = skill.specs;
+    const scriptsJson = JSON.stringify(skill.scripts);
+    const labelsJson = JSON.stringify(skill.labels);
+
+    // Look up existing skill row
+    const [rows] = await db.query<any[]>(
+      `SELECT id, version, specs, scripts FROM skills WHERE org_id = ? AND name = ? LIMIT 1`,
+      [orgId, skill.name],
+    );
+
+    if (rows.length === 0) {
+      // ── INSERT ────────────────────────────────────────────
+      const skillId = crypto.randomUUID();
+      const versionId = crypto.randomUUID();
+
+      await db.query(
+        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
+         VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, 'system')`,
+        [skillId, orgId, skill.name, skill.description, labelsJson, specsRaw, scriptsJson],
+      );
+
+      await db.query(
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
+         VALUES (?, ?, 1, ?, ?, 'Initial builtin import', 'system', 1)`,
+        [versionId, skillId, specsRaw, scriptsJson],
+      );
+
+      inserted++;
+      continue;
+    }
+
+    // ── Existing skill ────────────────────────────────────
+    const existing = rows[0] as { id: string; version: number; specs: any; scripts: any };
+    // specs is MEDIUMTEXT — should be a raw string, but may be double-encoded from old bug
+    let existingSpecs: string = typeof existing.specs === "string" ? existing.specs : String(existing.specs || "");
+    if (existingSpecs.startsWith('"')) { try { existingSpecs = JSON.parse(existingSpecs); } catch { /* keep */ } }
+    // scripts is JSON column — MySQL driver may return string or parsed object
+    let existingScripts: ScriptEntry[];
+    if (Array.isArray(existing.scripts)) {
+      existingScripts = existing.scripts;
+    } else if (typeof existing.scripts === "string") {
+      try { existingScripts = JSON.parse(existing.scripts); } catch { existingScripts = []; }
+    } else {
+      existingScripts = [];
+    }
+    const currentHash = computeHash(existingSpecs, existingScripts);
+
+    if (currentHash === hash) {
+      // Content identical — nothing to do
+      skipped++;
+      continue;
+    }
+
+    // Check v1 hash to detect user edits
+    const [v1Rows] = await db.query<any[]>(
+      `SELECT specs, scripts FROM skill_versions WHERE skill_id = ? AND version = 1 LIMIT 1`,
+      [existing.id],
+    );
+
+    if (v1Rows.length > 0) {
+      const v1 = v1Rows[0] as { specs: any; scripts: any };
+      let v1Specs: string = typeof v1.specs === "string" ? v1.specs : String(v1.specs || "");
+      if (v1Specs.startsWith('"')) { try { v1Specs = JSON.parse(v1Specs); } catch { /* keep */ } }
+      let v1Scripts: ScriptEntry[];
+      if (Array.isArray(v1.scripts)) { v1Scripts = v1.scripts; }
+      else if (typeof v1.scripts === "string") { try { v1Scripts = JSON.parse(v1.scripts); } catch { v1Scripts = []; } }
+      else { v1Scripts = []; }
+      const v1Hash = computeHash(v1Specs, v1Scripts);
+
+      if (v1Hash !== currentHash) {
+        // User has edited since v1 — leave their version alone
+        skipped++;
+        continue;
       }
     }
+
+    // ── UPDATE ────────────────────────────────────────────
+    // Current content matches v1 (or v1 doesn't exist): safe to update
+    const newVersion = existing.version + 1;
+    const versionId = crypto.randomUUID();
+
+    await db.query(
+      `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [skill.description, labelsJson, newVersion, specsRaw, scriptsJson, existing.id],
+    );
+
+    await db.query(
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
+       VALUES (?, ?, ?, ?, ?, 'Builtin update from image', 'system', 1)`,
+      [versionId, existing.id, newVersion, specsRaw, scriptsJson],
+    );
+
+    updated++;
   }
 
-  // Fix-up: backfill null tags on version records based on commit_message
-  try {
-    const { sql } = await import("drizzle-orm");
-    const { skillVersions } = await import("../db/schema.js");
-    const { isNull } = await import("drizzle-orm");
-    const nullTagVersions = await db.select().from(skillVersions).where(isNull(skillVersions.tag)).limit(500);
-    let tagFixed = 0;
-    for (const v of nullTagVersions) {
-      const msg = (v.commitMessage ?? "").toLowerCase();
-      let tag: "published" | "approved" | null = null;
-      if (msg.includes("published") || msg.includes("base version") || msg.includes("contributed") || msg.includes("initial version")) tag = "published";
-      else if (msg.includes("approved")) tag = "approved";
-      else if (msg.includes("rollback")) tag = msg.includes("dev") ? "published" : "approved";
-      if (tag) {
-        await db.update(skillVersions).set({ tag }).where(sql`${skillVersions.id} = ${v.id}`);
-        tagFixed++;
-      }
-    }
-    if (tagFixed > 0) console.log(`[builtin-sync] Fixed tag for ${tagFixed} version records`);
-  } catch { /* ignore if schema doesn't support tag yet */ }
-
-  if (upserted > 0 || scanned.length > 0) {
-    console.log(`[builtin-sync] Done: ${scanned.length} scanned, ${upserted} changed, ${existingMap.size - scannedIds.size > 0 ? existingMap.size - [...scannedIds].filter(id => existingMap.has(id)).length : 0} removed`);
-  }
-
-  return scanned.length;
+  console.log(`[builtin-sync] done — inserted=${inserted} updated=${updated} skipped=${skipped}`);
+  return { inserted, updated, skipped };
 }

@@ -11,6 +11,7 @@ import {
 } from "../infra/exec-utils.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 import { loadConfig } from "../../core/config.js";
 
 interface ResolvePodNetnsParams {
@@ -53,13 +54,22 @@ Parameters:
       pod: Type.String({ description: "Target pod name" }),
       namespace: Type.Optional(Type.String({ description: 'Namespace (default: "default")' })),
       container: Type.Optional(Type.String({ description: "Container name (for multi-container pods)" })),
-      kubeconfig: Type.Optional(Type.String({ description: "Credential name of the target cluster (from credential_list)." })),
+      kubeconfig: Type.Optional(Type.String({ description: "Credential name of the target cluster (from cluster_list)." })),
       image: Type.Optional(Type.String({ description: "Debug container image (default: SICLAW_DEBUG_IMAGE)" })),
     }),
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as ResolvePodNetnsParams;
 
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "resolve_pod_netns");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -92,7 +102,7 @@ Parameters:
       // so we use crictl pods + crictl inspectp (sandbox), not crictl inspect (container).
       // The runtime already creates /var/run/netns/<name> — ip netns exec works directly.
       const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
 
       const innerScript = [
         // Find sandbox ID by pod name and namespace

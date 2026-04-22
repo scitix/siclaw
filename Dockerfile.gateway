@@ -1,10 +1,8 @@
-# Gateway Docker Image — multi-stage build
-# Stage 1: backend build (tsc)
-# Stage 2: frontend build (vite)
-# Stage 3: production runtime
+# Siclaw Agent Runtime — Docker Image
+# Two-stage build: compile TypeScript → production runtime
 
-# ── Backend build stage ─────────────────────────────────────────
-FROM node:22-slim AS backend-builder
+# ── Build stage ─────────────────────────────────────────────
+FROM node:22-slim AS builder
 
 WORKDIR /app
 
@@ -12,59 +10,41 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
-# Copy source code
+# Copy source and compile
 COPY tsconfig.json ./
 COPY src/ ./src/
-
-# Backend build (tsc)
 RUN npx tsc
 
-# ── Frontend build stage ────────────────────────────────────────
-FROM node:22-slim AS frontend-builder
-
-WORKDIR /app
-
-# Frontend deps (cached unless web/package*.json changes)
-COPY src/gateway/web/package*.json ./
-RUN npm install
-
-# Copy frontend source and build
-COPY src/gateway/web/ ./
-RUN npm run build
-
-# ── Production stage ─────────────────────────────────────────────
+# ── Production stage ────────────────────────────────────────
 FROM node:22-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git \
+    curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Production deps (cached unless package*.json changes)
+# Production deps
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-# Copy compiled JS from backend builder
-COPY --from=backend-builder /app/dist/ ./dist/
+# Copy compiled JS
+COPY --from=builder /app/dist/ ./dist/
 
-# Copy web frontend from frontend builder
-COPY --from=frontend-builder /app/dist/ ./dist/gateway/web/dist/
-
-# Copy builtin skills + scripts
+# Copy builtin skills
 COPY skills/core/ ./skills/core/
 COPY skills/extension/ ./skills/extension/
-COPY scripts/memory-cleanup.sh ./scripts/
 
 RUN mkdir -p .siclaw
 
 ENV NODE_ENV=production
-ENV PORT=3000
-ENV HOST=0.0.0.0
+ENV SICLAW_PORT=3001
+ENV SICLAW_INTERNAL_PORT=3002
+ENV SICLAW_HOST=0.0.0.0
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3000/api/health || exit 1
+    CMD curl -f http://localhost:3001/api/health || exit 1
 
-EXPOSE 3000
+EXPOSE 3001 3002
 
 CMD ["node", "dist/gateway-main.js", "--k8s"]

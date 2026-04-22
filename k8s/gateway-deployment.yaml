@@ -1,38 +1,38 @@
-# Gateway Deployment
-# Stateless API Gateway that manages AgentBox pods
+# Siclaw Agent Runtime Deployment
+# Stateless process that manages AgentBox pods.
 #
 # Prerequisites:
 # 1. Create namespace: kubectl create namespace siclaw
-# 2. Create secret with MySQL connection URL:
-#    kubectl create secret generic siclaw-secrets \
-#      --from-literal=database-url='mysql://user:pass@host:3306/siclaw' \
+# 2. Create secrets:
+#    kubectl create secret generic siclaw-runtime-secrets \
+#      --from-literal=proxy-secret='<shared-secret>' \
 #      -n siclaw
 
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw
   labels:
-    app: siclaw-gateway
+    app: siclaw-runtime
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: siclaw-gateway
+      app: siclaw-runtime
   template:
     metadata:
       labels:
-        app: siclaw-gateway
+        app: siclaw-runtime
     spec:
-      serviceAccountName: siclaw-gateway
+      serviceAccountName: siclaw-runtime
       containers:
-      - name: gateway
-        image: siclaw-gateway:latest  # Replace with your registry image
+      - name: runtime
+        image: siclaw-runtime:latest
         imagePullPolicy: Always
         ports:
         - name: http
-          containerPort: 3000
+          containerPort: 3001
           protocol: TCP
         - name: mtls
           containerPort: 3002
@@ -40,30 +40,31 @@ spec:
         env:
         - name: NODE_ENV
           value: "production"
-        - name: PORT
-          value: "3000"
-        - name: HOST
+        - name: SICLAW_PORT
+          value: "3001"
+        - name: SICLAW_INTERNAL_PORT
+          value: "3002"
+        - name: SICLAW_HOST
           value: "0.0.0.0"
         - name: SICLAW_K8S_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
         - name: SICLAW_GATEWAY_HOSTNAME
-          value: "siclaw-gateway.siclaw.svc.cluster.local"
+          value: "siclaw-runtime.siclaw.svc.cluster.local"
         - name: SICLAW_AGENTBOX_IMAGE
           value: "siclaw-agentbox:latest"
         - name: SICLAW_SKILLS_DIR
           value: "/app/.siclaw/skills"
-        # User data persistence — shared PVC for ensureUserDir()
         - name: SICLAW_PERSISTENCE_ENABLED
           value: "true"
         - name: SICLAW_PERSISTENCE_CLAIM_NAME
           value: "siclaw-data"
-        - name: SICLAW_DATABASE_URL
+        - name: SICLAW_PROXY_SECRET
           valueFrom:
             secretKeyRef:
-              name: siclaw-secrets
-              key: database-url
+              name: siclaw-runtime-secrets
+              key: proxy-secret
         resources:
           requests:
             memory: "128Mi"
@@ -74,13 +75,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /api/health
-            port: 3000
+            port: 3001
           initialDelaySeconds: 5
           periodSeconds: 15
         readinessProbe:
           httpGet:
             path: /api/health
-            port: 3000
+            port: 3001
           initialDelaySeconds: 2
           periodSeconds: 2
         volumeMounts:
@@ -99,17 +100,16 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
-    app: siclaw-gateway
+    app: siclaw-runtime
   ports:
   - name: http
-    port: 80
-    targetPort: 3000
-    nodePort: 31000
+    port: 3001
+    targetPort: 3001
     protocol: TCP
   - name: mtls
     port: 3002
@@ -117,19 +117,17 @@ spec:
     protocol: TCP
 
 ---
-# ServiceAccount for Gateway to manage AgentBox pods
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw
 
 ---
-# Role for managing AgentBox pods
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw
 rules:
 - apiGroups: [""]
@@ -146,17 +144,16 @@ rules:
   verbs: ["get", "list"]
 
 ---
-# RoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: siclaw-gateway
+  name: siclaw-runtime
 subjects:
 - kind: ServiceAccount
-  name: siclaw-gateway
+  name: siclaw-runtime
   namespace: siclaw

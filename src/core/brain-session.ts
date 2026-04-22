@@ -1,8 +1,8 @@
 /**
- * BrainSession — unified interface for different AI agent backends.
+ * BrainSession — unified interface for the AI agent backend.
  *
  * Consumers (http-server, session.ts, cli-main) program against this interface.
- * Implementations: PiAgentBrain (pi-coding-agent) and ClaudeSdkBrain (claude-agent-sdk).
+ * Implementation: PiAgentBrain (pi-coding-agent).
  *
  * Event protocol follows the pi-agent format (frontend already adapted):
  * - agent_start/end, turn_start/end, message_start/end
@@ -12,7 +12,7 @@
  * - auto_compaction_start/end, auto_retry_start/end
  */
 
-export type BrainType = "pi-agent" | "claude-sdk";
+export type BrainType = "pi-agent";
 
 export interface BrainModelInfo {
   id: string;

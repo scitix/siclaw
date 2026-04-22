@@ -17,6 +17,7 @@ import {
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 interface NodeScriptParams {
   node: string;
@@ -82,7 +83,7 @@ Examples:
       ),
       kubeconfig: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from credential_list). If omitted, uses the default kubeconfig.",
+          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
         }),
       ),
       image: Type.Optional(
@@ -99,7 +100,16 @@ Examples:
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as NodeScriptParams;
 
-      const kubeResult = resolveRequiredKubeconfig(kubeconfigRef?.credentialsDir, params.kubeconfig);
+      try {
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "node_script");
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          details: { error: true, reason: "kubeconfig_ensure_failed" },
+        };
+      }
+
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -141,7 +151,7 @@ Examples:
       }
 
       const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage(kubeconfigRef?.credentialsDir, params.kubeconfig) || loadConfig().debugImage;
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
       // Security: shell-escape each argument to prevent injection via args parameter
