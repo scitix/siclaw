@@ -1082,7 +1082,6 @@ export const COMMANDS: Record<string, CommandDef> = {
   md5sum:    { category: "file" },
   sha256sum: { category: "file" },
 
-
   // ── system logs & services ──
   journalctl:  { category: "services", allowedFlags: [
     "-u", "--unit", "-n", "--lines", "--since", "--until",
