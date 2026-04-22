@@ -94,21 +94,21 @@ describe("LocalSpawner — spawn (happy path)", () => {
 
     expect(handle.boxId).toBe("local-a1");
     expect(handle.agentId).toBe("a1");
-    expect(handle.endpoint).toBe("http://127.0.0.1:5000");
+    expect(handle.endpoint).toBe("https://127.0.0.1:5000");
 
     // Cert bundle was issued — CN is agentId, no userId / env embedded.
     expect(cm.issuedFor).toHaveLength(1);
     expect(cm.issuedFor[0]).toEqual({ agentId: "a1" });
 
-    // Cert files were written into .siclaw/certs/<boxId>
+    // Cert files were written into .siclaw/certs/<boxId> using K8s-convention names
     const certDir = path.join(tmpDir, ".siclaw", "certs", "local-a1");
-    expect(fs.readFileSync(path.join(certDir, "cert.pem"), "utf-8")).toBe("CERT-a1");
-    expect(fs.readFileSync(path.join(certDir, "key.pem"), "utf-8")).toBe("KEY-a1");
-    expect(fs.readFileSync(path.join(certDir, "ca.pem"), "utf-8")).toBe("CA-a1");
+    expect(fs.readFileSync(path.join(certDir, "tls.crt"), "utf-8")).toBe("CERT-a1");
+    expect(fs.readFileSync(path.join(certDir, "tls.key"), "utf-8")).toBe("KEY-a1");
+    expect(fs.readFileSync(path.join(certDir, "ca.crt"), "utf-8")).toBe("CA-a1");
 
-    // ENV propagated for http-server to pick up
+    // ENV propagated for http-server / GatewayClient to pick up
     expect(process.env.SICLAW_GATEWAY_URL).toBe("https://127.0.0.1:3002");
-    expect(process.env.SICLAW_TLS_CERT).toBe(path.join(certDir, "cert.pem"));
+    expect(process.env.SICLAW_CERT_PATH).toBe(certDir);
   });
 
   it("returns the existing handle on a second spawn for the same agent (idempotent)", async () => {
@@ -116,15 +116,15 @@ describe("LocalSpawner — spawn (happy path)", () => {
     const h1 = await spawner.spawn({ agentId: "a1" });
     const h2 = await spawner.spawn({ agentId: "a1" });
     expect(h1).toEqual(h2);
-    expect(h1.endpoint).toBe("http://127.0.0.1:5000");
+    expect(h1.endpoint).toBe("https://127.0.0.1:5000");
   });
 
   it("allocates sequential ports for different agents", async () => {
     const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
     const h1 = await spawner.spawn({ agentId: "a1" });
     const h2 = await spawner.spawn({ agentId: "a2" });
-    expect(h1.endpoint).toBe("http://127.0.0.1:5000");
-    expect(h2.endpoint).toBe("http://127.0.0.1:5001");
+    expect(h1.endpoint).toBe("https://127.0.0.1:5000");
+    expect(h2.endpoint).toBe("https://127.0.0.1:5001");
   });
 
   it("throws when agentId is empty", async () => {

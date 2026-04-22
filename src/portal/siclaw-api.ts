@@ -28,6 +28,13 @@ import {
   type AuthContext,
 } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
+import {
+  buildUpsert,
+  jsonArrayContains,
+  jsonArrayFlattenSql,
+  safeParseJson,
+  toSqlTimestamp,
+} from "../gateway/dialect-helpers.js";
 import { evaluateScriptsStatic, buildAssessment } from "../gateway/skills/script-evaluator.js";
 import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { parseFrontmatter } from "../gateway/skills/builtin-sync.js";
@@ -124,8 +131,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
     const db = getDb();
+    const { joinClause, valueColumn } = jsonArrayFlattenSql(db, "skills", "labels");
     const [rows] = await db.query(
-      `SELECT DISTINCT jl.label FROM skills, JSON_TABLE(labels, '$[*]' COLUMNS(label VARCHAR(100) PATH '$')) AS jl WHERE jl.label IS NOT NULL ORDER BY jl.label`,
+      `SELECT DISTINCT ${valueColumn} AS label FROM ${joinClause} WHERE ${valueColumn} IS NOT NULL ORDER BY ${valueColumn}`,
     ) as any;
     sendJson(res, 200, { labels: (rows as any[]).map((r: any) => r.label) });
   });
@@ -157,19 +165,26 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (query.labels) {
       const labelList = (query.labels as string).split(",").map(l => l.trim());
       for (const label of labelList) {
-        const clause = " AND JSON_CONTAINS(labels, ?)";
+        // MySQL JSON_CONTAINS wants a JSON-encoded value; SQLite json_each compares
+        // raw string values. Helper picks the right SQL; we pass two param shapes.
+        const clause = " AND " + jsonArrayContains(db, "labels");
         countSql += clause;
         listSql += clause;
-        params.push(JSON.stringify(label));
+        params.push(db.driver === "mysql" ? JSON.stringify(label) : label);
       }
     }
 
-    listSql += " ORDER BY s.created_at DESC LIMIT ? OFFSET ?";
+    listSql += " ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?";
 
     const [[countRows], [listRows]] = await Promise.all([
       db.query(countSql, params),
       db.query(listSql, [...params, pageSize, offset]),
     ]) as [any, any];
+
+    for (const row of listRows as any[]) {
+      if (row.labels !== undefined) row.labels = safeParseJson(row.labels, []);
+      if (row.scripts !== undefined) row.scripts = safeParseJson(row.scripts, []);
+    }
 
     sendJson(res, 200, {
       data: listRows,
@@ -255,7 +270,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
+    const created = rows[0];
+    if (created) {
+      created.labels = safeParseJson(created.labels, []);
+      created.scripts = safeParseJson(created.scripts, []);
+    }
+    sendJson(res, 201, created);
   });
 
   // Get skill
@@ -273,7 +293,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 404, { error: "Skill not found" });
       return;
     }
-    sendJson(res, 200, rows[0]);
+    const row = rows[0];
+    row.labels = safeParseJson(row.labels, []);
+    row.scripts = safeParseJson(row.scripts, []);
+    sendJson(res, 200, row);
   });
 
   // Update skill
@@ -322,7 +345,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       );
 
       const [created] = await db.query("SELECT * FROM skills WHERE id = ?", [overlayId]) as any;
-      sendJson(res, 201, created[0]);
+      const overlay = created[0];
+      if (overlay) {
+        overlay.labels = safeParseJson(overlay.labels, []);
+        overlay.scripts = safeParseJson(overlay.scripts, []);
+      }
+      sendJson(res, 201, overlay);
       return;
     }
 
@@ -364,7 +392,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       await db.query(
         `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
          labels = COALESCE(?, labels), status = 'draft',
-         version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
+         version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts),
+         updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [
           body.name ?? null, body.description ?? null,
@@ -380,7 +409,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       await db.query(
         `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
          labels = COALESCE(?, labels),
-         specs = COALESCE(?, specs), scripts = COALESCE(?, scripts)
+         specs = COALESCE(?, specs), scripts = COALESCE(?, scripts),
+         updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [
           body.name ?? null, body.description ?? null,
@@ -393,7 +423,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
-    sendJson(res, 200, rows[0]);
+    const updated = rows[0];
+    if (updated) {
+      updated.labels = safeParseJson(updated.labels, []);
+      updated.scripts = safeParseJson(updated.scripts, []);
+    }
+    sendJson(res, 200, updated);
 
     // Draft update: notify dev agents to reload skills
     ctx?.notifySkillDevAgents?.(params.id, ["skills"]);
@@ -457,6 +492,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       "SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY version DESC",
       [params.id],
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.scripts !== undefined) row.scripts = safeParseJson(row.scripts, []);
+      if (row.labels !== undefined) row.labels = safeParseJson(row.labels, []);
+      if (row.diff !== undefined) row.diff = safeParseJson(row.diff, null);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -485,7 +525,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 404, { error: "Version not found" });
       return;
     }
-    sendJson(res, 200, rows[0]);
+    const versionRow = rows[0];
+    versionRow.scripts = safeParseJson(versionRow.scripts, []);
+    versionRow.labels = safeParseJson(versionRow.labels, []);
+    versionRow.diff = safeParseJson(versionRow.diff, null);
+    sendJson(res, 200, versionRow);
   });
 
   // ================================================================
@@ -550,16 +594,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     await db.query(
-      "UPDATE skills SET status = 'pending_review' WHERE id = ?",
+      "UPDATE skills SET status = 'pending_review', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.id],
     );
 
     sendJson(res, 200, { review_id: reviewId, status: "pending_review" });
 
     // Security assessment runs entirely in background — reviewer sees results when they open the review
-    const scriptsArr: { name: string; content: string }[] = skill.scripts
-      ? (typeof skill.scripts === "string" ? JSON.parse(skill.scripts) : skill.scripts)
-      : [];
+    const scriptsArr: { name: string; content: string }[] = safeParseJson(skill.scripts, []);
 
     (async () => {
       try {
@@ -619,13 +661,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     await db.query(
-      "UPDATE skills SET status = 'draft' WHERE id = ?",
+      "UPDATE skills SET status = 'draft', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.id],
     );
 
     // Close pending review records
     await db.query(
-      "UPDATE skill_reviews SET decision = 'withdrawn', reviewed_at = NOW(3) WHERE skill_id = ? AND decision IS NULL",
+      "UPDATE skill_reviews SET decision = 'withdrawn', reviewed_at = CURRENT_TIMESTAMP WHERE skill_id = ? AND decision IS NULL",
       [params.id],
     );
 
@@ -687,13 +729,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Update skill status to installed
     await db.query(
-      "UPDATE skills SET status = 'installed' WHERE id = ?",
+      "UPDATE skills SET status = 'installed', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.id],
     );
 
     // Update the review record
     await db.query(
-      `UPDATE skill_reviews SET decision = 'approved', reviewed_by = ?, reviewed_at = NOW(3)
+      `UPDATE skill_reviews SET decision = 'approved', reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
        WHERE skill_id = ? AND decision IS NULL ORDER BY submitted_at DESC LIMIT 1`,
       [auth.userId, params.id],
     );
@@ -732,13 +774,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Reset skill back to draft
     await db.query(
-      "UPDATE skills SET status = 'draft' WHERE id = ?",
+      "UPDATE skills SET status = 'draft', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.id],
     );
 
     // Update the review record
     await db.query(
-      `UPDATE skill_reviews SET decision = 'rejected', reject_reason = ?, reviewed_by = ?, reviewed_at = NOW(3)
+      `UPDATE skill_reviews SET decision = 'rejected', reject_reason = ?, reviewed_by = ?, reviewed_at = CURRENT_TIMESTAMP
        WHERE skill_id = ? AND decision IS NULL ORDER BY submitted_at DESC LIMIT 1`,
       [body.reason || null, auth.userId, params.id],
     );
@@ -773,7 +815,10 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
 
-    sendJson(res, 200, rows[0]);
+    const review = rows[0];
+    review.diff = safeParseJson(review.diff, null);
+    review.security_assessment = safeParseJson(review.security_assessment, null);
+    sendJson(res, 200, review);
   });
 
   // List pending reviews (reviewer dashboard)
@@ -788,10 +833,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        FROM skill_reviews sr
        JOIN skills s ON sr.skill_id = s.id
        WHERE sr.decision IS NULL AND s.org_id = ?
-       ORDER BY sr.submitted_at DESC`,
+       ORDER BY sr.submitted_at DESC, sr.id DESC`,
       [auth.orgId],
     ) as any;
 
+    for (const row of rows as any[]) {
+      row.diff = safeParseJson(row.diff, null);
+      row.security_assessment = safeParseJson(row.security_assessment, null);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -869,11 +918,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (rollbackName) { setClauses.push("name = ?"); setValues.push(rollbackName); }
     if (rollbackDesc) { setClauses.push("description = ?"); setValues.push(rollbackDesc); }
     if (rollbackLabels) { setClauses.push("labels = ?"); setValues.push(typeof rollbackLabels === "string" ? rollbackLabels : JSON.stringify(rollbackLabels)); }
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     setValues.push(params.id);
     await db.query(`UPDATE skills SET ${setClauses.join(", ")} WHERE id = ?`, setValues);
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
-    sendJson(res, 200, rows[0]);
+    const row = rows[0];
+    if (row) {
+      row.labels = safeParseJson(row.labels, []);
+      row.scripts = safeParseJson(row.scripts, []);
+    }
+    sendJson(res, 200, row);
   });
 
   // ================================================================
@@ -976,6 +1031,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `SELECT id, version, comment, skill_count, added, updated, deleted, imported_by, created_at
        FROM skill_import_history ORDER BY version DESC LIMIT 20`,
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.added !== undefined) row.added = safeParseJson(row.added, []);
+      if (row.updated !== undefined) row.updated = safeParseJson(row.updated, []);
+      if (row.deleted !== undefined) row.deleted = safeParseJson(row.deleted, []);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -1019,9 +1079,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT * FROM mcp_servers WHERE org_id = ? ORDER BY created_at DESC",
+      "SELECT * FROM mcp_servers WHERE org_id = ? ORDER BY created_at DESC, id DESC",
       [auth.orgId],
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.args !== undefined) row.args = safeParseJson(row.args, null);
+      if (row.env !== undefined) row.env = safeParseJson(row.env, null);
+      if (row.headers !== undefined) row.headers = safeParseJson(row.headers, null);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -1048,7 +1113,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
+    const created = rows[0];
+    if (created) {
+      created.args = safeParseJson(created.args, null);
+      created.env = safeParseJson(created.env, null);
+      created.headers = safeParseJson(created.headers, null);
+    }
+    sendJson(res, 201, created);
   });
 
   // Get MCP server
@@ -1065,7 +1136,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 404, { error: "MCP server not found" });
       return;
     }
-    sendJson(res, 200, rows[0]);
+    const row = rows[0];
+    row.args = safeParseJson(row.args, null);
+    row.env = safeParseJson(row.env, null);
+    row.headers = safeParseJson(row.headers, null);
+    sendJson(res, 200, row);
   });
 
   // Update MCP server
@@ -1091,7 +1166,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        name = COALESCE(?, name), transport = COALESCE(?, transport),
        url = COALESCE(?, url), command = COALESCE(?, command),
        args = COALESCE(?, args), env = COALESCE(?, env),
-       headers = COALESCE(?, headers), description = COALESCE(?, description)
+       headers = COALESCE(?, headers), description = COALESCE(?, description),
+       updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
         body.name ?? null, body.transport ?? null,
@@ -1105,7 +1181,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [params.id]) as any;
-    sendJson(res, 200, rows[0]);
+    const updated = rows[0];
+    if (updated) {
+      updated.args = safeParseJson(updated.args, null);
+      updated.env = safeParseJson(updated.env, null);
+      updated.headers = safeParseJson(updated.headers, null);
+    }
+    sendJson(res, 200, updated);
 
     // Notify bound agents to reload MCP config
     ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
@@ -1154,12 +1236,18 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     await db.query(
-      "UPDATE mcp_servers SET enabled = ? WHERE id = ?",
+      "UPDATE mcp_servers SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [body.enabled ? 1 : 0, params.id],
     );
 
     const [rows] = await db.query("SELECT * FROM mcp_servers WHERE id = ?", [params.id]) as any;
-    sendJson(res, 200, rows[0]);
+    const toggled = rows[0];
+    if (toggled) {
+      toggled.args = safeParseJson(toggled.args, null);
+      toggled.env = safeParseJson(toggled.env, null);
+      toggled.headers = safeParseJson(toggled.headers, null);
+    }
+    sendJson(res, 200, toggled);
 
     // Notify bound agents to reload MCP config
     ctx?.notifyMcpAgents?.(params.id, ["mcp"]);
@@ -1216,7 +1304,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     await db.query(
       `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, last_active_at)
-       VALUES (?, ?, ?, ?, ?, ?, NOW(3))`,
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
       [
         id, params.id, auth.userId,
         body.title || "New Session", body.preview || null, 0,
@@ -1273,7 +1361,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     await db.query(
-      "UPDATE chat_sessions SET deleted_at = NOW(3) WHERE id = ?",
+      "UPDATE chat_sessions SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.sid],
     );
     sendJson(res, 200, { ok: true });
@@ -1303,13 +1391,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       db.query(
         // Fetch newest N messages (DESC + LIMIT), then reverse in app to get chronological order.
         // This ensures page=1 returns the most recent messages (for initial load at bottom of chat).
-        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
         [params.sid, pageSize, offset],
       ),
     ]) as [any, any];
 
     // Reverse to chronological order (oldest first) for the frontend
     (listRows as any[]).reverse();
+    // Normalize JSON columns (three data states: legacy MySQL JSON, new MySQL TEXT, SQLite TEXT)
+    for (const row of listRows as any[]) {
+      if (row.metadata !== undefined) row.metadata = safeParseJson(row.metadata, null);
+    }
 
     sendJson(res, 200, {
       data: listRows,
@@ -1346,7 +1438,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        FROM agent_tasks t
        LEFT JOIN agents a ON t.agent_id = a.id
        WHERE t.created_by = ?
-       ORDER BY t.created_at DESC`,
+       ORDER BY t.created_at DESC, t.id DESC`,
       [auth.userId],
     ) as any;
     sendJson(res, 200, { data: rows });
@@ -1362,7 +1454,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [rows] = await db.query(
       `SELECT id, agent_id, name, description, schedule, prompt, status,
               last_run_at, last_result, created_by, created_at
-       FROM agent_tasks WHERE agent_id = ? AND created_by = ? ORDER BY created_at DESC`,
+       FROM agent_tasks WHERE agent_id = ? AND created_by = ? ORDER BY created_at DESC, id DESC`,
       [params.agentId, auth.userId],
     ) as any;
     sendJson(res, 200, { data: rows });
@@ -1438,6 +1530,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 400, { error: "No fields to update" });
       return;
     }
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     values.push(params.taskId, params.agentId, auth.userId);
 
     const db = getDb();
@@ -1555,7 +1648,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [rows] = await db.query(
       `SELECT id, task_id, status, result_text, error, duration_ms, session_id, created_at
        FROM agent_task_runs WHERE ${whereClauses.join(" AND ")}
-       ORDER BY created_at DESC LIMIT ?`,
+       ORDER BY created_at DESC, id DESC LIMIT ?`,
       sqlParams,
     ) as any;
 
@@ -1594,13 +1687,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       db.query(
         `SELECT id FROM agent_task_runs
          WHERE task_id = ? AND created_at < ?
-         ORDER BY created_at DESC LIMIT 1`,
+         ORDER BY created_at DESC, id DESC LIMIT 1`,
         [params.taskId, r.created_at],
       ),
       db.query(
         `SELECT id FROM agent_task_runs
          WHERE task_id = ? AND created_at > ?
-         ORDER BY created_at ASC LIMIT 1`,
+         ORDER BY created_at ASC, id ASC LIMIT 1`,
         [params.taskId, r.created_at],
       ),
     ]) as [any, any];
@@ -1657,7 +1750,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [msgRows] = await db.query(
       `SELECT id, role, content, tool_name, tool_input, outcome, duration_ms, created_at
        FROM chat_messages WHERE session_id = ?
-       ORDER BY created_at DESC LIMIT ?`,
+       ORDER BY created_at DESC, id DESC LIMIT ?`,
       [sessionId, MAX_TRACE_MESSAGES + 1],
     ) as any;
     const allMsgs = msgRows as any[];
@@ -1698,11 +1791,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       ? `SELECT cb.*, c.name as channel_name, c.type as channel_type
          FROM channel_bindings cb
          LEFT JOIN channels c ON cb.channel_id = c.id
-         WHERE cb.agent_id = ? ORDER BY cb.created_at DESC`
+         WHERE cb.agent_id = ? ORDER BY cb.created_at DESC, cb.id DESC`
       : `SELECT cb.*, c.name as channel_name, c.type as channel_type
          FROM channel_bindings cb
          LEFT JOIN channels c ON cb.channel_id = c.id
-         WHERE cb.agent_id = ? AND cb.created_by = ? ORDER BY cb.created_at DESC`;
+         WHERE cb.agent_id = ? AND cb.created_by = ? ORDER BY cb.created_at DESC, cb.id DESC`;
 
     const params2 = isAdmin ? [params.id] : [params.id, auth.userId];
     const [rows] = await db.query(sql, params2) as any;
@@ -1734,17 +1827,17 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     // Clean expired codes
-    await db.query("DELETE FROM channel_pairing_codes WHERE expires_at < NOW()");
+    await db.query("DELETE FROM channel_pairing_codes WHERE expires_at < ?", [toSqlTimestamp(new Date())]);
 
     const code = crypto.randomBytes(3).toString("hex").toUpperCase();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    const expiresAtDate = new Date(Date.now() + 5 * 60 * 1000);
 
     await db.query(
       "INSERT INTO channel_pairing_codes (code, channel_id, agent_id, created_by, expires_at) VALUES (?, ?, ?, ?, ?)",
-      [code, body.channel_id, params.id, auth.userId, expiresAt],
+      [code, body.channel_id, params.id, auth.userId, toSqlTimestamp(expiresAtDate)],
     );
 
-    sendJson(res, 200, { code, expires_at: expiresAt.toISOString() });
+    sendJson(res, 200, { code, expires_at: expiresAtDate.toISOString() });
   });
 
   // Delete a channel binding — admin can delete any, user can delete own
@@ -1781,9 +1874,12 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT * FROM agent_diagnostics WHERE agent_id = ? ORDER BY sort_order ASC, created_at DESC",
+      "SELECT * FROM agent_diagnostics WHERE agent_id = ? ORDER BY sort_order ASC, created_at DESC, id DESC",
       [params.id],
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.params !== undefined) row.params = safeParseJson(row.params, null);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -1808,7 +1904,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     const [rows] = await db.query("SELECT * FROM agent_diagnostics WHERE id = ?", [id]) as any;
-    sendJson(res, 201, rows[0]);
+    const created = rows[0];
+    if (created) created.params = safeParseJson(created.params, null);
+    sendJson(res, 201, created);
   });
 
   // Update diagnostic
@@ -1833,7 +1931,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `UPDATE agent_diagnostics SET
        name = COALESCE(?, name), description = COALESCE(?, description),
        prompt_template = COALESCE(?, prompt_template),
-       params = COALESCE(?, params), sort_order = COALESCE(?, sort_order)
+       params = COALESCE(?, params), sort_order = COALESCE(?, sort_order),
+       updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
         body.name ?? null, body.description ?? null,
@@ -1844,7 +1943,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     );
 
     const [rows] = await db.query("SELECT * FROM agent_diagnostics WHERE id = ?", [params.did]) as any;
-    sendJson(res, 200, rows[0]);
+    const updated = rows[0];
+    if (updated) updated.params = safeParseJson(updated.params, null);
+    sendJson(res, 200, updated);
   });
 
   // Delete diagnostic
@@ -1947,7 +2048,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       `UPDATE model_providers SET
        name = COALESCE(?, name), base_url = COALESCE(?, base_url),
        api_key = COALESCE(?, api_key), api_type = COALESCE(?, api_type),
-       sort_order = COALESCE(?, sort_order)
+       sort_order = COALESCE(?, sort_order),
+       updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
         trim(body.name), trim(body.base_url),
@@ -2086,11 +2188,13 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
     const orgId = auth.orgId;
 
+    const dayAgo = toSqlTimestamp(Date.now() - 24 * 3600e3);
     const [[skillRows], [mcpRows], [activeRows], [msgRows], [taskRows]] = await Promise.all([
       db.query("SELECT COUNT(*) AS count FROM skills WHERE org_id = ?", [orgId]),
       db.query("SELECT COUNT(*) AS count FROM mcp_servers WHERE org_id = ?", [orgId]),
       db.query(
-        "SELECT COUNT(*) AS count FROM chat_sessions WHERE last_active_at > DATE_SUB(NOW(), INTERVAL 24 HOUR) AND deleted_at IS NULL",
+        "SELECT COUNT(*) AS count FROM chat_sessions WHERE last_active_at > ? AND deleted_at IS NULL",
+        [dayAgo],
       ),
       db.query("SELECT COUNT(*) AS count FROM chat_messages"),
       db.query("SELECT COUNT(*) AS count FROM agent_tasks"),
@@ -2114,26 +2218,27 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const days = Math.min(90, Math.max(1, parseInt(query.days || "7", 10)));
     const db = getDb();
 
-    // MySQL doesn't have generate_series; use application-side date generation
-    // and LEFT JOIN with sub-queries for message and session counts
+    // Use application-side date cutoff (date-only string) — DATE() function
+    // is supported by both MySQL and SQLite
+    const cutoffDate = new Date(Date.now() - days * 86400e3).toISOString().slice(0, 10);
     const [msgRows] = await db.query(
       `SELECT DATE(created_at) AS day,
               COUNT(*) AS message_count,
               SUM(CASE WHEN role = 'tool' THEN 1 ELSE 0 END) AS tool_call_count
        FROM chat_messages
-       WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       WHERE created_at >= ?
        GROUP BY DATE(created_at)`,
-      [days],
+      [cutoffDate],
     ) as any;
 
     const [sessRows] = await db.query(
       `SELECT DATE(created_at) AS day,
               COUNT(*) AS session_count
        FROM chat_sessions
-       WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+       WHERE created_at >= ?
          AND deleted_at IS NULL
        GROUP BY DATE(created_at)`,
-      [days],
+      [cutoffDate],
     ) as any;
 
     // Build date series in application code
@@ -2379,12 +2484,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const db = getDb();
     for (const [key, value] of Object.entries(values)) {
-      await db.query(
-        `INSERT INTO system_config (config_key, config_value, updated_by)
-         VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+      const upsert = buildUpsert(
+        db,
+        "system_config",
+        ["config_key", "config_value", "updated_by"],
         [key, String(value), admin.userId],
+        ["config_key"],
+        ["config_value", "updated_by", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
       );
+      await db.query(upsert.sql, upsert.params);
     }
     sendJson(res, 200, { ok: true });
   });
@@ -2401,7 +2509,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const [rows] = await db.query(
       `SELECT r.*, (SELECT COUNT(*) FROM knowledge_versions v WHERE v.repo_id = r.id) AS version_count,
        (SELECT v2.version FROM knowledge_versions v2 WHERE v2.repo_id = r.id AND v2.is_active = 1 LIMIT 1) AS active_version
-       FROM knowledge_repos r ORDER BY r.created_at DESC`,
+       FROM knowledge_repos r ORDER BY r.created_at DESC, r.id DESC`,
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -2473,9 +2581,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     try {
       await conn.beginTransaction();
 
-      // Lock repo row to serialize concurrent uploads
+      // Serialize concurrent uploads via transaction isolation.
+      //   SQLite: BEGIN IMMEDIATE gives serializable — plain SELECT is sufficient.
+      //   MySQL:  REPEATABLE READ's consistent snapshot means plain SELECT does
+      //           NOT lock rows, so two concurrent uploads would compute the same
+      //           next version and one INSERT would fail on UNIQUE(repo_id, version).
+      //           We must explicitly take a row lock with FOR UPDATE.
+      const forUpdate = db.driver === "mysql" ? " FOR UPDATE" : "";
       const [maxRows] = await conn.query(
-        "SELECT COALESCE(MAX(version), 0) AS max_v FROM knowledge_versions WHERE repo_id = ? FOR UPDATE",
+        `SELECT COALESCE(MAX(version), 0) AS max_v FROM knowledge_versions WHERE repo_id = ?${forUpdate}`,
         [params.id],
       ) as any;
       nextVersion = Number(maxRows[0].max_v) + 1;
@@ -2483,7 +2597,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       await conn.query("UPDATE knowledge_versions SET is_active = 0, status = 'inactive' WHERE repo_id = ? AND is_active = 1", [params.id]);
       await conn.query(
         `INSERT INTO knowledge_versions (id, repo_id, version, message, data, size_bytes, sha256, file_count, is_active, status, activated_by, activated_at, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, CURRENT_TIMESTAMP(3), ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'active', ?, CURRENT_TIMESTAMP, ?)`,
         [versionId, params.id, nextVersion, body.message?.trim() || null, buf, buf.length,
          packageInfo.sha256, packageInfo.fileCount, admin.userId, admin.userId],
       );
@@ -2557,7 +2671,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
       await conn.query("UPDATE knowledge_versions SET is_active = 0, status = 'inactive' WHERE repo_id = ?", [params.repoId]);
       await conn.query(
-        "UPDATE knowledge_versions SET is_active = 1, status = 'active', activated_by = ?, activated_at = CURRENT_TIMESTAMP(3) WHERE id = ? AND repo_id = ?",
+        "UPDATE knowledge_versions SET is_active = 1, status = 'active', activated_by = ?, activated_at = CURRENT_TIMESTAMP WHERE id = ? AND repo_id = ?",
         [admin.userId, params.versionId, params.repoId],
       );
 
@@ -2597,7 +2711,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
               e.previous_version_id, e.previous_version, e.status, e.requested_by, e.created_at
        FROM knowledge_publish_events e
        JOIN knowledge_repos r ON r.id = e.repo_id
-       ORDER BY e.created_at DESC LIMIT ?`,
+       ORDER BY e.created_at DESC, e.id DESC LIMIT ?`,
       [limit],
     ) as any;
     sendJson(res, 200, { data: rows });

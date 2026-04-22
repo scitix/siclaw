@@ -28,7 +28,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, name, description, api_server, debug_image, is_production, created_at, updated_at FROM clusters ORDER BY created_at DESC",
+      "SELECT id, name, description, api_server, debug_image, is_production, created_at, updated_at FROM clusters ORDER BY created_at DESC, id DESC",
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -115,7 +115,7 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
       return;
     }
 
-    setClauses.push("updated_at = NOW(3)");
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     values.push(params.id);
 
     const sql = `UPDATE clusters SET ${setClauses.join(", ")} WHERE id = ?`;

@@ -26,7 +26,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
 
     const db = getDb();
     const [rows] = await db.query(
-      `SELECT ${SAFE_COLUMNS} FROM hosts ORDER BY created_at DESC`,
+      `SELECT ${SAFE_COLUMNS} FROM hosts ORDER BY created_at DESC, id DESC`,
     ) as any;
     sendJson(res, 200, { data: rows });
   });
@@ -117,7 +117,7 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
       return;
     }
 
-    setClauses.push("updated_at = NOW(3)");
+    setClauses.push("updated_at = CURRENT_TIMESTAMP");
     values.push(params.id);
 
     const sql = `UPDATE hosts SET ${setClauses.join(", ")} WHERE id = ?`;

@@ -7,6 +7,7 @@
 
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
+import { insertIgnorePrefix } from "../gateway/dialect-helpers.js";
 import {
   sendJson,
   parseBody,
@@ -59,7 +60,7 @@ export function registerAgentRoutes(
         (SELECT COUNT(*) FROM agent_channel_auth ach WHERE ach.agent_id = a.id) AS channels_count,
         (SELECT COUNT(*) FROM agent_knowledge_repos akr WHERE akr.agent_id = a.id) AS knowledge_count
       FROM agents a ${whereClause}
-      ORDER BY a.created_at DESC
+      ORDER BY a.created_at DESC, a.id DESC
       LIMIT ? OFFSET ?`;
 
     const [listRows] = await db.query(listSql, listParams) as any;
@@ -103,7 +104,7 @@ export function registerAgentRoutes(
       ) as any;
       for (const skill of builtinSkills) {
         await db.query(
-          "INSERT IGNORE INTO agent_skills (agent_id, skill_id) VALUES (?, ?)",
+          `${insertIgnorePrefix(db)} INTO agent_skills (agent_id, skill_id) VALUES (?, ?)`,
           [id, skill.id],
         );
       }
@@ -160,7 +161,7 @@ export function registerAgentRoutes(
       return;
     }
 
-    setClauses.push(`updated_at = NOW(3)`);
+    setClauses.push(`updated_at = CURRENT_TIMESTAMP`);
     values.push(params.id);
 
     const sql = `UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`;
@@ -355,7 +356,7 @@ export function registerAgentRoutes(
     const db = getDb();
     const [rows] = await db.query(
       `SELECT id, agent_id, name, key_plain, key_prefix, last_used_at, expires_at, created_by, created_at
-       FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC`,
+       FROM agent_api_keys WHERE agent_id = ? ORDER BY created_at DESC, id DESC`,
       [params.id],
     ) as any;
     sendJson(res, 200, { data: rows });
