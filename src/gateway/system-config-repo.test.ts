@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SystemConfigRepo, ALLOWED_CONFIG_KEYS } from "./system-config-repo.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: unknown }> = [];
   responses = new Map<string, unknown>();
   nextError: Error | null = null;
@@ -19,11 +19,11 @@ class FakeFrontendWsClient {
   }
 }
 
-let fake: FakeFrontendWsClient;
+let fake: FakeFrontendClient;
 let repo: SystemConfigRepo;
 
 beforeEach(() => {
-  fake = new FakeFrontendWsClient();
+  fake = new FakeFrontendClient();
   repo = new SystemConfigRepo(fake as unknown as FrontendWsClient);
 });
 

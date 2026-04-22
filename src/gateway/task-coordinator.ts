@@ -9,7 +9,7 @@
  *   - Each fire: resolve agent's model binding via RPC, create a fresh
  *     session, stream events through sse-consumer, record the run via RPC
  *   - Emits task.completed events via the supplied broadcaster so upstream
- *     (upstream in prod, Portal in test) can route notifications to users.
+ *     (Upstream in prod, Portal in test) can route notifications to users.
  */
 
 import crypto from "node:crypto";
@@ -40,7 +40,7 @@ interface AgentTaskDbRow {
 
 /**
  * Event emitted after a task run completes (or fails). Upstream consumers
- * (upstream / Portal) should route this by userId to the live user's UI session.
+ * (Upstream / Portal) should route this by userId to the live user's UI session.
  */
 export interface TaskCompletedEvent {
   taskId: string;

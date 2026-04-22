@@ -8,7 +8,7 @@ import {
 } from "./chat-repo.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
   responses = new Map<string, unknown>();
   nextError: Error | null = null;
@@ -25,10 +25,10 @@ class FakeFrontendWsClient {
   }
 }
 
-let fake: FakeFrontendWsClient;
+let fake: FakeFrontendClient;
 
 beforeEach(() => {
-  fake = new FakeFrontendWsClient();
+  fake = new FakeFrontendClient();
   initChatRepo(fake as unknown as FrontendWsClient);
 });
 
@@ -104,7 +104,7 @@ describe("appendMessage", () => {
       outcome: "success",
       durationMs: 42,
     });
-    // metadata is JSON-stringified so upstream's Go ptrStr handler (string-only)
+    // metadata is JSON-stringified so Upstream's Go ptrStr handler (string-only)
     // accepts it; the object contract is still the public API for callers.
     expect(fake.calls[0].params).toEqual({
       session_id: "sid",

@@ -60,7 +60,7 @@ export async function ensureChatSession(
 /**
  * Insert a single message row via RPC. Returns the generated id.
  *
- * `metadata` is JSON-stringified before sending because upstream's Go RPC
+ * `metadata` is JSON-stringified before sending because Upstream's Go RPC
  * handler extracts it with `ptrStr(...)` which only accepts string values;
  * passing a bare object would silently drop to nil on the wire. The read
  * path in `getMessages` below reverses the transformation.

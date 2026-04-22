@@ -83,7 +83,7 @@ import type { RuntimeConfig } from "./config.js";
 
 // ── Fake FrontendWsClient ─────────────────────────────────────
 
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
   responses = new Map<string, unknown>();
   /** If set, only affects the next matching-method call. */
@@ -123,12 +123,12 @@ function makeCoord(opts?: {
   retentionDays?: number;
   executionTimeoutMs?: number;
   manualRunCooldownSec?: number;
-}): { coord: TaskCoordinator; upstream: FakeFrontendWsClient; mgr: FakeAgentBoxManager } {
-  const upstream = new FakeFrontendWsClient();
+}): { coord: TaskCoordinator; frontend: FakeFrontendClient; mgr: FakeAgentBoxManager } {
+  const frontend = new FakeFrontendClient();
   const mgr = new FakeAgentBoxManager();
   const coord = new TaskCoordinator({
     config,
-    frontendClient: upstream as unknown as FrontendWsClient,
+    frontendClient: frontend as unknown as FrontendWsClient,
     agentBoxManager: mgr as unknown as AgentBoxManager,
     syncIntervalMs: opts?.syncIntervalMs ?? 60_000,
     retentionDays: opts?.retentionDays ?? 0,
@@ -136,7 +136,7 @@ function makeCoord(opts?: {
     manualRunCooldownSec: opts?.manualRunCooldownSec,
     onTaskCompleted: opts?.onTaskCompleted,
   });
-  return { coord, upstream, mgr };
+  return { coord, frontend, mgr };
 }
 
 beforeEach(() => {
@@ -161,17 +161,17 @@ afterEach(() => {
 
 describe("TaskCoordinator.start + stop", () => {
   it("start calls task.listActive once and sets up intervals; stop clears them", async () => {
-    const { coord, upstream } = makeCoord({ syncIntervalMs: 60_000 });
-    upstream.responses.set("task.listActive", { data: [] });
+    const { coord, frontend } = makeCoord({ syncIntervalMs: 60_000 });
+    frontend.responses.set("task.listActive", { data: [] });
     await coord.start();
-    expect(upstream.calls.find((c) => c.method === "task.listActive")).toBeDefined();
+    expect(frontend.calls.find((c) => c.method === "task.listActive")).toBeDefined();
     coord.stop();
   });
 
   it("syncFromAdapter loads jobs into the scheduler on start", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     // A schedule that fires once per minute — valid, but we won't let the timer fire.
-    upstream.responses.set("task.listActive", {
+    frontend.responses.set("task.listActive", {
       data: [
         { id: "t1", agent_id: "a", name: "Daily", description: null,
           schedule: "*/5 * * * *", prompt: "p", status: "active",
@@ -181,13 +181,13 @@ describe("TaskCoordinator.start + stop", () => {
     await coord.start();
     // scheduler now has t1 scheduled; check via follow-up fireNow outcome
     // — but easier: just verify internal sync called
-    expect(upstream.calls[0].method).toBe("task.listActive");
+    expect(frontend.calls[0].method).toBe("task.listActive");
     coord.stop();
   });
 
   it("syncFromAdapter cancels jobs that are no longer active", async () => {
-    const { coord, upstream } = makeCoord();
-    upstream.responses.set("task.listActive", {
+    const { coord, frontend } = makeCoord();
+    frontend.responses.set("task.listActive", {
       data: [
         { id: "t1", agent_id: "a", name: "X", description: null,
           schedule: "*/5 * * * *", prompt: "p", status: "active",
@@ -196,9 +196,9 @@ describe("TaskCoordinator.start + stop", () => {
     });
     await coord.start();
     // Second sync drops t1
-    upstream.responses.set("task.listActive", { data: [] });
+    frontend.responses.set("task.listActive", { data: [] });
     // Trigger a manual sync via private call — use fireNow to return not_found
-    upstream.responses.set("task.fireNow", { outcome: "not_found" });
+    frontend.responses.set("task.fireNow", { outcome: "not_found" });
     const outcome = await coord.fireNow("t1-removed");
     expect(outcome.kind).toBe("not_found");
     coord.stop();
@@ -216,42 +216,42 @@ describe("TaskCoordinator.fireNow", () => {
   });
 
   it("returns not_found when RPC outcome is not_found", async () => {
-    const { coord, upstream } = makeCoord();
-    upstream.responses.set("task.fireNow", { outcome: "not_found" });
+    const { coord, frontend } = makeCoord();
+    frontend.responses.set("task.fireNow", { outcome: "not_found" });
     const out = await coord.fireNow("missing");
     expect(out.kind).toBe("not_found");
   });
 
   it("returns in_flight when RPC outcome is in_flight", async () => {
-    const { coord, upstream } = makeCoord();
-    upstream.responses.set("task.fireNow", { outcome: "in_flight" });
+    const { coord, frontend } = makeCoord();
+    frontend.responses.set("task.fireNow", { outcome: "in_flight" });
     const out = await coord.fireNow("t1");
     expect(out.kind).toBe("in_flight");
   });
 
   it("returns cooldown with retryAfter when RPC outcome is cooldown", async () => {
-    const { coord, upstream } = makeCoord();
-    upstream.responses.set("task.fireNow", { outcome: "cooldown", retry_after_sec: 15 });
+    const { coord, frontend } = makeCoord();
+    frontend.responses.set("task.fireNow", { outcome: "cooldown", retry_after_sec: 15 });
     const out = await coord.fireNow("t1");
     expect(out).toEqual({ kind: "cooldown", retryAfterSec: 15 });
   });
 
   it("returns not_found when RPC throws", async () => {
-    const { coord, upstream } = makeCoord();
-    upstream.nextError = new Error("rpc dead");
+    const { coord, frontend } = makeCoord();
+    frontend.nextError = new Error("rpc dead");
     const out = await coord.fireNow("x");
     expect(out.kind).toBe("not_found");
   });
 
   it("schedules executeJob when outcome is ok", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     // Make the execution path succeed all the way through
     bindingResponder.result = {
       modelProvider: "p", modelId: "m",
       modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
     };
     sseResponder.result = { resultText: "ok", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 5 };
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "X", description: null,
@@ -259,15 +259,15 @@ describe("TaskCoordinator.fireNow", () => {
         created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
       },
     });
-    upstream.responses.set("task.runStart", { ok: true });
-    upstream.responses.set("task.runFinalize", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     const out = await coord.fireNow("t1");
     expect(out).toEqual({ kind: "ok" });
     // Wait for the fire-and-forget executeJob to complete
     await new Promise((r) => setTimeout(r, 20));
-    expect(upstream.calls.find((c) => c.method === "task.runStart")).toBeDefined();
-    expect(upstream.calls.find((c) => c.method === "task.runFinalize")).toBeDefined();
+    expect(frontend.calls.find((c) => c.method === "task.runStart")).toBeDefined();
+    expect(frontend.calls.find((c) => c.method === "task.runFinalize")).toBeDefined();
   });
 });
 
@@ -275,9 +275,9 @@ describe("TaskCoordinator.fireNow", () => {
 
 describe("TaskCoordinator execution", () => {
   it("records failure when model binding is missing", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     bindingResponder.result = null;
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "N", description: null,
@@ -285,13 +285,13 @@ describe("TaskCoordinator execution", () => {
         created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
       },
     });
-    upstream.responses.set("task.runStart", { ok: true });
-    upstream.responses.set("task.runFinalize", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     const out = await coord.fireNow("t1");
     expect(out.kind).toBe("ok");
     await new Promise((r) => setTimeout(r, 20));
-    const finalize = upstream.calls.find((c) => c.method === "task.runFinalize");
+    const finalize = frontend.calls.find((c) => c.method === "task.runFinalize");
     expect(finalize).toBeDefined();
     expect(finalize!.params.status).toBe("failure");
     expect(finalize!.params.error).toMatch(/no valid model binding/);
@@ -299,13 +299,13 @@ describe("TaskCoordinator execution", () => {
 
   it("invokes onTaskCompleted handler with success outcome", async () => {
     let received: any = null;
-    const { coord, upstream } = makeCoord({ onTaskCompleted: (evt) => { received = evt; } });
+    const { coord, frontend } = makeCoord({ onTaskCompleted: (evt) => { received = evt; } });
     bindingResponder.result = {
       modelProvider: "p", modelId: "m",
       modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
     };
     sseResponder.result = { resultText: "done", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 5 };
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "Good Task", description: null,
@@ -313,9 +313,9 @@ describe("TaskCoordinator execution", () => {
         created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
       },
     });
-    upstream.responses.set("task.runStart", { ok: true });
-    upstream.responses.set("task.runFinalize", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     await coord.fireNow("t1");
     await new Promise((r) => setTimeout(r, 20));
     expect(received).not.toBeNull();
@@ -326,13 +326,13 @@ describe("TaskCoordinator execution", () => {
   });
 
   it("propagates SSE-layer errorMessage as failure", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     bindingResponder.result = {
       modelProvider: "p", modelId: "m",
       modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
     };
     sseResponder.result = { resultText: "", taskReportText: "", errorMessage: "rate limit", eventCount: 0, durationMs: 1 };
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "N", description: null,
@@ -340,24 +340,24 @@ describe("TaskCoordinator execution", () => {
         created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
       },
     });
-    upstream.responses.set("task.runStart", { ok: true });
-    upstream.responses.set("task.runFinalize", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     await coord.fireNow("t1");
     await new Promise((r) => setTimeout(r, 20));
-    const finalize = upstream.calls.find((c) => c.method === "task.runFinalize");
+    const finalize = frontend.calls.find((c) => c.method === "task.runFinalize");
     expect(finalize!.params.status).toBe("failure");
     expect(finalize!.params.error).toMatch(/rate limit/);
   });
 
   it("falls back to task.runRecord when task.runStart fails", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     bindingResponder.result = {
       modelProvider: "p", modelId: "m",
       modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
     };
     sseResponder.result = { resultText: "ok", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 1 };
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "N", description: null,
@@ -366,22 +366,22 @@ describe("TaskCoordinator execution", () => {
       },
     });
     // task.runStart rejects once → triggers the fallback runRecord path
-    upstream.errorForMethod["task.runStart"] = new Error("runStart down");
-    upstream.responses.set("task.runRecord", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.errorForMethod["task.runStart"] = new Error("runStart down");
+    frontend.responses.set("task.runRecord", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     await coord.fireNow("t1");
     await new Promise((r) => setTimeout(r, 20));
-    expect(upstream.calls.find((c) => c.method === "task.runRecord")).toBeDefined();
+    expect(frontend.calls.find((c) => c.method === "task.runRecord")).toBeDefined();
   });
 
   it("seeds chat_session and writes the user message on successful run", async () => {
-    const { coord, upstream } = makeCoord();
+    const { coord, frontend } = makeCoord();
     bindingResponder.result = {
       modelProvider: "p", modelId: "m",
       modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
     };
     sseResponder.result = { resultText: "done", taskReportText: "", errorMessage: "", eventCount: 0, durationMs: 1 };
-    upstream.responses.set("task.fireNow", {
+    frontend.responses.set("task.fireNow", {
       outcome: "ok",
       task: {
         id: "t1", agent_id: "a", name: "X", description: null,
@@ -389,9 +389,9 @@ describe("TaskCoordinator execution", () => {
         created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
       },
     });
-    upstream.responses.set("task.runStart", { ok: true });
-    upstream.responses.set("task.runFinalize", { ok: true });
-    upstream.responses.set("task.updateMeta", { ok: true });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
     await coord.fireNow("t1");
     await new Promise((r) => setTimeout(r, 20));
     expect(ensureCalls).toHaveLength(1);
@@ -411,13 +411,13 @@ describe("TaskCoordinator execution", () => {
 
 describe("TaskCoordinator.pruneOldRuns (indirect via start)", () => {
   it("start with retentionDays > 0 calls task.prune once on initial schedule", async () => {
-    const { coord, upstream } = makeCoord({ retentionDays: 30 });
-    upstream.responses.set("task.listActive", { data: [] });
-    upstream.responses.set("task.prune", { sessions_deleted: 0, runs_deleted: 0 });
+    const { coord, frontend } = makeCoord({ retentionDays: 30 });
+    frontend.responses.set("task.listActive", { data: [] });
+    frontend.responses.set("task.prune", { sessions_deleted: 0, runs_deleted: 0 });
     await coord.start();
     // Give the promise a tick to resolve
     await new Promise((r) => setTimeout(r, 10));
-    expect(upstream.calls.find((c) => c.method === "task.prune")).toBeDefined();
+    expect(frontend.calls.find((c) => c.method === "task.prune")).toBeDefined();
     coord.stop();
   });
 });

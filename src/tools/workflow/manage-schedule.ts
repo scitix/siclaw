@@ -114,7 +114,7 @@ Common cron patterns:
       // Thread current chat sessionId so the Gateway can resolve the task
       // owner (userId) via sessionRegistry. Without this, task rows land
       // with empty created_by and downstream cron-task notifications
-      // silently drop at upstream's TaskNotify (empty-userID guard).
+      // silently drop at Upstream's TaskNotify (empty-userID guard).
       const client = new GatewayClient({ gatewayUrl, sessionId: sessionIdRef?.current });
 
       const fail = (msg: string) => ({

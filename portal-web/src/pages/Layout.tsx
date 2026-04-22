@@ -44,7 +44,7 @@ export function Layout() {
           <p className="text-[10px] text-muted-foreground mt-0.5">Agent Runtime Portal</p>
         </div>
         <nav className="flex-1 py-2 overflow-y-auto">
-          {/* Siclaw section — matches Upstream sidebar style */}
+          {/* Siclaw section — matches Frontend sidebar style */}
           <span className="px-4 py-1.5 text-[11px] font-medium tracking-wider text-muted-foreground block">
             Siclaw
           </span>

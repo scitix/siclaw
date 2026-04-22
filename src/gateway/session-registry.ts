@@ -2,7 +2,7 @@
  * Session Registry — maps `sessionId` to the user who owns the session.
  *
  * AgentBox is user-unaware (see docs/superpowers/specs/2026-04-18-agentbox-
- * agent-scoped-identity-design.md). User attribution for downstream Upstream
+ * agent-scoped-identity-design.md). User attribution for outbound Upstream
  * audit is recovered at the Runtime boundary via this registry:
  *
  *  - Channel / web / task entry points call `rememberSession(sessionId, userId)`
