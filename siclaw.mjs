@@ -53,6 +53,7 @@ Options:
   --prompt <text>   Run in non-interactive print mode
   --continue        Continue the most recent session
   --debug           Enable debug logging
+  --open            (local only) auto-open the Portal URL in the browser
   --help, -h        Show this help
   --version, -v     Show version
 

@@ -7,9 +7,12 @@
  */
 
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { bootstrapPortal } from "./lib/bootstrap-portal.js";
 import { bootstrapRuntime } from "./lib/bootstrap-runtime.js";
 import { loadOrGenerateLocalSecrets } from "./lib/local-secrets.js";
+
+const SHOULD_OPEN_BROWSER = process.argv.includes("--open");
 
 const PORTAL_PORT = parseInt(process.env.PORTAL_PORT || "3000", 10);
 const RUNTIME_PORT = parseInt(process.env.SICLAW_PORT || "3001", 10);
@@ -53,6 +56,19 @@ console.log(`[local] Runtime: ${runtimeUrl}`);
 console.log(`[local] DB:      ${DATABASE_URL}`);
 console.log(`[local] Secrets: ${secretsPath}`);
 console.log(`[local] Open ${portalUrl} to get started`);
+
+if (SHOULD_OPEN_BROWSER) {
+  const opener = process.platform === "darwin"
+    ? "open"
+    : process.platform === "win32"
+    ? "start"
+    : "xdg-open";
+  try {
+    spawn(opener, [portalUrl], { detached: true, stdio: "ignore" }).unref();
+  } catch (err) {
+    console.warn(`[local] --open: failed to launch browser (${err instanceof Error ? err.message : err})`);
+  }
+}
 
 async function shutdown() {
   console.log("\n[local] Shutting down...");

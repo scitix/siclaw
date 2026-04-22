@@ -59,8 +59,13 @@ describe("runPortalMigrations on SQLite :memory:", () => {
   });
 
   it("creates named indexes whose names match legacy MySQL DDL", async () => {
-    await runPortalMigrations();
-    const db = getDb();
+    // Frozen list — must stay byte-identical to `grep -oE "idx_[a-z_]+"` on
+    // the pre-MR migrate.ts (last stable legacy revision: bb3b599). If you
+    // rename an index here without also renaming it there, ensureIndex() on
+    // an old MySQL deployment will see the legacy name still present and
+    // skip creation, leaving the deployment with an index whose name no
+    // longer matches your DDL source. Add: fine. Rename / remove: breaks
+    // legacy idempotence.
     const expectedIndexes = [
       "idx_chat_sessions_user",
       "idx_chat_sessions_agent",
@@ -77,6 +82,9 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_skills_overlay",
       "idx_skills_org_name",
     ];
+
+    await runPortalMigrations();
+    const db = getDb();
     for (const idx of expectedIndexes) {
       const [rows] = await db.query<Array<{ name: string }>>(
         "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
@@ -84,6 +92,57 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       );
       expect(rows.length, `expected index ${idx}`).toBe(1);
     }
+
+    // Count assertion catches additions that weren't reflected in the frozen
+    // list — forces every new idx_* to be consciously added here.
+    const [allIdx] = await db.query<Array<{ name: string }>>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'",
+    );
+    expect(allIdx.map((r) => r.name).sort()).toEqual(expectedIndexes.slice().sort());
+  });
+
+  it("is resilient to legacy-style pre-populated schema (simulated dump replay)", async () => {
+    // Simulate a pre-MR deployment where key tables already exist with the
+    // legacy-compatible shape and legacy index names. Running the new migrate
+    // over this state must:
+    //   - not throw (CREATE TABLE IF NOT EXISTS is no-op on existing)
+    //   - leave existing rows intact
+    //   - create any missing columns / indexes added in later migrations
+    // Production MySQL dumps follow the same pattern; this test locks in the
+    // SQLite-observable portion of that contract.
+    const db = getDb();
+
+    // Minimal legacy skeleton: a couple of tables + one legacy index.
+    await db.query(`CREATE TABLE chat_sessions (
+      id CHAR(36) PRIMARY KEY,
+      agent_id CHAR(36) NOT NULL,
+      user_id CHAR(36) NOT NULL,
+      title TEXT,
+      preview TEXT,
+      message_count INT NOT NULL DEFAULT 0,
+      origin VARCHAR(20),
+      last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )`);
+    await db.query("CREATE INDEX idx_chat_sessions_user ON chat_sessions(user_id)");
+    await db.query(
+      "INSERT INTO chat_sessions (id, agent_id, user_id) VALUES ('s1', 'a1', 'u1')",
+    );
+
+    await runPortalMigrations();
+    // Running twice should remain a no-op (the whole point of idempotence).
+    await runPortalMigrations();
+
+    // Pre-existing row must survive both migration passes.
+    const [rows] = await db.query<Array<{ id: string }>>("SELECT id FROM chat_sessions");
+    expect(rows.map((r) => r.id)).toEqual(["s1"]);
+
+    // Later-added index co-exists with the pre-populated legacy index.
+    const [idxRows] = await db.query<Array<{ name: string }>>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_chat_sessions_user', 'idx_chat_sessions_agent')",
+    );
+    expect(idxRows.map((r) => r.name).sort()).toEqual(["idx_chat_sessions_agent", "idx_chat_sessions_user"]);
   });
 
   it("is idempotent when run twice", async () => {
