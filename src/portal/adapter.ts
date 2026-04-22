@@ -8,6 +8,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import { getDb } from "../gateway/db.js";
+import { buildUpsert, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
 import {
   sendJson,
   parseBody,
@@ -513,8 +514,11 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at",
+      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at, id",
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.config !== undefined) row.config = safeParseJson(row.config, null);
+    }
     sendJson(res, 200, { data: rows });
   });
 
@@ -533,13 +537,19 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       title?: string; preview?: string; origin?: string;
     }>(req);
     const db = getDb();
-    await db.query(
-      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, origin, last_active_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP(3))
-       ON DUPLICATE KEY UPDATE last_active_at = CURRENT_TIMESTAMP(3)`,
+    // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
+    // new rows, and the updateColumns expression for conflicts. Passing a
+    // JS ISO string ("2026-04-22T...Z") would be rejected by MySQL TIMESTAMP.
+    const upsert = buildUpsert(
+      db,
+      "chat_sessions",
+      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin"],
       [body.session_id, body.agent_id, body.user_id,
-       body.title || "New Session", body.preview || null, body.origin || null],
+       body.title || "New Session", body.preview || null, 0, body.origin || null],
+      ["id"],
+      [{ col: "last_active_at", expr: "CURRENT_TIMESTAMP" }],
     );
+    await db.query(upsert.sql, upsert.params);
     sendJson(res, 200, { ok: true });
   });
 
@@ -566,7 +576,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     );
     // Bump session message_count
     await db.query(
-      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [body.session_id],
     );
     sendJson(res, 200, { id });
@@ -596,7 +606,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     );
     // Update task last_run_at + last_result
     await db.query(
-      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [body.status, body.task_id],
     );
     sendJson(res, 200, { ok: true });
@@ -644,9 +654,9 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         transport: row.transport,
         ...(row.url ? { url: row.url } : {}),
         ...(row.command ? { command: row.command } : {}),
-        ...(row.args ? { args: typeof row.args === "string" ? JSON.parse(row.args) : row.args } : {}),
-        ...(row.env ? { env: typeof row.env === "string" ? JSON.parse(row.env) : row.env } : {}),
-        ...(row.headers ? { headers: typeof row.headers === "string" ? JSON.parse(row.headers) : row.headers } : {}),
+        ...(row.args ? { args: safeParseJson(row.args, []) } : {}),
+        ...(row.env ? { env: safeParseJson(row.env, {}) } : {}),
+        ...(row.headers ? { headers: safeParseJson(row.headers, {}) } : {}),
       };
     }
     sendJson(res, 200, { mcpServers });
@@ -712,7 +722,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
         scope: "global",
         specs: row.specs || "",
-        scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
+        scripts: safeParseJson(row.scripts, []),
       }));
     sendJson(res, 200, { version: new Date().toISOString(), skills });
   });
@@ -732,7 +742,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const [rows] = await db.query(
       `SELECT id, name, schedule, status, description, prompt, last_run_at, last_result
        FROM agent_tasks WHERE agent_id = ? AND created_by = ? AND status = 'active'
-       ORDER BY created_at`,
+       ORDER BY created_at, id`,
       [body.agent_id, body.user_id],
     ) as any;
     sendJson(res, 200, { tasks: rows });
@@ -784,7 +794,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
          description = COALESCE(?, description),
          schedule = COALESCE(?, schedule),
          prompt = COALESCE(?, prompt),
-         status = COALESCE(?, status)
+         status = COALESCE(?, status),
+         updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [body.name ?? null, body.description ?? null, body.schedule ?? null,
        body.prompt ?? null, body.status ?? null, body.task_id],
@@ -880,7 +891,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const body = await parseBody<{ task_id: string; last_result: string }>(req);
     const db = getDb();
     await db.query(
-      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [body.last_result, body.task_id],
     );
     sendJson(res, 200, { ok: true });
@@ -924,7 +935,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     // Stamp manual run time
     await db.query(
-      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
+      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [body.task_id],
     );
     sendJson(res, 200, { outcome: "ok", task: row });
@@ -939,14 +950,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const body = await parseBody<{ retention_days: number }>(req);
     const db = getDb();
     const days = body.retention_days;
+    const cutoff = toSqlTimestamp(Date.now() - days * 86400e3);
     const [sessResult] = await db.query(
       `DELETE FROM chat_sessions
-       WHERE origin = 'task' AND last_active_at < NOW() - INTERVAL ? DAY`,
-      [days],
+       WHERE origin = 'task' AND last_active_at < ?`,
+      [cutoff],
     ) as any;
     const [runsResult] = await db.query(
-      `DELETE FROM agent_task_runs WHERE created_at < NOW() - INTERVAL ? DAY`,
-      [days],
+      `DELETE FROM agent_task_runs WHERE created_at < ?`,
+      [cutoff],
     ) as any;
     sendJson(res, 200, {
       sessions_deleted: sessResult?.affectedRows ?? 0,
@@ -1046,9 +1058,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       route_type: "group" | "user";
     }>(req);
     const db = getDb();
+    const now = toSqlTimestamp(new Date());
     const [codeRows] = await db.query(
-      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > NOW()",
-      [body.code, body.channel_id],
+      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > ?",
+      [body.code, body.channel_id, now],
     ) as any;
     if (codeRows.length === 0) {
       sendJson(res, 200, { success: false, error: "Invalid or expired pairing code" });
@@ -1057,12 +1070,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const pairingCode = codeRows[0];
     const bindingId = crypto.randomUUID();
     try {
-      await db.query(
-        `INSERT INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE agent_id = VALUES(agent_id), route_type = VALUES(route_type), created_by = VALUES(created_by)`,
+      const upsert = buildUpsert(
+        db,
+        "channel_bindings",
+        ["id", "channel_id", "agent_id", "route_key", "route_type", "created_by"],
         [bindingId, body.channel_id, pairingCode.agent_id, body.route_key, body.route_type, pairingCode.created_by],
+        ["channel_id", "route_key"],
+        ["agent_id", "route_type", "created_by"],
       );
+      await db.query(upsert.sql, upsert.params);
     } catch (err: any) {
       sendJson(res, 200, { success: false, error: `Failed to create binding: ${err.message}` });
       return;
@@ -1108,12 +1124,15 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     const body = await parseBody<{ key: string; value: string; updated_by: string }>(req);
     const db = getDb();
-    await db.query(
-      `INSERT INTO system_config (config_key, config_value, updated_by)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+    const upsert = buildUpsert(
+      db,
+      "system_config",
+      ["config_key", "config_value", "updated_by"],
       [body.key, body.value, body.updated_by],
+      ["config_key"],
+      ["config_value", "updated_by", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
     );
+    await db.query(upsert.sql, upsert.params);
     sendJson(res, 200, { ok: true });
   });
 
@@ -1134,14 +1153,17 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     let where = "session_id = ?";
     if (body.before) {
       where += " AND created_at < ?";
-      params.push(new Date(body.before));
+      params.push(toSqlTimestamp(body.before));
     }
     params.push(limit);
     const [rows] = await db.query(
       `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
-       FROM chat_messages WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
+       FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
       params,
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.metadata !== undefined) row.metadata = safeParseJson(row.metadata, null);
+    }
     sendJson(res, 200, { messages: rows });
   });
 
@@ -1470,9 +1492,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         transport: row.transport,
         ...(row.url ? { url: row.url } : {}),
         ...(row.command ? { command: row.command } : {}),
-        ...(row.args ? { args: typeof row.args === "string" ? JSON.parse(row.args) : row.args } : {}),
-        ...(row.env ? { env: typeof row.env === "string" ? JSON.parse(row.env) : row.env } : {}),
-        ...(row.headers ? { headers: typeof row.headers === "string" ? JSON.parse(row.headers) : row.headers } : {}),
+        ...(row.args ? { args: safeParseJson(row.args, []) } : {}),
+        ...(row.env ? { env: safeParseJson(row.env, {}) } : {}),
+        ...(row.headers ? { headers: safeParseJson(row.headers, {}) } : {}),
       };
     }
     return { mcpServers };
@@ -1512,7 +1534,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
       scope: "global",
       specs: row.specs || "",
-      scripts: row.scripts ? (typeof row.scripts === "string" ? JSON.parse(row.scripts) : row.scripts) : [],
+      scripts: safeParseJson(row.scripts, []),
     }));
     return { version: new Date().toISOString(), skills };
   });
@@ -1578,12 +1600,15 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("config.setSystemConfig", async (params) => {
     const db = getDb();
-    await db.query(
-      `INSERT INTO system_config (config_key, config_value, updated_by)
-       VALUES (?, ?, ?)
-       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_by = VALUES(updated_by)`,
+    const upsert = buildUpsert(
+      db,
+      "system_config",
+      ["config_key", "config_value", "updated_by"],
       [params.key, params.value, params.updated_by],
+      ["config_key"],
+      ["config_value", "updated_by", { col: "updated_at", expr: "CURRENT_TIMESTAMP" }],
     );
+    await db.query(upsert.sql, upsert.params);
     return { ok: true };
   });
 
@@ -1793,13 +1818,19 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("chat.ensureSession", async (params) => {
     const db = getDb();
-    await db.query(
-      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, origin, last_active_at)
-       VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP(3))
-       ON DUPLICATE KEY UPDATE last_active_at = CURRENT_TIMESTAMP(3)`,
+    // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
+    // new rows, and the updateColumns expression for conflicts. Passing a
+    // JS ISO string ("2026-04-22T...Z") would be rejected by MySQL TIMESTAMP.
+    const upsert = buildUpsert(
+      db,
+      "chat_sessions",
+      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin"],
       [params.session_id, params.agent_id, params.user_id,
-       params.title || "New Session", params.preview || null, params.origin || null],
+       params.title || "New Session", params.preview || null, 0, params.origin || null],
+      ["id"],
+      [{ col: "last_active_at", expr: "CURRENT_TIMESTAMP" }],
     );
+    await db.query(upsert.sql, upsert.params);
     return { ok: true };
   });
 
@@ -1815,7 +1846,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
        params.outcome || null, params.duration_ms ?? null],
     );
     await db.query(
-      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP(3) WHERE id = ?`,
+      `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [params.session_id],
     );
     return { id };
@@ -1828,14 +1859,17 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     let where = "session_id = ?";
     if (params.before) {
       where += " AND created_at < ?";
-      sqlParams.push(new Date(params.before));
+      sqlParams.push(toSqlTimestamp(params.before));
     }
     sqlParams.push(limit);
     const [rows] = await db.query(
       `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
-       FROM chat_messages WHERE ${where} ORDER BY created_at DESC LIMIT ?`,
+       FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
       sqlParams,
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.metadata !== undefined) row.metadata = safeParseJson(row.metadata, null);
+    }
     return { messages: rows };
   });
 
@@ -1867,7 +1901,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const [rows] = await db.query(
       `SELECT id, name, schedule, status, description, prompt, last_run_at, last_result
        FROM agent_tasks WHERE agent_id = ? AND created_by = ? AND status = 'active'
-       ORDER BY created_at`,
+       ORDER BY created_at, id`,
       [params.agent_id, params.user_id],
     ) as any;
     return { tasks: rows };
@@ -1898,7 +1932,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
          description = COALESCE(?, description),
          schedule = COALESCE(?, schedule),
          prompt = COALESCE(?, prompt),
-         status = COALESCE(?, status)
+         status = COALESCE(?, status),
+         updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [params.name ?? null, params.description ?? null, params.schedule ?? null,
        params.prompt ?? null, params.status ?? null, params.task_id],
@@ -1928,7 +1963,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
        params.duration_ms ?? null, params.session_id || null],
     );
     await db.query(
-      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [params.status, params.task_id],
     );
     return { ok: true };
@@ -1958,7 +1993,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("task.updateMeta", async (params) => {
     const db = getDb();
     await db.query(
-      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP(3), last_result = ? WHERE id = ?`,
+      `UPDATE agent_tasks SET last_run_at = CURRENT_TIMESTAMP, last_result = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [params.last_result, params.task_id],
     );
     return { ok: true };
@@ -1990,7 +2025,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       }
     }
     await db.query(
-      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP(3) WHERE id = ?",
+      "UPDATE agent_tasks SET last_manual_run_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
       [params.task_id],
     );
     return { outcome: "ok", task: row };
@@ -1999,14 +2034,15 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("task.prune", async (params) => {
     const db = getDb();
     const days = params.retention_days;
+    const cutoff = toSqlTimestamp(Date.now() - days * 86400e3);
     const [sessResult] = await db.query(
       `DELETE FROM chat_sessions
-       WHERE origin = 'task' AND last_active_at < NOW() - INTERVAL ? DAY`,
-      [days],
+       WHERE origin = 'task' AND last_active_at < ?`,
+      [cutoff],
     ) as any;
     const [runsResult] = await db.query(
-      `DELETE FROM agent_task_runs WHERE created_at < NOW() - INTERVAL ? DAY`,
-      [days],
+      `DELETE FROM agent_task_runs WHERE created_at < ?`,
+      [cutoff],
     ) as any;
     return {
       sessions_deleted: sessResult?.affectedRows ?? 0,
@@ -2019,8 +2055,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("channel.list", async () => {
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at",
+      "SELECT * FROM channels WHERE status = 'active' ORDER BY created_at, id",
     ) as any;
+    for (const row of rows as any[]) {
+      if (row.config !== undefined) row.config = safeParseJson(row.config, null);
+    }
     return { data: rows };
   });
 
@@ -2038,9 +2077,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   handlers.set("channel.pair", async (params) => {
     const db = getDb();
+    const now = toSqlTimestamp(new Date());
     const [codeRows] = await db.query(
-      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > NOW()",
-      [params.code, params.channel_id],
+      "SELECT * FROM channel_pairing_codes WHERE code = ? AND channel_id = ? AND expires_at > ?",
+      [params.code, params.channel_id, now],
     ) as any;
     if (codeRows.length === 0) {
       return { success: false, error: "Invalid or expired pairing code" };
@@ -2048,12 +2088,15 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const pairingCode = codeRows[0];
     const bindingId = crypto.randomUUID();
     try {
-      await db.query(
-        `INSERT INTO channel_bindings (id, channel_id, agent_id, route_key, route_type, created_by)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE agent_id = VALUES(agent_id), route_type = VALUES(route_type), created_by = VALUES(created_by)`,
+      const upsert = buildUpsert(
+        db,
+        "channel_bindings",
+        ["id", "channel_id", "agent_id", "route_key", "route_type", "created_by"],
         [bindingId, params.channel_id, pairingCode.agent_id, params.route_key, params.route_type, pairingCode.created_by],
+        ["channel_id", "route_key"],
+        ["agent_id", "route_type", "created_by"],
       );
+      await db.query(upsert.sql, upsert.params);
     } catch (err: any) {
       return { success: false, error: `Failed to create binding: ${err.message}` };
     }

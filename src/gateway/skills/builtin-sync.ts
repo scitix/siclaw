@@ -277,7 +277,7 @@ export async function syncBuiltinSkills(
     const versionId = crypto.randomUUID();
 
     await db.query(
-      `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP(3)
+      `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [skill.description, labelsJson, newVersion, specsRaw, scriptsJson, existing.id],
     );

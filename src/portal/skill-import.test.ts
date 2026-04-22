@@ -245,7 +245,7 @@ describe("executeImport", () => {
 
     // Verify overlay promotion path: NOT delete agent_skills before rebind
     const sqls = conn.query.mock.calls.map(c => c[0] as string);
-    expect(sqls).toContain("UPDATE skills SET overlay_of = NULL WHERE overlay_of = ?");
+    expect(sqls).toContain("UPDATE skills SET overlay_of = NULL, updated_at = CURRENT_TIMESTAMP WHERE overlay_of = ?");
     expect(sqls).not.toContain("DELETE FROM agent_skills WHERE skill_id = ?");
   });
 });

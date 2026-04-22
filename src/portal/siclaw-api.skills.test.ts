@@ -92,7 +92,7 @@ describe("siclaw-api skills", () => {
       connectionMap: makeConnMap(),
     });
     query = vi.fn();
-    (getDb as any).mockReturnValue({ query, getConnection: vi.fn() });
+    (getDb as any).mockReturnValue({ query, getConnection: vi.fn(), driver: "mysql" });
   });
 
   // ── GET /skills/labels ───────────────────────────────────

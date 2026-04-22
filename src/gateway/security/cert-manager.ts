@@ -90,7 +90,13 @@ export class CertificateManager {
     return new CertificateManager(ca.cert, ca.key);
   }
 
-  /** Issue a server certificate for the Runtime itself. */
+  /**
+   * Issue a server certificate for the Runtime itself.
+   *
+   * The SAN list always includes `127.0.0.1` and `localhost` so that
+   * in-process (local mode) clients connecting over loopback pass hostname
+   * verification. K8s clients use the primary hostname which is also in SAN.
+   */
   issueServerCertificate(hostname: string): { cert: string; key: string } {
     const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -106,6 +112,7 @@ export class CertificateManager {
       isCA: false,
       validityDays: 90,
       extendedKeyUsage: ["serverAuth", "clientAuth"],
+      subjectAltNames: buildServerSans(hostname),
     });
 
     console.log(`[cert-manager] Issued server certificate for ${hostname}`);
@@ -140,6 +147,15 @@ export class CertificateManager {
       isCA: false,
       validityDays: 30,
       extendedKeyUsage: ["clientAuth", "serverAuth"],
+      // AgentBox cert is also used to terminate HTTPS on the AgentBox side.
+      // Include SANs so the Runtime (and any mTLS client) can verify hostnames
+      // when connecting over loopback (local mode) or K8s service DNS.
+      subjectAltNames: [
+        { type: 7, ip: "127.0.0.1" },
+        { type: 2, value: "localhost" },
+        { type: 2, value: agentId },
+        { type: 2, value: `siclaw-agentbox-${agentId}` },
+      ],
     });
 
     console.log(`[cert-manager] Issued certificate agentId=${agentId} orgId=${orgId} boxId=${boxId}`);
@@ -257,11 +273,37 @@ export class CertificateManager {
         serverAuth: opts.extendedKeyUsage.includes("serverAuth"),
       });
     }
+    if (opts.subjectAltNames && opts.subjectAltNames.length > 0) {
+      extensions.push({
+        name: "subjectAltName",
+        altNames: opts.subjectAltNames,
+      });
+    }
 
     cert.setExtensions(extensions);
     cert.sign(privateKeyForge, forge.md.sha256.create());
     return forge.pki.certificateToPem(cert);
   }
+}
+
+/**
+ * Build SAN entries for a Runtime server cert. Always includes 127.0.0.1 +
+ * localhost for loopback clients. If `hostname` parses as IP it's added as
+ * type=7 (iPAddress); otherwise as type=2 (dNSName).
+ */
+function buildServerSans(hostname: string): Array<{ type: number; value?: string; ip?: string }> {
+  const sans: Array<{ type: number; value?: string; ip?: string }> = [
+    { type: 7, ip: "127.0.0.1" },
+    { type: 2, value: "localhost" },
+  ];
+  if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+    sans.push(isIpAddress(hostname) ? { type: 7, ip: hostname } : { type: 2, value: hostname });
+  }
+  return sans;
+}
+
+function isIpAddress(s: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || s.includes(":");
 }
 
 interface CertOpts {
@@ -272,4 +314,5 @@ interface CertOpts {
   isCA: boolean;
   validityDays: number;
   extendedKeyUsage?: string[];
+  subjectAltNames?: Array<{ type: number; value?: string; ip?: string }>;
 }

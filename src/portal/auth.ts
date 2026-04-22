@@ -162,7 +162,7 @@ export function registerAuthRoutes(router: RestRouter, jwtSecret: string): void 
 
     const db = getDb();
     const [rows] = await db.query(
-      "SELECT id, username, role, can_review_skills, created_at FROM siclaw_users ORDER BY created_at",
+      "SELECT id, username, role, can_review_skills, created_at FROM siclaw_users ORDER BY created_at, id",
     ) as any;
     sendJson(res, 200, { data: rows });
   });

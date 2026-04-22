@@ -91,7 +91,7 @@ async function authenticateApiKey(req: http.IncomingMessage): Promise<ApiKeyAuth
 
   if (key.expires_at && new Date(key.expires_at) < new Date()) return null;
 
-  db.query("UPDATE agent_api_keys SET last_used_at = NOW(3) WHERE id = ?", [key.id]).catch(() => {});
+  db.query("UPDATE agent_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?", [key.id]).catch(() => {});
 
   return { agentId: key.agent_id, keyId: key.id, keyName: key.name, createdBy: key.created_by };
 }

@@ -62,7 +62,7 @@ export class LocalSpawner implements BoxSpawner {
     if (existing) {
       return {
         boxId,
-        endpoint: `http://127.0.0.1:${existing.port}`,
+        endpoint: `https://127.0.0.1:${existing.port}`,
         agentId,
       };
     }
@@ -71,17 +71,18 @@ export class LocalSpawner implements BoxSpawner {
 
     const certBundle = this.certManager.issueAgentBoxCertificate(agentId, "default", boxId);
 
+    // Use the K8s-convention filenames (tls.crt / tls.key / ca.crt) so that
+    // GatewayClient and the agentbox http-server can pick them up via the
+    // single SICLAW_CERT_PATH env var — the same code path as K8s mode.
     const certDir = path.resolve(process.cwd(), ".siclaw/certs", boxId);
     const fs = await import("node:fs");
     fs.mkdirSync(certDir, { recursive: true });
-    fs.writeFileSync(path.join(certDir, "cert.pem"), certBundle.cert);
-    fs.writeFileSync(path.join(certDir, "key.pem"), certBundle.key);
-    fs.writeFileSync(path.join(certDir, "ca.pem"), certBundle.ca);
+    fs.writeFileSync(path.join(certDir, "tls.crt"), certBundle.cert);
+    fs.writeFileSync(path.join(certDir, "tls.key"), certBundle.key);
+    fs.writeFileSync(path.join(certDir, "ca.crt"), certBundle.ca);
 
     process.env.SICLAW_GATEWAY_URL = this.gatewayInternalUrl;
-    process.env.SICLAW_TLS_CERT = path.join(certDir, "cert.pem");
-    process.env.SICLAW_TLS_KEY = path.join(certDir, "key.pem");
-    process.env.SICLAW_TLS_CA = path.join(certDir, "ca.pem");
+    process.env.SICLAW_CERT_PATH = certDir;
 
     const sessionManager = new AgentBoxSessionManager();
     sessionManager.agentId = agentId;
@@ -116,7 +117,10 @@ export class LocalSpawner implements BoxSpawner {
 
     return {
       boxId,
-      endpoint: `http://127.0.0.1:${port}`,
+      // The AgentBox http-server detects TLS certs via SICLAW_CERT_PATH and
+      // upgrades to HTTPS. LocalSpawner always provides certs, so endpoint
+      // must be https for the Runtime's AgentBoxClient to handshake correctly.
+      endpoint: `https://127.0.0.1:${port}`,
       agentId,
     };
   }
