@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { onDiagnostic, type DiagnosticEvent } from "../shared/diagnostic-events.js";
 import type { BrainSession, BrainSessionStats, BrainModelInfo } from "./brain-session.js";
+import { getTraceStore, type TraceStore } from "./trace-store.js";
 
 // ── Types ──────────────────────────────────────────────
 
@@ -31,6 +32,8 @@ export interface TraceRecorderOpts {
   brainType?: string;
   getSessionStats?: () => BrainSessionStats | undefined;
   getModel?: () => BrainModelInfo | undefined;
+  /** Persistent store; when provided, each flush also inserts a DB row. */
+  store?: TraceStore | null;
 }
 
 /**
@@ -499,13 +502,49 @@ export class TraceRecorder {
       fname = `${baseName}-${String(suffix).padStart(3, "0")}.json`;
     }
     const fpath = path.join(this.opts.traceDir, fname);
+    const bodyJson = JSON.stringify(trace, null, 2);
+    let written: string | null = null;
     try {
-      fs.writeFileSync(fpath, JSON.stringify(trace, null, 2), "utf-8");
-      return fpath;
+      fs.writeFileSync(fpath, bodyJson, "utf-8");
+      written = fpath;
     } catch (err) {
       console.warn(`[trace-recorder] write failed: ${fpath}`, err);
-      return null;
     }
+
+    // Persist to SQLite (same JSON body, plus indexed columns for API queries).
+    // Best-effort: DB failures must not break the trace contract on disk.
+    if (this.opts.store) {
+      try {
+        // File basename (without .json) is a human-friendly, unique-per-flush id.
+        const traceId = fname.replace(/\.json$/, "");
+        const toolCallCount = this.steps.reduce((n, s) => n + (s.kind === "tool_call" ? 1 : 0), 0);
+        this.opts.store.insert({
+          id: traceId,
+          sessionId: this.opts.sessionId,
+          promptIdx: this.promptIdx,
+          userId: this.opts.userId ?? null,
+          username: this.username ?? null,
+          mode: this.opts.mode,
+          brainType: this.opts.brainType ?? null,
+          modelName: model?.id ?? null,
+          userMessage: this.userMessage,
+          outcome: this.outcome,
+          startedAt: formatBeijing(this.startedAtMs),
+          endedAt: formatBeijing(endedAtMs),
+          durationMs: endedAtMs - this.startedAtMs,
+          stepCount: this.steps.length,
+          toolCallCount,
+          tokensTotal: tokensDelta?.total ?? null,
+          costUsd: costDelta ?? null,
+          schemaVersion: trace.schemaVersion,
+          bodyJson,
+        });
+      } catch (err) {
+        console.warn(`[trace-recorder] DB insert failed:`, err);
+      }
+    }
+
+    return written;
   }
 }
 
@@ -602,5 +641,7 @@ export function maybeCreateTraceRecorder(
     opts.traceDir ??
     process.env.SICLAW_TRACE_DIR ??
     path.join(process.cwd(), ".siclaw", "traces");
-  return new TraceRecorder({ ...opts, traceDir });
+  // Auto-attach the process-level trace store unless caller already supplied one.
+  const store = opts.store !== undefined ? opts.store : getTraceStore();
+  return new TraceRecorder({ ...opts, traceDir, store });
 }

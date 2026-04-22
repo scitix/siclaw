@@ -1023,6 +1023,11 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
     }
   });
 
+  // NOTE: /api/traces routes are intentionally NOT registered here.
+  // They live on the Gateway (src/gateway/server.ts) because querying the
+  // trace DB is a pure read that must not depend on the lazy-spawned
+  // AgentBox — you shouldn't have to send a prompt before you can query.
+
   // ==================== Server ====================
 
   /** Main request handler shared by HTTP and HTTPS servers */
