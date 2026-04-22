@@ -61,7 +61,7 @@ async function dispatchGet(router: ReturnType<typeof createRestRouter>, url: str
   return res;
 }
 
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
   responses = new Map<string, unknown>();
   request(method: string, params?: any): Promise<any> {
@@ -78,12 +78,12 @@ function userToken(): string {
 }
 
 let router: ReturnType<typeof createRestRouter>;
-let upstream: FakeFrontendWsClient;
+let frontend: FakeFrontendClient;
 
 beforeEach(() => {
   router = createRestRouter();
-  upstream = new FakeFrontendWsClient();
-  registerSystemRoutes(router, config, upstream as unknown as FrontendWsClient);
+  frontend = new FakeFrontendClient();
+  registerSystemRoutes(router, config, frontend as unknown as FrontendWsClient);
 });
 
 describe("GET /api/v1/siclaw/system/config", () => {
@@ -93,7 +93,7 @@ describe("GET /api/v1/siclaw/system/config", () => {
   });
 
   it("returns all config for admin", async () => {
-    upstream.responses.set("config.getSystemConfig", { config: { "system.grafanaUrl": "https://g" } });
+    frontend.responses.set("config.getSystemConfig", { config: { "system.grafanaUrl": "https://g" } });
     const res = await dispatchGet(router, "/api/v1/siclaw/system/config", { authorization: `Bearer ${adminToken()}` });
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).config).toEqual({ "system.grafanaUrl": "https://g" });
@@ -152,7 +152,7 @@ describe("PUT /api/v1/siclaw/system/config", () => {
     await dispatchReq(router, req, res);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ ok: true });
-    const setCall = upstream.calls.find((c) => c.method === "config.setSystemConfig");
+    const setCall = frontend.calls.find((c) => c.method === "config.setSystemConfig");
     expect(setCall).toBeDefined();
     expect(setCall!.params.key).toBe("system.grafanaUrl");
     expect(setCall!.params.value).toBe("https://grafana.example.com");
@@ -167,6 +167,6 @@ describe("PUT /api/v1/siclaw/system/config", () => {
     );
     await dispatchReq(router, req, res);
     expect(res.statusCode).toBe(200);
-    expect(upstream.calls.find((c) => c.method === "config.setSystemConfig")).toBeUndefined();
+    expect(frontend.calls.find((c) => c.method === "config.setSystemConfig")).toBeUndefined();
   });
 });

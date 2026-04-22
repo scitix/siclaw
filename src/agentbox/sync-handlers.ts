@@ -88,9 +88,9 @@ function writeSkillToDir(
   if (skill.specs) {
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
   }
-  // Some upstreams (notably upstream's GetSkillsBundle) serialize a missing
-  // scripts column as JSON `null` rather than `[]`. Treat null as "no scripts"
-  // instead of crashing on `.length` and taking down the whole reload.
+  // Upstream's GetSkillsBundle serializes a missing scripts column as JSON
+  // `null` rather than `[]`. Treat null as "no scripts" instead of crashing
+  // on `.length` and taking down the whole reload.
   const scripts = Array.isArray(skill.scripts) ? skill.scripts : [];
   if (scripts.length > 0) {
     const scriptsDir = path.join(skillDir, "scripts");
@@ -168,7 +168,7 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
 
     // Write every skill in the bundle, deduping by `dirName` in priority
     // order: "global" > "builtin" > anything else. Upstreams that don't set
-    // scope correctly (upstream currently serializes scope as the skill's own
+    // scope correctly (Upstream currently serializes scope as the skill's own
     // name) fall into the "other" bucket — they still get materialized,
     // just at lower priority so a genuine "global" overlay can win the
     // dirName collision.

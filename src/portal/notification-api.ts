@@ -1,6 +1,6 @@
 /**
  * Per-user notification inbox — lives in Portal because "who should be told
- * something happened" is the user-facing / upstream-owned concern in the A-route
+ * something happened" is the user-facing / frontend-owned concern in the A-route
  * architecture. Runtime fires task completions, Portal receives + persists +
  * pushes to the user's live WS connection.
  *

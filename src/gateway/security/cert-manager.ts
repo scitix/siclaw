@@ -15,7 +15,7 @@
  *
  * `is_production` is deliberately NOT encoded in the cert. The current
  * value is looked up from the agents table on every authz decision in
- * upstream (SQL join on agents.is_production = resource.is_production) —
+ * Upstream (SQL join on agents.is_production = resource.is_production) —
  * this way a toggle reflects immediately without requiring pod rebuild
  * or cert re-issue. AgentBox is user-unaware end-to-end: no userId in
  * cert, no userId in request payloads; user attribution is resolved at

@@ -46,7 +46,7 @@ function mkAggregator(): MetricsAggregator {
   } as unknown as MetricsAggregator;
 }
 
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
   responses = new Map<string, unknown>();
   nextError: Error | null = null;
@@ -62,13 +62,13 @@ class FakeFrontendWsClient {
 
 let router: ReturnType<typeof createRestRouter>;
 let aggregator: MetricsAggregator;
-let upstream: FakeFrontendWsClient;
+let frontend: FakeFrontendClient;
 
 beforeEach(() => {
   router = createRestRouter();
   aggregator = mkAggregator();
-  upstream = new FakeFrontendWsClient();
-  registerMetricsRoutes(router, config, aggregator, upstream as unknown as FrontendWsClient);
+  frontend = new FakeFrontendClient();
+  registerMetricsRoutes(router, config, aggregator, frontend as unknown as FrontendWsClient);
 });
 
 async function dispatch(req: http.IncomingMessage, res: FakeRes): Promise<void> {
@@ -97,20 +97,20 @@ describe("GET /api/v1/siclaw/metrics/live", () => {
 
 describe("GET /api/v1/siclaw/metrics/summary", () => {
   it("proxies query to metrics.summary RPC and returns its payload", async () => {
-    upstream.responses.set("metrics.summary", { hello: "world" });
+    frontend.responses.set("metrics.summary", { hello: "world" });
     const res = new FakeRes();
     await dispatch(makeReq("GET", "/api/v1/siclaw/metrics/summary?period=day", {
       authorization: `Bearer ${adminToken()}`,
     }), res);
     expect(res.statusCode).toBe(200);
-    expect(upstream.calls[0].method).toBe("metrics.summary");
-    expect(upstream.calls[0].params).toEqual({ period: "day" });
+    expect(frontend.calls[0].method).toBe("metrics.summary");
+    expect(frontend.calls[0].params).toEqual({ period: "day" });
     expect(JSON.parse(res.body)).toEqual({ hello: "world" });
   });
 
   it("returns 500 when RPC fails", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    upstream.nextError = new Error("oops");
+    frontend.nextError = new Error("oops");
     const res = new FakeRes();
     await dispatch(makeReq("GET", "/api/v1/siclaw/metrics/summary", { authorization: `Bearer ${adminToken()}` }), res);
     expect(res.statusCode).toBe(500);
@@ -126,24 +126,24 @@ describe("GET /api/v1/siclaw/metrics/summary", () => {
 
 describe("GET /api/v1/siclaw/metrics/audit (+ detail)", () => {
   it("proxies to metrics.audit with parsed query", async () => {
-    upstream.responses.set("metrics.audit", { entries: [] });
+    frontend.responses.set("metrics.audit", { entries: [] });
     const res = new FakeRes();
     await dispatch(makeReq("GET", "/api/v1/siclaw/metrics/audit?userId=u1&limit=10", {
       authorization: `Bearer ${adminToken()}`,
     }), res);
-    expect(upstream.calls[0].method).toBe("metrics.audit");
-    expect(upstream.calls[0].params).toEqual({ userId: "u1", limit: "10" });
+    expect(frontend.calls[0].method).toBe("metrics.audit");
+    expect(frontend.calls[0].params).toEqual({ userId: "u1", limit: "10" });
     expect(res.statusCode).toBe(200);
   });
 
   it("proxies /audit/:id to metrics.auditDetail with id param", async () => {
-    upstream.responses.set("metrics.auditDetail", { found: true });
+    frontend.responses.set("metrics.auditDetail", { found: true });
     const res = new FakeRes();
     await dispatch(makeReq("GET", "/api/v1/siclaw/metrics/audit/abc123", {
       authorization: `Bearer ${adminToken()}`,
     }), res);
-    expect(upstream.calls[0].method).toBe("metrics.auditDetail");
-    expect(upstream.calls[0].params).toEqual({ id: "abc123" });
+    expect(frontend.calls[0].method).toBe("metrics.auditDetail");
+    expect(frontend.calls[0].params).toEqual({ id: "abc123" });
     expect(res.statusCode).toBe(200);
   });
 

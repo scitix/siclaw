@@ -563,8 +563,8 @@ describe("skillsHandler", () => {
   });
 
   // ── defense: upstream null scripts must not crash the whole reload ──
-  it("tolerates scripts=null (upstream's NULL column serializes as JSON null)", async () => {
-    // Regression: upstream's GetSkillsBundle returned `scripts: null` for any
+  it("tolerates scripts=null (Upstream's NULL column serializes as JSON null)", async () => {
+    // Regression: Upstream's GetSkillsBundle returned `scripts: null` for any
     // skill whose DB scripts column was NULL. The old writeSkillToDir read
     // `skill.scripts.length` and threw "Cannot read properties of null
     // (reading 'length')" on the FIRST such skill, killing the entire
@@ -588,11 +588,11 @@ describe("skillsHandler", () => {
 
   // ── defense: unknown scope values must still be materialized ──
   it("materializes skills with non-standard scope values (lowest priority), rather than dropping them", async () => {
-    // Regression: upstream currently serializes `scope` as the skill's own
+    // Regression: Upstream currently serializes `scope` as the skill's own
     // name (e.g. "csi-diag") instead of "global"/"builtin". The old filter
     // `s.scope === "global" || s.scope === "builtin"` dropped every such
     // skill silently. Keep writing them so operators see the skills they
-    // bound, even while upstream is still shipping the wrong scope value.
+    // bound, even while Upstream is still shipping the wrong scope value.
     const payload = {
       version: "v1",
       skills: [

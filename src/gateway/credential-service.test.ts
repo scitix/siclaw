@@ -12,7 +12,7 @@ import { SessionRegistry } from "./session-registry.js";
  * Minimal fake FrontendWsClient that records every `request` invocation
  * and returns canned payloads.
  */
-class FakeFrontendWsClient {
+class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
   responses = new Map<string, unknown>();
   nextError: Error | null = null;
@@ -38,12 +38,12 @@ const identity: Identity = {
   sessionId: "sess-1",
 };
 
-let fake: FakeFrontendWsClient;
+let fake: FakeFrontendClient;
 let svc: CredentialService;
 let registry: SessionRegistry;
 
 beforeEach(() => {
-  fake = new FakeFrontendWsClient();
+  fake = new FakeFrontendClient();
   // Pre-seed a session → user mapping so we can assert audit attribution
   // comes from the registry (not the cert).
   registry = new SessionRegistry();
@@ -157,7 +157,7 @@ describe("CredentialNotFoundError", () => {
 });
 
 describe("createCredentialService factory", () => {
-  it("returns a CredentialService wrapping the passed upstream client", () => {
+  it("returns a CredentialService wrapping the passed frontend client", () => {
     const svc2 = createCredentialService(fake as unknown as FrontendWsClient);
     expect(svc2).toBeInstanceOf(CredentialService);
   });

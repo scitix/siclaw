@@ -81,7 +81,7 @@ Added by `mcpHandler.postReload` (`src/agentbox/sync-handlers.ts`).
 When Upstream / Portal issues an `agent.reload` for `mcp`:
 
 ```
-Portal mutation → upstream notify → Gateway notify → AgentBox /api/reload-mcp
+Portal mutation → Upstream notify → Gateway notify → AgentBox /api/reload-mcp
   → handler.fetch / materialize   (writes settings.json, reloadConfig())
   → handler.postReload(context)
        └→ for each session: session.invalidate()
@@ -128,9 +128,8 @@ a link to this document.
 
 ## 5. Required behavior on the Portal side
 
-This contract is only honest if the Portal matches it. See
-`docs/bug-reports/upstream-mcp-ux-coordination.md` for the coordination
-checklist: UX copy indicating "applies to the next turn", toast copy
+This contract is only honest if the Portal matches it. The coordination
+checklist covers: UX copy indicating "applies to the next turn", toast copy
 on Toggle-off / Delete, etc.
 
 ---

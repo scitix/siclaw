@@ -1,12 +1,11 @@
 # Siclaw Agent Runtime Deployment
-# Stateless process that manages AgentBox pods and proxies to Upstream.
+# Stateless process that manages AgentBox pods.
 #
 # Prerequisites:
 # 1. Create namespace: kubectl create namespace siclaw
 # 2. Create secrets:
 #    kubectl create secret generic siclaw-runtime-secrets \
 #      --from-literal=proxy-secret='<shared-secret>' \
-#      --from-literal=upstream-internal-secret='<shared-secret>' \
 #      -n siclaw
 
 apiVersion: apps/v1
@@ -66,13 +65,6 @@ spec:
             secretKeyRef:
               name: siclaw-runtime-secrets
               key: proxy-secret
-        - name: UPSTREAM_INTERNAL_URL
-          value: "http://upstream-apiserver.upstream.svc:8080"
-        - name: UPSTREAM_INTERNAL_SECRET
-          valueFrom:
-            secretKeyRef:
-              name: siclaw-runtime-secrets
-              key: upstream-internal-secret
         resources:
           requests:
             memory: "128Mi"
