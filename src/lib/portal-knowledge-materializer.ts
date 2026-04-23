@@ -70,10 +70,14 @@ export function materializePortalKnowledge(
     );
     try {
       fs.writeFileSync(tmpPath, Buffer.from(repo.dataBase64, "base64"));
-      // Snapshot file stats BEFORE extraction so we can tell which entries
-      // this repo actually wrote (either newly created or stat-changed by
-      // the extraction) and attribute collisions correctly.
-      const beforeFiles = snapshotFileStats(outDirResolved);
+      // Read the archive's own manifest rather than diffing pre/post fs stats.
+      // Earlier attempts to diff {size, mtime, ino} were unreliable on Linux:
+      // GNU tar's `-x` uses `open(O_TRUNC)` which preserves the inode, and
+      // two tiny files written in the same second (mtime granularity == 1s
+      // on many container mounts) can tie on all three fields, silently
+      // losing the "which repo wrote this" signal. The archive's own entry
+      // list is the authoritative answer and is platform-independent.
+      const writtenPaths = listTarArchivePaths(tmpPath);
       // `--no-same-owner` strips archived uid/gid so a malicious tar can't
       // install files owned by root (defensive even though we're not root).
       // Absolute-path stripping: BSD tar (macOS) strips leading `/` by default;
@@ -97,25 +101,7 @@ export function materializePortalKnowledge(
         firstWriter.clear();
         throw new Error(`tar extraction escaped outDir (${escapes.length} offending entries)`);
       }
-      // Diff: a file was written by THIS repo iff its stat changed (or it
-      // didn't exist before). That lets us attribute every real write to
-      // the correct repo instead of flagging every pre-existing file as a
-      // false-positive collision.
-      const afterFiles = snapshotFileStats(outDirResolved);
-      for (const [rel, afterStat] of afterFiles) {
-        const beforeStat = beforeFiles.get(rel);
-        // "Written by this repo" = any of the three stat dimensions changed.
-        // Inode is the most reliable signal: `tar x` defaults to unlink+create,
-        // so a rewritten file gets a new inode even when size and mtime happen
-        // to match on a coarse-granularity filesystem (FAT32, some NFS mounts).
-        // Size + mtime stay as belt-and-suspenders for tar implementations that
-        // overwrite in place (same inode, new content).
-        const writtenByThisRepo =
-          beforeStat === undefined ||
-          beforeStat.size !== afterStat.size ||
-          beforeStat.mtimeMs !== afterStat.mtimeMs ||
-          beforeStat.ino !== afterStat.ino;
-        if (!writtenByThisRepo) continue;
+      for (const rel of writtenPaths) {
         const prior = firstWriter.get(rel);
         if (prior && prior !== repo.name) {
           collisions.push({ path: rel, firstRepo: prior, overwrittenBy: repo.name });
@@ -145,34 +131,29 @@ export function materializePortalKnowledge(
 }
 
 /**
- * Enumerate every file under `dir` (recursively) with size, mtime, and inode
- * so the caller can diff pre/post-extraction and attribute each write to its
- * repo. Paths are relative to `dir`. Skips symlinks — the path-traversal walk
- * catches them separately.
+ * List every regular-file entry inside a gzip'd tar archive, as forward-slash
+ * paths normalised the way the extracted files will land on disk. Directory
+ * entries (trailing `/`), and soft / hard links are skipped — they don't
+ * represent a file the repo "wrote" for collision attribution purposes.
+ *
+ * Both BSD and GNU tar support `-tzf`; BSD prints paths with leading `./`
+ * and GNU strips it, so we normalise either form to the same shape.
  */
-function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: number; ino: number }> {
-  const out = new Map<string, { size: number; mtimeMs: number; ino: number }>();
-  if (!fs.existsSync(dir)) return out;
-  const walk = (current: string): void => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) {
-        try {
-          const st = fs.statSync(full);
-          out.set(path.relative(dir, full), { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino });
-        } catch { /* disappeared between readdir and stat; skip */ }
-      }
-    }
-  };
-  walk(dir);
+function listTarArchivePaths(tarGzPath: string): string[] {
+  const raw = execFileSync("tar", ["-tzf", tarGzPath], {
+    stdio: ["ignore", "pipe", "pipe"],
+  }).toString("utf8");
+
+  const out: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    if (line.endsWith("/")) continue; // directory entry
+    // Normalise `./foo/bar.md` → `foo/bar.md` so the two tars agree even
+    // when BSD and GNU print different prefixes for the same archive.
+    const rel = line.startsWith("./") ? line.slice(2) : line;
+    if (!rel || rel === ".") continue;
+    out.push(rel);
+  }
   return out;
 }
 
