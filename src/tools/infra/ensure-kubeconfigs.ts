@@ -7,9 +7,9 @@
  * arguments and calls broker.ensureCluster() for each, so the synchronous
  * kubeconfig-resolver can later look up the path without any async work.
  *
- * Rationale (see DESIGN.md §模块 6): the resolver is synchronous because
- * it's called deep inside synchronous validation pipelines. This helper is
- * the single async seam in front of that pipeline.
+ * Rationale: the kubeconfig resolver is synchronous because it's called deep
+ * inside synchronous validation pipelines. This helper is the single async
+ * seam in front of that pipeline.
  */
 
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";

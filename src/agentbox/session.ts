@@ -272,15 +272,14 @@ export class AgentBoxSessionManager {
     emitDiagnostic({ type: "session_created", sessionId: id });
 
     // Tool execution timing (for tool_call diagnostic events).
-    // NOTE: tool_execution_start/end events depend on the brain implementation.
-    // claude-sdk brain emits them reliably; pi-agent brain depends on the SDK's
-    // event stream — if these events aren't emitted, tool metrics will be zero
-    // for those sessions (best-effort, no incorrect data).
+    // NOTE: tool_execution_start/end events depend on pi-agent's event stream —
+    // if these events aren't emitted, tool metrics will be zero for those
+    // sessions (best-effort, no incorrect data).
     // Key by toolCallId (unique per invocation) to avoid concurrent same-name tool overwrites.
     const toolStartTimes = new Map<string, { name: string; startMs: number }>();
     let toolCallSeq = 0;
 
-    // Track agent lifecycle state + debug logging (works with both brain types)
+    // Track agent lifecycle state + debug logging
     result.brain.subscribe((event: any) => {
       // Update lastActiveAt on every event (used by Phase 2 stuck detection)
       managed!.lastActiveAt = new Date();

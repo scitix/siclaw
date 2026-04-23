@@ -25,10 +25,7 @@ siclaw local
 
 Launches the Web UI at `http://localhost:3000`.
 
-Default local login:
-
-- Username: `admin`
-- Password: `admin`
+On first launch, open the page and **register the first user** — that account becomes the admin. After that, new registrations require admin authentication.
 
 ### CLI
 
@@ -44,7 +41,7 @@ TUI mode for personal terminal diagnostics.
 git clone https://github.com/scitix/siclaw.git
 cd siclaw
 npm ci
-npm run build:web
+make build-portal-web
 npm run build
 node siclaw.mjs
 ```
@@ -83,7 +80,7 @@ Describe an issue:
 
 For complex issues, activate [Deep Investigation](/features/deep-investigation) mode (`/dp` or Ctrl+I) to run a structured investigation — the agent triages, proposes hypotheses for your review, validates in parallel after your confirmation, and produces a structured report with root cause, confidence score, and remediation steps.
 
-Reports are saved to `~/.siclaw/reports/`.
+Investigation traces are saved to `.siclaw/traces/` (relative to where Siclaw was launched).
 
 ## Add Cluster Access
 

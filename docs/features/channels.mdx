@@ -23,8 +23,15 @@ All channels share the same investigation engine — the interface differs but t
 Available in Local Server mode (`siclaw local`) and Kubernetes deployments:
 
 ```bash
-npm run dev:gateway
+siclaw local
 # Open http://localhost:3000
+```
+
+For development (running Runtime and Portal separately):
+
+```bash
+npm run dev:portal    # Portal + Web UI
+npm run dev:runtime   # Runtime control plane
 ```
 
 The Web UI provides:

@@ -178,7 +178,7 @@ Skill scripts (`skills/` directory) are **exempt from the binary allowlist** for
 **Invariant**: Agent file tools (`read`, `edit`, `write`, `grep`, `find`, `ls`) are path-scoped. The agent cannot write to credentials, config, or system directories.
 
 ```
-Read allowed:  builtin skills, dynamic skills, userDataDir, reports (~/.siclaw/reports/)
+Read allowed:  builtin skills, dynamic skills, userDataDir, traces (.siclaw/traces/)
 Write allowed: userDataDir ONLY (memory files, PROFILE.md, investigation notes)
 Blocked:       credentials dir, config dir, system dirs (/etc, /var, etc.)
 ```
@@ -328,18 +328,9 @@ Test runner:    vitest
 
 ---
 
-## 10. Brain Type Differences
+## 10. Agent Brain
 
-| Feature | pi-agent | claude-sdk |
-|---------|----------|-----------|
-| Backend | `@mariozechner/pi-coding-agent` | `@anthropic-ai/claude-agent-sdk` |
-| Memory tools | ✅ Available (hybrid search + investigation history) | ❌ Not integrated |
-| Tool protocol | TypeBox ToolDefinition | In-process MCP server (Zod) |
-| `steer()` | Native mid-run injection | Queued post-query |
-| Context tracking | ✅ Available | ❌ Not available |
-| Default | ✅ Yes | Optional (`brainType: "claude-sdk"`) |
-
-Memory-dependent features (investigations, `memory_search`) only work with pi-agent brain.
+**Invariant**: The agent runtime is `@mariozechner/pi-coding-agent` (the "pi-agent" brain). It is the only brain wired into `src/core/brains/`; tools use the TypeBox `ToolDefinition` protocol and register through `src/core/tool-registry.ts`. Memory-dependent features (investigations, `memory_search`) are built against this brain's tool and context APIs.
 
 ---
 

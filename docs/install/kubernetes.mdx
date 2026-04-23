@@ -9,26 +9,27 @@ description: "Deploy Siclaw on Kubernetes with full tenant isolation using Helm.
 Kubernetes is the production deployment model for Siclaw:
 
 ```
-Gateway Deployment
-  ├── Web UI + API
-  ├── K8sSpawner
-  ├── Cron coordination
+Portal Deployment
+  ├── Web UI (React) + REST API
+  ├── Auth + user management
   └── MySQL connection
 
-Cron Deployment
-  └── Executes scheduled jobs
+Runtime Deployment
+  ├── Channels (Slack / Lark / Discord / Telegram)
+  ├── Cron / scheduled tasks
+  └── K8s AgentBox spawner
 
-AgentBox Pod (spawned per user / workspace)
-  ├── Isolated runtime
+AgentBox Pod  (spawned per user / workspace)
+  ├── Isolated agent runtime
   ├── Synced skills and credentials
-  └── Internal mTLS back to Gateway
+  └── Internal mTLS back to Runtime
 ```
 
 ## Prerequisites
 
 - A Kubernetes cluster
 - A MySQL database reachable from the cluster
-- Published Siclaw images for `gateway`, `agentbox`, and `cron`
+- Published Siclaw images for `runtime`, `portal`, and `agentbox`
 
 Build and push images first if you are using your own registry:
 
@@ -50,7 +51,7 @@ helm upgrade --install siclaw ./helm/siclaw \
   --set database.url="mysql://user:pass@mysql.svc.cluster.local:3306/siclaw"
 ```
 
-The chart expects all three images to share the same registry and tag unless you explicitly override `agentbox.image.*`.
+All three images share `image.registry` and `image.tag` by default.
 
 ## Important Values
 
@@ -61,15 +62,16 @@ image:
   registry: registry.example.com/myteam
   tag: latest
 
-gateway:
+runtime:
+  replicas: 1
+
+portal:
+  enabled: true
   replicas: 1
   service:
     type: NodePort
-    port: 80
-    nodePort: 31000
-
-cron:
-  replicas: 2
+    port: 3003
+    nodePort: 31003
 
 database:
   url: mysql://user:pass@mysql.svc.cluster.local:3306/siclaw
@@ -79,19 +81,19 @@ Use `database.existingSecret.name` if you do not want to pass the connection str
 
 ## Accessing the UI
 
-By default the chart exposes the Gateway Service on port `80` inside the cluster.
+The Portal Service is the front door. With default values it listens on port `3003` inside the cluster and on NodePort `31003` on any node.
 
-- If you keep the default `NodePort`, the UI is available on node port `31000`
-- If you add an Ingress, route it to the Gateway Service on service port `80`
+- Keep `portal.service.type: NodePort` for quick access via `http://<any-node-ip>:31003`
+- Or point an Ingress at the Portal Service on service port `3003`
 
 Example Ingress backend:
 
 ```yaml
 backend:
   service:
-    name: siclaw-gateway
+    name: siclaw-portal
     port:
-      number: 80
+      number: 3003
 ```
 
 <Note>
@@ -100,22 +102,11 @@ WebSocket support is required for live investigation updates. Keep proxy read/se
 
 ## Authentication
 
-On first startup, Siclaw creates a default local admin account:
-
-- Username: `admin`
-- Password: `admin`
-
-To change the bootstrap password, set:
-
-```yaml
-gateway:
-  env:
-    SICLAW_ADMIN_PASSWORD: "change-me"
-```
+On first launch, open the Portal UI and register the first user — that account becomes the admin. Registration is open only for the very first account; every subsequent registration requires admin authentication.
 
 ## Metrics
 
-The Gateway exposes Prometheus metrics at `/metrics`. The chart can create ServiceMonitor, PodMonitor, Grafana dashboard, and PrometheusRule resources under the `metrics.*` values block.
+Runtime and Portal both expose Prometheus metrics at `/metrics`. The chart can create ServiceMonitor, PodMonitor, Grafana dashboard, and PrometheusRule resources under the `metrics.*` values block.
 
 Common settings:
 
@@ -135,7 +126,7 @@ metrics:
 If you want bearer-token protection for `/metrics`, add:
 
 ```yaml
-gateway:
+runtime:
   env:
     SICLAW_METRICS_TOKEN: "your-secret-token"
 ```
@@ -143,7 +134,7 @@ gateway:
 To remove the `user_id` label from token and cost metrics:
 
 ```yaml
-gateway:
+runtime:
   env:
     SICLAW_METRICS_USER_ID: "false"
 ```
@@ -151,6 +142,6 @@ gateway:
 ## Operational Notes
 
 - Kubernetes mode requires MySQL. SQLite is only for single-process local use.
-- AgentBox pods are created on demand by the Gateway.
-- Internal service-to-service communication is secured automatically.
+- AgentBox pods are created on demand by the Runtime.
+- Runtime ↔ AgentBox traffic is secured with mTLS automatically.
 - If you deploy monitoring resources from the chart, do not also apply duplicate monitor manifests manually.

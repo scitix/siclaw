@@ -22,8 +22,8 @@
 
 - [ ] **Deployment mode**: If touching resource sync, skills, or filesystem writes — verified behaviour in both local (LocalSpawner) and K8s (K8sSpawner) modes. See [`docs/design/invariants.md §1-2`](../docs/design/invariants.md).
 - [ ] **Security model**: No new shell execution paths bypassing `command-sets.ts`. Skill scripts go through the review gate.
-- [ ] **SQLite DDL parity**: New tables added to both `schema-sqlite.ts` AND `migrate-sqlite.ts`.
-- [ ] **Both brain types**: Tool changes work with pi-agent (TypeBox) and claude-sdk (MCP/Zod).
+- [ ] **DB parity**: Schema changes keep `src/portal/migrate.ts` compatible with both MySQL and SQLite (see [`docs/design/invariants.md §5`](../docs/design/invariants.md)).
+- [ ] **Tool protocol**: New tools register through `src/core/tool-registry.ts` and use the TypeBox `ToolDefinition` protocol.
 
 ## General Checklist
 
