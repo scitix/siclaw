@@ -13,13 +13,15 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Slack](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white)](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
-[Website](https://www.siclaw.ai) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
+[Website](https://www.siclaw.ai) | [Live Preview](https://www.siclaw.ai/demo/) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
 </div>
 
 ---
 
 Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the terminal, the web UI, or your team's chat channels.
+
+A hosted preview of the Portal UI — 4 specialist agents, recorded investigation sessions, and the built-in diagnostic skill set — is available at **[siclaw.ai/demo](https://www.siclaw.ai/demo/)**.
 
 ## Features
 
@@ -33,12 +35,14 @@ Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **re
 
 ## Architecture
 
-![Siclaw System Architecture](docs/assets/architecture.svg)
+![Siclaw System Architecture](docs/assets/architecture.png)
 
-> Three deployment modes share one agent core: **TUI** (single-user terminal),
-> **Local Server** (Gateway + SQLite, multi-user), **Kubernetes** (isolated AgentBox pod per user).
-> Every investigation is indexed into a local memory store and surfaced back to the agent,
-> so past diagnoses inform future hypotheses.
+> **Control plane** (Portal + Gateway + shared DB) stores the curated agents and their
+> bound resources — Skills, a versioned Knowledge wiki, MCP servers, and Credentials.
+> Each session spawns an isolated **AgentBox** (one Pod per user in Kubernetes, one
+> in-process per user in local dev, embedded in the CLI for standalone TUI) where the
+> Agent Brain runs a Deep Investigation Engine against its bound capabilities —
+> read-only across every target it touches.
 
 ## Prerequisites
 
@@ -72,6 +76,17 @@ siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
 # Continue last session
 siclaw --continue
 ```
+
+**Paired with a local server** (see profile 2 below): when `siclaw local` is running in the same working directory, the TUI automatically pairs with it and treats the Portal Web UI as the source of truth for skills, knowledge, credentials, agents, and LLM providers. Useful slash commands in that mode:
+
+| Command | What it does |
+|---|---|
+| `/ls` | Summary of the current session's skills / knowledge / MCP / credentials / agents |
+| `/ls skills` / `/ls credentials` / `/ls agents` / ... | Full listing for one category |
+| `/agent` | Show current Portal agent and all available ones; create / edit happens in Portal Web UI |
+| `/setup` | Read-only view of configured resources with "Open in Portal →" links |
+
+Pass `--agent <name>` to scope the session to one Portal-configured agent (its bound skills / credentials / knowledge / MCP / preferred model). `siclaw agents` lists them non-interactively from the shell.
 
 <details>
 <summary><b>Build from source</b></summary>
@@ -156,9 +171,9 @@ The default chart exposes the **Portal** Service on service port `3003` and Node
 
 ### TUI / CLI
 
-- TUI reads `.siclaw/config/settings.json`
-- The first-run wizard can generate this file for you
-- Kubernetes credentials should be imported through `/setup`
+- TUI reads `.siclaw/config/settings.json` in **standalone mode** (no local Portal running in the same cwd)
+- The first-run wizard can generate `settings.json` for you — but **if a `siclaw local` server is running in the same cwd, the wizard will redirect you to the Portal Web UI** instead (Portal is the single source of truth in that mode)
+- Kubernetes credentials should be imported through `/setup` in standalone TUI; in Portal-paired TUI, `/setup` becomes a read-only view and mutations happen in the Web UI
 - Investigation traces are written to `.siclaw/traces/` (relative to where Siclaw was launched)
 
 Minimal example:

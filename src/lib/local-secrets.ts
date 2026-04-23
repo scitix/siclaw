@@ -12,6 +12,13 @@ export interface LocalSecrets {
   jwtSecret: string;
   runtimeSecret: string;
   portalSecret: string;
+  /**
+   * Dedicated secret for the `/api/v1/cli-snapshot` endpoint. Kept separate
+   * from `jwtSecret` so the TUI doesn't have to self-sign an admin JWT
+   * (which would authenticate against every other admin route) just to
+   * read the snapshot.
+   */
+  cliSnapshotSecret: string;
 }
 
 export function loadOrGenerateLocalSecrets(filePath: string): LocalSecrets {
@@ -23,6 +30,14 @@ export function loadOrGenerateLocalSecrets(filePath: string): LocalSecrets {
         typeof raw.runtimeSecret === "string" &&
         typeof raw.portalSecret === "string"
       ) {
+        // Back-fill cliSnapshotSecret for secrets files written by older
+        // versions. Preserves existing JWT/Runtime/Portal secrets so the
+        // running Portal doesn't reject in-flight sessions.
+        if (typeof raw.cliSnapshotSecret !== "string") {
+          raw.cliSnapshotSecret = crypto.randomBytes(32).toString("hex");
+          fs.writeFileSync(filePath, JSON.stringify(raw, null, 2));
+          try { fs.chmodSync(filePath, 0o600); } catch { /* non-POSIX */ }
+        }
         return raw;
       }
     } catch {
@@ -34,6 +49,7 @@ export function loadOrGenerateLocalSecrets(filePath: string): LocalSecrets {
     jwtSecret: crypto.randomBytes(32).toString("hex"),
     runtimeSecret: crypto.randomBytes(32).toString("hex"),
     portalSecret: crypto.randomBytes(32).toString("hex"),
+    cliSnapshotSecret: crypto.randomBytes(32).toString("hex"),
   };
 
   const dir = path.dirname(filePath);

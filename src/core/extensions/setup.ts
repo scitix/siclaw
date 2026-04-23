@@ -1,12 +1,22 @@
 /**
  * /setup extension — in-session environment configuration for TUI mode.
  *
- * Provides credential management (kubeconfig, SSH, API tokens) and
- * model provider configuration via interactive dialogs.
+ * Two behaviours depending on whether a local Portal is running:
+ *
+ * - **Standalone (no Portal)**: full read/write against local filesystem.
+ *   Credentials and model providers can be added, listed, and removed.
+ *
+ * - **Portal-unified mode** (Portal snapshot active on localhost): all
+ *   mutating operations are replaced by links into the Portal Web UI,
+ *   because any write against the ephemeral `.portal-snapshot/` dirs
+ *   would either be cleaned up on TUI exit or overwritten by the next
+ *   snapshot fetch. List + view operations stay available so the user
+ *   can still inspect what the current session is running against.
  */
 
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
 
 /** Shorthand for the UI subset of ExtensionCommandContext used by setup handlers. */
@@ -47,14 +57,33 @@ const CREDENTIAL_TYPE_LABELS: Record<CredentialType, string> = {
 // Extension factory
 // ---------------------------------------------------------------------------
 
-export default function setupExtension(api: ExtensionAPI, credentialsDir: string): void {
+export interface SetupExtensionOpts {
+  /**
+   * When set, the TUI is running against a live local Portal and Portal is
+   * the single source of truth. `/setup` drops write operations in favour
+   * of opening the matching Portal Web UI page.
+   */
+  portalUrl?: string | null;
+}
+
+export default function setupExtension(
+  api: ExtensionAPI,
+  credentialsDir: string,
+  opts?: SetupExtensionOpts,
+): void {
+  const portalUrl = opts?.portalUrl ?? null;
+
   // --- Status bar: show config summary on session start ---
   api.on("session_start", async (_event, ctx) => {
     updateSetupStatus(ctx, credentialsDir);
   });
 
+  const description = portalUrl
+    ? "View credentials / models; edit via Portal Web UI"
+    : "Configure credentials and model provider";
+
   api.registerCommand("setup", {
-    description: "Configure credentials and model provider",
+    description,
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("Use web UI to manage credentials", "warning");
@@ -67,6 +96,12 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
         const action = await ctx.ui.select("Setup", [
           "Credentials",
           "Models",
+          ...(portalUrl
+            ? [
+                "Open Portal → Agents page",
+                "Open Portal home →",
+              ]
+            : []),
           "Exit",
         ]);
 
@@ -77,10 +112,16 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
 
         switch (action) {
           case "Credentials":
-            await credentialsSubmenu(ctx, credentialsDir);
+            await credentialsSubmenu(ctx, credentialsDir, portalUrl);
             break;
           case "Models":
-            await modelsSubmenu(ctx);
+            await modelsSubmenu(ctx, portalUrl);
+            break;
+          case "Open Portal → Agents page":
+            if (portalUrl) openInPortal(ctx, portalUrl, "/agents");
+            break;
+          case "Open Portal home →":
+            if (portalUrl) openInPortal(ctx, portalUrl, "/");
             break;
         }
       }
@@ -92,21 +133,47 @@ export default function setupExtension(api: ExtensionAPI, credentialsDir: string
 }
 
 // ---------------------------------------------------------------------------
+// Portal URL helpers
+// ---------------------------------------------------------------------------
+
+function openInPortal(ctx: SetupCtx, portalUrl: string, subPath: string): void {
+  const url = portalUrl.replace(/\/$/, "") + subPath;
+  ctx.ui.notify(
+    `Edit in Portal Web UI:\n  ${url}\n\nAttempting to open in your default browser...`,
+    "info",
+  );
+  try {
+    const opener =
+      process.platform === "darwin" ? "open"
+      : process.platform === "win32" ? "start"
+      : "xdg-open";
+    spawn(opener, [url], { detached: true, stdio: "ignore" }).unref();
+  } catch {
+    // Best-effort — user already saw the URL in the notify above.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sub-menus
 // ---------------------------------------------------------------------------
 
 async function credentialsSubmenu(
   ctx: SetupCtx,
   credentialsDir: string,
+  portalUrl: string | null,
 ): Promise<void> {
   let running = true;
   while (running) {
-    const action = await ctx.ui.select("Credentials", [
-      "Add",
-      "List",
-      "Remove",
-      "Back",
-    ]);
+    const options = portalUrl
+      ? [
+          "List",
+          "Open Portal → Clusters page",
+          "Open Portal → SSH Hosts page",
+          "Back",
+        ]
+      : ["Add", "List", "Remove", "Back"];
+
+    const action = await ctx.ui.select("Credentials", options);
 
     if (!action || action === "Back") {
       running = false;
@@ -123,24 +190,35 @@ async function credentialsSubmenu(
       case "Remove":
         await handleRemoveCredential(ctx, credentialsDir);
         break;
+      case "Open Portal → Clusters page":
+        if (portalUrl) openInPortal(ctx, portalUrl, "/settings/clusters");
+        break;
+      case "Open Portal → SSH Hosts page":
+        if (portalUrl) openInPortal(ctx, portalUrl, "/settings/hosts");
+        break;
     }
   }
 }
 
 async function modelsSubmenu(
   ctx: SetupCtx,
+  portalUrl: string | null,
 ): Promise<void> {
   let running = true;
   while (running) {
-    const action = await ctx.ui.select("Models", [
-      "List",
-      "Set default",
-      "Add model",
-      "Add provider",
-      "Remove model",
-      "Remove provider",
-      "Back",
-    ]);
+    const options = portalUrl
+      ? ["List", "Open Portal → Models page", "Back"]
+      : [
+          "List",
+          "Set default",
+          "Add model",
+          "Add provider",
+          "Remove model",
+          "Remove provider",
+          "Back",
+        ];
+
+    const action = await ctx.ui.select("Models", options);
 
     if (!action || action === "Back") {
       running = false;
@@ -165,6 +243,9 @@ async function modelsSubmenu(
         break;
       case "Remove provider":
         await handleRemoveProvider(ctx);
+        break;
+      case "Open Portal → Models page":
+        if (portalUrl) openInPortal(ctx, portalUrl, "/settings/models");
         break;
     }
   }

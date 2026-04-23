@@ -48,10 +48,12 @@ Usage: siclaw [command] [options]
 Commands:
   (default)    Start interactive TUI session
   local        Start local gateway with web UI (single process, SQLite)
+  agents       List Portal-configured agents and exit (requires local Portal)
 
 Options:
   --prompt <text>   Run in non-interactive print mode
   --continue        Continue the most recent session
+  --agent <name>    Use a specific Portal agent (skip picker / override default)
   --debug           Enable debug logging
   --open            (local only) auto-open the Portal URL in the browser
   --help, -h        Show this help
@@ -59,6 +61,8 @@ Options:
 
 In-session commands:
   /setup            Configure credentials and model provider
+  /ls               Show current workspace snapshot (read-only)
+  /agent            Show current Portal agent + list available ones
 `);
   }
 
@@ -75,6 +79,9 @@ In-session commands:
   if (subcommand === "local") {
     process.argv.splice(2, 1);
     await import("./dist/cli-local.js");
+  } else if (subcommand === "agents") {
+    process.argv.splice(2, 1);
+    await import("./dist/cli-agents.js");
   } else {
     await import("./dist/cli-main.js");
   }

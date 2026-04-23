@@ -417,12 +417,15 @@ AgentBox (materialize)
   -> Agent loads all skills from the single resolved/ directory
 ```
 
-### K8s vs Local mode
+### K8s vs Local vs TUI-with-Portal
 
-| Mode | resolved/ location | Written by |
-|------|-------------------|-----------|
+| Mode | Skills path | Written by |
+|------|-------------|-----------|
 | K8s (single-user pod) | `.siclaw/skills/resolved/` | `resource-handlers.ts materialize()` |
 | Local (multi-user process) | `.siclaw/skills/user/{userId}/resolved/` | `local-spawner.ts syncSkills()` |
+| TUI with local Portal | `.siclaw/.portal-snapshot/skills/` (**ephemeral**, cleaned on SIGINT/SIGTERM) | `src/lib/portal-skill-materializer.ts` on TUI startup |
+
+The TUI-with-Portal path is a separate write target from the other two. It never touches `skills/{core,extension,global,skillset,user}/` on disk — see `docs/design/invariants.md` §1.4 for the full snapshot contract.
 
 ---
 
@@ -506,6 +509,18 @@ The resolved directory is passed to `DefaultResourceLoader` via `additionalSkill
 The loader auto-discovers skills by scanning for `SKILL.md` files, parsing frontmatter,
 and injecting descriptions into the system prompt. The agent then knows which skills are
 available and can invoke them via `local_script`.
+
+### TUI with Local Portal — skillsOverride Filter
+
+When a TUI session has a local Portal snapshot active (`portalSkillsDir` set), the agent
+factory passes a `skillsOverride` to `DefaultResourceLoader` that **restricts** the visible
+skill set to paths rooted under either the Portal-materialized dir or the repo's
+`skills/platform/`. This filter removes user-global skills that the loader would otherwise
+auto-discover from `~/.pi/agent/skills/` or similar — they are invisible from the Portal
+operator's perspective and must not leak into the agent's tool inventory.
+
+Without the override, the agent could invoke skills the Portal operator never opted into.
+See `docs/design/invariants.md` §1.4 for the enclosing Portal-as-SoT contract.
 
 ### Deep Search Sub-Agents
 

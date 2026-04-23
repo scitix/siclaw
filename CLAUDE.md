@@ -10,7 +10,7 @@
 
 **Three runtime modes share one agent core:**
 ```
-TUI (single-user terminal)
+TUI (single-user terminal; may pair with a local Portal sidecar — see §1.4)
 Gateway + LocalSpawner (multi-user, local dev — all users share one process + filesystem)
 Gateway + K8sSpawner  (production — one isolated pod per user)
 ```
@@ -30,6 +30,15 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 ### 🔴 Skill Bundle Contract
 
 `buildSkillBundle()` packages **only global + skillset (dev only) + personal skills** selected for the current workspace. Core skills are baked into the Docker image. `materialize()` does NOT restore core skills.
+
+### 🔴 TUI + Local Portal: Read-Only Snapshot Contract
+
+When `siclaw` (TUI) starts in a cwd that has a reachable local Portal (`.siclaw/local-secrets.json` present AND `/api/health` responds), Portal becomes the **read-only source of truth** for skills, knowledge, credentials, agents, MCP servers, and LLM providers. Do not add code paths that let the TUI write back to Portal — writes belong in Portal Web UI. The existing `/setup` slash command detects Portal mode and switches to read-only + "Open in Portal →" behaviour; preserve that symmetry in any new command that would mutate configuration.
+
+- Snapshot contract: `GET /api/v1/cli-snapshot?agent=<name>` — see `src/portal/cli-snapshot-api.ts`. Agent-scoped joins via `agent_skills`, `agent_hosts`, `agent_clusters`, `agent_mcp_servers`, `agent_knowledge_repos`.
+- Materialization: payload unpacked to `.siclaw/.portal-snapshot/{skills,knowledge,credentials}/`. SIGINT/SIGTERM wipe the dir. These materializers (`src/lib/portal-*-materializer.ts`) are **NOT** the same as `skillsHandler.materialize()` (§1.2) — different code path, scoped ephemeral output, safe in TUI cwd.
+- First-run wizard: when Portal is reachable, `src/cli-first-run.ts` redirects user to Portal Web UI for provider setup and exits without writing `settings.json`. This prevents "ghost providers" that desync across workstations.
+- Standalone TUI (no Portal): legacy `settings.json` flow unchanged. Do not break that path.
 
 ### 🔴 Shell Security: Defense-in-Depth
 
@@ -70,7 +79,13 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/gateway/db.ts`, `db-mysql.ts`, `db-sqlite.ts` | invariants.md §5 | `npm test` — db.test.ts covers both drivers | DML return shape must match mysql2 (`[OkPacket, undefined]`); SQLite transactions serialised by mutex |
 | `src/gateway/dialect-helpers.ts` | invariants.md §5 | `dialect-helpers.test.ts` | All 4 dialect differences (upsert, INSERT IGNORE, JSON ops, `safeParseJson`) flow through here; every caller chooses via `db.driver` |
 | `src/lib/bootstrap-portal.ts`, `bootstrap-runtime.ts`, `src/cli-local.ts` | invariants.md §1 | manual `siclaw local` smoke test | Portal must `waitForListen` before Runtime boots; secrets persist in `.siclaw/local-secrets.json` |
-| `src/core/agent-factory.ts` | tools.md §7, guards.md §4, invariants.md §10 | `npm test` | Tool registration; guard pipeline installation; brain type compatibility |
+| `src/portal/cli-snapshot-api.ts` | invariants.md §1.4 | `npm test` — `cli-snapshot-api.test.ts` | Three auth gates in order: `enableCliSnapshot` flag, loopback-origin check, dedicated `cliSnapshotSecret` header (not `jwtSecret`); endpoint MUST stay read-only |
+| `src/lib/portal-snapshot-client.ts` | invariants.md §1.4 | `npm test` — `portal-snapshot-client.test.ts` | Cwd-scoped `.siclaw/local-secrets.json` read; sends `X-Siclaw-Cli-Snapshot-Secret` header (never `Authorization: Bearer`); silent fallback on 401 / 403 / missing secret (do not crash the TUI) |
+| `src/lib/portal-skill-materializer.ts`, `portal-knowledge-materializer.ts`, `portal-credential-materializer.ts` | invariants.md §1.4, skills.md "Skill Discovery by Agent" | `npm test` — each has a `.test.ts` | Ephemeral write to `.siclaw/.portal-snapshot/*/`; cleanup on SIGINT/SIGTERM; **distinct from** `skillsHandler.materialize()` — do not merge the two |
+| `src/cli-first-run.ts` | invariants.md §1.4 | manual smoke: `siclaw` in a cwd with Portal vs without | Portal-reachable branch bypasses `settings.json` write; preserve the interactive Y/n confirm, browser-launch, and opener-failure fallback path |
+| `src/cli-agents.ts` | invariants.md §1.4 | manual smoke: `siclaw agents` with/without Portal | Non-interactive agent lister; must exit non-zero + friendly stderr when Portal unreachable |
+| `src/core/extensions/ls.ts`, `agent.ts`, `setup.ts` | invariants.md §1.4 | manual smoke: `/ls`, `/ls skills`, `/agent`, `/setup` | TUI slash commands are **read-only observers** of the Portal snapshot; any new mutation path must route to Portal Web UI, not local state |
+| `src/core/agent-factory.ts` | tools.md §7, guards.md §4, invariants.md §10 | `npm test` | Tool registration; guard pipeline installation; brain type compatibility; `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts override `config.paths.*` when a Portal snapshot is active |
 | `src/core/guard-pipeline.ts` | guards.md | `npm test` | Guard registry, pipeline installation; all guard stages affected |
 | `src/core/guard-log.ts` | guards.md §7 | `npm test` | Structured logging for all guards |
 | `src/core/session-tool-result-guard.ts` | guards.md §5 | `npm test` | Persist guard; session history write validation |
