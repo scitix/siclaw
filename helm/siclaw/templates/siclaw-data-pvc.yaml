@@ -6,7 +6,7 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ .Values.agentbox.persistence.claimName }}
+  name: {{ include "siclaw.dataPvcName" . }}
   namespace: {{ .Release.Namespace }}
   annotations:
     # Keep the PVC (and user data) when the Helm release is uninstalled.

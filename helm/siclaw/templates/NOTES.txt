@@ -3,6 +3,9 @@ Thank you for installing {{ include "siclaw.fullname" . }}!
 {{- if .Values.agentbox.persistence.enabled }}
 
 ℹ️  User data persistence is enabled.
-   Ensure the shared PVC "{{ .Values.agentbox.persistence.claimName }}" exists and supports ReadWriteMany.
+   Chart-managed PVC: "{{ include "siclaw.dataPvcName" . }}" (ReadWriteMany).
+   {{- if not .Values.agentbox.persistence.storageClassName }}
+   ⚠️  agentbox.persistence.storageClassName is empty — the PVC will stay Pending until you set it to a RWX-capable StorageClass (e.g. nfs, efs-sc, csi-cephfs).
+   {{- end }}
    Gateway will create per-user subdirectories automatically.
 {{- end }}

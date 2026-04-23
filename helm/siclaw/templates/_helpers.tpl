@@ -68,3 +68,12 @@ Build agentbox image string — same registry/tag as gateway, different componen
 {{- define "siclaw.agentboxImage" -}}
 {{- include "siclaw.image" (dict "component" "agentbox" "ctx" .) -}}
 {{- end }}
+
+{{/*
+Name of the shared data PVC. Defaults to "<fullname>-data" so two releases
+in the same namespace don't collide; users can override via
+.Values.agentbox.persistence.claimName.
+*/}}
+{{- define "siclaw.dataPvcName" -}}
+{{- default (printf "%s-data" (include "siclaw.fullname" .)) .Values.agentbox.persistence.claimName -}}
+{{- end }}

@@ -60,7 +60,8 @@ agentbox:
   debugImage: ""
   persistence:
     enabled: false
-    claimName: "siclaw-data"
+    # Override the shared PVC name. Empty → "<release-fullname>-data".
+    claimName: ""
     # REQUIRED when enabled: true. Must support ReadWriteMany.
     # Examples: nfs, efs-sc, csi-cephfs, longhorn (with RWX).
     # Leaving this empty while enabled keeps the PVC in Pending state.
