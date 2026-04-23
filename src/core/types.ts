@@ -34,36 +34,22 @@ export interface MemoryRef {
 }
 
 // ── DP lifecycle types ──
-
-export type DpStatus =
-  | "idle"                    // No investigation active
-  | "investigating"           // Model is triaging / gathering context
-  | "awaiting_confirmation"   // Hypotheses presented, waiting for user decision
-  | "validating"              // User confirmed — deep_search executing Phase 3
-  | "concluding"              // Phase 4 or user skipped validation — model presenting conclusion
-  | "completed";              // Investigation finished
-
-export interface DpHypothesis {
-  id: string;
-  text: string;
-  confidence: number;
-  description?: string;
-}
+//
+// Post-refactor (Apr 2026): DP is reduced to a single mode flag. The
+// old enum (investigating / awaiting_confirmation / validating / concluding /
+// completed), draft / confirmed hypothesis storage, and per-phase state
+// were all removed together with the propose_hypotheses / deep_search tool
+// pair. See docs/design/2026-04-24-dp-mode-refactor-design.md.
 
 /**
  * Writable version of DpStateRef — held only by the extension (single writer).
- * Tools and agentbox receive the readonly DpStateRef view of the same object.
+ * Agentbox and other consumers receive the readonly DpStateRef view.
  */
 export interface MutableDpStateRef {
-  status: DpStatus;
-  triageContextDraft?: string;
-  confirmedHypotheses?: DpHypothesis[];
-  question?: string;
-  round?: number;
+  active: boolean;
 }
 
 /**
- * Read-only ref for tools that need to inspect DP state without mutating it.
- * Derived from MutableDpStateRef to guarantee both types stay in sync.
+ * Read-only ref for consumers that need to observe DP state without mutating it.
  */
 export type DpStateRef = Readonly<MutableDpStateRef>;

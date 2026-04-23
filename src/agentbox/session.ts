@@ -16,7 +16,7 @@ import path from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
-import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef, DpStatus } from "../core/types.js";
+import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
@@ -68,10 +68,7 @@ export interface ManagedSession {
 }
 
 export interface PersistedDpStateSnapshot {
-  dpStatus: DpStatus;
-  question?: string;
-  round?: number;
-  confirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
+  active: boolean;
 }
 
 /** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
@@ -395,33 +392,26 @@ export class AgentBoxSessionManager {
       const entry = frameworkSessionManager.getEntries()
         .filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "dp-mode")
         .pop() as { data?: {
-          dpStatus?: DpStatus;
-          dpQuestion?: string;
-          dpRound?: number;
-          dpConfirmedHypotheses?: Array<{ id: string; text: string; confidence: number }>;
-          checklist?: { question?: string };
+          active?: boolean;
+          enabled?: boolean;
+          dpStatus?: string;
+          checklist?: unknown;
           phase?: string;
-          question?: string;
         } } | undefined;
 
       if (!entry?.data) return null;
 
-      if (entry.data.dpStatus) {
-        return {
-          dpStatus: entry.data.dpStatus,
-          question: entry.data.dpQuestion ?? entry.data.checklist?.question,
-          round: entry.data.dpRound,
-          confirmedHypotheses: entry.data.dpConfirmedHypotheses,
-        };
+      // New shape: {active: boolean}
+      if (typeof entry.data.active === "boolean") {
+        return { active: entry.data.active };
       }
-
-      // Legacy fallback: any persisted checklist/phase means the session was in DP.
-      if (entry.data.checklist || (entry.data.phase && entry.data.phase !== "idle")) {
-        return {
-          dpStatus: "investigating",
-          question: entry.data.question ?? entry.data.checklist?.question,
-        };
-      }
+      // Legacy: {enabled: bool}, {dpStatus: "idle"|"investigating"|...},
+      // or presence of checklist/phase under the old state machine.
+      if (entry.data.enabled === true) return { active: true };
+      if (entry.data.dpStatus && entry.data.dpStatus !== "idle") return { active: true };
+      if (entry.data.checklist) return { active: true };
+      if (entry.data.phase && entry.data.phase !== "idle") return { active: true };
+      return { active: false };
     } catch (err) {
       console.warn(`[agentbox-session] Failed to read persisted dp-state for ${sessionId}:`, err);
     }

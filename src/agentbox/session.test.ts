@@ -317,7 +317,7 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
     expect(mgr.getPersistedDpState("nonexistent-session")).toBeNull();
   });
 
-  it("returns the last dp-mode entry's dpStatus", () => {
+  it("returns the last dp-mode entry as {active:true} (new shape)", () => {
     const mgr = new AgentBoxSessionManager();
     const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-dp");
     fs.mkdirSync(dir, { recursive: true });
@@ -327,27 +327,32 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
       {
         type: "custom",
         customType: "dp-mode",
-        data: {
-          dpStatus: "investigating",
-          dpQuestion: "why crash?",
-          dpRound: 3,
-          dpConfirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
-        },
+        data: { active: true },
       },
     ];
 
-    const snap = mgr.getPersistedDpState("sess-dp");
-    expect(snap).toEqual({
-      dpStatus: "investigating",
-      question: "why crash?",
-      round: 3,
-      confirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
-    });
+    expect(mgr.getPersistedDpState("sess-dp")).toEqual({ active: true });
   });
 
-  it("falls back to legacy checklist-based inference when dpStatus is absent", () => {
+  it("normalizes legacy dpStatus snapshot into {active:true}", () => {
     const mgr = new AgentBoxSessionManager();
-    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy");
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy-status");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      {
+        type: "custom",
+        customType: "dp-mode",
+        data: { dpStatus: "investigating" },
+      },
+    ];
+
+    expect(mgr.getPersistedDpState("sess-legacy-status")).toEqual({ active: true });
+  });
+
+  it("normalizes legacy checklist/phase snapshot into {active:true}", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy-checklist");
     fs.mkdirSync(dir, { recursive: true });
 
     (globalThis as any).__frameworkEntriesState.entries = [
@@ -361,9 +366,19 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
       },
     ];
 
-    const snap = mgr.getPersistedDpState("sess-legacy");
-    expect(snap?.dpStatus).toBe("investigating");
-    expect(snap?.question).toBe("oldQ");
+    expect(mgr.getPersistedDpState("sess-legacy-checklist")).toEqual({ active: true });
+  });
+
+  it("normalizes legacy {dpStatus:'idle'} into {active:false}", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-idle");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "custom", customType: "dp-mode", data: { dpStatus: "idle" } },
+    ];
+
+    expect(mgr.getPersistedDpState("sess-idle")).toEqual({ active: false });
   });
 
   it("returns null when the session dir has no dp-mode entry", () => {

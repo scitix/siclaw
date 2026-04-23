@@ -272,8 +272,8 @@ export async function createSiclawSession(
 
   // DP state ref — shared object, two views:
   // - MutableDpStateRef: held by the extension (single writer)
-  // - DpStateRef (readonly): passed to tools and agentbox for read-only access
-  const mutableDpStateRef: MutableDpStateRef = { status: "idle" };
+  // - DpStateRef (readonly): observed by agentbox and other consumers
+  const mutableDpStateRef: MutableDpStateRef = { active: false };
   const dpStateRef: DpStateRef = mutableDpStateRef;
 
   // Paths from settings.json (needed early for memoryIndexer init and tool resolution)

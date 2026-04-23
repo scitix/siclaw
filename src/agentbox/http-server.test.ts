@@ -33,11 +33,6 @@ vi.mock("../shared/detect-language.js", () => ({
   detectLanguage: (s: string) => (s.includes("你") ? "Chinese" : "English"),
 }));
 
-vi.mock("../tools/workflow/deep-search/events.js", async () => {
-  const { EventEmitter } = await import("node:events");
-  return { deepSearchEvents: new EventEmitter() };
-});
-
 // Config loader — point paths at /tmp (no PROFILE.md → no update)
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
@@ -131,7 +126,7 @@ function makeFakeSession(id: string) {
     _releaseTimer: null,
     llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
-    dpStateRef: { status: "idle", question: undefined, round: 0, confirmedHypotheses: [] },
+    dpStateRef: { active: false },
   };
 }
 
@@ -337,17 +332,16 @@ describe("http-server — dp-state", () => {
   it("returns live dpStateRef when session is loaded", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "dp1" });
     const s = sm.sessions.get("dp1")!;
-    s.dpStateRef = { status: "investigating", question: "why?", round: 2, confirmedHypotheses: [] };
+    s.dpStateRef = { active: true };
     const r = await getJson(port, "/api/sessions/dp1/dp-state");
     expect(r.status).toBe(200);
-    expect(r.data.dpStatus).toBe("investigating");
-    expect(r.data.question).toBe("why?");
+    expect(r.data.active).toBe(true);
   });
 
-  it("falls back to 'idle' when no session and no persisted state", async () => {
+  it("falls back to active=false when no session and no persisted state", async () => {
     const r = await getJson(port, "/api/sessions/ghost/dp-state");
     expect(r.status).toBe(200);
-    expect(r.data.dpStatus).toBe("idle");
+    expect(r.data.active).toBe(false);
   });
 });
 

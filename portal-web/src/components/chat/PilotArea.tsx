@@ -19,10 +19,7 @@ import { Markdown } from "./Markdown"
 import { InputArea, type PrefixChip } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
-import { InvestigationCard } from "./InvestigationCard"
-import { HypothesesCard } from "./HypothesesCard"
-import { DpChecklistCard } from "./DpChecklistCard"
-import type { PilotMessage, ContextUsage, InvestigationProgress, DpChecklistItem } from "./types"
+import type { PilotMessage, ContextUsage } from "./types"
 
 const DIG_DEEPER_CHIP: PrefixChip = {
   id: "dig-deeper",
@@ -52,13 +49,8 @@ export interface PilotAreaProps {
   contextUsage?: ContextUsage | null
   pendingMessages?: string[]
   onRemovePending?: (index: number) => void
-  investigationProgress?: InvestigationProgress | null
   dpActive?: boolean
   onSetDpActive?: (active: boolean) => void
-  dpFocus?: string | null
-  dpChecklist?: DpChecklistItem[] | null
-  onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void
-  onExitDp?: () => void
   sessionKey?: string | null
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
@@ -77,13 +69,8 @@ export function PilotArea({
   contextUsage,
   pendingMessages,
   onRemovePending,
-  investigationProgress,
   dpActive,
   onSetDpActive,
-  dpFocus,
-  dpChecklist,
-  onHypothesesConfirmed,
-  onExitDp,
   sessionKey,
   onOpenSkillPanel,
   onOpenSchedulePanel,
@@ -138,16 +125,6 @@ export function PilotArea({
     })
   }, [])
 
-  // Find the latest propose_hypotheses message
-  const latestHypothesesId = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].toolName === "propose_hypotheses" && !messages[i].isStreaming) {
-        return messages[i].id
-      }
-    }
-    return null
-  }, [messages])
-
   // Find last assistant message id
   const lastAssistantMsgId = useMemo(() => {
     const visible = messages.filter((m) => !m.hidden)
@@ -163,7 +140,7 @@ export function PilotArea({
   // outside Deep Investigation. Agency is with the user; no click-count cap.
   const showTraceButton = useMemo(() => {
     if (isLoading) return false
-    if (dpActive || (dpChecklist && dpChecklist.length > 0)) return false
+    if (dpActive) return false
     let turnStart = -1
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "user") {
@@ -175,20 +152,7 @@ export function PilotArea({
     return messages
       .slice(turnStart + 1)
       .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
-  }, [messages, isLoading, dpActive, dpChecklist])
-
-  // Check if latest hypotheses were already confirmed
-  const latestHypothesesConfirmed = useMemo(() => {
-    if (!latestHypothesesId) return false
-    const hypoIdx = messages.findIndex((m) => m.id === latestHypothesesId)
-    if (hypoIdx < 0) return false
-    const afterHypo = messages.slice(hypoIdx + 1)
-    if (afterHypo.some((m) => m.toolName === "deep_search")) return true
-    if (afterHypo.some((m) => m.role === "user" && m.content.includes("confirmed hypotheses"))) return true
-    if (dpChecklist?.some((i) => i.id === "deep_search" && (i.status === "in_progress" || i.status === "done")))
-      return true
-    return false
-  }, [messages, latestHypothesesId, dpChecklist])
+  }, [messages, isLoading, dpActive])
 
   // Auto-scroll logic
   useEffect(() => {
@@ -265,15 +229,7 @@ export function PilotArea({
                   <MessageItem
                     key={msg.id}
                     message={msg}
-                    investigationProgress={investigationProgress}
                     sendMessage={wrappedSendMessage}
-                    dpFocus={dpFocus}
-                    dpChecklistActive={dpChecklist != null && dpChecklist.length > 0}
-                    onHypothesesConfirmed={onHypothesesConfirmed}
-                    hypothesesSuperseded={
-                      latestHypothesesId != null && msg.toolName === "propose_hypotheses" && msg.id !== latestHypothesesId
-                    }
-                    hypothesesAlreadyConfirmed={msg.id === latestHypothesesId && latestHypothesesConfirmed}
                     showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
                     onChipClick={(key) => {
                       setChipSeq((s) => s + 1)
@@ -301,11 +257,6 @@ export function PilotArea({
                 </div>
               )}
 
-              {/* DP Checklist Card */}
-              {dpChecklist && dpChecklist.length > 0 && (
-                <DpChecklistCard items={dpChecklist} investigationProgress={investigationProgress} onDismiss={onExitDp} />
-              )}
-
               {isLoading && <ThinkingIndicator />}
             </>
           )}
@@ -320,7 +271,6 @@ export function PilotArea({
         contextUsage={contextUsage}
         pendingMessages={pendingMessages}
         onRemovePending={onRemovePending}
-        dpFocus={dpFocus}
         dpActive={dpActive}
         onSetDpActive={onSetDpActive}
         hasMessages={messages.length > 0}
@@ -457,13 +407,7 @@ function parseSuggestedReplies(content: string): { replies: SuggestedReply[]; te
 
 function MessageItem({
   message,
-  investigationProgress,
   sendMessage,
-  dpFocus,
-  dpChecklistActive,
-  onHypothesesConfirmed,
-  hypothesesSuperseded,
-  hypothesesAlreadyConfirmed,
   showSuggestedReplies,
   onChipClick,
   onOpenSkillPanel,
@@ -471,13 +415,7 @@ function MessageItem({
   agentId,
 }: {
   message: PilotMessage
-  investigationProgress?: InvestigationProgress | null
   sendMessage?: (text: string) => void
-  dpFocus?: string | null
-  dpChecklistActive?: boolean
-  onHypothesesConfirmed?: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void
-  hypothesesSuperseded?: boolean
-  hypothesesAlreadyConfirmed?: boolean
   showSuggestedReplies?: boolean
   onChipClick?: (key: string) => void
   onOpenSkillPanel?: (msg: PilotMessage) => void
@@ -500,29 +438,6 @@ function MessageItem({
     }
     if (message.toolName === "manage_schedule" && !message.isStreaming) {
       return <ScheduleCard message={message} onOpenPanel={onOpenSchedulePanel} agentId={agentId} />
-    }
-    if (message.toolName === "deep_search") {
-      if (message.isStreaming && (dpFocus || dpChecklistActive)) {
-        return null
-      }
-      return (
-        <InvestigationCard
-          message={message}
-          progress={message.isStreaming ? investigationProgress : undefined}
-          sendMessage={sendMessage}
-        />
-      )
-    }
-    if (message.toolName === "propose_hypotheses" && !message.isStreaming) {
-      return (
-        <HypothesesCard
-          message={message}
-          sendMessage={sendMessage}
-          onHypothesesConfirmed={onHypothesesConfirmed}
-          superseded={hypothesesSuperseded}
-          alreadyConfirmed={hypothesesAlreadyConfirmed}
-        />
-      )
     }
     return <ToolItem message={message} />
   }
@@ -572,11 +487,6 @@ function MessageItem({
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-500/10 border border-blue-500/30 text-xs font-medium text-blue-400">
                 <SearchCode className="w-3.5 h-3.5 text-blue-500" />
                 <span>Deep Investigation</span>
-                {dpFocus && (
-                  <span className="ml-1 px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 text-[10px] font-semibold uppercase">
-                    {dpFocus}
-                  </span>
-                )}
               </div>
             )}
             {skillName && (

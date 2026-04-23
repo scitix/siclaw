@@ -11,14 +11,11 @@ import { api, chatSteer, chatAbort } from "../api"
 import type {
   PilotMessage,
   ContextUsage,
-  InvestigationProgress,
-  InvestigationHypothesisProgress,
-  DpChecklistItem,
 } from "../components/chat/types"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText } from "./steer-pending"
 
 // Re-export types for convenience
-export type { PilotMessage, ContextUsage, InvestigationProgress, DpChecklistItem }
+export type { PilotMessage, ContextUsage }
 
 interface ChatSession {
   id: string
@@ -49,10 +46,7 @@ interface UsePilotChatReturn {
   messages: PilotMessage[]
   streaming: boolean
   streamText: string
-  dpProgress: InvestigationProgress | null
-  dpChecklist: DpChecklistItem[] | null
   dpActive: boolean
-  dpFocus: string | null
   contextUsage: ContextUsage | null
   isCompacting: boolean
   pendingMessages: string[]
@@ -65,7 +59,6 @@ interface UsePilotChatReturn {
   setDpActive: (active: boolean) => void
   removePending: (index: number) => void
   exitDp: () => void
-  onHypothesesConfirmed: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void
 }
 
 /** Format tool args into a readable one-liner for display */
@@ -148,78 +141,6 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
 }
 
 /** Reduce individual progress events into accumulated investigation state */
-function reduceInvestigationProgress(
-  state: InvestigationProgress,
-  event: Record<string, unknown>,
-): InvestigationProgress {
-  const next = { ...state, hypotheses: [...state.hypotheses] }
-
-  switch (event.type) {
-    case "phase":
-      next.phase = event.phase as string
-      if (event.detail) next.currentAction = event.detail as string
-      break
-
-    case "hypothesis": {
-      const id = event.id as string
-      const idx = next.hypotheses.findIndex((h) => h.id === id)
-      const update: InvestigationHypothesisProgress = {
-        id,
-        text: (event.text as string) || (idx >= 0 ? next.hypotheses[idx].text : ""),
-        status: event.status as string,
-        confidence: event.confidence as number,
-        callsUsed: idx >= 0 ? next.hypotheses[idx].callsUsed : 0,
-        maxCalls: idx >= 0 ? next.hypotheses[idx].maxCalls : 10,
-      }
-      if (idx >= 0) {
-        next.hypotheses[idx] = { ...next.hypotheses[idx], ...update }
-      } else {
-        next.hypotheses.push(update)
-      }
-      break
-    }
-
-    case "tool_exec": {
-      const hId = event.hypothesisId as string | undefined
-      const callsUsed = event.callsUsed as number
-      const maxCalls = event.maxCalls as number
-      const tool = event.tool as string
-      const command = event.command as string
-      const cmdShort = command.length > 60 ? command.slice(0, 57) + "..." : command
-      next.currentAction = `${hId ? hId + " " : ""}[${callsUsed}/${maxCalls}] ${tool}: ${cmdShort}`
-      if (hId) {
-        const idx = next.hypotheses.findIndex((h) => h.id === hId)
-        if (idx >= 0) {
-          next.hypotheses[idx] = {
-            ...next.hypotheses[idx],
-            callsUsed,
-            maxCalls,
-            lastAction: `[${callsUsed}/${maxCalls}] ${tool}: ${cmdShort}`,
-            status: next.hypotheses[idx].status === "pending" ? "validating" : next.hypotheses[idx].status,
-          }
-        }
-      }
-      break
-    }
-
-    case "budget_exhausted": {
-      const hId = event.hypothesisId as string | undefined
-      if (hId) {
-        const idx = next.hypotheses.findIndex((h) => h.id === hId)
-        if (idx >= 0) {
-          next.hypotheses[idx] = {
-            ...next.hypotheses[idx],
-            callsUsed: event.callsUsed as number,
-          }
-        }
-      }
-      break
-    }
-  }
-
-  return next
-}
-
 function timeNow(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
@@ -232,10 +153,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const [messages, setMessages] = useState<PilotMessage[]>([])
   const [streaming, setStreaming] = useState(false)
   const [streamText, setStreamText] = useState("")
-  const [dpProgress, setDpProgress] = useState<InvestigationProgress | null>(null)
-  const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null)
   const [dpActive, setDpActive] = useState(false)
-  const [dpFocus, setDpFocus] = useState<string | null>(null)
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const [pendingMessages, setPendingMessages] = useState<string[]>([])
   const [hasMore, setHasMore] = useState(true)
@@ -253,20 +171,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   interface SessionCache {
     messages: PilotMessage[]
     streaming: boolean
-    dpProgress: InvestigationProgress | null
-    dpChecklist: DpChecklistItem[] | null
     dpActive: boolean
-    dpFocus: string | null
     contextUsage: ContextUsage | null
   }
   const messagesCacheRef = useRef<Map<string, SessionCache>>(new Map())
   const prevSessionIdRef = useRef<string | undefined>(undefined)
 
-  // Reset DP state
+  // Reset DP mode flag. Kept as its own callback for the useEffect deps below.
   const resetDpState = useCallback(() => {
-    setDpChecklist(null)
-    setDpFocus(null)
-    setDpProgress(null)
     setDpActive(false)
   }, [])
 
@@ -278,7 +190,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     const prev = prevSessionIdRef.current
     if (prev) {
       messagesCacheRef.current.set(prev, {
-        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+        messages, streaming, dpActive, contextUsage,
       })
     }
     prevSessionIdRef.current = sessionId ?? undefined
@@ -303,20 +215,13 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages(cached.messages)
       setStreaming(true)
       streamingRef.current = true
-      setDpProgress(cached.dpProgress)
-      setDpChecklist(cached.dpChecklist)
       setDpActive(cached.dpActive)
-      setDpFocus(cached.dpFocus)
       setContextUsage(cached.contextUsage)
       setHasMore(true)
       return
     }
-    // Restore DP state from cache if available (even when loading messages from DB)
     if (cached) {
-      setDpProgress(cached.dpProgress)
-      setDpChecklist(cached.dpChecklist)
       setDpActive(cached.dpActive)
-      setDpFocus(cached.dpFocus)
       setContextUsage(cached.contextUsage)
     } else {
       resetDpState()
@@ -362,10 +267,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   useEffect(() => {
     if (sessionId) {
       messagesCacheRef.current.set(sessionId, {
-        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+        messages, streaming, dpActive, contextUsage,
       })
     }
-  }, [sessionId, messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage])
+  }, [sessionId, messages, streaming, dpActive, contextUsage])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(
@@ -426,12 +331,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const toolName = evt.toolName as string | undefined
           const args = evt.args as Record<string, unknown> | undefined
           const toolInput = formatToolInput(toolName ?? "", args)
-          const hidden = toolName === "update_plan" || toolName === "end_investigation"
-
-          // Initialize investigation progress for deep_search (preserve optimistic state if present)
-          if (toolName === "deep_search") {
-            setDpProgress((prev) => prev ?? { hypotheses: [] })
-          }
+          const hidden = toolName === "update_plan"
 
           setMessages((prev) => [
             ...prev,
@@ -465,19 +365,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // Use real DB message ID if available (enables metadata persistence)
           const dbMessageId = evt.dbMessageId as string | undefined
 
-          // Auto-clear hypothesis tree after all hypotheses finish
-          const endedToolName = evt.toolName as string | undefined
-          if (endedToolName === "deep_search") {
-            setTimeout(() => {
-              setDpProgress((prev) => {
-                if (prev && prev.hypotheses.every((h) => h.status !== "validating" && h.status !== "pending")) {
-                  return null
-                }
-                return prev
-              })
-            }, 5000)
-          }
-
           setMessages((prev) => {
             const last = prev[prev.length - 1]
             if (last?.role === "tool" && last.isStreaming) {
@@ -495,38 +382,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             }
             return prev
           })
-          break
-        }
-
-        // --- Tool progress (deep_search hypothesis-level) ---
-        case "tool_progress": {
-          const progress = evt.progress as Record<string, unknown> | undefined
-          if (evt.toolName === "deep_search" && progress) {
-            setDpProgress((prev) => {
-              const state = prev ?? { hypotheses: [] }
-              return reduceInvestigationProgress(state, progress)
-            })
-          }
-          break
-        }
-
-        // --- DP status (gateway-emitted synthetic event — single source for checklist state) ---
-        case "dp_status": {
-          const dpStatus = evt.dpStatus as string | undefined
-          const checklist = evt.checklist as DpChecklistItem[] | null | undefined
-          if (!dpStatus || dpStatus === "idle") {
-            resetDpState()
-            break
-          }
-          setDpActive(true)
-          if (checklist) {
-            setDpChecklist(checklist)
-            const focus = checklist.find((i) => i.status === "in_progress")
-            setDpFocus(focus ? focus.id : null)
-          }
-          if (dpStatus === "completed") {
-            setTimeout(() => resetDpState(), 3000)
-          }
           break
         }
 
@@ -872,23 +727,11 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     resetDpState()
   }, [agentId, sessionId, resetDpState])
 
-  // --- Hypotheses confirmed ---
-  const onHypothesesConfirmed = useCallback(
-    (_hypotheses: Array<{ id: string; text: string; confidence: number }>) => {
-      // The actual send is handled by HypothesesCard via sendMessage
-      // This callback is for any additional tracking
-    },
-    [],
-  )
-
   return {
     messages,
     streaming,
     streamText,
-    dpProgress,
-    dpChecklist,
     dpActive,
-    dpFocus,
     contextUsage,
     isCompacting,
     pendingMessages,
@@ -901,6 +744,5 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     setDpActive,
     removePending,
     exitDp,
-    onHypothesesConfirmed,
   }
 }

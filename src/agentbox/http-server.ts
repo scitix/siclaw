@@ -11,7 +11,6 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
-import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -305,21 +304,8 @@ export function createHttpServer(
       }
     });
 
-    // Also buffer deep_search progress events (same stream as session events)
-    const deepProgressBufHandler = (event: unknown) => {
-      if (!managed._promptDone) {
-        managed._eventBuffer.push({
-          type: "tool_progress",
-          toolName: "deep_search",
-          progress: event,
-        });
-      }
-    };
-    deepSearchEvents.on("progress", deepProgressBufHandler);
-
     managed._bufferUnsub = () => {
       brainUnsub();
-      deepSearchEvents.off("progress", deepProgressBufHandler);
     };
 
     let promptText = body.text;
@@ -330,8 +316,8 @@ export function createHttpServer(
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
-      // Find a safe injection point: after DP markers but before the user's actual text
-      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_REINVESTIGATE]\n", "[DP_SKIP]\n"];
+      // Only two DP markers remain after the refactor: activation and exit.
+      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n"];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
       if (matchedMarker) {
         // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
@@ -533,16 +519,6 @@ export function createHttpServer(
       writeEvent(event);
     });
 
-    // Also forward deep_search progress events as tool_progress SSE events
-    const deepProgressSSEHandler = (event: unknown) => {
-      writeEvent({
-        type: "tool_progress",
-        toolName: "deep_search",
-        progress: event,
-      });
-    };
-    deepSearchEvents.on("progress", deepProgressSSEHandler);
-
     // Heartbeat: send SSE comment every 30s to keep connection alive
     // during long agent thinking periods (prevents proxy/fetch body timeouts)
     const heartbeat = setInterval(() => {
@@ -560,7 +536,6 @@ export function createHttpServer(
     // Cleanup helper: unsubscribe from all event sources
     const unsubAll = () => {
       unsubscribe();
-      deepSearchEvents.off("progress", deepProgressSSEHandler);
     };
 
     // Decrement SSE counter and check idle (called once per SSE lifecycle)
@@ -633,25 +608,19 @@ export function createHttpServer(
   });
 
   /**
-   * GET /api/sessions/:sessionId/dp-state - read DP investigation state for recovery
+   * GET /api/sessions/:sessionId/dp-state — read DP mode flag for recovery.
    *
-   * Returns the current dpStateRef (live mirror of persisted dp-mode entries).
-   * Used by gateway's chat.dpProgress to provide authoritative recovery data.
+   * Simplified after the DP refactor: returns just `{active: boolean}` (or
+   * the legacy `{dpStatus}` shape if the session was persisted before the
+   * refactor, for one-migration transparency).
    */
   addRoute("GET", "/api/sessions/:sessionId/dp-state", async (_req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
 
-    if (managed) {
-      if (managed.dpStateRef) {
-        sendJson(res, 200, {
-          dpStatus: managed.dpStateRef.status,
-          question: managed.dpStateRef.question,
-          round: managed.dpStateRef.round,
-          confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
-        });
-        return;
-      }
+    if (managed?.dpStateRef) {
+      sendJson(res, 200, { active: managed.dpStateRef.active });
+      return;
     }
 
     const persisted = sessionManager.getPersistedDpState(sessionId);
@@ -660,7 +629,7 @@ export function createHttpServer(
       return;
     }
 
-    sendJson(res, 200, { dpStatus: "idle" });
+    sendJson(res, 200, { active: false });
   });
 
   /**

@@ -11,7 +11,7 @@ export interface PilotMessage {
   toolName?: string
   toolInput?: string
   toolStatus?: ToolStatus
-  /** Structured details from tool result (e.g. deep_search hypotheses + evidence) */
+  /** Structured details from tool result metadata */
   toolDetails?: Record<string, unknown>
   metadata?: Record<string, unknown>
   timestamp: string
@@ -29,29 +29,4 @@ export interface ContextUsage {
   cacheReadTokens: number
   cacheWriteTokens: number
   cost: number
-}
-
-// --- Deep Investigation progress types ---
-
-export interface InvestigationHypothesisProgress {
-  id: string
-  text: string
-  status: string // "pending" | "validating" | "validated" | "invalidated" | "inconclusive" | "skipped"
-  confidence: number
-  callsUsed: number
-  maxCalls: number
-  lastAction?: string
-}
-
-export interface InvestigationProgress {
-  phase?: string
-  hypotheses: InvestigationHypothesisProgress[]
-  currentAction?: string
-}
-
-export interface DpChecklistItem {
-  id: string
-  label: string
-  status: "pending" | "in_progress" | "done" | "skipped" | "error"
-  summary?: string
 }
