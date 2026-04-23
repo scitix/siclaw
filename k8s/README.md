@@ -5,19 +5,19 @@ This directory contains Kubernetes manifests for deploying Siclaw in a multi-ten
 ## Architecture
 
 ```
-┌─────────────────────┐
-│      Gateway        │  (Deployment, 1+ replicas)
-│  - User Auth        │
-│  - Web2 UI (React)  │
-│  - AgentBox Manager │
-└──────────┬──────────┘
-           │ K8s API
-    ┌──────┴──────┐
-    ▼             ▼
-┌─────────┐ ┌─────────┐
-│AgentBox │ │AgentBox │  (Dynamic Pods, per-user)
-│ User A  │ │ User B  │
-└─────────┘ └─────────┘
+┌──────────────────────┐     ┌─────────────────────┐
+│       Portal         │◄───►│      Runtime        │  (Deployments)
+│  - User Auth / RBAC  │     │  - AgentBox Manager │
+│  - Web UI (React)    │     │  - Channels / Cron  │
+│  - DB: MySQL/SQLite  │     │  - Resource Sync    │
+└──────────────────────┘     └──────────┬──────────┘
+                                        │ K8s API
+                                  ┌─────┴─────┐
+                                  ▼           ▼
+                            ┌─────────┐ ┌─────────┐
+                            │AgentBox │ │AgentBox │  (Dynamic pods, per-user)
+                            │ User A  │ │ User B  │
+                            └─────────┘ └─────────┘
 ```
 
 ## Deployment Options
@@ -55,15 +55,16 @@ helm install siclaw helm/siclaw -n siclaw --create-namespace -f my-values.yaml
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `image.registry` | `""` | Image registry prefix |
-| `image.tag` | `latest` | Image tag |
-| `gateway.replicas` | `1` | Gateway replicas |
-| `gateway.service.type` | `NodePort` | Service type |
-| `gateway.service.nodePort` | `31000` | NodePort port |
-| `cron.replicas` | `2` | Cron service replicas |
+| `image.registry` | `""` | Image registry prefix (e.g. `registry.example.com/myteam`) |
+| `image.tag` | `latest` | Image tag for all three images |
+| `runtime.replicas` | `1` | Runtime replicas |
+| `portal.enabled` | `true` | Enable the Portal (Web UI + DB) |
+| `portal.replicas` | `1` | Portal replicas |
+| `portal.service.type` | `NodePort` | Service type |
+| `portal.service.port` | `3003` | Service port |
+| `portal.service.nodePort` | `31003` | NodePort port |
 | `database.url` | `""` | MySQL connection URL |
 | `database.existingSecret.name` | `""` | Use existing K8s secret for DB URL |
-| `persistence.skills.size` | `10Gi` | Skills volume size |
 
 See `helm/siclaw/values.yaml` for the full list.
 
@@ -80,24 +81,19 @@ helm template siclaw helm/siclaw
 
 ```bash
 # Install dependencies
-npm install
+npm ci
 
 # Compile TypeScript
 npm run build
 
 # Build web React frontend
-npm run build:web
+make build-portal-web
 
-# Build Docker images
-npm run docker:build:gateway
-npm run docker:build:agentbox
-
-# Tag and push to your private registry
-REGISTRY=your-registry.example.com/siclaw
-docker tag siclaw-gateway:latest $REGISTRY/siclaw-gateway:latest
-docker tag siclaw-agentbox:latest $REGISTRY/siclaw-agentbox:latest
-docker push $REGISTRY/siclaw-gateway:latest
-docker push $REGISTRY/siclaw-agentbox:latest
+# Build all three Docker images (runtime, portal, agentbox)
+# and push them to your registry
+REGISTRY=your-registry.example.com/siclaw TAG=latest
+make docker REGISTRY=$REGISTRY TAG=$TAG
+make push   REGISTRY=$REGISTRY TAG=$TAG
 ```
 
 ### 2. Create Namespace and Secrets
@@ -127,18 +123,18 @@ sed "s|\${REGISTRY}|$REGISTRY|g" gateway-deployment.yaml | kubectl apply -f -
 kubectl get pods -n siclaw
 
 # Check logs
-kubectl logs -n siclaw -l app=siclaw-gateway
+kubectl logs -n siclaw -l app=siclaw-runtime
+kubectl logs -n siclaw -l app=siclaw-portal
 
-# Port-forward for local testing
-kubectl port-forward svc/siclaw-gateway -n siclaw 3000:80
+# Port-forward the Portal UI to localhost
+kubectl port-forward svc/siclaw-portal -n siclaw 3003:3003
 
-# Open http://localhost:3000
+# Open http://localhost:3003
 ```
 
-## AgentBox Template
+## AgentBox Pods
 
-The `agentbox-template.yaml` is reference documentation for the pod spec.
-The K8sSpawner creates pods programmatically via the K8s API.
+AgentBox pods are created programmatically by the Runtime's K8s spawner — there is no static manifest for them. The authoritative pod spec lives in [`src/gateway/agentbox/k8s-spawner.ts`](../src/gateway/agentbox/k8s-spawner.ts); see [`docs/design/security.md`](../docs/design/security.md) for the security model (capability set, user isolation, setgid kubectl) that constrains the spawn spec. Per-pod DNS comes from the headless Service in [`agentbox-headless-service.yaml`](./agentbox-headless-service.yaml).
 
 ## Per-User Kubeconfig
 

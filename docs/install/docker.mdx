@@ -6,10 +6,11 @@ description: "Build and publish Siclaw container images for Kubernetes deploymen
 
 ## What Docker Supports Today
 
-Siclaw currently ships Dockerfiles for **building runtime images**:
+Siclaw ships three Dockerfiles, one per deployment image:
 
-- `gateway` — Web UI + API server (includes cron scheduler)
-- `agentbox` — per-user execution runtime
+- `portal` — Web UI + REST API + DB (the user-facing front door)
+- `runtime` — Control plane: channels, cron, AgentBox spawner
+- `agentbox` — Per-user execution runtime (spawned by Runtime)
 
 For a single-machine setup, use [CLI & Local Server](/install/cli). The repository does **not** include a supported `docker compose` deployment.
 
@@ -23,13 +24,15 @@ make docker REGISTRY=registry.example.com/myteam TAG=latest
 
 That builds:
 
-- `registry.example.com/myteam/siclaw-gateway:latest`
+- `registry.example.com/myteam/siclaw-runtime:latest`
+- `registry.example.com/myteam/siclaw-portal:latest`
 - `registry.example.com/myteam/siclaw-agentbox:latest`
 
 To build one image only:
 
 ```bash
-make docker-gateway REGISTRY=registry.example.com/myteam TAG=latest
+make docker-runtime  REGISTRY=registry.example.com/myteam TAG=latest
+make docker-portal   REGISTRY=registry.example.com/myteam TAG=latest
 make docker-agentbox REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
@@ -42,15 +45,16 @@ make push REGISTRY=registry.example.com/myteam TAG=latest
 Or push individually:
 
 ```bash
-make push-gateway REGISTRY=registry.example.com/myteam TAG=latest
+make push-runtime  REGISTRY=registry.example.com/myteam TAG=latest
+make push-portal   REGISTRY=registry.example.com/myteam TAG=latest
 make push-agentbox REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
 ## Runtime Notes
 
-- The Gateway image listens on container port `3000`.
-- The Gateway image starts in Kubernetes mode by default.
-- The AgentBox image is designed to be spawned by the Gateway inside Kubernetes.
+- The Portal image serves the Web UI on container port `3003`.
+- Runtime and AgentBox communicate over mTLS inside the cluster.
+- The AgentBox image is designed to be spawned by the Runtime inside Kubernetes.
 - Core skills are baked into the images; dynamic skills and credentials are synced at runtime.
 
 ## Next Step

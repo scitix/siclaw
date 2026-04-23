@@ -35,7 +35,7 @@ import { GatewayClient } from "../agentbox/gateway-client.js";
 
 ```typescript
 const gatewayClient = new GatewayClient({
-  gatewayUrl: process.env.SICLAW_GATEWAY_URL, // e.g., "https://siclaw-gateway.siclaw.svc.cluster.local"
+  gatewayUrl: process.env.SICLAW_GATEWAY_URL, // e.g., "https://siclaw-runtime.siclaw.svc.cluster.local"
   certPath: "/etc/siclaw/certs", // Optional, defaults to SICLAW_CERT_PATH or "/etc/siclaw/certs"
 });
 ```
@@ -106,7 +106,7 @@ Fetch Gateway settings configuration.
 
 ```http
 GET /api/internal/settings HTTP/1.1
-Host: siclaw-gateway.siclaw.svc.cluster.local
+Host: siclaw-runtime.siclaw.svc.cluster.local
 ```
 
 **Response (200 OK):**
@@ -150,7 +150,7 @@ List cron jobs for a user.
 
 ```http
 GET /api/internal/cron-list?userId=user@example.com HTTP/1.1
-Host: siclaw-gateway.siclaw.svc.cluster.local
+Host: siclaw-runtime.siclaw.svc.cluster.local
 ```
 
 **Query Parameters:**
@@ -313,13 +313,13 @@ describe("GatewayClient Integration", () => {
 
 ```bash
 # Fetch settings
-curl https://siclaw-gateway.siclaw.svc.cluster.local/api/internal/settings \
+curl https://siclaw-runtime.siclaw.svc.cluster.local/api/internal/settings \
   --cert /etc/siclaw/certs/tls.crt \
   --key /etc/siclaw/certs/tls.key \
   --cacert /etc/siclaw/certs/ca.crt
 
 # List cron jobs
-curl "https://siclaw-gateway.siclaw.svc.cluster.local/api/internal/cron-list?userId=user@example.com" \
+curl "https://siclaw-runtime.siclaw.svc.cluster.local/api/internal/cron-list?userId=user@example.com" \
   --cert /etc/siclaw/certs/tls.crt \
   --key /etc/siclaw/certs/tls.key \
   --cacert /etc/siclaw/certs/ca.crt
@@ -507,7 +507,7 @@ req.setTimeout(10000, () => { // 10 seconds
 
 **Check**:
 - Gateway Service exists in Kubernetes
-- DNS resolution works: `nslookup siclaw-gateway.siclaw.svc.cluster.local`
+- DNS resolution works: `nslookup siclaw-runtime.siclaw.svc.cluster.local`
 - Network policies allow traffic
 
 ### Certificate verification errors in logs

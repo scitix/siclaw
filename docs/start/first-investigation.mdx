@@ -87,17 +87,17 @@ Siclaw synthesizes all evidence into a structured report:
     - Add memory requests to match expected usage
 ```
 
-The full report is saved to `~/.siclaw/reports/deep-search-{timestamp}.md`.
+The full trace is saved to `.siclaw/traces/deep-search-{timestamp}.md` (relative to where Siclaw was launched).
 
 ## Deep Investigation Mode
 
 For complex issues, you can explicitly trigger a deep investigation:
 
 ```
-> /deep "Intermittent 5xx errors on the API gateway, happening every 30 minutes"
+> /dp "Intermittent 5xx errors on the API gateway, happening every 30 minutes"
 ```
 
-This uses the full budget (up to 60 tool calls, 5 minutes) for thorough investigation.
+This activates the structured 4-phase workflow (triage → hypotheses → parallel validation → conclusion) for thorough investigation.
 
 ## More Examples
 
@@ -122,10 +122,10 @@ Siclaw will inspect node conditions, kubelet logs, kernel messages (dmesg), and 
 ### Intermittent Network Issues
 
 ```
-> /deep "Service mesh intermittent 503 errors between order-service and inventory-service"
+> /dp "Service mesh intermittent 503 errors between order-service and inventory-service"
 ```
 
-Using `/deep` triggers a full investigation with maximum budget — useful for complex cross-service issues.
+Using `/dp` triggers the full structured investigation — useful for complex cross-service issues.
 
 ## What's Next?
 

@@ -1,10 +1,9 @@
 # Dependencies
 node_modules/
-src/gateway/web/node_modules/
+portal-web/node_modules/
 
 # Build output
 dist/
-src/gateway/web/dist/
 portal-web/dist/
 
 # Stray TypeScript compile outputs in source tree (ts → js residue)

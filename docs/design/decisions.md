@@ -164,26 +164,21 @@ mTLS for K8s mode only. LocalSpawner mode uses plain HTTP (same machine, in-proc
 
 ---
 
-## ADR-007: Two Brain Implementations (pi-agent and claude-sdk)
+## ADR-007: Single Brain (pi-agent) Behind BrainSession Interface
 
 **Status**: Active
 
 **Context**:
-The agent runtime needs to support different LLM backends. Should there be one unified brain or multiple implementations?
+The agent runtime needs to support different LLM providers (OpenAI, Anthropic, Ollama, vLLM, ...). Should the project maintain multiple SDK-specific brain implementations, or one pluggable brain that talks to any OpenAI-compatible endpoint?
 
 **Decision**:
-Maintain two brain implementations behind the `BrainSession` interface:
-- **pi-agent** (`@mariozechner/pi-coding-agent`): Primary brain, full feature set including memory indexer
-- **claude-sdk** (`@anthropic-ai/claude-agent-sdk`): Secondary brain, uses in-process MCP server for tool exposure, adds LLM proxy for non-Anthropic providers
+Use a single brain implementation — `@mariozechner/pi-coding-agent` (the "pi-agent" brain) — exposed through the `BrainSession` interface. The brain talks to any OpenAI-compatible provider, so Anthropic / DeepSeek / Qwen / Kimi / Ollama / vLLM all work without dedicated SDK bindings. Tool exposure uses the TypeBox `ToolDefinition` protocol wired through `src/core/tool-registry.ts`.
 
 **Consequences**:
-- ✅ Users can switch brain type per-session based on model/provider preference
-- ✅ Anthropic SDK features (Claude-specific) available via claude-sdk brain
-- ⚠️ Feature parity gap: memory tools, context tracking, and `steer()` mid-run injection only work in pi-agent
-- ⚠️ Dual implementation means new features must be considered for both brains
-- ❌ Avoid adding brain-specific features unless they are truly backend-specific — prefer the `BrainSession` interface
-
-**Note**: When adding new tools, test with both brain types. Tool protocol differs (TypeBox for pi-agent, Zod/MCP for claude-sdk).
+- ✅ One tool protocol, one compaction strategy, one guard pipeline — no feature-parity gap to maintain
+- ✅ Provider switching is configuration, not code
+- ✅ Memory tools, context tracking, and `steer()` mid-run injection all work because there's no secondary backend to lag behind
+- ⚠️ Provider-specific features (e.g. Anthropic prompt caching) require going through pi-agent's provider layer; they are not accessed via a parallel SDK brain
 
 ---
 

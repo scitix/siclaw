@@ -21,11 +21,6 @@
 
 Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the terminal, the web UI, or your team's chat channels.
 
-<div align="center">
-<img src="docs/assets/demo.gif" alt="Siclaw Demo" width="800" />
-<p><em>Deep investigation: diagnosing a CrashLoopBackOff in seconds</em></p>
-</div>
-
 ## Features
 
 - **Deep Investigation** — A 4-phase workflow for evidence gathering, hypothesis testing, and root-cause analysis
@@ -42,8 +37,8 @@ Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **re
 
 > Three deployment modes share one agent core: **TUI** (single-user terminal),
 > **Local Server** (Gateway + SQLite, multi-user), **Kubernetes** (isolated AgentBox pod per user).
-> The Knowledge System feeds the agent with accumulated investigation experience (IM Phase 0–1 ✓)
-> and team-wide knowledge via Qdrant (KR0 — in progress).
+> Every investigation is indexed into a local memory store and surfaced back to the agent,
+> so past diagnoses inform future hypotheses.
 
 ## Prerequisites
 
@@ -83,7 +78,7 @@ siclaw --continue
 
 ```bash
 git clone https://github.com/scitix/siclaw.git && cd siclaw
-npm ci && npm run build:web && npm run build
+npm ci && make build-portal-web && npm run build
 npm link                 # register `siclaw` command globally
 
 siclaw                   # TUI mode
@@ -107,9 +102,9 @@ npm install -g siclaw
 siclaw local
 
 # Open http://localhost:3000
-# Login: admin / admin (default credentials)
+# On first visit: register the first user (becomes admin)
 # Configure providers in Models
-# Import kubeconfigs in Credentials
+# Import kubeconfigs in Clusters
 ```
 
 <details>
@@ -117,7 +112,7 @@ siclaw local
 
 ```bash
 git clone https://github.com/scitix/siclaw.git && cd siclaw
-npm ci && npm run build:web && npm run build
+npm ci && make build-portal-web && npm run build
 npm link                 # register `siclaw` command globally
 
 siclaw local             # start local server
@@ -127,12 +122,7 @@ siclaw local             # start local server
 
 </details>
 
-On first startup, Siclaw creates a local admin account:
-
-- Username: `admin`
-- Password: `admin`
-
-Set `SICLAW_ADMIN_PASSWORD` before first launch if you want a different bootstrap password.
+On first launch, open the web UI and **register the first user** — registration is open for the very first account and that account becomes the admin. Subsequent registrations require admin authentication.
 
 **Data locations (defaults, override with env vars):**
 - Database: `.siclaw/data/portal.db` — override with `DATABASE_URL=sqlite:///custom/path.db` or `DATABASE_URL=mysql://...`
@@ -140,13 +130,13 @@ Set `SICLAW_ADMIN_PASSWORD` before first launch if you want a different bootstra
 
 ### 3. Kubernetes — Team / enterprise
 
-Production deployment uses Helm plus three container images: `gateway`, `agentbox`, and `cron`.
+Production deployment uses Helm plus three container images: `runtime`, `portal`, and `agentbox`.
 
 Build and push images if you are using your own registry:
 
 ```bash
 make docker REGISTRY=registry.example.com/myteam TAG=latest
-make push REGISTRY=registry.example.com/myteam TAG=latest
+make push  REGISTRY=registry.example.com/myteam TAG=latest
 ```
 
 Then deploy the chart with a MySQL URL:
@@ -160,7 +150,7 @@ helm upgrade --install siclaw ./helm/siclaw \
   --set database.url="mysql://user:pass@host:3306/siclaw"
 ```
 
-The default chart exposes the Gateway Service on service port `80` and NodePort `31000`.
+The default chart exposes the **Portal** Service on service port `3003` and NodePort `31003`. Runtime and AgentBox run as ClusterIP-only services (internal traffic).
 
 ## Configuration
 
@@ -169,7 +159,7 @@ The default chart exposes the Gateway Service on service port `80` and NodePort 
 - TUI reads `.siclaw/config/settings.json`
 - The first-run wizard can generate this file for you
 - Kubernetes credentials should be imported through `/setup`
-- Investigation reports are written to `~/.siclaw/reports/`
+- Investigation traces are written to `.siclaw/traces/` (relative to where Siclaw was launched)
 
 Minimal example:
 
@@ -188,11 +178,15 @@ Minimal example:
 
 ### Local Server / Kubernetes
 
-- Configure providers in the **Models** page
-- Import kubeconfigs, API tokens, and SSH credentials in **Credentials**
+All configuration happens through the web UI:
+
+- Configure LLM providers in **Models**
+- Import kubeconfigs in **Clusters**
+- Import SSH hosts and credentials in **Hosts**
 - Configure Slack, Lark, Discord, and Telegram in **Channels**
-- Create inbound webhook endpoints in **Triggers**
-- Configure MCP servers in **MCP Servers**
+- Configure MCP servers in **MCP**
+- Manage users and roles in **Users**
+- Schedule recurring investigations in **My Tasks**
 
 ## Documentation
 
@@ -208,7 +202,7 @@ Minimal example:
 |-------|-----------|
 | Runtime | Node.js 22+ (ESM-only) |
 | Language | TypeScript 5.9 |
-| Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) / [claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk) |
+| Agent | [pi-coding-agent](https://github.com/badlogic/pi-mono) |
 | Database (portal) | MySQL (prod) or SQLite (local, via [node:sqlite](https://nodejs.org/api/sqlite.html)) — single DDL, driver chosen by `DATABASE_URL` scheme |
 | Database (memory) | node:sqlite + FTS5 + bge-m3 embeddings |
 | Frontend | React + Vite + Tailwind CSS |

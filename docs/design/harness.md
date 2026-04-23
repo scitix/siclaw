@@ -100,7 +100,7 @@ doc Y → must verify Z → watch out for cross-cutting concern W".
 **Layer 3 (Automated Verification)**: The safety net. Currently:
 - TypeScript strict mode + `npx tsc --noEmit` (type errors caught at compile)
 - `vitest` test suite with heavy coverage on security paths
-- DDL parity check (schema-sqlite.ts ↔ migrate-sqlite.ts table sync)
+- DDL parity check (`schema-invariants.test.ts` verifies single DDL in `src/portal/migrate.ts` stays MySQL + SQLite compatible)
 - CI pipeline (typecheck + test on every PR)
 
 ---
@@ -167,7 +167,7 @@ Current known cross-cutting concerns:
   parse command output; changing skills can expose unsanitized data
 - **Command whitelist ↔ Skills**: Adding/removing commands affects what skills
   can use (though skill scripts are exempt from the whitelist)
-- **Brain types ↔ Tools**: New tools must work with both pi-agent and claude-sdk
+- **Brain ↔ Tools**: New tools register through `src/core/tool-registry.ts` and must follow the TypeBox `ToolDefinition` protocol used by pi-agent
 - **Local mode ↔ Resource sync**: Any sync code must respect shared filesystem
 
 ---

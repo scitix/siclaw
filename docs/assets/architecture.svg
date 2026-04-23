@@ -86,7 +86,7 @@
   <line x1="30" y1="322" x2="285" y2="322" stroke="#0D9488" stroke-width="0.8"/>
   <text x="157" y="313" text-anchor="middle" dominant-baseline="middle" font-size="11" font-weight="bold" fill="#0F766E">Agent Brain</text>
   <rect x="40" y="328" width="235" height="75" rx="4" fill="#99F6E4" stroke="#0D9488" stroke-width="1"/>
-  <text x="157" y="361" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#0F766E">pi-agent · claude-sdk</text>
+  <text x="157" y="361" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#0F766E">pi-agent (OpenAI-compatible)</text>
 
   <!-- Tools sub-box -->
   <rect x="295" y="302" width="580" height="115" rx="5" fill="#CCFBF1" stroke="#0D9488" stroke-width="1.2"/>
@@ -163,13 +163,13 @@
   <rect x="30" y="632" width="560" height="87" rx="5" fill="#FEF3C7" stroke="#D97706" stroke-width="1.5"/>
   <text x="310" y="657" text-anchor="middle" dominant-baseline="middle" font-size="12" font-weight="bold" fill="#78350F">Investigation Memory</text>
   <text x="310" y="676" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#78350F">SQLite + FTS5 + bge-m3</text>
-  <text x="310" y="695" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#166534">✓ IM Phase 0–1 complete</text>
+  <text x="310" y="695" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#166534">session memory + persistent index</text>
 
-  <!-- Team Knowledge Base (dashed border) -->
-  <rect x="610" y="632" width="560" height="87" rx="5" fill="#FEF9C3" stroke="#CA8A04" stroke-width="1.5" stroke-dasharray="8,4"/>
+  <!-- Team Knowledge Base -->
+  <rect x="610" y="632" width="560" height="87" rx="5" fill="#FEF9C3" stroke="#CA8A04" stroke-width="1.5"/>
   <text x="890" y="657" text-anchor="middle" dominant-baseline="middle" font-size="12" font-weight="bold" fill="#713F12">Team Knowledge Base</text>
-  <text x="890" y="676" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#713F12">Qdrant vector DB</text>
-  <text x="890" y="695" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#92400E">⚡ KR0 — in progress</text>
+  <text x="890" y="676" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#713F12">DB-backed wiki</text>
+  <text x="890" y="695" text-anchor="middle" dominant-baseline="middle" font-size="11" fill="#92400E">shared playbooks + runbooks</text>
 
   <!-- Arrow E5: L4_im ↔ L3 bidirectional dashed (left side) -->
   <polyline points="30,675 6,675 6,412 20,412" fill="none" stroke="#D97706" stroke-width="1.5" stroke-dasharray="6,3" marker-start="url(#arr-amber-rev)" marker-end="url(#arr-amber)"/>
