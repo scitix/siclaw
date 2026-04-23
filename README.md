@@ -35,12 +35,14 @@ A hosted preview of the Portal UI — 4 specialist agents, recorded investigatio
 
 ## Architecture
 
-![Siclaw System Architecture](docs/assets/architecture.svg)
+![Siclaw System Architecture](docs/assets/architecture.png)
 
-> Three deployment modes share one agent core: **TUI** (single-user terminal),
-> **Local Server** (Gateway + SQLite, multi-user), **Kubernetes** (isolated AgentBox pod per user).
-> Every investigation is indexed into a local memory store and surfaced back to the agent,
-> so past diagnoses inform future hypotheses.
+> **Control plane** (Portal + Gateway + shared DB) stores the curated agents and their
+> bound resources — Skills, a versioned Knowledge wiki, MCP servers, and Credentials.
+> Each session spawns an isolated **AgentBox** (one Pod per user in Kubernetes, one
+> in-process per user in local dev, embedded in the CLI for standalone TUI) where the
+> Agent Brain runs a Deep Investigation Engine against its bound capabilities —
+> read-only across every target it touches.
 
 ## Prerequisites
 
