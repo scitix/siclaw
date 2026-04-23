@@ -13,13 +13,15 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Slack](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white)](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
-[Website](https://www.siclaw.ai) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
+[Website](https://www.siclaw.ai) | [Live Preview](https://www.siclaw.ai/demo/) | [Documentation](https://docs.siclaw.ai) | [Slack](https://join.slack.com/t/siclaw-scitix/shared_invite/zt-3rrsoc2ic-JIfbfvT1_04sqgQorSRfmw)
 
 </div>
 
 ---
 
 Siclaw is an open-source AI agent for DevOps and SRE teams. It is built for **read-only infrastructure diagnostics**: gather evidence, form hypotheses, validate them, and return a clear root-cause analysis without changing your environment directly. Describe a problem in plain language and Siclaw investigates it from the terminal, the web UI, or your team's chat channels.
+
+A hosted preview of the Portal UI — 4 specialist agents, recorded investigation sessions, and the built-in diagnostic skill set — is available at **[siclaw.ai/demo](https://www.siclaw.ai/demo/)**.
 
 ## Features
 
