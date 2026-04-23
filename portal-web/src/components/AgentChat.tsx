@@ -322,6 +322,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
         {activeSessionId ? (
           <>
             <PilotArea
+              agentId={agentId}
               messages={pilot.messages}
               isLoading={pilot.streaming}
               hasMore={pilot.hasMore}

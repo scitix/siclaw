@@ -89,10 +89,23 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
 }
 
 
+export interface CreateHttpServerOptions {
+  /**
+   * If true, skip the 5-minute idle self-destruct. Intended for LocalSpawner,
+   * which runs AgentBox in-process with the Portal — `process.exit(0)` from
+   * the idle timer would take the whole `siclaw local` process down with it.
+   * K8s mode must keep the default so idle pods get recycled.
+   */
+  disableIdleShutdown?: boolean;
+}
+
 /**
  * Create HTTP or HTTPS server (auto-detects certificates)
  */
-export function createHttpServer(sessionManager: AgentBoxSessionManager): http.Server | https.Server {
+export function createHttpServer(
+  sessionManager: AgentBoxSessionManager,
+  options: CreateHttpServerOptions = {},
+): http.Server | https.Server {
   // Initialize credential broker synchronously before any session is created.
   // The broker reference is captured by value into each session's KubeconfigRef,
   // so we cannot defer initialization — a late-arriving broker would never be
@@ -134,6 +147,7 @@ export function createHttpServer(sessionManager: AgentBoxSessionManager): http.S
   }
 
   function checkIdle(): void {
+    if (options.disableIdleShutdown) return;
     if (activeSseCount === 0 && sessionManager.activeCount() === 0) {
       if (idleTimer) return; // already scheduled
       idleTimer = setTimeout(() => {

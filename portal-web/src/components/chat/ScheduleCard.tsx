@@ -1,4 +1,5 @@
-import { Clock, Check, Eye } from "lucide-react"
+import { Clock, Eye, ExternalLink } from "lucide-react"
+import { Link } from "react-router-dom"
 import { cn } from "./cn"
 import type { PilotMessage } from "./types"
 
@@ -22,9 +23,11 @@ interface ParsedResult {
 export function ScheduleCard({
   message,
   onOpenPanel,
+  agentId,
 }: {
   message: PilotMessage
   onOpenPanel?: (msg: PilotMessage) => void
+  agentId?: string
 }) {
   let parsed: ParsedResult | null = null
   try {
@@ -89,7 +92,7 @@ export function ScheduleCard({
           {actionLabel}
         </span>
 
-        {/* View button */}
+        {/* View button — opens side panel with full details */}
         {onOpenPanel && (
           <button
             onClick={() => onOpenPanel(message)}
@@ -98,6 +101,30 @@ export function ScheduleCard({
             <Eye className="w-3 h-3" />
             View
           </button>
+        )}
+
+        {/* Open in Tasks page — deep link when we have the task id + current agentId. */}
+        {!isDelete && parsed.id && agentId && (
+          <Link
+            to={`/agents/${agentId}/tasks/${parsed.id}`}
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
+          >
+            <ExternalLink className="w-3 h-3" />
+            Open
+          </Link>
+        )}
+
+        {/* Fallback: jump to the tasks list.
+            Fires for delete (the per-task page is gone even though `id` is
+            still in the payload), and whenever id or agentId are missing. */}
+        {(isDelete || !parsed.id || !agentId) && (
+          <Link
+            to="/my-tasks"
+            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
+          >
+            <ExternalLink className="w-3 h-3" />
+            Tasks
+          </Link>
         )}
       </div>
     </div>

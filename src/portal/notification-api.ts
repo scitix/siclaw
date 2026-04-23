@@ -72,6 +72,49 @@ function pushToUser(userId: string, notification: Notification): void {
   }
 }
 
+/**
+ * Persist a task-completion notification + push to live WS subscribers.
+ * Shared by the internal HTTP route and the `task.notify` RPC handler — they
+ * used to diverge, leaving the RPC path (the one the Runtime actually uses)
+ * with no handler and cron runs producing no notifications.
+ */
+export async function createTaskNotification(params: {
+  userId: string;
+  taskId: string;
+  status: string;
+  agentId?: string | null;
+  runId?: string | null;
+  title?: string;
+  message?: string | null;
+}): Promise<{ id: string }> {
+  const id = crypto.randomUUID();
+  const type = params.status === "success" ? "task_success" : "task_failure";
+  const title = params.title ?? (params.status === "success" ? "Task completed" : "Task failed");
+  const message = params.message ?? null;
+
+  const db = getDb();
+  await db.query(
+    `INSERT INTO notifications (id, user_id, type, title, message, related_agent_id, related_task_id, related_run_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, params.userId, type, title, message, params.agentId ?? null, params.taskId, params.runId ?? null],
+  );
+
+  pushToUser(params.userId, {
+    id,
+    userId: params.userId,
+    type,
+    title,
+    message,
+    relatedAgentId: params.agentId ?? null,
+    relatedTaskId: params.taskId,
+    relatedRunId: params.runId ?? null,
+    readAt: null,
+    createdAt: new Date().toISOString(),
+  });
+
+  return { id };
+}
+
 // ── Row helpers ───────────────────────────────────────────────
 
 function rowToNotification(row: any): Notification {
@@ -224,33 +267,15 @@ export function registerNotificationRoutes(
       return;
     }
 
-    const id = crypto.randomUUID();
-    const type = body.status === "success" ? "task_success" : "task_failure";
-    const title = body.title ?? (body.status === "success" ? "Task completed" : "Task failed");
-    const message = body.message ?? null;
-
-    const db = getDb();
-    await db.query(
-      `INSERT INTO notifications (id, user_id, type, title, message, related_agent_id, related_task_id, related_run_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, body.userId, type, title, message, body.agentId ?? null, body.taskId, body.runId ?? null],
-    );
-
-    // Push to any live WS connection — best effort, persistence is source of truth.
-    const notification: Notification = {
-      id,
+    const { id } = await createTaskNotification({
       userId: body.userId,
-      type,
-      title,
-      message,
-      relatedAgentId: body.agentId ?? null,
-      relatedTaskId: body.taskId,
-      relatedRunId: body.runId ?? null,
-      readAt: null,
-      createdAt: new Date().toISOString(),
-    };
-    pushToUser(body.userId, notification);
-
+      taskId: body.taskId,
+      status: body.status,
+      agentId: body.agentId,
+      runId: body.runId,
+      title: body.title,
+      message: body.message,
+    });
     sendJson(res, 201, { id });
   });
 }

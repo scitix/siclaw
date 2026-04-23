@@ -117,7 +117,9 @@ describe("manage_schedule tool", () => {
 
   describe("delete / pause / resume", () => {
     beforeEach(() => {
-      mockClient.listAgentTasks.mockResolvedValue([{ id: "t1", name: "foo" }]);
+      mockClient.listAgentTasks.mockResolvedValue([
+        { id: "t1", name: "foo", schedule: "0 9 * * *", status: "active" },
+      ]);
     });
 
     it("deletes by name", async () => {
@@ -126,16 +128,40 @@ describe("manage_schedule tool", () => {
       expect(mockClient.deleteAgentTask).toHaveBeenCalledWith("t1");
     });
 
-    it("pauses", async () => {
+    it("pauses and echoes the current cron in the schedule field", async () => {
       const res = await tool.execute("id", { action: "pause", id: "t1" });
-      expect(JSON.parse(res.content[0].text).summary).toContain("Paused");
+      const parsed = JSON.parse(res.content[0].text);
+      expect(parsed.summary).toContain("Paused");
       expect(mockClient.updateAgentTask).toHaveBeenCalledWith("t1", { status: "paused" });
+      // Regression guard: schedule field must carry the real cron (not "")
+      // and reflect the new status so ScheduleCard renders them correctly.
+      expect(parsed.schedule).toEqual({
+        name: "foo",
+        schedule: "0 9 * * *",
+        status: "paused",
+      });
     });
 
-    it("resumes", async () => {
+    it("resumes and echoes the current cron in the schedule field", async () => {
       const res = await tool.execute("id", { action: "resume", id: "t1" });
-      expect(JSON.parse(res.content[0].text).summary).toContain("Resumed");
+      const parsed = JSON.parse(res.content[0].text);
+      expect(parsed.summary).toContain("Resumed");
       expect(mockClient.updateAgentTask).toHaveBeenCalledWith("t1", { status: "active" });
+      expect(parsed.schedule).toEqual({
+        name: "foo",
+        schedule: "0 9 * * *",
+        status: "active",
+      });
+    });
+
+    it("pause omits the schedule field when resolveId cannot surface the cron", async () => {
+      // resolveId's fallback path (id matches nothing in list) returns just
+      // { id, name } — pause must then omit `schedule` rather than emit "".
+      mockClient.listAgentTasks.mockResolvedValue([]);
+      const res = await tool.execute("id", { action: "pause", id: "t-unknown" });
+      const parsed = JSON.parse(res.content[0].text);
+      expect(parsed.summary).toContain("Paused");
+      expect("schedule" in parsed ? parsed.schedule : undefined).toBeUndefined();
     });
   });
 

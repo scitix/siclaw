@@ -13,6 +13,8 @@ import type { BoxSpawner } from "./spawner.js";
 import type { AgentBoxConfig, AgentBoxHandle, AgentBoxInfo } from "./types.js";
 import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
+import { GatewayClient } from "../../agentbox/gateway-client.js";
+import { syncResource } from "../../agentbox/resource-sync.js";
 import type { MemoryIndexer } from "../../memory/index.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 
@@ -95,7 +97,10 @@ export class LocalSpawner implements BoxSpawner {
       ".siclaw/credentials",
       agentId,
     );
-    const httpServer = createHttpServer(sessionManager);
+    // disableIdleShutdown: LocalSpawner runs AgentBox in the same process as
+    // the Portal — the 5-min idle timer's `process.exit(0)` would take the
+    // whole `siclaw local` down and strand the web UI.
+    const httpServer = createHttpServer(sessionManager, { disableIdleShutdown: true });
 
     await new Promise<void>((resolve, reject) => {
       httpServer.listen(port, "127.0.0.1", () => {
@@ -104,6 +109,28 @@ export class LocalSpawner implements BoxSpawner {
       });
       httpServer.on("error", reject);
     });
+
+    // K8s mode pulls knowledge via syncAllResources() in agentbox-main.ts.
+    // LocalSpawner bypasses that entrypoint, so without this call the agent's
+    // bound knowledge repos never land in .siclaw/knowledge/. Skills and MCP
+    // are intentionally skipped: their handlers wipe a shared directory and
+    // would clobber other users' state (invariant #1 in CLAUDE.md).
+    //
+    // Fire-and-forget: spawn() must stay cheap — sync retries (up to 7s) run
+    // in the background while the caller proceeds. A slow first chat is
+    // better than a blocked spawn.
+    void (async () => {
+      try {
+        const gatewayClient = new GatewayClient({
+          gatewayUrl: this.gatewayInternalUrl,
+          certPath: certDir,
+        });
+        await syncResource("knowledge", gatewayClient.toClientLike());
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[local-spawner] Initial knowledge sync failed for agent=${agentId}: ${msg}`);
+      }
+    })();
 
     const box: LocalBox = {
       agentId,

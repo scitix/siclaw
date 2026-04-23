@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import { getDb } from "../gateway/db.js";
 import { buildUpsert, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
+import { createTaskNotification } from "./notification-api.js";
 import {
   sendJson,
   parseBody,
@@ -2056,6 +2057,26 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       [params.task_id],
     );
     return { outcome: "ok", task: row };
+  });
+
+  // Runtime's TaskCoordinator emits this after each cron run completes.
+  // Missing handler = silent drop = no NotificationBell update = user
+  // thinks the task never ran. The HTTP /api/internal/task-notify route
+  // already existed but no caller reached it; the Runtime uses the RPC path.
+  handlers.set("task.notify", async (params) => {
+    if (!params.userId || !params.taskId || !params.status) {
+      throw new Error("userId, taskId, status are required");
+    }
+    const { id } = await createTaskNotification({
+      userId: params.userId as string,
+      taskId: params.taskId as string,
+      status: params.status as string,
+      agentId: params.agentId as string | undefined,
+      runId: params.runId as string | undefined,
+      title: params.title as string | undefined,
+      message: params.message as string | undefined,
+    });
+    return { id };
   });
 
   handlers.set("task.prune", async (params) => {
