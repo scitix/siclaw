@@ -61,6 +61,11 @@ agentbox:
   persistence:
     enabled: false
     claimName: "siclaw-data"
+    # REQUIRED when enabled: true. Must support ReadWriteMany.
+    # Examples: nfs, efs-sc, csi-cephfs, longhorn (with RWX).
+    # Leaving this empty while enabled keeps the PVC in Pending state.
+    storageClassName: ""
+    size: "10Gi"
 
 # -- Metrics & Observability
 metrics:

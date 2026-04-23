@@ -1,0 +1,23 @@
+{{- if .Values.agentbox.persistence.enabled }}
+# Shared data PVC — user memory, investigations, sessions.
+# Mounted by Runtime and every AgentBox pod; Runtime writes per-user
+# subdirectories (users/{userId}/{agentId}/) and AgentBox pods mount via subPath.
+# ReadWriteMany is architectural and not parametrised.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.agentbox.persistence.claimName }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # Keep the PVC (and user data) when the Helm release is uninstalled.
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "data") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: {{ .Values.agentbox.persistence.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.agentbox.persistence.size }}
+{{- end }}
