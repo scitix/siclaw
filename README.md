@@ -143,6 +143,51 @@ On first launch, open the web UI and **register the first user** — registratio
 - Database: `.siclaw/data/portal.db` — override with `DATABASE_URL=sqlite:///custom/path.db` or `DATABASE_URL=mysql://...`
 - Secrets: `.siclaw/local-secrets.json` — auto-generated JWT / Runtime / Portal secrets, 0600 perms
 
+#### Pairing the web UI and the CLI
+
+`siclaw local` runs the Portal **and** makes itself available as a data
+source for the plain `siclaw` TUI. In one terminal start the server; in
+a second terminal (same working directory) start the TUI and it
+auto-pairs against the running Portal.
+
+```bash
+# Terminal A — server + web UI
+siclaw local
+
+# Terminal B — TUI, same cwd
+siclaw
+```
+
+- **Pairing anchor: cwd.** Both processes read the same
+  `.siclaw/local-secrets.json` and the same `.siclaw/data/portal.db`.
+  Running the TUI from a different directory opens a different,
+  independent workspace — not a lost one.
+- **Portal is the source of truth.** Providers, agents, skills,
+  knowledge, clusters, and hosts are edited in the web UI; the TUI
+  pulls them as an ephemeral read-only snapshot at startup.
+  In-session slash commands like `/setup` become read-only listings
+  that link back to the matching Portal page.
+- **Edits aren't hot-reloaded.** Change a skill or add a cluster in the
+  web UI, then `Ctrl+C` and re-run the TUI to pick up the new snapshot.
+  The snapshot is materialized to `.siclaw/.portal-snapshot/` and wiped
+  on exit (SIGINT / SIGTERM / normal exit).
+- **Custom ports: set both env vars.** The server reads `PORTAL_PORT`;
+  the TUI's snapshot probe reads `SICLAW_PORTAL_PORT`. Leave both
+  unset to use the default 3000:
+
+  ```bash
+  PORTAL_PORT=8080        siclaw local
+  SICLAW_PORTAL_PORT=8080 siclaw
+  ```
+
+- **Back up the workspace** by copying the entire `.siclaw/` directory
+  — DB, secrets, and any materialized snapshots all live under it.
+  Nothing outside `.siclaw/` is state.
+
+Without a running `siclaw local` in the same directory, `siclaw` falls
+back to standalone file-system mode (`.siclaw/config/settings.json` +
+first-run wizard) — identical to earlier behaviour.
+
 ### 3. Kubernetes — Team / enterprise
 
 Production deployment uses Helm plus three container images: `runtime`, `portal`, and `agentbox`.

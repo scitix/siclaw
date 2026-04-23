@@ -8,6 +8,7 @@
   },
   "files": [
     "dist/",
+    "portal-web/dist/",
     "siclaw.mjs",
     "skills/",
     "settings.example.json"
@@ -88,6 +89,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build && cd portal-web && npm ci && npm run build",
     "dev": "tsx src/cli-main.ts",
     "dev:runtime": "tsx src/gateway-main.ts",
     "dev:agentbox": "tsx src/agentbox-main.ts",
