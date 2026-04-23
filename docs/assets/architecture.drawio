@@ -59,7 +59,7 @@
     <mxCell id="L3_brain" value="Agent Brain" style="swimlane;startSize=20;fillColor=#CCFBF1;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;fontStyle=1;rounded=1;arcSize=5;" vertex="1" parent="L3">
       <mxGeometry x="10" y="33" width="255" height="115" as="geometry"/>
     </mxCell>
-    <mxCell id="L3_brain1" value="pi-agent · claude-sdk" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_brain">
+    <mxCell id="L3_brain1" value="pi-agent (OpenAI-compatible)" style="rounded=1;whiteSpace=wrap;fillColor=#99F6E4;strokeColor=#0D9488;fontColor=#0F766E;fontSize=11;" vertex="1" parent="L3_brain">
       <mxGeometry x="10" y="25" width="235" height="75" as="geometry"/>
     </mxCell>
 
@@ -148,10 +148,10 @@
     <mxCell id="L4" value="Knowledge System" style="swimlane;startSize=25;fillColor=#FFFBEB;strokeColor=#D97706;fontColor=#92400E;fontSize=13;fontStyle=1;rounded=1;arcSize=3;" vertex="1" parent="1">
       <mxGeometry x="20" y="605" width="1160" height="135" as="geometry"/>
     </mxCell>
-    <mxCell id="L4_im" value="Investigation Memory&#xa;SQLite + FTS5 + bge-m3&#xa;&#x2713; IM Phase 0-1 complete" style="rounded=1;whiteSpace=wrap;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=11;" vertex="1" parent="L4">
+    <mxCell id="L4_im" value="Investigation Memory&#xa;SQLite + FTS5 + bge-m3&#xa;session memory + persistent index" style="rounded=1;whiteSpace=wrap;fillColor=#FEF3C7;strokeColor=#D97706;fontColor=#78350F;fontSize=11;" vertex="1" parent="L4">
       <mxGeometry x="10" y="33" width="560" height="87" as="geometry"/>
     </mxCell>
-    <mxCell id="L4_kb" value="Team Knowledge Base&#xa;Qdrant vector DB&#xa;&#x26A1; KR0 - in progress" style="rounded=1;whiteSpace=wrap;fillColor=#FEF9C3;strokeColor=#CA8A04;fontColor=#713F12;fontSize=11;dashed=1;dashPattern=8 4;" vertex="1" parent="L4">
+    <mxCell id="L4_kb" value="Team Knowledge Base&#xa;DB-backed wiki&#xa;shared playbooks + runbooks" style="rounded=1;whiteSpace=wrap;fillColor=#FEF9C3;strokeColor=#CA8A04;fontColor=#713F12;fontSize=11;" vertex="1" parent="L4">
       <mxGeometry x="590" y="33" width="560" height="87" as="geometry"/>
     </mxCell>
 

@@ -70,7 +70,7 @@ Ensure the Gateway deployment has:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
 spec:
   template:
     spec:
@@ -82,7 +82,7 @@ spec:
       volumes:
       - name: certs
         persistentVolumeClaim:
-          claimName: siclaw-gateway-certs
+          claimName: siclaw-runtime-certs
 ```
 
 **Why persistent storage?**
@@ -122,7 +122,7 @@ AgentBox automatically loads certificates from `/etc/siclaw/certs` (configurable
 **Environment variables:**
 
 ```bash
-SICLAW_GATEWAY_URL=https://siclaw-gateway.siclaw.svc.cluster.local
+SICLAW_GATEWAY_URL=https://siclaw-runtime.siclaw.svc.cluster.local
 SICLAW_CERT_PATH=/etc/siclaw/certs
 ```
 
@@ -311,13 +311,13 @@ Generate test certificate and make request:
 
 ```bash
 # 1. Extract CA from Gateway
-kubectl exec -it siclaw-gateway-xxx -- cat /.siclaw/certs/ca.crt > ca.crt
+kubectl exec -it siclaw-runtime-xxx -- cat /.siclaw/certs/ca.crt > ca.crt
 
 # 2. Generate test client certificate (using Gateway's issueAgentBoxCertificate)
 # (This requires running code in Gateway context - see test scripts)
 
 # 3. Make request with certificate
-curl https://siclaw-gateway.siclaw.svc.cluster.local/api/internal/settings \
+curl https://siclaw-runtime.siclaw.svc.cluster.local/api/internal/settings \
   --cert tls.crt \
   --key tls.key \
   --cacert ca.crt
@@ -378,7 +378,7 @@ Complete example with mTLS:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: siclaw-gateway-certs
+  name: siclaw-runtime-certs
 spec:
   accessModes: [ReadWriteOnce]
   resources:
@@ -389,30 +389,30 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
 spec:
   replicas: 1
   template:
     spec:
       containers:
       - name: gateway
-        image: siclaw-gateway:latest
+        image: siclaw-runtime:latest
         volumeMounts:
         - name: certs
           mountPath: /.siclaw/certs
       volumes:
       - name: certs
         persistentVolumeClaim:
-          claimName: siclaw-gateway-certs
+          claimName: siclaw-runtime-certs
 
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: siclaw-gateway
+  name: siclaw-runtime
 spec:
   selector:
-    app: siclaw-gateway
+    app: siclaw-runtime
   ports:
   - port: 443
     targetPort: 3001

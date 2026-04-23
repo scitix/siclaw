@@ -537,14 +537,6 @@ Also allows format strings starting with `+`.
 
 ---
 
-### SiChek Diagnostics
-
-| Command | Validator | Restrictions |
-|---------|-----------|-------------|
-| `sichek` | None | Unrestricted |
-
----
-
 ## kubectl Subcommand Whitelist
 
 kubectl commands go through `restricted_bash` with pipeline validation

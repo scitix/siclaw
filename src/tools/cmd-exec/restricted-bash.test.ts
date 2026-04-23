@@ -934,7 +934,7 @@ describe("createRestrictedBashTool — curl is now allowed with restrictions", (
   it("blocks curl file:// protocol (local file reading)", async () => {
     const result = await tool.execute(
       "test-id",
-      { command: "curl file:///app/.siclaw/credentials/roce-test.kubeconfig" },
+      { command: "curl file:///app/.siclaw/credentials/example-cluster.kubeconfig" },
       undefined,
       {} as any
     );
