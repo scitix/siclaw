@@ -7,21 +7,45 @@
  *   - mcpServers from `mcp_servers`
  *   - default = first model flagged `is_default = 1` (or null if none set)
  *
- * Auth: the caller presents a JWT signed with the Portal's `jwtSecret`.
- * On a developer's laptop both processes read `.siclaw/local-secrets.json`,
- * so the TUI self-signs a short-lived admin JWT before calling here — the
- * trust boundary is "whoever can read the secrets file can call this".
+ * Auth (defence in depth; all three gates must pass):
+ *   1. `enableCliSnapshot` must be true at server startup, otherwise the route
+ *      isn't registered at all.
+ *   2. Request origin must be loopback (`127.0.0.1` / `::1` / `::ffff:127.0.0.1`).
+ *      Hardens against accidentally exposing the endpoint over a remote network
+ *      if someone flips the flag for debugging.
+ *   3. Request must present a matching `X-Siclaw-Cli-Snapshot-Secret` header.
+ *      The secret is a dedicated random value in `.siclaw/local-secrets.json`,
+ *      not the Portal's `jwtSecret` — so reading the snapshot does NOT also
+ *      grant the caller the ability to self-sign admin JWTs and hit every
+ *      other admin-gated Portal route.
  *
- * The response intentionally excludes per-provider API keys so a leak of the
- * snapshot wire payload alone would not compromise credentials. The TUI in
- * local mode reads keys directly from the `model_providers.api_key` column
- * via the same snapshot — if that proves too permissive later we can split
- * into a "config snapshot" (public) + "secrets fetch" (stricter auth).
+ * The response contains every provider's api_key, every cluster's kubeconfig,
+ * and every host's password / private_key. Any change that broadens how this
+ * endpoint can be reached (or who can present the secret) must preserve the
+ * "local single-user only" trust boundary.
  */
 
+import type http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
-import { sendJson, requireAuth } from "../gateway/rest-router.js";
+import { sendJson } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
+
+const CLI_SNAPSHOT_SECRET_HEADER = "x-siclaw-cli-snapshot-secret";
+const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+function isLoopbackRequest(req: http.IncomingMessage): boolean {
+  const addr = req.socket.remoteAddress;
+  return addr !== undefined && LOOPBACK_ADDRS.has(addr);
+}
+
+/** Constant-time equality for header-provided secrets. */
+function secretsMatch(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, "utf-8");
+  const bBuf = Buffer.from(b, "utf-8");
+  if (aBuf.length !== bBuf.length) return false;
+  return timingSafeEqual(aBuf, bBuf);
+}
 
 function parseQuery(url: string): Record<string, string> {
   const q = url.split("?")[1];
@@ -209,10 +233,25 @@ export interface CliSnapshot {
   generatedAt: string;
 }
 
-export function registerCliSnapshotRoute(router: RestRouter, jwtSecret: string): void {
+export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: string): void {
+  if (!cliSnapshotSecret) {
+    throw new Error("registerCliSnapshotRoute: cliSnapshotSecret is required");
+  }
   router.get("/api/v1/cli-snapshot", async (req, res) => {
-    const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    // Gate 1: loopback origin only. A rogue / misconfigured Ingress can't
+    // reach this endpoint even if `enableCliSnapshot` ever flips on in prod.
+    if (!isLoopbackRequest(req)) {
+      sendJson(res, 403, { error: "Forbidden: loopback origin required" });
+      return;
+    }
+    // Gate 2: shared-secret header. Dedicated secret (not jwtSecret) so the
+    // caller cannot use the same credential to self-sign admin JWTs against
+    // every other admin-gated route.
+    const provided = req.headers[CLI_SNAPSHOT_SECRET_HEADER];
+    if (typeof provided !== "string" || !secretsMatch(provided, cliSnapshotSecret)) {
+      sendJson(res, 401, { error: "Unauthorized" });
+      return;
+    }
 
     const db = getDb();
     const query = parseQuery(req.url ?? "");

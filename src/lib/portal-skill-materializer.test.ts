@@ -73,4 +73,52 @@ describe("materializePortalSkills", () => {
     expect(fs.existsSync(out)).toBe(false);
     cleanupPortalSkills(out);  // second call shouldn't throw
   });
+
+  describe("defensive: unsafe skill / script names are rejected without writing files", () => {
+    const unsafeSkillNames = [
+      "..",
+      "../evil",
+      "../../etc",
+      "/etc/passwd",          // absolute path
+      "foo/bar",              // nested path separator
+      "foo\\bar",             // Windows-style separator
+      "bad\0name",            // null byte
+      "",                     // empty
+    ];
+
+    for (const name of unsafeSkillNames) {
+      it(`rejects unsafe skill name: ${JSON.stringify(name)}`, () => {
+        const out = path.join(tmpRoot, "skills");
+        const result = materializePortalSkills([skill(name, "# x")], out);
+        expect(result.count).toBe(0);
+        expect(result.skipped).toHaveLength(1);
+        // Nothing should have escaped outDir.
+        const parent = path.dirname(out);
+        const siblingLeak = fs.readdirSync(parent).filter(e => e !== "skills");
+        expect(siblingLeak).toEqual([]);
+      });
+    }
+
+    it("rejects unsafe script filenames but keeps the valid skill", () => {
+      const out = path.join(tmpRoot, "skills");
+      const result = materializePortalSkills(
+        [{
+          name: "legit",
+          description: "",
+          labels: [],
+          specs: "# legit",
+          scripts: [
+            { name: "../escape.sh", content: "#!/bin/bash\necho hi" },
+            { name: "good.sh",      content: "#!/bin/bash\necho ok" },
+          ],
+        }],
+        out,
+      );
+      expect(result.count).toBe(1);
+      expect(fs.existsSync(path.join(out, "legit", "scripts", "good.sh"))).toBe(true);
+      // The escape attempt must NOT have landed anywhere.
+      expect(fs.existsSync(path.join(tmpRoot, "escape.sh"))).toBe(false);
+      expect(fs.existsSync(path.join(out, "legit", "escape.sh"))).toBe(false);
+    });
+  });
 });

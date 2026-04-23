@@ -6,20 +6,21 @@
  * `GET /api/v1/cli-snapshot` to get the Portal's current config snapshot
  * (providers / default model / MCP servers).
  *
- * Auth: the TUI reads `.siclaw/local-secrets.json` to get the Portal's
- * `jwtSecret`, then self-signs a short-lived admin JWT. The trust boundary
- * is "whoever can read the secrets file can call the snapshot endpoint" —
- * this is correct for local single-user mode and degrades safely when the
- * secrets file is absent (no Portal running locally).
+ * Auth: the TUI reads `.siclaw/local-secrets.json` to obtain a dedicated
+ * `cliSnapshotSecret` and sends it in the `X-Siclaw-Cli-Snapshot-Secret`
+ * header. The secret is separate from `jwtSecret` on purpose — reading the
+ * snapshot does not give the caller the ability to self-sign admin JWTs
+ * against every other Portal route. The Portal also rejects non-loopback
+ * request origins, giving a defence-in-depth backstop if `enableCliSnapshot`
+ * ever flips on in a non-local deployment.
  *
  * Silent degradation: any failure — file missing, Portal unreachable, HTTP
- * error, JWT malformed — returns `null`, and the TUI continues with its
+ * error, wrong secret — returns `null`, and the TUI continues with its
  * settings.json-based loadConfig() path unchanged.
  */
 
 import fs from "node:fs";
 import path from "node:path";
-import jwt from "jsonwebtoken";
 import type {
   CliSnapshotSkill,
   CliSnapshotKnowledgeRepo,
@@ -27,6 +28,8 @@ import type {
   CliSnapshotAgentMeta,
   CliSnapshotActiveAgent,
 } from "../portal/cli-snapshot-api.js";
+
+const CLI_SNAPSHOT_SECRET_HEADER = "X-Siclaw-Cli-Snapshot-Secret";
 
 export interface PortalSnapshot {
   providers: Record<string, {
@@ -61,6 +64,8 @@ interface LocalSecrets {
   jwtSecret: string;
   runtimeSecret: string;
   portalSecret: string;
+  /** Absent in older `.siclaw/local-secrets.json` files — caller handles. */
+  cliSnapshotSecret?: string;
 }
 
 const DEFAULT_PORTAL_PORT = 3000;
@@ -120,6 +125,13 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
   const secretsPath = path.resolve(cwd, ".siclaw/local-secrets.json");
   const secrets = readSecrets(secretsPath);
   if (!secrets) return { snapshot: null, error: { kind: "no-secrets" } };
+  if (!secrets.cliSnapshotSecret) {
+    // Older `.siclaw/local-secrets.json` files written before the
+    // cli-snapshot-secret split — treat as no-secrets so the TUI falls
+    // back to settings.json. Re-running `siclaw local` back-fills the
+    // new field.
+    return { snapshot: null, error: { kind: "no-secrets" } };
+  }
 
   const baseUrl = `http://127.0.0.1:${port}`;
 
@@ -127,20 +139,15 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
   const healthy = await probeHealth(`${baseUrl}/api/health`);
   if (!healthy) return { snapshot: null, error: { kind: "portal-unreachable" } };
 
-  // Step 2: sign a short-lived JWT using the Portal's jwtSecret.
-  const token = jwt.sign(
-    { sub: "cli-local", username: "cli-local", role: "admin" },
-    secrets.jwtSecret,
-    { expiresIn: "5m" },
-  );
-
-  // Step 3: fetch snapshot (optionally scoped to an agent).
+  // Step 2: fetch snapshot (optionally scoped to an agent), authenticating
+  // with the dedicated cli-snapshot secret. No JWT forging here — see the
+  // module header for why the two secrets are kept separate.
   const url = opts?.agent
     ? `${baseUrl}/api/v1/cli-snapshot?agent=${encodeURIComponent(opts.agent)}`
     : `${baseUrl}/api/v1/cli-snapshot`;
   try {
     const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
+      headers: { [CLI_SNAPSHOT_SECRET_HEADER]: secrets.cliSnapshotSecret },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
     if (res.status === 404 && opts?.agent) {

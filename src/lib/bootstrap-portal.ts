@@ -16,6 +16,13 @@ import { waitForListen } from "./server-helpers.js";
 
 export interface BootstrapPortalConfig extends PortalConfig {
   databaseUrl: string;
+  /**
+   * When `true`, seed a bootstrap admin user on first-boot empty DB.
+   * ONLY cli-local (single-user local mode) should opt in. Production K8s
+   * Portal must leave this unset — there the first admin must be created
+   * explicitly (via migrations, ops script, or `SICLAW_ADMIN_PASSWORD`).
+   */
+  enableDefaultAdminSeed?: boolean;
 }
 
 export interface PortalHandle {
@@ -31,7 +38,9 @@ export async function bootstrapPortal(config: BootstrapPortalConfig): Promise<Po
 
   const db = initDb(config.databaseUrl);
   await runPortalMigrations();
-  await autoSeedAdminIfEmpty();
+  if (config.enableDefaultAdminSeed) {
+    await autoSeedAdminIfEmpty();
+  }
   await autoInitBuiltinSkillsIfEmpty();
   await syncBuiltinKnowledge();
   console.log("[portal] Database ready");
@@ -50,14 +59,13 @@ export async function bootstrapPortal(config: BootstrapPortalConfig): Promise<Po
 }
 
 /**
- * On first startup (no users in DB), seed a bootstrap admin so the Portal
- * Web UI is usable out of the box. Password comes from
- * `SICLAW_ADMIN_PASSWORD` if set, otherwise defaults to `admin` with a
- * loud reminder to change it.
+ * First-boot admin seed for the single-user local mode (`siclaw local`).
+ * Only runs when the caller opts in via `enableDefaultAdminSeed: true`.
  *
- * This matches the behaviour promised by README ("On first startup, Siclaw
- * creates a local admin account: admin / admin"). Until this helper ran,
- * fresh installs hit a dead-end — login rejected and no register UI.
+ * Password comes from `SICLAW_ADMIN_PASSWORD` if set, otherwise falls
+ * back to `admin` with a loud warning. Production K8s Portal must NOT
+ * enable this — there, the first admin must be created explicitly so
+ * an Ingress-exposed deployment never boots with default credentials.
  */
 async function autoSeedAdminIfEmpty(): Promise<void> {
   const db = getDb();

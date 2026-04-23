@@ -8,20 +8,34 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
-import jwt from "jsonwebtoken";
 import { initDb, closeDb, getDb } from "../gateway/db.js";
 import { runPortalMigrations } from "./migrate.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { registerCliSnapshotRoute } from "./cli-snapshot-api.js";
 
-const JWT_SECRET = "test-secret-for-cli-snapshot";
+const CLI_SNAPSHOT_SECRET = "test-cli-snapshot-secret-DO-NOT-USE-IN-PROD";
 
-function fakeReq(opts: { url: string; method?: string; headers?: Record<string, string> }): any {
+function fakeReq(opts: {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  /** Defaults to 127.0.0.1 so the route's loopback check passes. */
+  remoteAddress?: string;
+}): any {
   const em = new EventEmitter() as any;
   em.url = opts.url;
   em.method = opts.method ?? "GET";
   em.headers = opts.headers ?? {};
+  em.socket = { remoteAddress: opts.remoteAddress ?? "127.0.0.1" };
   return em;
+}
+
+/** Headers that satisfy both auth gates (loopback origin set via fakeReq). */
+function authedHeaders(extra?: Record<string, string>): Record<string, string> {
+  return {
+    "x-siclaw-cli-snapshot-secret": CLI_SNAPSHOT_SECRET,
+    ...(extra ?? {}),
+  };
 }
 
 function runRoute(router: ReturnType<typeof createRestRouter>, req: any) {
@@ -41,10 +55,6 @@ function runRoute(router: ReturnType<typeof createRestRouter>, req: any) {
   });
 }
 
-function signAdmin(): string {
-  return jwt.sign({ sub: "test-admin", role: "admin" }, JWT_SECRET, { expiresIn: "5m" });
-}
-
 describe("GET /api/v1/cli-snapshot", () => {
   let router: ReturnType<typeof createRestRouter>;
 
@@ -52,30 +62,73 @@ describe("GET /api/v1/cli-snapshot", () => {
     initDb("sqlite::memory:");
     await runPortalMigrations();
     router = createRestRouter();
-    registerCliSnapshotRoute(router, JWT_SECRET);
+    registerCliSnapshotRoute(router, CLI_SNAPSHOT_SECRET);
   });
 
   afterEach(async () => {
     await closeDb();
   });
 
-  it("returns 401 without Authorization header", async () => {
+  it("returns 401 without the cli-snapshot secret header", async () => {
     const { status } = await runRoute(router, fakeReq({ url: "/api/v1/cli-snapshot" }));
     expect(status).toBe(401);
   });
 
-  it("returns 401 with an invalid JWT", async () => {
+  it("returns 401 with a wrong secret", async () => {
     const { status } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: "Bearer not-a-valid-token" } }),
+      fakeReq({
+        url: "/api/v1/cli-snapshot",
+        headers: { "x-siclaw-cli-snapshot-secret": "wrong-secret" },
+      }),
     );
     expect(status).toBe(401);
+  });
+
+  it("rejects a request that doesn't have the header even if a bearer JWT is present", async () => {
+    // Hardening: the old scheme used jwtSecret-signed Bearer tokens; confirm
+    // presenting one alone no longer unlocks the snapshot.
+    const { status } = await runRoute(
+      router,
+      fakeReq({
+        url: "/api/v1/cli-snapshot",
+        headers: { authorization: "Bearer anything-here" },
+      }),
+    );
+    expect(status).toBe(401);
+  });
+
+  it("rejects non-loopback request origins with 403 even when the secret is correct", async () => {
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({
+        url: "/api/v1/cli-snapshot",
+        headers: authedHeaders(),
+        remoteAddress: "10.0.0.42",
+      }),
+    );
+    expect(status).toBe(403);
+    expect(body.error).toMatch(/loopback/i);
+  });
+
+  it("accepts ::1 and IPv4-mapped loopback (::ffff:127.0.0.1)", async () => {
+    for (const remote of ["::1", "::ffff:127.0.0.1"]) {
+      const { status } = await runRoute(
+        router,
+        fakeReq({
+          url: "/api/v1/cli-snapshot",
+          headers: authedHeaders(),
+          remoteAddress: remote,
+        }),
+      );
+      expect(status, `remoteAddress=${remote}`).toBe(200);
+    }
   });
 
   it("returns empty shape when DB is empty (providers/mcp/skills/knowledge all []/{})", async () => {
     const { status, body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(status).toBe(200);
     expect(body.providers).toEqual({});
@@ -102,7 +155,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { status, body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(status).toBe(200);
     expect(body.providers.openai).toBeDefined();
@@ -128,7 +181,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o-mini" });
   });
@@ -146,7 +199,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(Object.keys(body.mcpServers)).toEqual(["enabled-one"]);
   });
@@ -162,7 +215,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.skills).toHaveLength(1);
     expect(body.skills[0].name).toBe("my-custom-skill");
@@ -189,7 +242,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.knowledge).toHaveLength(1);
     expect(body.knowledge[0].name).toBe("siclaw-wiki");
@@ -210,7 +263,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.credentials.clusters).toHaveLength(1);
     expect(body.credentials.clusters[0].name).toBe("prod-east");
@@ -233,7 +286,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.credentials.hosts).toHaveLength(2);
     const pwd = body.credentials.hosts.find((h: any) => h.name === "pwd-host");
@@ -260,7 +313,7 @@ describe("GET /api/v1/cli-snapshot", () => {
     );
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.availableAgents).toHaveLength(2);
     expect(body.availableAgents.map((a: any) => a.name)).toEqual(["cost-advisor", "gpu-sre"]);
@@ -277,7 +330,7 @@ describe("GET /api/v1/cli-snapshot", () => {
       router,
       fakeReq({
         url: "/api/v1/cli-snapshot?agent=does-not-exist",
-        headers: { authorization: `Bearer ${signAdmin()}` },
+        headers: authedHeaders(),
       }),
     );
     expect(status).toBe(404);
@@ -330,7 +383,7 @@ describe("GET /api/v1/cli-snapshot", () => {
       router,
       fakeReq({
         url: "/api/v1/cli-snapshot?agent=scoped-agent",
-        headers: { authorization: `Bearer ${signAdmin()}` },
+        headers: authedHeaders(),
       }),
     );
     expect(status).toBe(200);
@@ -357,7 +410,7 @@ describe("GET /api/v1/cli-snapshot", () => {
 
     const { body } = await runRoute(
       router,
-      fakeReq({ url: "/api/v1/cli-snapshot", headers: { authorization: `Bearer ${signAdmin()}` } }),
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
     );
     expect(body.skills).toHaveLength(1);
     expect(body.skills[0].specs).toBe(overlay);

@@ -66,7 +66,7 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 
 ```
 GET /api/v1/cli-snapshot[?agent=<name>]
-Authorization: Bearer <JWT signed with local-secrets.jwtSecret, 5m TTL>
+X-Siclaw-Cli-Snapshot-Secret: <local-secrets.cliSnapshotSecret>
 
 Response shape (always present):
   providers       { [name]: ProviderConfig }   // LLM provider configs
@@ -82,6 +82,14 @@ Response shape (always present):
 
 - `?agent=<name>` filters skills / credentials / knowledge / MCP through the `agent_*` join tables. Missing name → `404` with `{ availableAgents: string[] }` so the client can show a friendly "did you mean..." list.
 - The endpoint is read-only by design. Any future write operations must go through Portal's existing `/api/v1/*` resource endpoints, never through this URL.
+
+**Defence-in-depth gating** — three independent checks must all pass:
+
+1. `enableCliSnapshot` must be `true` at `startPortal()` time. `cli-local.ts` passes it; `portal-main.ts` (prod K8s) does not. When `false` the route is simply not registered, so no gate beyond this matters.
+2. Request origin must be loopback — `127.0.0.1` / `::1` / `::ffff:127.0.0.1`. A rogue Ingress or a misconfigured helm override that ever flips `enableCliSnapshot` on cannot leak through a remote socket.
+3. Request must carry `X-Siclaw-Cli-Snapshot-Secret` whose value matches `local-secrets.cliSnapshotSecret`. This is a **dedicated** secret — not `jwtSecret`. Reading the snapshot does NOT also grant the caller the ability to self-sign admin JWTs against every other admin-gated route. The TUI in `portal-snapshot-client.ts` reads `.siclaw/local-secrets.json` once, sends only the header, and never forges a JWT.
+
+The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the Portal cwd", which matches single-user local mode. A missing `cliSnapshotSecret` in an older secrets file (pre-split) degrades gracefully — the client treats it as no-Portal and falls back to `settings.json`.
 
 **Ephemeral materialization** (`src/lib/portal-{skill,knowledge,credential}-materializer.ts`):
 

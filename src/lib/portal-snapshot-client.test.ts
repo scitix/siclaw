@@ -2,8 +2,8 @@
  * Unit tests for the TUI-side Portal snapshot client.
  *
  * Uses a temporary cwd + a short-lived http.Server as the fake Portal so we
- * exercise the real JWT sign -> fetch -> parse path rather than mocking
- * `fetch`. Keeps the test honest about the wire-shape expectations.
+ * exercise the real secrets-read -> header-auth -> fetch -> parse path
+ * rather than mocking `fetch`. Keeps the test honest about wire shape.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -11,38 +11,52 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import jwt from "jsonwebtoken";
 import { tryLoadPortalSnapshot } from "./portal-snapshot-client.js";
 
 const JWT_SECRET = "test-snapshot-secret-0123456789";
 const RUNTIME_SECRET = "test-runtime";
 const PORTAL_SECRET = "test-portal";
+const CLI_SNAPSHOT_SECRET = "test-cli-snapshot-secret-0123456789";
+const CLI_SNAPSHOT_SECRET_HEADER = "x-siclaw-cli-snapshot-secret";
 
-function writeSecrets(cwd: string, overrides: Partial<{ jwtSecret: string; runtimeSecret: string; portalSecret: string }> = {}): void {
+function writeSecrets(
+  cwd: string,
+  overrides: Partial<{ jwtSecret: string; runtimeSecret: string; portalSecret: string; cliSnapshotSecret: string | null }> = {},
+): void {
   const dir = path.join(cwd, ".siclaw");
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "local-secrets.json"), JSON.stringify({
+  const payload: Record<string, string> = {
     jwtSecret: overrides.jwtSecret ?? JWT_SECRET,
     runtimeSecret: overrides.runtimeSecret ?? RUNTIME_SECRET,
     portalSecret: overrides.portalSecret ?? PORTAL_SECRET,
-  }));
+  };
+  // Explicit null opts out of writing cliSnapshotSecret (simulates old files).
+  if (overrides.cliSnapshotSecret !== null) {
+    payload.cliSnapshotSecret = overrides.cliSnapshotSecret ?? CLI_SNAPSHOT_SECRET;
+  }
+  fs.writeFileSync(path.join(dir, "local-secrets.json"), JSON.stringify(payload));
 }
 
 interface FakePortal {
   port: number;
   server: http.Server;
   stop: () => Promise<void>;
-  requests: Array<{ url: string; authorization: string | undefined }>;
+  requests: Array<{ url: string; authHeader: string | undefined; snapshotSecret: string | undefined }>;
 }
 
 async function startFakePortal(opts: {
   health?: "ok" | "fail-404" | "fail-connect";
   snapshotResponse?: { status: number; body: unknown };
-  validateJwt?: boolean;
+  /** When true, the fake Portal enforces the cli-snapshot secret header. */
+  validateSnapshotSecret?: boolean;
 }): Promise<FakePortal> {
   const requests: FakePortal["requests"] = [];
   const server = http.createServer((req, res) => {
-    requests.push({ url: req.url ?? "", authorization: req.headers.authorization as string | undefined });
+    requests.push({
+      url: req.url ?? "",
+      authHeader: req.headers.authorization as string | undefined,
+      snapshotSecret: req.headers[CLI_SNAPSHOT_SECRET_HEADER] as string | undefined,
+    });
 
     if (req.url === "/api/health") {
       if (opts.health === "fail-404") { res.writeHead(404); res.end(); return; }
@@ -50,12 +64,10 @@ async function startFakePortal(opts: {
       res.end(JSON.stringify({ status: "ok" }));
       return;
     }
-    if (req.url === "/api/v1/cli-snapshot") {
-      if (opts.validateJwt) {
-        const auth = req.headers.authorization as string | undefined;
-        if (!auth?.startsWith("Bearer ")) { res.writeHead(401); res.end(); return; }
-        try { jwt.verify(auth.slice(7), JWT_SECRET); }
-        catch { res.writeHead(401); res.end(); return; }
+    if (req.url?.startsWith("/api/v1/cli-snapshot")) {
+      if (opts.validateSnapshotSecret) {
+        const presented = req.headers[CLI_SNAPSHOT_SECRET_HEADER];
+        if (presented !== CLI_SNAPSHOT_SECRET) { res.writeHead(401); res.end(); return; }
       }
       const r = opts.snapshotResponse ?? { status: 200, body: {
         providers: {}, default: null, mcpServers: {}, skills: [], knowledge: [],
@@ -118,19 +130,32 @@ describe("tryLoadPortalSnapshot", () => {
     } finally { await portal.stop(); }
   });
 
-  it("signs a short-lived admin JWT with jwtSecret from the file", async () => {
+  it("sends the cliSnapshotSecret in the X-Siclaw-Cli-Snapshot-Secret header and no Authorization", async () => {
     writeSecrets(cwd);
-    const portal = await startFakePortal({ validateJwt: true });
+    const portal = await startFakePortal({ validateSnapshotSecret: true });
     try {
       const result = await tryLoadPortalSnapshot({ cwd, port: portal.port });
       expect(result).not.toBeNull();
-      // Snapshot request's Authorization must have been a valid JWT.
-      const snapshotReq = portal.requests.find(r => r.url === "/api/v1/cli-snapshot");
+      const snapshotReq = portal.requests.find(r => r.url.startsWith("/api/v1/cli-snapshot"));
       expect(snapshotReq).toBeDefined();
-      expect(snapshotReq?.authorization?.startsWith("Bearer ")).toBe(true);
-      const payload = jwt.verify(snapshotReq!.authorization!.slice(7), JWT_SECRET) as { role?: string; sub?: string };
-      expect(payload.role).toBe("admin");
-      expect(payload.sub).toBe("cli-local");
+      expect(snapshotReq!.snapshotSecret).toBe(CLI_SNAPSHOT_SECRET);
+      // No Authorization header — the client must not forge admin JWTs.
+      expect(snapshotReq!.authHeader).toBeUndefined();
+    } finally { await portal.stop(); }
+  });
+
+  it("returns null when the secrets file is from an older version with no cliSnapshotSecret", async () => {
+    // Old `.siclaw/local-secrets.json` (pre cli-snapshot-secret split) should
+    // degrade gracefully — TUI falls back to settings.json rather than sending
+    // a bogus empty header that Portal would 401 on.
+    writeSecrets(cwd, { cliSnapshotSecret: null });
+    const portal = await startFakePortal({ validateSnapshotSecret: true });
+    try {
+      const result = await tryLoadPortalSnapshot({ cwd, port: portal.port });
+      expect(result).toBeNull();
+      // Should NOT even have reached the snapshot endpoint.
+      const snapshotReq = portal.requests.find(r => r.url.startsWith("/api/v1/cli-snapshot"));
+      expect(snapshotReq).toBeUndefined();
     } finally { await portal.stop(); }
   });
 

@@ -109,7 +109,11 @@ function writeHost(outDir: string, host: CliSnapshotHostCredential): void {
   if (host.authType === "key" && host.privateKey) {
     // registerSshKey takes a disk path; stage the Portal-delivered key in a
     // short-lived tmp file so we can reuse the existing helper verbatim.
-    const tmpPath = path.join(os.tmpdir(), `siclaw-cred-key-${host.name}-${Date.now()}-${process.pid}`);
+    // Sanitize host.name before interpolating into the path to avoid any
+    // directory-traversal shenanigans if a host row ever slipped through
+    // Portal's own validation.
+    const safeStem = host.name.replace(/[^A-Za-z0-9._-]/g, "_");
+    const tmpPath = path.join(os.tmpdir(), `siclaw-cred-key-${safeStem}-${Date.now()}-${process.pid}`);
     fs.writeFileSync(tmpPath, host.privateKey, { mode: 0o600 });
     try {
       const result = registerSshKey(outDir, {

@@ -96,43 +96,52 @@ if (portalSnapshot) {
   // filesystem-based skill loader reads them unchanged. Only when the
   // snapshot actually carries skills — empty array shouldn't clobber the
   // regular filesystem fallback.
+  // Collect cleanup thunks so a single shutdown handler sweeps all three
+  // dirs. Registered on SIGINT + SIGTERM + exit — the `exit` listener is
+  // what covers the happy-path `process.exit(0)` case, so `.portal-snapshot/
+  // credentials/` (plaintext SSH keys + kubeconfigs) cannot outlive the
+  // session and end up in a stray `git add -A`.
+  const snapshotCleanups: Array<() => void> = [];
   if (Array.isArray(portalSnapshot.skills) && portalSnapshot.skills.length > 0) {
     const skillCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/skills");
     const result = materializePortalSkills(portalSnapshot.skills, skillCacheDir);
     portalSkillsDir = result.rootDir;
+    snapshotCleanups.push(() => cleanupPortalSkills(skillCacheDir));
     console.log(`[siclaw] Materialized ${result.count} Portal skills into ${result.rootDir}${result.skipped.length ? ` (skipped ${result.skipped.length} with unsafe names: ${result.skipped.join(", ")})` : ""}`);
-    const cleanup = () => cleanupPortalSkills(skillCacheDir);
-    process.on("SIGINT", cleanup);
-    process.on("SIGTERM", cleanup);
   }
-  // Materialize Portal knowledge repos (gzip'd tars) → flat knowledge dir.
   if (Array.isArray(portalSnapshot.knowledge) && portalSnapshot.knowledge.length > 0) {
     const knowledgeCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/knowledge");
     const kres = materializePortalKnowledge(portalSnapshot.knowledge, knowledgeCacheDir);
     portalKnowledgeDir = kres.rootDir;
+    snapshotCleanups.push(() => cleanupPortalKnowledge(knowledgeCacheDir));
     const failureNote = kres.failures.length > 0
       ? ` (failures: ${kres.failures.map(f => `${f.repo}: ${f.error}`).join("; ")})`
       : "";
     console.log(`[siclaw] Materialized ${kres.reposUnpacked} Portal knowledge repo(s), ${kres.fileCount} page(s) into ${kres.rootDir}${failureNote}`);
-    const kcleanup = () => cleanupPortalKnowledge(knowledgeCacheDir);
-    process.on("SIGINT", kcleanup);
-    process.on("SIGTERM", kcleanup);
   }
-  // Materialize Portal credentials (clusters + hosts) → credentialsDir
-  // override. Reuses the same layout `credential-manager.ts` produces so
-  // kubectl / ssh / /setup list see zero format drift.
   const credsCount = (portalSnapshot.credentials?.clusters?.length ?? 0) + (portalSnapshot.credentials?.hosts?.length ?? 0);
   if (credsCount > 0) {
     const credsCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/credentials");
     const cres = await materializePortalCredentials(portalSnapshot.credentials, credsCacheDir);
     portalCredentialsDir = cres.rootDir;
+    snapshotCleanups.push(() => cleanupPortalCredentials(credsCacheDir));
     const failureNote = cres.failures.length > 0
       ? ` (failures: ${cres.failures.map(f => `${f.kind}/${f.name}: ${f.error}`).join("; ")})`
       : "";
     console.log(`[siclaw] Materialized ${cres.clusters} cluster(s) + ${cres.hosts} host(s) into ${cres.rootDir}${failureNote}`);
-    const ccleanup = () => cleanupPortalCredentials(credsCacheDir);
-    process.on("SIGINT", ccleanup);
-    process.on("SIGTERM", ccleanup);
+  }
+  if (snapshotCleanups.length > 0) {
+    let alreadySwept = false;
+    const sweepSnapshots = (): void => {
+      if (alreadySwept) return;
+      alreadySwept = true;
+      for (const fn of snapshotCleanups) {
+        try { fn(); } catch { /* best-effort; one dir failing shouldn't block the others */ }
+      }
+    };
+    process.on("exit", sweepSnapshots);
+    process.on("SIGINT", sweepSnapshots);
+    process.on("SIGTERM", sweepSnapshots);
   }
   const agentNote = portalSnapshot.activeAgent
     ? ` agent=${portalSnapshot.activeAgent.name}`

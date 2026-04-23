@@ -52,11 +52,20 @@ export interface PortalConfig {
    * config (including provider api_key values) for a local TUI to consume.
    *
    * LOCAL MODE ONLY. Leave undefined / false in K8s/prod Portal deployments:
-   * the endpoint bypasses per-tenant scoping and would let any admin-role JWT
-   * holder read every tenant's LLM API keys. `siclaw local` opts in via its
-   * single-user trust model (same process, same machine, same user).
+   * the endpoint returns every provider's api_key, every cluster's kubeconfig,
+   * and every host's password / private key in a single blob. Two independent
+   * gates defend it: (1) this flag must be true, and (2) the route additionally
+   * requires loopback origin + `cliSnapshotSecret` (see below).
    */
   enableCliSnapshot?: boolean;
+  /**
+   * Shared secret verifying requests to `/api/v1/cli-snapshot`. Clients send
+   * it in the `X-Siclaw-Cli-Snapshot-Secret` header. The endpoint also
+   * rejects non-loopback request origins. Required whenever
+   * `enableCliSnapshot` is true; only written into `.siclaw/local-secrets.json`
+   * by `siclaw local`.
+   */
+  cliSnapshotSecret?: string;
 }
 
 export function startPortal(config: PortalConfig): http.Server {
@@ -69,7 +78,13 @@ export function startPortal(config: PortalConfig): http.Server {
   // Register Portal's own routes
   registerAuthRoutes(router, config.jwtSecret);
   if (config.enableCliSnapshot) {
-    registerCliSnapshotRoute(router, config.jwtSecret);
+    if (!config.cliSnapshotSecret) {
+      throw new Error(
+        "startPortal: enableCliSnapshot=true requires cliSnapshotSecret. " +
+        "Generate one via loadOrGenerateLocalSecrets() and pass it in.",
+      );
+    }
+    registerCliSnapshotRoute(router, config.cliSnapshotSecret);
   }
   registerAdapterRoutes(router, config.portalSecret);
   registerChannelRoutes(router, config.jwtSecret);

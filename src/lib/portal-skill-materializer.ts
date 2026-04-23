@@ -21,8 +21,30 @@ import fs from "node:fs";
 import path from "node:path";
 import type { CliSnapshotSkill } from "../portal/cli-snapshot-api.js";
 
-/** Names that would try to escape the destination dir. Defence-in-depth. */
-const UNSAFE_NAME = /(^\.\.$)|(\/)|(\\)|(\0)/;
+/**
+ * Reject names that would land outside `rootDir` when joined with it.
+ * Uses `path.resolve` + `path.relative` to catch `..` segments, absolute
+ * paths, null bytes, trailing separators, and platform-specific escapes
+ * in one shot — strictly more robust than a hand-rolled regex.
+ */
+function isSafeName(name: string, rootDir: string): boolean {
+  if (!name || typeof name !== "string") return false;
+  if (name.includes("\0")) return false;
+  // Skill / script names encode a single leaf, never a directory tree.
+  // Reject any separator up-front — the materialized layout is always flat
+  // (`<rootDir>/<name>[/scripts/<script-name>]`) so a name with `/` or `\`
+  // is malformed even if it happens to stay under `rootDir`.
+  if (name.includes("/") || name.includes("\\")) return false;
+  const resolved = path.resolve(rootDir, name);
+  const rel = path.relative(rootDir, resolved);
+  // A safe name produces a non-empty, non-absolute, non-parent-escaping
+  // relative path. Same-dir (".") is not a valid skill/script name.
+  if (!rel) return false;
+  if (rel === "..") return false;
+  if (rel.startsWith("..")) return false;
+  if (path.isAbsolute(rel)) return false;
+  return true;
+}
 
 export interface MaterializeResult {
   /** Absolute path to the root dir holding all materialized skills. */
@@ -51,7 +73,7 @@ export function materializePortalSkills(
   let count = 0;
 
   for (const skill of skills) {
-    if (!skill.name || UNSAFE_NAME.test(skill.name)) {
+    if (!isSafeName(skill.name, outDir)) {
       skipped.push(skill.name || "(empty)");
       continue;
     }
@@ -63,7 +85,7 @@ export function materializePortalSkills(
       const scriptsDir = path.join(skillDir, "scripts");
       fs.mkdirSync(scriptsDir, { recursive: true });
       for (const script of skill.scripts) {
-        if (!script.name || UNSAFE_NAME.test(script.name)) continue;
+        if (!isSafeName(script.name, scriptsDir)) continue;
         const scriptPath = path.join(scriptsDir, script.name);
         fs.writeFileSync(scriptPath, script.content, "utf-8");
         // Mark executable so bash/pod_exec can invoke directly. best-effort on Windows.

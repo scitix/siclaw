@@ -47,11 +47,31 @@ export function materializePortalKnowledge(
   const failures: Array<{ repo: string; error: string }> = [];
   let reposUnpacked = 0;
 
+  const outDirResolved = fs.realpathSync(outDir);
+
   for (const repo of repos) {
-    const tmpPath = path.join(os.tmpdir(), `siclaw-knowledge-${repo.name}-${Date.now()}-${process.pid}.tar.gz`);
+    const tmpPath = path.join(os.tmpdir(), `siclaw-knowledge-${Date.now()}-${process.pid}.tar.gz`);
     try {
       fs.writeFileSync(tmpPath, Buffer.from(repo.dataBase64, "base64"));
-      execFileSync("tar", ["xzf", tmpPath, "-C", outDir], { stdio: "pipe" });
+      // `--no-same-owner` strips archived uid/gid so a malicious tar can't
+      // install files owned by root (defensive even though we're not root).
+      // Absolute-path stripping: BSD tar (macOS) strips leading `/` by default;
+      // GNU tar needs `--no-absolute-names`. Passing both leading-slash forms
+      // would break BSD; we rely on BSD's safer default + a post-extraction
+      // path-traversal walk below (which catches both `/abs` and `../rel`).
+      execFileSync("tar", ["--no-same-owner", "-xzf", tmpPath, "-C", outDir], { stdio: "pipe" });
+      const escapes = findEscapingEntries(outDirResolved);
+      if (escapes.length > 0) {
+        // Tar escaped outDir (symlink or path traversal). Delete the
+        // whole directory — partial state is worse than no state — and
+        // report as a failure rather than silently accepting tainted output.
+        for (const escape of escapes) {
+          try { fs.rmSync(escape, { recursive: true, force: true }); } catch { /* best-effort */ }
+        }
+        fs.rmSync(outDir, { recursive: true, force: true });
+        fs.mkdirSync(outDir, { recursive: true });
+        throw new Error(`tar extraction escaped outDir (${escapes.length} offending entries)`);
+      }
       reposUnpacked++;
     } catch (err) {
       failures.push({ repo: repo.name, error: err instanceof Error ? err.message : String(err) });
@@ -64,6 +84,44 @@ export function materializePortalKnowledge(
 
   const fileCount = countMarkdownFiles(outDir);
   return { rootDir: outDir, reposUnpacked, fileCount, failures };
+}
+
+/**
+ * Walk `dir`, resolve each entry's real path, and return any that escape
+ * `dir` (via symlink or a traversal that survived tar). Entries inside the
+ * returned list should be removed by the caller — the tarball is malicious.
+ */
+function findEscapingEntries(dir: string): string[] {
+  const offenders: string[] = [];
+  if (!fs.existsSync(dir)) return offenders;
+  const expectedPrefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+  const walk = (current: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      let real: string;
+      try {
+        real = fs.realpathSync(full);
+      } catch {
+        offenders.push(full);
+        continue;
+      }
+      if (real !== dir && !real.startsWith(expectedPrefix)) {
+        offenders.push(full);
+        continue;
+      }
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        walk(full);
+      }
+    }
+  };
+  walk(dir);
+  return offenders;
 }
 
 export function cleanupPortalKnowledge(outDir: string): void {
