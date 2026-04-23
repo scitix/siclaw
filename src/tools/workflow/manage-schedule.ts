@@ -121,26 +121,43 @@ Common cron patterns:
         content: [{ type: "text" as const, text: JSON.stringify({ error: msg }) }],
         details: { error: true },
       });
-      const ok = (summary: string) => ({
-        content: [{ type: "text" as const, text: JSON.stringify({ summary }) }],
+      // Emit the full shape expected by portal-web's ScheduleCard /
+      // SchedulePanel so the UI can render a card (with View button + deep
+      // link) instead of the raw JSON summary.
+      const ok = (summary: string, extra: {
+        action?: string;
+        id?: string;
+        name?: string;
+        newName?: string;
+        schedule?: { name: string; description?: string; schedule: string; status: string };
+      } = {}) => ({
+        content: [{ type: "text" as const, text: JSON.stringify({ ...extra, summary }) }],
         details: {},
       });
 
       // Resolve an id either from params.id or by looking up by name via list.
-      const resolveId = async (): Promise<{ id: string; name: string } | null> => {
+      // Returns schedule + status when a hit row is found (both paths already
+      // run a full list call, so surfacing those fields is free) so the
+      // caller — notably pause/resume — can echo the current cron in the
+      // tool result instead of emitting an empty-string placeholder.
+      const resolveId = async (): Promise<
+        { id: string; name: string; schedule?: string; status?: string } | null
+      > => {
         if (params.id) {
           // We still need the name for the summary message — list once to find it.
           try {
             const list = await client.listAgentTasks();
             const hit = list.find((t) => t.id === params.id);
-            if (hit) return { id: hit.id, name: hit.name };
+            if (hit) return { id: hit.id, name: hit.name, schedule: hit.schedule, status: hit.status };
             return { id: params.id, name: params.id };
           } catch { return { id: params.id, name: params.id }; }
         }
         if (!params.name) return null;
         const list = await client.listAgentTasks();
         const match = list.find((t) => t.name === params.name);
-        return match ? { id: match.id, name: match.name } : null;
+        return match
+          ? { id: match.id, name: match.name, schedule: match.schedule, status: match.status }
+          : null;
       };
 
       const validateSchedule = (schedule: string) => {
@@ -176,14 +193,30 @@ Common cron patterns:
           if (!params.name?.trim()) return fail("Schedule name is required.");
           if (!params.schedule?.trim()) return fail("Cron schedule expression is required.");
           validateSchedule(params.schedule.trim());
-          await client.createAgentTask({
-            name: params.name.trim(),
-            schedule: params.schedule.trim(),
-            prompt: params.description?.trim() || params.name.trim(),
+          const status = params.status ?? "active";
+          const name = params.name.trim();
+          const schedule = params.schedule.trim();
+          const created = await client.createAgentTask({
+            name,
+            schedule,
+            prompt: params.description?.trim() || name,
             description: params.description?.trim(),
-            status: params.status ?? "active",
+            status,
           });
-          return ok(`Created scheduled task "${params.name.trim()}" (${params.schedule.trim()}).`);
+          return ok(
+            `Created scheduled task "${name}" (${schedule}).`,
+            {
+              action: "create",
+              id: created?.id,
+              name,
+              schedule: {
+                name,
+                description: params.description?.trim(),
+                schedule,
+                status,
+              },
+            },
+          );
         }
 
         if (params.action === "update") {
@@ -197,23 +230,52 @@ Common cron patterns:
             description: params.description?.trim(),
             status: params.status,
           });
-          return ok(`Updated scheduled task "${target.name}".`);
+          const finalName = params.name?.trim() || target.name;
+          return ok(`Updated scheduled task "${target.name}".`, {
+            action: "update",
+            id: target.id,
+            name: finalName,
+            schedule: params.schedule?.trim()
+              ? {
+                  name: finalName,
+                  description: params.description?.trim(),
+                  schedule: params.schedule.trim(),
+                  status: params.status ?? "active",
+                }
+              : undefined,
+          });
         }
 
         if (params.action === "delete") {
           const target = await resolveId();
           if (!target) return fail("Schedule ID or name is required for delete.");
           await client.deleteAgentTask(target.id);
-          return ok(`Deleted scheduled task "${target.name}".`);
+          return ok(`Deleted scheduled task "${target.name}".`, {
+            action: "delete",
+            id: target.id,
+            name: target.name,
+          });
         }
 
         if (params.action === "pause" || params.action === "resume") {
           const target = await resolveId();
           if (!target) return fail(`Schedule ID or name is required for ${params.action}.`);
-          await client.updateAgentTask(target.id, {
-            status: params.action === "pause" ? "paused" : "active",
-          });
-          return ok(`${params.action === "pause" ? "Paused" : "Resumed"} scheduled task "${target.name}".`);
+          const newStatus = params.action === "pause" ? "paused" : "active";
+          await client.updateAgentTask(target.id, { status: newStatus });
+          return ok(
+            `${params.action === "pause" ? "Paused" : "Resumed"} scheduled task "${target.name}".`,
+            {
+              action: params.action,
+              id: target.id,
+              name: target.name,
+              // Emit schedule object only when resolveId surfaced the current
+              // cron; otherwise follow the update-branch pattern and omit it
+              // so ScheduleCard doesn't render an empty cron field.
+              schedule: target.schedule
+                ? { name: target.name, schedule: target.schedule, status: newStatus }
+                : undefined,
+            },
+          );
         }
 
         if (params.action === "rename") {
@@ -221,7 +283,15 @@ Common cron patterns:
           if (!target) return fail("Schedule ID or current name is required for rename.");
           if (!params.newName?.trim()) return fail("New name is required for rename.");
           await client.updateAgentTask(target.id, { name: params.newName.trim() });
-          return ok(`Renamed scheduled task "${target.name}" → "${params.newName.trim()}".`);
+          return ok(
+            `Renamed scheduled task "${target.name}" → "${params.newName.trim()}".`,
+            {
+              action: "rename",
+              id: target.id,
+              name: target.name,
+              newName: params.newName.trim(),
+            },
+          );
         }
 
         return fail(`Unknown action: ${params.action}`);

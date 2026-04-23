@@ -62,6 +62,7 @@ export interface PilotAreaProps {
   sessionKey?: string | null
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
+  agentId?: string
 }
 
 export function PilotArea({
@@ -86,6 +87,7 @@ export function PilotArea({
   sessionKey,
   onOpenSkillPanel,
   onOpenSchedulePanel,
+  agentId,
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -279,6 +281,7 @@ export function PilotArea({
                     }}
                     onOpenSkillPanel={onOpenSkillPanel}
                     onOpenSchedulePanel={onOpenSchedulePanel}
+                    agentId={agentId}
                   />
                 ))}
 
@@ -465,6 +468,7 @@ function MessageItem({
   onChipClick,
   onOpenSkillPanel,
   onOpenSchedulePanel,
+  agentId,
 }: {
   message: PilotMessage
   investigationProgress?: InvestigationProgress | null
@@ -478,6 +482,7 @@ function MessageItem({
   onChipClick?: (key: string) => void
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
+  agentId?: string
 }) {
   const isUser = message.role === "user"
   const isTool = message.role === "tool"
@@ -493,8 +498,8 @@ function MessageItem({
         </div>
       )
     }
-    if (message.toolName === "schedule_preview" && !message.isStreaming) {
-      return <ScheduleCard message={message} onOpenPanel={onOpenSchedulePanel} />
+    if (message.toolName === "manage_schedule" && !message.isStreaming) {
+      return <ScheduleCard message={message} onOpenPanel={onOpenSchedulePanel} agentId={agentId} />
     }
     if (message.toolName === "deep_search") {
       if (message.isStreaming && (dpFocus || dpChecklistActive)) {
