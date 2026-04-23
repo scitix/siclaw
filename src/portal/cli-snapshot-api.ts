@@ -48,13 +48,10 @@ function secretsMatch(a: string, b: string): boolean {
 }
 
 function parseQuery(url: string): Record<string, string> {
-  const q = url.split("?")[1];
-  if (!q) return {};
+  // The Host part is synthetic — we only need URLSearchParams's parser here.
+  const params = new URL(url, "http://x").searchParams;
   const out: Record<string, string> = {};
-  for (const pair of q.split("&")) {
-    const [k, v = ""] = pair.split("=");
-    if (k) out[decodeURIComponent(k)] = decodeURIComponent(v);
-  }
+  for (const [k, v] of params) out[k] = v;
   return out;
 }
 
@@ -279,8 +276,12 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     }
     const activeAgentId = activeAgent?.id ?? null;
 
+    // Filter providers with a missing/empty api_key — a provider row that
+    // lacks credentials would surface as an "authHeader: true + apiKey: ''"
+    // entry, causing the first model call to fail with a cryptic 401 from
+    // the upstream provider instead of a clean "no model configured" hint.
     const [providers] = await db.query<ProviderRow[]>(
-      "SELECT id, name, base_url, api_key, api_type FROM model_providers ORDER BY sort_order, name",
+      "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE api_key IS NOT NULL AND api_key != '' ORDER BY sort_order, name",
     );
     const [models] = await db.query<ModelRow[]>(
       "SELECT provider_id, model_id, name, reasoning, context_window, max_tokens, is_default FROM model_entries ORDER BY provider_id, sort_order, model_id",

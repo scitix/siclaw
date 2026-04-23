@@ -69,9 +69,20 @@ describe("GET /api/v1/cli-snapshot", () => {
     await closeDb();
   });
 
-  it("returns 401 without the cli-snapshot secret header", async () => {
-    const { status } = await runRoute(router, fakeReq({ url: "/api/v1/cli-snapshot" }));
+  it("returns 401 without the cli-snapshot secret header AND leaks no snapshot data in the body", async () => {
+    // Populate something that would be sensitive if ever returned.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-leak", "default", "leaky", "https://x.example", "SECRET-API-KEY-SHOULD-NEVER-LEAK", "openai-completions", 0],
+    );
+    const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/cli-snapshot" }));
     expect(status).toBe(401);
+    // Body must be the error envelope only, with no snapshot fields.
+    expect(body).toEqual({ error: "Unauthorized" });
+    expect(JSON.stringify(body)).not.toContain("SECRET-API-KEY-SHOULD-NEVER-LEAK");
+    expect(body.providers).toBeUndefined();
+    expect(body.credentials).toBeUndefined();
   });
 
   it("returns 401 with a wrong secret", async () => {
@@ -166,6 +177,45 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.providers.openai.models[0].id).toBe("gpt-4o");
     expect(body.providers.openai.models[0].contextWindow).toBe(128000);
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
+  });
+
+  it("filters out providers with empty or NULL api_key", async () => {
+    // A provider row without a usable api_key would land in the TUI as
+    // `apiKey: ""`, causing the first upstream call to fail with a cryptic
+    // 401 rather than a clean "no model configured" hint. Portal filters
+    // these so the snapshot only carries usable providers.
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-ok", "default", "ok-provider", "https://ok.example", "sk-real", "openai-completions", 0],
+    );
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-null", "default", "null-key", "https://null.example", null, "openai-completions", 1],
+    );
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-empty", "default", "empty-key", "https://empty.example", "", "openai-completions", 2],
+    );
+    // Attach models to each to make the shadow more concrete — only `ok-provider`'s
+    // model should appear in the snapshot.
+    await db.query(
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["m-ok", "p-ok", "gpt-4o", "GPT-4o", 0, 128000, 8192, 0, 0],
+    );
+    await db.query(
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["m-null", "p-null", "ghost", "Ghost", 0, 32000, 4096, 1, 0],  // is_default=1 but provider filtered
+    );
+
+    const { body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(Object.keys(body.providers).sort()).toEqual(["ok-provider"]);
+    // `default` should have walked past the filtered provider's is_default entry
+    // and fallen back to the first kept provider's first model.
+    expect(body.default).toEqual({ provider: "ok-provider", modelId: "gpt-4o" });
   });
 
   it("falls back to first model when no is_default is set", async () => {

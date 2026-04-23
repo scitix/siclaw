@@ -43,7 +43,11 @@ let portalSnapshot: Awaited<ReturnType<typeof tryLoadPortalSnapshot>> = null;
 
     let chosenAgent: string | undefined = explicitAgent;
     if (!chosenAgent && agentCount >= 2) {
-      if (isPrintMode || !process.stdin.isTTY) {
+      // `isTTY` is `true` when attached, `undefined` when piped/redirected —
+      // compare against `true` explicitly so the non-interactive branch is
+      // taken in both the undefined and false cases without relying on the
+      // coincidental truthiness of `!undefined`.
+      if (isPrintMode || process.stdin.isTTY !== true) {
         console.error("[siclaw] Portal has multiple agents configured; pass --agent <name> in non-interactive mode.");
         console.error("Available agents:");
         for (const a of probe.snapshot.availableAgents) {

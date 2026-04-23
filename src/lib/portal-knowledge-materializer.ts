@@ -33,6 +33,13 @@ export interface KnowledgeMaterializeResult {
   fileCount: number;
   /** Repos whose tar extraction failed (file kept logged; main flow continues). */
   failures: Array<{ repo: string; error: string }>;
+  /**
+   * Filename collisions across repos — the key is a file path relative to
+   * `outDir`, value is `{ firstRepo, overwrittenBy }`. Caller surfaces these
+   * on startup so the operator sees when "later wins" silently shadowed a
+   * page. Empty in the common single-repo case.
+   */
+  collisions: Array<{ path: string; firstRepo: string; overwrittenBy: string }>;
 }
 
 export function materializePortalKnowledge(
@@ -45,6 +52,9 @@ export function materializePortalKnowledge(
   fs.mkdirSync(outDir, { recursive: true });
 
   const failures: Array<{ repo: string; error: string }> = [];
+  const collisions: Array<{ path: string; firstRepo: string; overwrittenBy: string }> = [];
+  /** Tracks which repo was the first to write each relative path. */
+  const firstWriter = new Map<string, string>();
   let reposUnpacked = 0;
 
   const outDirResolved = fs.realpathSync(outDir);
@@ -53,6 +63,10 @@ export function materializePortalKnowledge(
     const tmpPath = path.join(os.tmpdir(), `siclaw-knowledge-${Date.now()}-${process.pid}.tar.gz`);
     try {
       fs.writeFileSync(tmpPath, Buffer.from(repo.dataBase64, "base64"));
+      // Snapshot file stats BEFORE extraction so we can tell which entries
+      // this repo actually wrote (either newly created or stat-changed by
+      // the extraction) and attribute collisions correctly.
+      const beforeFiles = snapshotFileStats(outDirResolved);
       // `--no-same-owner` strips archived uid/gid so a malicious tar can't
       // install files owned by root (defensive even though we're not root).
       // Absolute-path stripping: BSD tar (macOS) strips leading `/` by default;
@@ -70,7 +84,30 @@ export function materializePortalKnowledge(
         }
         fs.rmSync(outDir, { recursive: true, force: true });
         fs.mkdirSync(outDir, { recursive: true });
+        // Wipe was destructive — clear the collision tracking so prior
+        // repos' first-writer claims don't leak into the next iteration
+        // with dangling paths.
+        firstWriter.clear();
         throw new Error(`tar extraction escaped outDir (${escapes.length} offending entries)`);
+      }
+      // Diff: a file was written by THIS repo iff its stat changed (or it
+      // didn't exist before). That lets us attribute every real write to
+      // the correct repo instead of flagging every pre-existing file as a
+      // false-positive collision.
+      const afterFiles = snapshotFileStats(outDirResolved);
+      for (const [rel, afterStat] of afterFiles) {
+        const beforeStat = beforeFiles.get(rel);
+        const writtenByThisRepo =
+          beforeStat === undefined ||
+          beforeStat.size !== afterStat.size ||
+          beforeStat.mtimeMs !== afterStat.mtimeMs;
+        if (!writtenByThisRepo) continue;
+        const prior = firstWriter.get(rel);
+        if (prior && prior !== repo.name) {
+          collisions.push({ path: rel, firstRepo: prior, overwrittenBy: repo.name });
+        } else if (!prior) {
+          firstWriter.set(rel, repo.name);
+        }
       }
       reposUnpacked++;
     } catch (err) {
@@ -82,8 +119,47 @@ export function materializePortalKnowledge(
     }
   }
 
+  if (collisions.length > 0) {
+    console.warn(`[portal-knowledge] ${collisions.length} filename collision(s) across repos — later repo wins:`);
+    for (const c of collisions) {
+      console.warn(`  ${c.path}: ${c.firstRepo} → overwritten by ${c.overwrittenBy}`);
+    }
+  }
+
   const fileCount = countMarkdownFiles(outDir);
-  return { rootDir: outDir, reposUnpacked, fileCount, failures };
+  return { rootDir: outDir, reposUnpacked, fileCount, failures, collisions };
+}
+
+/**
+ * Enumerate every file under `dir` (recursively) with size+mtime so the
+ * caller can diff pre/post-extraction and attribute each write to its repo.
+ * Paths are relative to `dir`. Skips symlinks — the path-traversal walk
+ * catches them separately.
+ */
+function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: number }> {
+  const out = new Map<string, { size: number; mtimeMs: number }>();
+  if (!fs.existsSync(dir)) return out;
+  const walk = (current: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) {
+        try {
+          const st = fs.statSync(full);
+          out.set(path.relative(dir, full), { size: st.size, mtimeMs: st.mtimeMs });
+        } catch { /* disappeared between readdir and stat; skip */ }
+      }
+    }
+  };
+  walk(dir);
+  return out;
 }
 
 /**

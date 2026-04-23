@@ -84,6 +84,38 @@ describe("materializePortalKnowledge", () => {
     expect(fs.existsSync(path.join(out, "a.md"))).toBe(true);
   });
 
+  it("logs a collision when two repos ship the same filename", () => {
+    // Repo A writes overview.md, repo B writes overview.md; later-repo wins
+    // silently today. The collisions[] out-param makes the silent shadowing
+    // visible so the operator can namespace or rename upstream.
+    const a = makeTarRepo("repo-a", [
+      { filename: "overview.md", content: "# from repo A\n" },
+      { filename: "unique-a.md", content: "# A only\n" },
+    ]);
+    const b = makeTarRepo("repo-b", [
+      { filename: "overview.md", content: "# from repo B\n" },
+      { filename: "unique-b.md", content: "# B only\n" },
+    ]);
+    const out = path.join(tmpRoot, "knowledge");
+    const result = materializePortalKnowledge([a, b], out);
+    expect(result.reposUnpacked).toBe(2);
+    expect(result.collisions).toHaveLength(1);
+    expect(result.collisions[0].path).toBe("overview.md");
+    expect(result.collisions[0].firstRepo).toBe("repo-a");
+    expect(result.collisions[0].overwrittenBy).toBe("repo-b");
+    // Later-repo content wins (existing contract, unchanged).
+    expect(fs.readFileSync(path.join(out, "overview.md"), "utf-8")).toBe("# from repo B\n");
+  });
+
+  it("reports no collisions when repos ship disjoint filenames", () => {
+    const a = makeTarRepo("repo-a", [{ filename: "a.md", content: "A" }]);
+    const b = makeTarRepo("repo-b", [{ filename: "b.md", content: "B" }]);
+    const out = path.join(tmpRoot, "knowledge");
+    const result = materializePortalKnowledge([a, b], out);
+    expect(result.reposUnpacked).toBe(2);
+    expect(result.collisions).toEqual([]);
+  });
+
   it("cleanupPortalKnowledge removes the dir and is idempotent", () => {
     const repo = makeTarRepo("test", [{ filename: "x.md", content: "y" }]);
     const out = path.join(tmpRoot, "knowledge");

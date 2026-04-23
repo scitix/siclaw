@@ -182,6 +182,79 @@ describe("tryLoadPortalSnapshot", () => {
     } finally { await portal.stop(); }
   });
 
+  it("refuses to buffer a snapshot whose Content-Length exceeds the 50 MB cap", async () => {
+    writeSecrets(cwd);
+    // Build a fake Portal that advertises an oversized Content-Length.
+    const huge = "x".repeat(256); // body doesn't matter — we reject on headers.
+    const server = http.createServer((req, res) => {
+      if (req.url === "/api/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.url?.startsWith("/api/v1/cli-snapshot")) {
+        // Lie about the size — 100 MB > 50 MB cap.
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": String(100 * 1024 * 1024),
+        });
+        res.end(huge);
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const result = await tryLoadPortalSnapshot({ cwd, port });
+      expect(result).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("aborts mid-stream when body length exceeds the cap (no Content-Length header)", async () => {
+    writeSecrets(cwd);
+    // This server chunks a body > 50 MB without advertising size — the
+    // streaming reader must cancel once cumulative bytes exceed the cap.
+    const server = http.createServer((req, res) => {
+      if (req.url === "/api/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      if (req.url?.startsWith("/api/v1/cli-snapshot")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        // Write ~60 MB in chunks so we trip the streaming cap; the reader
+        // must stop the stream before we finish writing.
+        const chunk = Buffer.alloc(1 * 1024 * 1024, "a");
+        let sent = 0;
+        const writeNext = (): void => {
+          if (sent >= 60) { res.end(); return; }
+          sent++;
+          if (!res.write(chunk)) {
+            res.once("drain", writeNext);
+          } else {
+            // Schedule the next chunk so we don't tie up the event loop in
+            // a tight loop that would starve the client's cancel handling.
+            setImmediate(writeNext);
+          }
+        };
+        writeNext();
+        return;
+      }
+      res.writeHead(404); res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const result = await tryLoadPortalSnapshot({ cwd, port });
+      expect(result).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }, 30_000);
+
   it("honors SICLAW_PORTAL_PORT env over the opts.port", async () => {
     writeSecrets(cwd);
     const portal = await startFakePortal({});

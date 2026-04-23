@@ -71,6 +71,14 @@ interface LocalSecrets {
 const DEFAULT_PORTAL_PORT = 3000;
 const PROBE_TIMEOUT_MS = 1500;
 const FETCH_TIMEOUT_MS = 3000;
+/**
+ * Guard against a misconfigured or hostile Portal that returns an oversized
+ * snapshot. Knowledge/credential tars are base64-in-JSON so the inflation
+ * factor is ~4/3, but 50 MB of decoded payload is already far more than a
+ * reasonable per-session wiki. Beyond this, we refuse to buffer rather than
+ * risk OOMing the TUI.
+ */
+const MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 
 /**
  * Try to load a Portal snapshot. Returns null (silently) if anything goes
@@ -150,6 +158,13 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
       headers: { [CLI_SNAPSHOT_SECRET_HEADER]: secrets.cliSnapshotSecret },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
+    // Reject oversize responses up-front: if the server advertises a
+    // Content-Length beyond the cap, abort before buffering a byte of it.
+    const advertised = Number(res.headers.get("content-length"));
+    if (Number.isFinite(advertised) && advertised > MAX_SNAPSHOT_BYTES) {
+      console.warn(`[portal-snapshot] snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes (advertised=${advertised}) — falling back`);
+      return { snapshot: null, error: { kind: "portal-unreachable" } };
+    }
     if (res.status === 404 && opts?.agent) {
       // Server returned a 404 with `availableAgents` — surface structured.
       const body = (await res.json().catch(() => ({}))) as { availableAgents?: string[] };
@@ -162,7 +177,15 @@ export async function loadPortalSnapshotDetailed(opts?: TryLoadPortalSnapshotOpt
       console.warn(`[portal-snapshot] Portal responded ${res.status} — falling back to settings.json`);
       return { snapshot: null, error: { kind: "auth-failed", status: res.status } };
     }
-    const payload = (await res.json()) as PortalSnapshot;
+    // Read with a running byte-count so we stop the moment a chunked response
+    // (no Content-Length) crosses the cap — we never let the buffer grow past
+    // MAX_SNAPSHOT_BYTES even if the server lies about its size.
+    const body = await readBodyWithCap(res, MAX_SNAPSHOT_BYTES);
+    if (!body) {
+      console.warn(`[portal-snapshot] snapshot exceeded ${MAX_SNAPSHOT_BYTES} bytes mid-stream — falling back`);
+      return { snapshot: null, error: { kind: "portal-unreachable" } };
+    }
+    const payload = JSON.parse(body) as PortalSnapshot;
     payload.portalUrl = baseUrl;
     return { snapshot: payload, error: null };
   } catch (err) {
@@ -185,6 +208,35 @@ function readSecrets(filePath: string): LocalSecrets | null {
     return null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Read a Response body as UTF-8 text with a hard byte cap. Returns null as
+ * soon as cumulative bytes exceed `maxBytes` (and cancels the stream so we
+ * don't keep buffering). Returns the concatenated body on clean completion.
+ */
+async function readBodyWithCap(res: Response, maxBytes: number): Promise<string | null> {
+  if (!res.body) return await res.text();
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let total = 0;
+  let out = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* already closing */ }
+        return null;
+      }
+      out += decoder.decode(value, { stream: true });
+    }
+    out += decoder.decode();
+    return out;
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
   }
 }
 
