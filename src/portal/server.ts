@@ -9,6 +9,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRestRouter, sendJson } from "../gateway/rest-router.js";
 import { registerAuthRoutes } from "./auth.js";
+import { registerCliSnapshotRoute } from "./cli-snapshot-api.js";
 import { registerAgentRoutes } from "./agent-api.js";
 import { registerClusterRoutes } from "./cluster-api.js";
 import { registerHostRoutes } from "./host-api.js";
@@ -46,6 +47,16 @@ export interface PortalConfig {
   runtimeWsUrl?: string;   // Optional — Phase 1 backward compat
   runtimeSecret?: string;  // Optional — Phase 1 backward compat
   portalSecret: string;
+  /**
+   * Enable the `/api/v1/cli-snapshot` endpoint that returns provider/model/MCP
+   * config (including provider api_key values) for a local TUI to consume.
+   *
+   * LOCAL MODE ONLY. Leave undefined / false in K8s/prod Portal deployments:
+   * the endpoint bypasses per-tenant scoping and would let any admin-role JWT
+   * holder read every tenant's LLM API keys. `siclaw local` opts in via its
+   * single-user trust model (same process, same machine, same user).
+   */
+  enableCliSnapshot?: boolean;
 }
 
 export function startPortal(config: PortalConfig): http.Server {
@@ -57,6 +68,9 @@ export function startPortal(config: PortalConfig): http.Server {
 
   // Register Portal's own routes
   registerAuthRoutes(router, config.jwtSecret);
+  if (config.enableCliSnapshot) {
+    registerCliSnapshotRoute(router, config.jwtSecret);
+  }
   registerAdapterRoutes(router, config.portalSecret);
   registerChannelRoutes(router, config.jwtSecret);
   registerNotificationRoutes(router, config.jwtSecret, config.portalSecret);

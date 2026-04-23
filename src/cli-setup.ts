@@ -6,28 +6,19 @@
  * This file only exports `needsSetup()` for the startup check.
  */
 
-import fs from "node:fs";
-import { getConfigPath } from "./core/config.js";
+import { loadConfig } from "./core/config.js";
 
 /**
- * Returns true if the user has no usable LLM configuration in settings.json.
+ * Returns true if there is no usable LLM configuration for this session.
+ *
+ * Goes through `loadConfig()` rather than reading settings.json directly so a
+ * Portal snapshot injected via `setPortalSnapshot()` counts as "configured"
+ * even when no local settings.json file exists.
  */
 export function needsSetup(): boolean {
-  const configPath = getConfigPath();
-  if (!fs.existsSync(configPath)) return true;
-
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const providers = raw.providers;
-    if (!providers || typeof providers !== "object" || Object.keys(providers).length === 0) {
-      return true;
-    }
-    // Check that at least one provider has an apiKey
-    for (const p of Object.values(providers) as any[]) {
-      if (p.apiKey) return false;
-    }
-    return true;
-  } catch {
-    return true;
-  }
+  const cfg = loadConfig();
+  const providers = Object.values(cfg.providers);
+  if (providers.length === 0) return true;
+  // At least one provider must carry an apiKey to be usable.
+  return !providers.some((p) => p?.apiKey);
 }

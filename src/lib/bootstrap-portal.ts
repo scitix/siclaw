@@ -5,11 +5,13 @@
  * initialisation semantics.
  */
 
+import crypto from "node:crypto";
 import type http from "node:http";
 import { initDb, closeDb, getDb, type Db } from "../gateway/db.js";
 import { runPortalMigrations } from "../portal/migrate.js";
 import { syncBuiltinKnowledge } from "../portal/knowledge-sync.js";
 import { startPortal, type PortalConfig } from "../portal/server.js";
+import { hashPassword } from "../portal/auth.js";
 import { waitForListen } from "./server-helpers.js";
 
 export interface BootstrapPortalConfig extends PortalConfig {
@@ -29,6 +31,7 @@ export async function bootstrapPortal(config: BootstrapPortalConfig): Promise<Po
 
   const db = initDb(config.databaseUrl);
   await runPortalMigrations();
+  await autoSeedAdminIfEmpty();
   await autoInitBuiltinSkillsIfEmpty();
   await syncBuiltinKnowledge();
   console.log("[portal] Database ready");
@@ -44,6 +47,41 @@ export async function bootstrapPortal(config: BootstrapPortalConfig): Promise<Po
       await closeDb();
     },
   };
+}
+
+/**
+ * On first startup (no users in DB), seed a bootstrap admin so the Portal
+ * Web UI is usable out of the box. Password comes from
+ * `SICLAW_ADMIN_PASSWORD` if set, otherwise defaults to `admin` with a
+ * loud reminder to change it.
+ *
+ * This matches the behaviour promised by README ("On first startup, Siclaw
+ * creates a local admin account: admin / admin"). Until this helper ran,
+ * fresh installs hit a dead-end — login rejected and no register UI.
+ */
+async function autoSeedAdminIfEmpty(): Promise<void> {
+  const db = getDb();
+  const [rows] = await db.query<Array<{ c: number | bigint }>>(
+    "SELECT COUNT(*) AS c FROM siclaw_users",
+  );
+  if (Number(rows[0]?.c ?? 0) !== 0) return;
+
+  const envPassword = process.env.SICLAW_ADMIN_PASSWORD;
+  const password = envPassword && envPassword.length > 0 ? envPassword : "admin";
+  const hash = hashPassword(password);
+
+  await db.query(
+    "INSERT INTO siclaw_users (id, username, password_hash, role, can_review_skills) VALUES (?, ?, ?, ?, ?)",
+    [crypto.randomUUID(), "admin", hash, "admin", 0],
+  );
+
+  if (envPassword) {
+    console.log("[portal] Seeded bootstrap admin user (password from SICLAW_ADMIN_PASSWORD env)");
+  } else {
+    console.log("[portal] Seeded bootstrap admin user: admin / admin");
+    console.log("[portal]   ⚠ Change the password via `PUT /api/v1/users/:id/password` or Users page.");
+    console.log("[portal]   ⚠ Or set SICLAW_ADMIN_PASSWORD before first launch next time.");
+  }
 }
 
 /**
