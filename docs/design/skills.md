@@ -646,12 +646,11 @@ Sync & Materialization
   src/gateway/agentbox/local-spawner.ts      syncSkills() (local mode)
 
 Frontend
-  src/gateway/web/src/pages/Skills/index.tsx              My Skills + Global tab
-  src/gateway/web/src/pages/Skills/SkillSpaceDetail.tsx   Skill space detail page
-  src/gateway/web/src/pages/Skills/SkillEditor.tsx        Skill editor
-  src/gateway/web/src/pages/Skills/components/DiffPreviewDialog.tsx    GitHub-style diff dialog
-  src/gateway/web/src/pages/Skills/components/SkillLifecycleStatus.tsx Lifecycle indicator
-  src/gateway/web/src/pages/Skills/components/VersionHistoryDrawer.tsx Version history drawer
+  portal-web/src/pages/Skills.tsx          My Skills + Global tab
+  portal-web/src/pages/SkillDetail.tsx     Skill space / editor / diff / history
+  portal-web/src/pages/SkillImport.tsx     Skill import flow
+  portal-web/src/components/chat/SkillPanel.tsx  Skill selector in chat
+  portal-web/src/components/chat/SkillCard.tsx   Skill card presentation
 
 Tests
   src/gateway/skills/skill-lifecycle.test.ts  91 comprehensive RPC handler tests

@@ -15,7 +15,7 @@ npm ci
 npm run build
 
 # Build web frontend (needed for gateway mode)
-npm run build:web
+make build-portal-web
 
 # Run tests
 npm test
@@ -27,8 +27,11 @@ npm test
 # TUI mode (terminal)
 npm run dev
 
-# Gateway mode (web UI)
-npm run dev:gateway
+# Runtime (control plane)
+npm run dev:runtime
+
+# Portal (web UI + DB)
+npm run dev:portal
 
 # AgentBox mode (worker)
 npm run dev:agentbox
@@ -41,8 +44,9 @@ Before making significant changes, read the relevant design doc:
 | Document | When to read |
 |----------|-------------|
 | [`docs/design/invariants.md`](docs/design/invariants.md) | Touching resource sync, skills, security, or DB schema |
-| [`docs/design/roadmap.md`](docs/design/roadmap.md) | Planning work or checking current priorities |
 | [`docs/design/decisions.md`](docs/design/decisions.md) | Wondering "why was X designed this way?" |
+| [`docs/design/security.md`](docs/design/security.md) | Modifying execution tools, Dockerfile, or K8s manifests |
+| [`docs/design/tools.md`](docs/design/tools.md) | Adding or modifying a diagnostic tool |
 
 New architectural decisions should get an ADR entry in `docs/design/decisions.md`.
 
@@ -52,18 +56,24 @@ New architectural decisions should get an ADR entry in `docs/design/decisions.md
 
 Siclaw has three entry points, each serving a different deployment role:
 
-| Entry Point | File | Role |
-|-------------|------|------|
+| How to launch | Source | Role |
+|---------------|--------|------|
 | `siclaw` | `src/cli-main.ts` | Interactive TUI for local diagnostics |
-| `siclaw-gateway` | `src/gateway-main.ts` | HTTP + WebSocket control plane (includes cron scheduler) |
-| `siclaw-agentbox` | `src/agentbox-main.ts` | Isolated worker (one per user) |
+| `siclaw local` | `src/cli-local.ts` | Single-process Portal + Runtime for local web UI |
+| `node siclaw-gateway.mjs` (or `npm run start:runtime`) | `src/gateway-main.ts` | Runtime control plane (channels, cron, AgentBox spawner) |
+| `npm run start:portal` | `src/portal-main.ts` | Portal: Web UI + REST API + DB + auth + skill/MCP/knowledge admin |
+| `node siclaw-agentbox.mjs` (or `npm run start:agentbox`) | `src/agentbox-main.ts` | Isolated worker (one per user) |
 
 Key directories:
 
-- `src/core/` — Agent session factory, LLM adapters, system prompt
+- `src/core/` — Agent session factory, brain, guard pipeline, tool registry
 - `src/tools/` — 20+ diagnostic tool definitions
-- `src/gateway/` — Server, auth, DB, channels, web UI
-- `src/memory/` — Vector + keyword search indexer
+- `src/gateway/` — Runtime server, channels, DB, skills bundle builder
+- `src/portal/` — Portal: auth, REST API, admin resources
+- `src/agentbox/` — AgentBox HTTP server, credential broker, resource sync
+- `src/memory/` — Vector + keyword investigation indexer
+- `src/cron/` — Task scheduling
+- `portal-web/` — React + Vite web UI
 - `skills/` — Diagnostic playbooks (SKILL.md + scripts)
 
 ## Commit Convention

@@ -59,27 +59,25 @@ Click the magnifying glass toggle next to the message input.
 
 Or press `Ctrl+I` to toggle DP mode, then type your question.
 
-### CLI Flag
+### External API
+
+Automations can drive an agent from outside Siclaw using the `/api/v1/run` endpoint with an API-key-scoped agent. Issue an API key in the Portal UI (agent detail page → API keys), then:
 
 ```bash
-siclaw --dp
-```
-
-### Via Alert Webhook
-
-```bash
-curl -X POST https://siclaw.example.com/hooks/v1/<trigger-id> \
-  -H "Authorization: Bearer <trigger-secret>" \
+curl -X POST https://siclaw.example.com/api/v1/run \
+  -H "Authorization: Bearer sk-xxxxxxxx" \
   -H "Content-Type: application/json" \
-  -d '{"title": "High error rate on payment-service", "severity": "critical"}'
+  -d '{"text": "Intermittent 5xx errors on API gateway every 30 minutes"}'
 ```
 
-## Reports
+The agent resolved from the API key runs synchronously and returns the assistant reply.
 
-Every investigation produces a report saved to `~/.siclaw/reports/`:
+## Traces
+
+Every investigation produces a trace file (relative to where Siclaw was launched):
 
 ```
-~/.siclaw/reports/deep-search-2026-03-06T14-30-00.md
+.siclaw/traces/deep-search-2026-03-06T14-30-00.md
 ```
 
-Reports include the investigation summary, evidence, and recommended next steps.
+Traces include the investigation summary, evidence, and recommended next steps.

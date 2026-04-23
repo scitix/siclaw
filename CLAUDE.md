@@ -67,9 +67,9 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 | `src/tools/infra/security-pipeline.ts` | tools.md §8.2, security.md | `npm test` | Facade for all cmd-exec tools; changes affect all 3 tools |
 | `src/gateway/skills/` | skills.md, invariants.md §1-2 | `npm test` | Bundle contract; `materialize()` NOT safe in local mode |
 | `src/portal/migrate.ts` | invariants.md §5 | `npm test` (runs `migrate-sqlite.test.ts` + `schema-invariants.test.ts`) | Single DDL must stay MySQL + SQLite compatible; index names must match legacy; no `TIMESTAMP(3)` / `ON UPDATE` / `JSON` columns |
-| `src/gateway/db.ts`, `db-mysql.ts`, `db-sqlite.ts` | DESIGN.md, invariants.md §5 | `npm test` — db.test.ts covers both drivers | DML return shape must match mysql2 (`[OkPacket, undefined]`); SQLite transactions serialised by mutex |
-| `src/gateway/dialect-helpers.ts` | DESIGN.md §模块 3 | `dialect-helpers.test.ts` | All 4 dialect differences (upsert, INSERT IGNORE, JSON ops, `safeParseJson`) flow through here; every caller chooses via `db.driver` |
-| `src/lib/bootstrap-portal.ts`, `bootstrap-runtime.ts`, `src/cli-local.ts` | DESIGN.md §模块 5 | manual `siclaw local` smoke test | Portal must `waitForListen` before Runtime boots; secrets persist in `.siclaw/local-secrets.json` |
+| `src/gateway/db.ts`, `db-mysql.ts`, `db-sqlite.ts` | invariants.md §5 | `npm test` — db.test.ts covers both drivers | DML return shape must match mysql2 (`[OkPacket, undefined]`); SQLite transactions serialised by mutex |
+| `src/gateway/dialect-helpers.ts` | invariants.md §5 | `dialect-helpers.test.ts` | All 4 dialect differences (upsert, INSERT IGNORE, JSON ops, `safeParseJson`) flow through here; every caller chooses via `db.driver` |
+| `src/lib/bootstrap-portal.ts`, `bootstrap-runtime.ts`, `src/cli-local.ts` | invariants.md §1 | manual `siclaw local` smoke test | Portal must `waitForListen` before Runtime boots; secrets persist in `.siclaw/local-secrets.json` |
 | `src/core/agent-factory.ts` | tools.md §7, guards.md §4, invariants.md §10 | `npm test` | Tool registration; guard pipeline installation; brain type compatibility |
 | `src/core/guard-pipeline.ts` | guards.md | `npm test` | Guard registry, pipeline installation; all guard stages affected |
 | `src/core/guard-log.ts` | guards.md §7 | `npm test` | Structured logging for all guards |
@@ -99,7 +99,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 Runtime:    Node.js ≥22.12.0  (ESM-only)     Tests:      vitest (npm test)
 Language:   TypeScript 5.9    (strict, .js)   Type check: npx tsc --noEmit
 Frontend:   React + Vite + Tailwind           Agent:      pi-coding-agent
-DB (GW):    Drizzle → sql.js / MySQL          DB (mem):   node:sqlite + FTS5
+DB (GW):    mysql2 / node:sqlite (raw SQL)    DB (mem):   node:sqlite + FTS5 + sqlite-vec
 ```
 
 **Conventions**: ESM-only, named exports, no default exports. `CONTRIBUTING.md` for PR format. `gh` CLI for PR comments.

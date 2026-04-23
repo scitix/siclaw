@@ -27,12 +27,7 @@ siclaw local
 
 Launches the Web UI at `http://localhost:3000`.
 
-On first startup, the local server creates a default admin account:
-
-- Username: `admin`
-- Password: `admin`
-
-Change it after logging in, or set `SICLAW_ADMIN_PASSWORD` before the first start.
+On first launch, open the Web UI and **register the first user** — that account becomes the admin. Subsequent registrations require admin authentication.
 
 ## CLI (TUI)
 
@@ -48,7 +43,7 @@ Personal terminal mode. Same investigation engine, no server.
 git clone https://github.com/scitix/siclaw.git
 cd siclaw
 npm ci
-npm run build:web
+make build-portal-web
 npm run build
 
 # TUI
@@ -131,10 +126,12 @@ To enable Investigation Memory with semantic search, add an embedding config:
 
 If `embedding.apiKey` is omitted, Siclaw falls back to the default LLM provider key.
 
-## Reports
+## Traces
 
-Deep investigation reports are written to:
+Deep investigation traces are written to:
 
 ```text
-~/.siclaw/reports/
+.siclaw/traces/
 ```
+
+The path is resolved relative to the working directory where Siclaw was launched.

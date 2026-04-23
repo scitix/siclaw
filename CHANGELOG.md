@@ -56,11 +56,9 @@ Implemented mutual TLS (mTLS) authentication to secure internal APIs between Gat
 - `manage_schedule` tool: Uses `GatewayClient` for listing cron jobs with mTLS authentication
 
 **Documentation:**
-- [mTLS Setup Guide](docs/deployment/mtls-setup.md) - Comprehensive deployment guide
-- [mTLS API Reference](docs/development/mtls-api-reference.md) - Developer reference
-- [mTLS Security Design](docs/architecture/mtls-security.md) - Architecture documentation
-- [AgentBox-Gateway Communication](docs/architecture/agentbox-gateway-communication.md) - Communication patterns
-- [API Direction Analysis](docs/architecture/api-direction-analysis.md) - Bidirectional API design rationale
+- [mTLS Deployment Guide](docs/design/mtls-deployment.md) - Deployment and ops guide
+- [mTLS API Reference](docs/design/mtls-api.md) - Developer reference
+- [Security Architecture](docs/design/security.md) - Defense-in-depth model including mTLS
 
 **Dependencies:**
 - Added `node-forge` for X.509 certificate generation and verification
@@ -81,7 +79,7 @@ Implemented mutual TLS (mTLS) authentication to secure internal APIs between Gat
 **Testing:**
 - All code compiles successfully with TypeScript strict mode
 - Manual testing required for certificate generation and verification
-- See [Testing section](docs/deployment/mtls-setup.md#testing-mtls) for integration tests
+- See [Testing section](docs/design/mtls-deployment.md#testing-mtls) for integration tests
 
 ---
 

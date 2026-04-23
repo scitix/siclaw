@@ -547,7 +547,7 @@ spec:
   - to:
     - namespaceSelector:
         matchLabels:
-          app: siclaw-gateway
+          app: siclaw-runtime
     ports:
     - port: 3002
       protocol: TCP
