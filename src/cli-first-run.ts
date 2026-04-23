@@ -8,15 +8,81 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { intro, outro, selectKey, text, password, note, cancel, isCancel } from "@clack/prompts";
+import { spawn } from "node:child_process";
+import { intro, outro, selectKey, text, password, note, confirm, cancel, isCancel } from "@clack/prompts";
 import { getConfigPath, reloadConfig, type ProviderConfig, type SiclawConfig } from "./core/config.js";
 import { PRESETS } from "./core/provider-presets.js";
+import { probeLocalPortal } from "./lib/portal-snapshot-client.js";
+
+/** Best-effort: open a URL in the user's default browser. Returns true if
+ * the platform opener was spawned without throwing synchronously. */
+function openInBrowser(url: string): boolean {
+  const opener = process.platform === "darwin"
+    ? "open"
+    : process.platform === "win32"
+    ? "start"
+    : "xdg-open";
+  try {
+    spawn(opener, [url], { detached: true, stdio: "ignore" }).unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Run the first-run setup wizard. Returns true if setup completed successfully.
  */
 export async function runFirstRunSetup(): Promise<boolean> {
   intro("Welcome to Siclaw");
+
+  // 0. If a local Portal is running, redirect setup there — Portal is the
+  // source of truth for providers (and everything else) in this mode. Bypass
+  // the settings.json path entirely to avoid a per-workstation "ghost
+  // provider" that never reaches Portal.
+  const portal = await probeLocalPortal();
+  if (portal) {
+    const modelsUrl = `${portal.url}/settings/models`;
+    note(
+      `A local Portal is running at ${portal.url}.\n\n` +
+      `Model providers belong in Portal, not in this workstation's\n` +
+      `settings.json. Steps:\n\n` +
+      `  1. Log in to Portal (default: admin / admin)\n` +
+      `  2. Settings → Models → add a provider + model\n` +
+      `  3. Re-run \`siclaw\` — the TUI will pick up the Portal provider`,
+      "Provider setup has moved to Portal",
+    );
+
+    const shouldOpen = await confirm({
+      message: `Open ${modelsUrl} in your browser now?`,
+      initialValue: true,
+    });
+
+    if (isCancel(shouldOpen)) {
+      cancel("Setup cancelled.");
+      process.exit(0);
+    }
+
+    if (shouldOpen) {
+      const launched = openInBrowser(modelsUrl);
+      if (launched) {
+        outro(`Opening Portal… Re-run \`siclaw\` after you've added a provider.`);
+      } else {
+        // Platform opener threw. Fall back to a plainly visible URL line so
+        // the user can still reach Portal by copying it.
+        outro(
+          `Couldn't launch a browser automatically.\n` +
+          `Please open this URL manually:\n  ${modelsUrl}\n\n` +
+          `Then re-run \`siclaw\`.`,
+        );
+      }
+    } else {
+      outro(
+        `Skipped. Visit ${modelsUrl} when you're ready, then re-run \`siclaw\`.`,
+      );
+    }
+    process.exit(0);
+  }
 
   // 1. Select provider (use selectKey to avoid scroll rendering bugs)
   const presetKey = await selectKey({

@@ -30,7 +30,7 @@ function formatRelative(iso: string): string {
  * Bell + dropdown. WS subscription to /ws/notifications for live push,
  * REST bootstrap on mount, persistent across reconnects.
  */
-export function NotificationBell() {
+export function NotificationBell({ collapsed = false }: { collapsed?: boolean } = {}) {
   const [open, setOpen] = useState(false)
   const [items, setItems] = useState<Notification[]>([])
   const [unread, setUnread] = useState(0)
@@ -149,9 +149,11 @@ export function NotificationBell() {
     <div ref={anchorRef} className="relative">
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-2.5 px-4 py-3 text-[13px] text-muted-foreground hover:text-foreground border-t border-border w-full"
+        title={collapsed ? "Notifications" : undefined}
+        aria-label="Notifications"
+        className={`flex items-center ${collapsed ? "justify-center px-0" : "gap-2.5 px-4"} py-3 text-[13px] text-muted-foreground hover:text-foreground border-t border-border w-full`}
       >
-        <div className="relative">
+        <div className="relative shrink-0">
           <Bell className="h-4 w-4" />
           {unread > 0 && (
             <span className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-red-500 text-[9px] font-medium text-white flex items-center justify-center leading-none">
@@ -159,7 +161,7 @@ export function NotificationBell() {
             </span>
           )}
         </div>
-        Notifications
+        {!collapsed && "Notifications"}
       </button>
 
       {open && (

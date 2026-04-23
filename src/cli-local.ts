@@ -36,6 +36,15 @@ const portalHandle = await bootstrapPortal({
   runtimeWsUrl,
   runtimeSecret: secrets.runtimeSecret,
   portalSecret: secrets.portalSecret,
+  // Local single-user mode: expose the CLI snapshot endpoint so `siclaw`
+  // (TUI) running on the same machine can fetch providers/MCP/default model
+  // via HTTP instead of maintaining its own settings.json. Prod K8s Portal
+  // must NOT set this — the endpoint is not per-tenant scoped.
+  enableCliSnapshot: true,
+  cliSnapshotSecret: secrets.cliSnapshotSecret,
+  // Single-user mode: seed `admin / admin` on first-boot empty DB so the
+  // Web UI is usable out of the box. Production K8s must leave this unset.
+  enableDefaultAdminSeed: true,
 });
 console.log(`[local] Portal:  ${portalUrl}`);
 
