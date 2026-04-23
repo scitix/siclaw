@@ -6,7 +6,6 @@
  * Port 3001 (HTTP):
  *   GET  /api/health              — K8s liveness/readiness
  *   GET  /metrics                 — Prometheus
- *   WS   /ws                      — Upstream WS RPC (Trusted Proxy auth)
  *   /api/v1/siclaw/metrics/*      — Metrics (proxied to adapter for summary/audit)
  *   /api/v1/siclaw/system/*       — System config (proxied to adapter)
  *
@@ -591,4 +590,3 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   return runtimeServer;
 }
-

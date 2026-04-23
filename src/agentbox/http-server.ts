@@ -250,20 +250,6 @@ export function createHttpServer(
       try {
         managed.brain.registerProvider(body.modelProvider, body.modelConfig);
         console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
-        // Update LLM config ref so deep_search sub-agents follow the main model
-        const mc = body.modelConfig as Record<string, unknown>;
-        if (mc.baseUrl && mc.apiKey) {
-          managed.llmConfigRef.apiKey = mc.apiKey as string;
-          managed.llmConfigRef.baseUrl = mc.baseUrl as string;
-          if (mc.api) {
-            managed.llmConfigRef.api = mc.api as string;
-          }
-          // Use the specific modelId from the prompt if available
-          if (body.modelId) {
-            managed.llmConfigRef.model = body.modelId as string;
-          }
-          console.log(`[agentbox-http] Updated llmConfigRef: baseUrl=${(mc.baseUrl as string).slice(0, 40)}... model=${managed.llmConfigRef.model}`);
-        }
       } catch (err) {
         console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
       }

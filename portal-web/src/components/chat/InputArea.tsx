@@ -37,7 +37,6 @@ interface InputAreaProps {
   contextUsage?: ContextUsage | null
   pendingMessages?: string[]
   onRemovePending?: (index: number) => void
-  dpFocus?: string | null
   dpActive?: boolean
   onSetDpActive?: (active: boolean) => void
   hasMessages?: boolean
@@ -55,7 +54,6 @@ export function InputArea({
   contextUsage,
   pendingMessages,
   onRemovePending,
-  dpFocus,
   dpActive,
   onSetDpActive,
   hasMessages,
@@ -196,11 +194,6 @@ export function InputArea({
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-blue-500/10 border-blue-500/30 text-blue-400">
                   <SearchCode className="w-3.5 h-3.5 text-blue-500" />
                   <span>Deep Investigation</span>
-                  {dpFocus && (
-                    <span className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 text-[10px] font-semibold uppercase">
-                      {dpFocus.replace(/_/g, " ")}
-                    </span>
-                  )}
                   <button
                     type="button"
                     className="ml-0.5 p-0.5 rounded hover:bg-blue-500/20 transition-colors"

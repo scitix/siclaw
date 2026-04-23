@@ -349,29 +349,29 @@ Memory search (`memory_search` tool) is only available when an embedding provide
 
 ## 8. Deep Investigation Invariants
 
-### 8.1 Budget Constants
+Post-refactor (Apr 2026): DP mode is reduced to a lightweight flag plus a
+system-prompt addendum. No dedicated state machine, no parallel sub-agent
+orchestration, no specialized UI cards. See
+`docs/design/2026-04-24-dp-mode-refactor-design.md` for rationale and the
+Phase 2 work (generic `delegate_to_agent` + permission-gated tool calls).
 
-| Metric | Normal | Quick |
-|--------|--------|-------|
-| maxContextCalls | 15 | 10 |
-| maxHypotheses | 5 | 3 |
-| maxCallsPerHypothesis | 10 | 8 |
-| maxTotalCalls | 75 | 40 |
-| maxParallel | 3 | 3 |
-| maxDurationMs | 300,000 (5 min) | 180,000 (3 min) |
+### 8.1 User-Owned Mode Invariant
 
-**Source**: `src/tools/workflow/deep-search/types.ts`
+DP is a **user-owned mode**: once the user enables it (via
+`[Deep Investigation]` prefix marker, `/dp` command, Ctrl+I shortcut, or the
+frontend magnifier chip) the flag stays on until the user explicitly exits
+with `[DP_EXIT]`. No backend event — including any "completed" / "idle"
+signal the live path might emit — may flip it off.
 
-### 8.2 Early Exit
+### 8.2 Single Source of Truth
 
-`EARLY_EXIT_CONFIDENCE = 101` — effectively **disabled** by default (101 > 100% is unreachable). The intended threshold is 80% for "root-cause-first" mode. Do not lower this without testing that sub-agents reliably report calibrated confidence scores.
+`MutableDpStateRef.active: boolean` is the only authoritative DP state.
+Persisted via a `custom: dp-mode` session entry with shape
+`{active: boolean}`. Legacy shapes (`{enabled}`, `{dpStatus}`, the pre-
+refactor checklist snapshot) are accepted on read for sessions persisted
+under the old state machine — all normalize to `{active: boolean}`.
 
-### 8.3 Sub-Agent Tool Set
-
-Sub-agents get a **minimal tool set** — not the full agent tool inventory:
-- `read`, `restricted-bash`, `node_exec` only
-- No memory tools, no skill management, no scheduling
-- Skills pre-loaded from `skills/core/` and `skills/extension/` as text in prompt (not via `local_script`)
+**Source**: `src/core/extensions/deep-investigation.ts`, `src/core/types.ts`
 
 ---
 

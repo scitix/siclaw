@@ -146,32 +146,32 @@ describe("consumeAgentSse — tool execution", () => {
   });
 
   it("persists tool details as metadata (dropping blocked/error flags that are surfaced via outcome)", async () => {
-    // deep_search returns a rich `details` object the UI needs to rebuild
-    // InvestigationCard on history reload. Verify the structured payload
-    // survives the sse-consumer → appendMessage boundary intact.
-    const hypotheses = [
-      { id: "H1", text: "Secret missing", status: "validated", confidence: 80, toolCallsUsed: 6 },
-      { id: "H2", text: "DNS failure", status: "invalidated", confidence: 20, toolCallsUsed: 4 },
+    // Tools can attach a rich `details` object to their result; the UI
+    // consumes it on history reload. Verify the structured payload survives
+    // the sse-consumer → appendMessage boundary intact.
+    const findings = [
+      { id: "F1", label: "Missing secret", severity: "high" },
+      { id: "F2", label: "DNS failure", severity: "low" },
     ];
     const events = [
-      { type: "tool_execution_start", toolName: "deep_search", args: { question: "why?" } },
-      { type: "tool_execution_end", toolName: "deep_search",
+      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods" } },
+      { type: "tool_execution_end", toolName: "bash",
         result: {
           content: [{ type: "text", text: "## Summary\n..." }],
           details: {
-            dpStatus: "concluding",
-            hypothesesTotal: 2,
-            hypothesesValidated: 1,
-            hypotheses,
+            summary: "concluding",
+            totalChecks: 2,
+            passedChecks: 1,
+            findings,
           },
         } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     const toolRow = appendCalls.find((r) => r.role === "tool");
     expect(toolRow.metadata).toBeDefined();
-    expect(toolRow.metadata.hypotheses).toEqual(hypotheses);
-    expect(toolRow.metadata.hypothesesTotal).toBe(2);
-    expect(toolRow.metadata.dpStatus).toBe("concluding");
+    expect(toolRow.metadata.findings).toEqual(findings);
+    expect(toolRow.metadata.totalChecks).toBe(2);
+    expect(toolRow.metadata.summary).toBe("concluding");
   });
 
   it("skips metadata when details contains only blocked/error (already captured by outcome)", async () => {
@@ -198,8 +198,8 @@ describe("consumeAgentSse — tool execution", () => {
   it("redacts secrets inside persisted metadata via JSON round-trip", async () => {
     const redactionConfig = { patterns: [/sk-[a-z0-9]+/g] };
     const events = [
-      { type: "tool_execution_start", toolName: "deep_search", args: {} },
-      { type: "tool_execution_end", toolName: "deep_search",
+      { type: "tool_execution_start", toolName: "bash", args: {} },
+      { type: "tool_execution_end", toolName: "bash",
         result: {
           content: [{ type: "text", text: "ok" }],
           details: {

@@ -167,7 +167,7 @@ describe("AgentBoxClient — model + context endpoints", () => {
         res.end(JSON.stringify({ tokens: 10, contextWindow: 100, percent: 10, isCompacting: false, inputTokens: 5, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0.01 }));
       } else if (req.method === "GET" && url === "/api/sessions/s1/dp-state") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ dpStatus: "investigating", question: "why?" }));
+        res.end(JSON.stringify({ active: true }));
       } else if (req.method === "DELETE" && url === "/api/memory") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -203,8 +203,7 @@ describe("AgentBoxClient — model + context endpoints", () => {
 
   it("getDpState() returns dp-mode snapshot", async () => {
     const r = await client.getDpState("s1");
-    expect(r.dpStatus).toBe("investigating");
-    expect(r.question).toBe("why?");
+    expect(r.active).toBe(true);
   });
 
   it("resetMemory() issues DELETE /api/memory", async () => {

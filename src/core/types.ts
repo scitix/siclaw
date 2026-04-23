@@ -1,8 +1,9 @@
 /**
  * Shared types used across core/, tools/, and agentbox/ layers.
  *
- * Extracted from agent-factory.ts, deep-search/tool.ts, and dp-tools.ts
- * to eliminate circular type dependencies between core/ and tools/.
+ * Originally extracted to break a circular dependency between core/ and the
+ * now-deleted deep-search / dp-tools modules. The types that survived the
+ * Apr 2026 DP refactor continue to live here.
  */
 
 import type { MemoryIndexer } from "../memory/indexer.js";
@@ -19,14 +20,6 @@ export interface KubeconfigRef {
   credentialBroker?: import("../agentbox/credential-broker.js").CredentialBroker;
 }
 
-/** Mutable ref to LLM config for deep_search sub-agents (updated by gateway prompt handler) */
-export interface LlmConfigRef {
-  apiKey?: string;
-  baseUrl?: string;
-  model?: string;
-  api?: string;
-}
-
 /** Mutable ref to the shared memory indexer (set after session creation). */
 export interface MemoryRef {
   indexer?: MemoryIndexer;
@@ -35,11 +28,12 @@ export interface MemoryRef {
 
 // ── DP lifecycle types ──
 //
-// Post-refactor (Apr 2026): DP is reduced to a single mode flag. The
-// old enum (investigating / awaiting_confirmation / validating / concluding /
+// Post-refactor (Apr 2026): DP is reduced to a single mode flag. The old
+// enum (investigating / awaiting_confirmation / validating / concluding /
 // completed), draft / confirmed hypothesis storage, and per-phase state
-// were all removed together with the propose_hypotheses / deep_search tool
-// pair. See docs/design/2026-04-24-dp-mode-refactor-design.md.
+// were all removed together with the propose_hypotheses / deep_search /
+// end_investigation tool trio. See
+// docs/design/2026-04-24-dp-mode-refactor-design.md.
 
 /**
  * Writable version of DpStateRef — held only by the extension (single writer).

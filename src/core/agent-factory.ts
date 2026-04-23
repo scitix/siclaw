@@ -37,7 +37,7 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
-import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
+import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
@@ -101,8 +101,6 @@ export interface SiclawSessionResult {
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
   kubeconfigRef: KubeconfigRef;
-  /** Mutable ref to LLM config for deep_search sub-agents */
-  llmConfigRef: LlmConfigRef;
   /** Mutable skill dirs array — update contents + call session.reload() to switch */
   skillsDirs: string[];
   mode: SessionMode;
@@ -258,16 +256,10 @@ export async function createSiclawSession(
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
   const agentId: string | null = opts?.agentId ?? null;
-  // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
-  // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
-  // a model-change notification — so this initialization does not conflict with that path.
-  const llmConfigRef: LlmConfigRef = defaultLlm
-    ? { apiKey: defaultLlm.apiKey, baseUrl: defaultLlm.baseUrl, model: defaultLlm.model.id, api: defaultLlm.api }
-    : {};
   const sessionIdRef: { current: string } = { current: "" };
   const mode = opts?.mode ?? "web";
-  // Mutable ref — populated after memoryIndexer is created (below), so deep_search
-  // can retrieve past investigations and persist new ones.
+  // Mutable ref — populated after memoryIndexer is created (below) so memory-
+  // consuming tools can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
 
   // DP state ref — shared object, two views:
@@ -327,7 +319,7 @@ export async function createSiclawSession(
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef, llmConfigRef,
+      kubeconfigRef, userId, agentId, sessionIdRef,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer,
@@ -590,10 +582,10 @@ export async function createSiclawSession(
   // Trigger session_start for extension state restoration.
   // In web/gateway mode, bindExtensions() is never called by the TUI layer,
   // so session_start doesn't fire and extensions can't restore persisted state
-  // (e.g. DP mode status after session release/rebuild).
-  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings, session_start
-  // fires again — but the handler resets state first (checklist=null, dpStatus=idle)
-  // then restores from JSONL, so double-fire is idempotent.
+  // (e.g. DP mode flag after session release/rebuild).
+  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings,
+  // session_start fires again — but the DP handler resets state first
+  // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
   // ── Guard pipeline: unified guard registration and installation ──
@@ -602,5 +594,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

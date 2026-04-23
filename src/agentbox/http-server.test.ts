@@ -6,8 +6,8 @@ import type https from "node:https";
 /**
  * Tests for createHttpServer.
  *
- * We mock heavy subsystems (metrics registries, deep-search events, memory
- * indexer, config loader) so we can exercise the routing table against a
+ * We mock heavy subsystems (metrics registries, memory indexer, config
+ * loader) so we can exercise the routing table against a
  * lightweight fake session manager. The server itself is a real http.Server;
  * we send HTTP requests to it from the same process.
  */
@@ -124,7 +124,6 @@ function makeFakeSession(id: string) {
     mode: "web" as const,
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
-    llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
     dpStateRef: { active: false },
   };

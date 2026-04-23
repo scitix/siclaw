@@ -16,7 +16,7 @@ import path from "node:path";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
-import type { KubeconfigRef, LlmConfigRef, SessionMode, DpStateRef } from "../core/types.js";
+import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
@@ -47,8 +47,6 @@ export interface ManagedSession {
   _bufferUnsub: (() => void) | null;
   /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
   kubeconfigRef: KubeconfigRef;
-  /** Mutable LLM config ref for deep_search sub-agents — updated by gateway prompt handler */
-  llmConfigRef: LlmConfigRef;
   /** Whether the current prompt was aborted (prevents empty response retry) */
   _aborted: boolean;
   /** Mutable skill dirs array passed to DefaultResourceLoader — update + reload to switch */
@@ -253,7 +251,6 @@ export class AgentBoxSessionManager {
       _eventBuffer: [],
       _bufferUnsub: null,
       kubeconfigRef,
-      llmConfigRef: result.llmConfigRef,
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,

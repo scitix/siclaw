@@ -69,9 +69,8 @@ export class PiAgentBrain implements BrainSession {
       //
       // Skip retry when stopReason === "aborted": the empty turn was produced
       // by an intentional abort (user Stop, or an extension force-aborting a
-      // turn — e.g. DP extension waits for user confirmation after
-      // propose_hypotheses). Re-prompting the original text in that case
-      // re-runs input handlers and can corrupt extension state machines.
+      // turn). Re-prompting the original text in that case re-runs input
+      // handlers and can corrupt extension state.
       let retries = 0;
       while (
         !lastAssistantHadContent &&

@@ -522,17 +522,6 @@ operator's perspective and must not leak into the agent's tool inventory.
 Without the override, the agent could invoke skills the Portal operator never opted into.
 See `docs/design/invariants.md` §1.4 for the enclosing Portal-as-SoT contract.
 
-### Deep Search Sub-Agents
-
-Sub-agents in `src/tools/workflow/deep-search/sub-agent.ts` load skills separately:
-
-```typescript
-const { skills: coreSkills } = loadSkillsFromDir({ dir: "skills/core" });
-const { skills: extSkills }  = loadSkillsFromDir({ dir: "skills/extension" });
-```
-
-This gives sub-agents access to builtin skills without depending on the bundle.
-
 ---
 
 ## Database Schema
@@ -654,7 +643,6 @@ DB Repositories
 
 Agent Integration
   src/core/agent-factory.ts                  Skill directory setup, resolved/ loading, additionalSkillPaths
-  src/tools/workflow/deep-search/sub-agent.ts  Sub-agent skill loading
 
 Sync & Materialization
   src/agentbox/resource-handlers.ts          skillsHandler.materialize() (K8s)

@@ -75,10 +75,9 @@ function stripEmptyResponseMarkers(text: string): string {
  * Pick the subset of tool-result `details` worth persisting as message
  * metadata. The `blocked`/`error` flags are already surfaced via the message's
  * `outcome` column — dropping them here avoids duplicate storage. Anything
- * else (e.g. `propose_hypotheses`'s `hypotheses` array, `deep_search`'s rich
- * per-hypothesis validation results) is passed through so the UI can rebuild
- * cards like InvestigationCard on history reload without the ephemeral live
- * stream.
+ * else (structured data a tool attaches to its result) is passed through so
+ * the UI can rebuild from the DB row on history reload without depending on
+ * the ephemeral live stream.
  *
  * Redaction is applied via a JSON round-trip so patterns hit string values
  * nested inside arrays/objects. If redaction somehow produces invalid JSON

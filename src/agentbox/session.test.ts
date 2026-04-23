@@ -68,12 +68,11 @@ vi.mock("../core/agent-factory.js", async () => {
         session: { sessionId: "fake-session" },
         sessionIdRef: { current: "" },
         kubeconfigRef: opts.kubeconfigRef,
-        llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
         skillsDirs: ["skills/core"],
         mode: opts.mode ?? "web",
         mcpManager: { shutdown: async () => {} },
         memoryIndexer: undefined,
-        dpStateRef: { status: "idle", question: undefined, round: 0, confirmedHypotheses: [] },
+        dpStateRef: { active: false },
       };
     },
   };

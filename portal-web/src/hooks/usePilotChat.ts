@@ -127,9 +127,6 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
     const parts = [skill, script].filter(Boolean).join("/")
     return skillArgs ? `${parts} ${skillArgs}` : parts
   }
-  if (name === "deep_search") {
-    return (args.question as string) || ""
-  }
   if (name === "update_plan") {
     const step = args.step as number | undefined
     const status = (args.status as string) || ""

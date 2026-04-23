@@ -430,11 +430,14 @@ configuration. This is declared in each tool's registration, not in a central se
 
 ### Tools Not in Registry
 
-- **Extension tools** (`propose_hypotheses`, `end_investigation`): registered
-  via pi-agent extension API, lifecycle managed by extension
 - **MCP tools**: dynamically discovered at runtime, appended after resolve
 - **File I/O tools** (read/edit/write/grep/find/ls): framework tools with
   path-restricted operations injection, appended after resolve
+
+Historical note: the DP refactor (Apr 2026) removed three extension tools
+(`propose_hypotheses`, `end_investigation`, `deep_search`) that used to land
+here via the pi-agent extension API. DP now runs without dedicated tools —
+see `docs/design/2026-04-24-dp-mode-refactor-design.md`.
 
 ---
 
@@ -455,20 +458,12 @@ makes the debug pod subsystem itself harder to maintain.
 **Goal**: Split into `debug-pod/cache.ts`, `debug-pod/lifecycle.ts`,
 `debug-pod/gc.ts` under `infra/`.
 
-### 8.2 Extract `llmCompleteWithTool` to Shared Location
+### 8.2 Extract `llmCompleteWithTool` to Shared Location ✓ Done
 
-`llmCompleteWithTool` is a general-purpose "call LLM API to complete a task"
-utility, but it lives in `workflow/deep-search/sub-agent.ts` — an internal file
-of a specific workflow tool. Two memory module files depend on it:
-- `src/memory/topic-consolidator.ts`
-- `src/memory/knowledge-extractor.ts`
-
-This creates an architectural smell: a foundational module (`memory/`) depends
-on the internals of a higher-level workflow tool.
-
-**Goal**: Move `llmCompleteWithTool` to `src/core/` or `src/shared/`, making
-the dependency direction correct (both `memory/` and `workflow/deep-search/`
-import from `core/`).
+Previously noted as deferred work. Resolved in the DP refactor (Apr 2026):
+`llmCompleteWithTool` now lives in `src/core/llm-tool-call.ts` and is
+imported by the memory modules (`knowledge-extractor`, `topic-consolidator`)
+directly. The deep-search directory that originally hosted it is gone.
 
 ### 8.3 Execution Template Extraction (Low — Revisit Conditionally)
 
