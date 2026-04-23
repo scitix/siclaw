@@ -33,6 +33,12 @@ import { getDb } from "../gateway/db.js";
 
 const CLI_SNAPSHOT_SECRET_HEADER = "x-siclaw-cli-snapshot-secret";
 const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+// Mirror the client-side cap (see `portal-snapshot-client.ts:MAX_SNAPSHOT_BYTES`).
+// The client refuses to buffer more than this; the server matches so a future
+// field (e.g. a new bulk-delivered resource) can't silently blow past the
+// client cap and surface as a confusing "snapshot exceeds size" fallback on
+// the other side. Keep the two constants in lockstep.
+const MAX_SNAPSHOT_BYTES = 50 * 1024 * 1024;
 
 function isLoopbackRequest(req: http.IncomingMessage): boolean {
   const addr = req.socket.remoteAddress;
@@ -516,7 +522,19 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       activeAgent: activeAgentOut,
       generatedAt: new Date().toISOString(),
     };
-    sendJson(res, 200, snapshot);
+
+    // Server-side size cap (belt-and-suspenders for the matching client cap).
+    // Serialise once, size-check, then write the same string so we don't pay
+    // JSON.stringify twice for a happy path response.
+    const serialized = JSON.stringify(snapshot);
+    if (Buffer.byteLength(serialized, "utf8") > MAX_SNAPSHOT_BYTES) {
+      sendJson(res, 413, {
+        error: `Snapshot exceeds ${MAX_SNAPSHOT_BYTES}-byte cap`,
+      });
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(serialized);
   });
 }
 

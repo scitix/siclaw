@@ -17,6 +17,7 @@
  * SIGINT / SIGTERM cleanup is installed by cli-main, not here.
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -111,9 +112,14 @@ function writeHost(outDir: string, host: CliSnapshotHostCredential): void {
     // short-lived tmp file so we can reuse the existing helper verbatim.
     // Sanitize host.name before interpolating into the path to avoid any
     // directory-traversal shenanigans if a host row ever slipped through
-    // Portal's own validation.
+    // Portal's own validation. Randomised suffix beats Date.now() + pid:
+    // Date.now() collides in tight loops and is predictable enough to
+    // invite symlink-race tricks in a shared tmpdir.
     const safeStem = host.name.replace(/[^A-Za-z0-9._-]/g, "_");
-    const tmpPath = path.join(os.tmpdir(), `siclaw-cred-key-${safeStem}-${Date.now()}-${process.pid}`);
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `siclaw-cred-key-${safeStem}-${process.pid}-${crypto.randomBytes(8).toString("hex")}`,
+    );
     fs.writeFileSync(tmpPath, host.privateKey, { mode: 0o600 });
     try {
       const result = registerSshKey(outDir, {

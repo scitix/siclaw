@@ -21,6 +21,7 @@
  * target (linux, macOS) and avoids pulling in another npm dep.
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -60,7 +61,13 @@ export function materializePortalKnowledge(
   const outDirResolved = fs.realpathSync(outDir);
 
   for (const repo of repos) {
-    const tmpPath = path.join(os.tmpdir(), `siclaw-knowledge-${Date.now()}-${process.pid}.tar.gz`);
+    // Randomised staging name: Date.now() alone collides on clock tick in
+    // tight loops and is predictable enough to invite symlink-race tricks
+    // in a shared tmpdir. 8 random bytes is ample for a per-process path.
+    const tmpPath = path.join(
+      os.tmpdir(),
+      `siclaw-knowledge-${process.pid}-${crypto.randomBytes(8).toString("hex")}.tar.gz`,
+    );
     try {
       fs.writeFileSync(tmpPath, Buffer.from(repo.dataBase64, "base64"));
       // Snapshot file stats BEFORE extraction so we can tell which entries
@@ -97,10 +104,17 @@ export function materializePortalKnowledge(
       const afterFiles = snapshotFileStats(outDirResolved);
       for (const [rel, afterStat] of afterFiles) {
         const beforeStat = beforeFiles.get(rel);
+        // "Written by this repo" = any of the three stat dimensions changed.
+        // Inode is the most reliable signal: `tar x` defaults to unlink+create,
+        // so a rewritten file gets a new inode even when size and mtime happen
+        // to match on a coarse-granularity filesystem (FAT32, some NFS mounts).
+        // Size + mtime stay as belt-and-suspenders for tar implementations that
+        // overwrite in place (same inode, new content).
         const writtenByThisRepo =
           beforeStat === undefined ||
           beforeStat.size !== afterStat.size ||
-          beforeStat.mtimeMs !== afterStat.mtimeMs;
+          beforeStat.mtimeMs !== afterStat.mtimeMs ||
+          beforeStat.ino !== afterStat.ino;
         if (!writtenByThisRepo) continue;
         const prior = firstWriter.get(rel);
         if (prior && prior !== repo.name) {
@@ -131,13 +145,13 @@ export function materializePortalKnowledge(
 }
 
 /**
- * Enumerate every file under `dir` (recursively) with size+mtime so the
- * caller can diff pre/post-extraction and attribute each write to its repo.
- * Paths are relative to `dir`. Skips symlinks — the path-traversal walk
+ * Enumerate every file under `dir` (recursively) with size, mtime, and inode
+ * so the caller can diff pre/post-extraction and attribute each write to its
+ * repo. Paths are relative to `dir`. Skips symlinks — the path-traversal walk
  * catches them separately.
  */
-function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: number }> {
-  const out = new Map<string, { size: number; mtimeMs: number }>();
+function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: number; ino: number }> {
+  const out = new Map<string, { size: number; mtimeMs: number; ino: number }>();
   if (!fs.existsSync(dir)) return out;
   const walk = (current: string): void => {
     let entries: fs.Dirent[];
@@ -153,7 +167,7 @@ function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: nu
       else if (entry.isFile()) {
         try {
           const st = fs.statSync(full);
-          out.set(path.relative(dir, full), { size: st.size, mtimeMs: st.mtimeMs });
+          out.set(path.relative(dir, full), { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino });
         } catch { /* disappeared between readdir and stat; skip */ }
       }
     }
