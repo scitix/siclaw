@@ -6,12 +6,17 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
-import { loadConfig, getDefaultLlm, validateLlmConfig } from "./core/config.js";
+import { loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
 import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
+import { tryLoadPortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
+import { materializePortalSkills, cleanupPortalSkills } from "./lib/portal-skill-materializer.js";
+import { materializePortalKnowledge, cleanupPortalKnowledge } from "./lib/portal-knowledge-materializer.js";
+import { materializePortalCredentials, cleanupPortalCredentials } from "./lib/portal-credential-materializer.js";
+import { select, isCancel } from "@clack/prompts";
 
 
 // Parse arguments
@@ -20,6 +25,134 @@ const promptIndex = args.indexOf("--prompt");
 const initialMessage = promptIndex >= 0 ? args[promptIndex + 1] : undefined;
 const isPrintMode = args.includes("--print") || !!initialMessage;
 const continueSession = args.includes("--continue");
+const agentFlagIndex = args.indexOf("--agent");
+const explicitAgent: string | undefined = agentFlagIndex >= 0 ? args[agentFlagIndex + 1] : undefined;
+
+// Portal snapshot: when a local Portal is running and has multiple agents
+// configured, resolve which agent to use BEFORE fetching the scoped snapshot.
+//   * --agent <name> flag             → use that (error if not found)
+//   * Portal has 0 agents             → unscoped snapshot (legacy behaviour)
+//   * Portal has 1 agent              → use it silently
+//   * Portal has 2+ agents + no flag  → interactive picker (print mode: err)
+let portalSnapshot: Awaited<ReturnType<typeof tryLoadPortalSnapshot>> = null;
+{
+  // First fetch unscoped to discover available agents + whether Portal is up.
+  const probe = await loadPortalSnapshotDetailed();
+  if (probe.snapshot) {
+    const agentCount = probe.snapshot.availableAgents.length;
+
+    let chosenAgent: string | undefined = explicitAgent;
+    if (!chosenAgent && agentCount >= 2) {
+      // `isTTY` is `true` when attached, `undefined` when piped/redirected —
+      // compare against `true` explicitly so the non-interactive branch is
+      // taken in both the undefined and false cases without relying on the
+      // coincidental truthiness of `!undefined`.
+      if (isPrintMode || process.stdin.isTTY !== true) {
+        console.error("[siclaw] Portal has multiple agents configured; pass --agent <name> in non-interactive mode.");
+        console.error("Available agents:");
+        for (const a of probe.snapshot.availableAgents) {
+          console.error(`  ${a.name}${a.description ? ` — ${a.description}` : ""}`);
+        }
+        process.exit(1);
+      }
+      const picked = await select({
+        message: "Portal has multiple agents configured — which one?",
+        options: probe.snapshot.availableAgents.map((a) => ({
+          value: a.name,
+          label: a.name,
+          hint: a.description ?? undefined,
+        })),
+      });
+      if (isCancel(picked)) process.exit(0);
+      chosenAgent = picked as string;
+    }
+    if (!chosenAgent && agentCount === 1) {
+      chosenAgent = probe.snapshot.availableAgents[0].name;
+      console.log(`[siclaw] Using Portal agent: ${chosenAgent}`);
+    }
+
+    // Now fetch the (possibly scoped) snapshot we'll actually use.
+    if (chosenAgent) {
+      const scoped = await loadPortalSnapshotDetailed({ agent: chosenAgent });
+      if (scoped.error?.kind === "agent-not-found") {
+        console.error(`[siclaw] Agent "${scoped.error.requested}" not found in Portal.`);
+        console.error("Available agents:");
+        for (const name of scoped.error.available) console.error(`  ${name}`);
+        console.error("\nRun `siclaw agents` for more details.");
+        process.exit(1);
+      }
+      portalSnapshot = scoped.snapshot;
+    } else {
+      portalSnapshot = probe.snapshot;
+    }
+  }
+}
+let portalSkillsDir: string | undefined;
+let portalKnowledgeDir: string | undefined;
+let portalCredentialsDir: string | undefined;
+if (portalSnapshot) {
+  setPortalSnapshot({
+    providers: portalSnapshot.providers,
+    default: portalSnapshot.default ?? undefined,
+    mcpServers: portalSnapshot.mcpServers,
+  });
+  // Materialize Portal skills into an ephemeral cache so pi-coding-agent's
+  // filesystem-based skill loader reads them unchanged. Only when the
+  // snapshot actually carries skills — empty array shouldn't clobber the
+  // regular filesystem fallback.
+  // Collect cleanup thunks so a single shutdown handler sweeps all three
+  // dirs. Registered on SIGINT + SIGTERM + exit — the `exit` listener is
+  // what covers the happy-path `process.exit(0)` case, so `.portal-snapshot/
+  // credentials/` (plaintext SSH keys + kubeconfigs) cannot outlive the
+  // session and end up in a stray `git add -A`.
+  const snapshotCleanups: Array<() => void> = [];
+  if (Array.isArray(portalSnapshot.skills) && portalSnapshot.skills.length > 0) {
+    const skillCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/skills");
+    const result = materializePortalSkills(portalSnapshot.skills, skillCacheDir);
+    portalSkillsDir = result.rootDir;
+    snapshotCleanups.push(() => cleanupPortalSkills(skillCacheDir));
+    console.log(`[siclaw] Materialized ${result.count} Portal skills into ${result.rootDir}${result.skipped.length ? ` (skipped ${result.skipped.length} with unsafe names: ${result.skipped.join(", ")})` : ""}`);
+  }
+  if (Array.isArray(portalSnapshot.knowledge) && portalSnapshot.knowledge.length > 0) {
+    const knowledgeCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/knowledge");
+    const kres = materializePortalKnowledge(portalSnapshot.knowledge, knowledgeCacheDir);
+    portalKnowledgeDir = kres.rootDir;
+    snapshotCleanups.push(() => cleanupPortalKnowledge(knowledgeCacheDir));
+    const failureNote = kres.failures.length > 0
+      ? ` (failures: ${kres.failures.map(f => `${f.repo}: ${f.error}`).join("; ")})`
+      : "";
+    console.log(`[siclaw] Materialized ${kres.reposUnpacked} Portal knowledge repo(s), ${kres.fileCount} page(s) into ${kres.rootDir}${failureNote}`);
+  }
+  const credsCount = (portalSnapshot.credentials?.clusters?.length ?? 0) + (portalSnapshot.credentials?.hosts?.length ?? 0);
+  if (credsCount > 0) {
+    const credsCacheDir = path.resolve(process.cwd(), ".siclaw/.portal-snapshot/credentials");
+    const cres = await materializePortalCredentials(portalSnapshot.credentials, credsCacheDir);
+    portalCredentialsDir = cres.rootDir;
+    snapshotCleanups.push(() => cleanupPortalCredentials(credsCacheDir));
+    const failureNote = cres.failures.length > 0
+      ? ` (failures: ${cres.failures.map(f => `${f.kind}/${f.name}: ${f.error}`).join("; ")})`
+      : "";
+    console.log(`[siclaw] Materialized ${cres.clusters} cluster(s) + ${cres.hosts} host(s) into ${cres.rootDir}${failureNote}`);
+  }
+  if (snapshotCleanups.length > 0) {
+    let alreadySwept = false;
+    const sweepSnapshots = (): void => {
+      if (alreadySwept) return;
+      alreadySwept = true;
+      for (const fn of snapshotCleanups) {
+        try { fn(); } catch { /* best-effort; one dir failing shouldn't block the others */ }
+      }
+    };
+    process.on("exit", sweepSnapshots);
+    process.on("SIGINT", sweepSnapshots);
+    process.on("SIGTERM", sweepSnapshots);
+  }
+  const agentNote = portalSnapshot.activeAgent
+    ? ` agent=${portalSnapshot.activeAgent.name}`
+    : "";
+  console.log(`[siclaw] Using Portal snapshot from ${portalSnapshot.portalUrl} (generated ${portalSnapshot.generatedAt})${agentNote}`);
+  console.log(`[siclaw] Portal snapshot providers=${Object.keys(portalSnapshot.providers).length} mcp=${Object.keys(portalSnapshot.mcpServers).length} skills=${portalSnapshot.skills.length} knowledge=${portalSnapshot.knowledge.length} creds=${credsCount} default=${portalSnapshot.default ? `${portalSnapshot.default.provider}/${portalSnapshot.default.modelId}` : "(none)"}`);
+}
 
 // P0: First-run setup — if no LLM config, run interactive wizard
 if (needsSetup()) {
@@ -42,9 +175,11 @@ const sessionManager = continueSession
   ? SessionManager.continueRecent(process.cwd())
   : SessionManager.create(process.cwd());
 
-// Resolve credentialsDir from config and pass to session (fixes TUI credential_list + kubectl)
+// Resolve credentialsDir for kubectl + /setup + banner display. When a Portal
+// snapshot materialized credentials into an ephemeral dir, use THAT so the
+// banner count and tools all agree on the same source of truth.
 const config = loadConfig();
-const credentialsDir = path.resolve(process.cwd(), config.paths.credentialsDir);
+const credentialsDir = portalCredentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir);
 
 // Start background GC for orphaned debug pods (best-effort; silently skips if no cluster)
 void debugPodGC.start(credentialsDir).catch((err) => {
@@ -57,6 +192,15 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
     sessionManager,
     mode: "cli",
     kubeconfigRef: { credentialsDir },
+    portalSkillsDir,
+    portalKnowledgeDir,
+    portalCredentialsDir,
+    // When the snapshot is scoped to an agent that carries a custom
+    // system_prompt, swap out siclaw's default SRE prompt for the agent's.
+    systemPromptTemplate: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
+    portalActiveAgent: portalSnapshot?.activeAgent ?? null,
+    portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
+    portalUrl: portalSnapshot?.portalUrl,
   });
 
 // P1-1: Startup status summary

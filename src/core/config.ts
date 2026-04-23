@@ -138,6 +138,32 @@ export function getConfigPath(): string {
  * Load configuration from `.siclaw/config/settings.json`, merging with defaults.
  * Result is cached — subsequent calls return the same object.
  */
+/**
+ * Portal snapshot override — when set (typically by cli-main.ts right after
+ * fetching from a running local Portal), these fields take precedence over
+ * whatever settings.json has for the same keys. Set to null to clear.
+ *
+ * This is how CLI mode "inherits" Portal's configuration without having to
+ * materialise a settings.json file: the snapshot lives only in memory for
+ * the duration of the session.
+ */
+let snapshotOverride: {
+  providers?: SiclawConfig["providers"];
+  default?: SiclawConfig["default"];
+  mcpServers?: SiclawConfig["mcpServers"];
+} | null = null;
+
+export function setPortalSnapshot(
+  override: {
+    providers?: SiclawConfig["providers"];
+    default?: SiclawConfig["default"];
+    mcpServers?: SiclawConfig["mcpServers"];
+  } | null,
+): void {
+  snapshotOverride = override;
+  cached = null;  // next loadConfig() will reapply the override
+}
+
 export function loadConfig(): SiclawConfig {
   if (cached) return cached;
 
@@ -153,6 +179,19 @@ export function loadConfig(): SiclawConfig {
   }
 
   cached = deepMerge(DEFAULTS as unknown as Record<string, unknown>, fileConfig) as unknown as SiclawConfig;
+
+  // Apply Portal snapshot overrides AFTER file merge so Portal state wins.
+  if (snapshotOverride) {
+    if (snapshotOverride.providers && Object.keys(snapshotOverride.providers).length > 0) {
+      cached.providers = snapshotOverride.providers;
+    }
+    if (snapshotOverride.default) {
+      cached.default = snapshotOverride.default;
+    }
+    if (snapshotOverride.mcpServers && Object.keys(snapshotOverride.mcpServers).length > 0) {
+      cached.mcpServers = snapshotOverride.mcpServers;
+    }
+  }
 
   // Environment variable overrides (deployment/infrastructure only — NOT LLM config)
   if (process.env.SICLAW_AGENTBOX_PORT) {

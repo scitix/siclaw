@@ -24,9 +24,11 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 | Process | Single monolithic | Gateway + in-process AgentBoxes | Gateway Pod + one Pod per user |
 | Filesystem | Shared (single user) | **ALL users share one filesystem** | Each pod has isolated filesystem |
 | Database | None (file-based) | SQLite via node:sqlite (default) or MySQL | MySQL (required) |
-| Auth | None | JWT | mTLS (cert per pod) + JWT |
-| Skills source | Local `./skills/` | DB → shared `./skills/` | DB → pod-local emptyDir |
-| MCP source | Local file | DB merge + local file | DB merge |
+| Auth | None (standalone) / JWT (with local Portal) | JWT | mTLS (cert per pod) + JWT |
+| Skills source | Local `./skills/` (standalone) / Portal snapshot (with local Portal) | DB → shared `./skills/` | DB → pod-local emptyDir |
+| MCP source | Local file (standalone) / Portal snapshot | DB merge + local file | DB merge |
+
+TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired** (a `siclaw local` Portal is running and `.siclaw/local-secrets.json` exists). The second sub-mode is described in §1.4.
 
 ### 1.2 ⚠️ Critical: LocalSpawner Filesystem Sharing
 
@@ -50,6 +52,66 @@ Siclaw runs in three modes that differ fundamentally in process and filesystem t
 - Pod self-destructs after 5 minutes of idle (no SSE connections, no sessions)
 
 **Source**: `src/gateway/agentbox/k8s-spawner.ts`, `src/agentbox/http-server.ts` (IDLE_TIMEOUT_MS)
+
+### 1.4 TUI + Local Portal: Read-Only Snapshot Contract
+
+**Invariant**: When `siclaw` (TUI) starts in a cwd where a local Portal is reachable (`.siclaw/local-secrets.json` is present AND `http://127.0.0.1:3000/api/health` responds within the 1.5 s probe budget), Portal is the **read-only source of truth** for the session's skills, knowledge pages, credentials, agents, MCP servers, and LLM providers. The TUI is strictly an observer — it never mutates Portal state from the terminal.
+
+**Consequences**:
+- All mutations (create/edit/delete agents, skills, hosts, clusters, providers) happen in Portal Web UI. The TUI's `/setup` slash command detects Portal mode and becomes a read-only list view with "Open in Portal →" links.
+- First-run setup flows redirect to Portal. When Portal is reachable and `settings.json` is missing, `src/cli-first-run.ts` prints instructions, offers an interactive Y/n "open browser now?" prompt, and exits without writing `settings.json`. This prevents per-workstation "ghost providers" that never reach Portal and silently desync between machines.
+- Standalone TUI (no Portal in cwd) keeps the legacy `settings.json` flow — do not break it.
+
+**Snapshot contract** (`src/portal/cli-snapshot-api.ts`):
+
+```
+GET /api/v1/cli-snapshot[?agent=<name>]
+X-Siclaw-Cli-Snapshot-Secret: <local-secrets.cliSnapshotSecret>
+
+Response shape (always present):
+  providers       { [name]: ProviderConfig }   // LLM provider configs
+  default         string | null                // Default provider name
+  mcpServers      { [id]: McpServerConfig }    // MCP servers (agent-scoped when ?agent=)
+  skills          CliSnapshotSkill[]           // Full specs + scripts; core skills excluded
+  knowledge       CliSnapshotKnowledgeRepo[]   // Tarball payloads, base64
+  credentials     { clusters[], hosts[] }      // Kubeconfigs + SSH hosts (agent-scoped when ?agent=)
+  availableAgents CliSnapshotAgentMeta[]       // Always populated; powers picker UX
+  activeAgent     CliSnapshotActiveAgent | null
+  generatedAt     ISO 8601 timestamp
+```
+
+- `?agent=<name>` filters skills / credentials / knowledge / MCP through the `agent_*` join tables. Missing name → `404` with `{ availableAgents: string[] }` so the client can show a friendly "did you mean..." list.
+- The endpoint is read-only by design. Any future write operations must go through Portal's existing `/api/v1/*` resource endpoints, never through this URL.
+
+**Defence-in-depth gating** — three independent checks must all pass:
+
+1. `enableCliSnapshot` must be `true` at `startPortal()` time. `cli-local.ts` passes it; `portal-main.ts` (prod K8s) does not. When `false` the route is simply not registered, so no gate beyond this matters.
+2. Request origin must be loopback — `127.0.0.1` / `::1` / `::ffff:127.0.0.1`. A rogue Ingress or a misconfigured helm override that ever flips `enableCliSnapshot` on cannot leak through a remote socket.
+3. Request must carry `X-Siclaw-Cli-Snapshot-Secret` whose value matches `local-secrets.cliSnapshotSecret`. This is a **dedicated** secret — not `jwtSecret`. Reading the snapshot does NOT also grant the caller the ability to self-sign admin JWTs against every other admin-gated route. The TUI in `portal-snapshot-client.ts` reads `.siclaw/local-secrets.json` once, sends only the header, and never forges a JWT.
+
+The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the Portal cwd", which matches single-user local mode. A missing `cliSnapshotSecret` in an older secrets file (pre-split) degrades gracefully — the client treats it as no-Portal and falls back to `settings.json`.
+
+**Ephemeral materialization** (`src/lib/portal-{skill,knowledge,credential}-materializer.ts`):
+
+```
+.siclaw/.portal-snapshot/
+├── skills/<skill-name>/              ← SKILL.md + scripts/* per skill
+├── knowledge/<repo-name>/            ← tarball-unpacked files
+└── credentials/
+    ├── manifest.json                 ← { name, type, metadata }
+    ├── <host-name>.ssh_config
+    ├── <host-name>.password / .privateKey
+    └── <cluster-name>.kubeconfig
+```
+
+- The directory is **ephemeral**: TUI wipes it on `SIGINT` / `SIGTERM` / normal exit.
+- These materializers are **distinct from** `skillsHandler.materialize()` (§1.2). The canonical handler mutates `skills/{global,skillset,user}/` and is unsafe in LocalSpawner's shared filesystem; the Portal-snapshot materializers write only to `.siclaw/.portal-snapshot/` inside the cwd and are scoped to the TUI process. Do not consolidate the two without redesigning the skill-bundle contract.
+- `agent-factory.ts` picks up these paths via new `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts; when set, they override `config.paths.*` so the agent's Read tool, `local_script`, and kubectl use Portal content.
+
+**Skill filter** (`src/core/agent-factory.ts`):
+When a Portal snapshot is active, pi-coding-agent's `DefaultResourceLoader` auto-discovered user-global skills (e.g. `~/.pi/agent/skills/`) are filtered out — a `skillsOverride` keeps only skills whose path sits under the Portal-materialized dir or the repo's `skills/platform/`. This ensures the Portal operator's skill list is the single source of truth for what the agent can invoke.
+
+**Source**: `src/portal/cli-snapshot-api.ts`, `src/lib/portal-snapshot-client.ts`, `src/lib/portal-{skill,knowledge,credential}-materializer.ts`, `src/cli-first-run.ts`, `src/cli-main.ts`, `src/core/extensions/{ls,agent,setup}.ts`
 
 ---
 

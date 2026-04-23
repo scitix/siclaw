@@ -17,6 +17,7 @@ import {
   createLsTool,
   type AgentSession,
   type ToolDefinition,
+  type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
@@ -28,6 +29,8 @@ import compactionSafeguardExtension from "./extensions/compaction-safeguard.js";
 import memoryFlushExtension from "./extensions/memory-flush.js";
 import deepInvestigationExtension from "./extensions/deep-investigation.js";
 import setupExtension from "./extensions/setup.js";
+import lsExtension from "./extensions/ls.js";
+import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
@@ -58,6 +61,38 @@ export interface CreateSiclawSessionOpts {
   agentId?: string | null;
   /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
   knowledgeIndexer?: MemoryIndexer;
+  /**
+   * Absolute path to a directory that a local Portal snapshot has materialized
+   * skills into. CLI mode only: when set, the agent session loads builtin
+   * skills from here INSTEAD of `./skills/`, making Portal the source of
+   * truth for skill content. Unset = legacy filesystem behaviour.
+   */
+  portalSkillsDir?: string;
+  /**
+   * Absolute path to a directory that a local Portal snapshot has materialized
+   * knowledge pages into. CLI mode only: when set, replaces
+   * `config.paths.knowledgeDir` so the agent's Read tool + `[[page]]`
+   * wiki-link convention resolves to Portal-managed content.
+   */
+  portalKnowledgeDir?: string;
+  /**
+   * Absolute path to a directory that a local Portal snapshot has materialized
+   * credentials (kubeconfigs + SSH) into. CLI mode only: when set, replaces
+   * `config.paths.credentialsDir` so kubectl / ssh tools + `/setup` list
+   * see Portal-managed credentials. `/setup` writes in this mode go to the
+   * ephemeral dir and are lost on cleanup — edits should happen in Portal UI.
+   */
+  portalCredentialsDir?: string;
+  /** Metadata for all Portal-configured agents (used by /agent + /ls to show list). */
+  portalAvailableAgents?: import("../portal/cli-snapshot-api.js").CliSnapshotAgentMeta[];
+  /** The Portal agent this session is scoped to, null/undefined = unscoped. */
+  portalActiveAgent?: import("../portal/cli-snapshot-api.js").CliSnapshotActiveAgent | null;
+  /**
+   * Base URL of the live local Portal (e.g. http://127.0.0.1:3000). When set,
+   * `/setup` switches to read-only mode + opens Portal Web UI for writes so
+   * edits don't silently dead-end in the ephemeral `.portal-snapshot/` dirs.
+   */
+  portalUrl?: string;
 }
 
 export interface SiclawSessionResult {
@@ -247,6 +282,19 @@ export async function createSiclawSession(
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
 
+  // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
+  // opens its sqlite DB inside memoryDir, and before buildAppendSystemPrompt
+  // reads PROFILE.md below. Previously the mkdir happened later in the function,
+  // so a fresh install saw ERR_SQLITE_ERROR on first run and lost memory tools
+  // for that session.
+  if (!fs.existsSync(memoryDir)) {
+    fs.mkdirSync(memoryDir, { recursive: true });
+  }
+  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
+  if (!fs.existsSync(skeletonProfilePath)) {
+    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+  }
+
   // ── Memory indexer init (before resolve — memory tools use `available` guard) ──
   // TIMING: must run before DefaultResourceLoader construction (L~478) so that
   // the memoryFlushExtension lambda captures the initialized .current value.
@@ -337,8 +385,14 @@ export async function createSiclawSession(
   const reposDir = path.resolve(cwd, config.paths.reposDir);
   const docsDir = path.resolve(cwd, config.paths.docsDir);
   const tracesDir = path.resolve(cwd, ".siclaw", "traces");
-  const knowledgeDir = path.resolve(cwd, config.paths.knowledgeDir);
-  const readAllowedDirs = [builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir, os.tmpdir()];
+  const knowledgeDir = opts?.portalKnowledgeDir && fs.existsSync(opts.portalKnowledgeDir)
+    ? opts.portalKnowledgeDir
+    : path.resolve(cwd, config.paths.knowledgeDir);
+  const readAllowedDirs = [
+    builtinSkillsRoot, skillsBase, userDataDir, reportsDir, tracesDir, reposDir, docsDir, knowledgeDir,
+    os.tmpdir(),
+    ...(opts?.portalSkillsDir ? [opts.portalSkillsDir] : []),
+  ];
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
@@ -410,7 +464,11 @@ export async function createSiclawSession(
   const platformPath = path.resolve(cwd, "skills", "platform");
 
   const skillsDirs: string[] = [];
-  if (fs.existsSync(resolvedSkillsDir)) {
+  if (opts?.portalSkillsDir && fs.existsSync(opts.portalSkillsDir)) {
+    // CLI mode with a live local Portal: skills already fetched + materialized
+    // by cli-main → prefer them over repo-local or gateway-synced sources.
+    skillsDirs.push(opts.portalSkillsDir);
+  } else if (fs.existsSync(resolvedSkillsDir)) {
     skillsDirs.push(resolvedSkillsDir);
   } else {
     for (const bDir of [builtinPath, extensionPath]) {
@@ -421,12 +479,42 @@ export async function createSiclawSession(
   if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
 
   // Resolve credentials directory for tools and /setup extension
-  const credentialsDir = kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir);
+  // Credentials dir: Portal snapshot override > explicit kubeconfigRef > config default.
+  // Portal-materialized dir wins so kubectl / ssh / /setup list see the
+  // Portal-managed credentials in CLI mode with a live local Portal.
+  const credentialsDir = (opts?.portalCredentialsDir && fs.existsSync(opts.portalCredentialsDir))
+    ? opts.portalCredentialsDir
+    : (kubeconfigRef.credentialsDir || path.resolve(cwd, config.paths.credentialsDir));
 
   // Agent system prompt append (shared between pi-agent and SDK brain)
   const agentSystemPromptAppend = opts?.systemPromptAppend;
 
-  const loader = new DefaultResourceLoader({
+  // Forward-declared so the CLI-only /ls extension factory can close over it.
+  // Safe because extension command handlers run long after the constructor
+  // returns.
+  let loader!: DefaultResourceLoader;
+
+  const cliOnlyFactories = mode === "cli"
+    ? [
+        (api: ExtensionAPI) =>
+          lsExtension(api, {
+            getLoadedSkills: () => loader.getSkills().skills,
+            credentialsDir,
+            knowledgeDir,
+            activeAgentName: opts?.portalActiveAgent?.name ?? null,
+            availableAgents: opts?.portalAvailableAgents ?? [],
+            activeAgent: opts?.portalActiveAgent ?? null,
+          }),
+        (api: ExtensionAPI) =>
+          agentExtension(api, {
+            activeAgent: opts?.portalActiveAgent ?? null,
+            availableAgents: opts?.portalAvailableAgents ?? [],
+            portalUrl: opts?.portalUrl ?? null,
+          }),
+      ]
+    : [];
+
+  loader = new DefaultResourceLoader({
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
@@ -437,7 +525,31 @@ export async function createSiclawSession(
       return parts;
     },
     // Extension registration order: compactionSafeguard handles session_before_compact.
-    extensionFactories: [contextPruningExtension, compactionSafeguardExtension, (api) => memoryFlushExtension(api, memoryIndexerRef.current), (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef), (api) => setupExtension(api, credentialsDir)],
+    extensionFactories: [
+      contextPruningExtension,
+      compactionSafeguardExtension,
+      (api) => memoryFlushExtension(api, memoryIndexerRef.current),
+      (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
+      (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
+      ...cliOnlyFactories,
+    ],
+    // In Portal-unified mode, filter out skills that didn't come from either
+    // the Portal-materialized dir or the repo's platform dir. Without this
+    // filter, pi-coding-agent's DefaultResourceLoader also picks up whatever
+    // the user has at `~/.pi/agent/skills/` (e.g. personal lark-cli tools) —
+    // fine for standalone use, but violates "Portal is the source of truth"
+    // when we've just fetched a scoped snapshot.
+    skillsOverride: opts?.portalSkillsDir
+      ? (base) => ({
+          skills: base.skills.filter((s) => {
+            if (!s.filePath) return false;
+            if (s.filePath.startsWith(opts.portalSkillsDir!)) return true;
+            if (fs.existsSync(platformPath) && s.filePath.startsWith(platformPath)) return true;
+            return false;
+          }),
+          diagnostics: base.diagnostics,
+        })
+      : undefined,
     additionalSkillPaths: skillsDirs,
   });
   await loader.reload();
@@ -451,15 +563,6 @@ export async function createSiclawSession(
   }
   if (skillDiagnostics.length > 0) {
     console.log(`[agent-factory] Skill diagnostics: ${JSON.stringify(skillDiagnostics)}`);
-  }
-
-  // Ensure memoryDir and skeleton PROFILE.md exist (both brain paths need this)
-  if (!fs.existsSync(memoryDir)) {
-    fs.mkdirSync(memoryDir, { recursive: true });
-  }
-  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
-  if (!fs.existsSync(skeletonProfilePath)) {
-    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
   }
 
   const sessionManager =

@@ -50,7 +50,11 @@ node siclaw.mjs
 
 On first run, Siclaw launches a setup wizard to configure your LLM provider.
 
-If you prefer, you can also edit `.siclaw/config/settings.json` manually:
+<Note>
+If you started `siclaw local` first (recommended for teams), the wizard detects the running Portal and redirects provider setup to the Portal Web UI's **Models** page. One configuration in Portal serves every paired TUI — no per-workstation `settings.json` to drift out of sync.
+</Note>
+
+If you prefer the standalone TUI path, you can also edit `.siclaw/config/settings.json` manually:
 
 ```json
 {
@@ -86,8 +90,8 @@ Investigation traces are saved to `.siclaw/traces/` (relative to where Siclaw wa
 
 To investigate Kubernetes issues, import a kubeconfig into Siclaw:
 
-- **TUI**: `/setup`
-- **Local Server**: **Credentials** page in the Web UI
+- **Standalone TUI** (no local Portal): `/setup` inside the session
+- **Local Server, or TUI paired with one**: **Clusters** / **Hosts** in the Web UI — paired TUIs pick up the imports on the next launch
 
 Siclaw uses its stored credentials when running diagnostic tools.
 

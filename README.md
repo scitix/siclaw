@@ -73,6 +73,17 @@ siclaw --prompt "Why is pod nginx-abc in CrashLoopBackOff?"
 siclaw --continue
 ```
 
+**Paired with a local server** (see profile 2 below): when `siclaw local` is running in the same working directory, the TUI automatically pairs with it and treats the Portal Web UI as the source of truth for skills, knowledge, credentials, agents, and LLM providers. Useful slash commands in that mode:
+
+| Command | What it does |
+|---|---|
+| `/ls` | Summary of the current session's skills / knowledge / MCP / credentials / agents |
+| `/ls skills` / `/ls credentials` / `/ls agents` / ... | Full listing for one category |
+| `/agent` | Show current Portal agent and all available ones; create / edit happens in Portal Web UI |
+| `/setup` | Read-only view of configured resources with "Open in Portal →" links |
+
+Pass `--agent <name>` to scope the session to one Portal-configured agent (its bound skills / credentials / knowledge / MCP / preferred model). `siclaw agents` lists them non-interactively from the shell.
+
 <details>
 <summary><b>Build from source</b></summary>
 
@@ -156,9 +167,9 @@ The default chart exposes the **Portal** Service on service port `3003` and Node
 
 ### TUI / CLI
 
-- TUI reads `.siclaw/config/settings.json`
-- The first-run wizard can generate this file for you
-- Kubernetes credentials should be imported through `/setup`
+- TUI reads `.siclaw/config/settings.json` in **standalone mode** (no local Portal running in the same cwd)
+- The first-run wizard can generate `settings.json` for you — but **if a `siclaw local` server is running in the same cwd, the wizard will redirect you to the Portal Web UI** instead (Portal is the single source of truth in that mode)
+- Kubernetes credentials should be imported through `/setup` in standalone TUI; in Portal-paired TUI, `/setup` becomes a read-only view and mutations happen in the Web UI
 - Investigation traces are written to `.siclaw/traces/` (relative to where Siclaw was launched)
 
 Minimal example:
