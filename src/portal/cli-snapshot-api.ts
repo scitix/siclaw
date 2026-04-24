@@ -175,12 +175,15 @@ interface AgentRow {
 // to `src/shared/cli-snapshot-types.ts` so that `src/core/` (compiled into
 // the AgentBox image) can type-check against them without a compile-time
 // dependency on this Portal handler module — which the agentbox Dockerfile
-// intentionally does not copy. Re-export here preserves the original import
-// paths for existing external consumers (portal-web, siclaw-tui, etc.).
-export type {
+// intentionally does not copy. The `import type` brings the names into this
+// file's local scope (used by L224, L226, L487, L496 below); the `export
+// type` preserves the original public import path for existing external
+// consumers (portal-web, siclaw-tui, etc.).
+import type {
   CliSnapshotAgentMeta,
   CliSnapshotActiveAgent,
 } from "../shared/cli-snapshot-types.js";
+export type { CliSnapshotAgentMeta, CliSnapshotActiveAgent };
 
 export interface CliSnapshotSkill {
   /** Name from SKILL.md frontmatter; used as the materialized directory name. */
