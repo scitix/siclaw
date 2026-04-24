@@ -174,6 +174,7 @@ Phase 1 validates the DP loop with direct same-agent delegation:
 - Delegation tools are exposed to the model only while Deep Investigation is visibly active (`[Deep Investigation]` marker or restored DP-active state). Normal chat sessions do not receive the delegation executor, so the registry does not include these tool schemas.
 - The child receives only the model-written `scope` and `context_summary`, not the whole parent transcript.
 - The result returns to the parent model as a normal tool result and renders as an Agent Work Card.
+- Each child completion also writes a hidden `delegation_event` row into the parent chat session. In the synchronous Phase 1 flow this is audit/event metadata only; the visible UI continues to use the Agent Work Card. The event shape is intentionally compatible with a future async Notify scheduler, where the same capsule can become a synthetic parent input.
 - Delegated sessions deliberately do not receive delegation tools, preventing recursive fan-out in the first implementation.
 
 Cross-agent expert collaboration (`agent_id !== "self"`) is intentionally not implemented here. It must route through gateway/portal to the target agent's AgentBox so model config, system prompt, tools, credentials, and future permission boundaries are real.
@@ -493,6 +494,13 @@ Delegation tools are hidden in ordinary chat: `delegate_to_agent` and `delegate_
 - Do not fake non-self target agents inside the current AgentBox.
 - Route through gateway/portal to the target agent's AgentBox so the target's system prompt, model, tools, credentials, and future permission boundaries are real.
 - Open design questions: agent discovery, context handoff shape, cost/latency display, cancellation, and how expert traces aggregate.
+
+### Step 7.5 — Future: async Notify scheduler
+- Keep synchronous `delegate_to_agents` as the Phase 1 DP baseline.
+- Add a parent-session input queue that can serialize real user messages, cron/task events, and `delegation_event` notifications.
+- Async child sessions should outlive the parent turn; child completion enqueues a small capsule instead of relying on the parent model to poll for results.
+- Persist the synthetic notification with `role="user"` for model compatibility and metadata `kind="delegation_event"` / `source="system_notification"` so UI never renders it as a real user-authored message.
+- Feed only the budgeted capsule to the parent model; full child traces stay in hidden `origin="delegation"` sessions for audit.
 
 ### Step 8 — Future: add permission gate infrastructure
 - New `role="permission"` message type.

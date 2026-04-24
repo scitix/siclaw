@@ -1256,7 +1256,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const pParams: unknown[] = [cutoff];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'user' AND m.created_at >= ?`;
+      WHERE m.role = 'user' AND m.created_at >= ?
+        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);
@@ -1301,7 +1302,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const db = getDb();
     const [rows] = await db.query(
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
-              LEFT(m.tool_input, 500) AS toolInput,
+              SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
               s.user_id AS userId, s.agent_id AS agentId
        FROM chat_messages m
@@ -2263,7 +2264,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const pParams: unknown[] = [cutoff];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'user' AND m.created_at >= ?`;
+      WHERE m.role = 'user' AND m.created_at >= ?
+        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
     const totalPrompts = Number(pRows[0]?.c ?? 0);
@@ -2301,7 +2303,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     const [rows] = await db.query(
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
-              LEFT(m.tool_input, 500) AS toolInput,
+              SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
               s.user_id AS userId, s.agent_id AS agentId
        FROM chat_messages m

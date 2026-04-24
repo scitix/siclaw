@@ -3,6 +3,7 @@ import {
   initChatRepo,
   ensureChatSession,
   appendMessage,
+  appendDelegationEvent,
   updateMessage,
   incrementMessageCount,
   getMessages,
@@ -162,6 +163,59 @@ describe("appendMessage", () => {
       parent_session_id: "parent",
       delegation_id: "delegation-1",
       target_agent_id: "target-agent",
+    });
+  });
+});
+
+describe("appendDelegationEvent", () => {
+  it("persists a model-compatible synthetic event with UI-distinguishing metadata", async () => {
+    fake.responses.set("chat.appendMessage", { id: "event-1" });
+
+    const id = await appendDelegationEvent({
+      parentSessionId: "parent",
+      parentAgentId: "agent-parent",
+      userId: "u1",
+      delegationId: "delegation-1",
+      childSessionId: "child-1",
+      targetAgentId: "agent-parent",
+      status: "done",
+      capsule: "Verdict: likely",
+      fullSummary: "Full report",
+      summaryTruncated: false,
+      scope: "check pods",
+      taskIndex: 2,
+      totalTasks: 3,
+      toolCalls: 7,
+      durationMs: 1234,
+    });
+
+    expect(id).toBe("event-1");
+    expect(fake.calls[0].method).toBe("chat.appendMessage");
+    expect(fake.calls[0].params).toMatchObject({
+      session_id: "parent",
+      role: "user",
+      content: "Verdict: likely",
+      from_agent_id: "agent-parent",
+      delegation_id: "delegation-1",
+      target_agent_id: "agent-parent",
+    });
+    expect(JSON.parse(fake.calls[0].params.metadata)).toEqual({
+      kind: "delegation_event",
+      source: "system_notification",
+      event_type: "delegation.done",
+      delegation_id: "delegation-1",
+      child_session_id: "child-1",
+      target_agent_id: "agent-parent",
+      parent_agent_id: "agent-parent",
+      status: "done",
+      capsule: "Verdict: likely",
+      full_summary: "Full report",
+      summary_truncated: false,
+      scope: "check pods",
+      task_index: 2,
+      total_tasks: 3,
+      tool_calls: 7,
+      duration_ms: 1234,
     });
   });
 });

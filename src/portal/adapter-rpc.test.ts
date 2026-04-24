@@ -1114,7 +1114,7 @@ describe("agent.listForHost", () => {
 
 describe("metrics.summary", () => {
   it("returns summary with default 7d period", async () => {
-    mockQuery(
+    const query = mockQuery(
       [{ c: 10 }],   // total sessions
       [{ c: 50 }],   // total prompts
       [{ userId: "u1", sessions: 5, messages: 30 }],  // by user
@@ -1124,6 +1124,7 @@ describe("metrics.summary", () => {
     expect(result.totalSessions).toBe(10);
     expect(result.totalPrompts).toBe(50);
     expect(result.byUser).toEqual([{ userId: "u1", sessions: 5, messages: 30 }]);
+    expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
   });
 
   it("skips byUser query when userId filter is set", async () => {

@@ -211,6 +211,7 @@ function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): n
 function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
+  const isDelegationEvent = metadata?.kind === "delegation_event"
   const staleDelegation = isStaleDelegationTool(m)
   const toolStatus = toolStatusFromMessage(m)
   const recoveredMetadata = staleDelegation
@@ -231,7 +232,7 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
     toolStatus,
     metadata: recoveredMetadata,
-    hidden: m.hidden,
+    hidden: m.hidden || isDelegationEvent,
     fromAgentId: m.from_agent_id ?? null,
     parentSessionId: m.parent_session_id ?? null,
     delegationId: m.delegation_id ?? null,

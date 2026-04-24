@@ -62,6 +62,24 @@ export interface StoredMessage {
   createdAt: Date;
 }
 
+export interface AppendDelegationEventInput {
+  parentSessionId: string;
+  parentAgentId: string | null;
+  userId: string;
+  delegationId: string;
+  childSessionId: string;
+  targetAgentId: string | null;
+  status: "done" | "failed" | "timed_out" | "cancelled";
+  capsule: string;
+  fullSummary?: string;
+  summaryTruncated?: boolean;
+  scope?: string;
+  taskIndex?: number;
+  totalTasks?: number;
+  toolCalls?: number;
+  durationMs?: number;
+}
+
 /** Module-level FrontendWsClient reference, set via initChatRepo(). */
 let _client: FrontendWsClient | null = null;
 
@@ -120,6 +138,44 @@ export async function appendMessage(msg: AppendMessageInput): Promise<string> {
     target_agent_id: msg.targetAgentId ?? null,
   });
   return result.id;
+}
+
+/**
+ * Persist a parent-session notification that records a delegated child run
+ * result. Today this is audit/event metadata only; the frontend hides it so
+ * the synchronous delegation tool card remains the only visible user surface.
+ * A later async Notify scheduler can feed the same event shape back to the
+ * parent model as a synthetic user turn.
+ */
+export async function appendDelegationEvent(evt: AppendDelegationEventInput): Promise<string> {
+  const metadata: Record<string, unknown> = {
+    kind: "delegation_event",
+    source: "system_notification",
+    event_type: `delegation.${evt.status}`,
+    delegation_id: evt.delegationId,
+    child_session_id: evt.childSessionId,
+    target_agent_id: evt.targetAgentId,
+    parent_agent_id: evt.parentAgentId,
+    status: evt.status,
+    capsule: evt.capsule,
+    ...(evt.fullSummary ? { full_summary: evt.fullSummary } : {}),
+    ...(evt.summaryTruncated != null ? { summary_truncated: evt.summaryTruncated } : {}),
+    ...(evt.scope ? { scope: evt.scope } : {}),
+    ...(evt.taskIndex != null ? { task_index: evt.taskIndex } : {}),
+    ...(evt.totalTasks != null ? { total_tasks: evt.totalTasks } : {}),
+    ...(evt.toolCalls != null ? { tool_calls: evt.toolCalls } : {}),
+    ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
+  };
+
+  return appendMessage({
+    sessionId: evt.parentSessionId,
+    role: "user",
+    content: evt.capsule,
+    metadata,
+    fromAgentId: evt.targetAgentId,
+    delegationId: evt.delegationId,
+    targetAgentId: evt.targetAgentId,
+  });
 }
 
 /** Update an existing persisted message row. Used to turn running tool rows into completed rows. */

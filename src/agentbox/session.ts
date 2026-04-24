@@ -31,7 +31,7 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import { appendMessage, ensureChatSession, updateMessage } from "../gateway/chat-repo.js";
+import { appendDelegationEvent, appendMessage, ensureChatSession, updateMessage } from "../gateway/chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../gateway/output-redactor.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -669,8 +669,32 @@ Always end with a final report even if evidence is incomplete.`;
         });
       });
     }
-    await persistQueue;
     const bundle = buildDelegateSummaryBundle(finalText.trim() || finalError);
+    const durationMs = Date.now() - startedAt;
+
+    if (persistDelegationTrace && request.parentSessionId && currentAgentId && request.userId) {
+      enqueuePersist(async () => {
+        await appendDelegationEvent({
+          parentSessionId: request.parentSessionId,
+          parentAgentId: request.parentAgentId ?? currentAgentId,
+          userId: request.userId,
+          delegationId,
+          childSessionId,
+          targetAgentId,
+          status,
+          capsule: bundle.capsule,
+          fullSummary: bundle.fullSummary,
+          summaryTruncated: bundle.truncated,
+          scope: request.scope,
+          taskIndex: request.taskIndex,
+          totalTasks: request.totalTasks,
+          toolCalls,
+          durationMs,
+        });
+      });
+    }
+
+    await persistQueue;
     return {
       status,
       summary: bundle.capsule,
@@ -678,7 +702,7 @@ Always end with a final report even if evidence is incomplete.`;
       summaryTruncated: bundle.truncated,
       sessionId: childSessionId,
       toolCalls,
-      durationMs: Date.now() - startedAt,
+      durationMs,
       toolTrace,
     };
   }

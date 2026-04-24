@@ -324,6 +324,7 @@ describe("siclaw-api misc routes", () => {
       }));
       expect(status).toBe(200);
       expect(body.totalSessions).toBe(1);
+      expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
     });
   });
 
