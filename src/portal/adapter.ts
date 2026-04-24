@@ -21,6 +21,11 @@ function requireInternalAuth(req: http.IncomingMessage, internalSecret: string):
   return token === internalSecret;
 }
 
+function jsonParam(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 export function registerAdapterRoutes(router: RestRouter, internalSecret: string): void {
   // GET /api/internal/siclaw/agent/:agentId — agent basic info
   router.get("/api/internal/siclaw/agent/:agentId", async (req, res, params) => {
@@ -551,6 +556,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const body = await parseBody<{
       session_id: string; agent_id: string; user_id: string;
       title?: string; preview?: string; origin?: string;
+      parent_session_id?: string | null; parent_agent_id?: string | null;
+      delegation_id?: string | null; target_agent_id?: string | null;
     }>(req);
     const db = getDb();
     // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
@@ -559,9 +566,11 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const upsert = buildUpsert(
       db,
       "chat_sessions",
-      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin"],
+      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id"],
       [body.session_id, body.agent_id, body.user_id,
-       body.title || "New Session", body.preview || null, 0, body.origin || null],
+       body.title || "New Session", body.preview || null, 0, body.origin || null,
+       body.parent_session_id ?? null, body.parent_agent_id ?? null,
+       body.delegation_id ?? null, body.target_agent_id ?? null],
       ["id"],
       [{ col: "last_active_at", expr: "CURRENT_TIMESTAMP" }],
     );
@@ -579,16 +588,20 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       session_id: string; role: string; content: string;
       tool_name?: string; tool_input?: string; metadata?: any;
       outcome?: string; duration_ms?: number;
+      from_agent_id?: string | null; parent_session_id?: string | null;
+      delegation_id?: string | null; target_agent_id?: string | null;
     }>(req);
     const id = crypto.randomUUID();
     const db = getDb();
     await db.query(
-      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, body.session_id, body.role, body.content,
        body.tool_name || null, body.tool_input || null,
-       body.metadata ? JSON.stringify(body.metadata) : null,
-       body.outcome || null, body.duration_ms ?? null],
+       jsonParam(body.metadata),
+       body.outcome || null, body.duration_ms ?? null,
+       body.from_agent_id ?? null, body.parent_session_id ?? null,
+       body.delegation_id ?? null, body.target_agent_id ?? null],
     );
     // Bump session message_count
     await db.query(
@@ -1173,7 +1186,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     params.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
+      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
+              from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
       params,
     ) as any;
@@ -1852,9 +1866,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const upsert = buildUpsert(
       db,
       "chat_sessions",
-      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin"],
+      ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id"],
       [params.session_id, params.agent_id, params.user_id,
-       params.title || "New Session", params.preview || null, 0, params.origin || null],
+       params.title || "New Session", params.preview || null, 0, params.origin || null,
+       params.parent_session_id ?? null, params.parent_agent_id ?? null,
+       params.delegation_id ?? null, params.target_agent_id ?? null],
       ["id"],
       [{ col: "last_active_at", expr: "CURRENT_TIMESTAMP" }],
     );
@@ -1866,18 +1882,44 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const id = crypto.randomUUID();
     const db = getDb();
     await db.query(
-      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [id, params.session_id, params.role, params.content,
        params.tool_name || null, params.tool_input || null,
-       params.metadata ? JSON.stringify(params.metadata) : null,
-       params.outcome || null, params.duration_ms ?? null],
+       jsonParam(params.metadata),
+       params.outcome || null, params.duration_ms ?? null,
+       params.from_agent_id ?? null, params.parent_session_id ?? null,
+       params.delegation_id ?? null, params.target_agent_id ?? null],
     );
     await db.query(
       `UPDATE chat_sessions SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [params.session_id],
     );
     return { id };
+  });
+
+  handlers.set("chat.updateMessage", async (params) => {
+    const db = getDb();
+    await db.query(
+      `UPDATE chat_messages
+       SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?
+       WHERE id = ? AND session_id = ?`,
+      [
+        params.content ?? "",
+        params.tool_name || null,
+        params.tool_input || null,
+        jsonParam(params.metadata),
+        params.outcome || null,
+        params.duration_ms ?? null,
+        params.id,
+        params.session_id,
+      ],
+    );
+    await db.query(
+      `UPDATE chat_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [params.session_id],
+    );
+    return { ok: true };
   });
 
   handlers.set("chat.getMessages", async (params) => {
@@ -1891,7 +1933,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
     sqlParams.push(limit);
     const [rows] = await db.query(
-      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, created_at
+      `SELECT id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms,
+              from_agent_id, parent_session_id, delegation_id, target_agent_id, created_at
        FROM chat_messages WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
       sqlParams,
     ) as any;

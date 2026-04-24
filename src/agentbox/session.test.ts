@@ -33,13 +33,19 @@ vi.mock("@mariozechner/pi-coding-agent", () => {
 if (!(globalThis as any).__frameworkEntriesState) {
   (globalThis as any).__frameworkEntriesState = { entries: [] };
 }
+if (!(globalThis as any).__fakeBrainFactories) {
+  (globalThis as any).__fakeBrainFactories = [];
+}
 
 vi.mock("../core/agent-factory.js", async () => {
   const { EventEmitter } = await import("node:events");
   const g = globalThis as any;
   g.__createSessionCalls = g.__createSessionCalls ?? [];
+  g.__fakeBrainFactories = g.__fakeBrainFactories ?? [];
   function createFakeBrain() {
     const emitter = new EventEmitter();
+    const behaviorFactory = g.__fakeBrainFactories.shift();
+    const behavior = behaviorFactory ? behaviorFactory(emitter) : {};
     const subscribe = (cb: (e: any) => void) => {
       emitter.on("event", cb);
       return () => emitter.off("event", cb);
@@ -48,8 +54,8 @@ vi.mock("../core/agent-factory.js", async () => {
       emitter,
       subscribe,
       reload: async () => {},
-      prompt: async () => {},
-      abort: async () => {},
+      prompt: behavior.prompt ?? (async () => {}),
+      abort: behavior.abort ?? (async () => {}),
       steer: async () => {},
       clearQueue: () => ({ steering: [], followUp: [] }),
       getModel: () => null,
@@ -133,6 +139,7 @@ beforeEach(() => {
   _cfgCredentialsDir = path.join(tmpDir, ".siclaw/credentials");
   (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
   (globalThis as any).__createSessionCalls.length = 0;
+  (globalThis as any).__fakeBrainFactories.length = 0;
   lastCreateSiclawSession.calls = (globalThis as any).__createSessionCalls;
 });
 
@@ -195,6 +202,46 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls[0].mode).toBe("web");
   });
 
+  it("hides delegation tools by default", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1");
+    const opts = lastCreateSiclawSession.calls[0];
+    expect(s.delegationToolsEnabled).toBe(false);
+    expect(opts.enableDelegationTools).toBe(false);
+    expect(opts.delegateToAgentExecutor).toBeUndefined();
+  });
+
+  it("injects the delegation executor only when requested", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+    const opts = lastCreateSiclawSession.calls[0];
+    expect(s.delegationToolsEnabled).toBe(true);
+    expect(opts.enableDelegationTools).toBe(true);
+    expect(typeof opts.delegateToAgentExecutor).toBe("function");
+  });
+
+  it("rebuilds an idle session when delegation tool exposure changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    const s2 = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+
+    expect(s2).not.toBe(s1);
+    expect(s2.delegationToolsEnabled).toBe(true);
+    expect(lastCreateSiclawSession.calls).toHaveLength(2);
+  });
+
+  it("does not rebuild an active prompt when delegation tool exposure changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    s1._promptDone = false;
+
+    const s2 = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+
+    expect(s2).toBe(s1);
+    expect(s2.delegationToolsEnabled).toBe(false);
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
   it("populates sessionIdRef.current so skill_call events can attribute the session", async () => {
     // NOTE: We cannot inspect the sessionIdRef directly through the mock
     // factory pattern (mocks' return values are awaited-consumed), so we
@@ -204,6 +251,125 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     const s = await mgr.getOrCreate("abc-123");
     expect(s.id).toBe("abc-123");
+  });
+});
+
+describe("AgentBoxSessionManager — delegated agent timeout policy", () => {
+  const request = {
+    agentId: "self",
+    scope: "Investigate one bounded issue.",
+    contextSummary: "Parent context.",
+    parentSessionId: "parent-session",
+    parentAgentId: "agent-a",
+    userId: "alice",
+  };
+
+  it("keeps a delegated run alive while child events are still arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        abort,
+        prompt: () => new Promise<void>((resolve) => {
+          setTimeout(() => {
+            emitter.emit("event", { type: "tool_execution_end" });
+          }, 50_000);
+          setTimeout(() => {
+            emitter.emit("event", {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Child final report." }],
+              },
+            });
+            resolve();
+          }, 70_000);
+        }),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(50_000);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("done");
+      expect(result.fullSummary).toContain("Child final report.");
+      expect(result.toolCalls).toBe(1);
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat an in-flight child tool call as idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        abort,
+        prompt: () => new Promise<void>((resolve) => {
+          emitter.emit("event", { type: "tool_execution_start", toolName: "long_tool", args: {} });
+          setTimeout(() => {
+            emitter.emit("event", { type: "tool_execution_end", toolName: "long_tool", result: { content: [] } });
+          }, 70_000);
+          setTimeout(() => {
+            emitter.emit("event", {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Long tool completed." }],
+              },
+            });
+            resolve();
+          }, 71_000);
+        }),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(61_000);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("done");
+      expect(result.fullSummary).toContain("Long tool completed.");
+      expect(result.toolCalls).toBe(1);
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a delegated run after 60s without child activity", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push(() => ({
+        abort,
+        prompt: () => new Promise<void>(() => {}),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(60_001);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("timed_out");
+      expect(result.fullSummary).toContain("stopped producing activity for 60000ms");
+      expect(abort).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -162,8 +162,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             persistMessages: true,
             redactionConfig,
             signal: abortCtrl.signal,
-            onEvent: (evt) => {
-              context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: evt });
+            onEvent: (evt, _eventType, extras) => {
+              context.sendEvent("chat.event", {
+                sessionId: promptResult.sessionId,
+                event: extras.dbMessageId ? { ...evt, dbMessageId: extras.dbMessageId } : evt,
+              });
             },
           });
           // Signal Portal that the prompt is fully complete (all agent turns done).

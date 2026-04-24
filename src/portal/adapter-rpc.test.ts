@@ -632,6 +632,29 @@ describe("chat.ensureSession", () => {
     );
     expect(query.mock.calls[0][1]).toContain("New Session");
   });
+
+  it("persists delegation lineage fields", async () => {
+    const query = mockQuery([]);
+
+    await getHandler("chat.ensureSession")(
+      {
+        session_id: "child",
+        agent_id: "target-agent",
+        user_id: "u1",
+        parent_session_id: "parent",
+        parent_agent_id: "parent-agent",
+        delegation_id: "delegation-1",
+        target_agent_id: "target-agent",
+      },
+      "target-agent",
+    );
+    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      "parent",
+      "parent-agent",
+      "delegation-1",
+      "target-agent",
+    ]));
+  });
 });
 
 describe("chat.appendMessage", () => {
@@ -644,6 +667,63 @@ describe("chat.appendMessage", () => {
     expect(result.id).toBeDefined();
     expect(typeof result.id).toBe("string");
     expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  it("inserts delegated message lineage", async () => {
+    const query = mockQuery([], []);
+
+    await getHandler("chat.appendMessage")(
+      {
+        session_id: "child",
+        role: "assistant",
+        content: "Child result",
+        from_agent_id: "target-agent",
+        parent_session_id: "parent",
+        delegation_id: "delegation-1",
+        target_agent_id: "target-agent",
+      },
+      "target-agent",
+    );
+    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      "target-agent",
+      "parent",
+      "delegation-1",
+    ]));
+  });
+});
+
+describe("chat.updateMessage", () => {
+  it("updates message fields without bumping session count", async () => {
+    const query = mockQuery([], []);
+
+    const result = await getHandler("chat.updateMessage")(
+      {
+        id: "msg-1",
+        session_id: "sess1",
+        content: "Done",
+        tool_name: "delegate_to_agent",
+        tool_input: "{\"scope\":\"check\"}",
+        metadata: "{\"summary\":\"ok\"}",
+        outcome: "success",
+        duration_ms: 123,
+      },
+      "a1",
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[0][0]).toContain("UPDATE chat_messages");
+    expect(query.mock.calls[0][1]).toEqual([
+      "Done",
+      "delegate_to_agent",
+      "{\"scope\":\"check\"}",
+      "{\"summary\":\"ok\"}",
+      "success",
+      123,
+      "msg-1",
+      "sess1",
+    ]);
+    expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
   });
 });
 
@@ -1139,7 +1219,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.appendMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.appendMessage", "chat.updateMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

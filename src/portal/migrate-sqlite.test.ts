@@ -70,8 +70,12 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_chat_sessions_user",
       "idx_chat_sessions_agent",
       "idx_chat_sessions_origin",
+      "idx_chat_sessions_parent",
+      "idx_chat_sessions_delegation",
       "idx_chat_messages_session",
       "idx_chat_messages_audit",
+      "idx_chat_messages_parent",
+      "idx_chat_messages_delegation",
       "idx_notifications_user",
       "idx_api_keys_hash",
       "idx_agent_task_runs_task",
@@ -172,5 +176,27 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_messages)");
     const cols = rows.map((r) => r.name);
     expect(cols).not.toContain("updated_at");
+  });
+
+  it("adds delegation lineage columns to chat sessions and messages", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [sessionRows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_sessions)");
+    const sessionCols = sessionRows.map((r) => r.name);
+    expect(sessionCols).toEqual(expect.arrayContaining([
+      "parent_session_id",
+      "parent_agent_id",
+      "delegation_id",
+      "target_agent_id",
+    ]));
+
+    const [messageRows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_messages)");
+    const messageCols = messageRows.map((r) => r.name);
+    expect(messageCols).toEqual(expect.arrayContaining([
+      "from_agent_id",
+      "parent_session_id",
+      "delegation_id",
+      "target_agent_id",
+    ]));
   });
 });

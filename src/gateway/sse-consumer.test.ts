@@ -7,12 +7,16 @@ import { AgentBoxClient } from "./agentbox/client.js";
 // without initializing the FrontendWsClient-backed chat-repo.
 
 const appendCalls: any[] = [];
+const updateCalls: any[] = [];
 let appendCounter = 0;
 
 vi.mock("./chat-repo.js", () => ({
   appendMessage: vi.fn(async (msg: any) => {
     appendCalls.push(msg);
     return `msg-${++appendCounter}`;
+  }),
+  updateMessage: vi.fn(async (msg: any) => {
+    updateCalls.push(msg);
   }),
   incrementMessageCount: vi.fn(async () => {}),
   ensureChatSession: vi.fn(async () => {}),
@@ -36,6 +40,7 @@ function mkClient(events: unknown[]): AgentBoxClient {
 
 beforeEach(() => {
   appendCalls.length = 0;
+  updateCalls.length = 0;
   appendCounter = 0;
 });
 
@@ -116,13 +121,33 @@ describe("consumeAgentSse — tool execution", () => {
         result: { content: [{ type: "text", text: "pod-a  Running" }] } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     expect(toolRow).toBeDefined();
+    expect(toolRow.messageId).toBe("msg-1");
     expect(toolRow.toolName).toBe("kubectl");
     expect(toolRow.toolInput).toContain("get pods");
     expect(toolRow.content).toContain("pod-a");
     expect(toolRow.outcome).toBe("success");
     expect(typeof toolRow.durationMs).toBe("number");
+  });
+
+  it("persists a running placeholder on tool_execution_start", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "delegate_to_agent", args: { agent_id: "self", scope: "check pods" } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const toolRow = appendCalls.find((r) => r.role === "tool");
+    expect(toolRow).toMatchObject({
+      sessionId: "s",
+      role: "tool",
+      content: "",
+      toolName: "delegate_to_agent",
+      outcome: null,
+      durationMs: null,
+    });
+    expect(toolRow.toolInput).toContain("check pods");
+    expect(toolRow.metadata.status).toBe("running");
+    expect(updateCalls).toHaveLength(0);
   });
 
   it("marks outcome=blocked when details.blocked is true", async () => {
@@ -132,7 +157,7 @@ describe("consumeAgentSse — tool execution", () => {
         result: { content: [{ type: "text", text: "blocked" }], details: { blocked: true } } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    expect(appendCalls.find((r) => r.role === "tool").outcome).toBe("blocked");
+    expect(updateCalls[0].outcome).toBe("blocked");
   });
 
   it("marks outcome=error when details.error is true", async () => {
@@ -142,7 +167,7 @@ describe("consumeAgentSse — tool execution", () => {
         result: { content: [{ type: "text", text: "oops" }], details: { error: true } } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    expect(appendCalls.find((r) => r.role === "tool").outcome).toBe("error");
+    expect(updateCalls[0].outcome).toBe("error");
   });
 
   it("persists tool details as metadata (dropping blocked/error flags that are surfaced via outcome)", async () => {
@@ -167,7 +192,7 @@ describe("consumeAgentSse — tool execution", () => {
         } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     expect(toolRow.metadata).toBeDefined();
     expect(toolRow.metadata.findings).toEqual(findings);
     expect(toolRow.metadata.totalChecks).toBe(2);
@@ -181,7 +206,7 @@ describe("consumeAgentSse — tool execution", () => {
         result: { content: [{ type: "text", text: "fail" }], details: { error: true } } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     expect(toolRow.metadata).toBeNull();
   });
 
@@ -191,7 +216,7 @@ describe("consumeAgentSse — tool execution", () => {
       { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     expect(toolRow.metadata).toBeNull();
   });
 
@@ -213,7 +238,7 @@ describe("consumeAgentSse — tool execution", () => {
       persistMessages: true,
       redactionConfig,
     });
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     const evidence = (toolRow.metadata.evidence as Array<{ output: string }>)[0];
     expect(evidence.output).not.toContain("sk-abcdef");
     expect(evidence.output).toContain("[REDACTED]");
@@ -239,7 +264,8 @@ describe("consumeAgentSse — tool execution", () => {
       { type: "tool_execution_end", toolName: "b", result: { content: [{ type: "text", text: "B done" }] } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
-    const toolRows = appendCalls.filter((r) => r.role === "tool");
+    const toolRows = updateCalls;
+    expect(appendCalls.filter((r) => r.role === "tool")).toHaveLength(2);
     expect(toolRows).toHaveLength(2);
     const a = toolRows.find((r) => r.toolName === "a");
     const b = toolRows.find((r) => r.toolName === "b");
@@ -268,7 +294,7 @@ describe("consumeAgentSse — redaction and abort", () => {
     // Returned text redacted
     expect(result.resultText).not.toContain("sk-abcdef");
     // Persisted tool row redacted
-    const toolRow = appendCalls.find((r) => r.role === "tool");
+    const toolRow = updateCalls[0];
     expect(toolRow.content).not.toContain("sk-abcdef");
     expect(toolRow.toolInput).not.toContain("sk-abcdef");
   });
@@ -307,7 +333,7 @@ describe("consumeAgentSse — onEvent callback", () => {
       onEvent: (evt, _type, extras) => seen.push({ type: (evt as any).type, dbMessageId: extras.dbMessageId }),
     });
     expect(seen).toHaveLength(2);
-    expect(seen[0].dbMessageId).toBeUndefined();
-    expect(seen[1].dbMessageId).toBeDefined();
+    expect(seen[0].dbMessageId).toBeDefined();
+    expect(seen[1].dbMessageId).toBe(seen[0].dbMessageId);
   });
 });

@@ -3,6 +3,7 @@ import {
   initChatRepo,
   ensureChatSession,
   appendMessage,
+  updateMessage,
   incrementMessageCount,
   getMessages,
 } from "./chat-repo.js";
@@ -67,6 +68,24 @@ describe("ensureChatSession", () => {
     expect(fake.calls[0].params.title).toBeUndefined();
     expect(fake.calls[0].params.preview).toBeUndefined();
     expect(fake.calls[0].params.origin).toBeUndefined();
+    expect(fake.calls[0].params.parent_session_id).toBeUndefined();
+  });
+
+  it("passes delegation lineage fields when provided", async () => {
+    await ensureChatSession("child", "target-agent", "user", "Child", "preview", "delegation", {
+      parentSessionId: "parent",
+      parentAgentId: "parent-agent",
+      delegationId: "delegation-1",
+      targetAgentId: "target-agent",
+    });
+    expect(fake.calls[0].params).toMatchObject({
+      session_id: "child",
+      agent_id: "target-agent",
+      parent_session_id: "parent",
+      parent_agent_id: "parent-agent",
+      delegation_id: "delegation-1",
+      target_agent_id: "target-agent",
+    });
   });
 });
 
@@ -89,6 +108,10 @@ describe("appendMessage", () => {
       metadata: null,
       outcome: null,
       duration_ms: null,
+      from_agent_id: null,
+      parent_session_id: null,
+      delegation_id: null,
+      target_agent_id: null,
     });
   });
 
@@ -115,6 +138,59 @@ describe("appendMessage", () => {
       metadata: "{\"a\":1}",
       outcome: "success",
       duration_ms: 42,
+      from_agent_id: null,
+      parent_session_id: null,
+      delegation_id: null,
+      target_agent_id: null,
+    });
+  });
+
+  it("passes delegated message lineage fields", async () => {
+    fake.responses.set("chat.appendMessage", { id: "id-lineage" });
+    await appendMessage({
+      sessionId: "child",
+      role: "assistant",
+      content: "child result",
+      fromAgentId: "target-agent",
+      parentSessionId: "parent",
+      delegationId: "delegation-1",
+      targetAgentId: "target-agent",
+    });
+    expect(fake.calls[0].params).toMatchObject({
+      session_id: "child",
+      from_agent_id: "target-agent",
+      parent_session_id: "parent",
+      delegation_id: "delegation-1",
+      target_agent_id: "target-agent",
+    });
+  });
+});
+
+describe("updateMessage", () => {
+  it("updates an existing message row through RPC", async () => {
+    await updateMessage({
+      messageId: "msg-1",
+      sessionId: "sid",
+      content: "done",
+      toolName: "delegate_to_agent",
+      toolInput: "{\"scope\":\"check\"}",
+      metadata: { summary: "ok" },
+      outcome: "success",
+      durationMs: 17,
+    });
+
+    expect(fake.calls[0]).toEqual({
+      method: "chat.updateMessage",
+      params: {
+        id: "msg-1",
+        session_id: "sid",
+        content: "done",
+        tool_name: "delegate_to_agent",
+        tool_input: "{\"scope\":\"check\"}",
+        metadata: "{\"summary\":\"ok\"}",
+        outcome: "success",
+        duration_ms: 17,
+      },
     });
   });
 });

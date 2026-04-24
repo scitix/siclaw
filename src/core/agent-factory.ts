@@ -93,6 +93,24 @@ export interface CreateSiclawSessionOpts {
    * edits don't silently dead-end in the ephemeral `.portal-snapshot/` dirs.
    */
   portalUrl?: string;
+  /**
+   * Optional callback injected by agentbox. When present, tools may call it to
+   * push custom events into the parent session's SSE stream (used by
+   * `dispatch_subagents` to forward child-agent events so the frontend can
+   * render them in a nested block).
+   */
+  sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
+  /**
+   * Optional runtime bridge for `delegate_to_agent`. When absent, the tool is
+   * hidden from the model by the registry availability guard.
+   */
+  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
+  /**
+   * Expose same-agent delegation tools to the model for this session. Keep this
+   * false in normal chat so Deep Investigation internals do not leak through
+   * the callable tool schema.
+   */
+  enableDelegationTools?: boolean;
 }
 
 export interface SiclawSessionResult {
@@ -324,6 +342,8 @@ export async function createSiclawSession(
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer,
       memoryDir,
+      sessionEventEmitter: opts?.sessionEventEmitter,
+      delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
     },
     allowedTools,
   });

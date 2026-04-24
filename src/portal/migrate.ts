@@ -278,6 +278,10 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     preview VARCHAR(500),
     message_count INT NOT NULL DEFAULT 0,
     origin VARCHAR(20) DEFAULT NULL,
+    parent_session_id CHAR(36) DEFAULT NULL,
+    parent_agent_id CHAR(36) DEFAULT NULL,
+    delegation_id CHAR(36) DEFAULT NULL,
+    target_agent_id CHAR(36) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP NULL DEFAULT NULL
@@ -293,6 +297,10 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     outcome VARCHAR(16),
     duration_ms INT,
     metadata TEXT,
+    from_agent_id CHAR(36) DEFAULT NULL,
+    parent_session_id CHAR(36) DEFAULT NULL,
+    delegation_id CHAR(36) DEFAULT NULL,
+    target_agent_id CHAR(36) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_chat_messages_session FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
   )`,
@@ -447,9 +455,13 @@ async function createIndexes(): Promise<void> {
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_user", "user_id, last_active_at");
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_agent", "agent_id");
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_origin", "origin");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_parent", "parent_session_id, created_at");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_delegation", "delegation_id");
   // chat_messages
   await ensureIndex(db, "chat_messages", "idx_chat_messages_session", "session_id, created_at");
   await ensureIndex(db, "chat_messages", "idx_chat_messages_audit", "role, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_parent", "parent_session_id, created_at");
+  await ensureIndex(db, "chat_messages", "idx_chat_messages_delegation", "delegation_id");
   // notifications
   await ensureIndex(db, "notifications", "idx_notifications_user", "user_id, read_at, created_at");
   // agent_api_keys
@@ -482,6 +494,14 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "labels", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_messages", "target_agent_id", "CHAR(36) DEFAULT NULL");
 
   // Indexes that used to be inlined inside CREATE TABLE (+ overlay/org_name
   // indexes added later). Safe to run now that all referenced columns exist.
