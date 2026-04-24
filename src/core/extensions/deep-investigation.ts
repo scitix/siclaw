@@ -20,26 +20,48 @@ import type { MutableDpStateRef } from "../types.js";
  * event, DP_CONFIRM / DP_ADJUST / DP_SKIP / DP_REINVESTIGATE markers) were
  * removed in the Apr 2026 refactor — see
  * docs/design/2026-04-24-dp-mode-refactor-design.md. The new
- * `delegate_to_agent` tool plus the permission-gate primitive are Phase 2
- * work that lands on top of this clean baseline.
+ * The current DP baseline is single-agent plus optional same-agent
+ * `delegate_to_agent(agent_id="self")` sub-investigation. Cross-agent expert
+ * collaboration and permission gates are intentionally separate follow-up
+ * phases.
  */
 
-const DP_ACTIVATION_PROMPT = `You are now in Deep Investigation mode. Approach the user's question with the rigor of a senior SRE running an incident post-mortem:
+const DP_ACTIVATION_PROMPT = `You are now in Deep Investigation mode. Approach the user's question with the rigor of a senior SRE running an incident post-mortem.
 
-1. Don't rush to conclusions. Gather evidence with tools before forming hypotheses.
-2. When you have enough context, write 2-5 candidate hypotheses in plain markdown, each with your estimated confidence.
-3. After listing hypotheses, present three options on new lines so the user can steer you:
-   A. Proceed with current direction
-   B. Adjust — the user will elaborate
-   C. Skip validation and give me the best answer now
-4. When the user replies:
-   - "A" alone — proceed as they have agreed
-   - "B <text>" — redirect based on what they wrote
-   - "C" alone — wrap up with your current best answer
+Run this loop until you have a justified answer:
+
+1. Collect baseline evidence first. Inspect the current state, recent events, configuration, logs, and cheap high-signal data before forming hypotheses. If tool access is unavailable, say what evidence is missing and reason from the available context.
+2. Form hypotheses only when evidence makes them useful. Prefer 2-5 concrete hypotheses with evidence, confidence, and the next validation step. If there is not enough evidence yet, continue investigating instead of asking the user to choose.
+3. Work autonomously by default. Do not ask the user to choose A/B/C after every message. Do not narrate DP mechanics unless it helps the investigation.
+4. Use same-agent delegation when it reduces hallucination or latency. You may call delegate_to_agent with agent_id="self" for one focused check. When the user explicitly asks for multiple sub-agents, or when you identify 2-3 independent checks that should run in parallel, prefer delegate_to_agents with 1-3 tasks in a single tool call. Each delegated scope must be narrow and evidence-oriented, with only the context_summary needed for that sub-task. Do not call one sub-agent, wait for it, then decide whether to start the next unless the tasks truly depend on each other. Do not target another agent unless the runtime explicitly exposes that capability.
+5. After any delegated checks return, synthesize them in the parent answer. Update the hypotheses, confidence, and next step from the delegated evidence instead of leaving the user to inspect sub-agent cards.
+6. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, or credible competing hypotheses that would benefit from user steering.
+7. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
+   <!-- hypothesis-checkpoint -->
+   <!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->
+8. When the user replies:
+   - "Proceed" / "A" — proceed with validating the strongest current hypothesis
+   - "Refine" / "B <text>" — revise or add hypotheses based on what they wrote
+   - "Summarize" / "C" — wrap up with your current best answer
    - anything else — interpret naturally
-5. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
+9. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
 
 Stay in this mindset across turns until the user exits with [DP_EXIT].`;
+
+/**
+ * UI-only chip marker labels. When the frontend sends a message triggered by
+ * one of these chips, the content is prefixed with `[<label>]\n` so past
+ * messages can be re-rendered with a compact pill instead of the full prompt.
+ * The marker is stripped here before forwarding to the agent — it is not
+ * meaningful to the LLM.
+ */
+const CHIP_MARKER_ALLOWLIST = new Set(["Dig deeper", "Proceed", "Refine", "Summarize", "Adjust", "Skip"]);
+
+function stripChipMarker(text: string): string {
+  const match = text.match(/^\[([^\]]+)\]\n/);
+  if (!match || !CHIP_MARKER_ALLOWLIST.has(match[1])) return text;
+  return text.slice(match[0].length);
+}
 
 export default function deepInvestigationExtension(
   api: ExtensionAPI,
@@ -115,7 +137,10 @@ export default function deepInvestigationExtension(
     const marker = "[Deep Investigation]\n";
     if (!event.text.startsWith(marker)) return { action: "continue" as const };
 
-    const userText = event.text.slice(marker.length).trim();
+    // Also strip any chip marker (Adjust / Skip / Proceed / Dig deeper) that
+    // the frontend may have prefixed after the DP marker — those are
+    // UI-only hints and must not leak into the prompt.
+    const userText = stripChipMarker(event.text.slice(marker.length).trim());
     if (!userText) return { action: "continue" as const };
 
     if (!dpActive) {
@@ -144,6 +169,19 @@ export default function deepInvestigationExtension(
         ? `The user has exited Deep Investigation mode. ${userText}`
         : "The user has exited Deep Investigation mode.",
     };
+  });
+
+  // --- Prefix-chip marker: strip UI-only hint ---
+  //
+  // Handles non-DP cases like `[Dig deeper]\n...`. (In DP mode the marker is
+  // already stripped inside the `[Deep Investigation]` handler above before
+  // the activation preamble is prepended — the handler-chain transform would
+  // otherwise not see the marker, since it gets buried in the middle.)
+
+  api.on("input", async (event) => {
+    const stripped = stripChipMarker(event.text);
+    if (stripped === event.text) return { action: "continue" as const };
+    return { action: "transform" as const, text: stripped };
   });
 
   // --- session_start: restore dpActive from persisted entries ---

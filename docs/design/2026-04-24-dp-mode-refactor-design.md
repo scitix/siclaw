@@ -1,12 +1,12 @@
 ---
 title: "Deep Investigation Mode — Refactor Design"
 sidebarTitle: "DP Mode Refactor (2026-04-24)"
-description: "Replace the DP state machine + specialized cards with two generic primitives (action chips + permission-gated tool calls), simplifying maintenance and unlocking future agent-team work."
+description: "Replace the DP state machine + specialized cards with checkpoint action chips and same-agent sub-agent delegation, simplifying maintenance and preserving a clean path to future expert teams."
 ---
 
 # Deep Investigation Mode — Refactor Design
 
-> **Status**: Design approved (2026-04-24). Implementation pending.
+> **Status**: Phase 1 implementation active (2026-04-24). Current target is the single-agent DP + same-agent sub-agent loop; cross-agent expert teams are deliberately deferred.
 > **Supersedes**: The current `src/core/extensions/deep-investigation.ts` state-machine + `propose_hypotheses` / `deep_search` / `end_investigation` tool family + `HypothesesCard` / `InvestigationCard` / `DpChecklistCard` React components.
 
 ---
@@ -18,10 +18,10 @@ After shipping DP persistence fixes in late April 2026, ~70% of the bugs we hit 
 This refactor strips DP down to what it *is*:
 
 1. **A prompting enhancement** that makes a single agent reason more divergently and chase details.
-2. **A generic permission primitive** so the model cannot run away with expensive sub-agent calls without user consent.
-3. **A generic "action chips" primitive** so users can quickly respond to the agent without losing the ability to add free-form context.
+2. **A same-agent sub-agent primitive** so the model can run one focused, isolated investigation when it materially improves evidence quality.
+3. **A generic "action chips" primitive** so users can quickly respond to checkpoint moments without losing the ability to add free-form context.
 
-Neither primitive is DP-specific — both are reusable across the product. Phase 2 (future) builds on these to support multi-agent expert teams.
+The primitives are intentionally reusable. Phase 2 (future) builds on the same data model and card surface to support gateway-routed multi-agent expert teams.
 
 ---
 
@@ -30,20 +30,20 @@ Neither primitive is DP-specific — both are reusable across the product. Phase
 ### In scope (Phase 1 — this refactor)
 
 - Replace DP state machine with a simple mode flag (`dpActive`).
-- New generic tool `delegate_to_agent` replacing `deep_search`.
-- New tool-runtime primitive: `requiresUserApproval` + user permission flow.
+- New generic tool `delegate_to_agent(agent_id="self")` replacing `deep_search`.
+- Minimal runtime executor that creates a same-agent child session and returns a structured tool result.
 - Unify existing "suggested-replies" chips and "Dig deeper" chip under one `ActionChip` abstraction.
-- Add three fixed DP action chips (`Confirm` / `Adjust` / `Skip`) displayed when `dpActive && latest-is-assistant && !streaming && !pendingToolCall`.
-- Inline nested rendering for sub-agent delegations (collapsed-by-default, one-line summary).
+- Render DP steering chips only at explicit Hypothesis Checkpoints, not on every DP assistant turn.
+- Collapsed Agent Work Card rendering for same-agent sub-agent delegations.
 - Delete `HypothesesCard`, `InvestigationCard`, `DpChecklistCard`, `propose_hypotheses`, `end_investigation`, `deep_search`, `dp_status` event, `dpStatus` enum, `dpChecklist` / `dpProgress` / `dpFocus` hook state, `parseHypotheses` (both frontend and backend copies).
 
 ### Explicitly deferred (Phase 2+)
 
 - Multi-agent expert teams (`delegate_to_agent(agent_id=<other>)`).
 - Domain sweep phase (parallel specialist exploration before hypothesis).
-- Tool-level "always allow" setting in user preferences (Phase 1 only supports session-level).
+- Permission gate, approval persistence, and tool-level "always allow" settings.
 - Visual multi-agent sidebar / timeline.
-- Collapsible sub-agent block *expansion optimizations* (Phase 1 ships simple collapse/expand only).
+- Gateway/portal routing to target agent AgentBoxes.
 
 ---
 
@@ -57,17 +57,15 @@ Neither primitive is DP-specific — both are reusable across the product. Phase
 │    "Be more divergent, propose multiple hypotheses, chase        │
 │     details, structure your answer, don't rush."                 │
 │                                                                   │
-│  [Primitive 1 — ActionChip]                                       │
-│    A reusable click-to-fill-input button.                         │
-│    DP mode shows three fixed chips (Confirm / Adjust / Skip)     │
-│    whenever the agent is waiting for user input.                  │
-│    Model-emitted suggestions (A. xxx / B. yyy) keep working.     │
+│  [Primitive 1 — Checkpoint ActionChip]                            │
+│    DP only shows Proceed / Refine / Summarize at explicit        │
+│    Hypothesis Checkpoints. Buttons create hidden prompt pills,   │
+│    not raw A/B/C text.                                            │
 │                                                                   │
-│  [Primitive 2 — Permission-gated Tool Call]                       │
-│    Tools declared `requiresUserApproval: true` pause at runtime   │
-│    and emit a permission_request message. User clicks Allow /    │
-│    Deny / Always-allow-this-session to release the call.          │
-│    DP uses this for `delegate_to_agent`.                          │
+│  [Primitive 2 — Same-agent Delegation]                            │
+│    `delegate_to_agent(agent_id="self")` creates a focused child  │
+│    session and returns a structured summary. The frontend renders │
+│    it as a collapsed Agent Work Card.                             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -79,7 +77,7 @@ No state machine. No specialized cards. No DP-specific markers other than the ex
 
 ### Unified abstraction
 
-A single `ActionChip` config powers three existing use-cases (`suggested-replies`, `Dig deeper`) plus the new DP chips:
+A single `ActionChip` config powers `suggested-replies`, `Dig deeper`, and checkpoint-only DP steering chips:
 
 ```ts
 interface ActionChip {
@@ -97,15 +95,15 @@ interface ActionChip {
 **`fill`** (inserts visible text into input box):
 
 ```
-User clicks [A. Confirm hypotheses]
-  → input box now contains "A"
-  → user can press send immediately, OR add context like "A — also check kubelet logs"
+User clicks [Use example query]
+  → input box now contains the chip text
+  → user can press send immediately, OR edit the text before sending
   → send dispatches the raw text
 ```
 
 Used by:
 - Model-generated suggested replies (existing; `detectOptionReplies` regex catches `A. xxx / B. yyy` in assistant output)
-- DP three fixed chips
+- Non-DP suggested replies that should remain directly editable
 
 **`prefix`** (atomic pill in input that expands on send):
 
@@ -118,86 +116,88 @@ User clicks [Dig deeper]
 
 Used by:
 - `Dig deeper` button (existing)
+- DP Hypothesis Checkpoint chips (`Proceed` / `Refine` / `Summarize`)
 
-### DP fixed chip configuration
+### DP hypothesis checkpoint chip configuration
 
-```ts
-const DP_CONFIRM: ActionChip = {
-  id: "dp-confirm",
-  label: "按当前方向继续",
-  kind: "fill",
-  insertText: "A",
-}
+DP no longer renders fixed chips just because `dpActive === true`. The model must
+emit an explicit checkpoint marker when it has a real hypothesis fork or
+breakthrough:
 
-const DP_ADJUST: ActionChip = {
-  id: "dp-adjust",
-  label: "调整方向",
-  kind: "fill",
-  insertText: "B ",  // trailing space invites user to type
-}
-
-const DP_SKIP: ActionChip = {
-  id: "dp-skip",
-  label: "直接给我结论",
-  kind: "fill",
-  insertText: "C",
-}
+```md
+<!-- hypothesis-checkpoint -->
+<!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->
 ```
 
-### Display rule for DP chips
+Display rule:
 
 ```ts
-const showDpChips =
+const showDpCheckpointChips =
   dpActive &&
   latestMessage?.role === "assistant" &&
   !isStreaming &&
-  !hasPendingToolCall
+  hasHypothesisCheckpointMarker
 ```
 
-No content detection. No state machine phase check. Three booleans AND'd together — that's the entire rule.
-
-Chips render below the latest assistant message as buttons, identical in appearance and interaction to the existing `suggested-replies` chips.
+This keeps normal DP turns quiet. The user only sees steering chips when the
+agent has written H1/H2/H3-style hypotheses and wants directional input. Outside
+DP, the generic suggested-replies parser still works as before.
 
 ### Semantics: fully in the model's hands
 
 The chips are pure frontend UI sugar. When clicked:
-- `A` → user message is just the string `"A"` (or `"A user-added context"`)
-- `B ...` → user message is `"B ..."` 
-- `C` → user message is just `"C"`
+- `Proceed` creates an input pill and sends the hidden instruction to continue validating the leading hypothesis.
+- `Refine` creates an input pill and sends the hidden instruction to revise or add hypotheses based on user direction.
+- `Summarize` creates an input pill and sends the hidden instruction to stop deeper validation and summarize the current best answer.
 
-The backend agent has no knowledge of "chips". It receives natural user text and interprets via the DP system prompt, which says:
+The visible user bubble shows only the compact chip label plus any user-added text. The backend strips the marker before forwarding to the model, preserving the hidden instruction body. The DP system prompt also accepts legacy protocol replies:
 
 > When the user's reply starts with `A` alone — proceed with your current plan.
 > When the user's reply starts with `B` — they want to adjust your direction; read what follows.
 > When the user's reply starts with `C` — wrap up with your current best conclusion.
 > If the user types anything else — interpret naturally.
 
-No state machine is needed to enforce these semantics — the LLM handles context-sensitive interpretation.
+No state machine is needed to enforce these semantics — the LLM handles context-sensitive interpretation, while the UI avoids exposing protocol letters as the primary experience.
 
 ### Dynamic suggested replies (retained)
 
-The existing `<!-- suggested-replies: ... -->` HTML comment and `A. xxx / B. yyy` pattern detection are preserved. Model may emit them freely in non-DP turns; frontend renders them identically. No cross-interaction with DP chips (they're scoped to different conditions).
+The existing `<!-- suggested-replies: ... -->` HTML comment and `A. xxx / B. yyy` pattern detection are preserved. Model may emit them freely in non-DP turns; frontend renders them identically. In DP turns, suggested replies render only when the message also carries the explicit `<!-- hypothesis-checkpoint -->` marker.
 
 ---
 
-## 4. Primitive 2: Permission-gated Tool Calls
+## 4. Primitive 2: Same-agent Delegation Now, Permission Later
+
+Phase 1 validates the DP loop with direct same-agent delegation:
+
+- `delegate_to_agent(agent_id="self")` creates a focused child session under the same agent/runtime identity.
+- `delegate_to_agents` batches 1-3 independent same-agent checks into one parent-visible tool call.
+- Delegation tools are exposed to the model only while Deep Investigation is visibly active (`[Deep Investigation]` marker or restored DP-active state). Normal chat sessions do not receive the delegation executor, so the registry does not include these tool schemas.
+- The child receives only the model-written `scope` and `context_summary`, not the whole parent transcript.
+- The result returns to the parent model as a normal tool result and renders as an Agent Work Card.
+- Delegated sessions deliberately do not receive delegation tools, preventing recursive fan-out in the first implementation.
+
+Cross-agent expert collaboration (`agent_id !== "self"`) is intentionally not implemented here. It must route through gateway/portal to the target agent's AgentBox so model config, system prompt, tools, credentials, and future permission boundaries are real.
+
+The permission-gate design below is retained as the next layer, but it is not part of the current single-agent DP acceptance path.
 
 ### Tool declaration
 
-Tools opt in via a new property in the tool definition:
+Tools opt in via a property in the tool definition:
 
 ```ts
 {
   name: "delegate_to_agent",
   parameters: Type.Object({ ... }),
-  requiresUserApproval: true,  // new
+  requiresUserApproval: true,  // reserved metadata for later permission gate
   execute: async (...) => { ... },
 }
 ```
 
-### Runtime flow
+### Future permission-gate runtime flow
 
-1. Model's turn produces a tool call to `delegate_to_agent` (or any other `requiresUserApproval` tool).
+This flow is intentionally deferred until after the single-agent DP loop is validated. Phase 1 keeps the metadata on the tool contract but does not pause `delegate_to_agent(agent_id="self")` behind an approval UI.
+
+1. Model's turn produces a tool call to `delegate_to_agent` (or any other future `requiresUserApproval` tool).
 2. Tool runtime intercepts **before** invoking `execute`:
    - Writes a new row to `chat_messages` with `role="permission"`:
      ```json
@@ -215,7 +215,7 @@ Tools opt in via a new property in the tool definition:
    - `allow` / `always_allow`: invoke `execute()`, return result to model normally.
    - `deny`: return a structured error to the model (see §4.3).
 
-### Denial payload (encourages model to adjust)
+### Future denial payload (encourages model to adjust)
 
 ```json
 {
@@ -226,15 +226,15 @@ Tools opt in via a new property in the tool definition:
 
 The model sees this as the tool result and adjusts its next turn. This is more robust than the model "noticing" a rejection through natural language.
 
-### Anti-nagging: three layered defenses
+### Future anti-nagging: three layered defenses
 
 **Layer 1 — Session always-allow**
 
 When the user clicks `Always allow this session`, the backend persists `(session_id, tool_name)` in a new table `session_tool_permissions`. Subsequent calls of the same tool in the same session skip the permission prompt and execute directly.
 
-**Layer 2 — Tool-level always-allow** (deferred to Phase 2)
+**Layer 2 — Tool-level always-allow**
 
-User settings UI lets users pre-approve tools globally (e.g., "always allow `delegate_to_agent`"). Not implemented in Phase 1.
+User settings UI lets users pre-approve tools globally (e.g., "always allow `delegate_to_agent`").
 
 **Layer 3 — Consecutive-denial cooldown**
 
@@ -287,7 +287,7 @@ The model knows which parts of the current conversation are relevant to the sub-
 
 ### What happens to `deep_search`
 
-Deleted. `delegate_to_agent` covers the same functional territory (invoke a sub-agent to investigate) with a simpler contract (one task per call, not "N hypotheses in parallel"). If the model wants parallel validation, it calls `delegate_to_agent` multiple times — each of which requires user approval, which is the correct behavior given cost.
+Deleted. `delegate_to_agent` covers the same functional territory (invoke a sub-agent to investigate) with a simpler contract (one task per call, not "N hypotheses in parallel"). In Phase 1 the parent may call the tool directly for bounded same-agent checks. Permission gating is intentionally deferred until the DP loop and Agent Work Card UX are validated.
 
 ---
 
@@ -295,19 +295,16 @@ Deleted. `delegate_to_agent` covers the same functional territory (invoke a sub-
 
 ### 6.1 Data model additions
 
+Phase 1 stores delegation lineage. Permission rows are a future Phase 2 addition.
+
 ```sql
 ALTER TABLE chat_messages ADD COLUMN from_agent_id TEXT;       -- null = user / system / main-agent; else sub-agent id
 ALTER TABLE chat_messages ADD COLUMN parent_session_id TEXT;    -- non-null ⇒ this message belongs inside a sub-agent block
--- chat_messages.role enum gains "permission"
-
-CREATE TABLE session_tool_permissions (
-  session_id TEXT NOT NULL,
-  tool_name TEXT NOT NULL,
-  PRIMARY KEY (session_id, tool_name)
-);
+ALTER TABLE chat_messages ADD COLUMN delegation_id TEXT;         -- stable grouping id for delegated work
+ALTER TABLE chat_messages ADD COLUMN target_agent_id TEXT;       -- "self" now; external agent id later
 ```
 
-### 6.2 Permission message block
+### 6.2 Future permission message block
 
 Rendered inline in the chat, between the preceding agent message and the forthcoming tool execution:
 
@@ -348,13 +345,13 @@ The row persists in history — a full audit trail of every tool gated by the pe
 │ ▌ ┃ [▾ Collapse]
 │ ▌ ┃────────────────────────────────────────────────────
 │ ▌ ┃ 🤖 sub-agent
-│ ▌ ┃ 让我先看各节点的 mlx5 驱动状态
+│ ▌ ┃ I will first inspect mlx5 driver state on the affected nodes.
 │ ▌ ┃
 │ ▌ ┃ [tool: bash] kubectl get nodes -o wide
 │ ▌ ┃ [tool output] NAME          STATUS   ROLES   ...
 │ ▌ ┃
 │ ▌ ┃ 🤖 sub-agent
-│ ▌ ┃ 发现 nodepool-061 和 062 的 mlx5_core 固件有异常 reset
+│ ▌ ┃ nodepool-061 and nodepool-062 show mlx5_core firmware resets.
 │ ▌ ┃ 
 │ ▌ ┃ ...
 │ ▌ ┃────────────────────────────────────────────────────
@@ -424,29 +421,33 @@ rigor of a senior SRE running an incident post-mortem:
 
 1. Don't rush to conclusions. Gather multiple pieces of evidence before
    forming hypotheses.
-2. When you have enough context to hypothesize, write 2–5 candidate
+2. Work autonomously by default. Do not ask the user to choose after every
+   message.
+3. When a focused check would reduce hallucination or gather independent
+   evidence, call `delegate_to_agent` with `agent_id="self"`. When there are
+   2-3 independent checks, prefer one `delegate_to_agents` batch call. Keep
+   each scope bounded and pass only the `context_summary` the sub-agent needs.
+   Do not target another agent unless the runtime explicitly exposes that
+   capability.
+4. When you have enough context to hypothesize, write 2–5 candidate
    hypotheses in plain markdown (numbered list), each with your estimated
    confidence.
-3. After listing hypotheses, present three options on new lines:
-     A. Proceed with current direction
-     B. Adjust — (user will elaborate)
-     C. Skip validation and give me the best answer now
-4. If you need to delegate deeper investigation to a sub-agent, call the
-   `delegate_to_agent` tool. This requires user approval — do not expect
-   it to run silently. Write a tight `context_summary` so the sub-agent
-   has what it needs.
-5. When the user replies with "A", proceed as they've agreed to your plan.
-   "B <text>" means redirect based on what they wrote. "C" means wrap up
-   with your current best answer. Any other text — interpret naturally.
-6. Document evidence as you collect it. Structure your final answer with
+5. At a Hypothesis Checkpoint only, append hidden UI hints:
+     <!-- hypothesis-checkpoint -->
+     <!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->
+6. When the user replies with "Proceed" / "A", continue validating the
+   strongest hypothesis. "Refine" / "B <text>" means revise or add
+   hypotheses. "Summarize" / "C" means wrap up with your current best answer.
+   Any other text — interpret naturally.
+7. Document evidence as you collect it. Structure your final answer with
    clear sections: Findings, Root Cause, Recommendation, Caveats.
 ```
 
-Model is expected to follow points 1–6 but is not blocked by the frontend if it doesn't (no state machine). If the model forgets to emit A/B/C, the user still sees the three DP chips below the message (§3) and can click them — the model will receive the user's raw text response and interpret.
+Model is expected to follow points 1–6 but is not blocked by a DP state machine. If the model forgets the checkpoint marker, normal DP turns stay quiet; the user can still type free-form steering text, but the frontend will not show DP steering chips for that message.
 
 ### Non-DP sessions
 
-No system prompt changes. `delegate_to_agent` tool is still available in non-DP sessions (permission gate applies regardless). DP chips are only shown when `dpActive === true`.
+Delegation tools are hidden in ordinary chat: `delegate_to_agent` and `delegate_to_agents` are registered in the codebase but are not exposed to the model unless the AgentBox creates the session with `enableDelegationTools=true`. The HTTP prompt path sets that flag only for a visible `[Deep Investigation]` activation, a restored active DP session, or keeps it off for `[DP_EXIT]` and normal prompts. DP steering chips still require both `dpActive === true` and an explicit Hypothesis Checkpoint marker.
 
 ---
 
@@ -460,40 +461,63 @@ No system prompt changes. `delegate_to_agent` tool is still available in non-DP 
 - Refactor existing `suggested-replies` and `Dig deeper` chip code into a single `ActionChip` renderer.
 - Existing behaviors unchanged. This is a pure refactor for future reuse.
 
-### Step 2 — Add DP three-chip display
-- Frontend-only change. Model/backend untouched.
-- DP chips appear below latest assistant message when conditions match.
-- Cards + state machine still present (DP mode still partially uses the old machinery; chips coexist).
+### Step 2 — Add DP Hypothesis Checkpoint steering
+- Prompt asks the model to stay autonomous by default and emit checkpoint markers only at meaningful hypothesis forks.
+- Frontend renders DP steering chips only when `dpActive` and the latest assistant message includes `<!-- hypothesis-checkpoint -->`.
+- Cards + state machine stay deleted; checkpoint steering uses the existing suggested-replies primitive.
 
-### Step 3 — Add permission gate infrastructure
+### Step 3 — Validate DP checkpoint base with the real model
+- Prompt asks the model not to render visible A/B/C markdown; hidden comments drive the UI chips.
+- Frontend strips a trailing visible A/B/C option block when the hidden `suggested-replies` comment is present, so Kimi-style duplicated options do not leak into the message body.
+- Smoke against local Kimi-backed Portal verifies the model emits both `<!-- hypothesis-checkpoint -->` and `<!-- suggested-replies: ... -->`.
+
+### Step 4 — Add `delegate_to_agent` contract + Agent Work Card foundation
+- New tool contract with `requiresUserApproval: true` metadata reserved for the later permission gate, but availability-gated until a runtime executor is injected.
+- Sub-agent / future multi-agent output renders through one collapsed Agent Work Card (`delegate_to_agent` tool rows + lineage fields).
+- Permission gate is deliberately deferred so early DP validation does not add approval-click burden.
+
+### Step 5 — Add real same-agent sub-agent executor
+- Runtime injects `delegateToAgentExecutor` into web sessions.
+- `delegate_to_agent(agent_id="self")` creates a real child pi-agent session and returns `{ summary, session_id, tool_calls, duration_ms }`.
+- Child sessions inherit the active model provider/model/config from the parent prompt request.
+- Child sessions do not receive `delegate_to_agent` to avoid recursive fan-out in the first DP implementation.
+
+### Step 6 — Validate single-agent DP closed loop
+- Real Kimi-backed DP session emits hypothesis checkpoints.
+- User-visible checkpoint controls are English-first `Proceed / Refine / Summarize`.
+- Clicking a checkpoint control creates a hidden prompt pill in the input, not raw `A/B/C` text.
+- Same-agent `delegate_to_agent` renders as a collapsed `Delegated investigation` Agent Work Card in real history.
+
+### Step 7 — Discuss and design multi-agent expert collaboration
+- Reuse the same Agent Work Card model for `target_agent_id !== self`.
+- Do not fake non-self target agents inside the current AgentBox.
+- Route through gateway/portal to the target agent's AgentBox so the target's system prompt, model, tools, credentials, and future permission boundaries are real.
+- Open design questions: agent discovery, context handoff shape, cost/latency display, cancellation, and how expert traces aggregate.
+
+### Step 8 — Future: add permission gate infrastructure
 - New `role="permission"` message type.
 - Tool-runtime interception logic.
 - Permission decision endpoint.
 - Frontend permission block rendering.
-- No tools use `requiresUserApproval` yet — just the plumbing.
+- Enable this only after checkpoint UX and Agent Work Card UX are validated.
 
-### Step 4 — Add `delegate_to_agent` tool (initially with `deep_search` still alive)
-- New tool with `requiresUserApproval: true`.
-- Sub-agent block rendering on frontend (collapsed by default).
-- Tested alongside existing `deep_search` — both present.
+### Step 9 — Future: gateway-routed expert delegation
+- Add a gateway/portal route that can invoke a target agent's AgentBox instead of faking non-self work inside the caller's runtime.
+- Preserve the same `delegate_to_agent` tool contract where possible.
+- Reuse Agent Work Card rendering with `target_agent_id !== "self"`.
 
-### Step 5 — Swap DP over
-- Update DP system prompt to use `delegate_to_agent` (and remove references to `propose_hypotheses`).
-- Model now uses the new tool in DP sessions.
-- Old `deep_search` still callable but DP doesn't trigger it.
-
-### Step 6 — Delete dead code
+### Step 10 — Continue deleting dead code as the replacement proves stable
 - Remove `HypothesesCard`, `InvestigationCard`, `DpChecklistCard`, `propose_hypotheses`, `end_investigation`, `deep_search`, `parseHypotheses`.
 - Shrink `deep-investigation.ts` to just marker handling + prompt injection + `dpActive` flag.
 - Remove DP state from hook and SSE handlers.
 - Update tests.
 
-### Step 7 — Verify
+### Step 11 — Verify current Phase 1
 - Manual test: full DP session end-to-end with a couple of real SRE questions.
 - Regression: non-DP sessions unchanged.
-- Test: permission gate denied, allowed, always-allowed, cancel-mid-run paths.
+- Test: checkpoint chips, hidden prompt pills, same-agent delegation, Agent Work Card rendering, and migration compatibility.
 
-Steps 1–6 can each be a separate commit; Step 5 is the flip point. Steps 1–4 are purely additive (no user-visible breakage); Step 6 is deletion after the swap is verified.
+Steps 1–6 are the current Phase 1 acceptance path. Steps 7–9 are future design/implementation work and should not block the single-agent DP closed loop.
 
 ---
 
@@ -513,9 +537,11 @@ These are not blockers for Phase 1 but should be noted:
 Phase 1 is done when:
 
 - A new Deep Investigation session runs end-to-end without any `HypothesesCard` / `InvestigationCard` / `DpChecklistCard` rendering (they're deleted).
-- The DP chips (`Confirm` / `Adjust` / `Skip`) appear reliably when the agent is waiting for user input.
-- `delegate_to_agent` pauses for user approval; the user can Allow, Deny, Always-allow-session, or Cancel mid-run.
-- Sub-agent work renders collapsed-by-default with a one-line summary; expand reveals the full transcript.
+- DP steering chips do not appear on every turn; they appear reliably only on explicit Hypothesis Checkpoint messages.
+- Checkpoint controls are English-first (`Proceed / Refine / Summarize`) and click into hidden prompt pills instead of raw `A/B/C`.
+- `delegate_to_agent(agent_id="self")` runs a real same-agent child session and returns a structured tool result.
+- Sub-agent work renders collapsed-by-default with a one-line summary; expand reveals scope, summary, trace/session id, tool calls, and duration.
+- Non-self `agent_id` expert collaboration is not faked; it remains a gateway/portal routing design item.
 - No `dp_status` SSE events are emitted or handled.
 - Non-DP chat sessions are completely unaffected.
 - `src/core/extensions/deep-investigation.ts` line count is ≤ 200 (down from ~900).
@@ -530,5 +556,5 @@ Design developed in a series of discussions between the project author and Claud
 - "DP state should only toggle off on explicit user or agent exit." → drives the `dpActive` scan-based rebuild (Phase 1 already landed).
 - "Reuse the existing suggested-replies text-options primitive; don't invent new protocols." → drives the ActionChip unification.
 - "Use a Claude Code-style allow/deny mechanism for sub-agent calls; we don't need a state machine if the gate lives in the tool runtime." → drives Primitive 2.
-- "Three DP chips are generic conversation controls, not hypothesis-specific." → drives the "always show when waiting" display rule.
+- "DP steering should be hypothesis-specific, not a generic every-turn control." → drives the checkpoint-only display rule.
 - "Sub-agent block default collapsed with a one-line summary; expand on click." → resolves the density/verbosity trade-off.

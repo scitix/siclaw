@@ -99,7 +99,54 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
     expect(stateRef.active).toBe(true);
     expect(transform).toBeDefined();
     expect(transform.text).toContain("Deep Investigation mode");  // preamble
+    expect(transform.text).toContain("Do not ask the user to choose A/B/C after every message");
+    expect(transform.text).toContain('delegate_to_agent with agent_id="self"');
+    expect(transform.text).toContain("prefer delegate_to_agents with 1-3 tasks");
+    expect(transform.text).toContain("Do not call one sub-agent, wait for it");
+    expect(transform.text).toContain("Do not render any visible choice list in the markdown");
+    expect(transform.text).toContain("<!-- hypothesis-checkpoint -->");
+    expect(transform.text).toContain("<!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->");
+    expect(transform.text).not.toContain("继续验证当前最强假设");
     expect(transform.text).toContain("排查集群 DNS 异常");         // original user text preserved
+  });
+
+  it("strips UI-only prefix chip markers before forwarding DP input to the model", async () => {
+    const stateRef: MutableDpStateRef = { active: false };
+    const { api, handlers } = makeApi();
+    deepInvestigationExtension(api, undefined, stateRef);
+
+    const results = await callAll(handlers, "input",
+      { text: `[Deep Investigation]
+[Adjust]
+Adjust your investigation direction based on my input below.
+
+Additional direction from user: focus on ingress` },
+      makeCtx(),
+    );
+    const transform = results.find((r: any) => r?.action === "transform") as any;
+
+    expect(transform.text).not.toContain("[Adjust]");
+    expect(transform.text).toContain("focus on ingress");
+  });
+
+  it("strips current DP checkpoint prefix markers but preserves their hidden instruction body", async () => {
+    const stateRef: MutableDpStateRef = { active: false };
+    const { api, handlers } = makeApi();
+    deepInvestigationExtension(api, undefined, stateRef);
+
+    const results = await callAll(handlers, "input",
+      { text: `[Deep Investigation]
+[Refine]
+Refine or add hypotheses based on my additional direction below.
+
+Additional direction from user: compare H2 with kube-proxy evidence` },
+      makeCtx(),
+    );
+    const transform = results.find((r: any) => r?.action === "transform") as any;
+
+    expect(transform.text).not.toContain("[Refine]");
+    expect(transform.text).toContain("Refine or add hypotheses");
+    expect(transform.text).toContain("compare H2 with kube-proxy evidence");
   });
 
   it("subsequent [Deep Investigation]-prefixed messages only strip the marker (no preamble re-injection)", async () => {
@@ -133,7 +180,6 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
     expect(results.every((r: any) => r?.action === "continue")).toBe(true);
   });
 });
-
 describe("deepInvestigationExtension — deactivation via [DP_EXIT] marker", () => {
   it("turns dpActive off and transforms the message into a user-exited notice", async () => {
     const stateRef: MutableDpStateRef = { active: false };
