@@ -878,7 +878,7 @@ function MessageItem({
   const isTool = message.role === "tool"
 
   if (isTool) {
-    if (message.toolName === "delegate_to_agents" || message.toolName === "delegate_to_agents_async") {
+    if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
     }
     if (message.toolName === "delegate_to_agent" || message.metadata?.kind === "agent_work") {

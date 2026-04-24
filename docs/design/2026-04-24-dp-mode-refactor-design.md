@@ -65,7 +65,7 @@ The primitives are intentionally reusable. Phase 2 (future) builds on the same d
 │  [Primitive 2 — Same-agent Delegation]                            │
 │    `delegate_to_agent(agent_id="self")` creates a focused child  │
 │    session and returns a structured summary.                      │
-│    `delegate_to_agents_async` starts 1-3 child sessions in the   │
+│    `delegate_to_agents` starts 1-3 child sessions in the         │
 │    background and notifies the parent session when complete.      │
 │    The frontend renders both as collapsed Agent Work cards.       │
 └─────────────────────────────────────────────────────────────────┘
@@ -172,13 +172,13 @@ The existing `<!-- suggested-replies: ... -->` HTML comment and `A. xxx / B. yyy
 Phase 1 validates the DP loop with direct same-agent delegation:
 
 - `delegate_to_agent(agent_id="self")` creates a focused child session under the same agent/runtime identity.
-- `delegate_to_agents` batches 1-3 independent same-agent checks into one parent-visible tool call and blocks until those checks finish.
-- `delegate_to_agents_async` starts 1-3 independent same-agent checks in the background, returns a running batch card immediately, and lets the runtime notify the parent session after the batch finishes.
+- `delegate_to_agents` starts 1-3 independent same-agent checks in the background, returns a running batch card immediately, progressively updates task status as child sessions finish, and lets the runtime notify the parent session after the batch finishes.
+- There is no separate model-facing sync/async batch choice. The model sees one batch delegation tool; the runtime owns background execution and notification.
 - Delegation tools are exposed to the model only while Deep Investigation is visibly active (`[Deep Investigation]` marker or restored DP-active state). Normal chat sessions do not receive the delegation executor, so the registry does not include these tool schemas.
 - The child receives only the model-written `scope` and `context_summary`, not the whole parent transcript.
-- Synchronous delegation results return to the parent model as normal tool results and render as Agent Work Cards.
-- Async delegation writes the final batch result back to the original tool row, persists a hidden `delegation_event` row in the parent chat session, then injects a synthetic parent turn so the parent model sees the completed capsules without having to remember to poll.
-- The async UI polls persisted chat history while an async batch is running. This keeps the user input unlocked while preserving the visible card and the follow-up parent synthesis across refreshes.
+- Single-agent delegation results return to the parent model as normal tool results and render as Agent Work Cards.
+- Batch delegation writes progress and final results back to the original tool row, persists a hidden `delegation_event` row in the parent chat session, then injects a synthetic parent turn so the parent model sees the completed capsules without having to remember to poll.
+- The UI polls persisted chat history while a background batch is running. This keeps the user input unlocked while preserving the visible card and the follow-up parent synthesis across refreshes.
 - Delegated sessions are first-class hidden chat sessions for audit: their child tool calls and final reports are persisted with lineage (`parent_session_id`, `delegation_id`, `target_agent_id`) while the left navigation can keep them out of the normal chat list.
 - Delegated sessions deliberately do not receive delegation tools, preventing recursive fan-out in the first implementation.
 - Child session timeout is activity-based: the runtime aborts a delegated child after 60 seconds without model/tool activity, while long-running tool calls are allowed to continue up to a wide 10-minute max-runtime guard.
@@ -501,8 +501,8 @@ Delegation tools are hidden in ordinary chat: `delegate_to_agent` and `delegate_
 - Route through gateway/portal to the target agent's AgentBox so the target's system prompt, model, tools, credentials, and future permission boundaries are real.
 - Open design questions: agent discovery, context handoff shape, cost/latency display, cancellation, and how expert traces aggregate.
 
-### Step 7.5 — Future: async Notify scheduler
-- Keep synchronous `delegate_to_agents` as the Phase 1 DP baseline.
+### Step 7.5 — Notify scheduler
+- Keep `delegate_to_agents` as the single model-facing batch delegation primitive.
 - Add a parent-session input queue that can serialize real user messages, cron/task events, and `delegation_event` notifications.
 - Async child sessions should outlive the parent turn; child completion enqueues a small capsule instead of relying on the parent model to poll for results.
 - Persist the synthetic notification with `role="user"` for model compatibility and metadata `kind="delegation_event"` / `source="system_notification"` so UI never renders it as a real user-authored message.

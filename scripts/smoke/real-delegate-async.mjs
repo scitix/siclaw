@@ -1,6 +1,7 @@
 const baseUrl = process.env.SICLAW_PORTAL_URL ?? "http://127.0.0.1:3000";
 const apiBase = `${baseUrl}/api/v1`;
 const timeoutMs = Number(process.env.SICLAW_ASYNC_DELEGATE_TIMEOUT_MS ?? 12 * 60_000);
+const removedAsyncBatchTool = ["delegate_to_agents", "async"].join("_");
 
 async function jsonFetch(url, opts = {}) {
   const res = await fetch(url, {
@@ -55,7 +56,7 @@ const session = await jsonFetch(`${apiBase}/siclaw/agents/${agent.id}/chat/sessi
 const prompt = `[Deep Investigation]
 Please validate Siclaw async batch delegation.
 
-Call delegate_to_agents_async exactly once with this exact input:
+Call delegate_to_agents exactly once with this exact input:
 {
   "tasks": [
     {
@@ -71,7 +72,7 @@ Call delegate_to_agents_async exactly once with this exact input:
   ]
 }
 
-Do not call delegate_to_agent or delegate_to_agents. After calling the async tool, stop and wait for runtime notification.`;
+Do not call delegate_to_agent. After calling delegate_to_agents, stop and wait for runtime notification.`;
 
 console.log(JSON.stringify({ agent: agent.name, agentId: agent.id, sessionId: session.id }, null, 2));
 
@@ -117,20 +118,20 @@ while (true) {
   }
 }
 
-if (!toolStarts.some((t) => t.toolName === "delegate_to_agents_async")) {
-  throw new Error("delegate_to_agents_async was not called.");
+if (!toolStarts.some((t) => t.toolName === "delegate_to_agents")) {
+  throw new Error("delegate_to_agents was not called.");
 }
-if (toolStarts.some((t) => t.toolName === "delegate_to_agent" || t.toolName === "delegate_to_agents")) {
-  throw new Error("Smoke expected only delegate_to_agents_async.");
+if (toolStarts.some((t) => t.toolName === "delegate_to_agent" || t.toolName === removedAsyncBatchTool)) {
+  throw new Error("Smoke expected only delegate_to_agents.");
 }
-const asyncEnd = toolEnds.find((t) => t.toolName === "delegate_to_agents_async");
-if (!asyncEnd || asyncEnd.isError) {
-  throw new Error("delegate_to_agents_async did not return an initial running result.");
+const batchEnd = toolEnds.find((t) => t.toolName === "delegate_to_agents");
+if (!batchEnd || batchEnd.isError) {
+  throw new Error("delegate_to_agents did not return an initial running result.");
 }
 
 const startedAt = Date.now();
 let messages;
-let storedAsyncRow;
+let storedBatchRow;
 let asyncContent = {};
 let delegationEvents = [];
 let assistantAfterEvent = false;
@@ -141,8 +142,8 @@ while (Date.now() - startedAt < timeoutMs) {
     { headers: auth },
   );
   const rows = messages.data ?? [];
-  storedAsyncRow = rows.find((m) => m.tool_name === "delegate_to_agents_async");
-  asyncContent = parseMaybeJson(storedAsyncRow?.content);
+  storedBatchRow = rows.find((m) => m.tool_name === "delegate_to_agents");
+  asyncContent = parseMaybeJson(storedBatchRow?.content);
   delegationEvents = rows.filter((m) => parseMaybeJson(m.metadata).kind === "delegation_event");
   const eventIndex = rows.findIndex((m) => parseMaybeJson(m.metadata).kind === "delegation_event");
   assistantAfterEvent = eventIndex >= 0 && rows.slice(eventIndex + 1).some((m) => m.role === "assistant");
@@ -159,11 +160,11 @@ const result = {
     isError: t.isError,
     resultText: JSON.stringify(t.result).slice(0, 800),
   })),
-  storedAsyncRow: storedAsyncRow
+  storedBatchRow: storedBatchRow
     ? {
-        outcome: storedAsyncRow.outcome,
-        content: (storedAsyncRow.content ?? "").slice(0, 1200),
-        metadata: JSON.stringify(storedAsyncRow.metadata ?? {}).slice(0, 1200),
+        outcome: storedBatchRow.outcome,
+        content: (storedBatchRow.content ?? "").slice(0, 1200),
+        metadata: JSON.stringify(storedBatchRow.metadata ?? {}).slice(0, 1200),
       }
     : null,
   delegationEvents: delegationEvents.length,
@@ -171,14 +172,14 @@ const result = {
 };
 console.log(JSON.stringify(result, null, 2));
 
-if (!storedAsyncRow) {
-  throw new Error("Expected one persisted delegate_to_agents_async row.");
+if (!storedBatchRow) {
+  throw new Error("Expected one persisted delegate_to_agents row.");
 }
 if (!asyncContent.status || asyncContent.status === "running") {
   throw new Error(`Async delegation did not complete within ${timeoutMs}ms.`);
 }
 if (!Array.isArray(asyncContent.tasks) || asyncContent.tasks.length !== 2) {
-  throw new Error(`Persisted async batch result did not contain two tasks: ${storedAsyncRow.content?.slice(0, 500)}`);
+  throw new Error(`Persisted async batch result did not contain two tasks: ${storedBatchRow.content?.slice(0, 500)}`);
 }
 if (delegationEvents.length === 0) {
   throw new Error("Expected a hidden delegation_event row in the parent session.");

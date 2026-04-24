@@ -18,12 +18,13 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type {
-  DelegateToAgentsAsyncExecutor,
-  DelegateToAgentsAsyncRequest,
-  DelegateToAgentsAsyncStartResult,
+  DelegateToAgentsExecutor,
+  DelegateToAgentsRequest,
+  DelegateToAgentsStartResult,
   DelegateToAgentExecutor,
   DelegateToAgentRequest,
   DelegateToAgentResult,
+  DelegateToAgentStatus,
   DelegateToAgentToolTraceEntry,
 } from "../core/tool-registry.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
@@ -78,7 +79,7 @@ export interface ManagedSession {
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
-  /** Background async delegation batches currently owned by this parent session. */
+  /** Background delegation batches currently owned by this parent session. */
   _backgroundWorkCount: number;
   /**
    * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
@@ -117,9 +118,9 @@ interface PendingChildToolCall {
 
 type DelegationBatchStatus = "running" | "done" | "partial" | "failed" | "timed_out";
 
-interface AsyncDelegationTaskDetails {
+interface DelegationTaskDetails {
   index: number;
-  status: NonNullable<DelegateToAgentResult["status"]>;
+  status: DelegateToAgentStatus | "running";
   agent_id: string;
   scope: string;
   summary: string;
@@ -356,14 +357,14 @@ Always end with a final report even if evidence is incomplete.`;
     return async (request) => this.runDelegatedAgent(request);
   }
 
-  private createDelegateToAgentsAsyncExecutor(): DelegateToAgentsAsyncExecutor {
-    return async (request) => this.startDelegatedAgentsAsync(request);
+  private createDelegateToAgentsExecutor(): DelegateToAgentsExecutor {
+    return async (request) => this.startDelegatedAgents(request);
   }
 
-  private async startDelegatedAgentsAsync(request: DelegateToAgentsAsyncRequest): Promise<DelegateToAgentsAsyncStartResult> {
+  private async startDelegatedAgents(request: DelegateToAgentsRequest): Promise<DelegateToAgentsStartResult> {
     const parent = this.sessions.get(request.parentSessionId);
     if (!parent) {
-      throw new Error(`Parent session ${request.parentSessionId} is not active for async delegation.`);
+      throw new Error(`Parent session ${request.parentSessionId} is not active for delegation.`);
     }
 
     parent._backgroundWorkCount++;
@@ -373,9 +374,9 @@ Always end with a final report even if evidence is incomplete.`;
     }
 
     const startedAt = Date.now();
-    this.finishDelegatedAgentsAsync(request, startedAt)
+    this.finishDelegatedAgents(request, startedAt)
       .catch((err) => {
-        console.warn(`[agentbox-session] async delegation ${request.delegationId} failed:`, err);
+        console.warn(`[agentbox-session] delegation ${request.delegationId} failed:`, err);
       })
       .finally(() => {
         const current = this.sessions.get(request.parentSessionId);
@@ -404,8 +405,65 @@ Always end with a final report even if evidence is incomplete.`;
     };
   }
 
-  private async finishDelegatedAgentsAsync(request: DelegateToAgentsAsyncRequest, startedAt: number): Promise<void> {
-    const executions = await Promise.all(request.tasks.map(async (task) => {
+  private async finishDelegatedAgents(request: DelegateToAgentsRequest, startedAt: number): Promise<void> {
+    const details: DelegationTaskDetails[] = request.tasks.map((task) => ({
+      index: task.index,
+      status: "running",
+      agent_id: task.agentId,
+      scope: task.scope,
+      summary: "Delegated investigation is running.",
+      tool_calls: 0,
+      duration_ms: 0,
+    }));
+
+    let persistQueue = Promise.resolve();
+    const persistSnapshot = (final: boolean): Promise<void> => {
+      const snapshot = details.map((task) => ({ ...task }));
+      const hasRunning = snapshot.some((task) => task.status === "running");
+      const completed = snapshot.filter((task) => task.status !== "running");
+      const status: DelegationBatchStatus = hasRunning
+        ? "running"
+        : aggregateDelegationStatus(snapshot);
+      const totalToolCalls = snapshot.reduce((sum, task) => sum + task.tool_calls, 0);
+      const durationMs = Date.now() - startedAt;
+      const toolResult = {
+        status,
+        delegation_id: request.delegationId,
+        tasks: snapshot.map((task) => ({
+          index: task.index,
+          status: task.status,
+          agent_id: task.agent_id,
+          scope: task.scope,
+          summary: task.summary,
+          tool_calls: task.tool_calls,
+          duration_ms: task.duration_ms,
+        })),
+        total_tool_calls: totalToolCalls,
+        duration_ms: durationMs,
+      };
+      const metadata = {
+        ...toolResult,
+        async: true,
+        tasks: snapshot,
+        completed_tasks: completed.length,
+        total_tasks: snapshot.length,
+      };
+
+      persistQueue = persistQueue.then(() => updateDelegationToolMessage({
+        sessionId: request.parentSessionId,
+        toolName: "delegate_to_agents",
+        delegationId: request.delegationId,
+        content: JSON.stringify(toolResult),
+        metadata,
+        outcome: final && !hasRunning ? delegationBatchOutcome(status) : null,
+        durationMs,
+      }).catch((err) => {
+        console.warn(`[agentbox-session] Could not update delegation tool row ${request.delegationId}:`, err);
+      }));
+      return persistQueue;
+    };
+
+    await Promise.all(request.tasks.map(async (task, offset) => {
       const taskStartedAt = Date.now();
       try {
         const result = await this.runDelegatedAgent({
@@ -419,81 +477,48 @@ Always end with a final report even if evidence is incomplete.`;
           taskIndex: task.index,
           totalTasks: request.tasks.length,
         });
-        return { task, result } as const;
+        details[offset] = {
+          index: task.index,
+          status: result.status ?? "done",
+          agent_id: task.agentId,
+          scope: task.scope,
+          summary: result.summary,
+          tool_calls: result.toolCalls,
+          duration_ms: result.durationMs,
+          ...(result.sessionId ? { session_id: result.sessionId } : {}),
+          ...(result.fullSummary ? { full_summary: result.fullSummary } : {}),
+          ...(result.summaryTruncated != null ? { summary_truncated: result.summaryTruncated } : {}),
+          ...(result.toolTrace ? { tool_trace: result.toolTrace } : {}),
+        };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        const result: DelegateToAgentResult = {
+        details[offset] = {
+          index: task.index,
           status: "failed",
+          agent_id: task.agentId,
+          scope: task.scope,
           summary: `Delegated agent failed: ${message}`,
-          sessionId: "",
-          toolCalls: 0,
-          durationMs: Date.now() - taskStartedAt,
-          fullSummary: message,
-        };
-        return {
-          task,
-          result,
+          tool_calls: 0,
+          duration_ms: Date.now() - taskStartedAt,
+          full_summary: message,
           error: message,
-        } as const;
+        };
       }
+      await persistSnapshot(false);
     }));
 
-    const details: AsyncDelegationTaskDetails[] = executions.map((execution) => ({
-      index: execution.task.index,
-      status: execution.result.status ?? "done",
-      agent_id: execution.task.agentId,
-      scope: execution.task.scope,
-      summary: execution.result.summary,
-      tool_calls: execution.result.toolCalls,
-      duration_ms: execution.result.durationMs,
-      ...(execution.result.sessionId ? { session_id: execution.result.sessionId } : {}),
-      ...(execution.result.fullSummary ? { full_summary: execution.result.fullSummary } : {}),
-      ...(execution.result.summaryTruncated != null ? { summary_truncated: execution.result.summaryTruncated } : {}),
-      ...(execution.result.toolTrace ? { tool_trace: execution.result.toolTrace } : {}),
-      ...("error" in execution && execution.error ? { error: execution.error } : {}),
-    }));
-    const status = aggregateDelegationStatus(details);
-    const totalToolCalls = details.reduce((sum, task) => sum + task.tool_calls, 0);
+    await persistSnapshot(true);
+
+    const finalDetails = details.map((task) => ({ ...task, status: task.status === "running" ? "failed" as const : task.status }));
+    const status = aggregateDelegationStatus(finalDetails);
+    const totalToolCalls = finalDetails.reduce((sum, task) => sum + task.tool_calls, 0);
     const durationMs = Date.now() - startedAt;
-    const toolResult = {
-      status,
-      delegation_id: request.delegationId,
-      tasks: details.map((task) => ({
-        index: task.index,
-        status: task.status,
-        agent_id: task.agent_id,
-        scope: task.scope,
-        summary: task.summary,
-        tool_calls: task.tool_calls,
-        duration_ms: task.duration_ms,
-      })),
-      total_tool_calls: totalToolCalls,
-      duration_ms: durationMs,
-    };
-    const metadata = {
-      ...toolResult,
-      async: true,
-      tasks: details,
-    };
-
-    await updateDelegationToolMessage({
-      sessionId: request.parentSessionId,
-      toolName: "delegate_to_agents_async",
-      delegationId: request.delegationId,
-      content: JSON.stringify(toolResult),
-      metadata,
-      outcome: delegationBatchOutcome(status),
-      durationMs,
-    }).catch((err) => {
-      console.warn(`[agentbox-session] Could not update async delegation tool row ${request.delegationId}:`, err);
-    });
-
-    await this.notifyParentOfDelegationBatch(request, details, status, totalToolCalls, durationMs);
+    await this.notifyParentOfDelegationBatch(request, finalDetails, status, totalToolCalls, durationMs);
   }
 
   private buildDelegationBatchNotification(
-    request: DelegateToAgentsAsyncRequest,
-    tasks: AsyncDelegationTaskDetails[],
+    request: DelegateToAgentsRequest,
+    tasks: DelegationTaskDetails[],
     status: DelegationBatchStatus,
   ): string {
     const lines = [
@@ -523,8 +548,8 @@ Always end with a final report even if evidence is incomplete.`;
   }
 
   private async notifyParentOfDelegationBatch(
-    request: DelegateToAgentsAsyncRequest,
-    tasks: AsyncDelegationTaskDetails[],
+    request: DelegateToAgentsRequest,
+    tasks: DelegationTaskDetails[],
     status: DelegationBatchStatus,
     totalToolCalls: number,
     durationMs: number,
@@ -1162,7 +1187,7 @@ Always end with a final report even if evidence is incomplete.`;
       systemPromptTemplate,
       sessionEventEmitter: emitExtraEvent,
       delegateToAgentExecutor: enableDelegationTools ? this.createDelegateToAgentExecutor() : undefined,
-      delegateToAgentsAsyncExecutor: enableDelegationTools ? this.createDelegateToAgentsAsyncExecutor() : undefined,
+      delegateToAgentsExecutor: enableDelegationTools ? this.createDelegateToAgentsExecutor() : undefined,
       enableDelegationTools,
     });
 

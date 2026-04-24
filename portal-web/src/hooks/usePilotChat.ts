@@ -66,8 +66,8 @@ interface UsePilotChatReturn {
 }
 
 const DELEGATED_TOOL_STALE_MS = 4 * 60 * 1000
-const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents", "delegate_to_agents_async"])
-const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents_async"])
+const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"])
+const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents"])
 
 /** Format tool args into a readable one-liner for display */
 function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
@@ -128,7 +128,7 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
   if (name === "skill_preview") {
     return (args.dir as string)?.split("/").pop() || ""
   }
-  if (name === "delegate_to_agents" || name === "delegate_to_agents_async") {
+  if (name === "delegate_to_agents") {
     const tasks = Array.isArray(args.tasks) ? args.tasks : []
     const count = tasks.length
     const firstScope = tasks

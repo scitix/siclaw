@@ -77,22 +77,22 @@ export type DelegateToAgentExecutor = (
   request: DelegateToAgentRequest,
 ) => Promise<DelegateToAgentResult>;
 
-export interface DelegateToAgentsAsyncTaskRequest {
+export interface DelegateToAgentsTaskRequest {
   index: number;
   agentId: string;
   scope: string;
   contextSummary?: string;
 }
 
-export interface DelegateToAgentsAsyncRequest {
+export interface DelegateToAgentsRequest {
   delegationId: string;
   parentSessionId: string;
   parentAgentId: string | null;
   userId: string;
-  tasks: DelegateToAgentsAsyncTaskRequest[];
+  tasks: DelegateToAgentsTaskRequest[];
 }
 
-export interface DelegateToAgentsAsyncTaskStartResult {
+export interface DelegateToAgentsTaskStartResult {
   index: number;
   status: "running";
   agent_id: string;
@@ -102,17 +102,17 @@ export interface DelegateToAgentsAsyncTaskStartResult {
   duration_ms: 0;
 }
 
-export interface DelegateToAgentsAsyncStartResult {
+export interface DelegateToAgentsStartResult {
   status: "running";
   delegation_id: string;
-  tasks: DelegateToAgentsAsyncTaskStartResult[];
+  tasks: DelegateToAgentsTaskStartResult[];
   total_tool_calls: 0;
   duration_ms: 0;
 }
 
-export type DelegateToAgentsAsyncExecutor = (
-  request: DelegateToAgentsAsyncRequest,
-) => Promise<DelegateToAgentsAsyncStartResult>;
+export type DelegateToAgentsExecutor = (
+  request: DelegateToAgentsRequest,
+) => Promise<DelegateToAgentsStartResult>;
 
 /**
  * Callback a tool can invoke to push a custom event into the parent session's
@@ -142,10 +142,10 @@ export interface ToolRefs {
    */
   delegateToAgentExecutor?: DelegateToAgentExecutor;
   /**
-   * Optional async batch delegation executor. Separate from the synchronous
-   * executor so the existing DP baseline keeps its blocking semantics.
+   * Optional batch delegation executor. The model sees one batch tool; the
+   * runtime handles background execution and parent-session notification.
    */
-  delegateToAgentsAsyncExecutor?: DelegateToAgentsAsyncExecutor;
+  delegateToAgentsExecutor?: DelegateToAgentsExecutor;
 }
 
 /** Declarative registration for a single tool. */

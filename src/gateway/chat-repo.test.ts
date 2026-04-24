@@ -253,7 +253,7 @@ describe("updateMessage", () => {
   it("updates a delegation tool row by delegation id", async () => {
     await updateDelegationToolMessage({
       sessionId: "sid",
-      toolName: "delegate_to_agents_async",
+      toolName: "delegate_to_agents",
       delegationId: "call-1",
       content: "{\"status\":\"done\"}",
       metadata: { status: "done" },
@@ -265,7 +265,7 @@ describe("updateMessage", () => {
       method: "chat.updateDelegationToolMessage",
       params: {
         session_id: "sid",
-        tool_name: "delegate_to_agents_async",
+        tool_name: "delegate_to_agents",
         delegation_id: "call-1",
         content: "{\"status\":\"done\"}",
         metadata: "{\"status\":\"done\"}",
