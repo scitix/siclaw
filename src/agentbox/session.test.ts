@@ -209,6 +209,7 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s.delegationToolsEnabled).toBe(false);
     expect(opts.enableDelegationTools).toBe(false);
     expect(opts.delegateToAgentExecutor).toBeUndefined();
+    expect(opts.delegateToAgentsExecutor).toBeUndefined();
   });
 
   it("injects the delegation executor only when requested", async () => {
@@ -218,6 +219,7 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s.delegationToolsEnabled).toBe(true);
     expect(opts.enableDelegationTools).toBe(true);
     expect(typeof opts.delegateToAgentExecutor).toBe("function");
+    expect(typeof opts.delegateToAgentsExecutor).toBe("function");
   });
 
   it("rebuilds an idle session when delegation tool exposure changes", async () => {

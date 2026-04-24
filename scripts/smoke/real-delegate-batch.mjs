@@ -1,5 +1,6 @@
 const baseUrl = process.env.SICLAW_PORTAL_URL ?? "http://127.0.0.1:3000";
 const apiBase = `${baseUrl}/api/v1`;
+const timeoutMs = Number(process.env.SICLAW_DELEGATE_BATCH_TIMEOUT_MS ?? 12 * 60_000);
 
 async function jsonFetch(url, opts = {}) {
   const res = await fetch(url, {
@@ -15,6 +16,20 @@ async function jsonFetch(url, opts = {}) {
   }
   if (!res.ok) throw new Error(`${opts.method ?? "GET"} ${url} ${res.status}: ${text}`);
   return body;
+}
+
+function parseMaybeJson(value) {
+  if (value && typeof value === "object") return value;
+  if (!value || typeof value !== "string") return {};
+  try {
+    return JSON.parse(value);
+  } catch {
+    return {};
+  }
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const login = await jsonFetch(`${apiBase}/auth/login`, {
@@ -56,7 +71,7 @@ Call delegate_to_agents exactly once with this exact input:
   ]
 }
 
-Do not call delegate_to_agent. After the batch tool returns, briefly summarize the two findings.`;
+Do not call delegate_to_agent. After calling delegate_to_agents, stop and wait for runtime notification.`;
 
 console.log(JSON.stringify({ agent: agent.name, agentId: agent.id, sessionId: session.id }, null, 2));
 
@@ -106,13 +121,30 @@ while (true) {
   }
 }
 
-const messages = await jsonFetch(
-  `${apiBase}/siclaw/agents/${agent.id}/chat/sessions/${session.id}/messages?page=1&page_size=50`,
-  { headers: auth },
-);
 const batchEnds = toolEnds.filter((t) => t.toolName === "delegate_to_agents");
 const singleStarts = toolStarts.filter((t) => t.toolName === "delegate_to_agent");
-const storedBatchRows = (messages.data ?? []).filter((m) => m.tool_name === "delegate_to_agents");
+const startedAt = Date.now();
+let messages;
+let storedBatchRows = [];
+let contentJson = {};
+let delegationEvents = [];
+let assistantAfterEvent = false;
+while (Date.now() - startedAt < timeoutMs) {
+  messages = await jsonFetch(
+    `${apiBase}/siclaw/agents/${agent.id}/chat/sessions/${session.id}/messages?page=1&page_size=80`,
+    { headers: auth },
+  );
+  storedBatchRows = (messages.data ?? []).filter((m) => m.tool_name === "delegate_to_agents");
+  contentJson = {};
+  try {
+    contentJson = JSON.parse(storedBatchRows[0]?.content ?? "{}");
+  } catch {}
+  delegationEvents = (messages.data ?? []).filter((m) => parseMaybeJson(m.metadata).kind === "delegation_event");
+  const eventIndex = (messages.data ?? []).findIndex((m) => parseMaybeJson(m.metadata).kind === "delegation_event");
+  assistantAfterEvent = eventIndex >= 0 && (messages.data ?? []).slice(eventIndex + 1).some((m) => m.role === "assistant");
+  if (contentJson.status && contentJson.status !== "running" && delegationEvents.length > 0 && assistantAfterEvent) break;
+  await sleep(3000);
+}
 const result = {
   sessionId: session.id,
   events,
@@ -124,6 +156,8 @@ const result = {
     resultText: JSON.stringify(t.result).slice(0, 800),
   })),
   assistantPreview: text.slice(0, 800),
+  delegationEvents: delegationEvents.length,
+  assistantAfterEvent,
   stored: messages.data?.map((m) => ({
     role: m.role,
     tool_name: m.tool_name,
@@ -140,17 +174,22 @@ if (singleStarts.length > 0) {
   throw new Error("delegate_to_agent was called; batch smoke expected only delegate_to_agents.");
 }
 if (!batchEnds.some((t) => !t.isError)) {
-  throw new Error("delegate_to_agents did not finish successfully.");
+  throw new Error("delegate_to_agents did not return an initial running result.");
 }
 if (storedBatchRows.length !== 1) {
   throw new Error(`Expected one persisted delegate_to_agents row, got ${storedBatchRows.length}.`);
 }
 
 const contentText = storedBatchRows[0]?.content ?? "";
-let contentJson = {};
-try {
-  contentJson = JSON.parse(contentText);
-} catch {}
+if (!contentJson.status || contentJson.status === "running") {
+  throw new Error(`delegate_to_agents did not complete within ${timeoutMs}ms.`);
+}
 if (!Array.isArray(contentJson.tasks) || contentJson.tasks.length !== 2) {
   throw new Error(`Persisted batch result did not contain two tasks: ${contentText.slice(0, 500)}`);
+}
+if (delegationEvents.length === 0) {
+  throw new Error("Expected a hidden delegation_event row in the parent session.");
+}
+if (!assistantAfterEvent) {
+  throw new Error("Expected parent assistant synthesis after delegation_event notification.");
 }

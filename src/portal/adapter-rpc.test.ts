@@ -735,7 +735,7 @@ describe("chat.updateDelegationToolMessage", () => {
     const result = await getHandler("chat.updateDelegationToolMessage")(
       {
         session_id: "sess1",
-        tool_name: "delegate_to_agents_async",
+        tool_name: "delegate_to_agents",
         delegation_id: "call-1",
         content: "{\"status\":\"done\"}",
         metadata: "{\"status\":\"done\"}",
@@ -754,7 +754,7 @@ describe("chat.updateDelegationToolMessage", () => {
       "success",
       456,
       "sess1",
-      "delegate_to_agents_async",
+      "delegate_to_agents",
       "call-1",
     ]);
     expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
