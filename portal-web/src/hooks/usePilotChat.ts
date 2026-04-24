@@ -34,6 +34,10 @@ interface ChatMessage {
   duration_ms?: number
   metadata?: Record<string, unknown>
   hidden?: boolean
+  from_agent_id?: string | null
+  parent_session_id?: string | null
+  delegation_id?: string | null
+  target_agent_id?: string | null
   created_at: string
 }
 
@@ -60,6 +64,9 @@ interface UsePilotChatReturn {
   removePending: (index: number) => void
   exitDp: () => void
 }
+
+const DELEGATED_TOOL_STALE_MS = 4 * 60 * 1000
+const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"])
 
 /** Format tool args into a readable one-liner for display */
 function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
@@ -120,6 +127,14 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
   if (name === "skill_preview") {
     return (args.dir as string)?.split("/").pop() || ""
   }
+  if (name === "delegate_to_agents") {
+    const tasks = Array.isArray(args.tasks) ? args.tasks : []
+    const count = tasks.length
+    const firstScope = tasks
+      .map((task) => typeof task === "object" && task ? (task as Record<string, unknown>).scope : undefined)
+      .find((scope) => typeof scope === "string" && scope.length > 0) as string | undefined
+    return firstScope ? `${count} sub-agent tasks · ${firstScope}` : `${count} sub-agent tasks`
+  }
   if (name === "local_script") {
     const skill = (args.skill as string) || ""
     const script = (args.script as string) || ""
@@ -146,6 +161,90 @@ function tryParseJson(s: string): Record<string, unknown> | undefined {
   try { return JSON.parse(s) } catch { return undefined }
 }
 
+function normalizeMetadata(value: unknown): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  if (typeof value === "string") return tryParseJson(value);
+  if (typeof value === "object") return value as Record<string, unknown>;
+  return undefined;
+}
+
+export function parsePortalTimestamp(value: string): number {
+  // SQLite CURRENT_TIMESTAMP returns UTC as "YYYY-MM-DD HH:mm:ss" without a
+  // timezone. Browsers parse that shape as local time, which makes fresh
+  // running tool rows look hours old in non-UTC timezones.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)) {
+    return Date.parse(`${value.replace(" ", "T")}Z`)
+  }
+  return Date.parse(value)
+}
+
+function formatPortalTimestamp(value: string): string {
+  const parsed = parsePortalTimestamp(value)
+  if (!Number.isFinite(parsed)) return ""
+  return new Date(parsed).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function isStaleDelegationTool(m: ChatMessage): boolean {
+  if (m.role !== "tool") return false
+  if (m.outcome) return false
+  if (!m.tool_name || !DELEGATED_TOOL_NAMES.has(m.tool_name)) return false
+  const createdAt = parsePortalTimestamp(m.created_at)
+  if (!Number.isFinite(createdAt)) return false
+  return Date.now() - createdAt > DELEGATED_TOOL_STALE_MS
+}
+
+function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
+  if (m.role !== "tool") return undefined;
+  if (isStaleDelegationTool(m)) return "error";
+  if (m.outcome === "error" || m.outcome === "blocked") return "error";
+  if (m.outcome === "success") return "success";
+  return "running";
+}
+
+function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (predicate(items[i])) return i;
+  }
+  return -1;
+}
+
+function toPilotMessage(m: ChatMessage): PilotMessage {
+  const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
+  const metadata = normalizeMetadata(m.metadata)
+  const staleDelegation = isStaleDelegationTool(m)
+  const toolStatus = toolStatusFromMessage(m)
+  const recoveredMetadata = staleDelegation
+    ? {
+        ...(metadata ?? {}),
+        status: "timed_out",
+        recovery_reason: "stale_delegation_tool",
+      }
+    : metadata
+  return {
+    id: m.id,
+    role: m.role,
+    content: staleDelegation && !m.content?.trim()
+      ? "Delegated investigation did not finish before the recovery window. It may have timed out or been interrupted."
+      : m.content,
+    toolName: m.tool_name,
+    toolArgs,
+    toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
+    toolStatus,
+    metadata: recoveredMetadata,
+    hidden: m.hidden,
+    fromAgentId: m.from_agent_id ?? null,
+    parentSessionId: m.parent_session_id ?? null,
+    delegationId: m.delegation_id ?? null,
+    targetAgentId: m.target_agent_id ?? null,
+    timestamp: formatPortalTimestamp(m.created_at),
+    isStreaming: toolStatus === "running",
+  }
+}
+
+function hasRunningPersistedMessages(messages: PilotMessage[]): boolean {
+  return messages.some((m) => m.role === "tool" && (m.toolStatus === "running" || m.isStreaming))
+}
+
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
   const [streaming, setStreaming] = useState(false)
@@ -159,6 +258,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const streamingRef = useRef(false)
+  const recoveredStreamingRef = useRef(false)
   const isAbortingRef = useRef(false)
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
@@ -197,6 +297,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages([])
       setStreaming(false)
       streamingRef.current = false
+      recoveredStreamingRef.current = false
       setContextUsage(null)
       setHasMore(true)
       pageRef.current = 1
@@ -212,6 +313,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages(cached.messages)
       setStreaming(true)
       streamingRef.current = true
+      recoveredStreamingRef.current = false
       setDpActive(cached.dpActive)
       setContextUsage(cached.contextUsage)
       setHasMore(true)
@@ -221,6 +323,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setDpActive(cached.dpActive)
       setContextUsage(cached.contextUsage)
     } else {
+      // No cache (first visit / page reload) — fetch persisted dp-state below.
+      // Pre-set false as neutral default in case the fetch fails.
       resetDpState()
     }
 
@@ -234,28 +338,39 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         if (cancelled) return
-        const pilotMsgs: PilotMessage[] = items.map((m) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          toolName: m.tool_name,
-          toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
-          toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
-          metadata: m.metadata,
-          hidden: m.hidden,
-          timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        }))
+        const pilotMsgs: PilotMessage[] = items.map(toPilotMessage)
+        const recoveredActive = hasRunningPersistedMessages(pilotMsgs)
         setMessages(pilotMsgs)
+        setStreaming(recoveredActive)
+        streamingRef.current = recoveredActive
+        recoveredStreamingRef.current = recoveredActive
         setHasMore(items.length >= PAGE_SIZE)
       } catch (err) {
         console.error("[usePilotChat] Failed to load messages:", err)
         if (!cancelled) {
           setMessages([])
+          setStreaming(false)
+          streamingRef.current = false
+          recoveredStreamingRef.current = false
           setHasMore(false)
         }
       }
     }
+    // Restore persisted DP mode from the backend marker history. Only runs
+    // on cache miss (first visit / page reload); a cache hit above already
+    // reflected the last known state. Failures fall back to the reset-default.
+    async function loadDpState() {
+      try {
+        const { active } = await api<{ active: boolean }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/dp-state`,
+        )
+        if (!cancelled) setDpActive(!!active)
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to load dp-state:", err)
+      }
+    }
     loadHistory()
+    if (!cached) loadDpState()
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, sessionId, resetDpState])
@@ -268,6 +383,60 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       })
     }
   }, [sessionId, messages, streaming, dpActive, contextUsage])
+
+  // A page reload drops the browser's live SSE reader, but the runtime can
+  // keep the prompt running and continue persisting tool rows. When history
+  // contains a running persisted tool, keep the input in steer/abort mode and
+  // poll the DB until the recovered run has visibly settled.
+  useEffect(() => {
+    if (!sessionId || !streaming || !recoveredStreamingRef.current) return
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let settledPolls = 0
+
+    async function refreshRecoveredRun() {
+      try {
+        const res = await api<{ data: ChatMessage[] }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
+        )
+        if (cancelled) return
+        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+        const pilotMsgs = items.map(toPilotMessage)
+        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
+        const latest = pilotMsgs[pilotMsgs.length - 1]
+
+        setMessages(pilotMsgs)
+        setHasMore(items.length >= PAGE_SIZE)
+
+        if (hasRunning) {
+          settledPolls = 0
+        } else if (latest?.role === "assistant") {
+          settledPolls += 1
+        } else {
+          settledPolls = 0
+        }
+
+        if (!hasRunning && settledPolls >= 2) {
+          recoveredStreamingRef.current = false
+          setStreaming(false)
+          streamingRef.current = false
+          setPendingMessages([])
+          return
+        }
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to refresh recovered run:", err)
+      }
+
+      if (!cancelled) timer = setTimeout(refreshRecoveredRun, 2000)
+    }
+
+    timer = setTimeout(refreshRecoveredRun, 1000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [agentId, sessionId, streaming])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(
@@ -329,14 +498,16 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const args = evt.args as Record<string, unknown> | undefined
           const toolInput = formatToolInput(toolName ?? "", args)
           const hidden = toolName === "update_plan"
+          const dbMessageId = evt.dbMessageId as string | undefined
 
           setMessages((prev) => [
             ...prev,
             {
-              id: `tool-${Date.now()}`,
+              id: dbMessageId ?? `tool-${Date.now()}`,
               role: "tool" as const,
               content: "",
               toolName: toolName ?? "tool",
+              toolArgs: args,
               toolInput,
               toolStatus: "running" as const,
               timestamp: timeNow(),
@@ -363,18 +534,26 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const dbMessageId = evt.dbMessageId as string | undefined
 
           setMessages((prev) => {
-            const last = prev[prev.length - 1]
-            if (last?.role === "tool" && last.isStreaming) {
+            const index = dbMessageId
+              ? prev.findIndex((m) => m.id === dbMessageId && m.role === "tool")
+              : -1
+            const fallbackIndex = index >= 0
+              ? index
+              : findLastMessageIndex(prev, (m) => m.role === "tool" && Boolean(m.isStreaming))
+            if (fallbackIndex >= 0) {
+              const current = prev[fallbackIndex]
+              const next = {
+                ...current,
+                content: resultText,
+                toolStatus: isError ? ("error" as const) : ("success" as const),
+                isStreaming: false,
+                ...(toolDetails ? { toolDetails, metadata: toolDetails } : {}),
+                ...(dbMessageId ? { id: dbMessageId } : {}),
+              }
               return [
-                ...prev.slice(0, -1),
-                {
-                  ...last,
-                  content: resultText,
-                  toolStatus: isError ? ("error" as const) : ("success" as const),
-                  isStreaming: false,
-                  ...(toolDetails ? { toolDetails } : {}),
-                  ...(dbMessageId ? { id: dbMessageId } : {}),
-                },
+                ...prev.slice(0, fallbackIndex),
+                next,
+                ...prev.slice(fallbackIndex + 1),
               ]
             }
             return prev
@@ -469,6 +648,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           if (!isAbortingRef.current) {
             setStreaming(false)
             streamingRef.current = false
+            recoveredStreamingRef.current = false
           }
           setPendingMessages([])
           break
@@ -486,6 +666,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
           setStreaming(false)
           streamingRef.current = false
+          recoveredStreamingRef.current = false
           setPendingMessages([])
           // Update context usage from agent_end event
           const cu = evt.contextUsage as ContextUsage | undefined
@@ -518,17 +699,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=${nextPage}&page_size=${PAGE_SIZE}`,
       )
       const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-      const olderMsgs: PilotMessage[] = items.map((m) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        toolName: m.tool_name,
-        toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
-        toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
-        metadata: m.metadata,
-        hidden: m.hidden,
-        timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      }))
+      const olderMsgs: PilotMessage[] = items.map(toPilotMessage)
       setMessages((prev) => [...olderMsgs, ...prev])
       setHasMore(items.length >= PAGE_SIZE)
       pageRef.current = nextPage
@@ -559,6 +730,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages((prev) => [...prev, userMsg])
       setStreaming(true)
       streamingRef.current = true
+      recoveredStreamingRef.current = false
       setStreamText("")
 
       // Start SSE
@@ -635,6 +807,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                     setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
                     setStreaming(false)
                     streamingRef.current = false
+                    recoveredStreamingRef.current = false
                     setPendingMessages([])
                   }
                   // Update cache: mark stream as finished so switching back shows final state
@@ -644,6 +817,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                   if (isActive) {
                     setStreaming(false)
                     streamingRef.current = false
+                    recoveredStreamingRef.current = false
                   }
                   if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
                 }
@@ -659,6 +833,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             if (streamingRef.current) {
               setStreaming(false)
               streamingRef.current = false
+              recoveredStreamingRef.current = false
             }
           }
         } catch (err) {
@@ -669,7 +844,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
             setStreaming(false)
             streamingRef.current = false
+            recoveredStreamingRef.current = false
           }
+        } finally {
+          if (abortControllerRef.current === controller) abortControllerRef.current = null
         }
       })()
     },
@@ -709,6 +887,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     isAbortingRef.current = false
     setStreaming(false)
     streamingRef.current = false
+    recoveredStreamingRef.current = false
   }, [agentId, sessionId])
 
   // --- Remove pending ---
