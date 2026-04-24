@@ -224,6 +224,7 @@ export function PilotArea({
       .slice(turnStart + 1)
       .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
   }, [messages, isLoading, dpActive])
+  const renderMessages = useMemo(() => withDelegationStatusNotices(messages), [messages])
 
   // Auto-scroll logic
   useEffect(() => {
@@ -294,7 +295,7 @@ export function PilotArea({
                 </div>
               )}
 
-              {messages
+              {renderMessages
                 .filter((m) => !m.hidden)
                 .map((msg) => (
                   <MessageItem
@@ -674,6 +675,43 @@ function statusTone(status?: string): { label: string; className: string } {
   }
 }
 
+function messageDelegationId(message: PilotMessage): string | undefined {
+  return message.delegationId ?? stringValue(message.metadata?.delegation_id)
+}
+
+function isBatchCompleteDelegationEvent(message: PilotMessage): boolean {
+  return (
+    message.metadata?.kind === "delegation_event" &&
+    message.metadata?.event_type === "delegation.batch_complete" &&
+    Boolean(messageDelegationId(message))
+  )
+}
+
+function withDelegationStatusNotices(messages: PilotMessage[]): PilotMessage[] {
+  const next: PilotMessage[] = []
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    next.push(message)
+    if (!isBatchCompleteDelegationEvent(message)) continue
+
+    const hasSyntheticReply = messages
+      .slice(i + 1)
+      .some((candidate) => candidate.role === "assistant" && !candidate.hidden)
+    if (hasSyntheticReply) continue
+
+    next.push({
+      id: `delegation-status-${messageDelegationId(message) ?? message.id}`,
+      role: "assistant",
+      content: "Results ready · Siclaw is synthesizing",
+      timestamp: message.timestamp,
+      metadata: { kind: "delegation_status_notice" },
+    })
+  }
+
+  return next
+}
+
 function agentWorkBatchSummary(message: PilotMessage): {
   taskCount: number
   tasks: Array<{
@@ -691,6 +729,7 @@ function agentWorkBatchSummary(message: PilotMessage): {
   totalToolCalls?: number
   duration?: string
   status: string
+  notice?: string
 } {
   const args = message.toolArgs ?? {}
   const details = message.toolDetails ?? {}
@@ -773,6 +812,7 @@ function agentWorkBatchSummary(message: PilotMessage): {
       numberValue(metadata.total_tool_calls),
     duration: compactDuration(durationMs),
     status,
+    notice: stringValue(metadata.ui_status),
   }
 }
 
@@ -876,6 +916,10 @@ function MessageItem({
 }) {
   const isUser = message.role === "user"
   const isTool = message.role === "tool"
+
+  if (message.metadata?.kind === "delegation_status_notice") {
+    return <DelegationStatusNotice content={message.content} />
+  }
 
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
@@ -999,6 +1043,20 @@ function MessageItem({
             ))}
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+function DelegationStatusNotice({ content }: { content: string }) {
+  const [headline, detail] = content.split(" · ")
+  return (
+    <div className="pl-12 min-w-0">
+      <div className="inline-flex max-w-3xl items-center gap-2 rounded-full border border-blue-500/25 bg-blue-500/10 px-3 py-1.5 text-xs text-blue-300 shadow-sm shadow-black/10">
+        <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+        <span className="font-medium">{headline}</span>
+        {detail && <span className="text-blue-300/70">·</span>}
+        {detail && <span className="truncate">{detail}</span>}
       </div>
     </div>
   )
@@ -1226,6 +1284,7 @@ function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
   const batch = agentWorkBatchSummary(message)
   const [expanded, setExpanded] = useState(message.isStreaming ?? false)
   const tone = computeBatchTone(batch)
+  const isSynthesizing = batch.notice != null
   const taskLabel = `${batch.taskCount || 0} sub-agent${batch.taskCount === 1 ? "" : "s"}`
   const aggregateBits = [
     taskLabel,
@@ -1257,8 +1316,13 @@ function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
             <div className="text-xs text-muted-foreground truncate">
               {aggregateBits.join(" · ")}
             </div>
+            {batch.notice && (
+              <div className="mt-0.5 text-xs text-blue-300 truncate">
+                {batch.notice}
+              </div>
+            )}
           </div>
-          {batch.status === "running" && (
+          {(batch.status === "running" || isSynthesizing) && (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
           )}
         </button>

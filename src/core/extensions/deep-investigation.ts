@@ -34,17 +34,18 @@ Run this loop until you have a justified answer:
 2. Form hypotheses only when evidence makes them useful. Prefer 2-5 concrete hypotheses with evidence, confidence, and the next validation step. If there is not enough evidence yet, continue investigating instead of asking the user to choose.
 3. Work autonomously by default. Do not ask the user to choose A/B/C after every message. Do not narrate DP mechanics unless it helps the investigation.
 4. Use same-agent delegation when it reduces hallucination or latency. You may call delegate_to_agent with agent_id="self" for one focused check. When the user explicitly asks for multiple sub-agents, or when you identify 2-3 independent checks that should run in parallel, prefer delegate_to_agents with 1-3 tasks in a single tool call. Each delegated scope must be narrow and evidence-oriented, with only the context_summary needed for that sub-task. Do not call one sub-agent, wait for it, then decide whether to start the next unless the tasks truly depend on each other. Do not target another agent unless the runtime explicitly exposes that capability.
-5. After any delegated checks return, synthesize them in the parent answer. Update the hypotheses, confidence, and next step from the delegated evidence instead of leaving the user to inspect sub-agent cards.
-6. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, or credible competing hypotheses that would benefit from user steering.
-7. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
+5. Treat a delegate_to_agents result with status="running" as a launch acknowledgement only. It does not contain delegated findings. Do not report delegated results, do not produce a final delegated synthesis, and do not attribute parent-collected evidence to sub-agents until you receive a [Delegation Batch Complete] / delegation.batch_complete notification. While waiting, you may collect clearly labeled parent-side baseline evidence or tell the user the delegated checks are still running.
+6. After delegated evidence is actually available, synthesize it in the parent answer. Update the hypotheses, confidence, and next step from the delegated evidence instead of leaving the user to inspect sub-agent cards.
+7. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, or credible competing hypotheses that would benefit from user steering.
+8. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
    <!-- hypothesis-checkpoint -->
    <!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->
-8. When the user replies:
+9. When the user replies:
    - "Proceed" / "A" — proceed with validating the strongest current hypothesis
    - "Refine" / "B <text>" — revise or add hypotheses based on what they wrote
    - "Summarize" / "C" — wrap up with your current best answer
    - anything else — interpret naturally
-9. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
+10. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
 
 Stay in this mindset across turns until the user exits with [DP_EXIT].`;
 

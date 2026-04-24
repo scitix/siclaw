@@ -40,6 +40,10 @@ describe("delegate_to_agents", () => {
     const executor = vi.fn(async () => ({
       status: "running" as const,
       delegation_id: "call-1",
+      results_available: false as const,
+      next_event: "delegation.batch_complete" as const,
+      parent_instruction:
+        "The delegated agents are still running. Do not report delegated findings or synthesize a final delegated answer yet.",
       tasks: [
         {
           index: 1,
@@ -86,11 +90,15 @@ describe("delegate_to_agents", () => {
     expect(content).toMatchObject({
       status: "running",
       delegation_id: "call-1",
+      results_available: false,
+      next_event: "delegation.batch_complete",
       total_tool_calls: 0,
     });
+    expect(content.parent_instruction).toContain("Do not report delegated findings");
     expect(result.details).toMatchObject({
       status: "running",
       delegation_id: "call-1",
+      results_available: false,
       async: true,
     });
   });

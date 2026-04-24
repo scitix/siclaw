@@ -106,6 +106,12 @@ const DELEGATED_AGENT_IDLE_TIMEOUT_MS = 60_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = 10 * 60_000;
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 const DELEGATED_TOOL_TRACE_PREVIEW_CHARS = 1_200;
+const DELEGATION_BATCH_COMPLETE_EVENT = "delegation.batch_complete";
+const DELEGATION_BATCH_RUNNING_PARENT_INSTRUCTION =
+  "The delegated agents are still running. Do not report delegated findings or synthesize a final delegated answer yet. " +
+  "You may collect clearly labeled parent-side baseline evidence, or briefly tell the user you are waiting for delegation.batch_complete.";
+const DELEGATION_BATCH_READY_PARENT_INSTRUCTION =
+  "Delegated results are now available from delegation.batch_complete. Synthesize these delegated findings into the current investigation.";
 
 interface PendingChildToolCall {
   toolName: string;
@@ -391,6 +397,9 @@ Always end with a final report even if evidence is incomplete.`;
     return {
       status: "running",
       delegation_id: request.delegationId,
+      results_available: false,
+      next_event: DELEGATION_BATCH_COMPLETE_EVENT,
+      parent_instruction: DELEGATION_BATCH_RUNNING_PARENT_INSTRUCTION,
       tasks: request.tasks.map((task) => ({
         index: task.index,
         status: "running",
@@ -426,9 +435,17 @@ Always end with a final report even if evidence is incomplete.`;
         : aggregateDelegationStatus(snapshot);
       const totalToolCalls = snapshot.reduce((sum, task) => sum + task.tool_calls, 0);
       const durationMs = Date.now() - startedAt;
+      const resultsAvailable = !hasRunning;
       const toolResult = {
         status,
         delegation_id: request.delegationId,
+        results_available: resultsAvailable,
+        ...(resultsAvailable
+          ? { result_event: DELEGATION_BATCH_COMPLETE_EVENT, parent_instruction: DELEGATION_BATCH_READY_PARENT_INSTRUCTION }
+          : {
+              next_event: DELEGATION_BATCH_COMPLETE_EVENT,
+              parent_instruction: DELEGATION_BATCH_RUNNING_PARENT_INSTRUCTION,
+            }),
         tasks: snapshot.map((task) => ({
           index: task.index,
           status: task.status,

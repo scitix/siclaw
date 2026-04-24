@@ -103,6 +103,9 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
     expect(transform.text).toContain('delegate_to_agent with agent_id="self"');
     expect(transform.text).toContain("prefer delegate_to_agents with 1-3 tasks");
     expect(transform.text).toContain("Do not call one sub-agent, wait for it");
+    expect(transform.text).toContain('delegate_to_agents result with status="running" as a launch acknowledgement only');
+    expect(transform.text).toContain("do not attribute parent-collected evidence to sub-agents");
+    expect(transform.text).toContain("[Delegation Batch Complete]");
     expect(transform.text).toContain("Do not render any visible choice list in the markdown");
     expect(transform.text).toContain("<!-- hypothesis-checkpoint -->");
     expect(transform.text).toContain("<!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->");

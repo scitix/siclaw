@@ -264,6 +264,86 @@ function hasRunningAsyncDelegationMessages(messages: PilotMessage[]): boolean {
   return messages.some(isRunningAsyncDelegationMessage)
 }
 
+function messageString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function messageDelegationId(message: PilotMessage): string | undefined {
+  if (message.delegationId) return message.delegationId
+  const metadataId = messageString(message.metadata?.delegation_id)
+  if (metadataId) return metadataId
+  const parsedContent = message.content ? tryParseJson(message.content) : undefined
+  return messageString(parsedContent?.delegation_id)
+}
+
+function isBatchCompleteDelegationEvent(message: PilotMessage, delegationId: string): boolean {
+  return (
+    message.metadata?.kind === "delegation_event" &&
+    message.metadata?.event_type === "delegation.batch_complete" &&
+    messageDelegationId(message) === delegationId
+  )
+}
+
+function annotateDelegationSynthesis(messages: PilotMessage[]): PilotMessage[] {
+  let next: PilotMessage[] | null = null
+  const updateAt = (index: number, message: PilotMessage) => {
+    if (!next) next = [...messages]
+    next[index] = message
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (message.role !== "tool" || message.toolName !== "delegate_to_agents") continue
+
+    const delegationId = messageDelegationId(message)
+    const existingMetadata = message.metadata ?? {}
+    if (!delegationId) {
+      if (existingMetadata.ui_state === "synthesizing" || existingMetadata.ui_status) {
+        const { ui_state: _state, ui_status: _status, ...metadata } = existingMetadata
+        updateAt(i, { ...message, metadata })
+      }
+      continue
+    }
+
+    const eventIndex = messages.findIndex((candidate, index) =>
+      index > i && isBatchCompleteDelegationEvent(candidate, delegationId),
+    )
+    const hasSyntheticReply =
+      eventIndex >= 0 &&
+      messages.slice(eventIndex + 1).some((candidate) => candidate.role === "assistant" && !candidate.hidden)
+    const shouldShowSynthesizing = eventIndex >= 0 && !hasSyntheticReply
+
+    if (shouldShowSynthesizing) {
+      if (
+        existingMetadata.ui_state !== "synthesizing" ||
+        existingMetadata.ui_status !== "Results ready · Siclaw is synthesizing"
+      ) {
+        updateAt(i, {
+          ...message,
+          metadata: {
+            ...existingMetadata,
+            ui_state: "synthesizing",
+            ui_status: "Results ready · Siclaw is synthesizing",
+          },
+        })
+      }
+    } else if (existingMetadata.ui_state === "synthesizing" || existingMetadata.ui_status) {
+      const { ui_state: _state, ui_status: _status, ...metadata } = existingMetadata
+      updateAt(i, { ...message, metadata })
+    }
+  }
+
+  return next ?? messages
+}
+
+function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
+  return messages.some((message) => message.metadata?.ui_state === "synthesizing")
+}
+
+function hasActiveAsyncDelegationSurface(messages: PilotMessage[]): boolean {
+  return hasRunningAsyncDelegationMessages(messages) || hasPendingDelegationSynthesis(messages)
+}
+
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
   const [streaming, setStreaming] = useState(false)
@@ -357,7 +437,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         if (cancelled) return
-        const pilotMsgs: PilotMessage[] = items.map(toPilotMessage)
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         const recoveredActive = hasRunningPersistedMessages(pilotMsgs)
         setMessages(pilotMsgs)
         setStreaming(recoveredActive)
@@ -421,7 +501,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         if (cancelled) return
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-        const pilotMsgs = items.map(toPilotMessage)
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         const hasRunning = hasRunningPersistedMessages(pilotMsgs)
         const latest = pilotMsgs[pilotMsgs.length - 1]
 
@@ -463,7 +543,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // running; this keeps the input unlocked but lets the card and follow-up
   // assistant synthesis appear without a manual refresh.
   useEffect(() => {
-    if (!sessionId || !hasRunningAsyncDelegationMessages(messages)) return
+    if (!sessionId || !hasActiveAsyncDelegationSurface(messages)) return
 
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -475,10 +555,10 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         if (cancelled) return
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-        const pilotMsgs = items.map(toPilotMessage)
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
-        if (!hasRunningAsyncDelegationMessages(pilotMsgs)) return
+        if (!hasActiveAsyncDelegationSurface(pilotMsgs)) return
       } catch (err) {
         console.warn("[usePilotChat] Failed to refresh async delegation:", err)
       }
@@ -754,8 +834,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=${nextPage}&page_size=${PAGE_SIZE}`,
       )
       const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-      const olderMsgs: PilotMessage[] = items.map(toPilotMessage)
-      setMessages((prev) => [...olderMsgs, ...prev])
+      const olderMsgs = items.map(toPilotMessage)
+      setMessages((prev) => annotateDelegationSynthesis([...olderMsgs, ...prev]))
       setHasMore(items.length >= PAGE_SIZE)
       pageRef.current = nextPage
     } catch (err) {

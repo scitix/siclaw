@@ -105,6 +105,14 @@ export interface DelegateToAgentsTaskStartResult {
 export interface DelegateToAgentsStartResult {
   status: "running";
   delegation_id: string;
+  /**
+   * False while the batch is still running. The model must wait for the
+   * delegation.batch_complete notification before treating delegated evidence as
+   * available.
+   */
+  results_available: false;
+  next_event: "delegation.batch_complete";
+  parent_instruction: string;
   tasks: DelegateToAgentsTaskStartResult[];
   total_tool_calls: 0;
   duration_ms: 0;
