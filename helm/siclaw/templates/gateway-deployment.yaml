@@ -48,7 +48,7 @@ spec:
             - name: SICLAW_PERSISTENCE_ENABLED
               value: "true"
             - name: SICLAW_PERSISTENCE_CLAIM_NAME
-              value: {{ .Values.agentbox.persistence.claimName | quote }}
+              value: {{ include "siclaw.dataPvcName" . | quote }}
             {{- end }}
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
@@ -111,5 +111,5 @@ spec:
         {{- if .Values.agentbox.persistence.enabled }}
         - name: user-data
           persistentVolumeClaim:
-            claimName: {{ .Values.agentbox.persistence.claimName }}
+            claimName: {{ include "siclaw.dataPvcName" . }}
         {{- end }}

@@ -70,10 +70,6 @@ export function materializePortalKnowledge(
     );
     try {
       fs.writeFileSync(tmpPath, Buffer.from(repo.dataBase64, "base64"));
-      // Snapshot file stats BEFORE extraction so we can tell which entries
-      // this repo actually wrote (either newly created or stat-changed by
-      // the extraction) and attribute collisions correctly.
-      const beforeFiles = snapshotFileStats(outDirResolved);
       // `--no-same-owner` strips archived uid/gid so a malicious tar can't
       // install files owned by root (defensive even though we're not root).
       // Absolute-path stripping: BSD tar (macOS) strips leading `/` by default;
@@ -97,25 +93,12 @@ export function materializePortalKnowledge(
         firstWriter.clear();
         throw new Error(`tar extraction escaped outDir (${escapes.length} offending entries)`);
       }
-      // Diff: a file was written by THIS repo iff its stat changed (or it
-      // didn't exist before). That lets us attribute every real write to
-      // the correct repo instead of flagging every pre-existing file as a
-      // false-positive collision.
-      const afterFiles = snapshotFileStats(outDirResolved);
-      for (const [rel, afterStat] of afterFiles) {
-        const beforeStat = beforeFiles.get(rel);
-        // "Written by this repo" = any of the three stat dimensions changed.
-        // Inode is the most reliable signal: `tar x` defaults to unlink+create,
-        // so a rewritten file gets a new inode even when size and mtime happen
-        // to match on a coarse-granularity filesystem (FAT32, some NFS mounts).
-        // Size + mtime stay as belt-and-suspenders for tar implementations that
-        // overwrite in place (same inode, new content).
-        const writtenByThisRepo =
-          beforeStat === undefined ||
-          beforeStat.size !== afterStat.size ||
-          beforeStat.mtimeMs !== afterStat.mtimeMs ||
-          beforeStat.ino !== afterStat.ino;
-        if (!writtenByThisRepo) continue;
+      // Attribute writes via the archive's own manifest rather than diffing
+      // stats. GNU tar overwrites in place (same inode), restores mtime at
+      // second granularity, and two archives built in the same second with
+      // equal-length payloads tied on size/mtime/inode simultaneously —
+      // hiding collisions. The manifest is deterministic and OS-independent.
+      for (const rel of listTarEntries(tmpPath)) {
         const prior = firstWriter.get(rel);
         if (prior && prior !== repo.name) {
           collisions.push({ path: rel, firstRepo: prior, overwrittenBy: repo.name });
@@ -145,35 +128,23 @@ export function materializePortalKnowledge(
 }
 
 /**
- * Enumerate every file under `dir` (recursively) with size, mtime, and inode
- * so the caller can diff pre/post-extraction and attribute each write to its
- * repo. Paths are relative to `dir`. Skips symlinks — the path-traversal walk
- * catches them separately.
+ * List the regular-file entries in a tar.gz archive, yielding paths normalised
+ * to match what `tar -x` would write under `outDir`. Directory entries and
+ * entries whose normalised form escapes `outDir` (absolute paths, `..`) are
+ * dropped — the post-extraction escape walk is authoritative for those.
  */
-function snapshotFileStats(dir: string): Map<string, { size: number; mtimeMs: number; ino: number }> {
-  const out = new Map<string, { size: number; mtimeMs: number; ino: number }>();
-  if (!fs.existsSync(dir)) return out;
-  const walk = (current: string): void => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) walk(full);
-      else if (entry.isFile()) {
-        try {
-          const st = fs.statSync(full);
-          out.set(path.relative(dir, full), { size: st.size, mtimeMs: st.mtimeMs, ino: st.ino });
-        } catch { /* disappeared between readdir and stat; skip */ }
-      }
-    }
-  };
-  walk(dir);
-  return out;
+function listTarEntries(tarPath: string): string[] {
+  const raw = execFileSync("tar", ["-tzf", tarPath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const seen = new Set<string>();
+  for (const line of raw.split("\n")) {
+    if (!line || line.endsWith("/")) continue;
+    let rel = line.replace(/^\.\//, "");
+    if (rel.startsWith("/") || rel.split("/").includes("..")) continue;
+    rel = path.normalize(rel);
+    if (rel === "." || rel === "") continue;
+    seen.add(rel);
+  }
+  return Array.from(seen);
 }
 
 /**
