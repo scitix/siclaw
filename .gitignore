@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+node_modules
 portal-web/node_modules/
 
 # Build output
@@ -12,6 +13,7 @@ portal-web/src/**/*.js.map
 
 # Runtime data
 .siclaw/
+.siclaw
 *.sqlite
 *.db
 
@@ -29,3 +31,12 @@ Thumbs.db
 *.swp
 *.swo
 .worktrees
+.omx/
+.codex/*
+!.codex/agents/
+!.codex/agents/**
+!.codex/skills/
+!.codex/skills/**
+.codex/skills/.system/**
+!.codex/prompts/
+!.codex/prompts/**
