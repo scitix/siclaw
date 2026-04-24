@@ -19,7 +19,6 @@ database:
 # -- Agent Runtime
 runtime:
   replicas: 1
-  jwtSecret: ""         # shared JWT secret (same as Portal/Upstream)
   runtimeSecret: ""       # Portal/Upstream → Runtime WS auth
   portalSecret: ""      # Runtime → Portal/Upstream API auth
   # Where Runtime gets Agent/Credential info from:
@@ -39,7 +38,7 @@ runtime:
 portal:
   enabled: true
   replicas: 1
-  jwtSecret: ""         # same as runtime.jwtSecret
+  jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
   runtimeSecret: ""       # same as runtime.runtimeSecret
   portalSecret: ""      # same as runtime.portalSecret
   service:

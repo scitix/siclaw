@@ -58,7 +58,6 @@ const runtimeHandle = await bootstrapRuntime({
     runtimeSecret: secrets.runtimeSecret,
     serverUrl: portalUrl,
     portalSecret: secrets.portalSecret,
-    jwtSecret: secrets.jwtSecret,
   },
 });
 console.log(`[local] Runtime: ${runtimeUrl}`);

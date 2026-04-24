@@ -54,12 +54,6 @@ spec:
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
             {{- end }}
-            # JWT (shared with Portal/Upstream)
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "siclaw.fullname" . }}-runtime
-                  key: jwt-secret
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
             # Trusted Proxy secret
