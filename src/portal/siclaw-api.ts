@@ -1265,20 +1265,21 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
-    // origin='task' sessions are scheduled-task execution traces — they live
-    // in the same table so FK + sse-consumer keep working, but the user-facing
-    // Chat list should hide them (entry point is the task runs page).
+    // origin='task' and origin='delegation' sessions are execution traces —
+    // they live in the same table so FK + audit paths keep working, but the
+    // user-facing Chat list should hide them. Their entry points are task-run
+    // pages and delegated investigation cards.
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
         `SELECT COUNT(*) AS count FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'task')`,
+           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))`,
         [params.id, auth.userId],
       ),
       db.query(
         `SELECT * FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'task')
+           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))
          ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),
@@ -1408,6 +1409,44 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       page,
       page_size: pageSize,
     });
+  });
+
+  // GET .../chat/sessions/:sid/dp-state
+  // Reports whether the session is currently in Deep Investigation mode,
+  // derived from the most recent DP marker in the message history:
+  //   [Deep Investigation]  → active=true
+  //   [DP_EXIT]             → active=false
+  //   no marker             → active=false
+  // This is the source-of-truth for the frontend to restore DP UI state
+  // after page reload or first visit to an existing session.
+  router.get(`${P}/agents/:id/chat/sessions/:sid/dp-state`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [session] = await db.query(
+      "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+      [params.sid, params.id, auth.userId],
+    ) as any;
+    if (session.length === 0) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    // Substring match works identically under MySQL + SQLite; avoids any
+    // LIKE-wildcard-escape quirks around the literal '[' / ']' characters.
+    const [rows] = await db.query(
+      `SELECT content FROM chat_messages
+       WHERE session_id = ? AND role = 'user'
+         AND (substr(content, 1, 20) = '[Deep Investigation]' OR substr(content, 1, 9) = '[DP_EXIT]')
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [params.sid],
+    ) as any;
+
+    const latest = (rows as any[])[0]?.content as string | undefined;
+    const active = typeof latest === "string" && latest.startsWith("[Deep Investigation]");
+    sendJson(res, 200, { active });
   });
 
 

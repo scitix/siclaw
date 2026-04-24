@@ -13,9 +13,17 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
+import type {
+  DelegateToAgentExecutor,
+  DelegateToAgentRequest,
+  DelegateToAgentResult,
+  DelegateToAgentToolTraceEntry,
+} from "../core/tool-registry.js";
+import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
@@ -23,6 +31,8 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
+import { appendMessage, ensureChatSession, updateMessage } from "../gateway/chat-repo.js";
+import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../gateway/output-redactor.js";
 // topic-consolidator import removed — consolidation disabled
 
 export interface ManagedSession {
@@ -53,6 +63,8 @@ export interface ManagedSession {
   skillsDirs: string[];
   /** Session mode — determines which system skills are loaded */
   mode: SessionMode;
+  /** Whether same-agent delegation tools are exposed in this in-memory session */
+  delegationToolsEnabled: boolean;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -63,14 +75,113 @@ export interface ManagedSession {
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
+   * push custom events here, and the SSE handler forwards them to clients.
+   * Used by dispatch_subagents to surface child-agent events in the parent
+   * session's stream.
+   */
+  _extraEventSubs: Set<(event: Record<string, unknown>) => void>;
+  /** Buffer of extra events fired before an SSE client connects (replayed on connect, like _eventBuffer for brain events). */
+  _extraEventBuffer: Record<string, unknown>[];
 }
 
 export interface PersistedDpStateSnapshot {
   active: boolean;
 }
 
+export interface GetOrCreateSessionOptions {
+  enableDelegationTools?: boolean;
+}
+
 /** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
 const SESSION_RELEASE_TTL_MS = 30_000;
+const DELEGATED_AGENT_IDLE_TIMEOUT_MS = 60_000;
+const DELEGATED_AGENT_MAX_RUNTIME_MS = 10 * 60_000;
+const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
+const DELEGATED_TOOL_TRACE_PREVIEW_CHARS = 1_200;
+
+interface PendingChildToolCall {
+  toolName: string;
+  rawToolInput: string;
+  redactedToolInput: string | null;
+  startedAt: string;
+  startMs: number;
+  messageId?: string;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pushPendingChildTool(
+  map: Map<string, PendingChildToolCall[]>,
+  key: string,
+  value: PendingChildToolCall,
+): void {
+  const queue = map.get(key);
+  if (queue) queue.push(value);
+  else map.set(key, [value]);
+}
+
+function shiftPendingChildTool(
+  map: Map<string, PendingChildToolCall[]>,
+  key: string,
+): PendingChildToolCall | undefined {
+  const queue = map.get(key);
+  if (!queue) return undefined;
+  const value = queue.shift();
+  if (queue.length === 0) map.delete(key);
+  return value;
+}
+
+function extractToolText(result: unknown): string {
+  const content = (result as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((item) => item?.type === "text")
+    .map((item) => item.text ?? "")
+    .join("");
+}
+
+function delegatedToolOutcome(result: unknown, event: any): "success" | "error" | "blocked" {
+  const details = (result as { details?: Record<string, unknown> } | undefined)?.details;
+  if (details?.blocked) return "blocked";
+  if (details?.error || event?.isError) return "error";
+  return "success";
+}
+
+function persistableToolDetails(result: unknown, redactionConfig: RedactionConfig): Record<string, unknown> | null {
+  const details = (result as { details?: Record<string, unknown> } | undefined)?.details;
+  if (!details) return null;
+  const { blocked: _blocked, error: _error, ...rest } = details;
+  if (Object.keys(rest).length === 0) return null;
+  if (redactionConfig.patterns.length === 0) return rest;
+  try {
+    return JSON.parse(redactText(JSON.stringify(rest), redactionConfig)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function abortBrainBestEffort(
+  brain: Pick<BrainSession, "abort">,
+  label: string,
+  timeoutMs = DELEGATED_AGENT_ABORT_TIMEOUT_MS,
+): Promise<void> {
+  const abortPromise = Promise.resolve()
+    .then(() => brain.abort())
+    .catch((err) => {
+      console.warn(`[agentbox-session] ${label}: abort failed:`, err);
+    });
+  const outcome = await Promise.race([
+    abortPromise.then(() => "done" as const),
+    delay(timeoutMs).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    console.warn(`[agentbox-session] ${label}: abort did not settle within ${timeoutMs}ms; continuing with timeout result`);
+  }
+}
 
 export class AgentBoxSessionManager {
   private sessions = new Map<string, ManagedSession>();
@@ -99,10 +210,25 @@ export class AgentBoxSessionManager {
   /** Callback fired after a session is released — used by http-server to check idle status */
   onSessionRelease?: () => void;
 
+  /** Last model selection supplied by the gateway for this AgentBox. */
+  private delegationModelProvider?: string;
+  private delegationModelId?: string;
+  private delegationModelConfig?: Record<string, unknown>;
+
   // ── Shared components (AgentBox-level, outlive individual sessions) ──
   private _sharedMemoryIndexer: MemoryIndexer | null = null;
   /** Whether shared components have been initialized */
   private _sharedInitialized = false;
+
+  setDelegationModel(opts: {
+    provider?: string;
+    modelId?: string;
+    config?: Record<string, unknown>;
+  }): void {
+    if (opts.provider) this.delegationModelProvider = opts.provider;
+    if (opts.modelId) this.delegationModelId = opts.modelId;
+    if (opts.config) this.delegationModelConfig = opts.config;
+  }
 
   /**
    * Get base session storage directory.
@@ -164,6 +290,399 @@ export class AgentBoxSessionManager {
     // MCP is initialized per-session inside createSiclawSession via loadConfig().mcpServers.
   }
 
+  private buildDelegatedAgentPrompt(request: DelegateToAgentRequest): string {
+    const context = request.contextSummary?.trim()
+      ? `\n\nRelevant parent context:\n${request.contextSummary.trim()}`
+      : "";
+    return `You are running as a delegated sub-agent for a parent Siclaw investigation.
+
+Scope:
+${request.scope.trim()}${context}
+
+Work autonomously. Use tools only when they materially improve evidence quality.
+Do not delegate to another agent from this delegated run.
+Return a final report with these sections:
+
+## Evidence Capsule
+- Verdict: likely / unlikely / inconclusive
+- Confidence: low / medium / high
+- Key evidence: 2-4 short bullets
+- Counter-evidence or uncertainty: 0-2 short bullets
+- Recommended next step: one short action
+
+## Full Report
+Only include detail that helps a user audit the work. Do not dump raw transcripts.
+
+The Evidence Capsule is passed back to the parent agent, so keep it under 1,200 characters.
+Always end with a final report even if evidence is incomplete.`;
+  }
+
+  private createDelegateToAgentExecutor(): DelegateToAgentExecutor {
+    return async (request) => this.runDelegatedAgent(request);
+  }
+
+  private async runDelegatedAgent(request: DelegateToAgentRequest): Promise<DelegateToAgentResult> {
+    const requestedAgentId = request.agentId.trim();
+    const currentAgentId = this.agentId ?? request.parentAgentId ?? null;
+    const isSelfTarget = requestedAgentId === "self" || requestedAgentId === currentAgentId;
+
+    // Cross-AgentBox routing needs the gateway/portal-level bridge so the
+    // target agent's model, credentials, and system prompt are used. Keep the
+    // contract open, but fail clearly until that bridge is wired.
+    if (!isSelfTarget) {
+      return {
+        status: "failed",
+        summary:
+          `Target agent "${requestedAgentId}" is not reachable from this AgentBox yet. ` +
+          "Same-agent sub-agent delegation is available; cross-agent expert collaboration needs the gateway bridge.",
+        sessionId: "",
+        toolCalls: 0,
+        durationMs: 0,
+      };
+    }
+
+    await this.ensureSharedComponents();
+
+    const childSessionId = randomUUID();
+    const childSessionDir = this.getSessionDir(childSessionId);
+    const childSessionManager = SessionManager.continueRecent(process.cwd(), childSessionDir);
+    const config = loadConfig();
+    const kubeconfigRef: KubeconfigRef = {
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
+    };
+
+    const child = await createSiclawSession({
+      sessionManager: childSessionManager,
+      kubeconfigRef,
+      mode: "web",
+      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      userId: this.userId,
+      agentId: currentAgentId,
+      knowledgeIndexer: this.knowledgeIndexer,
+      // Deliberately omit delegateToAgentExecutor for delegated sessions to
+      // avoid recursive agent spawning in the first runtime bridge.
+    });
+    child.sessionIdRef.current = childSessionId;
+
+    if (this.delegationModelProvider && this.delegationModelConfig && child.brain.registerProvider) {
+      child.brain.registerProvider(this.delegationModelProvider, this.delegationModelConfig);
+    }
+    if (this.delegationModelProvider && this.delegationModelId) {
+      const model = child.brain.findModel(this.delegationModelProvider, this.delegationModelId);
+      if (model) await child.brain.setModel(model);
+    }
+
+    const targetAgentId = isSelfTarget ? currentAgentId : requestedAgentId;
+    const delegationId = request.delegationId ?? childSessionId;
+    const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
+    const lineage = {
+      parentSessionId: request.parentSessionId,
+      parentAgentId: request.parentAgentId ?? currentAgentId,
+      delegationId,
+      targetAgentId,
+    };
+    let persistDelegationTrace = Boolean(currentAgentId && targetAgentId && request.userId && request.parentSessionId);
+    let persistQueue: Promise<void> = Promise.resolve();
+    const enqueuePersist = (op: () => Promise<void>) => {
+      if (!persistDelegationTrace) return;
+      persistQueue = persistQueue
+        .then(op)
+        .catch((err) => {
+          persistDelegationTrace = false;
+          console.warn(`[agentbox-session] Delegated trace persistence disabled for ${childSessionId}:`, err);
+        });
+    };
+    if (persistDelegationTrace && currentAgentId && targetAgentId) {
+      try {
+        const title = request.totalTasks && request.taskIndex
+          ? `Delegated investigation ${request.taskIndex}/${request.totalTasks}`
+          : "Delegated investigation";
+        await ensureChatSession(
+          childSessionId,
+          currentAgentId,
+          request.userId,
+          title,
+          request.scope,
+          "delegation",
+          lineage,
+        );
+        await appendMessage({
+          sessionId: childSessionId,
+          role: "user",
+          content: redactText(request.scope, redactionConfig),
+          fromAgentId: request.parentAgentId ?? currentAgentId,
+          parentSessionId: request.parentSessionId,
+          delegationId,
+          targetAgentId,
+        });
+      } catch (err) {
+        persistDelegationTrace = false;
+        console.warn(`[agentbox-session] Could not initialize delegated trace session ${childSessionId}:`, err);
+      }
+    }
+
+    let finalText = "";
+    let currentAssistantText = "";
+    let finalError = "";
+    let status: DelegateToAgentResult["status"] = "done";
+    let toolCalls = 0;
+    let activeChildToolCalls = 0;
+    const toolTrace: DelegateToAgentToolTraceEntry[] = [];
+    const pendingToolCalls = new Map<string, PendingChildToolCall[]>();
+    let markChildActivity: () => void = () => {};
+    const unsubscribe = child.brain.subscribe((event: any) => {
+      if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
+        activeChildToolCalls++;
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const rawToolInput = event.args ? JSON.stringify(event.args) : "";
+        const pending: PendingChildToolCall = {
+          toolName,
+          rawToolInput,
+          redactedToolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
+          startedAt: new Date().toISOString(),
+          startMs: Date.now(),
+        };
+        pushPendingChildTool(pendingToolCalls, toolName, pending);
+        enqueuePersist(async () => {
+          pending.messageId = await appendMessage({
+            sessionId: childSessionId,
+            role: "tool",
+            content: "",
+            toolName,
+            toolInput: pending.redactedToolInput,
+            outcome: null,
+            durationMs: null,
+            metadata: {
+              status: "running",
+              started_at: pending.startedAt,
+              delegation_task_index: request.taskIndex ?? null,
+            },
+            fromAgentId: targetAgentId,
+            parentSessionId: request.parentSessionId,
+            delegationId,
+            targetAgentId,
+          });
+        });
+      }
+      if (event?.type === "tool_execution_end" || event?.type === "tool_end") {
+        activeChildToolCalls = Math.max(0, activeChildToolCalls - 1);
+        toolCalls++;
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const pending = shiftPendingChildTool(pendingToolCalls, toolName);
+        const endedAt = new Date().toISOString();
+        const durationMs = pending ? Date.now() - pending.startMs : null;
+        const resultText = extractToolText(event.result);
+        const redactedText = redactText(resultText, redactionConfig);
+        const outcome = delegatedToolOutcome(event.result, event);
+        const traceEntry: DelegateToAgentToolTraceEntry = {
+          toolName,
+          toolInput: pending?.redactedToolInput ?? null,
+          outcome,
+          durationMs,
+          ...(redactedText ? { contentPreview: redactedText.slice(0, DELEGATED_TOOL_TRACE_PREVIEW_CHARS) } : {}),
+          startedAt: pending?.startedAt,
+          endedAt,
+        };
+        toolTrace.push(traceEntry);
+        enqueuePersist(async () => {
+          const payload = {
+            sessionId: childSessionId,
+            content: redactedText,
+            toolName,
+            toolInput: pending?.redactedToolInput ?? null,
+            outcome,
+            durationMs,
+            metadata: persistableToolDetails(event.result, redactionConfig),
+          };
+          if (pending?.messageId) {
+            await updateMessage({ ...payload, messageId: pending.messageId });
+          } else {
+            await appendMessage({
+              ...payload,
+              role: "tool",
+              fromAgentId: targetAgentId,
+              parentSessionId: request.parentSessionId,
+              delegationId,
+              targetAgentId,
+            });
+          }
+        });
+      }
+      markChildActivity();
+      if (event?.type === "message_start") currentAssistantText = "";
+      if (event?.type === "message_end" && event.message?.role === "assistant") {
+        const content = Array.isArray(event.message.content) ? event.message.content : [];
+        const text = content
+          .filter((c: any) => c?.type === "text" && typeof c.text === "string")
+          .map((c: any) => c.text)
+          .join("");
+        const messageText = text || currentAssistantText;
+        if (messageText) {
+          finalText = finalText ? `${finalText.trimEnd()}\n\n${messageText.trim()}` : messageText.trim();
+        }
+        currentAssistantText = "";
+        if (event.message.errorMessage) finalError = event.message.errorMessage;
+      }
+      if (event?.type === "agent_message" && typeof event.text === "string") {
+        finalText = finalText ? `${finalText.trimEnd()}\n\n${event.text.trim()}` : event.text.trim();
+      }
+      const assistantEvent = event?.assistantMessageEvent;
+      if (assistantEvent?.type === "text_delta" && typeof assistantEvent.delta === "string") {
+        currentAssistantText += assistantEvent.delta;
+      }
+    });
+
+    const startedAt = Date.now();
+    let timeoutReason: "idle" | "max_runtime" | null = null;
+    let idleTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let maxRuntimeHandle: ReturnType<typeof setTimeout> | null = null;
+    let lastActivityAt = startedAt;
+    let timeoutSettled = false;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const rejectOnce = (reason: "idle" | "max_runtime", message: string) => {
+          if (timeoutSettled) return;
+          timeoutSettled = true;
+          timeoutReason = reason;
+          reject(new Error(message));
+        };
+
+        const resetIdleTimer = () => {
+          lastActivityAt = Date.now();
+          if (idleTimeoutHandle) clearTimeout(idleTimeoutHandle);
+          if (activeChildToolCalls > 0) {
+            idleTimeoutHandle = null;
+            return;
+          }
+          idleTimeoutHandle = setTimeout(() => {
+            rejectOnce(
+              "idle",
+              `delegate_to_agent idle timed out after ${DELEGATED_AGENT_IDLE_TIMEOUT_MS}ms`,
+            );
+          }, DELEGATED_AGENT_IDLE_TIMEOUT_MS);
+        };
+
+        markChildActivity = resetIdleTimer;
+        resetIdleTimer();
+        maxRuntimeHandle = setTimeout(() => {
+          rejectOnce(
+            "max_runtime",
+            `delegate_to_agent exceeded max runtime ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms`,
+          );
+        }, DELEGATED_AGENT_MAX_RUNTIME_MS);
+      });
+
+      await Promise.race([
+        child.brain.prompt(this.buildDelegatedAgentPrompt(request)),
+        timeoutPromise,
+      ]);
+    } catch (err) {
+      if (timeoutReason) {
+        status = "timed_out";
+        await abortBrainBestEffort(child.brain, `delegated session ${childSessionId}`);
+        const partial = [finalText.trim(), currentAssistantText.trim()].filter(Boolean).join("\n\n");
+        const timeoutMessage = timeoutReason === "idle"
+          ? `Delegated agent stopped producing activity for ${DELEGATED_AGENT_IDLE_TIMEOUT_MS}ms.`
+          : `Delegated agent reached the max runtime limit of ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms.`;
+        const elapsedMs = Date.now() - startedAt;
+        finalText = partial
+          ? `${timeoutMessage} Elapsed: ${elapsedMs}ms. Last activity: ${Date.now() - lastActivityAt}ms ago. Partial report before timeout:\n\n${partial}`
+          : `${timeoutMessage} Elapsed: ${elapsedMs}ms. Last activity: ${Date.now() - lastActivityAt}ms ago.`;
+      } else {
+        status = "failed";
+        finalText = finalText.trim() || finalError || `Delegated agent failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } finally {
+      markChildActivity = () => {};
+      if (idleTimeoutHandle) clearTimeout(idleTimeoutHandle);
+      if (maxRuntimeHandle) clearTimeout(maxRuntimeHandle);
+      unsubscribe();
+      await child.mcpManager?.shutdown().catch((err) => {
+        console.warn(`[agentbox-session] Delegated MCP shutdown failed for ${childSessionId}:`, err);
+      });
+    }
+
+    if (!finalText && currentAssistantText.trim()) {
+      finalText = currentAssistantText.trim();
+    }
+    if (status === "done" && finalError) {
+      status = "failed";
+      if (!finalText) finalText = finalError;
+    }
+    if (pendingToolCalls.size > 0) {
+      const unfinished = [...pendingToolCalls.values()].flat();
+      pendingToolCalls.clear();
+      for (const pending of unfinished) {
+        const endedAt = new Date().toISOString();
+        const durationMs = Date.now() - pending.startMs;
+        const content = status === "timed_out"
+          ? "Delegated session timed out before this tool returned."
+          : "Delegated session ended before this tool returned.";
+        toolTrace.push({
+          toolName: pending.toolName,
+          toolInput: pending.redactedToolInput,
+          outcome: "error",
+          durationMs,
+          contentPreview: content,
+          startedAt: pending.startedAt,
+          endedAt,
+        });
+        enqueuePersist(async () => {
+          const payload = {
+            sessionId: childSessionId,
+            content,
+            toolName: pending.toolName,
+            toolInput: pending.redactedToolInput,
+            outcome: "error" as const,
+            durationMs,
+            metadata: {
+              status: status === "timed_out" ? "timed_out" : "ended_without_result",
+              ended_at: endedAt,
+            },
+          };
+          if (pending.messageId) {
+            await updateMessage({ ...payload, messageId: pending.messageId });
+          } else {
+            await appendMessage({
+              ...payload,
+              role: "tool",
+              fromAgentId: targetAgentId,
+              parentSessionId: request.parentSessionId,
+              delegationId,
+              targetAgentId,
+            });
+          }
+        });
+      }
+    }
+    if (finalText.trim()) {
+      enqueuePersist(async () => {
+        await appendMessage({
+          sessionId: childSessionId,
+          role: "assistant",
+          content: redactText(finalText.trim(), redactionConfig),
+          fromAgentId: targetAgentId,
+          parentSessionId: request.parentSessionId,
+          delegationId,
+          targetAgentId,
+        });
+      });
+    }
+    await persistQueue;
+    const bundle = buildDelegateSummaryBundle(finalText.trim() || finalError);
+    return {
+      status,
+      summary: bundle.capsule,
+      fullSummary: bundle.fullSummary,
+      summaryTruncated: bundle.truncated,
+      sessionId: childSessionId,
+      toolCalls,
+      durationMs: Date.now() - startedAt,
+      toolTrace,
+    };
+  }
+
   /**
    * Get or create a session.
    * Each gateway sessionId maps to its own pi-coding-agent session directory,
@@ -172,8 +691,14 @@ export class AgentBoxSessionManager {
    * After Phase 2, sessions are released after each prompt completes.
    * getOrCreate() restores from JSONL, reusing shared components for fast recovery.
    */
-  async getOrCreate(sessionId?: string, mode?: SessionMode, systemPromptTemplate?: string): Promise<ManagedSession> {
+  async getOrCreate(
+    sessionId?: string,
+    mode?: SessionMode,
+    systemPromptTemplate?: string,
+    options: GetOrCreateSessionOptions = {},
+  ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
+    const enableDelegationTools = options.enableDelegationTools === true;
 
     let managed = this.sessions.get(id);
     if (managed) {
@@ -184,7 +709,16 @@ export class AgentBoxSessionManager {
         managed._releaseTimer = null;
         console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
       }
-      return managed;
+      if (managed.delegationToolsEnabled === enableDelegationTools || !managed._promptDone) {
+        return managed;
+      }
+
+      console.log(
+        `[agentbox-session] Rebuilding session ${id} for delegation tool mode ` +
+        `${managed.delegationToolsEnabled ? "on" : "off"} -> ${enableDelegationTools ? "on" : "off"}`,
+      );
+      await this.release(id);
+      managed = undefined;
     }
 
     // Ensure shared components are ready
@@ -215,6 +749,18 @@ export class AgentBoxSessionManager {
       credentialBroker: this.credentialBroker,
     };
     const effectiveMode = mode ?? "web";
+
+    // Per-session extra event bus — tools (e.g. dispatch_subagents) use this
+    // to push custom events into the SSE stream alongside the brain's events.
+    // Allocated BEFORE createSiclawSession so we can wire the emitter into
+    // ToolRefs. Buffered events replay to the SSE handler on connect.
+    const extraEventSubs = new Set<(event: Record<string, unknown>) => void>();
+    const extraEventBuffer: Record<string, unknown>[] = [];
+    const emitExtraEvent = (event: Record<string, unknown>) => {
+      if (extraEventSubs.size === 0) extraEventBuffer.push(event);
+      else for (const sub of extraEventSubs) { try { sub(event); } catch { /* best-effort */ } }
+    };
+
     const result = await createSiclawSession({
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
@@ -224,6 +770,9 @@ export class AgentBoxSessionManager {
       agentId: this.agentId ?? null,
       knowledgeIndexer: this.knowledgeIndexer,
       systemPromptTemplate,
+      sessionEventEmitter: emitExtraEvent,
+      delegateToAgentExecutor: enableDelegationTools ? this.createDelegateToAgentExecutor() : undefined,
+      enableDelegationTools,
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session
@@ -254,12 +803,15 @@ export class AgentBoxSessionManager {
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
+      delegationToolsEnabled: enableDelegationTools,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,
       dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
+      _extraEventSubs: extraEventSubs,
+      _extraEventBuffer: extraEventBuffer,
     };
 
     this.sessions.set(id, managed);

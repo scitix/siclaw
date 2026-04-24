@@ -39,6 +39,8 @@ interface Route {
  */
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const BODY_TIMEOUT_MS = 30_000; // 30s
+const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
+const DP_EXIT_MARKER = "[DP_EXIT]";
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -79,6 +81,29 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
+function startsDeepInvestigation(text: string): boolean {
+  return text.startsWith(DP_ACTIVATION_MARKER);
+}
+
+function startsDpExit(text: string): boolean {
+  return text.startsWith(`${DP_EXIT_MARKER}\n`) || text.trim() === DP_EXIT_MARKER;
+}
+
+function shouldEnableDelegationTools(
+  text: string,
+  sessionId: string | undefined,
+  sessionManager: AgentBoxSessionManager,
+): boolean {
+  if (startsDpExit(text)) return false;
+  if (startsDeepInvestigation(text)) return true;
+  if (!sessionId) return false;
+
+  const live = sessionManager.get(sessionId)?.dpStateRef?.active;
+  if (live === true) return true;
+
+  return sessionManager.getPersistedDpState(sessionId)?.active === true;
+}
+
 /**
  * Send JSON response
  */
@@ -87,6 +112,33 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+const ABORT_ENDPOINT_TIMEOUT_MS = 2_000;
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function abortBrainForHttp(
+  brain: { abort: () => Promise<void> | void },
+  sessionId: string,
+): Promise<"done" | "failed" | "timeout"> {
+  const abortPromise = Promise.resolve()
+    .then(() => brain.abort())
+    .then(() => "done" as const)
+    .catch((err) => {
+      console.error(`[agentbox-http] Abort error for session ${sessionId}:`, err);
+      return "failed" as const;
+    });
+
+  const outcome = await Promise.race([
+    abortPromise,
+    waitMs(ABORT_ENDPOINT_TIMEOUT_MS).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    console.warn(`[agentbox-http] Abort for session ${sessionId} did not settle within ${ABORT_ENDPOINT_TIMEOUT_MS}ms`);
+  }
+  return outcome;
+}
 
 export interface CreateHttpServerOptions {
   /**
@@ -243,7 +295,45 @@ export function createHttpServer(
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
+    const enableDelegationTools = shouldEnableDelegationTools(body.text, body.sessionId, sessionManager);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, {
+      enableDelegationTools,
+    });
+    if (!managed._promptDone) {
+      sendJson(res, 409, {
+        error: "Session is already running. Use the steer endpoint to add input to the active prompt.",
+        sessionId: managed.id,
+      });
+      return;
+    }
+
+    // Mark the session busy before model setup so a refresh, second tab, or
+    // fast double-submit cannot start a second prompt on the same brain.
+    managed._promptDone = false;
+    managed._aborted = false;
+    managed._eventBuffer = [];
+    // Unsubscribe previous buffer listener if any
+    if (managed._bufferUnsub) {
+      managed._bufferUnsub();
+    }
+    // Subscribe to buffer events so SSE can replay them even if it connects late
+    const brainUnsub = managed.brain.subscribe((event) => {
+      if (!managed._promptDone) {
+        managed._eventBuffer.push(event);
+      }
+    });
+
+    managed._bufferUnsub = () => {
+      brainUnsub();
+    };
+
+    if (body.modelProvider || body.modelId || body.modelConfig) {
+      sessionManager.setDelegationModel({
+        provider: body.modelProvider,
+        modelId: body.modelId,
+        config: body.modelConfig,
+      });
+    }
 
     // Dynamically register provider config from gateway DB (before findModel)
     if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
@@ -275,25 +365,6 @@ export function createHttpServer(
       }
     }
 
-    // Reset prompt state and start buffering events before async execution
-    managed._promptDone = false;
-    managed._aborted = false;
-    managed._eventBuffer = [];
-    // Unsubscribe previous buffer listener if any
-    if (managed._bufferUnsub) {
-      managed._bufferUnsub();
-    }
-    // Subscribe to buffer events so SSE can replay them even if it connects late
-    const brainUnsub = managed.brain.subscribe((event) => {
-      if (!managed._promptDone) {
-        managed._eventBuffer.push(event);
-      }
-    });
-
-    managed._bufferUnsub = () => {
-      brainUnsub();
-    };
-
     let promptText = body.text;
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
@@ -303,7 +374,7 @@ export function createHttpServer(
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
       // Only two DP markers remain after the refactor: activation and exit.
-      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n"];
+      const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
       if (matchedMarker) {
         // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
@@ -471,6 +542,13 @@ export function createHttpServer(
     for (const event of managed._eventBuffer) {
       writeEvent(event);
     }
+    // Replay extra (tool-pushed) events that arrived before SSE connected.
+    // These are tagged events like { type: "subagent_event", ... } from
+    // dispatch_subagents' sub-agent bridge.
+    for (const event of managed._extraEventBuffer) {
+      writeEvent(event);
+    }
+    managed._extraEventBuffer.length = 0;
 
     // If prompt already finished before SSE connected, close immediately
     if (managed._promptDone) {
@@ -478,6 +556,12 @@ export function createHttpServer(
       closeSSE();
       return;
     }
+
+    // Subscribe to the session's extra event bus (tool-pushed events — see
+    // ToolRefs.sessionEventEmitter). Unsubscribed alongside the brain
+    // subscription in unsubAll below.
+    const extraSub = (event: Record<string, unknown>) => writeEvent(event);
+    managed._extraEventSubs.add(extraSub);
 
     // Subscribe to Agent events (live, after buffer replay)
     const unsubscribe = managed.brain.subscribe((event: any) => {
@@ -522,6 +606,7 @@ export function createHttpServer(
     // Cleanup helper: unsubscribe from all event sources
     const unsubAll = () => {
       unsubscribe();
+      managed._extraEventSubs.delete(extraSub);
     };
 
     // Decrement SSE counter and check idle (called once per SSE lifecycle)
@@ -650,13 +735,12 @@ export function createHttpServer(
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
     console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
-    try {
-      await managed.brain.abort();
-      sendJson(res, 200, { ok: true });
-    } catch (err) {
-      console.error(`[agentbox-http] Abort error for session ${sessionId}:`, err);
+    const outcome = await abortBrainForHttp(managed.brain, sessionId);
+    if (outcome === "failed") {
       sendJson(res, 500, { error: "Abort failed" });
+      return;
     }
+    sendJson(res, 200, { ok: true, ...(outcome === "timeout" ? { pending: true } : {}) });
   });
 
   /**
