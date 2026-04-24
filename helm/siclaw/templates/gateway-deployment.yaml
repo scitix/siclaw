@@ -6,7 +6,12 @@ metadata:
   labels:
     {{- include "siclaw.labels" (dict "ctx" . "component" "runtime") | nindent 4 }}
 spec:
-  replicas: {{ .Values.runtime.replicas }}
+  # Singleton — see comment in values.yaml. Recreate (not RollingUpdate) so
+  # the old pod is torn down before the new one starts, avoiding the brief
+  # two-pod overlap that would evict each other on the upstream WS map.
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "runtime") | nindent 6 }}
