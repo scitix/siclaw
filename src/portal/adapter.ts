@@ -1903,7 +1903,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     await db.query(
       `UPDATE chat_messages
-       SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?
+       SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
+           delegation_id = COALESCE(?, delegation_id)
        WHERE id = ? AND session_id = ?`,
       [
         params.content ?? "",
@@ -1912,8 +1913,32 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         jsonParam(params.metadata),
         params.outcome || null,
         params.duration_ms ?? null,
+        params.delegation_id ?? null,
         params.id,
         params.session_id,
+      ],
+    );
+    await db.query(
+      `UPDATE chat_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [params.session_id],
+    );
+    return { ok: true };
+  });
+
+  handlers.set("chat.updateDelegationToolMessage", async (params) => {
+    const db = getDb();
+    await db.query(
+      `UPDATE chat_messages
+       SET content = ?, metadata = ?, outcome = ?, duration_ms = ?
+       WHERE session_id = ? AND role = 'tool' AND tool_name = ? AND delegation_id = ?`,
+      [
+        params.content ?? "",
+        jsonParam(params.metadata),
+        params.outcome || null,
+        params.duration_ms ?? null,
+        params.session_id,
+        params.tool_name,
+        params.delegation_id,
       ],
     );
     await db.query(

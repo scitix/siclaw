@@ -18,6 +18,9 @@ import type { AgentSession } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "../core/agent-factory.js";
 import type {
+  DelegateToAgentsAsyncExecutor,
+  DelegateToAgentsAsyncRequest,
+  DelegateToAgentsAsyncStartResult,
   DelegateToAgentExecutor,
   DelegateToAgentRequest,
   DelegateToAgentResult,
@@ -31,7 +34,7 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import { appendDelegationEvent, appendMessage, ensureChatSession, updateMessage } from "../gateway/chat-repo.js";
+import { appendDelegationEvent, appendMessage, ensureChatSession, updateDelegationToolMessage, updateMessage } from "../gateway/chat-repo.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../gateway/output-redactor.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -75,6 +78,8 @@ export interface ManagedSession {
   _lastSavedMessageCount: number;
   /** Pending release timer (cleared when a new prompt arrives before TTL expires) */
   _releaseTimer: ReturnType<typeof setTimeout> | null;
+  /** Background async delegation batches currently owned by this parent session. */
+  _backgroundWorkCount: number;
   /**
    * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
    * push custom events here, and the SSE handler forwards them to clients.
@@ -108,6 +113,23 @@ interface PendingChildToolCall {
   startedAt: string;
   startMs: number;
   messageId?: string;
+}
+
+type DelegationBatchStatus = "running" | "done" | "partial" | "failed" | "timed_out";
+
+interface AsyncDelegationTaskDetails {
+  index: number;
+  status: NonNullable<DelegateToAgentResult["status"]>;
+  agent_id: string;
+  scope: string;
+  summary: string;
+  tool_calls: number;
+  duration_ms: number;
+  session_id?: string;
+  full_summary?: string;
+  summary_truncated?: boolean;
+  tool_trace?: DelegateToAgentToolTraceEntry[];
+  error?: string;
 }
 
 function delay(ms: number): Promise<void> {
@@ -149,6 +171,19 @@ function delegatedToolOutcome(result: unknown, event: any): "success" | "error" 
   if (details?.blocked) return "blocked";
   if (details?.error || event?.isError) return "error";
   return "success";
+}
+
+function aggregateDelegationStatus(tasks: Array<{ status: string }>): DelegationBatchStatus {
+  if (tasks.length === 0) return "failed";
+  const doneCount = tasks.filter((task) => task.status === "done").length;
+  if (doneCount === tasks.length) return "done";
+  if (doneCount > 0) return "partial";
+  if (tasks.every((task) => task.status === "timed_out")) return "timed_out";
+  return "failed";
+}
+
+function delegationBatchOutcome(status: DelegationBatchStatus): "success" | "error" {
+  return status === "failed" || status === "timed_out" ? "error" : "success";
 }
 
 function persistableToolDetails(result: unknown, redactionConfig: RedactionConfig): Record<string, unknown> | null {
@@ -319,6 +354,337 @@ Always end with a final report even if evidence is incomplete.`;
 
   private createDelegateToAgentExecutor(): DelegateToAgentExecutor {
     return async (request) => this.runDelegatedAgent(request);
+  }
+
+  private createDelegateToAgentsAsyncExecutor(): DelegateToAgentsAsyncExecutor {
+    return async (request) => this.startDelegatedAgentsAsync(request);
+  }
+
+  private async startDelegatedAgentsAsync(request: DelegateToAgentsAsyncRequest): Promise<DelegateToAgentsAsyncStartResult> {
+    const parent = this.sessions.get(request.parentSessionId);
+    if (!parent) {
+      throw new Error(`Parent session ${request.parentSessionId} is not active for async delegation.`);
+    }
+
+    parent._backgroundWorkCount++;
+    if (parent._releaseTimer) {
+      clearTimeout(parent._releaseTimer);
+      parent._releaseTimer = null;
+    }
+
+    const startedAt = Date.now();
+    this.finishDelegatedAgentsAsync(request, startedAt)
+      .catch((err) => {
+        console.warn(`[agentbox-session] async delegation ${request.delegationId} failed:`, err);
+      })
+      .finally(() => {
+        const current = this.sessions.get(request.parentSessionId);
+        if (current) {
+          current._backgroundWorkCount = Math.max(0, current._backgroundWorkCount - 1);
+          if (current._backgroundWorkCount === 0 && current._promptDone) {
+            this.scheduleRelease(current.id);
+          }
+        }
+      });
+
+    return {
+      status: "running",
+      delegation_id: request.delegationId,
+      tasks: request.tasks.map((task) => ({
+        index: task.index,
+        status: "running",
+        agent_id: task.agentId,
+        scope: task.scope,
+        summary: "Delegated investigation is running.",
+        tool_calls: 0,
+        duration_ms: 0,
+      })),
+      total_tool_calls: 0,
+      duration_ms: 0,
+    };
+  }
+
+  private async finishDelegatedAgentsAsync(request: DelegateToAgentsAsyncRequest, startedAt: number): Promise<void> {
+    const executions = await Promise.all(request.tasks.map(async (task) => {
+      const taskStartedAt = Date.now();
+      try {
+        const result = await this.runDelegatedAgent({
+          agentId: task.agentId,
+          scope: task.scope,
+          contextSummary: task.contextSummary,
+          parentSessionId: request.parentSessionId,
+          parentAgentId: request.parentAgentId,
+          userId: request.userId,
+          delegationId: request.delegationId,
+          taskIndex: task.index,
+          totalTasks: request.tasks.length,
+        });
+        return { task, result } as const;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const result: DelegateToAgentResult = {
+          status: "failed",
+          summary: `Delegated agent failed: ${message}`,
+          sessionId: "",
+          toolCalls: 0,
+          durationMs: Date.now() - taskStartedAt,
+          fullSummary: message,
+        };
+        return {
+          task,
+          result,
+          error: message,
+        } as const;
+      }
+    }));
+
+    const details: AsyncDelegationTaskDetails[] = executions.map((execution) => ({
+      index: execution.task.index,
+      status: execution.result.status ?? "done",
+      agent_id: execution.task.agentId,
+      scope: execution.task.scope,
+      summary: execution.result.summary,
+      tool_calls: execution.result.toolCalls,
+      duration_ms: execution.result.durationMs,
+      ...(execution.result.sessionId ? { session_id: execution.result.sessionId } : {}),
+      ...(execution.result.fullSummary ? { full_summary: execution.result.fullSummary } : {}),
+      ...(execution.result.summaryTruncated != null ? { summary_truncated: execution.result.summaryTruncated } : {}),
+      ...(execution.result.toolTrace ? { tool_trace: execution.result.toolTrace } : {}),
+      ...("error" in execution && execution.error ? { error: execution.error } : {}),
+    }));
+    const status = aggregateDelegationStatus(details);
+    const totalToolCalls = details.reduce((sum, task) => sum + task.tool_calls, 0);
+    const durationMs = Date.now() - startedAt;
+    const toolResult = {
+      status,
+      delegation_id: request.delegationId,
+      tasks: details.map((task) => ({
+        index: task.index,
+        status: task.status,
+        agent_id: task.agent_id,
+        scope: task.scope,
+        summary: task.summary,
+        tool_calls: task.tool_calls,
+        duration_ms: task.duration_ms,
+      })),
+      total_tool_calls: totalToolCalls,
+      duration_ms: durationMs,
+    };
+    const metadata = {
+      ...toolResult,
+      async: true,
+      tasks: details,
+    };
+
+    await updateDelegationToolMessage({
+      sessionId: request.parentSessionId,
+      toolName: "delegate_to_agents_async",
+      delegationId: request.delegationId,
+      content: JSON.stringify(toolResult),
+      metadata,
+      outcome: delegationBatchOutcome(status),
+      durationMs,
+    }).catch((err) => {
+      console.warn(`[agentbox-session] Could not update async delegation tool row ${request.delegationId}:`, err);
+    });
+
+    await this.notifyParentOfDelegationBatch(request, details, status, totalToolCalls, durationMs);
+  }
+
+  private buildDelegationBatchNotification(
+    request: DelegateToAgentsAsyncRequest,
+    tasks: AsyncDelegationTaskDetails[],
+    status: DelegationBatchStatus,
+  ): string {
+    const lines = [
+      "[Delegation Batch Complete]",
+      `Delegation ID: ${request.delegationId}`,
+      `Status: ${status}`,
+      "",
+      "Evidence capsules:",
+      ...tasks.map((task) => [
+        `- Agent ${task.index} (${task.status})`,
+        `  Scope: ${task.scope}`,
+        `  Capsule: ${task.summary}`,
+      ].join("\n")),
+      "",
+      "Synthesize these capsules into the current investigation. Do not call more tools in this turn unless the user explicitly asks; if evidence is incomplete, say what is still uncertain.",
+    ];
+    return lines.join("\n");
+  }
+
+  private async waitForParentIdle(managed: ManagedSession, timeoutMs = DELEGATED_AGENT_MAX_RUNTIME_MS): Promise<boolean> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (managed._promptDone && !managed.isAgentActive && !managed.isCompacting && !managed.isRetrying) return true;
+      await delay(250);
+    }
+    return false;
+  }
+
+  private async notifyParentOfDelegationBatch(
+    request: DelegateToAgentsAsyncRequest,
+    tasks: AsyncDelegationTaskDetails[],
+    status: DelegationBatchStatus,
+    totalToolCalls: number,
+    durationMs: number,
+  ): Promise<void> {
+    const notification = this.buildDelegationBatchNotification(request, tasks, status);
+    await appendMessage({
+      sessionId: request.parentSessionId,
+      role: "user",
+      content: notification,
+      metadata: {
+        kind: "delegation_event",
+        source: "system_notification",
+        event_type: "delegation.batch_complete",
+        delegation_id: request.delegationId,
+        parent_agent_id: request.parentAgentId,
+        status,
+        capsule: notification,
+        tasks,
+        total_tasks: tasks.length,
+        total_tool_calls: totalToolCalls,
+        duration_ms: durationMs,
+      },
+      fromAgentId: request.parentAgentId,
+      delegationId: request.delegationId,
+    });
+
+    const parent = this.sessions.get(request.parentSessionId);
+    if (!parent) return;
+    const idle = await this.waitForParentIdle(parent);
+    if (!idle || this.sessions.get(request.parentSessionId) !== parent) {
+      console.warn(`[agentbox-session] Skipping parent notify prompt for ${request.delegationId}: parent session did not become idle.`);
+      return;
+    }
+
+    await this.runSyntheticParentPrompt(parent, notification);
+  }
+
+  private async runSyntheticParentPrompt(managed: ManagedSession, promptText: string): Promise<void> {
+    const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
+    const pendingToolCalls = new Map<string, PendingChildToolCall[]>();
+    let assistantContent = "";
+    let currentAssistantText = "";
+    let persistQueue: Promise<void> = Promise.resolve();
+    const enqueueParentPersist = (op: () => Promise<void>) => {
+      persistQueue = persistQueue
+        .then(op)
+        .catch((err) => {
+          console.warn(`[agentbox-session] Synthetic parent persistence failed for ${managed.id}:`, err);
+        });
+    };
+
+    managed._promptDone = false;
+    managed._aborted = false;
+
+    const unsubscribe = managed.brain.subscribe((event: any) => {
+      if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const rawToolInput = event.args ? JSON.stringify(event.args) : "";
+        const pending: PendingChildToolCall = {
+          toolName,
+          rawToolInput,
+          redactedToolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
+          startedAt: new Date().toISOString(),
+          startMs: Date.now(),
+        };
+        pushPendingChildTool(pendingToolCalls, toolName, pending);
+        enqueueParentPersist(async () => {
+          pending.messageId = await appendMessage({
+            sessionId: managed.id,
+            role: "tool",
+            content: "",
+            toolName,
+            toolInput: pending.redactedToolInput,
+            outcome: null,
+            durationMs: null,
+            metadata: { status: "running", started_at: pending.startedAt, source: "delegation_notify" },
+          });
+        });
+      }
+      if (event?.type === "tool_execution_end" || event?.type === "tool_end") {
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const pending = shiftPendingChildTool(pendingToolCalls, toolName);
+        const resultText = extractToolText(event.result);
+        const redactedText = redactText(resultText, redactionConfig);
+        const payload = {
+          sessionId: managed.id,
+          content: redactedText,
+          toolName,
+          toolInput: pending?.redactedToolInput ?? null,
+          outcome: delegatedToolOutcome(event.result, event),
+          durationMs: pending ? Date.now() - pending.startMs : null,
+          metadata: persistableToolDetails(event.result, redactionConfig),
+        };
+        enqueueParentPersist(async () => {
+          if (pending?.messageId) {
+            await updateMessage({ ...payload, messageId: pending.messageId });
+          } else {
+            await appendMessage({ ...payload, role: "tool" });
+          }
+        });
+      }
+      if (event?.type === "message_start") currentAssistantText = "";
+      if (event?.type === "message_update") {
+        const assistantEvent = event.assistantMessageEvent as { type?: string; delta?: string } | undefined;
+        if (assistantEvent?.type === "text_delta" && assistantEvent.delta) {
+          assistantContent += assistantEvent.delta;
+          currentAssistantText += assistantEvent.delta;
+        }
+      }
+      if (event?.type === "message_end" && event.message?.role === "assistant") {
+        const content = Array.isArray(event.message.content) ? event.message.content : [];
+        const text = content
+          .filter((c: any) => c?.type === "text" && typeof c.text === "string")
+          .map((c: any) => c.text)
+          .join("");
+        const messageText = (text || currentAssistantText || assistantContent).trim();
+        if (messageText) {
+          enqueueParentPersist(async () => {
+            await appendMessage({
+              sessionId: managed.id,
+              role: "assistant",
+              content: redactText(messageText, redactionConfig),
+            });
+          });
+        }
+        assistantContent = "";
+        currentAssistantText = "";
+      }
+    });
+
+    const promptStartTime = Date.now();
+    let promptOutcome: "completed" | "error" = "completed";
+    try {
+      await managed.brain.prompt(promptText);
+    } catch (err) {
+      promptOutcome = "error";
+      await appendMessage({
+        sessionId: managed.id,
+        role: "assistant",
+        content: `Delegation notification synthesis failed: ${err instanceof Error ? err.message : String(err)}`,
+      }).catch(() => {});
+    } finally {
+      unsubscribe();
+      await persistQueue;
+      managed._promptDone = true;
+      const currStats = managed.brain.getSessionStats();
+      const model = managed.brain.getModel();
+      emitDiagnostic({
+        type: "prompt_complete",
+        sessionId: managed.id,
+        prev: currStats,
+        curr: currStats,
+        model,
+        durationMs: Date.now() - promptStartTime,
+        outcome: promptOutcome,
+        userId: this.userId,
+      });
+      for (const cb of managed._promptDoneCallbacks) cb();
+      managed._promptDoneCallbacks.clear();
+    }
   }
 
   private async runDelegatedAgent(request: DelegateToAgentRequest): Promise<DelegateToAgentResult> {
@@ -796,6 +1162,7 @@ Always end with a final report even if evidence is incomplete.`;
       systemPromptTemplate,
       sessionEventEmitter: emitExtraEvent,
       delegateToAgentExecutor: enableDelegationTools ? this.createDelegateToAgentExecutor() : undefined,
+      delegateToAgentsAsyncExecutor: enableDelegationTools ? this.createDelegateToAgentsAsyncExecutor() : undefined,
       enableDelegationTools,
     });
 
@@ -834,6 +1201,7 @@ Always end with a final report even if evidence is incomplete.`;
       dpStateRef: result.dpStateRef,
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
+      _backgroundWorkCount: 0,
       _extraEventSubs: extraEventSubs,
       _extraEventBuffer: extraEventBuffer,
     };
@@ -1020,6 +1388,14 @@ Always end with a final report even if evidence is incomplete.`;
   scheduleRelease(sessionId: string, ttlMs: number = SESSION_RELEASE_TTL_MS): void {
     const managed = this.sessions.get(sessionId);
     if (!managed) return;
+
+    if (managed._backgroundWorkCount > 0) {
+      console.log(
+        `[agentbox-session] Deferring release for session ${sessionId}; ` +
+        `${managed._backgroundWorkCount} background delegation batch(es) still running`,
+      );
+      return;
+    }
 
     // Clear any existing timer
     if (managed._releaseTimer) {

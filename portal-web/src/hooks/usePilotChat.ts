@@ -66,7 +66,8 @@ interface UsePilotChatReturn {
 }
 
 const DELEGATED_TOOL_STALE_MS = 4 * 60 * 1000
-const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"])
+const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents", "delegate_to_agents_async"])
+const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents_async"])
 
 /** Format tool args into a readable one-liner for display */
 function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
@@ -127,7 +128,7 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
   if (name === "skill_preview") {
     return (args.dir as string)?.split("/").pop() || ""
   }
-  if (name === "delegate_to_agents") {
+  if (name === "delegate_to_agents" || name === "delegate_to_agents_async") {
     const tasks = Array.isArray(args.tasks) ? args.tasks : []
     const count = tasks.length
     const firstScope = tasks
@@ -190,7 +191,8 @@ function isStaleDelegationTool(m: ChatMessage): boolean {
   if (!m.tool_name || !DELEGATED_TOOL_NAMES.has(m.tool_name)) return false
   const createdAt = parsePortalTimestamp(m.created_at)
   if (!Number.isFinite(createdAt)) return false
-  return Date.now() - createdAt > DELEGATED_TOOL_STALE_MS
+  const staleMs = ASYNC_DELEGATED_TOOL_NAMES.has(m.tool_name) ? 15 * 60 * 1000 : DELEGATED_TOOL_STALE_MS
+  return Date.now() - createdAt > staleMs
 }
 
 function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
@@ -243,7 +245,23 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
 }
 
 function hasRunningPersistedMessages(messages: PilotMessage[]): boolean {
-  return messages.some((m) => m.role === "tool" && (m.toolStatus === "running" || m.isStreaming))
+  return messages.some((m) =>
+    m.role === "tool" &&
+    !ASYNC_DELEGATED_TOOL_NAMES.has(m.toolName ?? "") &&
+    (m.toolStatus === "running" || m.isStreaming),
+  )
+}
+
+function isRunningAsyncDelegationMessage(m: PilotMessage): boolean {
+  if (m.role !== "tool" || !ASYNC_DELEGATED_TOOL_NAMES.has(m.toolName ?? "")) return false
+  if (m.toolStatus === "error") return false
+  const parsedContent = m.content ? tryParseJson(m.content) : undefined
+  const status = (m.metadata?.status as string | undefined) ?? (parsedContent?.status as string | undefined)
+  return status === "running" || m.toolStatus === "running" || !!m.isStreaming
+}
+
+function hasRunningAsyncDelegationMessages(messages: PilotMessage[]): boolean {
+  return messages.some(isRunningAsyncDelegationMessage)
 }
 
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
@@ -438,6 +456,42 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       if (timer) clearTimeout(timer)
     }
   }, [agentId, sessionId, streaming])
+
+  // Async delegation is intentionally detached from the parent prompt, so the
+  // normal SSE request may be closed while sub-agents continue in the
+  // background. Poll persisted history only while an async batch card is still
+  // running; this keeps the input unlocked but lets the card and follow-up
+  // assistant synthesis appear without a manual refresh.
+  useEffect(() => {
+    if (!sessionId || !hasRunningAsyncDelegationMessages(messages)) return
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    async function refreshAsyncDelegation() {
+      try {
+        const res = await api<{ data: ChatMessage[] }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
+        )
+        if (cancelled) return
+        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+        const pilotMsgs = items.map(toPilotMessage)
+        setMessages(pilotMsgs)
+        setHasMore(items.length >= PAGE_SIZE)
+        if (!hasRunningAsyncDelegationMessages(pilotMsgs)) return
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to refresh async delegation:", err)
+      }
+
+      if (!cancelled) timer = setTimeout(refreshAsyncDelegation, 2000)
+    }
+
+    timer = setTimeout(refreshAsyncDelegation, 1000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [agentId, sessionId, messages])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(

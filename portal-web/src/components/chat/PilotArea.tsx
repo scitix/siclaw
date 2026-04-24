@@ -702,9 +702,9 @@ function agentWorkBatchSummary(message: PilotMessage): {
   const detailTasks = arrayValue(details.tasks) ?? arrayValue(metadata.tasks) ?? []
   const maxTasks = Math.max(argTasks.length, resultTasks.length, detailTasks.length)
   const status =
-    stringValue(result.status) ??
-    stringValue(details.status) ??
     stringValue(metadata.status) ??
+    stringValue(details.status) ??
+    stringValue(result.status) ??
     message.toolStatus ??
     "ready"
   const tasks = Array.from({ length: maxTasks }).map((_, i) => {
@@ -722,11 +722,17 @@ function agentWorkBatchSummary(message: PilotMessage): {
       numberValue(resultTask.duration_ms) ??
       numberValue(detailTask.durationMs) ??
       numberValue(resultTask.durationMs)
+    const taskStatus =
+      stringValue(detailTask.status) ??
+      stringValue(resultTask.status)
+    const resolvedTaskStatus =
+      status === "timed_out" && taskStatus === "running"
+        ? "timed_out"
+        : taskStatus
     return {
       index: numberValue(detailTask.index) ?? numberValue(resultTask.index) ?? i + 1,
       status:
-        stringValue(detailTask.status) ??
-        stringValue(resultTask.status) ??
+        resolvedTaskStatus ??
         (status === "running" || status === "timed_out" ? status : undefined),
       targetLabel: isSelfDelegation ? "self sub-agent" : rawTarget,
       scope:
@@ -872,7 +878,7 @@ function MessageItem({
   const isTool = message.role === "tool"
 
   if (isTool) {
-    if (message.toolName === "delegate_to_agents") {
+    if (message.toolName === "delegate_to_agents" || message.toolName === "delegate_to_agents_async") {
       return <AgentWorkBatchCard message={message} />
     }
     if (message.toolName === "delegate_to_agent" || message.metadata?.kind === "agent_work") {
@@ -1252,7 +1258,7 @@ function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
               {aggregateBits.join(" · ")}
             </div>
           </div>
-          {message.toolStatus === "running" && (
+          {batch.status === "running" && (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
           )}
         </button>

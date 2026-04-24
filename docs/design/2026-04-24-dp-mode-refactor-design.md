@@ -6,7 +6,7 @@ description: "Replace the DP state machine + specialized cards with checkpoint a
 
 # Deep Investigation Mode — Refactor Design
 
-> **Status**: Phase 1 implementation active (2026-04-24). Current target is the single-agent DP + same-agent sub-agent loop; cross-agent expert teams are deliberately deferred.
+> **Status**: Phase 1 implementation active (2026-04-24). Current target is the single-agent DP + same-agent sub-agent loop, including async notify-style same-agent delegation; cross-agent expert teams are deliberately deferred.
 > **Supersedes**: The current `src/core/extensions/deep-investigation.ts` state-machine + `propose_hypotheses` / `deep_search` / `end_investigation` tool family + `HypothesesCard` / `InvestigationCard` / `DpChecklistCard` React components.
 
 ---
@@ -18,7 +18,7 @@ After shipping DP persistence fixes in late April 2026, ~70% of the bugs we hit 
 This refactor strips DP down to what it *is*:
 
 1. **A prompting enhancement** that makes a single agent reason more divergently and chase details.
-2. **A same-agent sub-agent primitive** so the model can run one focused, isolated investigation when it materially improves evidence quality.
+2. **A same-agent sub-agent primitive** so the model can run focused, isolated investigations when they materially improve evidence quality.
 3. **A generic "action chips" primitive** so users can quickly respond to checkpoint moments without losing the ability to add free-form context.
 
 The primitives are intentionally reusable. Phase 2 (future) builds on the same data model and card surface to support gateway-routed multi-agent expert teams.
@@ -64,8 +64,10 @@ The primitives are intentionally reusable. Phase 2 (future) builds on the same d
 │                                                                   │
 │  [Primitive 2 — Same-agent Delegation]                            │
 │    `delegate_to_agent(agent_id="self")` creates a focused child  │
-│    session and returns a structured summary. The frontend renders │
-│    it as a collapsed Agent Work Card.                             │
+│    session and returns a structured summary.                      │
+│    `delegate_to_agents_async` starts 1-3 child sessions in the   │
+│    background and notifies the parent session when complete.      │
+│    The frontend renders both as collapsed Agent Work cards.       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -170,12 +172,16 @@ The existing `<!-- suggested-replies: ... -->` HTML comment and `A. xxx / B. yyy
 Phase 1 validates the DP loop with direct same-agent delegation:
 
 - `delegate_to_agent(agent_id="self")` creates a focused child session under the same agent/runtime identity.
-- `delegate_to_agents` batches 1-3 independent same-agent checks into one parent-visible tool call.
+- `delegate_to_agents` batches 1-3 independent same-agent checks into one parent-visible tool call and blocks until those checks finish.
+- `delegate_to_agents_async` starts 1-3 independent same-agent checks in the background, returns a running batch card immediately, and lets the runtime notify the parent session after the batch finishes.
 - Delegation tools are exposed to the model only while Deep Investigation is visibly active (`[Deep Investigation]` marker or restored DP-active state). Normal chat sessions do not receive the delegation executor, so the registry does not include these tool schemas.
 - The child receives only the model-written `scope` and `context_summary`, not the whole parent transcript.
-- The result returns to the parent model as a normal tool result and renders as an Agent Work Card.
-- Each child completion also writes a hidden `delegation_event` row into the parent chat session. In the synchronous Phase 1 flow this is audit/event metadata only; the visible UI continues to use the Agent Work Card. The event shape is intentionally compatible with a future async Notify scheduler, where the same capsule can become a synthetic parent input.
+- Synchronous delegation results return to the parent model as normal tool results and render as Agent Work Cards.
+- Async delegation writes the final batch result back to the original tool row, persists a hidden `delegation_event` row in the parent chat session, then injects a synthetic parent turn so the parent model sees the completed capsules without having to remember to poll.
+- The async UI polls persisted chat history while an async batch is running. This keeps the user input unlocked while preserving the visible card and the follow-up parent synthesis across refreshes.
+- Delegated sessions are first-class hidden chat sessions for audit: their child tool calls and final reports are persisted with lineage (`parent_session_id`, `delegation_id`, `target_agent_id`) while the left navigation can keep them out of the normal chat list.
 - Delegated sessions deliberately do not receive delegation tools, preventing recursive fan-out in the first implementation.
+- Child session timeout is activity-based: the runtime aborts a delegated child after 60 seconds without model/tool activity, while long-running tool calls are allowed to continue up to a wide 10-minute max-runtime guard.
 
 Cross-agent expert collaboration (`agent_id !== "self"`) is intentionally not implemented here. It must route through gateway/portal to the target agent's AgentBox so model config, system prompt, tools, credentials, and future permission boundaries are real.
 

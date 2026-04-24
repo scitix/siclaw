@@ -720,8 +720,42 @@ describe("chat.updateMessage", () => {
       "{\"summary\":\"ok\"}",
       "success",
       123,
+      null,
       "msg-1",
       "sess1",
+    ]);
+    expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+});
+
+describe("chat.updateDelegationToolMessage", () => {
+  it("updates async delegation tool rows by delegation id", async () => {
+    const query = mockQuery([], []);
+
+    const result = await getHandler("chat.updateDelegationToolMessage")(
+      {
+        session_id: "sess1",
+        tool_name: "delegate_to_agents_async",
+        delegation_id: "call-1",
+        content: "{\"status\":\"done\"}",
+        metadata: "{\"status\":\"done\"}",
+        outcome: "success",
+        duration_ms: 456,
+      },
+      "a1",
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(query.mock.calls[0][0]).toContain("WHERE session_id = ? AND role = 'tool' AND tool_name = ? AND delegation_id = ?");
+    expect(query.mock.calls[0][1]).toEqual([
+      "{\"status\":\"done\"}",
+      "{\"status\":\"done\"}",
+      "success",
+      456,
+      "sess1",
+      "delegate_to_agents_async",
+      "call-1",
     ]);
     expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
   });
@@ -1207,9 +1241,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 41 handlers", () => {
+  it("registers exactly 42 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(41);
+    expect(handlers.size).toBe(42);
   });
 
   it("all expected handler names are registered", () => {
@@ -1220,7 +1254,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.appendMessage", "chat.updateMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

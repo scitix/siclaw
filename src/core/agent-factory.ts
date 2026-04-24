@@ -106,6 +106,10 @@ export interface CreateSiclawSessionOpts {
    */
   delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
   /**
+   * Optional runtime bridge for async batch same-agent delegation.
+   */
+  delegateToAgentsAsyncExecutor?: import("./tool-registry.js").DelegateToAgentsAsyncExecutor;
+  /**
    * Expose same-agent delegation tools to the model for this session. Keep this
    * false in normal chat so Deep Investigation internals do not leak through
    * the callable tool schema.
@@ -344,6 +348,7 @@ export async function createSiclawSession(
       memoryDir,
       sessionEventEmitter: opts?.sessionEventEmitter,
       delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
+      delegateToAgentsAsyncExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsAsyncExecutor : undefined,
     },
     allowedTools,
   });

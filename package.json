@@ -102,6 +102,7 @@
     "smoke:dp-live": "node scripts/smoke/dp-live-checkpoint.mjs",
     "smoke:delegate": "node scripts/smoke/real-delegate.mjs",
     "smoke:delegate-batch": "node scripts/smoke/real-delegate-batch.mjs",
+    "smoke:delegate-async": "node scripts/smoke/real-delegate-async.mjs",
     "smoke:delegate-ui": "node scripts/smoke/real-delegate-ui.mjs",
     "smoke:delegate-batch-ui": "node scripts/smoke/real-delegate-batch-ui.mjs",
     "docker:build:runtime": "docker build -f Dockerfile.gateway -t siclaw/siclaw-runtime:latest .",

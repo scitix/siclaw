@@ -43,6 +43,17 @@ export interface UpdateMessageInput {
   metadata?: Record<string, unknown> | null;
   outcome?: "success" | "error" | "blocked" | null;
   durationMs?: number | null;
+  delegationId?: string | null;
+}
+
+export interface UpdateDelegationToolMessageInput {
+  sessionId: string;
+  toolName: string;
+  delegationId: string;
+  content: string;
+  metadata?: Record<string, unknown> | null;
+  outcome?: "success" | "error" | "blocked" | null;
+  durationMs?: number | null;
 }
 
 export interface StoredMessage {
@@ -186,6 +197,20 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
     content: msg.content,
     tool_name: msg.toolName ?? null,
     tool_input: msg.toolInput ?? null,
+    metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
+    outcome: msg.outcome ?? null,
+    duration_ms: msg.durationMs ?? null,
+    delegation_id: msg.delegationId ?? null,
+  });
+}
+
+/** Update the parent async delegation tool row after its background batch finishes. */
+export async function updateDelegationToolMessage(msg: UpdateDelegationToolMessageInput): Promise<void> {
+  await getClient().request("chat.updateDelegationToolMessage", {
+    session_id: msg.sessionId,
+    tool_name: msg.toolName,
+    delegation_id: msg.delegationId,
+    content: msg.content,
     metadata: msg.metadata != null ? JSON.stringify(msg.metadata) : null,
     outcome: msg.outcome ?? null,
     duration_ms: msg.durationMs ?? null,

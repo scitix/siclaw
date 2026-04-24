@@ -5,6 +5,7 @@ import {
   appendMessage,
   appendDelegationEvent,
   updateMessage,
+  updateDelegationToolMessage,
   incrementMessageCount,
   getMessages,
 } from "./chat-repo.js";
@@ -244,6 +245,32 @@ describe("updateMessage", () => {
         metadata: "{\"summary\":\"ok\"}",
         outcome: "success",
         duration_ms: 17,
+        delegation_id: null,
+      },
+    });
+  });
+
+  it("updates a delegation tool row by delegation id", async () => {
+    await updateDelegationToolMessage({
+      sessionId: "sid",
+      toolName: "delegate_to_agents_async",
+      delegationId: "call-1",
+      content: "{\"status\":\"done\"}",
+      metadata: { status: "done" },
+      outcome: "success",
+      durationMs: 42,
+    });
+
+    expect(fake.calls[0]).toEqual({
+      method: "chat.updateDelegationToolMessage",
+      params: {
+        session_id: "sid",
+        tool_name: "delegate_to_agents_async",
+        delegation_id: "call-1",
+        content: "{\"status\":\"done\"}",
+        metadata: "{\"status\":\"done\"}",
+        outcome: "success",
+        duration_ms: 42,
       },
     });
   });

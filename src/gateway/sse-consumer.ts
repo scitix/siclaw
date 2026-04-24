@@ -180,6 +180,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       const toolInput = shiftPending(pendingToolInputs, toolName) || "";
       const existingMessageId = shiftPending(pendingToolMessageIds, toolName);
       const metadata = extractPersistableDetails(toolResult?.details, redactionConfig);
+      const delegationId = typeof metadata?.delegation_id === "string" ? metadata.delegation_id : null;
 
       if (persist) {
         const payload = {
@@ -190,6 +191,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           outcome,
           durationMs: durationMs ?? null,
           metadata,
+          delegationId,
         };
         if (existingMessageId) {
           await updateMessage({ ...payload, messageId: existingMessageId });

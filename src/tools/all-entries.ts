@@ -34,6 +34,7 @@ import { registration as memoryGet } from "./query/memory-get.js";
 // non-working path to the model.
 import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
 import { registration as delegateToAgents } from "./workflow/delegate-to-agents.js";
+import { registration as delegateToAgentsAsync } from "./workflow/delegate-to-agents-async.js";
 import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
@@ -48,5 +49,5 @@ export const allToolEntries: ToolEntry[] = [
   clusterList, clusterProbe, clusterInfo, hostList,
   resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
-  delegateToAgent, delegateToAgents, saveFeedback, manageSchedule, taskReport, skillPreview,
+  delegateToAgent, delegateToAgents, delegateToAgentsAsync, saveFeedback, manageSchedule, taskReport, skillPreview,
 ];

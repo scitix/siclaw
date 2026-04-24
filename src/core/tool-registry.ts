@@ -77,6 +77,43 @@ export type DelegateToAgentExecutor = (
   request: DelegateToAgentRequest,
 ) => Promise<DelegateToAgentResult>;
 
+export interface DelegateToAgentsAsyncTaskRequest {
+  index: number;
+  agentId: string;
+  scope: string;
+  contextSummary?: string;
+}
+
+export interface DelegateToAgentsAsyncRequest {
+  delegationId: string;
+  parentSessionId: string;
+  parentAgentId: string | null;
+  userId: string;
+  tasks: DelegateToAgentsAsyncTaskRequest[];
+}
+
+export interface DelegateToAgentsAsyncTaskStartResult {
+  index: number;
+  status: "running";
+  agent_id: string;
+  scope: string;
+  summary: string;
+  tool_calls: 0;
+  duration_ms: 0;
+}
+
+export interface DelegateToAgentsAsyncStartResult {
+  status: "running";
+  delegation_id: string;
+  tasks: DelegateToAgentsAsyncTaskStartResult[];
+  total_tool_calls: 0;
+  duration_ms: 0;
+}
+
+export type DelegateToAgentsAsyncExecutor = (
+  request: DelegateToAgentsAsyncRequest,
+) => Promise<DelegateToAgentsAsyncStartResult>;
+
 /**
  * Callback a tool can invoke to push a custom event into the parent session's
  * SSE stream (e.g., forwarding a spawned sub-agent's events so the frontend
@@ -104,6 +141,11 @@ export interface ToolRefs {
    * the resolved tool list, so the model never sees a non-working tool.
    */
   delegateToAgentExecutor?: DelegateToAgentExecutor;
+  /**
+   * Optional async batch delegation executor. Separate from the synchronous
+   * executor so the existing DP baseline keeps its blocking semantics.
+   */
+  delegateToAgentsAsyncExecutor?: DelegateToAgentsAsyncExecutor;
 }
 
 /** Declarative registration for a single tool. */
