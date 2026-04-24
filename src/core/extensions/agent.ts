@@ -10,7 +10,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { CliSnapshotAgentMeta, CliSnapshotActiveAgent } from "../../portal/cli-snapshot-api.js";
+import type { CliSnapshotAgentMeta, CliSnapshotActiveAgent } from "../../shared/cli-snapshot-types.js";
 
 export interface AgentExtensionDeps {
   activeAgent: CliSnapshotActiveAgent | null;

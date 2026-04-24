@@ -171,24 +171,16 @@ interface AgentRow {
   color: string | null;
 }
 
-export interface CliSnapshotAgentMeta {
-  /** Display name; used as `--agent <name>` value. */
-  name: string;
-  description: string | null;
-  /** Model this agent prefers, if configured in Portal. */
-  modelProvider: string | null;
-  modelId: string | null;
-  icon: string | null;
-  color: string | null;
-}
-
-export interface CliSnapshotActiveAgent {
-  name: string;
-  description: string | null;
-  systemPrompt: string | null;
-  modelProvider: string | null;
-  modelId: string | null;
-}
+// The two type contracts below used to live here. They have been relocated
+// to `src/shared/cli-snapshot-types.ts` so that `src/core/` (compiled into
+// the AgentBox image) can type-check against them without a compile-time
+// dependency on this Portal handler module — which the agentbox Dockerfile
+// intentionally does not copy. Re-export here preserves the original import
+// paths for existing external consumers (portal-web, siclaw-tui, etc.).
+export type {
+  CliSnapshotAgentMeta,
+  CliSnapshotActiveAgent,
+} from "../shared/cli-snapshot-types.js";
 
 export interface CliSnapshotSkill {
   /** Name from SKILL.md frontmatter; used as the materialized directory name. */
