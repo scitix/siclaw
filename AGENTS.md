@@ -53,6 +53,11 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
   command validation second, plus pre/post execution sanitization.
 - Portal/Gateway DB and Memory DB are separate persistence domains. Do not mix
   user/session config with embedding/chunk/investigation storage.
+- AgentBox and Runtime are separate processes in K8s mode. Code under
+  `src/agentbox/**` must not import Gateway or Portal persistence modules such
+  as `src/gateway/chat-repo.ts`; LocalSpawner's shared process can hide this.
+  AgentBox background work should call Runtime internal APIs through
+  `GatewayClient`, with Runtime owning Portal RPC and database persistence.
 - `src/portal/migrate.ts` must stay compatible with both MySQL and SQLite.
 - mTLS is for K8s mode only; do not pull mTLS requirements into local mode.
 

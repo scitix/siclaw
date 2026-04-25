@@ -262,6 +262,52 @@ describe("GatewayClient — toClientLike adapter", () => {
   });
 });
 
+describe("GatewayClient — delegation persistence", () => {
+  it("POSTs delegation persistence events to the Runtime internal API", async () => {
+    const srv = await startServer((req, res) => {
+      if (req.method === "POST" && req.url === "/api/internal/delegation-events") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, id: "msg-1" }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    try {
+      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
+      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
+      fs.rmSync(certPath, { recursive: true, force: true });
+
+      const result = await client.sendDelegationPersistenceEvent({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "parent-session",
+          role: "assistant",
+          content: "Delegated result synthesized.",
+          delegationId: "delegation-1",
+        },
+      });
+
+      expect(result).toEqual({ ok: true, id: "msg-1" });
+      expect(srv.requests[0]).toMatchObject({
+        method: "POST",
+        url: "/api/internal/delegation-events",
+      });
+      expect(srv.requests[0].body).toMatchObject({
+        type: "delegation.append_message",
+        message: {
+          sessionId: "parent-session",
+          role: "assistant",
+          content: "Delegated result synthesized.",
+          delegationId: "delegation-1",
+        },
+      });
+    } finally {
+      await srv.close();
+    }
+  });
+});
+
 describe("GatewayClient — error handling", () => {
   it("rejects with helpful message on non-2xx status", async () => {
     const srv = await startServer((_req, res) => {

@@ -46,6 +46,7 @@ import {
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
+  handleDelegationEvents,
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
@@ -550,6 +551,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             }
             res.writeHead(405, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "Method not allowed" }));
+            return;
+          }
+
+          // Background delegation persistence/audit callback from AgentBox.
+          if (url === "/api/internal/delegation-events" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleDelegationEvents(req, res, identity, frontendClient);
             return;
           }
 

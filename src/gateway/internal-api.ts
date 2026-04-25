@@ -20,6 +20,14 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import { sessionRegistry } from "./session-registry.js";
 import { validateSchedule } from "../cron/cron-limits.js";
+import type {
+  DelegationAppendMessagePayload,
+  DelegationEventPayload,
+  DelegationPersistenceEvent,
+  DelegationPersistenceResponse,
+  DelegationToolUpdatePayload,
+  DelegationUpdateMessagePayload,
+} from "../shared/delegation-persistence.js";
 
 /** Read + JSON-parse an HTTP request body. */
 async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
@@ -324,6 +332,165 @@ export async function handleAgentTasksDelete(
     sendJson(res, data.error ? 404 : 200, data);
   } catch (err) {
     console.error("[internal-api] agent-tasks delete error:", err);
+    sendJson(res, 500, { error: "Internal server error" });
+  }
+}
+
+function maybeJson(metadata: Record<string, unknown> | null | undefined): string | null {
+  return metadata != null ? JSON.stringify(metadata) : null;
+}
+
+async function appendDelegationMessage(
+  frontendClient: FrontendWsClient,
+  msg: DelegationAppendMessagePayload,
+): Promise<string> {
+  const result = await frontendClient.request("chat.appendMessage", {
+    session_id: msg.sessionId,
+    role: msg.role,
+    content: msg.content,
+    tool_name: msg.toolName ?? null,
+    tool_input: msg.toolInput ?? null,
+    metadata: maybeJson(msg.metadata),
+    outcome: msg.outcome ?? null,
+    duration_ms: msg.durationMs ?? null,
+    from_agent_id: msg.fromAgentId ?? null,
+    parent_session_id: msg.parentSessionId ?? null,
+    delegation_id: msg.delegationId ?? null,
+    target_agent_id: msg.targetAgentId ?? null,
+  });
+  return result.id as string;
+}
+
+async function updateDelegationMessage(
+  frontendClient: FrontendWsClient,
+  msg: DelegationUpdateMessagePayload,
+): Promise<void> {
+  await frontendClient.request("chat.updateMessage", {
+    id: msg.messageId,
+    session_id: msg.sessionId,
+    content: msg.content,
+    tool_name: msg.toolName ?? null,
+    tool_input: msg.toolInput ?? null,
+    metadata: maybeJson(msg.metadata),
+    outcome: msg.outcome ?? null,
+    duration_ms: msg.durationMs ?? null,
+    delegation_id: msg.delegationId ?? null,
+  });
+}
+
+async function updateDelegationToolMessage(
+  frontendClient: FrontendWsClient,
+  msg: DelegationToolUpdatePayload,
+): Promise<void> {
+  await frontendClient.request("chat.updateDelegationToolMessage", {
+    session_id: msg.sessionId,
+    tool_name: msg.toolName,
+    delegation_id: msg.delegationId,
+    content: msg.content,
+    metadata: maybeJson(msg.metadata),
+    outcome: msg.outcome ?? null,
+    duration_ms: msg.durationMs ?? null,
+  });
+}
+
+async function appendDelegationEvent(
+  frontendClient: FrontendWsClient,
+  evt: DelegationEventPayload,
+): Promise<string> {
+  const metadata: Record<string, unknown> = {
+    kind: "delegation_event",
+    source: "system_notification",
+    event_type: `delegation.${evt.status}`,
+    delegation_id: evt.delegationId,
+    child_session_id: evt.childSessionId,
+    target_agent_id: evt.targetAgentId,
+    parent_agent_id: evt.parentAgentId,
+    status: evt.status,
+    capsule: evt.capsule,
+    ...(evt.fullSummary ? { full_summary: evt.fullSummary } : {}),
+    ...(evt.summaryTruncated != null ? { summary_truncated: evt.summaryTruncated } : {}),
+    ...(evt.scope ? { scope: evt.scope } : {}),
+    ...(evt.taskIndex != null ? { task_index: evt.taskIndex } : {}),
+    ...(evt.totalTasks != null ? { total_tasks: evt.totalTasks } : {}),
+    ...(evt.toolCalls != null ? { tool_calls: evt.toolCalls } : {}),
+    ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
+    ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
+    ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
+  };
+
+  return appendDelegationMessage(frontendClient, {
+    sessionId: evt.parentSessionId,
+    role: "user",
+    content: evt.capsule,
+    metadata,
+    fromAgentId: evt.targetAgentId,
+    delegationId: evt.delegationId,
+    targetAgentId: evt.targetAgentId,
+  });
+}
+
+/**
+ * POST /api/internal/delegation-events
+ *
+ * AgentBox-side background delegation runs persist through this Runtime-owned
+ * callback. AgentBox must not import Gateway chat repositories directly: in
+ * K8s it is a separate pod/process and Runtime owns the Portal RPC connection.
+ */
+export async function handleDelegationEvents(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  identity: CertificateIdentity,
+  frontendClient: FrontendWsClient,
+): Promise<void> {
+  try {
+    const event = await readJsonBody(req) as DelegationPersistenceEvent;
+    let response: DelegationPersistenceResponse = { ok: true };
+
+    switch (event.type) {
+      case "delegation.ensure_session": {
+        await frontendClient.request("chat.ensureSession", {
+          session_id: event.sessionId,
+          agent_id: event.agentId,
+          user_id: event.userId || sessionRegistry.resolveUser(event.sessionId),
+          title: event.title,
+          preview: event.preview,
+          origin: event.origin,
+          parent_session_id: event.lineage?.parentSessionId ?? null,
+          parent_agent_id: event.lineage?.parentAgentId ?? identity.agentId,
+          delegation_id: event.lineage?.delegationId ?? null,
+          target_agent_id: event.lineage?.targetAgentId ?? null,
+        });
+        break;
+      }
+      case "delegation.append_message": {
+        response = { ok: true, id: await appendDelegationMessage(frontendClient, event.message) };
+        break;
+      }
+      case "delegation.update_message": {
+        await updateDelegationMessage(frontendClient, event.message);
+        break;
+      }
+      case "delegation.update_tool_message": {
+        await updateDelegationToolMessage(frontendClient, event.message);
+        break;
+      }
+      case "delegation.append_event": {
+        response = { ok: true, id: await appendDelegationEvent(frontendClient, event.event) };
+        break;
+      }
+      case "delegation.emit_chat_event": {
+        frontendClient.emitEvent("chat.event", { sessionId: event.sessionId, event: event.event });
+        break;
+      }
+      default: {
+        sendJson(res, 400, { error: "Unknown delegation event type" });
+        return;
+      }
+    }
+
+    sendJson(res, 200, response);
+  } catch (err) {
+    console.error("[internal-api] delegation-events error:", err);
     sendJson(res, 500, { error: "Internal server error" });
   }
 }
