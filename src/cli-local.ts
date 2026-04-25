@@ -24,7 +24,6 @@ const secretsPath = path.resolve(".siclaw/local-secrets.json");
 const secrets = loadOrGenerateLocalSecrets(secretsPath);
 
 const runtimeUrl = `http://127.0.0.1:${RUNTIME_PORT}`;
-const runtimeWsUrl = `ws://127.0.0.1:${RUNTIME_PORT}/ws`;
 const portalUrl = `http://127.0.0.1:${PORTAL_PORT}`;
 
 // Phase 1: Portal (DB + migrations + HTTP server listening)
@@ -32,9 +31,6 @@ const portalHandle = await bootstrapPortal({
   port: PORTAL_PORT,
   databaseUrl: DATABASE_URL,
   jwtSecret: secrets.jwtSecret,
-  runtimeUrl,
-  runtimeWsUrl,
-  runtimeSecret: secrets.runtimeSecret,
   portalSecret: secrets.portalSecret,
   // Local single-user mode: expose the CLI snapshot endpoint so `siclaw`
   // (TUI) running on the same machine can fetch providers/MCP/default model
@@ -55,7 +51,6 @@ const runtimeHandle = await bootstrapRuntime({
     port: RUNTIME_PORT,
     internalPort: INTERNAL_PORT,
     host: "127.0.0.1",
-    runtimeSecret: secrets.runtimeSecret,
     serverUrl: portalUrl,
     portalSecret: secrets.portalSecret,
   },

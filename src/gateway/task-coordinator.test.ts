@@ -114,7 +114,7 @@ class FakeAgentBoxManager {
 
 const config: RuntimeConfig = {
   port: 0, internalPort: 0, host: "0.0.0.0",
-  runtimeSecret: "", serverUrl: "", portalSecret: "",
+  serverUrl: "", portalSecret: "",
 };
 
 function makeCoord(opts?: {

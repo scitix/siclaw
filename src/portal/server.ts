@@ -18,7 +18,6 @@ import { registerChatRoutes } from "./chat-gateway.js";
 import { registerChannelRoutes } from "./channel-api.js";
 import { registerNotificationRoutes, registerNotificationWs } from "./notification-api.js";
 import { registerSiclawRoutes } from "./siclaw-api.js";
-import { createRuntimeProxy } from "./proxy.js";
 import { registerRuntimeWs } from "./runtime-connection.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -43,9 +42,6 @@ const WEB_DIR = fs.existsSync(path.join(__dirname, "..", "..", "portal-web", "di
 export interface PortalConfig {
   port: number;
   jwtSecret: string;
-  runtimeUrl: string;
-  runtimeWsUrl?: string;   // Optional — Phase 1 backward compat
-  runtimeSecret?: string;  // Optional — Phase 1 backward compat
   portalSecret: string;
   /**
    * Enable the `/api/v1/cli-snapshot` endpoint that returns provider/model/MCP
@@ -70,7 +66,6 @@ export interface PortalConfig {
 
 export function startPortal(config: PortalConfig): http.Server {
   const router = createRestRouter();
-  const runtimeProxy = createRuntimeProxy(config.runtimeUrl);
 
   // Build phone-home connection map (Runtimes connect to Portal via WS)
   const rpcHandlers = buildAdapterRpcHandlers();
@@ -187,7 +182,6 @@ export function startPortal(config: PortalConfig): http.Server {
   registerChatRoutes(router, connectionMap, config.jwtSecret);
   registerSiclawRoutes(router, {
     jwtSecret: config.jwtSecret,
-    serverUrl: config.runtimeUrl,
     portalSecret: config.portalSecret,
     connectionMap,
   });

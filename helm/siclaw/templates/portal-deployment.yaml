@@ -39,15 +39,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "siclaw.fullname" . }}-portal
                   key: jwt-secret
-            - name: SICLAW_RUNTIME_URL
-              value: "http://{{ include "siclaw.fullname" . }}-runtime:3001"
-            - name: SICLAW_RUNTIME_WS_URL
-              value: "ws://{{ include "siclaw.fullname" . }}-runtime:3001"
-            - name: SICLAW_RUNTIME_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "siclaw.fullname" . }}-portal
-                  key: runtime-secret
             - name: SICLAW_PORTAL_SECRET
               valueFrom:
                 secretKeyRef:

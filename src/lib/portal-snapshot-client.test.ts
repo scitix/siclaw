@@ -14,20 +14,18 @@ import http from "node:http";
 import { tryLoadPortalSnapshot } from "./portal-snapshot-client.js";
 
 const JWT_SECRET = "test-snapshot-secret-0123456789";
-const RUNTIME_SECRET = "test-runtime";
 const PORTAL_SECRET = "test-portal";
 const CLI_SNAPSHOT_SECRET = "test-cli-snapshot-secret-0123456789";
 const CLI_SNAPSHOT_SECRET_HEADER = "x-siclaw-cli-snapshot-secret";
 
 function writeSecrets(
   cwd: string,
-  overrides: Partial<{ jwtSecret: string; runtimeSecret: string; portalSecret: string; cliSnapshotSecret: string | null }> = {},
+  overrides: Partial<{ jwtSecret: string; portalSecret: string; cliSnapshotSecret: string | null }> = {},
 ): void {
   const dir = path.join(cwd, ".siclaw");
   fs.mkdirSync(dir, { recursive: true });
   const payload: Record<string, string> = {
     jwtSecret: overrides.jwtSecret ?? JWT_SECRET,
-    runtimeSecret: overrides.runtimeSecret ?? RUNTIME_SECRET,
     portalSecret: overrides.portalSecret ?? PORTAL_SECRET,
   };
   // Explicit null opts out of writing cliSnapshotSecret (simulates old files).
