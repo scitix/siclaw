@@ -17,9 +17,12 @@ database:
   url: ""               # mysql://user:pass@host:3306/siclaw
 
 # -- Agent Runtime
+# NOTE: Runtime is a singleton — exactly one replica per Helm release.
+# Phone-home WS registration on the upstream (Portal or SiCore) is keyed by
+# runtime identity and a second connection with the same identity evicts the
+# first, so multiple replicas of the same release would continuously fight.
+# Scale horizontally by deploying multiple releases with distinct identities.
 runtime:
-  replicas: 1
-  jwtSecret: ""         # shared JWT secret (same as Portal/Upstream)
   runtimeSecret: ""       # Portal/Upstream → Runtime WS auth
   portalSecret: ""      # Runtime → Portal/Upstream API auth
   # Where Runtime gets Agent/Credential info from:
@@ -39,7 +42,7 @@ runtime:
 portal:
   enabled: true
   replicas: 1
-  jwtSecret: ""         # same as runtime.jwtSecret
+  jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
   runtimeSecret: ""       # same as runtime.runtimeSecret
   portalSecret: ""      # same as runtime.portalSecret
   service:

@@ -30,6 +30,9 @@ COPY src/gateway/config.ts src/gateway/jwt.ts \
      src/gateway/metrics-aggregator.ts src/gateway/ws-protocol.ts ./src/gateway/
 COPY src/gateway/agentbox/ ./src/gateway/agentbox/
 COPY src/gateway/security/ ./src/gateway/security/
+# Type-only file consumed by core/agent-factory.ts and core/extensions/* —
+# keeps Portal runtime code (db, rest-router) out of the agentbox tsc graph.
+COPY src/portal/cli-snapshot-types.ts ./src/portal/
 
 # Backend build (agentbox-specific tsconfig, excludes gateway server/portal/channel code)
 RUN npx tsc -p tsconfig.agentbox.json

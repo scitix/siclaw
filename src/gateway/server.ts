@@ -56,13 +56,10 @@ import {
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
 } from "./internal-api.js";
-import { createRestRouter } from "./rest-router.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
 import { consumeAgentSse } from "./sse-consumer.js";
 import { buildRedactionConfigForModelConfig } from "./output-redactor.js";
-import { registerMetricsRoutes } from "./metrics-api.js";
-import { registerSystemRoutes } from "./system-api.js";
 import { MetricsAggregator } from "./metrics-aggregator.js";
 import { LocalSpawner } from "./agentbox/local-spawner.js";
 import { sessionRegistry } from "./session-registry.js";
@@ -393,11 +390,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     return handler(params, context);
   });
 
-  // ── REST API Router ──────────────────────────────────────
-  // Siclaw CRUD routes are now handled by Portal (portal/siclaw-api.ts).
-  // Runtime only serves health, WS, and internal mTLS endpoints.
-  const restRouter = createRestRouter();
-
   // ── MetricsAggregator (K8s: pull loop; Local: proxy to in-process localCollector) ──
   const isK8sMode = !(spawner instanceof LocalSpawner);
   let metricsAggregator: MetricsAggregator;
@@ -418,8 +410,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   }
 
   metricsAggregatorRef = metricsAggregator;
-  registerMetricsRoutes(restRouter, config, metricsAggregator, frontendClient);
-  registerSystemRoutes(restRouter, config, frontendClient);
 
   // ── Metrics config ───────────────────────────────────────
   const cachedMetricsToken = process.env.SICLAW_METRICS_TOKEN;
@@ -465,10 +455,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       return;
     }
 
-    // Siclaw REST API routes
-    if (restRouter.handle(req, res)) return;
-
     // Everything else → 404
+    // Siclaw CRUD routes live in Portal; Runtime only exposes health, WS,
+    // and internal mTLS endpoints above.
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
   });
