@@ -62,7 +62,6 @@ export interface PortalSnapshot {
 
 interface LocalSecrets {
   jwtSecret: string;
-  runtimeSecret: string;
   portalSecret: string;
   /** Absent in older `.siclaw/local-secrets.json` files — caller handles. */
   cliSnapshotSecret?: string;
@@ -200,7 +199,6 @@ function readSecrets(filePath: string): LocalSecrets | null {
     const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
     if (
       typeof raw.jwtSecret === "string" &&
-      typeof raw.runtimeSecret === "string" &&
       typeof raw.portalSecret === "string"
     ) {
       return raw;

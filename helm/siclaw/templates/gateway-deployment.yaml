@@ -61,13 +61,7 @@ spec:
             {{- end }}
             - name: SICLAW_SKILLS_DIR
               value: ".siclaw/skills"
-            # Trusted Proxy secret
-            - name: SICLAW_RUNTIME_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "siclaw.fullname" . }}-runtime
-                  key: runtime-secret
-            # Adapter API — auto-discover Portal if enabled, else use configured URL
+            # Phone-home upstream — auto-discover Portal if enabled, else use configured URL
             - name: SICLAW_SERVER_URL
               {{- if .Values.portal.enabled }}
               value: "http://{{ include "siclaw.fullname" . }}-portal:{{ .Values.portal.service.port }}"

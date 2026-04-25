@@ -15,7 +15,6 @@ import type { RuntimeConnectionMap } from "./runtime-connection.js";
 /** Subset of config needed by siclaw API routes */
 interface SiclawConfig {
   jwtSecret: string;
-  serverUrl: string;
   portalSecret: string;
   connectionMap: RuntimeConnectionMap;
 }

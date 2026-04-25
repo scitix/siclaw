@@ -24,21 +24,13 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import https from "node:https";
-import { WebSocketServer, WebSocket } from "ws";
 import type { RuntimeConfig } from "./config.js";
 import type { AgentBoxManager } from "./agentbox/manager.js";
 import { AgentBoxClient, type PromptOptions } from "./agentbox/client.js";
 import {
-  createBroadcaster,
-  buildEvent,
-  parseFrame,
-  dispatchRpc,
-  MAX_BUFFERED_BYTES,
   type RpcHandler,
   type RpcContext,
-  type BroadcastFn,
 } from "./ws-protocol.js";
-import { authenticateProxy, type ProxyIdentity } from "./trusted-proxy.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
@@ -68,7 +60,6 @@ export interface RuntimeServer {
   httpServer: http.Server;
   httpsServer: https.Server | null;
   certManager: CertificateManager;
-  broadcast: BroadcastFn;
   rpcMethods: Map<string, RpcHandler>;
   agentBoxTlsOptions?: { cert: string; key: string; ca: string };
   credentialService: CredentialService;
@@ -90,9 +81,6 @@ export interface StartRuntimeOptions {
 export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeServer> {
   const { config, agentBoxManager, spawner, frontendClient } = opts;
 
-  const clients = new Set<WebSocket>();
-  const broadcast = createBroadcaster(clients);
-
   // ── Credential Service ───────────────────────────────────
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
@@ -112,11 +100,8 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   // ── RPC Methods (chat only) ──────────────────────────────
   const rpcMethods = new Map<string, RpcHandler>();
 
-  // Map of per-WS abort controllers for SSE streaming
-  const activeStreams = new Map<WebSocket, AbortController>();
-
   rpcMethods.set("chat.send", async (params, context: RpcContext) => {
-    const agentId = (params.agentId as string) || context.proxy?.agentId;
+    const agentId = params.agentId as string;
     const userId = params.userId as string;
     const orgId = params.orgId as string | undefined;
     const text = params.text as string;
@@ -164,12 +149,9 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // output. Credential-manifest redaction is follow-up work.
     const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
 
-    // Stream + persist events back to the caller via sendEvent().
-    // - Direct WS mode: sendEvent writes to the originating WS connection
-    // - Phone-home mode: sendEvent emits via FrontendWsClient to Portal
+    // Stream + persist events back to Portal via sendEvent (FrontendWsClient).
     {
       const abortCtrl = new AbortController();
-      if (context.ws) activeStreams.set(context.ws, abortCtrl);
 
       // Non-blocking: consume events in background
       (async () => {
@@ -194,8 +176,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
           }
           // Ensure prompt_done is sent even on error so Portal SSE doesn't hang
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
-        } finally {
-          if (context.ws) activeStreams.delete(context.ws);
         }
       })();
     }
@@ -462,89 +442,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     res.end(JSON.stringify({ error: "Not found" }));
   });
 
-  // ── WebSocket Server ─────────────────────────────────────
-  const wss = new WebSocketServer({ noServer: true });
-
-  httpServer.on("upgrade", (req, socket, head) => {
-    const urlPath = req.url?.split("?")[0];
-    if (urlPath !== "/ws") {
-      socket.destroy();
-      return;
-    }
-
-    // Trusted Proxy authentication
-    const proxy = authenticateProxy(req, config.runtimeSecret);
-    if (!proxy) {
-      console.warn(`[runtime] WS upgrade rejected: invalid proxy credentials`);
-      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
-      socket.destroy();
-      return;
-    }
-
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      (ws as any).proxy = proxy;
-      wss.emit("connection", ws, proxy);
-    });
-  });
-
-  // Keep-alive: ping every 30s
-  const aliveClients = new WeakSet<WebSocket>();
-  const pingTimer = setInterval(() => {
-    for (const ws of clients) {
-      if (!aliveClients.has(ws)) { ws.terminate(); continue; }
-      aliveClients.delete(ws);
-      ws.ping();
-    }
-  }, 30_000);
-  wss.on("close", () => clearInterval(pingTimer));
-
-  wss.on("connection", (ws: WebSocket, proxy: ProxyIdentity) => {
-    clients.add(ws);
-    aliveClients.add(ws);
-    ws.on("pong", () => aliveClients.add(ws));
-    console.log(`[runtime] WS connected agentId=${proxy.agentId} (total: ${clients.size})`);
-
-    ws.on("message", async (data) => {
-      const raw = String(data);
-      const frame = parseFrame(raw);
-      if (!frame) return;
-
-      const context: RpcContext = {
-        proxy,
-        sendEvent: (event, payload) => {
-          if (ws.readyState === ws.OPEN && ws.bufferedAmount <= MAX_BUFFERED_BYTES) {
-            ws.send(buildEvent(event, payload));
-          }
-        },
-        ws,
-      };
-
-      await dispatchRpc(rpcMethods, frame, ws, context);
-    });
-
-    ws.on("close", () => {
-      clients.delete(ws);
-      // Do NOT abort in-flight SSE consumers on WS close. A prompt is the
-      // minimal unit of work: once submitted, let it run to completion so
-      // the agent's full output — including empty-response retries and the
-      // post-deep_search synthesis turn — is persisted to DB via
-      // persistMessages. On reconnect the frontend fetches history and
-      // sees messages produced after the disconnect. Explicit cancellation
-      // still flows through chat.abort → agentbox abortSession.
-      activeStreams.delete(ws);
-      console.log(`[runtime] WS disconnected (total: ${clients.size})`);
-    });
-
-    ws.on("error", (err) => {
-      console.error("[runtime] WS error:", err.message);
-      clients.delete(ws);
-    });
-  });
-
+  // Runtime no longer accepts inbound WS connections — Portal/SiCore drive
+  // RPCs over the phone-home WS owned by FrontendWsClient. The HTTP server
+  // here serves only /api/health and the internal mTLS endpoints.
   httpServer.keepAliveTimeout = 500;
   httpServer.listen(config.port, config.host, () => {
     console.log(`[runtime] HTTP listening on http://${config.host}:${config.port}`);
-    console.log(`[runtime] WebSocket: ws://${config.host}:${config.port}/ws`);
   });
 
   // ── HTTPS Server (Port 3002 — mTLS for AgentBox) ────────
@@ -674,7 +577,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     httpServer,
     httpsServer,
     certManager,
-    broadcast,
     rpcMethods,
     agentBoxTlsOptions,
     credentialService,
@@ -682,9 +584,6 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       metricsAggregator.destroy();
       frontendClient.close();
       await agentBoxManager.cleanup();
-      for (const ws of clients) ws.close();
-      clients.clear();
-      wss.close();
       httpServer.close();
       httpsServer?.close();
     },

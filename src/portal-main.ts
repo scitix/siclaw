@@ -9,9 +9,6 @@ import { bootstrapPortal } from "./lib/bootstrap-portal.js";
 const config = {
   port: parseInt(process.env.PORTAL_PORT || "3003", 10),
   jwtSecret: process.env.JWT_SECRET || "dev-secret",
-  runtimeUrl: process.env.SICLAW_RUNTIME_URL || "",
-  runtimeWsUrl: process.env.SICLAW_RUNTIME_WS_URL || "",
-  runtimeSecret: process.env.SICLAW_RUNTIME_SECRET || "dev-secret",
   portalSecret: process.env.SICLAW_PORTAL_SECRET || "dev-secret",
   databaseUrl: process.env.DATABASE_URL || "",
 };

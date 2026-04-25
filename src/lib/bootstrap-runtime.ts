@@ -45,10 +45,6 @@ export async function bootstrapRuntime(opts: BootstrapRuntimeOptions): Promise<R
   console.log(`[runtime] Config: port=${config.port} internalPort=${config.internalPort} host=${config.host}`);
   console.log(`[runtime] Server URL: ${config.serverUrl}`);
 
-  if (!config.runtimeSecret) {
-    console.warn("[runtime] WARNING: SICLAW_RUNTIME_SECRET not set — WS connections will be rejected");
-  }
-
   // FrontendWsClient — persistent WS connection to Portal/Upstream
   const frontendClient = new FrontendWsClient({
     serverUrl: config.serverUrl,
