@@ -427,7 +427,7 @@ The row persists in history — a full audit trail of every tool gated by the pe
 │ ▌ ┃
 │ ▌ ┃ 🤖 sub-agent
 │ ▌ ┃ nodepool-061 and nodepool-062 show mlx5_core firmware resets.
-│ ▌ ┃ 
+│ ▌ ┃
 │ ▌ ┃ ...
 │ ▌ ┃────────────────────────────────────────────────────
 │ ▌ ┃ ✅ Completed · 8 tool calls · 45s
