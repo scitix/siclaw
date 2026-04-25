@@ -36,8 +36,8 @@ if (!(globalThis as any).__frameworkEntriesState) {
 if (!(globalThis as any).__fakeBrainFactories) {
   (globalThis as any).__fakeBrainFactories = [];
 }
-if (!(globalThis as any).__chatRepoCalls) {
-  (globalThis as any).__chatRepoCalls = [];
+if (!(globalThis as any).__delegationPersistenceEvents) {
+  (globalThis as any).__delegationPersistenceEvents = [];
 }
 
 vi.mock("../core/agent-factory.js", async () => {
@@ -87,22 +87,6 @@ vi.mock("../core/agent-factory.js", async () => {
   };
 });
 
-vi.mock("../gateway/chat-repo.js", () => {
-  const g = globalThis as any;
-  g.__chatRepoCalls = g.__chatRepoCalls ?? [];
-  const record = async (method: string, payload: unknown) => {
-    g.__chatRepoCalls.push({ method, payload });
-    return `msg-${g.__chatRepoCalls.length}`;
-  };
-  return {
-    appendMessage: (msg: unknown) => record("appendMessage", msg),
-    appendDelegationEvent: (msg: unknown) => record("appendDelegationEvent", msg),
-    ensureChatSession: (msg: unknown) => record("ensureChatSession", msg),
-    updateDelegationToolMessage: (msg: unknown) => record("updateDelegationToolMessage", msg),
-    updateMessage: (msg: unknown) => record("updateMessage", msg),
-  };
-});
-
 const lastCreateSiclawSession = { calls: (globalThis as any).__createSessionCalls ?? [] };
 if (!(globalThis as any).__createSessionCalls) (globalThis as any).__createSessionCalls = lastCreateSiclawSession.calls;
 
@@ -141,6 +125,20 @@ vi.mock("../core/config.js", () => ({
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
 
+function installDelegationPersistenceRecorder(mgr: AgentBoxSessionManager): void {
+  const g = globalThis as any;
+  g.__delegationPersistenceEvents = g.__delegationPersistenceEvents ?? [];
+  mgr.gatewayClient = {
+    sendDelegationPersistenceEvent: vi.fn(async (event: any) => {
+      g.__delegationPersistenceEvents.push(event);
+      if (event.type === "delegation.append_message" || event.type === "delegation.append_event") {
+        return { ok: true, id: `msg-${g.__delegationPersistenceEvents.length}` };
+      }
+      return { ok: true };
+    }),
+  } as any;
+}
+
 // ── Test setup ────────────────────────────────────────────────────────
 
 let origCwd: string;
@@ -159,7 +157,7 @@ beforeEach(() => {
   (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
   (globalThis as any).__createSessionCalls.length = 0;
   (globalThis as any).__fakeBrainFactories.length = 0;
-  (globalThis as any).__chatRepoCalls.length = 0;
+  (globalThis as any).__delegationPersistenceEvents.length = 0;
   lastCreateSiclawSession.calls = (globalThis as any).__createSessionCalls;
 });
 
@@ -412,6 +410,7 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
       steer: parentSteer,
     }));
     const mgr = new AgentBoxSessionManager();
+    installDelegationPersistenceRecorder(mgr);
     mgr.agentId = "agent-a";
     const parent = await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
     parent._promptDone = false;
@@ -438,9 +437,9 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
     });
     expect(parentSteer.mock.calls[0][0]).toContain("[Delegation Batch Complete]");
     expect(parentSteer.mock.calls[0][0]).toContain("Pod evidence capsule.");
-    expect((globalThis as any).__chatRepoCalls.some((call: any) => (
-      call.method === "appendMessage" &&
-      call.payload.metadata?.event_type === "delegation.batch_complete"
+    expect((globalThis as any).__delegationPersistenceEvents.some((call: any) => (
+      call.type === "delegation.append_message" &&
+      call.message.metadata?.event_type === "delegation.batch_complete"
     ))).toBe(true);
   });
 
@@ -452,6 +451,7 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
       steer: parentSteer,
     }));
     const mgr = new AgentBoxSessionManager();
+    installDelegationPersistenceRecorder(mgr);
     mgr.agentId = "agent-a";
     await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
     const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
@@ -486,6 +486,7 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
         prompt: parentPrompt,
       }));
       const mgr = new AgentBoxSessionManager();
+      installDelegationPersistenceRecorder(mgr);
       mgr.agentId = "agent-a";
       await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
       const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
@@ -550,12 +551,12 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
       expect(notification).toContain("l40-068 NotReady");
       expect(notification).not.toContain("Interrupted active tool");
 
-      const finalUpdate = [...(globalThis as any).__chatRepoCalls]
+      const finalUpdate = [...(globalThis as any).__delegationPersistenceEvents]
         .reverse()
-        .find((call: any) => call.method === "updateDelegationToolMessage" && call.payload.metadata?.results_available === true);
-      expect(finalUpdate?.payload.metadata.status).toBe("partial");
-      expect(finalUpdate?.payload.metadata.tasks[1].partial_source).toBe("runtime_fallback");
-      expect(finalUpdate?.payload.metadata.tasks[1].interrupted_tool).toBe("node_exec");
+        .find((call: any) => call.type === "delegation.update_tool_message" && call.message.metadata?.results_available === true);
+      expect(finalUpdate?.message.metadata.status).toBe("partial");
+      expect(finalUpdate?.message.metadata.tasks[1].partial_source).toBe("runtime_fallback");
+      expect(finalUpdate?.message.metadata.tasks[1].interrupted_tool).toBe("node_exec");
     } finally {
       vi.useRealTimers();
     }

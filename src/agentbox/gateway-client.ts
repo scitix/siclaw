@@ -9,6 +9,7 @@ import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
+import type { DelegationPersistenceEvent, DelegationPersistenceResponse } from "../shared/delegation-persistence.js";
 
 export interface GatewayClientOptions {
   gatewayUrl: string;
@@ -128,6 +129,16 @@ export class GatewayClient {
   async searchKnowledge(query: string, topK = 5, minScore = 0.35): Promise<import("../memory/types.js").MemorySearchResult> {
     const url = `/api/internal/knowledge-search?query=${encodeURIComponent(query)}&topK=${topK}&minScore=${minScore}`;
     return this.request(url, "GET");
+  }
+
+  /**
+   * Send background delegation persistence/audit events to Runtime.
+   *
+   * AgentBox must not import Gateway DB/RPC modules directly: in K8s it runs in
+   * a separate pod, while Runtime owns the Portal RPC connection.
+   */
+  async sendDelegationPersistenceEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
+    return this.request("/api/internal/delegation-events", "POST", event);
   }
 
   /**

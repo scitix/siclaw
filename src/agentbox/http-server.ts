@@ -163,11 +163,14 @@ export function createHttpServer(
   // seen by sessions created before it landed.
   // Credential broker: both K8s and Local mode use HTTP to call gateway.
   // SICLAW_GATEWAY_URL is set by K8s env or LocalSpawner process.env injection.
-  if (!sessionManager.credentialBroker) {
+  {
     const credentialsDir = sessionManager.credentialsDir;
     const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
-    if (gatewayUrl) {
-      const client = new GatewayClient({ gatewayUrl });
+    if (gatewayUrl && !sessionManager.gatewayClient) {
+      sessionManager.gatewayClient = new GatewayClient({ gatewayUrl });
+    }
+    if (gatewayUrl && !sessionManager.credentialBroker && sessionManager.gatewayClient) {
+      const client = sessionManager.gatewayClient;
       sessionManager.credentialBroker = new CredentialBroker(new HttpTransport(client), credentialsDir);
       console.log(`[agentbox-http] Credential broker initialized (${gatewayUrl})`);
     }

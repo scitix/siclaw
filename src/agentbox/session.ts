@@ -35,8 +35,17 @@ import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
-import { appendDelegationEvent, appendMessage, ensureChatSession, updateDelegationToolMessage, updateMessage } from "../gateway/chat-repo.js";
-import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../gateway/output-redactor.js";
+import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
+import type {
+  DelegationAppendMessagePayload,
+  DelegationEventPayload,
+  DelegationLineagePayload,
+  DelegationPersistenceEvent,
+  DelegationPersistenceResponse,
+  DelegationToolUpdatePayload,
+  DelegationUpdateMessagePayload,
+} from "../shared/delegation-persistence.js";
+import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
 
 export interface ManagedSession {
@@ -297,6 +306,12 @@ export class AgentBoxSessionManager {
   credentialBroker?: import("./credential-broker.js").CredentialBroker;
 
   /**
+   * Optional Runtime callback client. In K8s, AgentBox runs in a separate pod
+   * and must persist delegation/audit rows through Runtime's internal API.
+   */
+  gatewayClient?: GatewayClient;
+
+  /**
    * Optional override for the directory where the broker materializes credential
    * files. LocalSpawner sets this to a per-user path so multiple
    * AgentBoxes don't collide on a shared credentialsDir. When undefined the
@@ -422,6 +437,50 @@ Always end with a final report even if evidence is incomplete.`;
     return async (request) => this.startDelegatedAgents(request);
   }
 
+  private async persistDelegationEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
+    if (!this.gatewayClient) return { ok: false };
+    return this.gatewayClient.sendDelegationPersistenceEvent(event);
+  }
+
+  private async persistEnsureChatSession(
+    sessionId: string,
+    agentId: string,
+    userId: string,
+    title?: string,
+    preview?: string,
+    origin?: string,
+    lineage?: DelegationLineagePayload,
+  ): Promise<void> {
+    await this.persistDelegationEvent({
+      type: "delegation.ensure_session",
+      sessionId,
+      agentId,
+      userId,
+      title,
+      preview,
+      origin,
+      lineage,
+    });
+  }
+
+  private async persistAppendMessage(message: DelegationAppendMessagePayload): Promise<string> {
+    const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
+    return result.id ?? "";
+  }
+
+  private async persistUpdateMessage(message: DelegationUpdateMessagePayload): Promise<void> {
+    await this.persistDelegationEvent({ type: "delegation.update_message", message });
+  }
+
+  private async persistUpdateDelegationToolMessage(message: DelegationToolUpdatePayload): Promise<void> {
+    await this.persistDelegationEvent({ type: "delegation.update_tool_message", message });
+  }
+
+  private async persistAppendDelegationEvent(event: DelegationEventPayload): Promise<string> {
+    const result = await this.persistDelegationEvent({ type: "delegation.append_event", event });
+    return result.id ?? "";
+  }
+
   private async startDelegatedAgents(request: DelegateToAgentsRequest): Promise<DelegateToAgentsStartResult> {
     const parent = this.sessions.get(request.parentSessionId);
     if (!parent) {
@@ -524,7 +583,7 @@ Always end with a final report even if evidence is incomplete.`;
         total_tasks: snapshot.length,
       };
 
-      persistQueue = persistQueue.then(() => updateDelegationToolMessage({
+      persistQueue = persistQueue.then(() => this.persistUpdateDelegationToolMessage({
         sessionId: request.parentSessionId,
         toolName: "delegate_to_agents",
         delegationId: request.delegationId,
@@ -653,7 +712,7 @@ Always end with a final report even if evidence is incomplete.`;
     durationMs: number,
   ): Promise<void> {
     const notification = this.buildDelegationBatchNotification(request, tasks, status);
-    await appendMessage({
+    await this.persistAppendMessage({
       sessionId: request.parentSessionId,
       role: "user",
       content: notification,
@@ -725,7 +784,7 @@ Always end with a final report even if evidence is incomplete.`;
         };
         pushPendingChildTool(pendingToolCalls, toolName, pending);
         enqueueParentPersist(async () => {
-          pending.messageId = await appendMessage({
+          pending.messageId = await this.persistAppendMessage({
             sessionId: managed.id,
             role: "tool",
             content: "",
@@ -753,9 +812,9 @@ Always end with a final report even if evidence is incomplete.`;
         };
         enqueueParentPersist(async () => {
           if (pending?.messageId) {
-            await updateMessage({ ...payload, messageId: pending.messageId });
+            await this.persistUpdateMessage({ ...payload, messageId: pending.messageId });
           } else {
-            await appendMessage({ ...payload, role: "tool" });
+            await this.persistAppendMessage({ ...payload, role: "tool" });
           }
         });
       }
@@ -776,7 +835,7 @@ Always end with a final report even if evidence is incomplete.`;
         const messageText = (text || currentAssistantText || assistantContent).trim();
         if (messageText) {
           enqueueParentPersist(async () => {
-            await appendMessage({
+            await this.persistAppendMessage({
               sessionId: managed.id,
               role: "assistant",
               content: redactText(messageText, redactionConfig),
@@ -794,7 +853,7 @@ Always end with a final report even if evidence is incomplete.`;
       await managed.brain.prompt(promptText);
     } catch (err) {
       promptOutcome = "error";
-      await appendMessage({
+      await this.persistAppendMessage({
         sessionId: managed.id,
         role: "assistant",
         content: `Delegation notification synthesis failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -900,7 +959,7 @@ Always end with a final report even if evidence is incomplete.`;
         const title = request.totalTasks && request.taskIndex
           ? `Delegated investigation ${request.taskIndex}/${request.totalTasks}`
           : "Delegated investigation";
-        await ensureChatSession(
+        await this.persistEnsureChatSession(
           childSessionId,
           currentAgentId,
           request.userId,
@@ -909,7 +968,7 @@ Always end with a final report even if evidence is incomplete.`;
           "delegation",
           lineage,
         );
-        await appendMessage({
+        await this.persistAppendMessage({
           sessionId: childSessionId,
           role: "user",
           content: redactText(request.scope, redactionConfig),
@@ -971,7 +1030,7 @@ Always end with a final report even if evidence is incomplete.`;
         };
         pushPendingChildTool(pendingToolCalls, toolName, pending);
         enqueuePersist(async () => {
-          pending.messageId = await appendMessage({
+          pending.messageId = await this.persistAppendMessage({
             sessionId: childSessionId,
             role: "tool",
             content: "",
@@ -1022,9 +1081,9 @@ Always end with a final report even if evidence is incomplete.`;
             metadata: persistableToolDetails(event.result, redactionConfig),
           };
           if (pending?.messageId) {
-            await updateMessage({ ...payload, messageId: pending.messageId });
+            await this.persistUpdateMessage({ ...payload, messageId: pending.messageId });
           } else {
-            await appendMessage({
+            await this.persistAppendMessage({
               ...payload,
               role: "tool",
               fromAgentId: targetAgentId,
@@ -1190,9 +1249,9 @@ Always end with a final report even if evidence is incomplete.`;
             },
           };
           if (pending.messageId) {
-            await updateMessage({ ...payload, messageId: pending.messageId });
+            await this.persistUpdateMessage({ ...payload, messageId: pending.messageId });
           } else {
-            await appendMessage({
+            await this.persistAppendMessage({
               ...payload,
               role: "tool",
               fromAgentId: targetAgentId,
@@ -1206,7 +1265,7 @@ Always end with a final report even if evidence is incomplete.`;
     }
     if (finalText.trim()) {
       enqueuePersist(async () => {
-        await appendMessage({
+        await this.persistAppendMessage({
           sessionId: childSessionId,
           role: "assistant",
           content: redactText(finalText.trim(), redactionConfig),
@@ -1222,7 +1281,7 @@ Always end with a final report even if evidence is incomplete.`;
 
     if (persistDelegationTrace && request.parentSessionId && currentAgentId && request.userId) {
       enqueuePersist(async () => {
-        await appendDelegationEvent({
+        await this.persistAppendDelegationEvent({
           parentSessionId: request.parentSessionId,
           parentAgentId: request.parentAgentId ?? currentAgentId,
           userId: request.userId,
