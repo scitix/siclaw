@@ -461,11 +461,12 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         if (cancelled) return
         const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
-        const recoveredActive = hasRunningPersistedMessages(pilotMsgs)
+        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
+        const recoveredActive = hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
         setStreaming(recoveredActive)
         streamingRef.current = recoveredActive
-        recoveredStreamingRef.current = recoveredActive
+        recoveredStreamingRef.current = hasRunning
         setHasMore(items.length >= PAGE_SIZE)
       } catch (err) {
         console.error("[usePilotChat] Failed to load messages:", err)
@@ -562,9 +563,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
   // Async delegation is intentionally detached from the parent prompt, so the
   // normal SSE request may be closed while sub-agents continue in the
-  // background. Poll persisted history only while an async batch card is still
-  // running; this keeps the input unlocked but lets the card and follow-up
-  // assistant synthesis appear without a manual refresh.
+  // background. Poll persisted history while an async batch card is running or
+  // while a completed batch is waiting for parent synthesis.
   useEffect(() => {
     if (!sessionId || !hasActiveAsyncDelegationSurface(messages)) return
 
@@ -579,9 +579,20 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         if (cancelled) return
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
+        const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
-        if (!hasActiveAsyncDelegationSurface(pilotMsgs)) return
+        if (pendingSynthesis) {
+          setStreaming(true)
+          streamingRef.current = true
+        }
+        if (!hasActiveAsyncDelegationSurface(pilotMsgs)) {
+          if (!recoveredStreamingRef.current && !abortControllerRef.current) {
+            setStreaming(false)
+            streamingRef.current = false
+          }
+          return
+        }
       } catch (err) {
         console.warn("[usePilotChat] Failed to refresh async delegation:", err)
       }
@@ -871,7 +882,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // --- Send a message ---
   const send = useCallback(
     (text: string) => {
-      if (streamingRef.current && sessionId) {
+      if ((streamingRef.current || hasPendingDelegationSynthesis(messages)) && sessionId) {
         // While streaming, send as steer
         chatSteer(agentId, sessionId, text).catch((err) => console.error("[usePilotChat] steer error:", err))
         setPendingMessages((prev) => [...prev, text])
@@ -1009,7 +1020,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         }
       })()
     },
-    [agentId, sessionId, handleChatEvent],
+    [agentId, sessionId, messages, handleChatEvent],
   )
 
   // --- Steer ---
