@@ -1,7 +1,7 @@
 /**
- * Local mode secrets — auto-generate JWT / Portal / Runtime secrets on first
- * launch and persist them so subsequent `siclaw local` runs use the same
- * values. Makes zero-config startup possible.
+ * Local mode secrets — auto-generate JWT / Portal secrets on first launch
+ * and persist them so subsequent `siclaw local` runs use the same values.
+ * Makes zero-config startup possible.
  */
 
 import crypto from "node:crypto";
@@ -10,7 +10,6 @@ import path from "node:path";
 
 export interface LocalSecrets {
   jwtSecret: string;
-  runtimeSecret: string;
   portalSecret: string;
   /**
    * Dedicated secret for the `/api/v1/cli-snapshot` endpoint. Kept separate
@@ -27,12 +26,11 @@ export function loadOrGenerateLocalSecrets(filePath: string): LocalSecrets {
       const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
       if (
         typeof raw.jwtSecret === "string" &&
-        typeof raw.runtimeSecret === "string" &&
         typeof raw.portalSecret === "string"
       ) {
         // Back-fill cliSnapshotSecret for secrets files written by older
-        // versions. Preserves existing JWT/Runtime/Portal secrets so the
-        // running Portal doesn't reject in-flight sessions.
+        // versions. Preserves existing JWT/Portal secrets so the running
+        // Portal doesn't reject in-flight sessions.
         if (typeof raw.cliSnapshotSecret !== "string") {
           raw.cliSnapshotSecret = crypto.randomBytes(32).toString("hex");
           fs.writeFileSync(filePath, JSON.stringify(raw, null, 2));
@@ -47,7 +45,6 @@ export function loadOrGenerateLocalSecrets(filePath: string): LocalSecrets {
 
   const secrets: LocalSecrets = {
     jwtSecret: crypto.randomBytes(32).toString("hex"),
-    runtimeSecret: crypto.randomBytes(32).toString("hex"),
     portalSecret: crypto.randomBytes(32).toString("hex"),
     cliSnapshotSecret: crypto.randomBytes(32).toString("hex"),
   };

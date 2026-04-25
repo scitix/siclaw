@@ -201,34 +201,10 @@ describe("parseQuery", () => {
 
 describe("requireAuth", () => {
   const SECRET = "jwt-secret-1";
-  const PROXY_SECRET = "proxy-secret-1";
 
-  beforeEach(() => {
-    process.env.SICLAW_RUNTIME_SECRET = PROXY_SECRET;
-  });
-  afterEach(() => {
-    delete process.env.SICLAW_RUNTIME_SECRET;
-  });
-
-  it("returns identity from trusted proxy headers when x-auth-token matches", () => {
-    const req = makeReq("GET", "/", {
-      "x-auth-token": PROXY_SECRET,
-      "x-siclaw-user-id": "u1",
-      "x-siclaw-org-id": "o1",
-      "x-siclaw-username": "alice",
-      "x-siclaw-role": "admin",
-    });
-    expect(requireAuth(req, SECRET)).toEqual({
-      userId: "u1", orgId: "o1", username: "alice", role: "admin",
-    });
-  });
-
-  it("falls through to JWT when proxy token does not match", () => {
+  it("returns identity from a valid JWT", () => {
     const token = jwt.sign({ sub: "u-jwt", role: "user" }, SECRET);
-    const req = makeReq("GET", "/", {
-      "x-auth-token": "wrong",
-      authorization: `Bearer ${token}`,
-    });
+    const req = makeReq("GET", "/", { authorization: `Bearer ${token}` });
     const auth = requireAuth(req, SECRET);
     expect(auth?.userId).toBe("u-jwt");
     expect(auth?.role).toBe("user");
@@ -241,20 +217,6 @@ describe("requireAuth", () => {
   it("returns null when JWT signature invalid", () => {
     const token = jwt.sign({ sub: "u" }, "other-secret");
     const req = makeReq("GET", "/", { authorization: `Bearer ${token}` });
-    expect(requireAuth(req, SECRET)).toBeNull();
-  });
-
-  it("rejects proxy auth when user id header is missing", () => {
-    const req = makeReq("GET", "/", { "x-auth-token": PROXY_SECRET });
-    expect(requireAuth(req, SECRET)).toBeNull();
-  });
-
-  it("rejects proxy auth when SICLAW_RUNTIME_SECRET is unset", () => {
-    delete process.env.SICLAW_RUNTIME_SECRET;
-    const req = makeReq("GET", "/", {
-      "x-auth-token": PROXY_SECRET,
-      "x-siclaw-user-id": "u1",
-    });
     expect(requireAuth(req, SECRET)).toBeNull();
   });
 });

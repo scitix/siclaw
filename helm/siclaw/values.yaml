@@ -23,8 +23,7 @@ database:
 # first, so multiple replicas of the same release would continuously fight.
 # Scale horizontally by deploying multiple releases with distinct identities.
 runtime:
-  runtimeSecret: ""       # Portal/Upstream → Runtime WS auth
-  portalSecret: ""      # Runtime → Portal/Upstream API auth
+  portalSecret: ""      # Runtime → Portal/Upstream API auth (X-Auth-Token on phone-home WS)
   # Where Runtime gets Agent/Credential info from:
   #   Standalone mode: http://siclaw-portal:3003
   #   Upstream mode:     http://upstream-apiserver:8080
@@ -43,8 +42,7 @@ portal:
   enabled: true
   replicas: 1
   jwtSecret: ""         # Portal's JWT signing key (Portal is the auth boundary)
-  runtimeSecret: ""       # same as runtime.runtimeSecret
-  portalSecret: ""      # same as runtime.portalSecret
+  portalSecret: ""      # shared with Runtime; verifies Runtime phone-home X-Auth-Token
   service:
     type: NodePort
     port: 3003
