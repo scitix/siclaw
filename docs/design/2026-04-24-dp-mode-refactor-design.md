@@ -42,6 +42,7 @@ The primitives are intentionally reusable. Phase 2 (future) builds on the same d
 - Multi-agent expert teams (`delegate_to_agent(agent_id=<other>)`).
 - Domain sweep phase (parallel specialist exploration before hypothesis).
 - Permission gate, approval persistence, and tool-level "always allow" settings.
+- Background long-running tool jobs.
 - Visual multi-agent sidebar / timeline.
 - Gateway/portal routing to target agent AgentBoxes.
 
@@ -184,6 +185,73 @@ Phase 1 validates the DP loop with direct same-agent delegation:
 - Child session timeout is activity-based: the runtime aborts a delegated child after 60 seconds without model/tool activity, while long-running tool calls are allowed to continue up to a wide 10-minute max-runtime guard.
 
 Cross-agent expert collaboration (`agent_id !== "self"`) is intentionally not implemented here. It must route through gateway/portal to the target agent's AgentBox so model config, system prompt, tools, credentials, and future permission boundaries are real.
+
+### Batch completion barrier
+
+Batch delegation is optimized for DP milestone behavior, not for letting the
+slowest worker dominate the parent session. The runtime currently applies this
+collection policy:
+
+1. Start all tasks concurrently and update the original `delegate_to_agents`
+   tool row as children finish.
+2. Wait a bounded grace window for the batch to complete.
+3. If any children are still running, steer each unfinished child to stop
+   calling tools and return a concise partial `## Evidence Capsule` from
+   evidence already collected.
+4. Wait a short partial window.
+5. If a child still does not return, stop it and recover a conservative partial
+   capsule from completed tool traces.
+6. Notify the parent once with the usable batch result. The parent sees `done`
+   or `partial` evidence capsules; runtime-only fields such as the interrupted
+   tool are stored in audit metadata but are not part of the model-facing
+   notification.
+
+This deliberately keeps partial recovery local to delegation. It does not
+change normal tool execution, does not introduce a general state machine, and
+does not expose partial-worker implementation details to the parent model.
+
+### Deferred: background long-running tool jobs
+
+Some diagnostic commands are valuable but naturally slow: node log collection,
+large pod sweeps, network probes, or host-level checks that can run close to the
+tool timeout. A future background-tool mechanism can improve this, but it must
+be treated as a separate runtime primitive rather than folded into the current
+DP delegation work.
+
+Proposed constraints:
+
+- **Parent-session privilege only at first.** Background tool jobs should be
+  available to the main agent runtime, not to delegated child sessions. Child
+  sessions already run in the background; letting them also spawn background
+  tools creates nested notify paths and makes parent synthesis timing harder to
+  reason about.
+- **No recursive background work.** Sub-agents should complete their bounded
+  scopes using normal tools and report evidence capsules. If a child hits a
+  slow command, the batch barrier can collect a partial capsule instead of
+  waiting forever.
+- **Notify into the owning session.** A parent-owned background tool should
+  persist a job row, keep running after the current turn, and notify the same
+  parent session when the result is available. This mirrors delegated batch
+  notification but has a different owner and payload shape.
+- **Do not change regular tool schemas by default.** The model should not see a
+  new background-tool surface unless the runtime explicitly enables it for the
+  session mode and product path.
+- **Keep audit complete.** A background job must preserve the original tool
+  input, start/end timestamps, redacted output, outcome, and the notification
+  that re-enters the parent session.
+- **Do not block this PR.** The current single-agent DP PR only implements
+  same-agent delegation, batch notification, and partial batch collection.
+  Background tool jobs require a separate design and test plan around tool
+  cancellation, result ownership, refresh persistence, and notification order.
+
+Open questions for that future design:
+
+- Which tools are eligible for background execution?
+- Does the model choose background mode, or does the runtime demote slow tools
+  automatically after a threshold?
+- How should user cancel interact with an already-running background job?
+- Should the final result trigger a synthesis-only parent turn, or only render
+  a visible result chip until the user asks to continue?
 
 The permission-gate design below is retained as the next layer, but it is not part of the current single-agent DP acceptance path.
 

@@ -268,12 +268,32 @@ function messageString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined
 }
 
+function messageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
 function messageDelegationId(message: PilotMessage): string | undefined {
   if (message.delegationId) return message.delegationId
   const metadataId = messageString(message.metadata?.delegation_id)
   if (metadataId) return metadataId
   const parsedContent = message.content ? tryParseJson(message.content) : undefined
   return messageString(parsedContent?.delegation_id)
+}
+
+function delegationResultsReadyLabel(toolMessage: PilotMessage, eventMessage?: PilotMessage): string {
+  const parsedContent = toolMessage.content ? tryParseJson(toolMessage.content) : undefined
+  const tasks = Array.isArray(parsedContent?.tasks) ? parsedContent.tasks : []
+  const total =
+    messageNumber(eventMessage?.metadata?.total_tasks) ??
+    messageNumber(toolMessage.metadata?.total_tasks) ??
+    tasks.length
+  const completed =
+    messageNumber(eventMessage?.metadata?.total_tasks) ??
+    messageNumber(toolMessage.metadata?.completed_tasks) ??
+    total
+  return total > 0
+    ? `${completed}/${total} results ready · Siclaw is synthesizing`
+    : "Results ready · Siclaw is synthesizing"
 }
 
 function isBatchCompleteDelegationEvent(message: PilotMessage, delegationId: string): boolean {
@@ -312,18 +332,21 @@ function annotateDelegationSynthesis(messages: PilotMessage[]): PilotMessage[] {
       eventIndex >= 0 &&
       messages.slice(eventIndex + 1).some((candidate) => candidate.role === "assistant" && !candidate.hidden)
     const shouldShowSynthesizing = eventIndex >= 0 && !hasSyntheticReply
+    const uiStatus = shouldShowSynthesizing
+      ? delegationResultsReadyLabel(message, messages[eventIndex])
+      : undefined
 
     if (shouldShowSynthesizing) {
       if (
         existingMetadata.ui_state !== "synthesizing" ||
-        existingMetadata.ui_status !== "Results ready · Siclaw is synthesizing"
+        existingMetadata.ui_status !== uiStatus
       ) {
         updateAt(i, {
           ...message,
           metadata: {
             ...existingMetadata,
             ui_state: "synthesizing",
-            ui_status: "Results ready · Siclaw is synthesizing",
+            ui_status: uiStatus,
           },
         })
       }

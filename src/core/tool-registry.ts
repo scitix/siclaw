@@ -46,7 +46,7 @@ export interface DelegateToAgentRequest {
   totalTasks?: number;
 }
 
-export type DelegateToAgentStatus = "done" | "failed" | "timed_out";
+export type DelegateToAgentStatus = "done" | "partial" | "failed" | "timed_out";
 
 export interface DelegateToAgentToolTraceEntry {
   toolName: string;
@@ -71,6 +71,10 @@ export interface DelegateToAgentResult {
   durationMs: number;
   /** Lightweight UI trace. Full redacted output is persisted in the child execution session. */
   toolTrace?: DelegateToAgentToolTraceEntry[];
+  /** Audit/UI-only source for partial delegated results. Not intended for parent model context. */
+  partialSource?: "steered" | "runtime_fallback";
+  /** Audit/UI-only tool name that was still active when a partial fallback was produced. */
+  interruptedTool?: string;
 }
 
 export type DelegateToAgentExecutor = (

@@ -80,7 +80,7 @@ export interface AppendDelegationEventInput {
   delegationId: string;
   childSessionId: string;
   targetAgentId: string | null;
-  status: "done" | "failed" | "timed_out" | "cancelled";
+  status: "done" | "partial" | "failed" | "timed_out" | "cancelled";
   capsule: string;
   fullSummary?: string;
   summaryTruncated?: boolean;
@@ -89,6 +89,8 @@ export interface AppendDelegationEventInput {
   totalTasks?: number;
   toolCalls?: number;
   durationMs?: number;
+  partialSource?: "steered" | "runtime_fallback";
+  interruptedTool?: string;
 }
 
 /** Module-level FrontendWsClient reference, set via initChatRepo(). */
@@ -176,6 +178,8 @@ export async function appendDelegationEvent(evt: AppendDelegationEventInput): Pr
     ...(evt.totalTasks != null ? { total_tasks: evt.totalTasks } : {}),
     ...(evt.toolCalls != null ? { tool_calls: evt.toolCalls } : {}),
     ...(evt.durationMs != null ? { duration_ms: evt.durationMs } : {}),
+    ...(evt.partialSource ? { partial_source: evt.partialSource } : {}),
+    ...(evt.interruptedTool ? { interrupted_tool: evt.interruptedTool } : {}),
   };
 
   return appendMessage({

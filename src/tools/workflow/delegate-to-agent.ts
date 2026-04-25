@@ -35,6 +35,8 @@ export interface DelegateToAgentToolDetails extends DelegateToAgentToolResult {
   full_summary?: string;
   summary_truncated?: boolean;
   tool_trace?: DelegateToAgentToolTraceEntry[];
+  partial_source?: DelegateToAgentResult["partialSource"];
+  interrupted_tool?: string;
 }
 
 function cleanOptionalString(value: unknown): string | undefined {
@@ -59,6 +61,8 @@ function toToolDetails(result: DelegateToAgentResult): DelegateToAgentToolDetail
         ...(result.fullSummary ? { full_summary: result.fullSummary } : {}),
         ...(result.summaryTruncated != null ? { summary_truncated: result.summaryTruncated } : {}),
         ...(result.toolTrace ? { tool_trace: result.toolTrace } : {}),
+        ...(result.partialSource ? { partial_source: result.partialSource } : {}),
+        ...(result.interruptedTool ? { interrupted_tool: result.interruptedTool } : {}),
       };
 }
 

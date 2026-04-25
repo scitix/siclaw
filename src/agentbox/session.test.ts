@@ -36,6 +36,9 @@ if (!(globalThis as any).__frameworkEntriesState) {
 if (!(globalThis as any).__fakeBrainFactories) {
   (globalThis as any).__fakeBrainFactories = [];
 }
+if (!(globalThis as any).__chatRepoCalls) {
+  (globalThis as any).__chatRepoCalls = [];
+}
 
 vi.mock("../core/agent-factory.js", async () => {
   const { EventEmitter } = await import("node:events");
@@ -56,7 +59,7 @@ vi.mock("../core/agent-factory.js", async () => {
       reload: async () => {},
       prompt: behavior.prompt ?? (async () => {}),
       abort: behavior.abort ?? (async () => {}),
-      steer: async () => {},
+      steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
       getModel: () => null,
       setModel: async () => {},
@@ -81,6 +84,22 @@ vi.mock("../core/agent-factory.js", async () => {
         dpStateRef: { active: false },
       };
     },
+  };
+});
+
+vi.mock("../gateway/chat-repo.js", () => {
+  const g = globalThis as any;
+  g.__chatRepoCalls = g.__chatRepoCalls ?? [];
+  const record = async (method: string, payload: unknown) => {
+    g.__chatRepoCalls.push({ method, payload });
+    return `msg-${g.__chatRepoCalls.length}`;
+  };
+  return {
+    appendMessage: (msg: unknown) => record("appendMessage", msg),
+    appendDelegationEvent: (msg: unknown) => record("appendDelegationEvent", msg),
+    ensureChatSession: (msg: unknown) => record("ensureChatSession", msg),
+    updateDelegationToolMessage: (msg: unknown) => record("updateDelegationToolMessage", msg),
+    updateMessage: (msg: unknown) => record("updateMessage", msg),
   };
 });
 
@@ -140,6 +159,7 @@ beforeEach(() => {
   (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
   (globalThis as any).__createSessionCalls.length = 0;
   (globalThis as any).__fakeBrainFactories.length = 0;
+  (globalThis as any).__chatRepoCalls.length = 0;
   lastCreateSiclawSession.calls = (globalThis as any).__createSessionCalls;
 });
 
@@ -369,6 +389,173 @@ describe("AgentBoxSessionManager — delegated agent timeout policy", () => {
       expect(result.status).toBe("timed_out");
       expect(result.fullSummary).toContain("stopped producing activity for 60000ms");
       expect(abort).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("AgentBoxSessionManager — delegation batch parent notification", () => {
+  const batchRequest = {
+    delegationId: "delegation-1",
+    parentSessionId: "parent-session",
+    parentAgentId: "agent-a",
+    userId: "alice",
+    tasks: [
+      { index: 1, agentId: "self", scope: "Check pod health.", contextSummary: "Parent context." },
+    ],
+  };
+
+  it("steers an active parent when delegated batch results are ready", async () => {
+    const parentSteer = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      steer: parentSteer,
+    }));
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentId = "agent-a";
+    const parent = await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+    parent._promptDone = false;
+    parent.isAgentActive = true;
+    const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Pod evidence capsule." }],
+          },
+        });
+      },
+    }));
+
+    const result = await executor(batchRequest);
+    expect(result.status).toBe("running");
+
+    await vi.waitFor(() => {
+      expect(parentSteer).toHaveBeenCalledTimes(1);
+    });
+    expect(parentSteer.mock.calls[0][0]).toContain("[Delegation Batch Complete]");
+    expect(parentSteer.mock.calls[0][0]).toContain("Pod evidence capsule.");
+    expect((globalThis as any).__chatRepoCalls.some((call: any) => (
+      call.method === "appendMessage" &&
+      call.payload.metadata?.event_type === "delegation.batch_complete"
+    ))).toBe(true);
+  });
+
+  it("runs a synthetic parent prompt immediately when the parent is idle", async () => {
+    const parentPrompt = vi.fn(async () => {});
+    const parentSteer = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      prompt: parentPrompt,
+      steer: parentSteer,
+    }));
+    const mgr = new AgentBoxSessionManager();
+    mgr.agentId = "agent-a";
+    await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+    const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Node evidence capsule." }],
+          },
+        });
+      },
+    }));
+
+    await executor(batchRequest);
+
+    await vi.waitFor(() => {
+      expect(parentPrompt).toHaveBeenCalledTimes(1);
+    });
+    expect(parentPrompt.mock.calls[0][0]).toContain("[Delegation Batch Complete]");
+    expect(parentPrompt.mock.calls[0][0]).toContain("Node evidence capsule.");
+    expect(parentSteer).not.toHaveBeenCalled();
+  });
+
+  it("collects available delegated evidence and marks a slow child partial after the batch grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      const parentPrompt = vi.fn(async () => {});
+      (globalThis as any).__fakeBrainFactories.push(() => ({
+        prompt: parentPrompt,
+      }));
+      const mgr = new AgentBoxSessionManager();
+      mgr.agentId = "agent-a";
+      await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async () => {
+          emitter.emit("event", {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Agent 1 found node l40-068 NotReady." }],
+            },
+          });
+        },
+      }));
+      const slowSteer = vi.fn(async () => {});
+      const slowAbort = vi.fn(async () => {});
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        steer: slowSteer,
+        abort: slowAbort,
+        prompt: async () => {
+          emitter.emit("event", {
+            type: "tool_execution_start",
+            toolName: "kubectl_get",
+            args: { command: "kubectl get nodes" },
+          });
+          emitter.emit("event", {
+            type: "tool_execution_end",
+            toolName: "kubectl_get",
+            result: "l40-068 NotReady\nnodepool-061 Ready",
+          });
+          emitter.emit("event", {
+            type: "tool_execution_start",
+            toolName: "node_exec",
+            args: { command: "slow node probe" },
+          });
+          await new Promise(() => {});
+        },
+      }));
+
+      await executor({
+        ...batchRequest,
+        tasks: [
+          { index: 1, agentId: "self", scope: "Check node health.", contextSummary: "Parent context." },
+          { index: 2, agentId: "self", scope: "Run a slow node probe.", contextSummary: "Parent context." },
+        ],
+      });
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.waitFor(() => {
+        expect(slowSteer).toHaveBeenCalledWith(expect.stringContaining("Return a partial ## Evidence Capsule"));
+      });
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      await vi.waitFor(() => {
+        expect(parentPrompt).toHaveBeenCalledTimes(1);
+      });
+      expect(slowAbort).toHaveBeenCalledTimes(1);
+      const notification = parentPrompt.mock.calls[0][0];
+      expect(notification).toContain("Agent 1 (done)");
+      expect(notification).toContain("Agent 2 (partial)");
+      expect(notification).toContain("l40-068 NotReady");
+      expect(notification).not.toContain("Interrupted active tool");
+
+      const finalUpdate = [...(globalThis as any).__chatRepoCalls]
+        .reverse()
+        .find((call: any) => call.method === "updateDelegationToolMessage" && call.payload.metadata?.results_available === true);
+      expect(finalUpdate?.payload.metadata.status).toBe("partial");
+      expect(finalUpdate?.payload.metadata.tasks[1].partial_source).toBe("runtime_fallback");
+      expect(finalUpdate?.payload.metadata.tasks[1].interrupted_tool).toBe("node_exec");
     } finally {
       vi.useRealTimers();
     }

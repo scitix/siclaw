@@ -105,6 +105,8 @@ const SESSION_RELEASE_TTL_MS = 30_000;
 const DELEGATED_AGENT_IDLE_TIMEOUT_MS = 60_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = 10 * 60_000;
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
+const DELEGATION_BATCH_GRACE_MS = 120_000;
+const DELEGATED_AGENT_PARTIAL_STEER_WAIT_MS = 25_000;
 const DELEGATED_TOOL_TRACE_PREVIEW_CHARS = 1_200;
 const DELEGATION_BATCH_COMPLETE_EVENT = "delegation.batch_complete";
 const DELEGATION_BATCH_RUNNING_PARENT_INSTRUCTION =
@@ -112,6 +114,8 @@ const DELEGATION_BATCH_RUNNING_PARENT_INSTRUCTION =
   "You may collect clearly labeled parent-side baseline evidence, or briefly tell the user you are waiting for delegation.batch_complete.";
 const DELEGATION_BATCH_READY_PARENT_INSTRUCTION =
   "Delegated results are now available from delegation.batch_complete. Synthesize these delegated findings into the current investigation.";
+const DELEGATED_AGENT_FINISH_NOW_PROMPT =
+  "Stop this delegated investigation now. Do not call more tools. Return a partial ## Evidence Capsule using only evidence already collected. Mark uncertainty clearly and keep the capsule concise.";
 
 interface PendingChildToolCall {
   toolName: string;
@@ -136,7 +140,15 @@ interface DelegationTaskDetails {
   full_summary?: string;
   summary_truncated?: boolean;
   tool_trace?: DelegateToAgentToolTraceEntry[];
+  partial_source?: DelegateToAgentResult["partialSource"];
+  interrupted_tool?: string;
   error?: string;
+}
+
+interface DelegatedAgentControl {
+  requestPartial?: () => Promise<void>;
+  forceStop?: () => void;
+  isSettled?: () => boolean;
 }
 
 function delay(ms: number): Promise<void> {
@@ -183,8 +195,9 @@ function delegatedToolOutcome(result: unknown, event: any): "success" | "error" 
 function aggregateDelegationStatus(tasks: Array<{ status: string }>): DelegationBatchStatus {
   if (tasks.length === 0) return "failed";
   const doneCount = tasks.filter((task) => task.status === "done").length;
+  const usableCount = tasks.filter((task) => task.status === "done" || task.status === "partial").length;
   if (doneCount === tasks.length) return "done";
-  if (doneCount > 0) return "partial";
+  if (usableCount > 0) return "partial";
   if (tasks.every((task) => task.status === "timed_out")) return "timed_out";
   return "failed";
 }
@@ -223,6 +236,48 @@ async function abortBrainBestEffort(
   if (outcome === "timeout") {
     console.warn(`[agentbox-session] ${label}: abort did not settle within ${timeoutMs}ms; continuing with timeout result`);
   }
+}
+
+function compactTracePreview(text: string | undefined, maxChars = 260): string | null {
+  const compact = text?.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+  return compact.length <= maxChars ? compact : `${compact.slice(0, maxChars - 1)}…`;
+}
+
+function buildPartialDelegateReport(params: {
+  scope: string;
+  priorAssistantText: string;
+  toolTrace: DelegateToAgentToolTraceEntry[];
+  interruptedTool?: string;
+}): string {
+  const evidence = params.toolTrace
+    .filter((entry) => entry.outcome === "success" && entry.contentPreview)
+    .slice(-3)
+    .map((entry) => compactTracePreview(`${entry.toolName}: ${entry.contentPreview}`))
+    .filter((line): line is string => Boolean(line));
+  const assistantText = compactTracePreview(params.priorAssistantText, 500);
+  const bullets = evidence.length > 0
+    ? evidence
+    : assistantText
+      ? [assistantText]
+      : ["No completed evidence was available before the delegated scope had to close."];
+
+  return [
+    "## Evidence Capsule",
+    "- Verdict: inconclusive",
+    "- Completeness: partial",
+    "- Key evidence:",
+    ...bullets.map((line) => `  - ${line}`),
+    "- Counter-evidence or uncertainty:",
+    "  - Partial result; the delegated scope was not fully validated.",
+    "- Recommended next step: Validate the unresolved portion with a narrower follow-up check.",
+    "",
+    "## Full Report",
+    "This is a partial result recovered from evidence completed before the delegated batch closed.",
+    `Scope: ${params.scope}`,
+    ...(assistantText ? ["", "Partial assistant text:", assistantText] : []),
+    ...(params.interruptedTool ? ["", `Interrupted active tool: ${params.interruptedTool}`] : []),
+  ].join("\n");
 }
 
 export class AgentBoxSessionManager {
@@ -424,6 +479,7 @@ Always end with a final report even if evidence is incomplete.`;
       tool_calls: 0,
       duration_ms: 0,
     }));
+    const controls: DelegatedAgentControl[] = request.tasks.map(() => ({}));
 
     let persistQueue = Promise.resolve();
     const persistSnapshot = (final: boolean): Promise<void> => {
@@ -454,6 +510,8 @@ Always end with a final report even if evidence is incomplete.`;
           summary: task.summary,
           tool_calls: task.tool_calls,
           duration_ms: task.duration_ms,
+          ...(task.partial_source ? { partial_source: task.partial_source } : {}),
+          ...(task.interrupted_tool ? { interrupted_tool: task.interrupted_tool } : {}),
         })),
         total_tool_calls: totalToolCalls,
         duration_ms: durationMs,
@@ -480,7 +538,7 @@ Always end with a final report even if evidence is incomplete.`;
       return persistQueue;
     };
 
-    await Promise.all(request.tasks.map(async (task, offset) => {
+    const taskPromises = request.tasks.map(async (task, offset) => {
       const taskStartedAt = Date.now();
       try {
         const result = await this.runDelegatedAgent({
@@ -493,7 +551,7 @@ Always end with a final report even if evidence is incomplete.`;
           delegationId: request.delegationId,
           taskIndex: task.index,
           totalTasks: request.tasks.length,
-        });
+        }, controls[offset]);
         details[offset] = {
           index: task.index,
           status: result.status ?? "done",
@@ -506,6 +564,8 @@ Always end with a final report even if evidence is incomplete.`;
           ...(result.fullSummary ? { full_summary: result.fullSummary } : {}),
           ...(result.summaryTruncated != null ? { summary_truncated: result.summaryTruncated } : {}),
           ...(result.toolTrace ? { tool_trace: result.toolTrace } : {}),
+          ...(result.partialSource ? { partial_source: result.partialSource } : {}),
+          ...(result.interruptedTool ? { interrupted_tool: result.interruptedTool } : {}),
         };
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -522,7 +582,28 @@ Always end with a final report even if evidence is incomplete.`;
         };
       }
       await persistSnapshot(false);
-    }));
+    });
+
+    const allDone = Promise.all(taskPromises).then(() => true);
+    const graceExpired = delay(DELEGATION_BATCH_GRACE_MS).then(() => false);
+    const completedWithinGrace = await Promise.race([allDone, graceExpired]);
+    if (!completedWithinGrace) {
+      await Promise.all(controls.map(async (control) => {
+        if (control.isSettled?.()) return;
+        await control.requestPartial?.();
+      }));
+      const partialWindowDone = await Promise.race([
+        allDone,
+        delay(DELEGATED_AGENT_PARTIAL_STEER_WAIT_MS).then(() => false),
+      ]);
+      if (!partialWindowDone) {
+        for (const control of controls) {
+          if (!control.isSettled?.()) control.forceStop?.();
+        }
+      }
+    }
+
+    await Promise.allSettled(taskPromises);
 
     await persistSnapshot(true);
 
@@ -595,6 +676,16 @@ Always end with a final report even if evidence is incomplete.`;
 
     const parent = this.sessions.get(request.parentSessionId);
     if (!parent) return;
+
+    if (!parent._promptDone || parent.isAgentActive || parent.isCompacting || parent.isRetrying) {
+      try {
+        await parent.brain.steer(notification);
+        return;
+      } catch (err) {
+        console.warn(`[agentbox-session] Could not steer parent session for ${request.delegationId}:`, err);
+      }
+    }
+
     const idle = await this.waitForParentIdle(parent);
     if (!idle || this.sessions.get(request.parentSessionId) !== parent) {
       console.warn(`[agentbox-session] Skipping parent notify prompt for ${request.delegationId}: parent session did not become idle.`);
@@ -729,7 +820,10 @@ Always end with a final report even if evidence is incomplete.`;
     }
   }
 
-  private async runDelegatedAgent(request: DelegateToAgentRequest): Promise<DelegateToAgentResult> {
+  private async runDelegatedAgent(
+    request: DelegateToAgentRequest,
+    control?: DelegatedAgentControl,
+  ): Promise<DelegateToAgentResult> {
     const requestedAgentId = request.agentId.trim();
     const currentAgentId = this.agentId ?? request.parentAgentId ?? null;
     const isSelfTarget = requestedAgentId === "self" || requestedAgentId === currentAgentId;
@@ -834,11 +928,35 @@ Always end with a final report even if evidence is incomplete.`;
     let currentAssistantText = "";
     let finalError = "";
     let status: DelegateToAgentResult["status"] = "done";
+    let partialSource: DelegateToAgentResult["partialSource"] | undefined;
+    let interruptedTool: string | undefined;
     let toolCalls = 0;
     let activeChildToolCalls = 0;
+    let settled = false;
+    let forceStopRequested = false;
+    let forceStop: ((reason: string) => void) | null = null;
     const toolTrace: DelegateToAgentToolTraceEntry[] = [];
     const pendingToolCalls = new Map<string, PendingChildToolCall[]>();
     let markChildActivity: () => void = () => {};
+
+    if (control) {
+      control.isSettled = () => settled;
+      control.requestPartial = async () => {
+        if (settled) return;
+        try {
+          partialSource = "steered";
+          await child.brain.steer(DELEGATED_AGENT_FINISH_NOW_PROMPT);
+        } catch (err) {
+          console.warn(`[agentbox-session] Could not steer delegated session ${childSessionId} to partial result:`, err);
+        }
+      };
+      control.forceStop = () => {
+        if (settled || forceStopRequested) return;
+        forceStopRequested = true;
+        forceStop?.("delegated batch closed before this sub-agent returned a final report");
+      };
+    }
+
     const unsubscribe = child.brain.subscribe((event: any) => {
       if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
         activeChildToolCalls++;
@@ -980,13 +1098,32 @@ Always end with a final report even if evidence is incomplete.`;
           );
         }, DELEGATED_AGENT_MAX_RUNTIME_MS);
       });
+      const forceStopPromise = new Promise<never>((_, reject) => {
+        forceStop = (reason: string) => {
+          reject(new Error(reason));
+        };
+      });
 
       await Promise.race([
         child.brain.prompt(this.buildDelegatedAgentPrompt(request)),
         timeoutPromise,
+        forceStopPromise,
       ]);
     } catch (err) {
-      if (timeoutReason) {
+      if (forceStopRequested) {
+        status = "partial";
+        partialSource = "runtime_fallback";
+        const unfinished = [...pendingToolCalls.values()].flat();
+        interruptedTool = unfinished[0]?.toolName;
+        await abortBrainBestEffort(child.brain, `delegated session ${childSessionId}`);
+        const partial = [finalText.trim(), currentAssistantText.trim()].filter(Boolean).join("\n\n");
+        finalText = buildPartialDelegateReport({
+          scope: request.scope,
+          priorAssistantText: partial,
+          toolTrace,
+          interruptedTool,
+        });
+      } else if (timeoutReason) {
         status = "timed_out";
         await abortBrainBestEffort(child.brain, `delegated session ${childSessionId}`);
         const partial = [finalText.trim(), currentAssistantText.trim()].filter(Boolean).join("\n\n");
@@ -1017,6 +1154,9 @@ Always end with a final report even if evidence is incomplete.`;
     if (status === "done" && finalError) {
       status = "failed";
       if (!finalText) finalText = finalError;
+    }
+    if (status === "done" && partialSource === "steered") {
+      status = "partial";
     }
     if (pendingToolCalls.size > 0) {
       const unfinished = [...pendingToolCalls.values()].flat();
@@ -1098,11 +1238,14 @@ Always end with a final report even if evidence is incomplete.`;
           totalTasks: request.totalTasks,
           toolCalls,
           durationMs,
+          partialSource,
+          interruptedTool,
         });
       });
     }
 
     await persistQueue;
+    settled = true;
     return {
       status,
       summary: bundle.capsule,
@@ -1112,6 +1255,8 @@ Always end with a final report even if evidence is incomplete.`;
       toolCalls,
       durationMs,
       toolTrace,
+      partialSource,
+      interruptedTool,
     };
   }
 

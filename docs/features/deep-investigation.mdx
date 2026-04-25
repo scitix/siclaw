@@ -57,13 +57,17 @@ assistant reply. DP-style reasoning can be requested in the prompt text.
 
 ## What DP Changes
 
-DP mode is additive — it does not change which tools the agent has access to.
-What it changes is how the agent *thinks*:
+DP mode changes how the agent *thinks* and, in supported runtimes, exposes a
+same-agent delegation primitive for bounded parallel evidence collection. Normal
+chat sessions do not see the delegation tool.
 
 - **Slower triage**: the agent spends more effort cross-verifying evidence
   before proposing a cause.
 - **Hypothesis framing**: conclusions are presented with confidence
   and the counter-evidence considered.
+- **Parallel evidence collection**: for complex DP investigations, the agent can
+  start one to three same-agent sub-investigations and then synthesize their
+  returned evidence capsules.
 - **Conversation continuity**: DP state persists across messages in the same
   session until explicitly exited.
 

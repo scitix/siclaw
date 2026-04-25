@@ -74,7 +74,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-proceed",
     label: "Proceed",
     fullPrompt:
-      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again; take the next validation step and report evidence.",
+      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again. If there are two or more independent hypotheses, validation paths, objects, or evidence sources to check, prefer a single delegate_to_agents call with 1-3 narrow self sub-agent tasks instead of sequentially checking everything yourself. Treat delegate_to_agents status=\"running\" as launch-only and wait for delegated results before synthesizing. If there is only one small direct validation, run it yourself. Report evidence after the validation step.",
     placeholder: "Add optional direction for this step",
   },
   B: {
@@ -82,7 +82,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-refine",
     label: "Refine",
     fullPrompt:
-      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed.",
+      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed. If the refined direction names multiple independent hypotheses, validation paths, objects, or evidence sources, prefer a single delegate_to_agents call with 1-3 narrow self sub-agent tasks instead of sequentially checking everything yourself. Treat delegate_to_agents status=\"running\" as launch-only and wait for delegated results before synthesizing.",
     placeholder: "Describe what to adjust or add",
   },
   C: {
@@ -687,6 +687,13 @@ function isBatchCompleteDelegationEvent(message: PilotMessage): boolean {
   )
 }
 
+function delegationStatusNoticeContent(message: PilotMessage): string {
+  const total = numberValue(message.metadata?.total_tasks)
+  return total && total > 0
+    ? `${total}/${total} results ready · Siclaw is synthesizing`
+    : "Results ready · Siclaw is synthesizing"
+}
+
 function withDelegationStatusNotices(messages: PilotMessage[]): PilotMessage[] {
   const next: PilotMessage[] = []
 
@@ -703,7 +710,7 @@ function withDelegationStatusNotices(messages: PilotMessage[]): PilotMessage[] {
     next.push({
       id: `delegation-status-${messageDelegationId(message) ?? message.id}`,
       role: "assistant",
-      content: "Results ready · Siclaw is synthesizing",
+      content: delegationStatusNoticeContent(message),
       timestamp: message.timestamp,
       metadata: { kind: "delegation_status_notice" },
     })
