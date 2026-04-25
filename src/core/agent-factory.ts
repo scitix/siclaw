@@ -84,9 +84,9 @@ export interface CreateSiclawSessionOpts {
    */
   portalCredentialsDir?: string;
   /** Metadata for all Portal-configured agents (used by /agent + /ls to show list). */
-  portalAvailableAgents?: import("../portal/cli-snapshot-api.js").CliSnapshotAgentMeta[];
+  portalAvailableAgents?: import("../portal/cli-snapshot-types.js").CliSnapshotAgentMeta[];
   /** The Portal agent this session is scoped to, null/undefined = unscoped. */
-  portalActiveAgent?: import("../portal/cli-snapshot-api.js").CliSnapshotActiveAgent | null;
+  portalActiveAgent?: import("../portal/cli-snapshot-types.js").CliSnapshotActiveAgent | null;
   /**
    * Base URL of the live local Portal (e.g. http://127.0.0.1:3000). When set,
    * `/setup` switches to read-only mode + opens Portal Web UI for writes so
