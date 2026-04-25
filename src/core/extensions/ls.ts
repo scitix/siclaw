@@ -16,7 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { Skill } from "@mariozechner/pi-coding-agent";
-import type { CliSnapshotAgentMeta, CliSnapshotActiveAgent } from "../../portal/cli-snapshot-api.js";
+import type { CliSnapshotAgentMeta, CliSnapshotActiveAgent } from "../../portal/cli-snapshot-types.js";
 import { loadConfig } from "../config.js";
 import { listCredentials } from "../../tools/infra/credential-manager.js";
 

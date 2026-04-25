@@ -30,6 +30,25 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
+import type {
+  CliSnapshotKnowledgeRepo,
+  CliSnapshotClusterCredential,
+  CliSnapshotHostCredential,
+  CliSnapshotCredentials,
+  CliSnapshotAgentMeta,
+  CliSnapshotActiveAgent,
+  CliSnapshotSkill,
+} from "./cli-snapshot-types.js";
+
+export type {
+  CliSnapshotKnowledgeRepo,
+  CliSnapshotClusterCredential,
+  CliSnapshotHostCredential,
+  CliSnapshotCredentials,
+  CliSnapshotAgentMeta,
+  CliSnapshotActiveAgent,
+  CliSnapshotSkill,
+};
 
 const CLI_SNAPSHOT_SECRET_HEADER = "x-siclaw-cli-snapshot-secret";
 const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -108,16 +127,6 @@ interface KnowledgeRow {
   file_count: number | null;
 }
 
-export interface CliSnapshotKnowledgeRepo {
-  name: string;
-  version: number;
-  fileCount: number;
-  sizeBytes: number;
-  sha256: string | null;
-  /** Gzip'd tar of the repo's markdown pages, base64-encoded for JSON transport. */
-  dataBase64: string;
-}
-
 interface ClusterRow {
   name: string;
   kubeconfig: string | null;
@@ -135,30 +144,6 @@ interface HostRow {
   description: string | null;
 }
 
-export interface CliSnapshotClusterCredential {
-  name: string;
-  /** Raw kubeconfig YAML/JSON content. */
-  kubeconfig: string;
-  description: string | null;
-}
-
-export interface CliSnapshotHostCredential {
-  name: string;
-  ip: string;
-  port: number;
-  username: string;
-  /** "password" or "key". Determines which of password/privateKey is set. */
-  authType: string;
-  password: string | null;
-  privateKey: string | null;
-  description: string | null;
-}
-
-export interface CliSnapshotCredentials {
-  clusters: CliSnapshotClusterCredential[];
-  hosts: CliSnapshotHostCredential[];
-}
-
 interface AgentRow {
   id: string;
   name: string;
@@ -169,36 +154,6 @@ interface AgentRow {
   system_prompt: string | null;
   icon: string | null;
   color: string | null;
-}
-
-export interface CliSnapshotAgentMeta {
-  /** Display name; used as `--agent <name>` value. */
-  name: string;
-  description: string | null;
-  /** Model this agent prefers, if configured in Portal. */
-  modelProvider: string | null;
-  modelId: string | null;
-  icon: string | null;
-  color: string | null;
-}
-
-export interface CliSnapshotActiveAgent {
-  name: string;
-  description: string | null;
-  systemPrompt: string | null;
-  modelProvider: string | null;
-  modelId: string | null;
-}
-
-export interface CliSnapshotSkill {
-  /** Name from SKILL.md frontmatter; used as the materialized directory name. */
-  name: string;
-  description: string;
-  labels: string[];
-  /** Raw SKILL.md content including YAML frontmatter. */
-  specs: string;
-  /** Companion scripts (shell / python) referenced by SKILL.md. */
-  scripts: Array<{ name: string; content: string }>;
 }
 
 export interface CliSnapshot {
