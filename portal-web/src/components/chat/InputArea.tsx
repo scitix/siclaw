@@ -1,4 +1,4 @@
-import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check } from "lucide-react"
+import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check, ArrowRight, PencilLine, FileText } from "lucide-react"
 import type { ContextUsage, PrefixActionChip } from "./types"
 import { useState, useCallback, useRef, useEffect } from "react"
 import type { KeyboardEvent } from "react"
@@ -15,6 +15,20 @@ function formatTokens(n: number): string {
 function formatCost(cost: number): string {
   if (cost < 0.01) return "$" + cost.toFixed(3)
   return "$" + cost.toFixed(2)
+}
+
+function PrefixChipIcon({ chip }: { chip: PrefixActionChip }) {
+  const label = chip.label.toLowerCase()
+  if (label.includes("refine") || label.includes("adjust")) {
+    return <PencilLine className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("summarize") || label.includes("summary")) {
+    return <FileText className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("proceed")) {
+    return <ArrowRight className="w-3.5 h-3.5 text-purple-500" />
+  }
+  return <SearchCode className="w-3.5 h-3.5 text-purple-500" />
 }
 
 interface InputAreaProps {
@@ -201,7 +215,7 @@ export function InputArea({
             {activePrefix && (
               <div className="flex flex-wrap gap-2 px-4 pb-1">
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-purple-500/10 border-purple-500/30 text-purple-400">
-                  <SearchCode className="w-3.5 h-3.5 text-purple-500" />
+                  <PrefixChipIcon chip={activePrefix} />
                   <span>{activePrefix.label}</span>
                   <button
                     type="button"

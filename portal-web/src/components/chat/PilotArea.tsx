@@ -15,6 +15,9 @@ import {
   Check,
   Users,
   Clock,
+  ArrowRight,
+  PencilLine,
+  FileText,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
@@ -486,13 +489,40 @@ function toDpCheckpointFillChip(chip: FillActionChip): FillActionChip {
   }
 }
 
+function SuggestedReplyIcon({ chip }: { chip: FillActionChip }) {
+  const label = chip.label.toLowerCase()
+  if (label.includes("refine") || label.includes("adjust")) {
+    return <PencilLine className="w-3.5 h-3.5" />
+  }
+  if (label.includes("summarize") || label.includes("summary")) {
+    return <FileText className="w-3.5 h-3.5" />
+  }
+  return <ArrowRight className="w-3.5 h-3.5" />
+}
+
+function PrefixChipIcon({ chip }: { chip: PrefixActionChip }) {
+  const label = chip.label.toLowerCase()
+  if (label.includes("refine") || label.includes("adjust")) {
+    return <PencilLine className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("summarize") || label.includes("summary")) {
+    return <FileText className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("proceed")) {
+    return <ArrowRight className="w-3.5 h-3.5 text-purple-500" />
+  }
+  return <SearchCode className="w-3.5 h-3.5 text-purple-500" />
+}
+
 function FillChipButton({ chip, onClick }: { chip: FillActionChip; onClick: () => void }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="rounded-full px-3 py-1.5 text-sm border border-border bg-card hover:bg-secondary text-foreground transition-colors cursor-pointer"
+      title={`${chip.labelPrefix ?? chip.insertText} | ${chip.label}`}
+      className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm border border-border bg-card hover:bg-secondary text-foreground transition-colors cursor-pointer"
     >
+      <SuggestedReplyIcon chip={chip} />
       {chip.labelPrefix && (
         <span className="font-medium text-muted-foreground">{chip.labelPrefix}</span>
       )}
@@ -1009,7 +1039,7 @@ function MessageItem({
             )}
             {actionChip && (
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-purple-500/10 border border-purple-500/30 text-xs font-medium text-purple-400">
-                <SearchCode className="w-3.5 h-3.5 text-purple-500" />
+                <PrefixChipIcon chip={actionChip} />
                 <span>{actionChip.label}</span>
               </div>
             )}
