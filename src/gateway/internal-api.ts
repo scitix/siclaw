@@ -113,6 +113,10 @@ export async function handleMcpServers(
     }
 
     const data = await frontendClient.request("config.getMcpServers", {
+      // Upstream uses agentId to resolve the caller's org and reject
+      // cross-org id requests. Without it, sicore falls back to the WS
+      // runtime_id and the org lookup fails ("agent <runtime_id> not found").
+      agentId: identity.agentId,
       ids: mcpServerIds,
     });
     sendJson(res, 200, { mcpServers: data.mcpServers });
@@ -137,6 +141,12 @@ export async function handleSkillsBundle(
     const { skillIds, isProduction } = await fetchAgentResources(frontendClient, identity.orgId, identity.agentId);
 
     const data = await frontendClient.request("config.getSkillBundle", {
+      // Upstream uses agentId to resolve the caller's org and reject
+      // cross-org skill_id requests. Without it, sicore falls back to the
+      // WS runtime_id and the org lookup fails ("agent <runtime_id> not
+      // found"), which manifests as repeated `skills/bundle error` in
+      // Runtime logs and a fresh AgentBox with no skills materialised.
+      agentId: identity.agentId,
       skill_ids: skillIds,
       is_production: isProduction,
     });
