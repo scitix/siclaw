@@ -722,7 +722,10 @@ export function createHttpServer(
       sendJson(res, 200, { ok: true });
     } catch (err) {
       console.error(`[agentbox-http] Steer error for session ${sessionId}:`, err);
-      sendJson(res, 500, { error: "Steer failed" });
+      const message = err instanceof Error ? err.message : "Steer failed";
+      sendJson(res, 500, {
+        error: { code: "INTERNAL_ERROR", message, retriable: true },
+      });
     }
   });
 

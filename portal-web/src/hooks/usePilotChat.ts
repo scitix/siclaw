@@ -11,8 +11,45 @@ import { api, chatSteer, chatAbort } from "../api"
 import type {
   PilotMessage,
   ContextUsage,
+  ErrorDetail,
 } from "../components/chat/types"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText } from "./steer-pending"
+
+/** Parse an unknown payload into an ErrorDetail with backward-compat fallbacks.
+ *  See docs/design/error-envelope.md §4. */
+function parseErrorDetail(raw: unknown): ErrorDetail {
+  if (raw && typeof raw === "object") {
+    const obj = raw as Record<string, unknown>
+    if (
+      typeof obj.code === "string" &&
+      typeof obj.message === "string" &&
+      typeof obj.retriable === "boolean"
+    ) {
+      return obj as unknown as ErrorDetail
+    }
+    if ("error" in obj) {
+      const e = obj.error
+      if (typeof e === "object" && e !== null) return parseErrorDetail(e)
+      if (typeof e === "string") {
+        return { code: "INTERNAL_ERROR", message: e, retriable: true }
+      }
+    }
+  }
+  if (typeof raw === "string") {
+    return { code: "INTERNAL_ERROR", message: raw, retriable: true }
+  }
+  return { code: "INTERNAL_ERROR", message: "Unknown error", retriable: true }
+}
+
+function makeErrorMessage(detail: ErrorDetail): PilotMessage {
+  return {
+    id: `error-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`,
+    role: "error",
+    content: detail.message,
+    timestamp: new Date().toISOString(),
+    errorDetail: detail,
+  }
+}
 
 // Re-export types for convenience
 export type { PilotMessage, ContextUsage }
@@ -942,7 +979,22 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             signal: controller.signal,
           })
 
-          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          if (!res.ok) {
+            // Try to read error envelope from body before failing.
+            let bodyDetail: ErrorDetail | null = null
+            try {
+              const bodyText = await res.text()
+              if (bodyText) bodyDetail = parseErrorDetail(JSON.parse(bodyText))
+            } catch {
+              // body wasn't JSON — fall through to generic
+            }
+            const detail: ErrorDetail = bodyDetail ?? {
+              code: "INTERNAL_ERROR",
+              message: `Request failed (HTTP ${res.status})`,
+              retriable: res.status >= 500,
+            }
+            throw Object.assign(new Error(detail.message), { __errorDetail: detail })
+          }
 
           const reader = res.body?.getReader()
           if (!reader) throw new Error("No body")
@@ -1005,7 +1057,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                   if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
                 } else if (event === "error") {
                   console.error("[usePilotChat] SSE error:", parsed)
+                  const detail = parseErrorDetail(parsed)
                   if (isActive) {
+                    setMessages((prev) => [...prev, makeErrorMessage(detail)])
                     setStreaming(false)
                     streamingRef.current = false
                     recoveredStreamingRef.current = false
@@ -1028,11 +1082,22 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             }
           }
         } catch (err) {
-          if ((err as Error).name !== "AbortError") {
+          const isAbort = (err as Error).name === "AbortError"
+          if (!isAbort) {
             console.error("[usePilotChat] SSE error:", err)
           }
           if (activeSessionIdRef.current === streamSessionId) {
-            setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+            setMessages((prev) => {
+              const cleared = prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m))
+              if (isAbort) return cleared
+              const attached = (err as { __errorDetail?: ErrorDetail }).__errorDetail
+              const detail = attached ?? {
+                code: "STREAM_INTERRUPTED",
+                message: err instanceof Error ? err.message : "Connection lost",
+                retriable: true,
+              }
+              return [...cleared, makeErrorMessage(detail)]
+            })
             setStreaming(false)
             streamingRef.current = false
             recoveredStreamingRef.current = false
@@ -1049,7 +1114,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const steer = useCallback(
     (text: string) => {
       if (!sessionId) return
-      chatSteer(agentId, sessionId, text).catch((err) => console.error("[usePilotChat] steer error:", err))
+      chatSteer(agentId, sessionId, text).catch((err) => {
+        console.error("[usePilotChat] steer error:", err)
+        const body = (err as { body?: unknown }).body
+        const detail = body !== undefined
+          ? parseErrorDetail(body)
+          : {
+              code: "INTERNAL_ERROR",
+              message: err instanceof Error ? err.message : "Failed to steer",
+              retriable: true,
+            }
+        setMessages((prev) => [...prev, makeErrorMessage(detail)])
+      })
       setPendingMessages((prev) => [...prev, text])
     },
     [agentId, sessionId],

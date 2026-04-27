@@ -30,6 +30,7 @@ import {
   type RpcHandler,
   type RpcContext,
 } from "./ws-protocol.js";
+import { ErrorCodes, wrapError } from "../lib/error-envelope.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
@@ -137,7 +138,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelConfig,
     };
 
-    const promptResult = await client.prompt(promptOpts);
+    let promptResult: Awaited<ReturnType<typeof client.prompt>>;
+    try {
+      promptResult = await client.prompt(promptOpts);
+    } catch (err) {
+      // Concurrent send: agentbox returns 409 "Session is already running.
+      // Use the steer endpoint to add input to the active prompt." when the
+      // user double-taps send before the previous prompt's pi-agent retries
+      // settle. Per agentbox's own hint, inject as steer instead of erroring
+      // — surfaces nothing to the user, message goes into the running session.
+      if (err instanceof Error && err.message.includes("Session is already running")) {
+        await client.steerSession(sessionId, text);
+        await appendMessage({ sessionId, role: "user", content: text });
+        await incrementMessageCount(sessionId);
+        return { ok: true, sessionId, steered: true };
+      }
+      throw err;
+    }
 
     // Ensure chat_sessions exists + persist the user message BEFORE the SSE
     // consumer starts writing assistant/tool rows (FK on chat_messages).
@@ -176,6 +193,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
+            // Surface the failure as an inline error bubble (proxy translates
+            // stream_error to an SSE error frame). Without this the frontend
+            // sees the stream silently stop.
+            const detail = wrapError(err, {
+              code: ErrorCodes.STREAM_INTERRUPTED,
+              retriable: true,
+            });
+            context.sendEvent("chat.event", {
+              sessionId: promptResult.sessionId,
+              event: { type: "stream_error", error: detail },
+            });
           }
           // Ensure prompt_done is sent even on error so Portal SSE doesn't hang
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
