@@ -11,6 +11,7 @@ import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PORTAL_SCHEMA_SQLS } from "./migrate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORTAL_DIR = path.resolve(__dirname);
@@ -169,6 +170,48 @@ describe("schema invariants: updated_at must be set on every UPDATE", () => {
     if (offenders.length > 0) {
       const msg = offenders.map((o) => `  ${o.file}: ${o.snippet}`).join("\n");
       expect.fail(`Found MySQL date functions still in business SQL:\n${msg}`);
+    }
+  });
+
+  // SQLite (even with PRAGMA foreign_keys=ON) accepts CREATE TABLE with FK
+  // references to non-existent parent tables — the constraint is only enforced
+  // on INSERT/UPDATE. MySQL rejects such CREATE TABLE outright with errno 1824
+  // (ER_FK_CANNOT_OPEN_PARENT). Production deployments avoid the trap because
+  // their pre-existing schema already has both tables and `IF NOT EXISTS` skips
+  // them. A fresh MySQL DB hits it on the first migration. This static check
+  // closes the test gap by parsing the DDL array directly.
+  it("every FOREIGN KEY references a table created earlier in PORTAL_SCHEMA_SQLS", () => {
+    const createPos = new Map<string, number>();
+    const createPattern = /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/i;
+    PORTAL_SCHEMA_SQLS.forEach((sql, idx) => {
+      const m = sql.match(createPattern);
+      if (m) createPos.set(m[1], idx);
+    });
+
+    const fkPattern = /REFERENCES\s+(\w+)\s*\(/gi;
+    const violations: Array<{ child: string; parent: string; childIdx: number; parentIdx: number | undefined }> = [];
+
+    PORTAL_SCHEMA_SQLS.forEach((sql, idx) => {
+      const m = sql.match(createPattern);
+      if (!m) return;
+      const child = m[1];
+      let fkMatch: RegExpExecArray | null;
+      const re = new RegExp(fkPattern.source, fkPattern.flags);
+      while ((fkMatch = re.exec(sql)) !== null) {
+        const parent = fkMatch[1];
+        if (parent === child) continue; // self-reference, ignore
+        const parentIdx = createPos.get(parent);
+        if (parentIdx === undefined || parentIdx > idx) {
+          violations.push({ child, parent, childIdx: idx, parentIdx });
+        }
+      }
+    });
+
+    if (violations.length > 0) {
+      const msg = violations
+        .map((v) => `  CREATE TABLE ${v.child} (idx ${v.childIdx}) REFERENCES ${v.parent} (idx ${v.parentIdx ?? "MISSING"})`)
+        .join("\n");
+      expect.fail(`FK parent must precede child in PORTAL_SCHEMA_SQLS:\n${msg}`);
     }
   });
 });

@@ -91,6 +91,75 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     CONSTRAINT fk_ah_host FOREIGN KEY (host_id) REFERENCES hosts(id) ON DELETE CASCADE
   )`,
 
+  // Skills + MCP servers must be created BEFORE their junction tables below,
+  // otherwise CREATE TABLE agent_skills / agent_mcp_servers fails on MySQL with
+  // ER_FK_CANNOT_OPEN_PARENT (1824). SQLite tolerates forward FK refs, which is
+  // why the SQLite-only migrate test never caught this.
+  `CREATE TABLE IF NOT EXISTS skills (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    labels TEXT,
+    author_id CHAR(36) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'draft',
+    version INT NOT NULL DEFAULT 1,
+    specs MEDIUMTEXT,
+    scripts TEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_versions (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    specs MEDIUMTEXT,
+    scripts TEXT,
+    diff TEXT,
+    commit_message VARCHAR(500),
+    author_id CHAR(36) NOT NULL,
+    is_approved TINYINT(1) NOT NULL DEFAULT 0,
+    labels TEXT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (skill_id, version),
+    CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS skill_reviews (
+    id CHAR(36) PRIMARY KEY,
+    skill_id CHAR(36) NOT NULL,
+    version INT NOT NULL,
+    diff TEXT,
+    security_assessment TEXT,
+    submitted_by CHAR(36) NOT NULL,
+    reviewed_by CHAR(36),
+    decision VARCHAR(20),
+    reject_reason TEXT,
+    submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at TIMESTAMP,
+    CONSTRAINT fk_review_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS mcp_servers (
+    id CHAR(36) PRIMARY KEY,
+    org_id CHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    transport VARCHAR(30) NOT NULL,
+    url VARCHAR(500),
+    command VARCHAR(500),
+    args TEXT,
+    env TEXT,
+    headers TEXT,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    description TEXT,
+    created_by CHAR(36) NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (org_id, name)
+  )`,
+
   // Agent <-> Skill junction
   `CREATE TABLE IF NOT EXISTS agent_skills (
     agent_id CHAR(36) NOT NULL,
@@ -198,76 +267,9 @@ const PORTAL_SCHEMA_SQLS: string[] = [
   )`,
 
   // ================================================================
-  // Siclaw core tables (skills, MCP, chat, tasks, models, etc.)
+  // Siclaw core tables (chat, tasks, models, etc.)
+  // skills + mcp_servers are defined above, before their junction tables.
   // ================================================================
-
-  // Skills — note: unique index on (org_id, name) is added separately below,
-  // then downgraded to a non-unique index when skill overlays are introduced.
-  `CREATE TABLE IF NOT EXISTS skills (
-    id CHAR(36) PRIMARY KEY,
-    org_id CHAR(36) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    labels TEXT,
-    author_id CHAR(36) NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'draft',
-    version INT NOT NULL DEFAULT 1,
-    specs MEDIUMTEXT,
-    scripts TEXT,
-    created_by CHAR(36) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS skill_versions (
-    id CHAR(36) PRIMARY KEY,
-    skill_id CHAR(36) NOT NULL,
-    version INT NOT NULL,
-    specs MEDIUMTEXT,
-    scripts TEXT,
-    diff TEXT,
-    commit_message VARCHAR(500),
-    author_id CHAR(36) NOT NULL,
-    is_approved TINYINT(1) NOT NULL DEFAULT 0,
-    labels TEXT DEFAULT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (skill_id, version),
-    CONSTRAINT fk_skill_versions_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS skill_reviews (
-    id CHAR(36) PRIMARY KEY,
-    skill_id CHAR(36) NOT NULL,
-    version INT NOT NULL,
-    diff TEXT,
-    security_assessment TEXT,
-    submitted_by CHAR(36) NOT NULL,
-    reviewed_by CHAR(36),
-    decision VARCHAR(20),
-    reject_reason TEXT,
-    submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    reviewed_at TIMESTAMP,
-    CONSTRAINT fk_review_skill FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
-  )`,
-
-  // MCP Servers
-  `CREATE TABLE IF NOT EXISTS mcp_servers (
-    id CHAR(36) PRIMARY KEY,
-    org_id CHAR(36) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    transport VARCHAR(30) NOT NULL,
-    url VARCHAR(500),
-    command VARCHAR(500),
-    args TEXT,
-    env TEXT,
-    headers TEXT,
-    enabled TINYINT(1) NOT NULL DEFAULT 1,
-    description TEXT,
-    created_by CHAR(36) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (org_id, name)
-  )`,
 
   // Chat
   `CREATE TABLE IF NOT EXISTS chat_sessions (
