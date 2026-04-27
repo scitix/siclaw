@@ -130,6 +130,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let resultText = "";
   let taskReportText = "";
   let errorMessage = "";
+  let streamErrorEmitted = false;
   let lastToolName = "";
 
   // Queued by toolName. pi-agent events do not always expose a stable call id,
@@ -257,11 +258,14 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       const message = evt.message as Record<string, unknown> | undefined;
       if (message?.role === "assistant") {
         // Capture model-level errors (e.g. API 404, rate-limit) and surface
-        // them upstream as a stream_error event so the proxy/frontend can
-        // render an inline error bubble instead of silently stopping.
+        // them upstream as a single stream_error event so the proxy/frontend
+        // can render an inline error bubble instead of silently stopping.
+        // Dedupe within one consume run — pi-agent retries internally, which
+        // would otherwise produce one bubble per retry attempt.
         if (message.stopReason === "error" && message.errorMessage) {
           errorMessage = String(message.errorMessage);
-          if (onEvent) {
+          if (onEvent && !streamErrorEmitted) {
+            streamErrorEmitted = true;
             onEvent(
               {
                 type: "stream_error",

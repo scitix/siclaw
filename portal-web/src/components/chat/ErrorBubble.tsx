@@ -15,67 +15,54 @@ export function ErrorBubble({
   const hasDetails = detail.details !== undefined && detail.details !== null
 
   return (
-    <div className="flex gap-4 flex-row">
-      <div className="w-8 h-8 rounded-full flex items-center justify-center shrink-0 shadow-sm shadow-black/10 border bg-red-50 border-red-200 text-red-500">
-        <AlertTriangle className="w-4 h-4" />
-      </div>
+    <div className="flex gap-2 flex-row items-start">
+      <AlertTriangle className="w-3.5 h-3.5 mt-1.5 shrink-0 text-red-500/80 dark:text-red-400/80" />
       <div
         className={cn(
-          "flex-1 min-w-0 rounded-2xl border border-red-200 bg-red-50 dark:bg-red-950/40 dark:border-red-900",
-          "px-4 py-3 shadow-sm shadow-black/10 max-w-3xl",
+          "rounded-lg border border-red-300/40 bg-red-50/40 dark:bg-red-950/20 dark:border-red-900/40",
+          "px-3 py-1.5 max-w-3xl",
         )}
       >
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-[15px] leading-relaxed text-red-900 dark:text-red-200 break-words">
-              {detail.message}
-            </div>
-            <div className="mt-1 flex items-center gap-2 text-xs text-red-700/80 dark:text-red-300/70">
-              <span className="font-mono">{detail.code}</span>
-              {detail.requestId && (
-                <span className="font-mono opacity-70" title="Copy request id for support">
-                  · {detail.requestId.slice(0, 8)}
-                </span>
-              )}
-            </div>
-          </div>
+        <div className="flex items-baseline gap-2 flex-wrap">
+          <span className="text-sm text-red-700 dark:text-red-300/90 break-words">
+            {detail.message}
+          </span>
+          <span className="font-mono text-[10px] uppercase tracking-wide text-red-600/60 dark:text-red-400/50 shrink-0">
+            {detail.code}
+          </span>
+          {detail.requestId && (
+            <span className="font-mono text-[10px] text-red-600/40 dark:text-red-400/30 shrink-0">
+              {detail.requestId.slice(0, 8)}
+            </span>
+          )}
           {detail.retriable && onRetry && (
             <button
               onClick={onRetry}
-              className={cn(
-                "shrink-0 inline-flex items-center gap-1.5 rounded-lg",
-                "px-2.5 py-1.5 text-xs font-medium",
-                "bg-red-600 text-white hover:bg-red-700",
-                "dark:bg-red-700 dark:hover:bg-red-600",
-                "transition-colors",
-              )}
+              className="ml-auto inline-flex items-center gap-1 text-[11px] text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-200 transition-colors"
             >
-              <RefreshCw className="w-3.5 h-3.5" />
+              <RefreshCw className="w-3 h-3" />
               Retry
             </button>
           )}
-        </div>
-        {hasDetails && (
-          <div className="mt-2 border-t border-red-200/70 dark:border-red-900/70 pt-2">
+          {hasDetails && (
             <button
               onClick={() => setShowDetails((v) => !v)}
-              className="inline-flex items-center gap-1 text-xs text-red-700/80 dark:text-red-300/70 hover:text-red-900 dark:hover:text-red-200"
+              className="inline-flex items-center text-[10px] text-red-600/60 dark:text-red-400/50 hover:text-red-800 dark:hover:text-red-200"
             >
               {showDetails ? (
-                <ChevronDown className="w-3.5 h-3.5" />
+                <ChevronDown className="w-3 h-3" />
               ) : (
-                <ChevronRight className="w-3.5 h-3.5" />
+                <ChevronRight className="w-3 h-3" />
               )}
-              Details
             </button>
-            {showDetails && (
-              <pre className="mt-1.5 overflow-auto rounded-md bg-red-100/60 dark:bg-red-950/60 p-2 text-[11px] text-red-900/90 dark:text-red-200/80 font-mono whitespace-pre-wrap break-all">
-                {typeof detail.details === "string"
-                  ? detail.details
-                  : JSON.stringify(detail.details, null, 2)}
-              </pre>
-            )}
-          </div>
+          )}
+        </div>
+        {showDetails && hasDetails && (
+          <pre className="mt-1 overflow-auto rounded bg-red-100/30 dark:bg-red-950/40 p-1.5 text-[10px] text-red-900/80 dark:text-red-200/70 font-mono whitespace-pre-wrap break-all">
+            {typeof detail.details === "string"
+              ? detail.details
+              : JSON.stringify(detail.details, null, 2)}
+          </pre>
         )}
       </div>
     </div>
