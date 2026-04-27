@@ -24,6 +24,7 @@ import { Markdown } from "./Markdown"
 import { InputArea } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
+import { ErrorBubble } from "./ErrorBubble"
 import type { PilotMessage, ContextUsage, ActionChip, PrefixActionChip } from "./types"
 
 const DIG_DEEPER_CHIP: PrefixActionChip = {
@@ -954,6 +955,11 @@ function MessageItem({
 }) {
   const isUser = message.role === "user"
   const isTool = message.role === "tool"
+  const isError = message.role === "error"
+
+  if (isError && message.errorDetail) {
+    return <ErrorBubble detail={message.errorDetail} />
+  }
 
   if (message.metadata?.kind === "delegation_status_notice") {
     return <DelegationStatusNotice content={message.content} />

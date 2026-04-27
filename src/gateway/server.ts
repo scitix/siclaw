@@ -30,6 +30,7 @@ import {
   type RpcHandler,
   type RpcContext,
 } from "./ws-protocol.js";
+import { ErrorCodes, wrapError } from "../lib/error-envelope.js";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
 import { type CredentialService } from "./credential-service.js";
 import { CertificateManager, type CertificateIdentity } from "./security/cert-manager.js";
@@ -176,6 +177,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
+            // Surface the failure as an inline error bubble (proxy translates
+            // stream_error to an SSE error frame). Without this the frontend
+            // sees the stream silently stop.
+            const detail = wrapError(err, {
+              code: ErrorCodes.STREAM_INTERRUPTED,
+              retriable: true,
+            });
+            context.sendEvent("chat.event", {
+              sessionId: promptResult.sessionId,
+              event: { type: "stream_error", error: detail },
+            });
           }
           // Ensure prompt_done is sent even on error so Portal SSE doesn't hang
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
