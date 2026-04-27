@@ -138,7 +138,23 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelConfig,
     };
 
-    const promptResult = await client.prompt(promptOpts);
+    let promptResult: Awaited<ReturnType<typeof client.prompt>>;
+    try {
+      promptResult = await client.prompt(promptOpts);
+    } catch (err) {
+      // Concurrent send: agentbox returns 409 "Session is already running.
+      // Use the steer endpoint to add input to the active prompt." when the
+      // user double-taps send before the previous prompt's pi-agent retries
+      // settle. Per agentbox's own hint, inject as steer instead of erroring
+      // — surfaces nothing to the user, message goes into the running session.
+      if (err instanceof Error && err.message.includes("Session is already running")) {
+        await client.steerSession(sessionId, text);
+        await appendMessage({ sessionId, role: "user", content: text });
+        await incrementMessageCount(sessionId);
+        return { ok: true, sessionId, steered: true };
+      }
+      throw err;
+    }
 
     // Ensure chat_sessions exists + persist the user message BEFORE the SSE
     // consumer starts writing assistant/tool rows (FK on chat_messages).
