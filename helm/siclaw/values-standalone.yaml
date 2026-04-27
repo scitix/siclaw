@@ -15,6 +15,13 @@
 #     --set portal.jwtSecret=your-jwt-secret \
 #     --set portal.portalSecret=your-portal-secret \
 #     --set image.registry=your-registry.com
+#
+# Re-deploying with the same image tag (e.g. rebuilding "main-<sha>" without
+# bumping the tag): helm upgrade alone will NOT roll the pods because the
+# rendered Deployment spec is unchanged. Either use a unique tag per build
+# (e.g. main-<sha>-<timestamp>) or force a rollout afterwards:
+#
+#   kubectl -n <ns> rollout restart deploy/siclaw-runtime deploy/siclaw-portal
 
 image:
   pullPolicy: Always
