@@ -125,6 +125,8 @@ function makeFakeSession(id: string) {
     delegationToolsEnabled: false,
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
+    _activeDelegationControls: new Set(),
+    _promptInflight: null,
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
     dpStateRef: { active: false },
   };
@@ -398,6 +400,86 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(r.status).toBe(200);
     expect(r.data).toEqual({ ok: true, pending: true });
     expect(s._aborted).toBe(true);
+  });
+
+  it("POST /api/sessions/:id/abort cascades forceStop to in-flight delegation controls", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-cascade" });
+    const s = sm.sessions.get("ab-cascade")!;
+    // Simulate two concurrent delegation batches with 3 + 2 sub-agents.
+    const batchA = [
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+    ];
+    const batchB = [
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+    ];
+    s._activeDelegationControls.add(batchA);
+    s._activeDelegationControls.add(batchB);
+
+    const r = await getJson(port, "/api/sessions/ab-cascade/abort", "POST");
+
+    expect(r.status).toBe(200);
+    for (const c of [...batchA, ...batchB]) {
+      expect(c.forceStop).toHaveBeenCalledTimes(1);
+    }
+    expect(s._aborted).toBe(true);
+  });
+
+  it("POST /api/sessions/:id/abort tolerates a forceStop that throws (best-effort cascade)", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-throw" });
+    const s = sm.sessions.get("ab-throw")!;
+    const ok = { forceStop: vi.fn() };
+    const broken = { forceStop: vi.fn(() => { throw new Error("kaboom"); }) };
+    s._activeDelegationControls.add([broken, ok]);
+
+    const r = await getJson(port, "/api/sessions/ab-throw/abort", "POST");
+
+    expect(r.status).toBe(200);
+    expect(broken.forceStop).toHaveBeenCalledTimes(1);
+    // Still cascades to siblings even after one throws.
+    expect(ok.forceStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /api/prompt returns 409 when _promptInflight is held even if _promptDone flipped back", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "first", sessionId: "lock1" });
+    const s = sm.sessions.get("lock1")!;
+    // Simulate the synth notify path holding the brain.prompt mutex even
+    // though _promptDone is true (this is the exact TOCTOU window the
+    // mutex closes — without _promptInflight, the second /prompt would
+    // 200 and call brain.prompt() concurrently with synth).
+    s._promptDone = true;
+    s._promptInflight = new Promise<void>(() => {}); // never resolves
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "second", sessionId: "lock1" });
+    expect(r.status).toBe(409);
+  });
+
+  it("POST /api/prompt does not deadlock the session when setModel throws", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "first", sessionId: "stuck" });
+    const s = sm.sessions.get("stuck")!;
+    // Simulate a transient setModel failure on the next prompt — without the
+    // deadlock fix, _promptDone would stay false and every subsequent prompt
+    // would 409 forever.
+    s._promptDone = true;
+    s.brain.setModel.mockImplementationOnce(() => Promise.reject(new Error("transient")));
+
+    const fail = await getJson(port, "/api/prompt", "POST", {
+      text: "second",
+      sessionId: "stuck",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+    });
+    expect(fail.status).toBe(500);
+    expect(s._promptDone).toBe(true);
+    // Both locks must be released — _promptInflight was set synchronously
+    // before setModel and the setup-failure path must clear it too.
+    expect(s._promptInflight).toBe(null);
+
+    // Session must accept a follow-up prompt; pre-fix it returned 409 here.
+    const recover = await getJson(port, "/api/prompt", "POST", { text: "third", sessionId: "stuck" });
+    expect(recover.status).toBe(200);
   });
 
   it("POST /api/sessions/:id/clear-queue returns cleared arrays", async () => {

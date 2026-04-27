@@ -302,7 +302,11 @@ export function createHttpServer(
     const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, {
       enableDelegationTools,
     });
-    if (!managed._promptDone) {
+    if (!managed._promptDone || managed._promptInflight) {
+      // _promptInflight covers the synthetic-parent-prompt path that may
+      // be holding the brain even when _promptDone has already flipped
+      // back to true momentarily during synth setup. Both must be clear
+      // before a fresh HTTP /prompt can claim brain.prompt().
       sendJson(res, 409, {
         error: "Session is already running. Use the steer endpoint to add input to the active prompt.",
         sessionId: managed.id,
@@ -314,6 +318,12 @@ export function createHttpServer(
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    // Acquire the brain.prompt mutex synchronously before any await so the
+    // synth notify path (which polls _promptDone via waitForParentIdle)
+    // cannot race in and call brain.prompt() concurrently — see jacoblee
+    // #2/#3 in the PR review thread.
+    let releasePromptInflight!: () => void;
+    managed._promptInflight = new Promise<void>((resolve) => { releasePromptInflight = resolve; });
     managed._eventBuffer = [];
     // Unsubscribe previous buffer listener if any
     if (managed._bufferUnsub) {
@@ -330,45 +340,74 @@ export function createHttpServer(
       brainUnsub();
     };
 
-    if (body.modelProvider || body.modelId || body.modelConfig) {
-      sessionManager.setDelegationModel({
-        provider: body.modelProvider,
-        modelId: body.modelId,
-        config: body.modelConfig,
-      });
-    }
-
-    // Dynamically register provider config from gateway DB (before findModel)
-    if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
-      try {
-        managed.brain.registerProvider(body.modelProvider, body.modelConfig);
-        console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
-      } catch (err) {
-        console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
+    // If any setup step throws (setModel network blip, registerProvider edge
+    // case, fs write in profile sync, etc.) before brain.prompt() is kicked
+    // off, _promptDone stays false forever and every subsequent prompt
+    // returns 409 — the session is permanently locked. Run cleanup that
+    // mirrors actuallyFinish (minus diagnostics + scheduleRelease, since the
+    // prompt never actually started) and surface as 500.
+    const releasePromptLockOnSetupFailure = (err: unknown): void => {
+      console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
+      managed._promptDone = true;
+      if (managed._bufferUnsub) {
+        managed._bufferUnsub();
+        managed._bufferUnsub = null;
       }
-    }
+      for (const cb of managed._promptDoneCallbacks) {
+        try { cb(); } catch { /* swallow — best-effort signal */ }
+      }
+      managed._promptDoneCallbacks.clear();
+      // Release the brain.prompt mutex so a follow-up prompt isn't blocked.
+      managed._promptInflight = null;
+      releasePromptInflight();
+      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    };
 
-    // Set model if specified in prompt request (ensures model is applied before first prompt)
-    // Always call setModel when the registry model differs from the session model
-    // (covers field changes like reasoning/contextWindow without id/provider change)
-    if (body.modelProvider && body.modelId) {
-      const found = managed.brain.findModel(body.modelProvider, body.modelId);
-      if (found) {
-        const currentModel = managed.brain.getModel();
-        const needsUpdate = !currentModel
-          || currentModel.id !== found.id
-          || currentModel.provider !== found.provider
-          || currentModel.reasoning !== found.reasoning
-          || currentModel.contextWindow !== found.contextWindow
-          || currentModel.maxTokens !== found.maxTokens;
-        if (needsUpdate) {
-          console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
-          await managed.brain.setModel(found);
+    let promptText: string;
+    try {
+      if (body.modelProvider || body.modelId || body.modelConfig) {
+        sessionManager.setDelegationModel({
+          provider: body.modelProvider,
+          modelId: body.modelId,
+          config: body.modelConfig,
+        });
+      }
+
+      // Dynamically register provider config from gateway DB (before findModel)
+      if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
+        try {
+          managed.brain.registerProvider(body.modelProvider, body.modelConfig);
+          console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
+        } catch (err) {
+          console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
         }
       }
-    }
 
-    let promptText = body.text;
+      // Set model if specified in prompt request (ensures model is applied before first prompt)
+      // Always call setModel when the registry model differs from the session model
+      // (covers field changes like reasoning/contextWindow without id/provider change)
+      if (body.modelProvider && body.modelId) {
+        const found = managed.brain.findModel(body.modelProvider, body.modelId);
+        if (found) {
+          const currentModel = managed.brain.getModel();
+          const needsUpdate = !currentModel
+            || currentModel.id !== found.id
+            || currentModel.provider !== found.provider
+            || currentModel.reasoning !== found.reasoning
+            || currentModel.contextWindow !== found.contextWindow
+            || currentModel.maxTokens !== found.maxTokens;
+          if (needsUpdate) {
+            console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
+            await managed.brain.setModel(found);
+          }
+        }
+      }
+
+      promptText = body.text;
+    } catch (err) {
+      releasePromptLockOnSetupFailure(err);
+      return;
+    }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
     // IMPORTANT: append after DP markers, not prepend before them.
@@ -444,6 +483,12 @@ export function createHttpServer(
         cb();
       }
       managed._promptDoneCallbacks.clear();
+
+      // Release the brain.prompt mutex so any queued synth notify or the
+      // next HTTP /prompt can proceed. Promise.resolve() is idempotent
+      // per spec — re-calling on an already-resolved promise is a no-op.
+      managed._promptInflight = null;
+      releasePromptInflight();
 
       // Schedule delayed release — gives frontend time to query context/model
       // after SSE closes. If a new prompt arrives before the TTL, the timer is
@@ -547,7 +592,7 @@ export function createHttpServer(
     }
     // Replay extra (tool-pushed) events that arrived before SSE connected.
     // These are tagged events like { type: "subagent_event", ... } from
-    // dispatch_subagents' sub-agent bridge.
+    // the delegate_to_agent[s] sub-agent bridge.
     for (const event of managed._extraEventBuffer) {
       writeEvent(event);
     }
@@ -738,6 +783,16 @@ export function createHttpServer(
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
     console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
+
+    // Cascade abort to in-flight delegation batches: without this, sub-agents
+    // continue running for up to DELEGATED_AGENT_MAX_RUNTIME_MS (10 min) and
+    // their capsule rows land in chat history after the user already hit stop.
+    for (const controls of managed._activeDelegationControls) {
+      for (const control of controls) {
+        try { control.forceStop?.(); } catch { /* swallow — best-effort cascade */ }
+      }
+    }
+
     const outcome = await abortBrainForHttp(managed.brain, sessionId);
     if (outcome === "failed") {
       sendJson(res, 500, { error: "Abort failed" });

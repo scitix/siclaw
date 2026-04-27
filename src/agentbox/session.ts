@@ -70,6 +70,22 @@ export interface ManagedSession {
   _bufferUnsub: (() => void) | null;
   /** Serializes synthetic parent prompts triggered by delegation notifications */
   _syntheticPromptQueue: Promise<void> | null;
+  /**
+   * Mutex around brain.prompt() — resolves when the current prompt path
+   * (HTTP /prompt OR synth notify) lets go. Prevents the TOCTOU race
+   * where waitForParentIdle() observed _promptDone === true and the synth
+   * path is mid-await when an HTTP /prompt sneaks in: both paths would
+   * end up calling brain.prompt() concurrently. Acquired before
+   * brain.prompt(), released in finally.
+   *
+   * TODO(post-247): consolidate _promptDone / _syntheticPromptQueue /
+   * _promptInflight into one mutex queue. Three overlapping primitives is
+   * harder to reason about than necessary; this lock patches the
+   * immediate jacoblee #2/#3 race but the long-term answer is unification
+   * (every brain.prompt() callsite chains through a single Promise queue,
+   * _promptDone becomes a status flag derived from the queue).
+   */
+  _promptInflight: Promise<void> | null;
   /** Mutable reference to the active kubeconfig path — tools read .current at execution time */
   kubeconfigRef: KubeconfigRef;
   /** Whether the current prompt was aborted (prevents empty response retry) */
@@ -93,10 +109,18 @@ export interface ManagedSession {
   /** Background delegation batches currently owned by this parent session. */
   _backgroundWorkCount: number;
   /**
+   * In-flight delegation batches — one entry per active `delegate_to_agents`
+   * call, each entry is the batch's per-task control array. Used by the
+   * abort handler to cascade `forceStop()` to sub-agents so they stop
+   * burning tool budget the moment the user hits stop, instead of running
+   * to DELEGATED_AGENT_MAX_RUNTIME_MS in the background.
+   */
+  _activeDelegationControls: Set<DelegatedAgentControl[]>;
+  /**
    * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
    * push custom events here, and the SSE handler forwards them to clients.
-   * Used by dispatch_subagents to surface child-agent events in the parent
-   * session's stream.
+   * Used by delegate_to_agent / delegate_to_agents to surface child-agent
+   * events in the parent session's stream.
    */
   _extraEventSubs: Set<(event: Record<string, unknown>) => void>;
   /** Buffer of extra events fired before an SSE client connects (replayed on connect, like _eventBuffer for brain events). */
@@ -555,7 +579,13 @@ Always end with a final report even if evidence is incomplete.`;
       duration_ms: 0,
     }));
     const controls: DelegatedAgentControl[] = request.tasks.map(() => ({}));
+    // Register controls with parent so `/api/sessions/:id/abort` can cascade
+    // forceStop() to every sub-agent. Removed in finally so a failed batch
+    // doesn't leak a permanent reference.
+    const parent = this.sessions.get(request.parentSessionId);
+    parent?._activeDelegationControls.add(controls);
 
+    try {
     let persistQueue = Promise.resolve();
     const persistSnapshot = (final: boolean): Promise<void> => {
       const snapshot = details.map((task) => ({ ...task }));
@@ -687,6 +717,9 @@ Always end with a final report even if evidence is incomplete.`;
     const totalToolCalls = finalDetails.reduce((sum, task) => sum + task.tool_calls, 0);
     const durationMs = Date.now() - startedAt;
     await this.notifyParentOfDelegationBatch(request, finalDetails, status, totalToolCalls, durationMs);
+    } finally {
+      parent?._activeDelegationControls.delete(controls);
+    }
   }
 
   private buildDelegationBatchNotification(
@@ -786,6 +819,23 @@ Always end with a final report even if evidence is incomplete.`;
   }
 
   private async runSyntheticParentPrompt(managed: ManagedSession, promptText: string): Promise<void> {
+    // jacoblee #2/#3 race: waitForParentIdle observed _promptDone === true
+    // at a prior poll tick, but the HTTP /prompt entry may have grabbed
+    // the brain in the meantime. Without this wait we'd call brain.prompt()
+    // concurrently — undefined behavior on the brain's internal state.
+    while (managed._promptInflight) {
+      try { await managed._promptInflight; } catch { /* swallow — best-effort wait */ }
+    }
+    // Re-verify idle after the wait; HTTP may have transitioned us back
+    // to an active prompt or compaction during the await above.
+    if (!managed._promptDone || managed.isAgentActive || managed.isCompacting || managed.isRetrying) {
+      console.warn(`[agentbox-session] Parent ${managed.id} became busy while waiting for prompt lock; skipping synthetic notify.`);
+      return;
+    }
+
+    let releaseLock!: () => void;
+    managed._promptInflight = new Promise<void>((resolve) => { releaseLock = resolve; });
+
     const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
     const pendingToolCalls = new Map<string, PendingChildToolCall[]>();
     let assistantContent = "";
@@ -915,6 +965,11 @@ Always end with a final report even if evidence is incomplete.`;
       });
       for (const cb of managed._promptDoneCallbacks) cb();
       managed._promptDoneCallbacks.clear();
+      // Release the brain.prompt mutex so any waiting HTTP /prompt or
+      // queued synth notification can proceed. Promise.resolve() is
+      // idempotent — calling it twice is a no-op per spec.
+      managed._promptInflight = null;
+      releaseLock();
     }
   }
 
@@ -1426,15 +1481,31 @@ Always end with a final report even if evidence is incomplete.`;
     };
     const effectiveMode = mode ?? "web";
 
-    // Per-session extra event bus — tools (e.g. dispatch_subagents) use this
-    // to push custom events into the SSE stream alongside the brain's events.
+    // Per-session extra event bus — tools (e.g. delegate_to_agent[s]) use
+    // this to push custom events into the SSE stream alongside the brain's events.
     // Allocated BEFORE createSiclawSession so we can wire the emitter into
     // ToolRefs. Buffered events replay to the SSE handler on connect.
     const extraEventSubs = new Set<(event: Record<string, unknown>) => void>();
     const extraEventBuffer: Record<string, unknown>[] = [];
+    // Cap the buffer so a long batch with no SSE client (e.g. user closed
+    // the tab while a 10-min delegation runs) cannot grow the heap without
+    // bound. 1000 events is far above any realistic SSE catch-up window.
+    // On overflow, drop the OLDEST event — late connectors lose context but
+    // never OOM the agentbox process. Warn once per session so operators
+    // can see when it happens; subsequent drops stay silent.
+    const EXTRA_EVENT_BUFFER_CAP = 1000;
+    let extraEventBufferOverflowed = false;
     const emitExtraEvent = (event: Record<string, unknown>) => {
-      if (extraEventSubs.size === 0) extraEventBuffer.push(event);
-      else for (const sub of extraEventSubs) { try { sub(event); } catch { /* best-effort */ } }
+      if (extraEventSubs.size === 0) {
+        extraEventBuffer.push(event);
+        if (extraEventBuffer.length > EXTRA_EVENT_BUFFER_CAP) {
+          extraEventBuffer.shift();
+          if (!extraEventBufferOverflowed) {
+            extraEventBufferOverflowed = true;
+            console.warn(`[agentbox-session] extra event buffer for session ${id} exceeded ${EXTRA_EVENT_BUFFER_CAP}; dropping oldest events`);
+          }
+        }
+      } else for (const sub of extraEventSubs) { try { sub(event); } catch { /* best-effort */ } }
     };
 
     const result = await createSiclawSession({
@@ -1489,6 +1560,8 @@ Always end with a final report even if evidence is incomplete.`;
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
       _backgroundWorkCount: 0,
+      _activeDelegationControls: new Set(),
+      _promptInflight: null,
       _extraEventSubs: extraEventSubs,
       _extraEventBuffer: extraEventBuffer,
     };

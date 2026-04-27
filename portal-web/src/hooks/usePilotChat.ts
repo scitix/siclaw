@@ -66,6 +66,14 @@ interface UsePilotChatReturn {
 }
 
 const DELEGATED_TOOL_STALE_MS = 4 * 60 * 1000
+// Generic stale window for non-delegation tools (kubectl, skill, etc.).
+// `tool_execution_start` now persists a "running" row eagerly; if the
+// gateway/agentbox restarts or the SSE stream drops before
+// `tool_execution_end` lands, the row stays outcome=null forever and the
+// frontend shows a permanently-spinning card on reload. 30 min is far
+// above any realistic non-delegation tool runtime — kubectl reads finish
+// in seconds, skill scripts have their own timeouts well under 30 min.
+const NON_DELEGATION_TOOL_STALE_MS = 30 * 60 * 1000
 const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"])
 const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents"])
 
@@ -185,19 +193,29 @@ function formatPortalTimestamp(value: string): string {
   return new Date(parsed).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
-function isStaleDelegationTool(m: ChatMessage): boolean {
+function isStaleRunningTool(m: ChatMessage): boolean {
   if (m.role !== "tool") return false
   if (m.outcome) return false
-  if (!m.tool_name || !DELEGATED_TOOL_NAMES.has(m.tool_name)) return false
   const createdAt = parsePortalTimestamp(m.created_at)
   if (!Number.isFinite(createdAt)) return false
-  const staleMs = ASYNC_DELEGATED_TOOL_NAMES.has(m.tool_name) ? 15 * 60 * 1000 : DELEGATED_TOOL_STALE_MS
+  let staleMs: number
+  if (m.tool_name && ASYNC_DELEGATED_TOOL_NAMES.has(m.tool_name)) {
+    staleMs = 15 * 60 * 1000
+  } else if (m.tool_name && DELEGATED_TOOL_NAMES.has(m.tool_name)) {
+    staleMs = DELEGATED_TOOL_STALE_MS
+  } else {
+    staleMs = NON_DELEGATION_TOOL_STALE_MS
+  }
   return Date.now() - createdAt > staleMs
+}
+
+function isDelegationTool(toolName?: string | null): boolean {
+  return Boolean(toolName && DELEGATED_TOOL_NAMES.has(toolName))
 }
 
 function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
   if (m.role !== "tool") return undefined;
-  if (isStaleDelegationTool(m)) return "error";
+  if (isStaleRunningTool(m)) return "error";
   if (m.outcome === "error" || m.outcome === "blocked") return "error";
   if (m.outcome === "success") return "success";
   return "running";
@@ -214,20 +232,23 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
   const isDelegationEvent = metadata?.kind === "delegation_event"
-  const staleDelegation = isStaleDelegationTool(m)
+  const staleRunning = isStaleRunningTool(m)
+  const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)
-  const recoveredMetadata = staleDelegation
+  const recoveredMetadata = staleRunning
     ? {
         ...(metadata ?? {}),
         status: "timed_out",
-        recovery_reason: "stale_delegation_tool",
+        recovery_reason: toolIsDelegation ? "stale_delegation_tool" : "stale_running_tool",
       }
     : metadata
   return {
     id: m.id,
     role: m.role,
-    content: staleDelegation && !m.content?.trim()
-      ? "Delegated investigation did not finish before the recovery window. It may have timed out or been interrupted."
+    content: staleRunning && !m.content?.trim()
+      ? (toolIsDelegation
+          ? "Delegated investigation did not finish before the recovery window. It may have timed out or been interrupted."
+          : "Tool execution did not finish before the recovery window. It may have timed out or been interrupted.")
       : m.content,
     toolName: m.tool_name,
     toolArgs,

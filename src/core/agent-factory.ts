@@ -96,8 +96,8 @@ export interface CreateSiclawSessionOpts {
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
    * push custom events into the parent session's SSE stream (used by
-   * `dispatch_subagents` to forward child-agent events so the frontend can
-   * render them in a nested block).
+   * `delegate_to_agent` / `delegate_to_agents` to forward child-agent events
+   * so the frontend can render them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
   /**
