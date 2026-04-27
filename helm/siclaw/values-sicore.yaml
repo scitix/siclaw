@@ -1,0 +1,67 @@
+# Siclaw Runtime-only Deployment (SiCore upstream)
+# Deploys ONLY the Runtime — phone-homes to an external SiCore apiserver
+# which acts as the management/adapter layer. No Portal, no DB, no MySQL.
+#
+# Prerequisites:
+#   1. SiCore deployed in the same cluster (or reachable via DNS)
+#   2. Register this Runtime in SiCore admin and capture the returned
+#      adapter_secret + runtime id:
+#        curl -X POST <sicore>/api/v1/siclaw/admin/runtimes \
+#          -H "Authorization: Bearer <admin-jwt>" \
+#          -d '{"id":"<runtime-id>","name":"<display-name>"}'
+#   3. Build and push images:
+#        make docker push REGISTRY=your-registry.com TAG=<tag>
+#
+# Deploy:
+#   helm upgrade --install siclaw ./helm/siclaw \
+#     -f helm/siclaw/values-sicore.yaml \
+#     --set image.registry=your-registry.com \
+#     --set image.tag=<tag> \
+#     --set runtime.serverUrl=http://sicore-apiserver.<sicore-ns>.svc:8080 \
+#     --set runtime.portalSecret=<adapter_secret-from-sicore> \
+#     --set runtime.env.SICLAW_AGENT_ID=<runtime-id-registered-in-sicore>
+
+image:
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# No bundled Portal — SiCore is the upstream
+portal:
+  enabled: false
+
+# Runtime is stateless — no DB needed in this mode
+mysql:
+  enabled: false
+database:
+  url: ""
+
+runtime:
+  serverUrl: ""        # REQUIRED: SiCore apiserver endpoint
+  # adapter_secret returned by SiCore at runtime registration. Sent as
+  # X-Auth-Token on the phone-home WS; SiCore reverse-looks-up runtime_id
+  # from this secret.
+  portalSecret: ""     # REQUIRED
+  env:
+    # Runtime identity registered in SiCore (siclaw_runtimes.id). SiCore's
+    # /ws/runtime endpoint does not actually read this header — it derives
+    # runtime_id from the adapter_secret — but Runtime still sends it for
+    # symmetry with Portal mode and for log/audit clarity.
+    SICLAW_AGENT_ID: ""  # REQUIRED
+  resources:
+    requests: { cpu: 50m,  memory: 128Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+
+agentbox:
+  persistence:
+    enabled: false     # set true + storageClassName for cross-restart user data
+
+metrics:
+  enabled: false       # turn on if Prometheus operator is installed
+  serviceMonitor:
+    enabled: false
+  podMonitor:
+    enabled: false
+  grafanaDashboard:
+    enabled: false
+  prometheusRule:
+    enabled: false

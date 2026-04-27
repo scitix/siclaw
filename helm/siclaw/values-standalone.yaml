@@ -1,50 +1,50 @@
 # Siclaw Standalone Deployment
-# Deploy without Upstream — uses Portal for user/agent/cluster management.
+# Self-contained: bundled Portal + Runtime + (optionally bundled MySQL).
+# Use this for isolated test clusters or when there is no SiCore upstream.
 #
 # Prerequisites:
-#   1. MySQL accessible from the cluster
-#   2. Build and push images:
-#      make docker push REGISTRY=your-registry.com
+#   1. Build and push images:
+#        make docker push REGISTRY=your-registry.com TAG=<tag>
+#   2. Provide MySQL — either via mysql.enabled=true (demo) or an external DB.
 #
 # Deploy:
 #   helm upgrade --install siclaw ./helm/siclaw \
 #     -f helm/siclaw/values-standalone.yaml \
-#     --set database.url=mysql://user:pass@mysql-host:3306/siclaw \
-#     --set runtime.jwtSecret=your-jwt-secret \
-#     --set runtime.runtimeSecret=your-runtime-secret \
-#     --set runtime.portalSecret=your-portal-secret \
-#     --set portal.jwtSecret=your-jwt-secret \
-#     --set portal.runtimeSecret=your-runtime-secret \
-#     --set portal.portalSecret=your-portal-secret \
-#     --set image.registry=your-registry.com
+#     --set image.registry=your-registry.com \
+#     --set image.tag=<tag> \
+#     --set database.url=mysql://siclaw:<pw>@siclaw-mysql:3306/siclaw \
+#     --set runtime.portalSecret=<shared-secret> \
+#     --set portal.jwtSecret=<jwt-signing-secret> \
+#     --set portal.portalSecret=<shared-secret>   # must equal runtime.portalSecret
 
 image:
   pullPolicy: Always
   tag: "latest"
 
+# Demo MySQL — for production, set mysql.enabled=false and point database.url
+# at an externally-managed instance.
+mysql:
+  enabled: true
+
 database:
-  url: ""  # REQUIRED: --set database.url=mysql://...
+  url: ""  # REQUIRED: mysql://siclaw:<pw>@siclaw-mysql:3306/siclaw
 
-# Runtime points to Portal (not Upstream)
 runtime:
-  replicas: 1
   serverUrl: "http://siclaw-portal:3003"
-  jwtSecret: ""       # REQUIRED: --set runtime.jwtSecret=...
-  runtimeSecret: ""     # REQUIRED: --set runtime.runtimeSecret=...
-  portalSecret: ""    # REQUIRED: --set runtime.portalSecret=...
+  # Shared secret presented as X-Auth-Token when Runtime phone-homes to Portal.
+  # Must equal portal.portalSecret below.
+  portalSecret: ""
 
-# Portal enabled for standalone
 portal:
   enabled: true
   replicas: 1
-  jwtSecret: ""       # REQUIRED: must match runtime.jwtSecret
-  runtimeSecret: ""     # REQUIRED: must match runtime.runtimeSecret
-  portalSecret: ""    # REQUIRED: must match runtime.portalSecret
+  jwtSecret: ""        # REQUIRED: Portal JWT signing key
+  portalSecret: ""     # REQUIRED: must match runtime.portalSecret
   service:
     type: NodePort
     port: 3003
-    nodePort: 31003   # Access Portal UI at http://<node-ip>:31003
+    nodePort: 31003    # Portal UI: http://<node-ip>:31003
 
 agentbox:
   persistence:
-    enabled: false
+    enabled: false     # set true + storageClassName for cross-restart user data
