@@ -11,10 +11,8 @@
 #     -f helm/siclaw/values-standalone.yaml \
 #     --set database.url=mysql://user:pass@mysql-host:3306/siclaw \
 #     --set runtime.jwtSecret=your-jwt-secret \
-#     --set runtime.runtimeSecret=your-runtime-secret \
 #     --set runtime.portalSecret=your-portal-secret \
 #     --set portal.jwtSecret=your-jwt-secret \
-#     --set portal.runtimeSecret=your-runtime-secret \
 #     --set portal.portalSecret=your-portal-secret \
 #     --set image.registry=your-registry.com
 
@@ -30,7 +28,6 @@ runtime:
   replicas: 1
   serverUrl: "http://siclaw-portal:3003"
   jwtSecret: ""       # REQUIRED: --set runtime.jwtSecret=...
-  runtimeSecret: ""     # REQUIRED: --set runtime.runtimeSecret=...
   portalSecret: ""    # REQUIRED: --set runtime.portalSecret=...
 
 # Portal enabled for standalone
@@ -38,7 +35,6 @@ portal:
   enabled: true
   replicas: 1
   jwtSecret: ""       # REQUIRED: must match runtime.jwtSecret
-  runtimeSecret: ""     # REQUIRED: must match runtime.runtimeSecret
   portalSecret: ""    # REQUIRED: must match runtime.portalSecret
   service:
     type: NodePort
