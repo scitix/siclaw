@@ -658,19 +658,21 @@ describe("chat.ensureSession", () => {
 });
 
 describe("chat.appendMessage", () => {
-  it("inserts message and bumps session count", async () => {
-    const query = mockQuery([], []);
+  it("inserts message and bumps session count when caller owns the session", async () => {
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
 
     const result = await getHandler("chat.appendMessage")(
       { session_id: "sess1", role: "user", content: "Hello", metadata: { key: "val" } }, "a1",
     );
     expect(result.id).toBeDefined();
     expect(typeof result.id).toBe("string");
-    expect(query).toHaveBeenCalledTimes(2);
+    // 1 ownership SELECT + INSERT + session UPDATE
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
   });
 
   it("inserts delegated message lineage", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ agent_id: "target-agent" }], [], []);
 
     await getHandler("chat.appendMessage")(
       {
@@ -684,17 +686,40 @@ describe("chat.appendMessage", () => {
       },
       "target-agent",
     );
-    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+    // INSERT params land on call index 1 now (call 0 is the ownership SELECT)
+    expect(query.mock.calls[1][1]).toEqual(expect.arrayContaining([
       "target-agent",
       "parent",
       "delegation-1",
     ]));
   });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "victim" }]);
+
+    await expect(getHandler("chat.appendMessage")(
+      { session_id: "victim-session", role: "user", content: "smuggled", metadata: null }, "attacker",
+    )).rejects.toThrow(/not owned by agent attacker/);
+
+    // Only the ownership SELECT ran; no INSERT, no session UPDATE.
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it("permits write when session is not yet registered (ensureSession-first contract)", async () => {
+    const query = mockQuery([], [], []);
+
+    const result = await getHandler("chat.appendMessage")(
+      { session_id: "fresh", role: "user", content: "Hello", metadata: null }, "a1",
+    );
+
+    expect(result.id).toBeDefined();
+    expect(query).toHaveBeenCalledTimes(3);
+  });
 });
 
 describe("chat.updateMessage", () => {
   it("updates message fields without bumping session count", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
 
     const result = await getHandler("chat.updateMessage")(
       {
@@ -711,9 +736,10 @@ describe("chat.updateMessage", () => {
     );
 
     expect(result).toEqual({ ok: true });
-    expect(query).toHaveBeenCalledTimes(2);
-    expect(query.mock.calls[0][0]).toContain("UPDATE chat_messages");
-    expect(query.mock.calls[0][1]).toEqual([
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
+    expect(query.mock.calls[1][0]).toContain("UPDATE chat_messages");
+    expect(query.mock.calls[1][1]).toEqual([
       "Done",
       "delegate_to_agent",
       "{\"scope\":\"check\"}",
@@ -724,13 +750,30 @@ describe("chat.updateMessage", () => {
       "msg-1",
       "sess1",
     ]);
-    expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
+    expect(query.mock.calls[2][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "owner" }]);
+
+    await expect(getHandler("chat.updateMessage")(
+      {
+        id: "msg-x",
+        session_id: "other-session",
+        content: "edit",
+        outcome: "success",
+        duration_ms: 1,
+      },
+      "intruder",
+    )).rejects.toThrow(/not owned by agent intruder/);
+
+    expect(query).toHaveBeenCalledTimes(1);
   });
 });
 
 describe("chat.updateDelegationToolMessage", () => {
   it("updates async delegation tool rows by delegation id", async () => {
-    const query = mockQuery([], []);
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
 
     const result = await getHandler("chat.updateDelegationToolMessage")(
       {
@@ -746,9 +789,10 @@ describe("chat.updateDelegationToolMessage", () => {
     );
 
     expect(result).toEqual({ ok: true });
-    expect(query).toHaveBeenCalledTimes(2);
-    expect(query.mock.calls[0][0]).toContain("WHERE session_id = ? AND role = 'tool' AND tool_name = ? AND delegation_id = ?");
-    expect(query.mock.calls[0][1]).toEqual([
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
+    expect(query.mock.calls[1][0]).toContain("WHERE session_id = ? AND role = 'tool' AND tool_name = ? AND delegation_id = ?");
+    expect(query.mock.calls[1][1]).toEqual([
       "{\"status\":\"done\"}",
       "{\"status\":\"done\"}",
       "success",
@@ -757,7 +801,26 @@ describe("chat.updateDelegationToolMessage", () => {
       "delegate_to_agents",
       "call-1",
     ]);
-    expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET last_active_at");
+    expect(query.mock.calls[2][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "owner" }]);
+
+    await expect(getHandler("chat.updateDelegationToolMessage")(
+      {
+        session_id: "other-session",
+        tool_name: "delegate_to_agents",
+        delegation_id: "call-x",
+        content: "{}",
+        metadata: "{}",
+        outcome: "success",
+        duration_ms: 1,
+      },
+      "intruder",
+    )).rejects.toThrow(/not owned by agent intruder/);
+
+    expect(query).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1241,9 +1304,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 42 handlers", () => {
+  it("registers exactly 43 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(42);
+    expect(handlers.size).toBe(43);
   });
 
   it("all expected handler names are registered", () => {
