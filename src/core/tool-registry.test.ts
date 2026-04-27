@@ -7,9 +7,8 @@ function stubRefs(overrides: Partial<ToolRefs> = {}): ToolRefs {
     userId: "u1",
     agentId: null,
     sessionIdRef: { current: "" },
-    llmConfigRef: {},
     memoryRef: {},
-    dpStateRef: { status: "idle" },
+    dpStateRef: { active: false },
     ...overrides,
   };
 }
@@ -124,5 +123,35 @@ describe("ToolRegistry", () => {
       const tools = reg.resolve({ mode, refs: stubRefs() });
       expect(tools.map((t) => t.name)).toEqual(["univ"]);
     }
+  });
+
+  it("annotates tools that require explicit user approval", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "workflow", create: () => stubToolDef("delegate_to_agent"), requiresUserApproval: true },
+      { category: "query", create: () => stubToolDef("safe_lookup") },
+    );
+
+    const tools = reg.resolve({ mode: "web", refs: stubRefs() });
+
+    expect(tools.find((t) => t.name === "delegate_to_agent")?.requiresUserApproval).toBe(true);
+    expect(tools.find((t) => t.name === "safe_lookup")?.requiresUserApproval).toBeUndefined();
+  });
+
+  it("preserves approval metadata after allowedTools filtering", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "workflow", create: () => stubToolDef("delegate_to_agent"), requiresUserApproval: true },
+      { category: "query", create: () => stubToolDef("safe_lookup") },
+    );
+
+    const tools = reg.resolve({
+      mode: "web",
+      refs: stubRefs(),
+      allowedTools: ["delegate_to_agent"],
+    });
+
+    expect(tools.map((t) => t.name)).toEqual(["delegate_to_agent"]);
+    expect(tools[0].requiresUserApproval).toBe(true);
   });
 });

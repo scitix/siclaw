@@ -54,7 +54,7 @@ export interface InvestigationRecord {
   totalToolCalls: number;
   hypotheses: Array<{ id: string; text: string; status: string; confidence: number }>;
   createdAt: number;
-  /** Retrieval weight multiplier (default 1.0). Set by investigation_feedback tool. */
+  /** Retrieval weight multiplier (default 1.0). Reserved for future feedback flow. */
   feedbackSignal?: number;
   /** Feedback note: status label + optional user text (e.g. "corrected: actual root cause was X"). */
   feedbackNote?: string;

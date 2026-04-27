@@ -6,7 +6,6 @@
  * Port 3001 (HTTP):
  *   GET  /api/health              — K8s liveness/readiness
  *   GET  /metrics                 — Prometheus
- *   WS   /ws                      — Upstream WS RPC (Trusted Proxy auth)
  *   /api/v1/siclaw/metrics/*      — Metrics (proxied to adapter for summary/audit)
  *   /api/v1/siclaw/system/*       — System config (proxied to adapter)
  *
@@ -47,6 +46,7 @@ import {
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
+  handleDelegationEvents,
 } from "./internal-api.js";
 // siclaw-api.ts routes moved to Portal — Runtime no longer registers CRUD routes.
 import { appendMessage, incrementMessageCount, ensureChatSession } from "./chat-repo.js";
@@ -163,8 +163,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             persistMessages: true,
             redactionConfig,
             signal: abortCtrl.signal,
-            onEvent: (evt) => {
-              context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: evt });
+            onEvent: (evt, _eventType, extras) => {
+              context.sendEvent("chat.event", {
+                sessionId: promptResult.sessionId,
+                event: extras.dbMessageId ? { ...evt, dbMessageId: extras.dbMessageId } : evt,
+              });
             },
           });
           // Signal Portal that the prompt is fully complete (all agent turns done).
@@ -551,6 +554,13 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             return;
           }
 
+          // Background delegation persistence/audit callback from AgentBox.
+          if (url === "/api/internal/delegation-events" && method === "POST") {
+            if (!identity) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "Client certificate required" })); return; }
+            handleDelegationEvents(req, res, identity, frontendClient);
+            return;
+          }
+
           // Feedback endpoint
           if (url === "/api/internal/feedback" && method === "POST") {
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -591,4 +601,3 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
 
   return runtimeServer;
 }
-

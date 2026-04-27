@@ -1,55 +1,29 @@
 ---
 title: "Deep Investigation"
 sidebarTitle: "Deep Investigation"
-description: "How Siclaw's interactive investigation workflow works — triage, hypothesize, confirm, validate."
+description: "How Siclaw's interactive investigation mode works — a focus mode for complex root-cause analysis."
 ---
 
 ## Overview
 
-Deep Investigation is Siclaw's diagnostic engine for complex issues. It combines **interactive investigation** (you and the agent collaborate on triage and hypothesis formation) with **automated validation** (parallel sub-agents test hypotheses independently).
+Deep Investigation (DP) is a **mode** you toggle on when you want Siclaw to slow
+down and reason through a complex problem instead of jumping to a fix. In DP
+mode the agent is coached by an enhanced system prompt to:
 
-Deep Investigation is activated **only by explicit user action** — it does not run automatically.
+1. Gather evidence with tools before forming hypotheses.
+2. Consider 2–5 candidate causes and weigh them against the evidence.
+3. Cross-verify from multiple data sources before drawing conclusions.
+4. Present findings with explicit confidence and a causal chain.
 
-## Workflow
-
-### Interactive Planning Loop
-
-When you activate Deep Investigation, the agent enters an interactive triage cycle:
-
-1. **Triage**: The agent runs targeted commands to understand the environment and confirm the problem.
-2. **Propose Hypotheses**: The agent presents 3-5 ranked hypotheses for your review.
-3. **Your Decision**:
-   - **Confirm** → proceeds to parallel validation
-   - **Adjust** → provide feedback, agent re-investigates and proposes again
-   - **Skip** → agent presents a conclusion based on current findings
-
-This loop can repeat as many times as needed. Each round improves hypothesis quality with your domain knowledge.
-
-### Parallel Validation
-
-After you confirm hypotheses, the deep_search engine validates them:
-
-- Up to 3 sub-agents run simultaneously, each validating one hypothesis
-- Sub-agents don't share information — this prevents confirmation bias
-- Each agent produces a verdict: `validated`, `invalidated`, or `inconclusive`
-
-If [Investigation Memory](/features/memory) has data, past investigations with similar patterns are injected to improve validation.
-
-### Conclusion
-
-All evidence is synthesized into a structured report containing:
-
-- **Root cause** with confidence score
-- **Causal chain** (ordered steps from trigger to symptom)
-- **Evidence references** (which commands produced which findings)
-- **Remediation steps** (actionable next steps)
-- **Structured extraction** (category, affected entities, environment tags) → stored in Investigation Memory
+DP mode stays on until you explicitly turn it off. It does not activate by
+itself.
 
 ## Triggering Deep Investigation
 
 ### Web UI
 
-Click the magnifying glass toggle next to the message input.
+Click the magnifying-glass toggle next to the message input. A banner appears
+while DP mode is active. Click again (or type `/dp exit`) to turn it off.
 
 ### Terminal (TUI)
 
@@ -59,9 +33,17 @@ Click the magnifying glass toggle next to the message input.
 
 Or press `Ctrl+I` to toggle DP mode, then type your question.
 
+### Dig Deeper
+
+Any regular answer can be escalated into DP by clicking the **Dig deeper**
+action chip that appears below the agent's reply. This sends a follow-up prompt
+asking for a deeper investigation into the same question.
+
 ### External API
 
-Automations can drive an agent from outside Siclaw using the `/api/v1/run` endpoint with an API-key-scoped agent. Issue an API key in the Portal UI (agent detail page → API keys), then:
+Automations can drive an agent from outside Siclaw using the `/api/v1/run`
+endpoint with an API-key-scoped agent. Issue an API key in the Portal UI
+(agent detail page → API keys), then:
 
 ```bash
 curl -X POST https://siclaw.example.com/api/v1/run \
@@ -70,14 +52,28 @@ curl -X POST https://siclaw.example.com/api/v1/run \
   -d '{"text": "Intermittent 5xx errors on API gateway every 30 minutes"}'
 ```
 
-The agent resolved from the API key runs synchronously and returns the assistant reply.
+The agent resolved from the API key runs synchronously and returns the
+assistant reply. DP-style reasoning can be requested in the prompt text.
 
-## Traces
+## What DP Changes
 
-Every investigation produces a trace file (relative to where Siclaw was launched):
+DP mode changes how the agent *thinks* and, in supported runtimes, exposes a
+same-agent delegation primitive for bounded parallel evidence collection. Normal
+chat sessions do not see the delegation tool.
 
-```
-.siclaw/traces/deep-search-2026-03-06T14-30-00.md
-```
+- **Slower triage**: the agent spends more effort cross-verifying evidence
+  before proposing a cause.
+- **Hypothesis framing**: conclusions are presented with confidence
+  and the counter-evidence considered.
+- **Parallel evidence collection**: for complex DP investigations, the agent can
+  start one to three same-agent sub-investigations and then synthesize their
+  returned evidence capsules.
+- **Conversation continuity**: DP state persists across messages in the same
+  session until explicitly exited.
 
-Traces include the investigation summary, evidence, and recommended next steps.
+## Investigation Memory
+
+When [Investigation Memory](/features/memory) is enabled, DP-mode sessions
+write their conclusions (root cause, causal chain, evidence refs) to the
+memory index. Future investigations with similar symptoms retrieve past
+matches automatically to speed up triage.

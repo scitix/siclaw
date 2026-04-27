@@ -37,7 +37,7 @@ import { McpClientManager } from "./mcp-client.js";
 import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
-import type { SessionMode, KubeconfigRef, LlmConfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
+import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
 
 export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
@@ -93,6 +93,28 @@ export interface CreateSiclawSessionOpts {
    * edits don't silently dead-end in the ephemeral `.portal-snapshot/` dirs.
    */
   portalUrl?: string;
+  /**
+   * Optional callback injected by agentbox. When present, tools may call it to
+   * push custom events into the parent session's SSE stream (used by
+   * `delegate_to_agent` / `delegate_to_agents` to forward child-agent events
+   * so the frontend can render them in a nested block).
+   */
+  sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
+  /**
+   * Optional runtime bridge for `delegate_to_agent`. When absent, the tool is
+   * hidden from the model by the registry availability guard.
+   */
+  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
+  /**
+   * Optional runtime bridge for notify-driven batch same-agent delegation.
+   */
+  delegateToAgentsExecutor?: import("./tool-registry.js").DelegateToAgentsExecutor;
+  /**
+   * Expose same-agent delegation tools to the model for this session. Keep this
+   * false in normal chat so Deep Investigation internals do not leak through
+   * the callable tool schema.
+   */
+  enableDelegationTools?: boolean;
 }
 
 export interface SiclawSessionResult {
@@ -101,8 +123,6 @@ export interface SiclawSessionResult {
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
   kubeconfigRef: KubeconfigRef;
-  /** Mutable ref to LLM config for deep_search sub-agents */
-  llmConfigRef: LlmConfigRef;
   /** Mutable skill dirs array — update contents + call session.reload() to switch */
   skillsDirs: string[];
   mode: SessionMode;
@@ -258,22 +278,16 @@ export async function createSiclawSession(
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
   const agentId: string | null = opts?.agentId ?? null;
-  // Populate from defaultLlm so Phase 3 sub-agents inherit the active LLM config in TUI/CLI mode.
-  // In K8s mode, agentbox/http-server.ts will overwrite these fields when the Gateway pushes
-  // a model-change notification — so this initialization does not conflict with that path.
-  const llmConfigRef: LlmConfigRef = defaultLlm
-    ? { apiKey: defaultLlm.apiKey, baseUrl: defaultLlm.baseUrl, model: defaultLlm.model.id, api: defaultLlm.api }
-    : {};
   const sessionIdRef: { current: string } = { current: "" };
   const mode = opts?.mode ?? "web";
-  // Mutable ref — populated after memoryIndexer is created (below), so deep_search
-  // can retrieve past investigations and persist new ones.
+  // Mutable ref — populated after memoryIndexer is created (below) so memory-
+  // consuming tools can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
 
   // DP state ref — shared object, two views:
   // - MutableDpStateRef: held by the extension (single writer)
-  // - DpStateRef (readonly): passed to tools and agentbox for read-only access
-  const mutableDpStateRef: MutableDpStateRef = { status: "idle" };
+  // - DpStateRef (readonly): observed by agentbox and other consumers
+  const mutableDpStateRef: MutableDpStateRef = { active: false };
   const dpStateRef: DpStateRef = mutableDpStateRef;
 
   // Paths from settings.json (needed early for memoryIndexer init and tool resolution)
@@ -327,11 +341,14 @@ export async function createSiclawSession(
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef, llmConfigRef,
+      kubeconfigRef, userId, agentId, sessionIdRef,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer,
       memoryDir,
+      sessionEventEmitter: opts?.sessionEventEmitter,
+      delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
+      delegateToAgentsExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsExecutor : undefined,
     },
     allowedTools,
   });
@@ -590,10 +607,10 @@ export async function createSiclawSession(
   // Trigger session_start for extension state restoration.
   // In web/gateway mode, bindExtensions() is never called by the TUI layer,
   // so session_start doesn't fire and extensions can't restore persisted state
-  // (e.g. DP mode status after session release/rebuild).
-  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings, session_start
-  // fires again — but the handler resets state first (checklist=null, dpStatus=idle)
-  // then restores from JSONL, so double-fire is idempotent.
+  // (e.g. DP mode flag after session release/rebuild).
+  // Safe for TUI: if TUI later calls bindExtensions() with UI bindings,
+  // session_start fires again — but the DP handler resets state first
+  // (dpActive=false) then restores from JSONL, so double-fire is idempotent.
   await session.bindExtensions({});
 
   // ── Guard pipeline: unified guard registration and installation ──
@@ -602,5 +619,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, llmConfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
+  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

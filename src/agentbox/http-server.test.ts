@@ -6,8 +6,8 @@ import type https from "node:https";
 /**
  * Tests for createHttpServer.
  *
- * We mock heavy subsystems (metrics registries, deep-search events, memory
- * indexer, config loader) so we can exercise the routing table against a
+ * We mock heavy subsystems (metrics registries, memory indexer, config
+ * loader) so we can exercise the routing table against a
  * lightweight fake session manager. The server itself is a real http.Server;
  * we send HTTP requests to it from the same process.
  */
@@ -32,11 +32,6 @@ vi.mock("../shared/diagnostic-events.js", () => ({ emitDiagnostic: () => {} }));
 vi.mock("../shared/detect-language.js", () => ({
   detectLanguage: (s: string) => (s.includes("你") ? "Chinese" : "English"),
 }));
-
-vi.mock("../tools/workflow/deep-search/events.js", async () => {
-  const { EventEmitter } = await import("node:events");
-  return { deepSearchEvents: new EventEmitter() };
-});
 
 // Config loader — point paths at /tmp (no PROFILE.md → no update)
 vi.mock("../core/config.js", () => ({
@@ -127,37 +122,43 @@ function makeFakeSession(id: string) {
     _aborted: false,
     skillsDirs: [] as string[],
     mode: "web" as const,
+    delegationToolsEnabled: false,
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
-    llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
+    _activeDelegationControls: new Set(),
+    _promptInflight: null,
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
-    dpStateRef: { status: "idle", question: undefined, round: 0, confirmedHypotheses: [] },
+    dpStateRef: { active: false },
   };
 }
 
 function makeFakeSessionManager() {
   const sessions = new Map<string, ReturnType<typeof makeFakeSession>>();
+  const getOrCreateCalls: any[] = [];
   return {
     sessions,
+    getOrCreateCalls,
     userId: "u",
     agentId: "a",
     activeCount: () => sessions.size,
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
-    getOrCreate: async (id?: string) => {
+    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, options?: { enableDelegationTools?: boolean }) => {
+      getOrCreateCalls.push({ id, options });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
         s = makeFakeSession(key);
         sessions.set(key, s);
       }
+      s.delegationToolsEnabled = options?.enableDelegationTools === true;
       return s;
     },
     close: async (id: string) => { sessions.delete(id); },
     closeAll: async () => { sessions.clear(); },
     resetMemory: async () => {},
     scheduleRelease: (_id: string) => {},
-    getPersistedDpState: (_id: string) => null,
+    getPersistedDpState: (_id: string): { active: boolean } | null => null,
     onSessionRelease: undefined as undefined | (() => void),
     credentialBroker: undefined,
     credentialsDir: undefined,
@@ -239,10 +240,74 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(sm.sessions.has("default")).toBe(true);
   });
 
+  it("POST /api/prompt keeps delegation tools hidden for normal chat", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", { text: "normal question", sessionId: "normal" });
+
+    expect(r.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
+      id: "normal",
+      options: { enableDelegationTools: false },
+    });
+  });
+
+  it("POST /api/prompt exposes delegation tools for visible Deep Investigation activation", async () => {
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "[Deep Investigation]\ncheck the cluster",
+      sessionId: "dp",
+    });
+
+    expect(r.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
+      id: "dp",
+      options: { enableDelegationTools: true },
+    });
+  });
+
+  it("POST /api/prompt keeps delegation tools exposed while persisted DP mode is active", async () => {
+    sm.getPersistedDpState = vi.fn(() => ({ active: true }));
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "continue investigation",
+      sessionId: "dp-persisted",
+    });
+
+    expect(r.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
+      id: "dp-persisted",
+      options: { enableDelegationTools: true },
+    });
+  });
+
+  it("POST /api/prompt hides delegation tools on DP exit even when persisted state is active", async () => {
+    sm.getPersistedDpState = vi.fn(() => ({ active: true }));
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "[DP_EXIT]\nback to normal",
+      sessionId: "dp-exit",
+    });
+
+    expect(r.status).toBe(200);
+    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
+      id: "dp-exit",
+      options: { enableDelegationTools: false },
+    });
+  });
+
   it("POST /api/prompt rejects missing text", async () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
     expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("POST /api/prompt rejects a second prompt while the session is still running", async () => {
+    const existing = await sm.getOrCreate("busy");
+    existing._promptDone = false;
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "hi again", sessionId: "busy" });
+
+    expect(r.status).toBe(409);
+    expect(r.data.error).toMatch(/already running/i);
+    expect(existing.brain.prompt).not.toHaveBeenCalled();
   });
 
   it("DELETE /api/sessions/:id closes the session", async () => {
@@ -325,6 +390,98 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(s._aborted).toBe(true);
   });
 
+  it("POST /api/sessions/:id/abort returns pending when brain abort hangs", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-hangs" });
+    const s = sm.sessions.get("ab-hangs")!;
+    s.brain.abort.mockImplementation(() => new Promise(() => {}));
+
+    const r = await getJson(port, "/api/sessions/ab-hangs/abort", "POST");
+
+    expect(r.status).toBe(200);
+    expect(r.data).toEqual({ ok: true, pending: true });
+    expect(s._aborted).toBe(true);
+  });
+
+  it("POST /api/sessions/:id/abort cascades forceStop to in-flight delegation controls", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-cascade" });
+    const s = sm.sessions.get("ab-cascade")!;
+    // Simulate two concurrent delegation batches with 3 + 2 sub-agents.
+    const batchA = [
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+    ];
+    const batchB = [
+      { forceStop: vi.fn() },
+      { forceStop: vi.fn() },
+    ];
+    s._activeDelegationControls.add(batchA);
+    s._activeDelegationControls.add(batchB);
+
+    const r = await getJson(port, "/api/sessions/ab-cascade/abort", "POST");
+
+    expect(r.status).toBe(200);
+    for (const c of [...batchA, ...batchB]) {
+      expect(c.forceStop).toHaveBeenCalledTimes(1);
+    }
+    expect(s._aborted).toBe(true);
+  });
+
+  it("POST /api/sessions/:id/abort tolerates a forceStop that throws (best-effort cascade)", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-throw" });
+    const s = sm.sessions.get("ab-throw")!;
+    const ok = { forceStop: vi.fn() };
+    const broken = { forceStop: vi.fn(() => { throw new Error("kaboom"); }) };
+    s._activeDelegationControls.add([broken, ok]);
+
+    const r = await getJson(port, "/api/sessions/ab-throw/abort", "POST");
+
+    expect(r.status).toBe(200);
+    expect(broken.forceStop).toHaveBeenCalledTimes(1);
+    // Still cascades to siblings even after one throws.
+    expect(ok.forceStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("POST /api/prompt returns 409 when _promptInflight is held even if _promptDone flipped back", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "first", sessionId: "lock1" });
+    const s = sm.sessions.get("lock1")!;
+    // Simulate the synth notify path holding the brain.prompt mutex even
+    // though _promptDone is true (this is the exact TOCTOU window the
+    // mutex closes — without _promptInflight, the second /prompt would
+    // 200 and call brain.prompt() concurrently with synth).
+    s._promptDone = true;
+    s._promptInflight = new Promise<void>(() => {}); // never resolves
+
+    const r = await getJson(port, "/api/prompt", "POST", { text: "second", sessionId: "lock1" });
+    expect(r.status).toBe(409);
+  });
+
+  it("POST /api/prompt does not deadlock the session when setModel throws", async () => {
+    await getJson(port, "/api/prompt", "POST", { text: "first", sessionId: "stuck" });
+    const s = sm.sessions.get("stuck")!;
+    // Simulate a transient setModel failure on the next prompt — without the
+    // deadlock fix, _promptDone would stay false and every subsequent prompt
+    // would 409 forever.
+    s._promptDone = true;
+    s.brain.setModel.mockImplementationOnce(() => Promise.reject(new Error("transient")));
+
+    const fail = await getJson(port, "/api/prompt", "POST", {
+      text: "second",
+      sessionId: "stuck",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+    });
+    expect(fail.status).toBe(500);
+    expect(s._promptDone).toBe(true);
+    // Both locks must be released — _promptInflight was set synchronously
+    // before setModel and the setup-failure path must clear it too.
+    expect(s._promptInflight).toBe(null);
+
+    // Session must accept a follow-up prompt; pre-fix it returned 409 here.
+    const recover = await getJson(port, "/api/prompt", "POST", { text: "third", sessionId: "stuck" });
+    expect(recover.status).toBe(200);
+  });
+
   it("POST /api/sessions/:id/clear-queue returns cleared arrays", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "cq1" });
     const r = await getJson(port, "/api/sessions/cq1/clear-queue", "POST");
@@ -337,17 +494,16 @@ describe("http-server — dp-state", () => {
   it("returns live dpStateRef when session is loaded", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "dp1" });
     const s = sm.sessions.get("dp1")!;
-    s.dpStateRef = { status: "investigating", question: "why?", round: 2, confirmedHypotheses: [] };
+    s.dpStateRef = { active: true };
     const r = await getJson(port, "/api/sessions/dp1/dp-state");
     expect(r.status).toBe(200);
-    expect(r.data.dpStatus).toBe("investigating");
-    expect(r.data.question).toBe("why?");
+    expect(r.data.active).toBe(true);
   });
 
-  it("falls back to 'idle' when no session and no persisted state", async () => {
+  it("falls back to active=false when no session and no persisted state", async () => {
     const r = await getJson(port, "/api/sessions/ghost/dp-state");
     expect(r.status).toBe(200);
-    expect(r.data.dpStatus).toBe("idle");
+    expect(r.data.active).toBe(false);
   });
 });
 

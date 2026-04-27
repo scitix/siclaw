@@ -1265,20 +1265,21 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const { page, pageSize, offset } = parsePagination(query);
     const db = getDb();
 
-    // origin='task' sessions are scheduled-task execution traces — they live
-    // in the same table so FK + sse-consumer keep working, but the user-facing
-    // Chat list should hide them (entry point is the task runs page).
+    // origin='task' and origin='delegation' sessions are execution traces —
+    // they live in the same table so FK + audit paths keep working, but the
+    // user-facing Chat list should hide them. Their entry points are task-run
+    // pages and delegated investigation cards.
     const [[countRows], [listRows]] = await Promise.all([
       db.query(
         `SELECT COUNT(*) AS count FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'task')`,
+           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))`,
         [params.id, auth.userId],
       ),
       db.query(
         `SELECT * FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
-           AND (origin IS NULL OR origin <> 'task')
+           AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))
          ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),
@@ -1408,6 +1409,44 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       page,
       page_size: pageSize,
     });
+  });
+
+  // GET .../chat/sessions/:sid/dp-state
+  // Reports whether the session is currently in Deep Investigation mode,
+  // derived from the most recent DP marker in the message history:
+  //   [Deep Investigation]  → active=true
+  //   [DP_EXIT]             → active=false
+  //   no marker             → active=false
+  // This is the source-of-truth for the frontend to restore DP UI state
+  // after page reload or first visit to an existing session.
+  router.get(`${P}/agents/:id/chat/sessions/:sid/dp-state`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const db = getDb();
+    const [session] = await db.query(
+      "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+      [params.sid, params.id, auth.userId],
+    ) as any;
+    if (session.length === 0) {
+      sendJson(res, 404, { error: "Session not found" });
+      return;
+    }
+
+    // Substring match works identically under MySQL + SQLite; avoids any
+    // LIKE-wildcard-escape quirks around the literal '[' / ']' characters.
+    const [rows] = await db.query(
+      `SELECT content FROM chat_messages
+       WHERE session_id = ? AND role = 'user'
+         AND (substr(content, 1, 20) = '[Deep Investigation]' OR substr(content, 1, 9) = '[DP_EXIT]')
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
+      [params.sid],
+    ) as any;
+
+    const latest = (rows as any[])[0]?.content as string | undefined;
+    const active = typeof latest === "string" && latest.startsWith("[Deep Investigation]");
+    sendJson(res, 200, { active });
   });
 
 
@@ -2299,7 +2338,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
     const totalSessions = Number(sRows[0]?.c ?? 0);
@@ -2307,7 +2346,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const pParams: unknown[] = [cutoff];
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
-      WHERE m.role = 'user' AND m.created_at >= ?`;
+      WHERE m.role = 'user' AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
+        AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
     const totalPrompts = Number(pRows[0]?.c ?? 0);
@@ -2317,6 +2358,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       const [uRows] = await db.query(
         `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
          FROM chat_sessions s WHERE s.created_at >= ?
+           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
          GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
         [cutoff],
       ) as any;
@@ -2351,7 +2393,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
     const [rows] = await db.query(
       `SELECT m.id, m.session_id AS sessionId, m.tool_name AS toolName,
-              LEFT(m.tool_input, 500) AS toolInput,
+              SUBSTR(m.tool_input, 1, 500) AS toolInput,
               m.outcome, m.duration_ms AS durationMs, m.created_at AS timestamp,
               s.user_id AS userId, s.agent_id AS agentId
        FROM chat_messages m

@@ -33,13 +33,22 @@ vi.mock("@mariozechner/pi-coding-agent", () => {
 if (!(globalThis as any).__frameworkEntriesState) {
   (globalThis as any).__frameworkEntriesState = { entries: [] };
 }
+if (!(globalThis as any).__fakeBrainFactories) {
+  (globalThis as any).__fakeBrainFactories = [];
+}
+if (!(globalThis as any).__delegationPersistenceEvents) {
+  (globalThis as any).__delegationPersistenceEvents = [];
+}
 
 vi.mock("../core/agent-factory.js", async () => {
   const { EventEmitter } = await import("node:events");
   const g = globalThis as any;
   g.__createSessionCalls = g.__createSessionCalls ?? [];
+  g.__fakeBrainFactories = g.__fakeBrainFactories ?? [];
   function createFakeBrain() {
     const emitter = new EventEmitter();
+    const behaviorFactory = g.__fakeBrainFactories.shift();
+    const behavior = behaviorFactory ? behaviorFactory(emitter) : {};
     const subscribe = (cb: (e: any) => void) => {
       emitter.on("event", cb);
       return () => emitter.off("event", cb);
@@ -48,9 +57,9 @@ vi.mock("../core/agent-factory.js", async () => {
       emitter,
       subscribe,
       reload: async () => {},
-      prompt: async () => {},
-      abort: async () => {},
-      steer: async () => {},
+      prompt: behavior.prompt ?? (async () => {}),
+      abort: behavior.abort ?? (async () => {}),
+      steer: behavior.steer ?? (async () => {}),
       clearQueue: () => ({ steering: [], followUp: [] }),
       getModel: () => null,
       setModel: async () => {},
@@ -68,12 +77,11 @@ vi.mock("../core/agent-factory.js", async () => {
         session: { sessionId: "fake-session" },
         sessionIdRef: { current: "" },
         kubeconfigRef: opts.kubeconfigRef,
-        llmConfigRef: { apiKey: "", baseUrl: "", api: "anthropic", model: "m" },
         skillsDirs: ["skills/core"],
         mode: opts.mode ?? "web",
         mcpManager: { shutdown: async () => {} },
         memoryIndexer: undefined,
-        dpStateRef: { status: "idle", question: undefined, round: 0, confirmedHypotheses: [] },
+        dpStateRef: { active: false },
       };
     },
   };
@@ -117,6 +125,20 @@ vi.mock("../core/config.js", () => ({
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
 
+function installDelegationPersistenceRecorder(mgr: AgentBoxSessionManager): void {
+  const g = globalThis as any;
+  g.__delegationPersistenceEvents = g.__delegationPersistenceEvents ?? [];
+  mgr.gatewayClient = {
+    sendDelegationPersistenceEvent: vi.fn(async (event: any) => {
+      g.__delegationPersistenceEvents.push(event);
+      if (event.type === "delegation.append_message" || event.type === "delegation.append_event") {
+        return { ok: true, id: `msg-${g.__delegationPersistenceEvents.length}` };
+      }
+      return { ok: true };
+    }),
+  } as any;
+}
+
 // ── Test setup ────────────────────────────────────────────────────────
 
 let origCwd: string;
@@ -134,6 +156,8 @@ beforeEach(() => {
   _cfgCredentialsDir = path.join(tmpDir, ".siclaw/credentials");
   (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
   (globalThis as any).__createSessionCalls.length = 0;
+  (globalThis as any).__fakeBrainFactories.length = 0;
+  (globalThis as any).__delegationPersistenceEvents.length = 0;
   lastCreateSiclawSession.calls = (globalThis as any).__createSessionCalls;
 });
 
@@ -196,6 +220,48 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(lastCreateSiclawSession.calls[0].mode).toBe("web");
   });
 
+  it("hides delegation tools by default", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1");
+    const opts = lastCreateSiclawSession.calls[0];
+    expect(s.delegationToolsEnabled).toBe(false);
+    expect(opts.enableDelegationTools).toBe(false);
+    expect(opts.delegateToAgentExecutor).toBeUndefined();
+    expect(opts.delegateToAgentsExecutor).toBeUndefined();
+  });
+
+  it("injects the delegation executor only when requested", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+    const opts = lastCreateSiclawSession.calls[0];
+    expect(s.delegationToolsEnabled).toBe(true);
+    expect(opts.enableDelegationTools).toBe(true);
+    expect(typeof opts.delegateToAgentExecutor).toBe("function");
+    expect(typeof opts.delegateToAgentsExecutor).toBe("function");
+  });
+
+  it("rebuilds an idle session when delegation tool exposure changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    const s2 = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+
+    expect(s2).not.toBe(s1);
+    expect(s2.delegationToolsEnabled).toBe(true);
+    expect(lastCreateSiclawSession.calls).toHaveLength(2);
+  });
+
+  it("does not rebuild an active prompt when delegation tool exposure changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1");
+    s1._promptDone = false;
+
+    const s2 = await mgr.getOrCreate("sess-1", undefined, undefined, { enableDelegationTools: true });
+
+    expect(s2).toBe(s1);
+    expect(s2.delegationToolsEnabled).toBe(false);
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+  });
+
   it("populates sessionIdRef.current so skill_call events can attribute the session", async () => {
     // NOTE: We cannot inspect the sessionIdRef directly through the mock
     // factory pattern (mocks' return values are awaited-consumed), so we
@@ -205,6 +271,297 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     const s = await mgr.getOrCreate("abc-123");
     expect(s.id).toBe("abc-123");
+  });
+});
+
+describe("AgentBoxSessionManager — delegated agent timeout policy", () => {
+  const request = {
+    agentId: "self",
+    scope: "Investigate one bounded issue.",
+    contextSummary: "Parent context.",
+    parentSessionId: "parent-session",
+    parentAgentId: "agent-a",
+    userId: "alice",
+  };
+
+  it("keeps a delegated run alive while child events are still arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        abort,
+        prompt: () => new Promise<void>((resolve) => {
+          setTimeout(() => {
+            emitter.emit("event", { type: "tool_execution_end" });
+          }, 50_000);
+          setTimeout(() => {
+            emitter.emit("event", {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Child final report." }],
+              },
+            });
+            resolve();
+          }, 70_000);
+        }),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(50_000);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("done");
+      expect(result.fullSummary).toContain("Child final report.");
+      expect(result.toolCalls).toBe(1);
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not treat an in-flight child tool call as idle", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        abort,
+        prompt: () => new Promise<void>((resolve) => {
+          emitter.emit("event", { type: "tool_execution_start", toolName: "long_tool", args: {} });
+          setTimeout(() => {
+            emitter.emit("event", { type: "tool_execution_end", toolName: "long_tool", result: { content: [] } });
+          }, 70_000);
+          setTimeout(() => {
+            emitter.emit("event", {
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: "Long tool completed." }],
+              },
+            });
+            resolve();
+          }, 71_000);
+        }),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(61_000);
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("done");
+      expect(result.fullSummary).toContain("Long tool completed.");
+      expect(result.toolCalls).toBe(1);
+      expect(abort).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a delegated run after 60s without child activity", async () => {
+    vi.useFakeTimers();
+    try {
+      const mgr = new AgentBoxSessionManager();
+      await mgr.getOrCreate("parent", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentExecutor;
+      const abort = vi.fn(async () => {});
+
+      (globalThis as any).__fakeBrainFactories.push(() => ({
+        abort,
+        prompt: () => new Promise<void>(() => {}),
+      }));
+
+      const resultPromise = executor(request);
+      await vi.advanceTimersByTimeAsync(60_001);
+      const result = await resultPromise;
+
+      expect(result.status).toBe("timed_out");
+      expect(result.fullSummary).toContain("stopped producing activity for 60000ms");
+      expect(abort).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("AgentBoxSessionManager — delegation batch parent notification", () => {
+  const batchRequest = {
+    delegationId: "delegation-1",
+    parentSessionId: "parent-session",
+    parentAgentId: "agent-a",
+    userId: "alice",
+    tasks: [
+      { index: 1, agentId: "self", scope: "Check pod health.", contextSummary: "Parent context." },
+    ],
+  };
+
+  it("steers an active parent when delegated batch results are ready", async () => {
+    const parentSteer = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      steer: parentSteer,
+    }));
+    const mgr = new AgentBoxSessionManager();
+    installDelegationPersistenceRecorder(mgr);
+    mgr.agentId = "agent-a";
+    const parent = await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+    parent._promptDone = false;
+    parent.isAgentActive = true;
+    const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Pod evidence capsule." }],
+          },
+        });
+      },
+    }));
+
+    const result = await executor(batchRequest);
+    expect(result.status).toBe("running");
+
+    await vi.waitFor(() => {
+      expect(parentSteer).toHaveBeenCalledTimes(1);
+    });
+    expect(parentSteer.mock.calls[0][0]).toContain("[Delegation Batch Complete]");
+    expect(parentSteer.mock.calls[0][0]).toContain("Pod evidence capsule.");
+    expect((globalThis as any).__delegationPersistenceEvents.some((call: any) => (
+      call.type === "delegation.append_message" &&
+      call.message.metadata?.event_type === "delegation.batch_complete"
+    ))).toBe(true);
+  });
+
+  it("runs a synthetic parent prompt immediately when the parent is idle", async () => {
+    const parentPrompt = vi.fn(async () => {});
+    const parentSteer = vi.fn(async () => {});
+    (globalThis as any).__fakeBrainFactories.push(() => ({
+      prompt: parentPrompt,
+      steer: parentSteer,
+    }));
+    const mgr = new AgentBoxSessionManager();
+    installDelegationPersistenceRecorder(mgr);
+    mgr.agentId = "agent-a";
+    await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+    const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+    (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+      prompt: async () => {
+        emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Node evidence capsule." }],
+          },
+        });
+      },
+    }));
+
+    await executor(batchRequest);
+
+    await vi.waitFor(() => {
+      expect(parentPrompt).toHaveBeenCalledTimes(1);
+    });
+    expect(parentPrompt.mock.calls[0][0]).toContain("[Delegation Batch Complete]");
+    expect(parentPrompt.mock.calls[0][0]).toContain("Node evidence capsule.");
+    expect(parentSteer).not.toHaveBeenCalled();
+  });
+
+  it("collects available delegated evidence and marks a slow child partial after the batch grace window", async () => {
+    vi.useFakeTimers();
+    try {
+      const parentPrompt = vi.fn(async () => {});
+      (globalThis as any).__fakeBrainFactories.push(() => ({
+        prompt: parentPrompt,
+      }));
+      const mgr = new AgentBoxSessionManager();
+      installDelegationPersistenceRecorder(mgr);
+      mgr.agentId = "agent-a";
+      await mgr.getOrCreate("parent-session", undefined, undefined, { enableDelegationTools: true });
+      const executor = lastCreateSiclawSession.calls[0].delegateToAgentsExecutor;
+
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        prompt: async () => {
+          emitter.emit("event", {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [{ type: "text", text: "Agent 1 found node test-node-a NotReady." }],
+            },
+          });
+        },
+      }));
+      const slowSteer = vi.fn(async () => {});
+      const slowAbort = vi.fn(async () => {});
+      (globalThis as any).__fakeBrainFactories.push((emitter: any) => ({
+        steer: slowSteer,
+        abort: slowAbort,
+        prompt: async () => {
+          emitter.emit("event", {
+            type: "tool_execution_start",
+            toolName: "kubectl_get",
+            args: { command: "kubectl get nodes" },
+          });
+          emitter.emit("event", {
+            type: "tool_execution_end",
+            toolName: "kubectl_get",
+            result: "test-node-a NotReady\ntest-node-b Ready",
+          });
+          emitter.emit("event", {
+            type: "tool_execution_start",
+            toolName: "node_exec",
+            args: { command: "slow node probe" },
+          });
+          await new Promise(() => {});
+        },
+      }));
+
+      await executor({
+        ...batchRequest,
+        tasks: [
+          { index: 1, agentId: "self", scope: "Check node health.", contextSummary: "Parent context." },
+          { index: 2, agentId: "self", scope: "Run a slow node probe.", contextSummary: "Parent context." },
+        ],
+      });
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.waitFor(() => {
+        expect(slowSteer).toHaveBeenCalledWith(expect.stringContaining("Return a partial ## Evidence Capsule"));
+      });
+      await vi.advanceTimersByTimeAsync(25_000);
+
+      await vi.waitFor(() => {
+        expect(parentPrompt).toHaveBeenCalledTimes(1);
+      });
+      expect(slowAbort).toHaveBeenCalledTimes(1);
+      const notification = parentPrompt.mock.calls[0][0];
+      expect(notification).toContain("--- BEGIN DELEGATED AGENT 1 EVIDENCE ---");
+      expect(notification).toContain("Status: done");
+      expect(notification).toContain("--- BEGIN DELEGATED AGENT 2 EVIDENCE ---");
+      expect(notification).toContain("Status: partial");
+      expect(notification).toContain("test-node-a NotReady");
+      expect(notification).not.toContain("Interrupted active tool");
+
+      const finalUpdate = [...(globalThis as any).__delegationPersistenceEvents]
+        .reverse()
+        .find((call: any) => call.type === "delegation.update_tool_message" && call.message.metadata?.results_available === true);
+      expect(finalUpdate?.message.metadata.status).toBe("partial");
+      expect(finalUpdate?.message.metadata.tasks[1].partial_source).toBe("runtime_fallback");
+      expect(finalUpdate?.message.metadata.tasks[1].interrupted_tool).toBe("node_exec");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -317,7 +674,7 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
     expect(mgr.getPersistedDpState("nonexistent-session")).toBeNull();
   });
 
-  it("returns the last dp-mode entry's dpStatus", () => {
+  it("returns the last dp-mode entry as {active:true} (new shape)", () => {
     const mgr = new AgentBoxSessionManager();
     const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-dp");
     fs.mkdirSync(dir, { recursive: true });
@@ -327,27 +684,32 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
       {
         type: "custom",
         customType: "dp-mode",
-        data: {
-          dpStatus: "investigating",
-          dpQuestion: "why crash?",
-          dpRound: 3,
-          dpConfirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
-        },
+        data: { active: true },
       },
     ];
 
-    const snap = mgr.getPersistedDpState("sess-dp");
-    expect(snap).toEqual({
-      dpStatus: "investigating",
-      question: "why crash?",
-      round: 3,
-      confirmedHypotheses: [{ id: "h1", text: "oom", confidence: 0.9 }],
-    });
+    expect(mgr.getPersistedDpState("sess-dp")).toEqual({ active: true });
   });
 
-  it("falls back to legacy checklist-based inference when dpStatus is absent", () => {
+  it("normalizes legacy dpStatus snapshot into {active:true}", () => {
     const mgr = new AgentBoxSessionManager();
-    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy");
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy-status");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      {
+        type: "custom",
+        customType: "dp-mode",
+        data: { dpStatus: "investigating" },
+      },
+    ];
+
+    expect(mgr.getPersistedDpState("sess-legacy-status")).toEqual({ active: true });
+  });
+
+  it("normalizes legacy checklist/phase snapshot into {active:true}", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-legacy-checklist");
     fs.mkdirSync(dir, { recursive: true });
 
     (globalThis as any).__frameworkEntriesState.entries = [
@@ -361,9 +723,19 @@ describe("AgentBoxSessionManager — getPersistedDpState", () => {
       },
     ];
 
-    const snap = mgr.getPersistedDpState("sess-legacy");
-    expect(snap?.dpStatus).toBe("investigating");
-    expect(snap?.question).toBe("oldQ");
+    expect(mgr.getPersistedDpState("sess-legacy-checklist")).toEqual({ active: true });
+  });
+
+  it("normalizes legacy {dpStatus:'idle'} into {active:false}", () => {
+    const mgr = new AgentBoxSessionManager();
+    const dir = path.join(_cfgUserDataDir, "agent", "sessions", "sess-idle");
+    fs.mkdirSync(dir, { recursive: true });
+
+    (globalThis as any).__frameworkEntriesState.entries = [
+      { type: "custom", customType: "dp-mode", data: { dpStatus: "idle" } },
+    ];
+
+    expect(mgr.getPersistedDpState("sess-idle")).toEqual({ active: false });
   });
 
   it("returns null when the session dir has no dp-mode entry", () => {

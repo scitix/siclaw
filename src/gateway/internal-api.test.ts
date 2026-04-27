@@ -10,9 +10,11 @@ import {
   handleAgentTasksCreate,
   handleAgentTasksUpdate,
   handleAgentTasksDelete,
+  handleDelegationEvents,
 } from "./internal-api.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
+import { sessionRegistry } from "./session-registry.js";
 
 // ── fakes ─────────────────────────────────────────────────
 
@@ -60,6 +62,7 @@ const identity: CertificateIdentity = {
 
 class FakeFrontendClient {
   calls: Array<{ method: string; params: any }> = [];
+  emitted: Array<{ event: string; payload: any }> = [];
   responses = new Map<string, unknown>();
   nextError: Error | null = null;
   request(method: string, params?: any): Promise<any> {
@@ -70,12 +73,18 @@ class FakeFrontendClient {
     }
     return Promise.resolve(this.responses.get(method) ?? {});
   }
+  emitEvent(event: string, payload: any): void {
+    this.emitted.push({ event, payload });
+  }
 }
 
 let frontend: FakeFrontendClient;
 
 beforeEach(() => {
   frontend = new FakeFrontendClient();
+  sessionRegistry.forget("parent-1");
+  sessionRegistry.forget("parent-other");
+  sessionRegistry.forget("child-1");
 });
 
 // ── handleSettings ────────────────────────────────────────
@@ -357,5 +366,107 @@ describe("handleAgentTasksDelete", () => {
     );
     expect(res.statusCode).toBe(500);
     errSpy.mockRestore();
+  });
+});
+
+// ── delegation persistence ───────────────────────────────
+
+describe("handleDelegationEvents", () => {
+  it("ensures a delegated session with explicit user ownership and lineage", async () => {
+    sessionRegistry.remember("parent-1", "user-1", "agent-1");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-1",
+        userId: "user-1",
+        title: "Delegated investigation",
+        preview: "scope",
+        origin: "delegation",
+        lineage: {
+          parentSessionId: "parent-1",
+          parentAgentId: "agent-1",
+          delegationId: "delegation-1",
+          targetAgentId: "agent-1",
+        },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(frontend.calls[0]).toEqual({
+      method: "chat.ensureSession",
+      params: {
+        session_id: "child-1",
+        agent_id: "agent-1",
+        user_id: "user-1",
+        title: "Delegated investigation",
+        preview: "scope",
+        origin: "delegation",
+        parent_session_id: "parent-1",
+        parent_agent_id: "agent-1",
+        delegation_id: "delegation-1",
+        target_agent_id: "agent-1",
+      },
+    });
+  });
+
+  it("rejects delegated session creation without an explicit userId", async () => {
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-1",
+        userId: "",
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("rejects delegated writes for another agent identity", async () => {
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-2",
+        userId: "user-1",
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls).toHaveLength(0);
+  });
+
+  it("rejects delegated writes targeting a parent session owned by another agent", async () => {
+    sessionRegistry.remember("parent-other", "user-2", "agent-2");
+    const res = new FakeRes();
+    await handleDelegationEvents(
+      asReq(new FakeReq(JSON.stringify({
+        type: "delegation.ensure_session",
+        sessionId: "child-1",
+        agentId: "agent-1",
+        userId: "user-1",
+        lineage: { parentSessionId: "parent-other", parentAgentId: "agent-1", targetAgentId: "agent-1" },
+      }))),
+      asRes(res),
+      identity,
+      frontend as unknown as FrontendWsClient,
+    );
+
+    expect(res.statusCode).toBe(403);
+    expect(frontend.calls).toHaveLength(0);
   });
 });

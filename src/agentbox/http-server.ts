@@ -11,7 +11,6 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
-import { deepSearchEvents } from "../tools/workflow/deep-search/events.js";
 import { loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -40,6 +39,8 @@ interface Route {
  */
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const BODY_TIMEOUT_MS = 30_000; // 30s
+const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
+const DP_EXIT_MARKER = "[DP_EXIT]";
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -80,6 +81,29 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
+function startsDeepInvestigation(text: string): boolean {
+  return text.startsWith(DP_ACTIVATION_MARKER);
+}
+
+function startsDpExit(text: string): boolean {
+  return text.startsWith(`${DP_EXIT_MARKER}\n`) || text.trim() === DP_EXIT_MARKER;
+}
+
+function shouldEnableDelegationTools(
+  text: string,
+  sessionId: string | undefined,
+  sessionManager: AgentBoxSessionManager,
+): boolean {
+  if (startsDpExit(text)) return false;
+  if (startsDeepInvestigation(text)) return true;
+  if (!sessionId) return false;
+
+  const live = sessionManager.get(sessionId)?.dpStateRef?.active;
+  if (live === true) return true;
+
+  return sessionManager.getPersistedDpState(sessionId)?.active === true;
+}
+
 /**
  * Send JSON response
  */
@@ -88,6 +112,33 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+const ABORT_ENDPOINT_TIMEOUT_MS = 2_000;
+
+function waitMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function abortBrainForHttp(
+  brain: { abort: () => Promise<void> | void },
+  sessionId: string,
+): Promise<"done" | "failed" | "timeout"> {
+  const abortPromise = Promise.resolve()
+    .then(() => brain.abort())
+    .then(() => "done" as const)
+    .catch((err) => {
+      console.error(`[agentbox-http] Abort error for session ${sessionId}:`, err);
+      return "failed" as const;
+    });
+
+  const outcome = await Promise.race([
+    abortPromise,
+    waitMs(ABORT_ENDPOINT_TIMEOUT_MS).then(() => "timeout" as const),
+  ]);
+  if (outcome === "timeout") {
+    console.warn(`[agentbox-http] Abort for session ${sessionId} did not settle within ${ABORT_ENDPOINT_TIMEOUT_MS}ms`);
+  }
+  return outcome;
+}
 
 export interface CreateHttpServerOptions {
   /**
@@ -112,11 +163,14 @@ export function createHttpServer(
   // seen by sessions created before it landed.
   // Credential broker: both K8s and Local mode use HTTP to call gateway.
   // SICLAW_GATEWAY_URL is set by K8s env or LocalSpawner process.env injection.
-  if (!sessionManager.credentialBroker) {
+  {
     const credentialsDir = sessionManager.credentialsDir;
     const gatewayUrl = process.env.SICLAW_GATEWAY_URL;
-    if (gatewayUrl) {
-      const client = new GatewayClient({ gatewayUrl });
+    if (gatewayUrl && !sessionManager.gatewayClient) {
+      sessionManager.gatewayClient = new GatewayClient({ gatewayUrl });
+    }
+    if (gatewayUrl && !sessionManager.credentialBroker && sessionManager.gatewayClient) {
+      const client = sessionManager.gatewayClient;
       sessionManager.credentialBroker = new CredentialBroker(new HttpTransport(client), credentialsDir);
       console.log(`[agentbox-http] Credential broker initialized (${gatewayUrl})`);
     }
@@ -244,55 +298,32 @@ export function createHttpServer(
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
-
-    // Dynamically register provider config from gateway DB (before findModel)
-    if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
-      try {
-        managed.brain.registerProvider(body.modelProvider, body.modelConfig);
-        console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
-        // Update LLM config ref so deep_search sub-agents follow the main model
-        const mc = body.modelConfig as Record<string, unknown>;
-        if (mc.baseUrl && mc.apiKey) {
-          managed.llmConfigRef.apiKey = mc.apiKey as string;
-          managed.llmConfigRef.baseUrl = mc.baseUrl as string;
-          if (mc.api) {
-            managed.llmConfigRef.api = mc.api as string;
-          }
-          // Use the specific modelId from the prompt if available
-          if (body.modelId) {
-            managed.llmConfigRef.model = body.modelId as string;
-          }
-          console.log(`[agentbox-http] Updated llmConfigRef: baseUrl=${(mc.baseUrl as string).slice(0, 40)}... model=${managed.llmConfigRef.model}`);
-        }
-      } catch (err) {
-        console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
-      }
+    const enableDelegationTools = shouldEnableDelegationTools(body.text, body.sessionId, sessionManager);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, {
+      enableDelegationTools,
+    });
+    if (!managed._promptDone || managed._promptInflight) {
+      // _promptInflight covers the synthetic-parent-prompt path that may
+      // be holding the brain even when _promptDone has already flipped
+      // back to true momentarily during synth setup. Both must be clear
+      // before a fresh HTTP /prompt can claim brain.prompt().
+      sendJson(res, 409, {
+        error: "Session is already running. Use the steer endpoint to add input to the active prompt.",
+        sessionId: managed.id,
+      });
+      return;
     }
 
-    // Set model if specified in prompt request (ensures model is applied before first prompt)
-    // Always call setModel when the registry model differs from the session model
-    // (covers field changes like reasoning/contextWindow without id/provider change)
-    if (body.modelProvider && body.modelId) {
-      const found = managed.brain.findModel(body.modelProvider, body.modelId);
-      if (found) {
-        const currentModel = managed.brain.getModel();
-        const needsUpdate = !currentModel
-          || currentModel.id !== found.id
-          || currentModel.provider !== found.provider
-          || currentModel.reasoning !== found.reasoning
-          || currentModel.contextWindow !== found.contextWindow
-          || currentModel.maxTokens !== found.maxTokens;
-        if (needsUpdate) {
-          console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
-          await managed.brain.setModel(found);
-        }
-      }
-    }
-
-    // Reset prompt state and start buffering events before async execution
+    // Mark the session busy before model setup so a refresh, second tab, or
+    // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    // Acquire the brain.prompt mutex synchronously before any await so the
+    // synth notify path (which polls _promptDone via waitForParentIdle)
+    // cannot race in and call brain.prompt() concurrently — see jacoblee
+    // #2/#3 in the PR review thread.
+    let releasePromptInflight!: () => void;
+    managed._promptInflight = new Promise<void>((resolve) => { releasePromptInflight = resolve; });
     managed._eventBuffer = [];
     // Unsubscribe previous buffer listener if any
     if (managed._bufferUnsub) {
@@ -305,24 +336,78 @@ export function createHttpServer(
       }
     });
 
-    // Also buffer deep_search progress events (same stream as session events)
-    const deepProgressBufHandler = (event: unknown) => {
-      if (!managed._promptDone) {
-        managed._eventBuffer.push({
-          type: "tool_progress",
-          toolName: "deep_search",
-          progress: event,
-        });
-      }
-    };
-    deepSearchEvents.on("progress", deepProgressBufHandler);
-
     managed._bufferUnsub = () => {
       brainUnsub();
-      deepSearchEvents.off("progress", deepProgressBufHandler);
     };
 
-    let promptText = body.text;
+    // If any setup step throws (setModel network blip, registerProvider edge
+    // case, fs write in profile sync, etc.) before brain.prompt() is kicked
+    // off, _promptDone stays false forever and every subsequent prompt
+    // returns 409 — the session is permanently locked. Run cleanup that
+    // mirrors actuallyFinish (minus diagnostics + scheduleRelease, since the
+    // prompt never actually started) and surface as 500.
+    const releasePromptLockOnSetupFailure = (err: unknown): void => {
+      console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
+      managed._promptDone = true;
+      if (managed._bufferUnsub) {
+        managed._bufferUnsub();
+        managed._bufferUnsub = null;
+      }
+      for (const cb of managed._promptDoneCallbacks) {
+        try { cb(); } catch { /* swallow — best-effort signal */ }
+      }
+      managed._promptDoneCallbacks.clear();
+      // Release the brain.prompt mutex so a follow-up prompt isn't blocked.
+      managed._promptInflight = null;
+      releasePromptInflight();
+      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    };
+
+    let promptText: string;
+    try {
+      if (body.modelProvider || body.modelId || body.modelConfig) {
+        sessionManager.setDelegationModel({
+          provider: body.modelProvider,
+          modelId: body.modelId,
+          config: body.modelConfig,
+        });
+      }
+
+      // Dynamically register provider config from gateway DB (before findModel)
+      if (body.modelConfig && body.modelProvider && managed.brain.registerProvider) {
+        try {
+          managed.brain.registerProvider(body.modelProvider, body.modelConfig);
+          console.log(`[agentbox-http] Registered provider "${body.modelProvider}" from gateway DB config`);
+        } catch (err) {
+          console.warn(`[agentbox-http] Failed to register provider "${body.modelProvider}":`, err instanceof Error ? err.message : err);
+        }
+      }
+
+      // Set model if specified in prompt request (ensures model is applied before first prompt)
+      // Always call setModel when the registry model differs from the session model
+      // (covers field changes like reasoning/contextWindow without id/provider change)
+      if (body.modelProvider && body.modelId) {
+        const found = managed.brain.findModel(body.modelProvider, body.modelId);
+        if (found) {
+          const currentModel = managed.brain.getModel();
+          const needsUpdate = !currentModel
+            || currentModel.id !== found.id
+            || currentModel.provider !== found.provider
+            || currentModel.reasoning !== found.reasoning
+            || currentModel.contextWindow !== found.contextWindow
+            || currentModel.maxTokens !== found.maxTokens;
+          if (needsUpdate) {
+            console.log(`[agentbox-http] Setting model for session ${managed.id}: ${found.provider}/${found.id} (reasoning=${found.reasoning})`);
+            await managed.brain.setModel(found);
+          }
+        }
+      }
+
+      promptText = body.text;
+    } catch (err) {
+      releasePromptLockOnSetupFailure(err);
+      return;
+    }
 
     // --- Language detection: inject explicit instruction so model doesn't guess ---
     // IMPORTANT: append after DP markers, not prepend before them.
@@ -330,8 +415,8 @@ export function createHttpServer(
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     const detectedLang = detectLanguage(body.text);
     if (detectedLang !== "English") {
-      // Find a safe injection point: after DP markers but before the user's actual text
-      const dpMarkers = ["[Deep Investigation]\n", "[DP_EXIT]\n", "[DP_CONFIRM]\n", "[DP_ADJUST]\n", "[DP_REINVESTIGATE]\n", "[DP_SKIP]\n"];
+      // Only two DP markers remain after the refactor: activation and exit.
+      const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
       if (matchedMarker) {
         // Insert language hint after the marker: [Deep Investigation]\n[System: respond in Chinese]\n...
@@ -398,6 +483,12 @@ export function createHttpServer(
         cb();
       }
       managed._promptDoneCallbacks.clear();
+
+      // Release the brain.prompt mutex so any queued synth notify or the
+      // next HTTP /prompt can proceed. Promise.resolve() is idempotent
+      // per spec — re-calling on an already-resolved promise is a no-op.
+      managed._promptInflight = null;
+      releasePromptInflight();
 
       // Schedule delayed release — gives frontend time to query context/model
       // after SSE closes. If a new prompt arrives before the TTL, the timer is
@@ -499,6 +590,13 @@ export function createHttpServer(
     for (const event of managed._eventBuffer) {
       writeEvent(event);
     }
+    // Replay extra (tool-pushed) events that arrived before SSE connected.
+    // These are tagged events like { type: "subagent_event", ... } from
+    // the delegate_to_agent[s] sub-agent bridge.
+    for (const event of managed._extraEventBuffer) {
+      writeEvent(event);
+    }
+    managed._extraEventBuffer.length = 0;
 
     // If prompt already finished before SSE connected, close immediately
     if (managed._promptDone) {
@@ -506,6 +604,12 @@ export function createHttpServer(
       closeSSE();
       return;
     }
+
+    // Subscribe to the session's extra event bus (tool-pushed events — see
+    // ToolRefs.sessionEventEmitter). Unsubscribed alongside the brain
+    // subscription in unsubAll below.
+    const extraSub = (event: Record<string, unknown>) => writeEvent(event);
+    managed._extraEventSubs.add(extraSub);
 
     // Subscribe to Agent events (live, after buffer replay)
     const unsubscribe = managed.brain.subscribe((event: any) => {
@@ -533,16 +637,6 @@ export function createHttpServer(
       writeEvent(event);
     });
 
-    // Also forward deep_search progress events as tool_progress SSE events
-    const deepProgressSSEHandler = (event: unknown) => {
-      writeEvent({
-        type: "tool_progress",
-        toolName: "deep_search",
-        progress: event,
-      });
-    };
-    deepSearchEvents.on("progress", deepProgressSSEHandler);
-
     // Heartbeat: send SSE comment every 30s to keep connection alive
     // during long agent thinking periods (prevents proxy/fetch body timeouts)
     const heartbeat = setInterval(() => {
@@ -560,7 +654,7 @@ export function createHttpServer(
     // Cleanup helper: unsubscribe from all event sources
     const unsubAll = () => {
       unsubscribe();
-      deepSearchEvents.off("progress", deepProgressSSEHandler);
+      managed._extraEventSubs.delete(extraSub);
     };
 
     // Decrement SSE counter and check idle (called once per SSE lifecycle)
@@ -633,25 +727,19 @@ export function createHttpServer(
   });
 
   /**
-   * GET /api/sessions/:sessionId/dp-state - read DP investigation state for recovery
+   * GET /api/sessions/:sessionId/dp-state — read DP mode flag for recovery.
    *
-   * Returns the current dpStateRef (live mirror of persisted dp-mode entries).
-   * Used by gateway's chat.dpProgress to provide authoritative recovery data.
+   * Simplified after the DP refactor: returns just `{active: boolean}` (or
+   * the legacy `{dpStatus}` shape if the session was persisted before the
+   * refactor, for one-migration transparency).
    */
   addRoute("GET", "/api/sessions/:sessionId/dp-state", async (_req, res, params) => {
     const { sessionId } = params;
     const managed = sessionManager.get(sessionId);
 
-    if (managed) {
-      if (managed.dpStateRef) {
-        sendJson(res, 200, {
-          dpStatus: managed.dpStateRef.status,
-          question: managed.dpStateRef.question,
-          round: managed.dpStateRef.round,
-          confirmedHypotheses: managed.dpStateRef.confirmedHypotheses,
-        });
-        return;
-      }
+    if (managed?.dpStateRef) {
+      sendJson(res, 200, { active: managed.dpStateRef.active });
+      return;
     }
 
     const persisted = sessionManager.getPersistedDpState(sessionId);
@@ -660,7 +748,7 @@ export function createHttpServer(
       return;
     }
 
-    sendJson(res, 200, { dpStatus: "idle" });
+    sendJson(res, 200, { active: false });
   });
 
   /**
@@ -695,13 +783,22 @@ export function createHttpServer(
     console.log(`[agentbox-http] Aborting session ${sessionId} (abort endpoint called)`);
     console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
-    try {
-      await managed.brain.abort();
-      sendJson(res, 200, { ok: true });
-    } catch (err) {
-      console.error(`[agentbox-http] Abort error for session ${sessionId}:`, err);
-      sendJson(res, 500, { error: "Abort failed" });
+
+    // Cascade abort to in-flight delegation batches: without this, sub-agents
+    // continue running for up to DELEGATED_AGENT_MAX_RUNTIME_MS (10 min) and
+    // their capsule rows land in chat history after the user already hit stop.
+    for (const controls of managed._activeDelegationControls) {
+      for (const control of controls) {
+        try { control.forceStop?.(); } catch { /* swallow — best-effort cascade */ }
+      }
     }
+
+    const outcome = await abortBrainForHttp(managed.brain, sessionId);
+    if (outcome === "failed") {
+      sendJson(res, 500, { error: "Abort failed" });
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...(outcome === "timeout" ? { pending: true } : {}) });
   });
 
   /**

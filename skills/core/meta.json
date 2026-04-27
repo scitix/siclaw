@@ -1,7 +1,6 @@
 {
   "labels": {
     "cluster-events":           ["kubernetes", "general",  "diagnostic", "sre", "developer"],
-    "deep-investigation":       ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "deployment-rollout-debug": ["kubernetes", "general",  "diagnostic", "sre", "developer"],
     "dns-debug":                ["kubernetes", "network",  "diagnostic", "sre", "developer"],
     "find-node":                ["kubernetes", "general",  "diagnostic", "sre", "developer"],

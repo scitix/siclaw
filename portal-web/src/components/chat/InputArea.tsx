@@ -1,5 +1,5 @@
-import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check } from "lucide-react"
-import type { ContextUsage } from "./types"
+import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check, ArrowRight, PencilLine, FileText } from "lucide-react"
+import type { ContextUsage, PrefixActionChip } from "./types"
 import { useState, useCallback, useRef, useEffect } from "react"
 import type { KeyboardEvent } from "react"
 import { cn } from "./cn"
@@ -17,16 +17,18 @@ function formatCost(cost: number): string {
   return "$" + cost.toFixed(2)
 }
 
-/**
- * A canned prompt presented as an atomic pill in the input area.
- * The user cannot edit label text; they type follow-up detail after it and
- * fullPrompt is expanded on send.
- */
-export interface PrefixChip {
-  id: string
-  label: string
-  fullPrompt: string
-  placeholder?: string
+function PrefixChipIcon({ chip }: { chip: PrefixActionChip }) {
+  const label = chip.label.toLowerCase()
+  if (label.includes("refine") || label.includes("adjust")) {
+    return <PencilLine className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("summarize") || label.includes("summary")) {
+    return <FileText className="w-3.5 h-3.5 text-purple-500" />
+  }
+  if (label.includes("proceed")) {
+    return <ArrowRight className="w-3.5 h-3.5 text-purple-500" />
+  }
+  return <SearchCode className="w-3.5 h-3.5 text-purple-500" />
 }
 
 interface InputAreaProps {
@@ -37,13 +39,12 @@ interface InputAreaProps {
   contextUsage?: ContextUsage | null
   pendingMessages?: string[]
   onRemovePending?: (index: number) => void
-  dpFocus?: string | null
   dpActive?: boolean
   onSetDpActive?: (active: boolean) => void
   hasMessages?: boolean
   draft?: string | null
   draftSeq?: number
-  activePrefix?: PrefixChip | null
+  activePrefix?: PrefixActionChip | null
   onClearPrefix?: () => void
 }
 
@@ -55,7 +56,6 @@ export function InputArea({
   contextUsage,
   pendingMessages,
   onRemovePending,
-  dpFocus,
   dpActive,
   onSetDpActive,
   hasMessages,
@@ -105,6 +105,10 @@ export function InputArea({
       fullMessage += "[Deep Investigation]\n"
     }
     if (activePrefix) {
+      // Prepend a chip marker so the frontend can re-derive which chip was
+      // used when rendering past messages (hiding the long fullPrompt), and
+      // the backend can strip it before forwarding to the agent.
+      fullMessage += `[${activePrefix.label}]\n`
       fullMessage += activePrefix.fullPrompt
       if (text) fullMessage += `\n\nAdditional direction from user: ${text}`
     } else {
@@ -187,36 +191,31 @@ export function InputArea({
                   </>
                 )}
               </div>
+
+              {/* Deep Investigation active indicator — only rendered when DP is on.
+                  Activation stays in the `+` menu to prevent accidental enable;
+                  clicking this icon turns DP off. */}
+              {deepInvestigation && (
+                <button
+                  type="button"
+                  onClick={() => setDeepInvestigation(false)}
+                  disabled={disabled}
+                  className="p-1.5 rounded-lg transition-colors disabled:opacity-50 text-blue-500 bg-blue-500/15 hover:bg-blue-500/25"
+                  title="Deep Investigation on (click to turn off)"
+                >
+                  <SearchCode className="w-4 h-4" />
+                </button>
+              )}
+
               <div className="ml-auto flex items-center gap-3 shrink-0" />
             </div>
 
-            {/* Mode chips */}
-            {deepInvestigation && (
-              <div className="flex flex-wrap gap-2 px-4 pb-1">
-                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-blue-500/10 border-blue-500/30 text-blue-400">
-                  <SearchCode className="w-3.5 h-3.5 text-blue-500" />
-                  <span>Deep Investigation</span>
-                  {dpFocus && (
-                    <span className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 text-[10px] font-semibold uppercase">
-                      {dpFocus.replace(/_/g, " ")}
-                    </span>
-                  )}
-                  <button
-                    type="button"
-                    className="ml-0.5 p-0.5 rounded hover:bg-blue-500/20 transition-colors"
-                    onClick={() => setDeepInvestigation(false)}
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </div>
-              </div>
-            )}
 
             {/* Prefix chip — canned prompt presented as atomic pill */}
             {activePrefix && (
               <div className="flex flex-wrap gap-2 px-4 pb-1">
                 <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium bg-purple-500/10 border-purple-500/30 text-purple-400">
-                  <SearchCode className="w-3.5 h-3.5 text-purple-500" />
+                  <PrefixChipIcon chip={activePrefix} />
                   <span>{activePrefix.label}</span>
                   <button
                     type="button"

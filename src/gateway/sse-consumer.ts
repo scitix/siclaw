@@ -12,7 +12,7 @@
  */
 
 import { AgentBoxClient } from "./agentbox/client.js";
-import { appendMessage, incrementMessageCount } from "./chat-repo.js";
+import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
 
 // ── Public types ────────────────────────────────────
@@ -75,10 +75,9 @@ function stripEmptyResponseMarkers(text: string): string {
  * Pick the subset of tool-result `details` worth persisting as message
  * metadata. The `blocked`/`error` flags are already surfaced via the message's
  * `outcome` column — dropping them here avoids duplicate storage. Anything
- * else (e.g. `propose_hypotheses`'s `hypotheses` array, `deep_search`'s rich
- * per-hypothesis validation results) is passed through so the UI can rebuild
- * cards like InvestigationCard on history reload without the ephemeral live
- * stream.
+ * else (structured data a tool attaches to its result) is passed through so
+ * the UI can rebuild from the DB row on history reload without depending on
+ * the ephemeral live stream.
  *
  * Redaction is applied via a JSON round-trip so patterns hit string values
  * nested inside arrays/objects. If redaction somehow produces invalid JSON
@@ -106,6 +105,20 @@ function extractPersistableDetails(
   }
 }
 
+function pushPending<T>(map: Map<string, T[]>, key: string, value: T): void {
+  const queue = map.get(key);
+  if (queue) queue.push(value);
+  else map.set(key, [value]);
+}
+
+function shiftPending<T>(map: Map<string, T[]>, key: string): T | undefined {
+  const queue = map.get(key);
+  if (!queue) return undefined;
+  const value = queue.shift();
+  if (queue.length === 0) map.delete(key);
+  return value;
+}
+
 export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<SseConsumptionResult> {
   const { client, sessionId, userId, onEvent, signal } = opts;
   const persist = opts.persistMessages === true;
@@ -118,9 +131,12 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   let errorMessage = "";
   let lastToolName = "";
 
-  // Keyed by toolName to handle parallel tool calls
-  const pendingToolInputs = new Map<string, string>();
-  const pendingToolStartTimes = new Map<string, number>();
+  // Queued by toolName. pi-agent events do not always expose a stable call id,
+  // so this preserves multiple same-name starts across refresh persistence in
+  // the order the runtime emits them.
+  const pendingToolInputs = new Map<string, string[]>();
+  const pendingToolStartTimes = new Map<string, number[]>();
+  const pendingToolMessageIds = new Map<string, string[]>();
 
   let eventCount = 0;
   const startTime = Date.now();
@@ -159,26 +175,32 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (toolResult?.details?.blocked) outcome = "blocked";
       else if (toolResult?.details?.error) outcome = "error";
 
-      const toolStartTime = pendingToolStartTimes.get(toolName);
+      const toolStartTime = shiftPending(pendingToolStartTimes, toolName);
       const durationMs = toolStartTime != null ? Date.now() - toolStartTime : undefined;
-      const toolInput = pendingToolInputs.get(toolName) || "";
+      const toolInput = shiftPending(pendingToolInputs, toolName) || "";
+      const existingMessageId = shiftPending(pendingToolMessageIds, toolName);
       const metadata = extractPersistableDetails(toolResult?.details, redactionConfig);
+      const delegationId = typeof metadata?.delegation_id === "string" ? metadata.delegation_id : null;
 
       if (persist) {
-        dbMessageId = await appendMessage({
+        const payload = {
           sessionId,
-          role: "tool",
           content: redactText(text, redactionConfig),
           toolName,
           toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
           outcome,
           durationMs: durationMs ?? null,
           metadata,
-        });
-        await incrementMessageCount(sessionId);
+          delegationId,
+        };
+        if (existingMessageId) {
+          await updateMessage({ ...payload, messageId: existingMessageId });
+          dbMessageId = existingMessageId;
+        } else {
+          dbMessageId = await appendMessage({ ...payload, role: "tool" });
+          await incrementMessageCount(sessionId);
+        }
       }
-      pendingToolInputs.delete(toolName);
-      pendingToolStartTimes.delete(toolName);
 
       // task_report detection — use toolName from this event, not lastToolName
       // (lastToolName tracks the last *started* tool, unreliable with parallel calls)
@@ -205,9 +227,28 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (eventType === "tool_execution_start" || eventType === "tool_start") {
       const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
       const args = evt.args as Record<string, unknown> | undefined;
-      pendingToolInputs.set(startToolName, args ? JSON.stringify(args) : "");
-      pendingToolStartTimes.set(startToolName, Date.now());
+      const rawToolInput = args ? JSON.stringify(args) : "";
+      pushPending(pendingToolInputs, startToolName, rawToolInput);
+      pushPending(pendingToolStartTimes, startToolName, Date.now());
       lastToolName = startToolName;
+
+      if (persist) {
+        dbMessageId = await appendMessage({
+          sessionId,
+          role: "tool",
+          content: "",
+          toolName: startToolName,
+          toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
+          outcome: null,
+          durationMs: null,
+          metadata: {
+            status: "running",
+            started_at: new Date().toISOString(),
+          },
+        });
+        pushPending(pendingToolMessageIds, startToolName, dbMessageId);
+        await incrementMessageCount(sessionId);
+      }
     }
 
     // ── message_end / turn_end: persist assistant message + extract result ──

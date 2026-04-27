@@ -88,7 +88,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 
 **Types:** `feat`, `fix`, `refactor`, `docs`, `chore`, `test`, `perf`, `ci`
 
-**Scope** (optional): the module affected — e.g. `deep-search`, `gateway`, `agentbox`, `tui`, `tools`, `memory`, `skills`
+**Scope** (optional): the module affected — e.g. `gateway`, `agentbox`, `tui`, `tools`, `memory`, `skills`, `portal-web`
 
 **Rules:**
 - Subject line: imperative mood, lowercase, no period, ≤72 characters
@@ -98,14 +98,15 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 **Examples:**
 
 ```
-feat(deep-search): add adaptive budget for quick investigations
+feat(portal-web): add Pause/Activate button to task run-history page
 
 fix(gateway): prevent session leak on WebSocket disconnect
 
-refactor(tools): remove blocking gate from DP workflow
+refactor(core): collapse DP state machine into a single mode flag
 
-The gate mechanism caused state desync between checklist and execution
-when WebSocket connections dropped mid-investigation.
+The old state machine (investigating / awaiting_confirmation / validating
+/ concluding) coupled four layers — prompt markers, tools, SSE events,
+and UI cards. Reducing to a boolean eliminates the coupling surface.
 ```
 
 ## Pull Request Guidelines

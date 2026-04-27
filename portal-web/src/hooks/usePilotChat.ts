@@ -11,14 +11,11 @@ import { api, chatSteer, chatAbort } from "../api"
 import type {
   PilotMessage,
   ContextUsage,
-  InvestigationProgress,
-  InvestigationHypothesisProgress,
-  DpChecklistItem,
 } from "../components/chat/types"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText } from "./steer-pending"
 
 // Re-export types for convenience
-export type { PilotMessage, ContextUsage, InvestigationProgress, DpChecklistItem }
+export type { PilotMessage, ContextUsage }
 
 interface ChatSession {
   id: string
@@ -37,6 +34,10 @@ interface ChatMessage {
   duration_ms?: number
   metadata?: Record<string, unknown>
   hidden?: boolean
+  from_agent_id?: string | null
+  parent_session_id?: string | null
+  delegation_id?: string | null
+  target_agent_id?: string | null
   created_at: string
 }
 
@@ -49,10 +50,7 @@ interface UsePilotChatReturn {
   messages: PilotMessage[]
   streaming: boolean
   streamText: string
-  dpProgress: InvestigationProgress | null
-  dpChecklist: DpChecklistItem[] | null
   dpActive: boolean
-  dpFocus: string | null
   contextUsage: ContextUsage | null
   isCompacting: boolean
   pendingMessages: string[]
@@ -65,8 +63,19 @@ interface UsePilotChatReturn {
   setDpActive: (active: boolean) => void
   removePending: (index: number) => void
   exitDp: () => void
-  onHypothesesConfirmed: (hypotheses: Array<{ id: string; text: string; confidence: number }>) => void
 }
+
+const DELEGATED_TOOL_STALE_MS = 4 * 60 * 1000
+// Generic stale window for non-delegation tools (kubectl, skill, etc.).
+// `tool_execution_start` now persists a "running" row eagerly; if the
+// gateway/agentbox restarts or the SSE stream drops before
+// `tool_execution_end` lands, the row stays outcome=null forever and the
+// frontend shows a permanently-spinning card on reload. 30 min is far
+// above any realistic non-delegation tool runtime — kubectl reads finish
+// in seconds, skill scripts have their own timeouts well under 30 min.
+const NON_DELEGATION_TOOL_STALE_MS = 30 * 60 * 1000
+const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"])
+const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents"])
 
 /** Format tool args into a readable one-liner for display */
 function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
@@ -127,15 +136,20 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
   if (name === "skill_preview") {
     return (args.dir as string)?.split("/").pop() || ""
   }
+  if (name === "delegate_to_agents") {
+    const tasks = Array.isArray(args.tasks) ? args.tasks : []
+    const count = tasks.length
+    const firstScope = tasks
+      .map((task) => typeof task === "object" && task ? (task as Record<string, unknown>).scope : undefined)
+      .find((scope) => typeof scope === "string" && scope.length > 0) as string | undefined
+    return firstScope ? `${count} sub-agent tasks · ${firstScope}` : `${count} sub-agent tasks`
+  }
   if (name === "local_script") {
     const skill = (args.skill as string) || ""
     const script = (args.script as string) || ""
     const skillArgs = (args.args as string) || ""
     const parts = [skill, script].filter(Boolean).join("/")
     return skillArgs ? `${parts} ${skillArgs}` : parts
-  }
-  if (name === "deep_search") {
-    return (args.question as string) || ""
   }
   if (name === "update_plan") {
     const step = args.step as number | undefined
@@ -148,78 +162,6 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
 }
 
 /** Reduce individual progress events into accumulated investigation state */
-function reduceInvestigationProgress(
-  state: InvestigationProgress,
-  event: Record<string, unknown>,
-): InvestigationProgress {
-  const next = { ...state, hypotheses: [...state.hypotheses] }
-
-  switch (event.type) {
-    case "phase":
-      next.phase = event.phase as string
-      if (event.detail) next.currentAction = event.detail as string
-      break
-
-    case "hypothesis": {
-      const id = event.id as string
-      const idx = next.hypotheses.findIndex((h) => h.id === id)
-      const update: InvestigationHypothesisProgress = {
-        id,
-        text: (event.text as string) || (idx >= 0 ? next.hypotheses[idx].text : ""),
-        status: event.status as string,
-        confidence: event.confidence as number,
-        callsUsed: idx >= 0 ? next.hypotheses[idx].callsUsed : 0,
-        maxCalls: idx >= 0 ? next.hypotheses[idx].maxCalls : 10,
-      }
-      if (idx >= 0) {
-        next.hypotheses[idx] = { ...next.hypotheses[idx], ...update }
-      } else {
-        next.hypotheses.push(update)
-      }
-      break
-    }
-
-    case "tool_exec": {
-      const hId = event.hypothesisId as string | undefined
-      const callsUsed = event.callsUsed as number
-      const maxCalls = event.maxCalls as number
-      const tool = event.tool as string
-      const command = event.command as string
-      const cmdShort = command.length > 60 ? command.slice(0, 57) + "..." : command
-      next.currentAction = `${hId ? hId + " " : ""}[${callsUsed}/${maxCalls}] ${tool}: ${cmdShort}`
-      if (hId) {
-        const idx = next.hypotheses.findIndex((h) => h.id === hId)
-        if (idx >= 0) {
-          next.hypotheses[idx] = {
-            ...next.hypotheses[idx],
-            callsUsed,
-            maxCalls,
-            lastAction: `[${callsUsed}/${maxCalls}] ${tool}: ${cmdShort}`,
-            status: next.hypotheses[idx].status === "pending" ? "validating" : next.hypotheses[idx].status,
-          }
-        }
-      }
-      break
-    }
-
-    case "budget_exhausted": {
-      const hId = event.hypothesisId as string | undefined
-      if (hId) {
-        const idx = next.hypotheses.findIndex((h) => h.id === hId)
-        if (idx >= 0) {
-          next.hypotheses[idx] = {
-            ...next.hypotheses[idx],
-            callsUsed: event.callsUsed as number,
-          }
-        }
-      }
-      break
-    }
-  }
-
-  return next
-}
-
 function timeNow(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
@@ -228,14 +170,229 @@ function tryParseJson(s: string): Record<string, unknown> | undefined {
   try { return JSON.parse(s) } catch { return undefined }
 }
 
+function normalizeMetadata(value: unknown): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  if (typeof value === "string") return tryParseJson(value);
+  if (typeof value === "object") return value as Record<string, unknown>;
+  return undefined;
+}
+
+export function parsePortalTimestamp(value: string): number {
+  // SQLite CURRENT_TIMESTAMP returns UTC as "YYYY-MM-DD HH:mm:ss" without a
+  // timezone. Browsers parse that shape as local time, which makes fresh
+  // running tool rows look hours old in non-UTC timezones.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)) {
+    return Date.parse(`${value.replace(" ", "T")}Z`)
+  }
+  return Date.parse(value)
+}
+
+function formatPortalTimestamp(value: string): string {
+  const parsed = parsePortalTimestamp(value)
+  if (!Number.isFinite(parsed)) return ""
+  return new Date(parsed).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function isStaleRunningTool(m: ChatMessage): boolean {
+  if (m.role !== "tool") return false
+  if (m.outcome) return false
+  const createdAt = parsePortalTimestamp(m.created_at)
+  if (!Number.isFinite(createdAt)) return false
+  let staleMs: number
+  if (m.tool_name && ASYNC_DELEGATED_TOOL_NAMES.has(m.tool_name)) {
+    staleMs = 15 * 60 * 1000
+  } else if (m.tool_name && DELEGATED_TOOL_NAMES.has(m.tool_name)) {
+    staleMs = DELEGATED_TOOL_STALE_MS
+  } else {
+    staleMs = NON_DELEGATION_TOOL_STALE_MS
+  }
+  return Date.now() - createdAt > staleMs
+}
+
+function isDelegationTool(toolName?: string | null): boolean {
+  return Boolean(toolName && DELEGATED_TOOL_NAMES.has(toolName))
+}
+
+function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
+  if (m.role !== "tool") return undefined;
+  if (isStaleRunningTool(m)) return "error";
+  if (m.outcome === "error" || m.outcome === "blocked") return "error";
+  if (m.outcome === "success") return "success";
+  return "running";
+}
+
+function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): number {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (predicate(items[i])) return i;
+  }
+  return -1;
+}
+
+function toPilotMessage(m: ChatMessage): PilotMessage {
+  const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
+  const metadata = normalizeMetadata(m.metadata)
+  const isDelegationEvent = metadata?.kind === "delegation_event"
+  const staleRunning = isStaleRunningTool(m)
+  const toolIsDelegation = isDelegationTool(m.tool_name)
+  const toolStatus = toolStatusFromMessage(m)
+  const recoveredMetadata = staleRunning
+    ? {
+        ...(metadata ?? {}),
+        status: "timed_out",
+        recovery_reason: toolIsDelegation ? "stale_delegation_tool" : "stale_running_tool",
+      }
+    : metadata
+  return {
+    id: m.id,
+    role: m.role,
+    content: staleRunning && !m.content?.trim()
+      ? (toolIsDelegation
+          ? "Delegated investigation did not finish before the recovery window. It may have timed out or been interrupted."
+          : "Tool execution did not finish before the recovery window. It may have timed out or been interrupted.")
+      : m.content,
+    toolName: m.tool_name,
+    toolArgs,
+    toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
+    toolStatus,
+    metadata: recoveredMetadata,
+    hidden: m.hidden || isDelegationEvent,
+    fromAgentId: m.from_agent_id ?? null,
+    parentSessionId: m.parent_session_id ?? null,
+    delegationId: m.delegation_id ?? null,
+    targetAgentId: m.target_agent_id ?? null,
+    timestamp: formatPortalTimestamp(m.created_at),
+    isStreaming: toolStatus === "running",
+  }
+}
+
+function hasRunningPersistedMessages(messages: PilotMessage[]): boolean {
+  return messages.some((m) =>
+    m.role === "tool" &&
+    !ASYNC_DELEGATED_TOOL_NAMES.has(m.toolName ?? "") &&
+    (m.toolStatus === "running" || m.isStreaming),
+  )
+}
+
+function isRunningAsyncDelegationMessage(m: PilotMessage): boolean {
+  if (m.role !== "tool" || !ASYNC_DELEGATED_TOOL_NAMES.has(m.toolName ?? "")) return false
+  if (m.toolStatus === "error") return false
+  const parsedContent = m.content ? tryParseJson(m.content) : undefined
+  const status = (m.metadata?.status as string | undefined) ?? (parsedContent?.status as string | undefined)
+  return status === "running" || m.toolStatus === "running" || !!m.isStreaming
+}
+
+function hasRunningAsyncDelegationMessages(messages: PilotMessage[]): boolean {
+  return messages.some(isRunningAsyncDelegationMessage)
+}
+
+function messageString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function messageNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function messageDelegationId(message: PilotMessage): string | undefined {
+  if (message.delegationId) return message.delegationId
+  const metadataId = messageString(message.metadata?.delegation_id)
+  if (metadataId) return metadataId
+  const parsedContent = message.content ? tryParseJson(message.content) : undefined
+  return messageString(parsedContent?.delegation_id)
+}
+
+function delegationResultsReadyLabel(toolMessage: PilotMessage, eventMessage?: PilotMessage): string {
+  const parsedContent = toolMessage.content ? tryParseJson(toolMessage.content) : undefined
+  const tasks = Array.isArray(parsedContent?.tasks) ? parsedContent.tasks : []
+  const total =
+    messageNumber(eventMessage?.metadata?.total_tasks) ??
+    messageNumber(toolMessage.metadata?.total_tasks) ??
+    tasks.length
+  const completed =
+    messageNumber(eventMessage?.metadata?.completed_tasks) ??
+    messageNumber(toolMessage.metadata?.completed_tasks) ??
+    total
+  return total > 0
+    ? `${completed}/${total} results ready · Siclaw is synthesizing`
+    : "Results ready · Siclaw is synthesizing"
+}
+
+function isBatchCompleteDelegationEvent(message: PilotMessage, delegationId: string): boolean {
+  return (
+    message.metadata?.kind === "delegation_event" &&
+    message.metadata?.event_type === "delegation.batch_complete" &&
+    messageDelegationId(message) === delegationId
+  )
+}
+
+function annotateDelegationSynthesis(messages: PilotMessage[]): PilotMessage[] {
+  let next: PilotMessage[] | null = null
+  const updateAt = (index: number, message: PilotMessage) => {
+    if (!next) next = [...messages]
+    next[index] = message
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (message.role !== "tool" || message.toolName !== "delegate_to_agents") continue
+
+    const delegationId = messageDelegationId(message)
+    const existingMetadata = message.metadata ?? {}
+    if (!delegationId) {
+      if (existingMetadata.ui_state === "synthesizing" || existingMetadata.ui_status) {
+        const { ui_state: _state, ui_status: _status, ...metadata } = existingMetadata
+        updateAt(i, { ...message, metadata })
+      }
+      continue
+    }
+
+    const eventIndex = messages.findIndex((candidate, index) =>
+      index > i && isBatchCompleteDelegationEvent(candidate, delegationId),
+    )
+    const hasSyntheticReply =
+      eventIndex >= 0 &&
+      messages.slice(eventIndex + 1).some((candidate) => candidate.role === "assistant" && !candidate.hidden)
+    const shouldShowSynthesizing = eventIndex >= 0 && !hasSyntheticReply
+    const uiStatus = shouldShowSynthesizing
+      ? delegationResultsReadyLabel(message, messages[eventIndex])
+      : undefined
+
+    if (shouldShowSynthesizing) {
+      if (
+        existingMetadata.ui_state !== "synthesizing" ||
+        existingMetadata.ui_status !== uiStatus
+      ) {
+        updateAt(i, {
+          ...message,
+          metadata: {
+            ...existingMetadata,
+            ui_state: "synthesizing",
+            ui_status: uiStatus,
+          },
+        })
+      }
+    } else if (existingMetadata.ui_state === "synthesizing" || existingMetadata.ui_status) {
+      const { ui_state: _state, ui_status: _status, ...metadata } = existingMetadata
+      updateAt(i, { ...message, metadata })
+    }
+  }
+
+  return next ?? messages
+}
+
+function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
+  return messages.some((message) => message.metadata?.ui_state === "synthesizing")
+}
+
+function hasActiveAsyncDelegationSurface(messages: PilotMessage[]): boolean {
+  return hasRunningAsyncDelegationMessages(messages) || hasPendingDelegationSynthesis(messages)
+}
+
 export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePilotChatReturn {
   const [messages, setMessages] = useState<PilotMessage[]>([])
   const [streaming, setStreaming] = useState(false)
   const [streamText, setStreamText] = useState("")
-  const [dpProgress, setDpProgress] = useState<InvestigationProgress | null>(null)
-  const [dpChecklist, setDpChecklist] = useState<DpChecklistItem[] | null>(null)
   const [dpActive, setDpActive] = useState(false)
-  const [dpFocus, setDpFocus] = useState<string | null>(null)
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const [pendingMessages, setPendingMessages] = useState<string[]>([])
   const [hasMore, setHasMore] = useState(true)
@@ -244,29 +401,25 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
   const abortControllerRef = useRef<AbortController | null>(null)
   const streamingRef = useRef(false)
+  const recoveredStreamingRef = useRef(false)
   const isAbortingRef = useRef(false)
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
+  const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
 
   // Per-session state cache: preserves ALL state across session switches so each
   // agent's conversation feels independent — like browser tabs.
   interface SessionCache {
     messages: PilotMessage[]
     streaming: boolean
-    dpProgress: InvestigationProgress | null
-    dpChecklist: DpChecklistItem[] | null
     dpActive: boolean
-    dpFocus: string | null
     contextUsage: ContextUsage | null
   }
   const messagesCacheRef = useRef<Map<string, SessionCache>>(new Map())
   const prevSessionIdRef = useRef<string | undefined>(undefined)
 
-  // Reset DP state
+  // Reset DP mode flag. Kept as its own callback for the useEffect deps below.
   const resetDpState = useCallback(() => {
-    setDpChecklist(null)
-    setDpFocus(null)
-    setDpProgress(null)
     setDpActive(false)
   }, [])
 
@@ -278,7 +431,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     const prev = prevSessionIdRef.current
     if (prev) {
       messagesCacheRef.current.set(prev, {
-        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+        messages, streaming, dpActive, contextUsage,
       })
     }
     prevSessionIdRef.current = sessionId ?? undefined
@@ -288,6 +441,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages([])
       setStreaming(false)
       streamingRef.current = false
+      recoveredStreamingRef.current = false
       setContextUsage(null)
       setHasMore(true)
       pageRef.current = 1
@@ -303,22 +457,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages(cached.messages)
       setStreaming(true)
       streamingRef.current = true
-      setDpProgress(cached.dpProgress)
-      setDpChecklist(cached.dpChecklist)
+      recoveredStreamingRef.current = false
       setDpActive(cached.dpActive)
-      setDpFocus(cached.dpFocus)
       setContextUsage(cached.contextUsage)
       setHasMore(true)
       return
     }
-    // Restore DP state from cache if available (even when loading messages from DB)
     if (cached) {
-      setDpProgress(cached.dpProgress)
-      setDpChecklist(cached.dpChecklist)
       setDpActive(cached.dpActive)
-      setDpFocus(cached.dpFocus)
       setContextUsage(cached.contextUsage)
     } else {
+      // No cache (first visit / page reload) — fetch persisted dp-state below.
+      // Pre-set false as neutral default in case the fetch fails.
       resetDpState()
     }
 
@@ -332,28 +482,40 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         )
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
         if (cancelled) return
-        const pilotMsgs: PilotMessage[] = items.map((m) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-          toolName: m.tool_name,
-          toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
-          toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
-          metadata: m.metadata,
-          hidden: m.hidden,
-          timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        }))
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
+        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
+        const recoveredActive = hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
+        setStreaming(recoveredActive)
+        streamingRef.current = recoveredActive
+        recoveredStreamingRef.current = hasRunning
         setHasMore(items.length >= PAGE_SIZE)
       } catch (err) {
         console.error("[usePilotChat] Failed to load messages:", err)
         if (!cancelled) {
           setMessages([])
+          setStreaming(false)
+          streamingRef.current = false
+          recoveredStreamingRef.current = false
           setHasMore(false)
         }
       }
     }
+    // Restore persisted DP mode from the backend marker history. Only runs
+    // on cache miss (first visit / page reload); a cache hit above already
+    // reflected the last known state. Failures fall back to the reset-default.
+    async function loadDpState() {
+      try {
+        const { active } = await api<{ active: boolean }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/dp-state`,
+        )
+        if (!cancelled) setDpActive(!!active)
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to load dp-state:", err)
+      }
+    }
     loadHistory()
+    if (!cached) loadDpState()
     return () => { cancelled = true }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentId, sessionId, resetDpState])
@@ -362,10 +524,110 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   useEffect(() => {
     if (sessionId) {
       messagesCacheRef.current.set(sessionId, {
-        messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage,
+        messages, streaming, dpActive, contextUsage,
       })
     }
-  }, [sessionId, messages, streaming, dpProgress, dpChecklist, dpActive, dpFocus, contextUsage])
+  }, [sessionId, messages, streaming, dpActive, contextUsage])
+
+  // A page reload drops the browser's live SSE reader, but the runtime can
+  // keep the prompt running and continue persisting tool rows. When history
+  // contains a running persisted tool, keep the input in steer/abort mode and
+  // poll the DB until the recovered run has visibly settled.
+  useEffect(() => {
+    if (!sessionId || !streaming || !recoveredStreamingRef.current) return
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let settledPolls = 0
+
+    async function refreshRecoveredRun() {
+      try {
+        const res = await api<{ data: ChatMessage[] }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
+        )
+        if (cancelled) return
+        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
+        const hasRunning = hasRunningPersistedMessages(pilotMsgs)
+        const latest = pilotMsgs[pilotMsgs.length - 1]
+
+        setMessages(pilotMsgs)
+        setHasMore(items.length >= PAGE_SIZE)
+
+        if (hasRunning) {
+          settledPolls = 0
+        } else if (latest?.role === "assistant") {
+          settledPolls += 1
+        } else {
+          settledPolls = 0
+        }
+
+        if (!hasRunning && settledPolls >= 2) {
+          recoveredStreamingRef.current = false
+          setStreaming(false)
+          streamingRef.current = false
+          setPendingMessages([])
+          return
+        }
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to refresh recovered run:", err)
+      }
+
+      if (!cancelled) timer = setTimeout(refreshRecoveredRun, 2000)
+    }
+
+    timer = setTimeout(refreshRecoveredRun, 1000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [agentId, sessionId, streaming])
+
+  // Async delegation is intentionally detached from the parent prompt, so the
+  // normal SSE request may be closed while sub-agents continue in the
+  // background. Poll persisted history while an async batch card is running or
+  // while a completed batch is waiting for parent synthesis.
+  useEffect(() => {
+    if (!sessionId || !hasActiveAsyncDelegation) return
+
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    async function refreshAsyncDelegation() {
+      try {
+        const res = await api<{ data: ChatMessage[] }>(
+          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
+        )
+        if (cancelled) return
+        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
+        const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
+        setMessages(pilotMsgs)
+        setHasMore(items.length >= PAGE_SIZE)
+        if (pendingSynthesis) {
+          setStreaming(true)
+          streamingRef.current = true
+        }
+        if (!hasActiveAsyncDelegationSurface(pilotMsgs)) {
+          if (!recoveredStreamingRef.current && !abortControllerRef.current) {
+            setStreaming(false)
+            streamingRef.current = false
+          }
+          return
+        }
+      } catch (err) {
+        console.warn("[usePilotChat] Failed to refresh async delegation:", err)
+      }
+
+      if (!cancelled) timer = setTimeout(refreshAsyncDelegation, 2000)
+    }
+
+    timer = setTimeout(refreshAsyncDelegation, 1000)
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [agentId, sessionId, hasActiveAsyncDelegation])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(
@@ -426,20 +688,17 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const toolName = evt.toolName as string | undefined
           const args = evt.args as Record<string, unknown> | undefined
           const toolInput = formatToolInput(toolName ?? "", args)
-          const hidden = toolName === "update_plan" || toolName === "end_investigation"
-
-          // Initialize investigation progress for deep_search (preserve optimistic state if present)
-          if (toolName === "deep_search") {
-            setDpProgress((prev) => prev ?? { hypotheses: [] })
-          }
+          const hidden = toolName === "update_plan"
+          const dbMessageId = evt.dbMessageId as string | undefined
 
           setMessages((prev) => [
             ...prev,
             {
-              id: `tool-${Date.now()}`,
+              id: dbMessageId ?? `tool-${Date.now()}`,
               role: "tool" as const,
               content: "",
               toolName: toolName ?? "tool",
+              toolArgs: args,
               toolInput,
               toolStatus: "running" as const,
               timestamp: timeNow(),
@@ -465,68 +724,31 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // Use real DB message ID if available (enables metadata persistence)
           const dbMessageId = evt.dbMessageId as string | undefined
 
-          // Auto-clear hypothesis tree after all hypotheses finish
-          const endedToolName = evt.toolName as string | undefined
-          if (endedToolName === "deep_search") {
-            setTimeout(() => {
-              setDpProgress((prev) => {
-                if (prev && prev.hypotheses.every((h) => h.status !== "validating" && h.status !== "pending")) {
-                  return null
-                }
-                return prev
-              })
-            }, 5000)
-          }
-
           setMessages((prev) => {
-            const last = prev[prev.length - 1]
-            if (last?.role === "tool" && last.isStreaming) {
+            const index = dbMessageId
+              ? prev.findIndex((m) => m.id === dbMessageId && m.role === "tool")
+              : -1
+            const fallbackIndex = index >= 0
+              ? index
+              : findLastMessageIndex(prev, (m) => m.role === "tool" && Boolean(m.isStreaming))
+            if (fallbackIndex >= 0) {
+              const current = prev[fallbackIndex]
+              const next = {
+                ...current,
+                content: resultText,
+                toolStatus: isError ? ("error" as const) : ("success" as const),
+                isStreaming: false,
+                ...(toolDetails ? { toolDetails, metadata: toolDetails } : {}),
+                ...(dbMessageId ? { id: dbMessageId } : {}),
+              }
               return [
-                ...prev.slice(0, -1),
-                {
-                  ...last,
-                  content: resultText,
-                  toolStatus: isError ? ("error" as const) : ("success" as const),
-                  isStreaming: false,
-                  ...(toolDetails ? { toolDetails } : {}),
-                  ...(dbMessageId ? { id: dbMessageId } : {}),
-                },
+                ...prev.slice(0, fallbackIndex),
+                next,
+                ...prev.slice(fallbackIndex + 1),
               ]
             }
             return prev
           })
-          break
-        }
-
-        // --- Tool progress (deep_search hypothesis-level) ---
-        case "tool_progress": {
-          const progress = evt.progress as Record<string, unknown> | undefined
-          if (evt.toolName === "deep_search" && progress) {
-            setDpProgress((prev) => {
-              const state = prev ?? { hypotheses: [] }
-              return reduceInvestigationProgress(state, progress)
-            })
-          }
-          break
-        }
-
-        // --- DP status (gateway-emitted synthetic event — single source for checklist state) ---
-        case "dp_status": {
-          const dpStatus = evt.dpStatus as string | undefined
-          const checklist = evt.checklist as DpChecklistItem[] | null | undefined
-          if (!dpStatus || dpStatus === "idle") {
-            resetDpState()
-            break
-          }
-          setDpActive(true)
-          if (checklist) {
-            setDpChecklist(checklist)
-            const focus = checklist.find((i) => i.status === "in_progress")
-            setDpFocus(focus ? focus.id : null)
-          }
-          if (dpStatus === "completed") {
-            setTimeout(() => resetDpState(), 3000)
-          }
           break
         }
 
@@ -617,6 +839,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           if (!isAbortingRef.current) {
             setStreaming(false)
             streamingRef.current = false
+            recoveredStreamingRef.current = false
           }
           setPendingMessages([])
           break
@@ -634,6 +857,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
           setStreaming(false)
           streamingRef.current = false
+          recoveredStreamingRef.current = false
           setPendingMessages([])
           // Update context usage from agent_end event
           const cu = evt.contextUsage as ContextUsage | undefined
@@ -666,18 +890,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=${nextPage}&page_size=${PAGE_SIZE}`,
       )
       const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-      const olderMsgs: PilotMessage[] = items.map((m) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        toolName: m.tool_name,
-        toolInput: m.tool_input ? formatToolInput(m.tool_name ?? "", tryParseJson(m.tool_input)) : undefined,
-        toolStatus: m.role === "tool" ? ((m.outcome === "error" ? "error" : "success") as PilotMessage["toolStatus"]) : undefined,
-        metadata: m.metadata,
-        hidden: m.hidden,
-        timestamp: new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      }))
-      setMessages((prev) => [...olderMsgs, ...prev])
+      const olderMsgs = items.map(toPilotMessage)
+      setMessages((prev) => annotateDelegationSynthesis([...olderMsgs, ...prev]))
       setHasMore(items.length >= PAGE_SIZE)
       pageRef.current = nextPage
     } catch (err) {
@@ -690,7 +904,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // --- Send a message ---
   const send = useCallback(
     (text: string) => {
-      if (streamingRef.current && sessionId) {
+      if ((streamingRef.current || hasPendingDelegationSynthesis(messages)) && sessionId) {
         // While streaming, send as steer
         chatSteer(agentId, sessionId, text).catch((err) => console.error("[usePilotChat] steer error:", err))
         setPendingMessages((prev) => [...prev, text])
@@ -707,6 +921,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       setMessages((prev) => [...prev, userMsg])
       setStreaming(true)
       streamingRef.current = true
+      recoveredStreamingRef.current = false
       setStreamText("")
 
       // Start SSE
@@ -783,6 +998,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                     setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
                     setStreaming(false)
                     streamingRef.current = false
+                    recoveredStreamingRef.current = false
                     setPendingMessages([])
                   }
                   // Update cache: mark stream as finished so switching back shows final state
@@ -792,6 +1008,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                   if (isActive) {
                     setStreaming(false)
                     streamingRef.current = false
+                    recoveredStreamingRef.current = false
                   }
                   if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
                 }
@@ -807,6 +1024,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             if (streamingRef.current) {
               setStreaming(false)
               streamingRef.current = false
+              recoveredStreamingRef.current = false
             }
           }
         } catch (err) {
@@ -817,11 +1035,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
             setStreaming(false)
             streamingRef.current = false
+            recoveredStreamingRef.current = false
           }
+        } finally {
+          if (abortControllerRef.current === controller) abortControllerRef.current = null
         }
       })()
     },
-    [agentId, sessionId, handleChatEvent],
+    [agentId, sessionId, messages, handleChatEvent],
   )
 
   // --- Steer ---
@@ -857,6 +1078,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     isAbortingRef.current = false
     setStreaming(false)
     streamingRef.current = false
+    recoveredStreamingRef.current = false
   }, [agentId, sessionId])
 
   // --- Remove pending ---
@@ -872,23 +1094,11 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     resetDpState()
   }, [agentId, sessionId, resetDpState])
 
-  // --- Hypotheses confirmed ---
-  const onHypothesesConfirmed = useCallback(
-    (_hypotheses: Array<{ id: string; text: string; confidence: number }>) => {
-      // The actual send is handled by HypothesesCard via sendMessage
-      // This callback is for any additional tracking
-    },
-    [],
-  )
-
   return {
     messages,
     streaming,
     streamText,
-    dpProgress,
-    dpChecklist,
     dpActive,
-    dpFocus,
     contextUsage,
     isCompacting,
     pendingMessages,
@@ -901,6 +1111,5 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     setDpActive,
     removePending,
     exitDp,
-    onHypothesesConfirmed,
   }
 }

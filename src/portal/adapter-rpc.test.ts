@@ -632,18 +632,195 @@ describe("chat.ensureSession", () => {
     );
     expect(query.mock.calls[0][1]).toContain("New Session");
   });
+
+  it("persists delegation lineage fields", async () => {
+    const query = mockQuery([]);
+
+    await getHandler("chat.ensureSession")(
+      {
+        session_id: "child",
+        agent_id: "target-agent",
+        user_id: "u1",
+        parent_session_id: "parent",
+        parent_agent_id: "parent-agent",
+        delegation_id: "delegation-1",
+        target_agent_id: "target-agent",
+      },
+      "target-agent",
+    );
+    expect(query.mock.calls[0][1]).toEqual(expect.arrayContaining([
+      "parent",
+      "parent-agent",
+      "delegation-1",
+      "target-agent",
+    ]));
+  });
 });
 
 describe("chat.appendMessage", () => {
-  it("inserts message and bumps session count", async () => {
-    const query = mockQuery([], []);
+  it("inserts message and bumps session count when caller owns the session", async () => {
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
 
     const result = await getHandler("chat.appendMessage")(
       { session_id: "sess1", role: "user", content: "Hello", metadata: { key: "val" } }, "a1",
     );
     expect(result.id).toBeDefined();
     expect(typeof result.id).toBe("string");
-    expect(query).toHaveBeenCalledTimes(2);
+    // 1 ownership SELECT + INSERT + session UPDATE
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
+  });
+
+  it("inserts delegated message lineage", async () => {
+    const query = mockQuery([{ agent_id: "target-agent" }], [], []);
+
+    await getHandler("chat.appendMessage")(
+      {
+        session_id: "child",
+        role: "assistant",
+        content: "Child result",
+        from_agent_id: "target-agent",
+        parent_session_id: "parent",
+        delegation_id: "delegation-1",
+        target_agent_id: "target-agent",
+      },
+      "target-agent",
+    );
+    // INSERT params land on call index 1 now (call 0 is the ownership SELECT)
+    expect(query.mock.calls[1][1]).toEqual(expect.arrayContaining([
+      "target-agent",
+      "parent",
+      "delegation-1",
+    ]));
+  });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "victim" }]);
+
+    await expect(getHandler("chat.appendMessage")(
+      { session_id: "victim-session", role: "user", content: "smuggled", metadata: null }, "attacker",
+    )).rejects.toThrow(/not owned by agent attacker/);
+
+    // Only the ownership SELECT ran; no INSERT, no session UPDATE.
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it("permits write when session is not yet registered (ensureSession-first contract)", async () => {
+    const query = mockQuery([], [], []);
+
+    const result = await getHandler("chat.appendMessage")(
+      { session_id: "fresh", role: "user", content: "Hello", metadata: null }, "a1",
+    );
+
+    expect(result.id).toBeDefined();
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("chat.updateMessage", () => {
+  it("updates message fields without bumping session count", async () => {
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
+
+    const result = await getHandler("chat.updateMessage")(
+      {
+        id: "msg-1",
+        session_id: "sess1",
+        content: "Done",
+        tool_name: "delegate_to_agent",
+        tool_input: "{\"scope\":\"check\"}",
+        metadata: "{\"summary\":\"ok\"}",
+        outcome: "success",
+        duration_ms: 123,
+      },
+      "a1",
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
+    expect(query.mock.calls[1][0]).toContain("UPDATE chat_messages");
+    expect(query.mock.calls[1][1]).toEqual([
+      "Done",
+      "delegate_to_agent",
+      "{\"scope\":\"check\"}",
+      "{\"summary\":\"ok\"}",
+      "success",
+      123,
+      null,
+      "msg-1",
+      "sess1",
+    ]);
+    expect(query.mock.calls[2][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "owner" }]);
+
+    await expect(getHandler("chat.updateMessage")(
+      {
+        id: "msg-x",
+        session_id: "other-session",
+        content: "edit",
+        outcome: "success",
+        duration_ms: 1,
+      },
+      "intruder",
+    )).rejects.toThrow(/not owned by agent intruder/);
+
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("chat.updateDelegationToolMessage", () => {
+  it("updates async delegation tool rows by delegation id", async () => {
+    const query = mockQuery([{ agent_id: "a1" }], [], []);
+
+    const result = await getHandler("chat.updateDelegationToolMessage")(
+      {
+        session_id: "sess1",
+        tool_name: "delegate_to_agents",
+        delegation_id: "call-1",
+        content: "{\"status\":\"done\"}",
+        metadata: "{\"status\":\"done\"}",
+        outcome: "success",
+        duration_ms: 456,
+      },
+      "a1",
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("SELECT agent_id FROM chat_sessions");
+    expect(query.mock.calls[1][0]).toContain("WHERE session_id = ? AND role = 'tool' AND tool_name = ? AND delegation_id = ?");
+    expect(query.mock.calls[1][1]).toEqual([
+      "{\"status\":\"done\"}",
+      "{\"status\":\"done\"}",
+      "success",
+      456,
+      "sess1",
+      "delegate_to_agents",
+      "call-1",
+    ]);
+    expect(query.mock.calls[2][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+
+  it("rejects when caller does not own the session", async () => {
+    const query = mockQuery([{ agent_id: "owner" }]);
+
+    await expect(getHandler("chat.updateDelegationToolMessage")(
+      {
+        session_id: "other-session",
+        tool_name: "delegate_to_agents",
+        delegation_id: "call-x",
+        content: "{}",
+        metadata: "{}",
+        outcome: "success",
+        duration_ms: 1,
+      },
+      "intruder",
+    )).rejects.toThrow(/not owned by agent intruder/);
+
+    expect(query).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1034,7 +1211,7 @@ describe("agent.listForHost", () => {
 
 describe("metrics.summary", () => {
   it("returns summary with default 7d period", async () => {
-    mockQuery(
+    const query = mockQuery(
       [{ c: 10 }],   // total sessions
       [{ c: 50 }],   // total prompts
       [{ userId: "u1", sessions: 5, messages: 30 }],  // by user
@@ -1044,6 +1221,7 @@ describe("metrics.summary", () => {
     expect(result.totalSessions).toBe(10);
     expect(result.totalPrompts).toBe(50);
     expect(result.byUser).toEqual([{ userId: "u1", sessions: 5, messages: 30 }]);
+    expect(query.mock.calls[1][0]).toContain('metadata NOT LIKE \'%"kind":"delegation_event"%\'');
   });
 
   it("skips byUser query when userId filter is set", async () => {
@@ -1126,9 +1304,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 41 handlers", () => {
+  it("registers exactly 43 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(41);
+    expect(handlers.size).toBe(43);
   });
 
   it("all expected handler names are registered", () => {
@@ -1139,7 +1317,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.appendMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
