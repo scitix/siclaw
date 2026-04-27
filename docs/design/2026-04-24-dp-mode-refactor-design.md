@@ -474,7 +474,7 @@ SSE event handling:
 - `tool_progress` event handler's deep_search-specific branch — deleted
 
 Backend:
-- `src/core/extensions/deep-investigation.ts` — shrinks from ~900 lines to ~100. Keeps: `[Deep Investigation]` / `[DP_EXIT]` marker handling, system-prompt enhancement injection, `dpActive` boolean tracking. Removes: state machine, `dpHypothesesDraft`, `dpConfirmedHypotheses`, `dpRound`, `DpStatus` enum, `setDpStatus`, checklist sync, TUI widget rendering (if not used), agent_end nudge.
+- `src/core/extensions/deep-investigation.ts` — shrinks from ~900 lines to a compact mode module. Keeps: `[Deep Investigation]` / `[DP_EXIT]` marker handling, system-prompt enhancement injection, `dpActive` boolean tracking, delegation synthesis barrier, and checkpoint cadence guard. Removes: state machine, `dpHypothesesDraft`, `dpConfirmedHypotheses`, `dpRound`, `DpStatus` enum, `setDpStatus`, checklist sync, TUI widget rendering (if not used), agent_end nudge.
 - `src/tools/workflow/dp-tools.ts` — `propose_hypotheses` and `end_investigation` tools removed.
 - `src/tools/workflow/deep-search/` — entire directory deleted.
 - `parseHypotheses` in `deep-investigation.ts` — deleted.
@@ -626,7 +626,7 @@ Phase 1 is done when:
 - Non-self `agent_id` expert collaboration is not faked; it remains a gateway/portal routing design item.
 - No `dp_status` SSE events are emitted or handled.
 - Non-DP chat sessions are completely unaffected.
-- `src/core/extensions/deep-investigation.ts` line count is ≤ 200 (down from ~900).
+- `src/core/extensions/deep-investigation.ts` stays compact, with a target of ≤ 350 lines including delegation synthesis and checkpoint cadence guards (down from ~900).
 - All tests pass; the removed-feature tests are deleted, not skipped.
 
 ---

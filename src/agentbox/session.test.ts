@@ -497,7 +497,7 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
             type: "message_end",
             message: {
               role: "assistant",
-              content: [{ type: "text", text: "Agent 1 found node l40-068 NotReady." }],
+              content: [{ type: "text", text: "Agent 1 found node test-node-a NotReady." }],
             },
           });
         },
@@ -516,7 +516,7 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
           emitter.emit("event", {
             type: "tool_execution_end",
             toolName: "kubectl_get",
-            result: "l40-068 NotReady\nnodepool-061 Ready",
+            result: "test-node-a NotReady\ntest-node-b Ready",
           });
           emitter.emit("event", {
             type: "tool_execution_start",
@@ -546,9 +546,11 @@ describe("AgentBoxSessionManager — delegation batch parent notification", () =
       });
       expect(slowAbort).toHaveBeenCalledTimes(1);
       const notification = parentPrompt.mock.calls[0][0];
-      expect(notification).toContain("Agent 1 (done)");
-      expect(notification).toContain("Agent 2 (partial)");
-      expect(notification).toContain("l40-068 NotReady");
+      expect(notification).toContain("--- BEGIN DELEGATED AGENT 1 EVIDENCE ---");
+      expect(notification).toContain("Status: done");
+      expect(notification).toContain("--- BEGIN DELEGATED AGENT 2 EVIDENCE ---");
+      expect(notification).toContain("Status: partial");
+      expect(notification).toContain("test-node-a NotReady");
       expect(notification).not.toContain("Interrupted active tool");
 
       const finalUpdate = [...(globalThis as any).__delegationPersistenceEvents]

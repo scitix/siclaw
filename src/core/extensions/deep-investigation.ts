@@ -19,8 +19,8 @@ import type { MutableDpStateRef } from "../types.js";
  * tools, dpStatus state machine, checklist, custom cards, dp_status SSE
  * event, DP_CONFIRM / DP_ADJUST / DP_SKIP / DP_REINVESTIGATE markers) were
  * removed in the Apr 2026 refactor — see
- * docs/design/2026-04-24-dp-mode-refactor-design.md. The new
- * The current DP baseline is single-agent plus optional same-agent
+ * docs/design/2026-04-24-dp-mode-refactor-design.md. The current DP baseline
+ * is single-agent plus optional same-agent
  * `delegate_to_agent(agent_id="self")` sub-investigation. Cross-agent expert
  * collaboration and permission gates are intentionally separate follow-up
  * phases.
@@ -198,7 +198,10 @@ export default function deepInvestigationExtension(
     // the frontend may have prefixed after the DP marker — those are
     // UI-only hints and must not leak into the prompt.
     const userText = stripChipMarker(event.text.slice(marker.length).trim());
-    if (!userText) return { action: "continue" as const };
+    if (!userText) {
+      enableDpMode(ctx);
+      return { action: "handled" as const };
+    }
 
     if (!dpActive) {
       enableDpMode(ctx);

@@ -43,6 +43,58 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
+function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): boolean {
+  if (!sessionId) return true;
+  const owner = sessionRegistry.get(sessionId);
+  return !owner || owner.agentId === identity.agentId;
+}
+
+function agentMatchesIdentity(agentId: string | null | undefined, identity: CertificateIdentity): boolean {
+  return !agentId || agentId === identity.agentId;
+}
+
+function validateDelegationEventActor(
+  event: DelegationPersistenceEvent,
+  identity: CertificateIdentity,
+): { status: number; error: string } | null {
+  switch (event.type) {
+    case "delegation.ensure_session": {
+      if (!event.userId) return { status: 400, error: "delegation.ensure_session requires userId" };
+      if (!agentMatchesIdentity(event.agentId, identity)) return { status: 403, error: "delegation agent mismatch" };
+      if (!sessionBelongsToIdentity(event.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      if (!sessionBelongsToIdentity(event.lineage?.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!agentMatchesIdentity(event.lineage?.parentAgentId, identity)) return { status: 403, error: "delegation parent agent mismatch" };
+      if (!agentMatchesIdentity(event.lineage?.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
+      return null;
+    }
+    case "delegation.append_message": {
+      if (!sessionBelongsToIdentity(event.message.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      if (!sessionBelongsToIdentity(event.message.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!agentMatchesIdentity(event.message.fromAgentId, identity)) return { status: 403, error: "delegation source agent mismatch" };
+      if (!agentMatchesIdentity(event.message.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
+      return null;
+    }
+    case "delegation.update_message":
+    case "delegation.update_tool_message": {
+      if (!sessionBelongsToIdentity(event.message.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      return null;
+    }
+    case "delegation.append_event": {
+      if (!event.event.userId) return { status: 400, error: "delegation.append_event requires userId" };
+      if (!sessionBelongsToIdentity(event.event.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!agentMatchesIdentity(event.event.parentAgentId, identity)) return { status: 403, error: "delegation parent agent mismatch" };
+      if (!agentMatchesIdentity(event.event.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
+      return null;
+    }
+    case "delegation.emit_chat_event": {
+      if (!sessionBelongsToIdentity(event.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      return null;
+    }
+    default:
+      return null;
+  }
+}
+
 /**
  * Fetch agent resource bindings from Portal via RPC.
  * Returns skill_ids and mcp_server_ids bound to the agent.
@@ -444,6 +496,11 @@ export async function handleDelegationEvents(
 ): Promise<void> {
   try {
     const event = await readJsonBody(req) as DelegationPersistenceEvent;
+    const actorError = validateDelegationEventActor(event, identity);
+    if (actorError) {
+      sendJson(res, actorError.status, { error: actorError.error });
+      return;
+    }
     let response: DelegationPersistenceResponse = { ok: true };
 
     switch (event.type) {
@@ -451,7 +508,7 @@ export async function handleDelegationEvents(
         await frontendClient.request("chat.ensureSession", {
           session_id: event.sessionId,
           agent_id: event.agentId,
-          user_id: event.userId || sessionRegistry.resolveUser(event.sessionId),
+          user_id: event.userId,
           title: event.title,
           preview: event.preview,
           origin: event.origin,

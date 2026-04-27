@@ -2338,7 +2338,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as [Array<{ c: number }>, unknown];
     const totalSessions = Number(sRows[0]?.c ?? 0);
@@ -2347,6 +2347,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as [Array<{ c: number }>, unknown];
@@ -2357,6 +2358,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       const [uRows] = await db.query(
         `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
          FROM chat_sessions s WHERE s.created_at >= ?
+           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
          GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
         [cutoff],
       ) as any;

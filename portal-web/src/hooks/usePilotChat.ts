@@ -288,7 +288,7 @@ function delegationResultsReadyLabel(toolMessage: PilotMessage, eventMessage?: P
     messageNumber(toolMessage.metadata?.total_tasks) ??
     tasks.length
   const completed =
-    messageNumber(eventMessage?.metadata?.total_tasks) ??
+    messageNumber(eventMessage?.metadata?.completed_tasks) ??
     messageNumber(toolMessage.metadata?.completed_tasks) ??
     total
   return total > 0
@@ -384,6 +384,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const isAbortingRef = useRef(false)
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
+  const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
 
   // Per-session state cache: preserves ALL state across session switches so each
   // agent's conversation feels independent — like browser tabs.
@@ -566,7 +567,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // background. Poll persisted history while an async batch card is running or
   // while a completed batch is waiting for parent synthesis.
   useEffect(() => {
-    if (!sessionId || !hasActiveAsyncDelegationSurface(messages)) return
+    if (!sessionId || !hasActiveAsyncDelegation) return
 
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -605,7 +606,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [agentId, sessionId, messages])
+  }, [agentId, sessionId, hasActiveAsyncDelegation])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(

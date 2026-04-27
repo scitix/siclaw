@@ -718,9 +718,10 @@ function isBatchCompleteDelegationEvent(message: PilotMessage): boolean {
 }
 
 function delegationStatusNoticeContent(message: PilotMessage): string {
+  const completed = numberValue(message.metadata?.completed_tasks)
   const total = numberValue(message.metadata?.total_tasks)
-  return total && total > 0
-    ? `${total}/${total} results ready · Siclaw is synthesizing`
+  return completed != null && total != null && total > 0
+    ? `${completed}/${total} results ready · Siclaw is synthesizing`
     : "Results ready · Siclaw is synthesizing"
 }
 
@@ -1320,6 +1321,7 @@ function computeBatchTone(
 function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
   const batch = agentWorkBatchSummary(message)
   const [expanded, setExpanded] = useState(message.isStreaming ?? false)
+  const isOpen = message.isStreaming || expanded
   const tone = computeBatchTone(batch)
   const isSynthesizing = batch.notice != null
   const taskLabel = `${batch.taskCount || 0} sub-agent${batch.taskCount === 1 ? "" : "s"}`
@@ -1335,10 +1337,10 @@ function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
         <button
           type="button"
           className="flex items-center gap-3 w-full px-4 py-3 bg-secondary/70 hover:bg-secondary transition-colors text-left min-w-0"
-          onClick={() => setExpanded(!expanded)}
+          onClick={() => setExpanded((value) => !value)}
         >
           <ChevronRight
-            className={cn("w-3.5 h-3.5 text-muted-foreground/70 transition-transform shrink-0", expanded && "rotate-90")}
+            className={cn("w-3.5 h-3.5 text-muted-foreground/70 transition-transform shrink-0", isOpen && "rotate-90")}
           />
           <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/30 flex items-center justify-center shrink-0">
             <Users className="w-4 h-4 text-purple-400" />
@@ -1364,12 +1366,12 @@ function AgentWorkBatchCard({ message }: { message: PilotMessage }) {
           )}
         </button>
 
-        {expanded && (
+        {isOpen && (
           <div className="px-4 py-3 bg-secondary/20 border-t border-border">
             {batch.tasks.length > 0 ? (
               <div className="ml-5 pl-4 border-l-2 border-border/60">
-                {batch.tasks.map((task) => (
-                  <AgentWorkBatchRow key={task.index} task={task} />
+                {batch.tasks.map((task, index) => (
+                  <AgentWorkBatchRow key={`${task.targetLabel}-${task.index ?? index}`} task={task} />
                 ))}
               </div>
             ) : (

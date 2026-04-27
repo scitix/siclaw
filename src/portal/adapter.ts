@@ -982,7 +982,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     const cutoff = toSqlTimestamp(Date.now() - days * 86400e3);
     const [sessResult] = await db.query(
       `DELETE FROM chat_sessions
-       WHERE origin = 'task' AND last_active_at < ?`,
+       WHERE origin IN ('task', 'delegation') AND last_active_at < ?`,
       [cutoff],
     ) as any;
     const [runsResult] = await db.query(
@@ -1248,7 +1248,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const db = getDb();
     const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as any;
     const totalSessions = Number(sRows[0]?.c ?? 0);
@@ -1257,6 +1257,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
@@ -1267,6 +1268,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       const [uRows] = await db.query(
         `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
          FROM chat_sessions s WHERE s.created_at >= ?
+           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
          GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
         [cutoff],
       ) as any;
@@ -2154,7 +2156,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const cutoff = toSqlTimestamp(Date.now() - days * 86400e3);
     const [sessResult] = await db.query(
       `DELETE FROM chat_sessions
-       WHERE origin = 'task' AND last_active_at < ?`,
+       WHERE origin IN ('task', 'delegation') AND last_active_at < ?`,
       [cutoff],
     ) as any;
     const [runsResult] = await db.query(
@@ -2281,7 +2283,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
     const db = getDb();
     const sessionParams: unknown[] = [cutoff];
-    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ?";
+    let totalSessionsSql = "SELECT COUNT(*) AS c FROM chat_sessions WHERE created_at >= ? AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))";
     if (userFilter) { totalSessionsSql += " AND user_id = ?"; sessionParams.push(userFilter); }
     const [sRows] = await db.query(totalSessionsSql, sessionParams) as any;
     const totalSessions = Number(sRows[0]?.c ?? 0);
@@ -2290,6 +2292,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     let totalPromptsSql = `SELECT COUNT(*) AS c FROM chat_messages m
       JOIN chat_sessions s ON m.session_id = s.id
       WHERE m.role = 'user' AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
         AND (m.metadata IS NULL OR m.metadata NOT LIKE '%"kind":"delegation_event"%')`;
     if (userFilter) { totalPromptsSql += " AND s.user_id = ?"; pParams.push(userFilter); }
     const [pRows] = await db.query(totalPromptsSql, pParams) as any;
@@ -2300,6 +2303,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       const [uRows] = await db.query(
         `SELECT s.user_id AS userId, COUNT(DISTINCT s.id) AS sessions, SUM(s.message_count) AS messages
          FROM chat_sessions s WHERE s.created_at >= ?
+           AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))
          GROUP BY s.user_id ORDER BY sessions DESC LIMIT 50`,
         [cutoff],
       ) as any;
