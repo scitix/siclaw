@@ -187,14 +187,17 @@ Additional direction from user: compare H2 with kube-proxy evidence` },
     expect(transform.text).not.toContain("Deep Investigation mode");
   });
 
-  it("empty user text after the marker is passed through unchanged", async () => {
+  it("bare marker enables DP mode without forwarding marker text", async () => {
+    const stateRef: MutableDpStateRef = { active: false };
     const { api, handlers } = makeApi();
-    deepInvestigationExtension(api);
+    deepInvestigationExtension(api, undefined, stateRef);
     const results = await callAll(handlers, "input",
       { text: "[Deep Investigation]\n   " },
       makeCtx(),
     );
-    expect(results.every((r: any) => r?.action === "continue")).toBe(true);
+    expect(stateRef.active).toBe(true);
+    expect(results.some((r: any) => r?.action === "handled")).toBe(true);
+    expect(results.some((r: any) => r?.action === "transform")).toBe(false);
   });
 });
 describe("deepInvestigationExtension — deactivation via [DP_EXIT] marker", () => {
