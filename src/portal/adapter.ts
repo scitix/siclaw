@@ -1861,40 +1861,6 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   // --- chat.* ---
 
-  /**
-   * Verify the calling Runtime owns `sessionId` before mutating it.
-   *
-   * The chat.* RPCs receive the connection's authenticated agentId as the
-   * second arg from buildAdapterRpcHandlers. Without this check, a buggy
-   * or compromised Runtime could write rows into another agent's chat
-   * session by passing an arbitrary session_id in the body. internal-api's
-   * validateDelegationEventActor already covers the delegation.* event
-   * surface; this closes the gap on the plain chat.* RPC surface
-   * (chent1996 review #4 / jacoblee #6).
-   *
-   * Permissive on "session not found" so first-write call paths can still
-   * land — the adapter's caller is expected to chat.ensureSession first,
-   * which sets agent_id atomically and is itself protected by the same
-   * authentication.
-   */
-  async function assertSessionBelongsToAgent(
-    db: { query: (sql: string, params?: unknown[]) => Promise<unknown> },
-    sessionId: string,
-    callerAgentId: string,
-  ): Promise<void> {
-    if (!callerAgentId) return;
-    if (!sessionId) return;
-    const [rows] = (await db.query(
-      "SELECT agent_id FROM chat_sessions WHERE id = ?",
-      [sessionId],
-    )) as [Array<{ agent_id: string | null }>, unknown];
-    if (rows.length === 0) return;
-    const ownerAgentId = rows[0].agent_id;
-    if (ownerAgentId && ownerAgentId !== callerAgentId) {
-      throw new Error(`session ${sessionId} not owned by agent ${callerAgentId}`);
-    }
-  }
-
   handlers.set("chat.ensureSession", async (params) => {
     const db = getDb();
     // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
@@ -1915,10 +1881,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { ok: true };
   });
 
-  handlers.set("chat.appendMessage", async (params, agentId) => {
+  handlers.set("chat.appendMessage", async (params) => {
     const id = crypto.randomUUID();
     const db = getDb();
-    await assertSessionBelongsToAgent(db, params.session_id, agentId);
     await db.query(
       `INSERT INTO chat_messages (id, session_id, role, content, tool_name, tool_input, metadata, outcome, duration_ms, from_agent_id, parent_session_id, delegation_id, target_agent_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1936,9 +1901,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { id };
   });
 
-  handlers.set("chat.updateMessage", async (params, agentId) => {
+  handlers.set("chat.updateMessage", async (params) => {
     const db = getDb();
-    await assertSessionBelongsToAgent(db, params.session_id, agentId);
     await db.query(
       `UPDATE chat_messages
        SET content = ?, tool_name = ?, tool_input = ?, metadata = ?, outcome = ?, duration_ms = ?,
@@ -1963,9 +1927,8 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { ok: true };
   });
 
-  handlers.set("chat.updateDelegationToolMessage", async (params, agentId) => {
+  handlers.set("chat.updateDelegationToolMessage", async (params) => {
     const db = getDb();
-    await assertSessionBelongsToAgent(db, params.session_id, agentId);
     await db.query(
       `UPDATE chat_messages
        SET content = ?, metadata = ?, outcome = ?, duration_ms = ?
