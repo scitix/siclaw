@@ -82,6 +82,25 @@ describe("PiAgentBrain", () => {
     expect(session.prompt).toHaveBeenCalledTimes(1);
   });
 
+  it("prompt skips retry when stopReason is error", async () => {
+    // Model errors (auth/quota/network give-up after pi-agent-core's
+    // transport retries) reach the brain as stopReason="error" with empty
+    // content. The empty-response retry must NOT engage — re-prompting just
+    // hammers the same permanent failure and flickers the frontend Thinking
+    // indicator with each agent_start/agent_end retry pair.
+    const session = makeFakeSession();
+    session.prompt = vi.fn(async (_text: string) => {
+      session.__emit({ type: "message_start", message: { role: "assistant" } });
+      session.__emit({
+        type: "message_end",
+        message: { role: "assistant", content: [], stopReason: "error", errorMessage: "Connection error." },
+      });
+    });
+    const brain = new PiAgentBrain(session);
+    await brain.prompt("q");
+    expect(session.prompt).toHaveBeenCalledTimes(1);
+  });
+
   it("prompt retries up to MAX_EMPTY_RETRIES when content is empty", async () => {
     const session = makeFakeSession();
     let attempt = 0;
