@@ -112,20 +112,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       throw new Error("agentId, userId, and text are required");
     }
 
-    // Get or create AgentBox for this agent — one pod per agent, shared by
-    // all callers. Caller identity travels as sessionId.
-    const handle = await agentBoxManager.getOrCreate(agentId);
-    const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
-
-    // Pre-generate a UUID so the AgentBox doesn't fall back to the literal
-    // "default" session id (LocalSpawner behaviour), which would merge every
-    // caller's trace into one chat_sessions row.
+    // Pre-generate a UUID so AgentBox doesn't fall back to the literal
+    // "default" session id (LocalSpawner behaviour), which would merge
+    // every caller's trace into one chat_sessions row.
     const sessionId = incomingSessionId ?? crypto.randomUUID();
-    // Record sessionId → userId so AgentBox → Runtime internal-api callbacks
-    // can recover user attribution for Upstream audit.
     sessionRegistry.remember(sessionId, userId, agentId);
 
-    // Build prompt options from params (Upstream sends full context)
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
     const promptOpts: PromptOptions = {
       sessionId,
@@ -138,40 +130,57 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       modelConfig,
     };
 
-    let promptResult: Awaited<ReturnType<typeof client.prompt>>;
-    try {
-      promptResult = await client.prompt(promptOpts);
-    } catch (err) {
-      // Concurrent send: agentbox returns 409 "Session is already running.
-      // Use the steer endpoint to add input to the active prompt." when the
-      // user double-taps send before the previous prompt's pi-agent retries
-      // settle. Per agentbox's own hint, inject as steer instead of erroring
-      // — surfaces nothing to the user, message goes into the running session.
-      if (err instanceof Error && err.message.includes("Session is already running")) {
-        await client.steerSession(sessionId, text);
+    // Async-ack protocol: return { ok, sessionId } within milliseconds; do
+    // every slow step (agentbox spawn, prompt() roundtrip, SSE consume) in
+    // the background and stream events back to Portal via the chat.event
+    // WS channel.
+    //
+    // Why: sicore's WS RPC carries a fixed 30s timeout. Coupling the ack
+    // to "agentbox is ready and prompt() returned" forced that timeout to
+    // cover worst-case cold-start (image pull, container start, ready
+    // probe), which routinely exceeds 30s and produced spurious
+    // CONNECTION_TIMEOUT bubbles even when the runtime was healthy. Once
+    // the bubble fires, sicore tears down the SSE response and the
+    // delayed reply (which still arrives later) is dropped — leaving a
+    // ghost session in DB and a confused user.
+    //
+    // After the ack, the existing chat.event stream (agent_start /
+    // agent_end / agent_message / stream_error / prompt_done) carries
+    // every observable progress signal the frontend needs.
+    (async () => {
+      try {
+        // Persist user message + ensure session row before any agent events
+        // could land. consumeAgentSse writes assistant/tool rows with FK
+        // referencing chat_sessions, so the row has to exist first.
+        await ensureChatSession(sessionId, agentId, userId, text);
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
-        return { ok: true, sessionId, steered: true };
-      }
-      throw err;
-    }
 
-    // Ensure chat_sessions exists + persist the user message BEFORE the SSE
-    // consumer starts writing assistant/tool rows (FK on chat_messages).
-    await ensureChatSession(promptResult.sessionId, agentId, userId, text);
-    await appendMessage({ sessionId: promptResult.sessionId, role: "user", content: text });
-    await incrementMessageCount(promptResult.sessionId);
+        const handle = await agentBoxManager.getOrCreate(agentId);
+        const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
-    // Minimal redaction: scrub the apiKey + baseUrl from any captured tool
-    // output. Credential-manifest redaction is follow-up work.
-    const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
+        let promptResult: Awaited<ReturnType<typeof client.prompt>>;
+        try {
+          promptResult = await client.prompt(promptOpts);
+        } catch (err) {
+          // Concurrent send: agentbox returns 409 "Session is already
+          // running. Use the steer endpoint to add input to the active
+          // prompt." when the user double-taps send before the previous
+          // prompt's pi-agent retries settle. Per agentbox's own hint,
+          // inject as steer — the message rides on the still-running
+          // prompt's stream. Don't emit prompt_done here: the running
+          // prompt will fire its own when it actually finishes, and an
+          // extra one would close the frontend stream prematurely.
+          if (err instanceof Error && err.message.includes("Session is already running")) {
+            await client.steerSession(sessionId, text);
+            return;
+          }
+          throw err;
+        }
 
-    // Stream + persist events back to Portal via sendEvent (FrontendWsClient).
-    {
-      const abortCtrl = new AbortController();
+        const redactionConfig = buildRedactionConfigForModelConfig(modelConfig);
+        const abortCtrl = new AbortController();
 
-      // Non-blocking: consume events in background
-      (async () => {
         try {
           await consumeAgentSse({
             client,
@@ -187,15 +196,10 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               });
             },
           });
-          // Signal Portal that the prompt is fully complete (all agent turns done).
-          // agent_end fires after each turn — prompt_done fires once at the very end.
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         } catch (err) {
           if (!abortCtrl.signal.aborted) {
             console.error(`[runtime] SSE stream error for session=${promptResult.sessionId}:`, err);
-            // Surface the failure as an inline error bubble (proxy translates
-            // stream_error to an SSE error frame). Without this the frontend
-            // sees the stream silently stop.
             const detail = wrapError(err, {
               code: ErrorCodes.STREAM_INTERRUPTED,
               retriable: true,
@@ -205,13 +209,26 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
               event: { type: "stream_error", error: detail },
             });
           }
-          // Ensure prompt_done is sent even on error so Portal SSE doesn't hang
           context.sendEvent("chat.event", { sessionId: promptResult.sessionId, event: { type: "prompt_done" } });
         }
-      })();
-    }
+      } catch (err) {
+        // Failure before/during agentbox spawn or prompt() — surface as a
+        // stream_error so the frontend renders an inline bubble instead of
+        // hanging on the spawning state forever.
+        console.error(`[runtime] chat.send background failure for session=${sessionId}:`, err);
+        const detail = wrapError(err, {
+          code: ErrorCodes.INTERNAL,
+          retriable: true,
+        });
+        context.sendEvent("chat.event", {
+          sessionId,
+          event: { type: "stream_error", error: detail },
+        });
+        context.sendEvent("chat.event", { sessionId, event: { type: "prompt_done" } });
+      }
+    })();
 
-    return { ok: true, sessionId: promptResult.sessionId };
+    return { ok: true, sessionId };
   });
 
   rpcMethods.set("chat.abort", async (params) => {
