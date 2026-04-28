@@ -156,6 +156,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
         await appendMessage({ sessionId, role: "user", content: text });
         await incrementMessageCount(sessionId);
 
+        // DEBUG-ONLY (test branch): when SICLAW_DEBUG_SLOW_SPAWN_MS is set
+        // to a positive integer, sleep that many milliseconds before
+        // getOrCreate so the frontend's long-wait UX (post-10s "Still
+        // working on it…" reassurance) can be exercised on a real
+        // cluster with predictable timing. NOT in the upstream PR (#256).
+        const slowSpawnMs = parseInt(process.env.SICLAW_DEBUG_SLOW_SPAWN_MS ?? "0", 10);
+        if (slowSpawnMs > 0) {
+          console.log(`[runtime/debug] simulating slow agentbox spawn: sleeping ${slowSpawnMs}ms before getOrCreate`);
+          await new Promise((r) => setTimeout(r, slowSpawnMs));
+        }
+
         const handle = await agentBoxManager.getOrCreate(agentId);
         const client = new AgentBoxClient(handle.endpoint, 30000, agentBoxTlsOptions);
 
