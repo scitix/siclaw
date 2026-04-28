@@ -112,6 +112,17 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       throw new Error("agentId, userId, and text are required");
     }
 
+    // DEBUG: simulate slow agentbox spawn / response for frontend testing.
+    // Set env SICLAW_DEBUG_SLOW_SPAWN_MS to a positive integer to inject a
+    // pre-spawn delay (in ms) on every chat.send. Frontend perceives this
+    // as "agentbox is taking forever to come up". Off by default — when the
+    // env is unset, missing, or 0 the parseInt branch is a no-op.
+    const slowSpawnMs = parseInt(process.env.SICLAW_DEBUG_SLOW_SPAWN_MS ?? "0", 10);
+    if (slowSpawnMs > 0) {
+      console.log(`[runtime/debug] simulating slow agentbox spawn: sleeping ${slowSpawnMs}ms before getOrCreate`);
+      await new Promise((r) => setTimeout(r, slowSpawnMs));
+    }
+
     // Get or create AgentBox for this agent — one pod per agent, shared by
     // all callers. Caller identity travels as sessionId.
     const handle = await agentBoxManager.getOrCreate(agentId);
