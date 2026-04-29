@@ -1,13 +1,3 @@
-# Siclaw 镜像清单 — 一行一个，三个组件必须共享同一 registry 和 tag。
-# 空行和 # 开头的注释会被忽略。registry 可换任意可用地域。
-#
-# 用法：
-#   cp scripts/images.txt.example images.txt
-#   # 改成你这次构建的实际镜像 ref
-#   ./scripts/deploy-k8s.sh           # 默认读 ./images.txt
-#   # 或显式指定
-#   ./scripts/deploy-k8s.sh -f images-shanghai.txt
-
-registry-cn-beijing.siflow.cn/k8s/siclaw-portal:yye-feat-trace-store-v2-6330af8
-registry-cn-beijing.siflow.cn/k8s/siclaw-runtime:yye-feat-trace-store-v2-6330af8
-registry-cn-beijing.siflow.cn/k8s/siclaw-agentbox:yye-feat-trace-store-v2-6330af8
+registry-cn-beijing.siflow.cn/k8s/siclaw-portal:yye-feat-trace-store-v2-1cad153
+registry-cn-beijing.siflow.cn/k8s/siclaw-agentbox:yye-feat-trace-store-v2-1cad153
+registry-cn-beijing.siflow.cn/k8s/siclaw-runtime:yye-feat-trace-store-v2-1cad1531
