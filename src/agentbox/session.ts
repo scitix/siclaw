@@ -943,6 +943,15 @@ Always end with a final report even if evidence is incomplete.`;
 
     const promptStartTime = Date.now();
     let promptOutcome: "completed" | "error" = "completed";
+    // Synthetic parent prompts bypass HTTP /api/prompt, so the trace recorder
+    // never sees beginPrompt/endPrompt and the delegation-batch synthesis turn
+    // would otherwise leave no trace row. Wire it up explicitly so isInjectedPrompt
+    // (the [Delegation Batch Complete] capsule is 100% machine-generated) and
+    // dpStatusEnd are recorded for this turn.
+    if (managed._traceRecorder) {
+      try { await managed._traceRecorder.beginPrompt(promptText); }
+      catch (err) { console.warn(`[agentbox-session] synthetic beginPrompt failed for ${managed.id}:`, err); }
+    }
     try {
       await managed.brain.prompt(promptText);
     } catch (err) {
@@ -955,6 +964,10 @@ Always end with a final report even if evidence is incomplete.`;
     } finally {
       stopManagedBuffer(managed);
       await persistQueue;
+      if (managed._traceRecorder) {
+        try { await managed._traceRecorder.endPrompt(promptOutcome); }
+        catch (err) { console.warn(`[agentbox-session] synthetic endPrompt failed for ${managed.id}:`, err); }
+      }
       managed._promptDone = true;
       const currStats = managed.brain.getSessionStats();
       const model = managed.brain.getModel();
