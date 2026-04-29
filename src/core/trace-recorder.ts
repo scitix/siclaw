@@ -43,29 +43,31 @@ export interface TraceRecorderOpts {
 /**
  * Classification rule for `isInjectedPrompt`:
  *
- *   TRUE  — the prompt body is 100% machine-generated (UI button click with no
- *           user-typed content, or a synthetic system notification such as the
- *           delegation batch-complete capsule injected after delegate_to_agents).
- *   FALSE — the prompt contains user-typed content, even if it carries a
- *           marker prefix (e.g. `[Deep Investigation]\n<user question>` or
- *           a chip marker followed by an "Additional direction from user:"
- *           segment). Those markers are *mode flags*, not content replacements
- *           — analytics that want "real user intent" still want to see them.
+ *   TRUE  — the prompt body carries any system-injected content the user did
+ *           not type. This covers two cases:
+ *             (a) UI button clicks that prepend a canned `fullPrompt` to the
+ *                 message body (Dig deeper, DP checkpoint chips, etc.). Any
+ *                 user text the chip allows is treated as supplementary
+ *                 context — the click itself is what defined the prompt.
+ *             (b) Synthetic system notifications such as the delegation
+ *                 batch-complete capsule injected after delegate_to_agents.
+ *   FALSE — the prompt is a plain user message. The `[Deep Investigation]`
+ *           wrapper is a mode flag (no canned content), so it does NOT
+ *           promote a regular question to injected.
  *
  * Matching strategies, in order:
  *   1. EXACT string match — fixed canned bodies (legacy DP_* + Feedback)
  *   2. PREFIX match       — long canned paragraphs and synthetic system
  *                           notifications (dig-deeper text, delegation batch
  *                           complete capsule)
- *   3. REGEX match        — structured templates with no trailing user text
- *                           (investigation feedback verdicts without comment)
- *   4. CHIP-MARKER rule   — current-world DP/Dig-deeper chips. The frontend
- *                           wraps a chip click as `[<label>]\n<fullPrompt>`
- *                           and appends `\n\nAdditional direction from user:`
- *                           only when the user typed extra text. So a chip
- *                           marker WITHOUT that suffix is a pure click
- *                           (injected); WITH the suffix it carries user
- *                           intent (not injected).
+ *   3. REGEX match        — structured templates (investigation feedback
+ *                           verdicts)
+ *   4. CHIP-MARKER rule   — any current-world DP/Dig-deeper chip click. The
+ *                           frontend sends them as `[<label>]\n<fullPrompt>`,
+ *                           with optional `\n\nAdditional direction from user:`
+ *                           suffix when the user added text. Either form is
+ *                           injected because the canned `fullPrompt` is always
+ *                           present.
  */
 const CANNED_INJECTED_STRINGS: readonly string[] = [
   // Legacy pre-refactor markers (HypothesesCard etc., deleted Apr 2026). Kept
@@ -95,7 +97,9 @@ const CANNED_INJECTED_PATTERNS: readonly RegExp[] = [
 // Current-world DP/Dig-deeper prefix-chip labels. Source of truth:
 // portal-web/src/components/chat/PilotArea.tsx (DIG_DEEPER_CHIP +
 // DP_CHECKPOINT_PREFIX_CHIPS + LEGACY_DP_PREFIX_CHIPS). Sent on the wire as
-// `[<label>]\n<fullPrompt>` by InputArea.handleSend.
+// `[<label>]\n<fullPrompt>` by InputArea.handleSend. Any click of these
+// buttons injects a canned fullPrompt into the message, so the prompt is
+// classified as injected regardless of whether the user typed extra context.
 const CHIP_MARKER_LABELS: readonly string[] = [
   "Dig deeper",
   "Proceed",
@@ -104,7 +108,6 @@ const CHIP_MARKER_LABELS: readonly string[] = [
   "Adjust",
   "Skip",
 ];
-const CHIP_USER_ADDITION_MARKER = "\n\nAdditional direction from user:";
 // Optional `[Deep Investigation]\n` wrapper added by InputArea when DP toggle
 // is on. Strip it before chip-marker matching so DP+chip combinations classify
 // the same as bare chip clicks.
@@ -121,9 +124,7 @@ function isInjectedPromptText(text: string): boolean {
     ? trimmed.slice(DP_MODE_WRAPPER.length)
     : trimmed;
   const chipMatch = afterDpWrapper.match(/^\[([^\]]+)\]\n/);
-  if (chipMatch && CHIP_MARKER_LABELS.includes(chipMatch[1])) {
-    return !afterDpWrapper.includes(CHIP_USER_ADDITION_MARKER);
-  }
+  if (chipMatch && CHIP_MARKER_LABELS.includes(chipMatch[1])) return true;
 
   return false;
 }
