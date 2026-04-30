@@ -106,6 +106,11 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const orgId = params.orgId as string | undefined;
     const text = params.text as string;
     const incomingSessionId = params.sessionId as string | undefined;
+    // Portal stamps turnStartMs at POST receipt — closer to user click than
+    // the runtime's loop start. Use it as the canonical turn anchor when
+    // present; fall back gracefully so direct callers (tests, /run path)
+    // still work without it.
+    const turnStartMs = typeof params.turnStartMs === "number" ? params.turnStartMs : undefined;
 
     if (!agentId || !userId || !text) {
       throw new Error("agentId, userId, and text are required");
@@ -163,6 +168,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
             persistMessages: true,
             redactionConfig,
             signal: abortCtrl.signal,
+            turnStartTime: turnStartMs,
             onEvent: (evt, _eventType, extras) => {
               context.sendEvent("chat.event", {
                 sessionId: promptResult.sessionId,

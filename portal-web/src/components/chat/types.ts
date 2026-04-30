@@ -4,6 +4,31 @@ export type MessageRole = "user" | "assistant" | "tool"
 
 export type ToolStatus = "running" | "success" | "error" | "aborted"
 
+/**
+ * Per-message timing data shown as small badges in the chat bubble.
+ *
+ * Designed so a naive sum of all visible badges equals the turn's wall clock
+ * (within event-dispatch noise) — no double-counting, no missing intervals.
+ *
+ * Assistant messages:
+ *   - ⏳ ttftMs:     first message of a turn ONLY. Time to first token.
+ *   - 💭 thinkingMs: boundary (turn-start or last tool_end) → first text token.
+ *   - ✍️ outputMs:  first text token → message_end (text streaming time).
+ *
+ * Tool messages:
+ *   - 💭 thinkingMs: model reasoning before this tool fired (boundary-based).
+ *   - ⚙️ durationMs: tool wall-clock execution time.
+ *
+ * turnTotalMs is carried for cross-checking but not rendered as a badge.
+ */
+export interface MessageTiming {
+  ttftMs?: number
+  thinkingMs?: number
+  outputMs?: number
+  durationMs?: number
+  turnTotalMs?: number
+}
+
 export interface PilotMessage {
   id: string
   role: MessageRole
@@ -16,6 +41,8 @@ export interface PilotMessage {
   /** Structured details from tool result metadata */
   toolDetails?: Record<string, unknown>
   metadata?: Record<string, unknown>
+  /** Timing badges (⏳ TTFT / 💭 thinking / ⚙️ tool-exec) */
+  timing?: MessageTiming
   fromAgentId?: string | null
   parentSessionId?: string | null
   delegationId?: string | null

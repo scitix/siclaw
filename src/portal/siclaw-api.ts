@@ -43,6 +43,28 @@ import { validateKnowledgePackage } from "../shared/knowledge-package.js";
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
 
+/**
+ * Summarise a vector of millisecond latency samples into avg / min / max / p90.
+ * Empty input → `count: 0` and the rest 0; the frontend renders a "no data"
+ * state in that case. p90 uses nearest-rank: index = ceil(n * 0.9) - 1.
+ */
+function summariseLatency(values: number[]): {
+  count: number; avg: number; min: number; max: number; p90: number;
+} {
+  if (values.length === 0) return { count: 0, avg: 0, min: 0, max: 0, p90: 0 };
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const sum = sorted.reduce((a, b) => a + b, 0);
+  const p90Index = Math.max(0, Math.ceil(n * 0.9) - 1);
+  return {
+    count: n,
+    avg: Math.round(sum / n),
+    min: sorted[0],
+    max: sorted[n - 1],
+    p90: sorted[p90Index],
+  };
+}
+
 // ── Permission check helper ───────────────────────────────────
 
 interface AccessResult {
@@ -2366,6 +2388,70 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+  });
+
+  // GET /api/v1/siclaw/metrics/timing
+  // Aggregates per-message timing telemetry stamped by sse-consumer:
+  //   ⏳ ttft     — chat_messages.metadata.timing.ttft_ms (assistant rows)
+  //   💭 thinking — chat_messages.metadata.timing.thinking_ms (assistant)
+  //   ⚙️ bash    — chat_messages.duration_ms (tool rows where tool_name='bash')
+  //
+  // Aggregation is done in JS rather than via JSON_EXTRACT so the same code
+  // path works under MySQL and SQLite without the dialect-helpers dance —
+  // the dataset for a 30d window per user is bounded (~thousands of rows)
+  // and we read only the columns we need (`metadata` / `duration_ms`).
+  router.get("/api/v1/siclaw/metrics/timing", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const period = query.period || "7d";
+    const rangeMs = PERIODS[period];
+    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
+    const cutoff = new Date(Date.now() - rangeMs);
+    const userFilter = query.userId || null;
+
+    const db = getDb();
+
+    // Assistant rows: pull metadata JSON, parse client-side, harvest ttft/thinking.
+    const aParams: unknown[] = [cutoff];
+    let assistantSql = `SELECT m.metadata
+      FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.metadata IS NOT NULL
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { assistantSql += " AND s.user_id = ?"; aParams.push(userFilter); }
+    const [aRows] = await db.query(assistantSql, aParams) as [Array<{ metadata: unknown }>, unknown];
+
+    const ttftValues: number[] = [];
+    const thinkingValues: number[] = [];
+    for (const r of aRows) {
+      const meta = safeParseJson<Record<string, unknown> | null>(r.metadata, null);
+      const timing = meta?.timing as Record<string, unknown> | undefined;
+      if (!timing) continue;
+      if (typeof timing.ttft_ms === "number") ttftValues.push(timing.ttft_ms);
+      if (typeof timing.thinking_ms === "number") thinkingValues.push(timing.thinking_ms);
+    }
+
+    // Bash tool rows: duration_ms is its own column — no JSON parsing needed.
+    const bParams: unknown[] = [cutoff];
+    let bashSql = `SELECT m.duration_ms AS durationMs
+      FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'tool' AND m.tool_name = 'bash' AND m.duration_ms IS NOT NULL
+        AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { bashSql += " AND s.user_id = ?"; bParams.push(userFilter); }
+    const [bRows] = await db.query(bashSql, bParams) as [Array<{ durationMs: number | null }>, unknown];
+    const bashValues: number[] = bRows
+      .map((r) => Number(r.durationMs))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+
+    sendJson(res, 200, {
+      ttft: summariseLatency(ttftValues),
+      thinking: summariseLatency(thinkingValues),
+      bash: summariseLatency(bashValues),
+    });
   });
 
   // GET /api/v1/siclaw/metrics/audit
