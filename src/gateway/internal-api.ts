@@ -43,51 +43,71 @@ function sendJson(res: http.ServerResponse, status: number, data: unknown): void
   res.end(JSON.stringify(data));
 }
 
-function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): boolean {
+async function sessionBelongsToIdentity(sessionId: string | null | undefined, identity: CertificateIdentity): Promise<boolean> {
   if (!sessionId) return true;
-  const owner = sessionRegistry.get(sessionId);
+  const owner = await sessionRegistry.get(sessionId);
   return !owner || owner.agentId === identity.agentId;
+}
+
+/**
+ * Resolve sessionId → userId, **enforcing that the session belongs to the
+ * calling cert's agent**. Cross-agent attribution is rejected (`ok: false`)
+ * — without this check, AgentBox A could pass a session_id owned by
+ * AgentBox B and have its task / credential request audited under B's user.
+ *
+ * Unknown sessions degrade gracefully (`ok: true`, `userId: ""`); only an
+ * explicit ownership mismatch trips the gate.
+ */
+async function resolveUserForIdentity(
+  sessionId: string | null | undefined,
+  identity: CertificateIdentity,
+): Promise<{ userId: string; ok: boolean }> {
+  if (!sessionId) return { userId: "", ok: true };
+  const owner = await sessionRegistry.get(sessionId);
+  if (!owner) return { userId: "", ok: true };
+  if (owner.agentId !== identity.agentId) return { userId: "", ok: false };
+  return { userId: owner.userId, ok: true };
 }
 
 function agentMatchesIdentity(agentId: string | null | undefined, identity: CertificateIdentity): boolean {
   return !agentId || agentId === identity.agentId;
 }
 
-function validateDelegationEventActor(
+async function validateDelegationEventActor(
   event: DelegationPersistenceEvent,
   identity: CertificateIdentity,
-): { status: number; error: string } | null {
+): Promise<{ status: number; error: string } | null> {
   switch (event.type) {
     case "delegation.ensure_session": {
       if (!event.userId) return { status: 400, error: "delegation.ensure_session requires userId" };
       if (!agentMatchesIdentity(event.agentId, identity)) return { status: 403, error: "delegation agent mismatch" };
-      if (!sessionBelongsToIdentity(event.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
-      if (!sessionBelongsToIdentity(event.lineage?.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.lineage?.parentSessionId, identity))) return { status: 403, error: "delegation parent session mismatch" };
       if (!agentMatchesIdentity(event.lineage?.parentAgentId, identity)) return { status: 403, error: "delegation parent agent mismatch" };
       if (!agentMatchesIdentity(event.lineage?.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
       return null;
     }
     case "delegation.append_message": {
-      if (!sessionBelongsToIdentity(event.message.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
-      if (!sessionBelongsToIdentity(event.message.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.message.parentSessionId, identity))) return { status: 403, error: "delegation parent session mismatch" };
       if (!agentMatchesIdentity(event.message.fromAgentId, identity)) return { status: 403, error: "delegation source agent mismatch" };
       if (!agentMatchesIdentity(event.message.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
       return null;
     }
     case "delegation.update_message":
     case "delegation.update_tool_message": {
-      if (!sessionBelongsToIdentity(event.message.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.message.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
       return null;
     }
     case "delegation.append_event": {
       if (!event.event.userId) return { status: 400, error: "delegation.append_event requires userId" };
-      if (!sessionBelongsToIdentity(event.event.parentSessionId, identity)) return { status: 403, error: "delegation parent session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.event.parentSessionId, identity))) return { status: 403, error: "delegation parent session mismatch" };
       if (!agentMatchesIdentity(event.event.parentAgentId, identity)) return { status: 403, error: "delegation parent agent mismatch" };
       if (!agentMatchesIdentity(event.event.targetAgentId, identity)) return { status: 403, error: "delegation target agent mismatch" };
       return null;
     }
     case "delegation.emit_chat_event": {
-      if (!sessionBelongsToIdentity(event.sessionId, identity)) return { status: 403, error: "delegation session mismatch" };
+      if (!(await sessionBelongsToIdentity(event.sessionId, identity))) return { status: 403, error: "delegation session mismatch" };
       return null;
     }
     default:
@@ -253,7 +273,8 @@ export async function handleAgentTasksList(
   try {
     // Session may be threaded via query param for GET; resolve → userId for audit.
     const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
-    const userId = sessionRegistry.resolveUser(sessionId);
+    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.list", {
       agent_id: identity.agentId,
       user_id: userId,
@@ -306,7 +327,8 @@ export async function handleAgentTasksCreate(
     const invalid = validateSchedule(body.schedule);
     if (invalid) { sendJson(res, 400, { error: invalid }); return; }
 
-    const userId = sessionRegistry.resolveUser(body.session_id);
+    const { userId, ok } = await resolveUserForIdentity(body.session_id, identity);
+    if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.create", {
       id: randomUUID(),
       agent_id: identity.agentId,
@@ -345,7 +367,8 @@ export async function handleAgentTasksUpdate(
     }
 
     const sessionId = typeof body.session_id === "string" ? body.session_id : undefined;
-    const userId = sessionRegistry.resolveUser(sessionId);
+    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.update", {
       task_id: taskId,
       agent_id: identity.agentId,
@@ -375,7 +398,8 @@ export async function handleAgentTasksDelete(
 ): Promise<void> {
   try {
     const sessionId = new URL(req.url || "/", "http://_").searchParams.get("session_id") ?? "";
-    const userId = sessionRegistry.resolveUser(sessionId);
+    const { userId, ok } = await resolveUserForIdentity(sessionId, identity);
+    if (!ok) { sendJson(res, 403, { error: "session ownership mismatch" }); return; }
     const data = await frontendClient.request("task.delete", {
       task_id: taskId,
       agent_id: identity.agentId,
@@ -496,7 +520,7 @@ export async function handleDelegationEvents(
 ): Promise<void> {
   try {
     const event = await readJsonBody(req) as DelegationPersistenceEvent;
-    const actorError = validateDelegationEventActor(event, identity);
+    const actorError = await validateDelegationEventActor(event, identity);
     if (actorError) {
       sendJson(res, actorError.status, { error: actorError.error });
       return;

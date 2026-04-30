@@ -9,3 +9,21 @@ Thank you for installing {{ include "siclaw.fullname" . }}!
    {{- end }}
    Gateway will create per-user subdirectories automatically.
 {{- end }}
+
+ℹ️  Runtime mTLS CA
+   {{- $caSecret := include "siclaw.runtimeTls.caSecret" . }}
+   {{- $generateCa := include "siclaw.runtimeTls.generateCa" . }}
+   {{- if $caSecret }}
+   Source: external Secret "{{ $caSecret }}" (kubernetes.io/tls).
+   Rotate the Secret then `kubectl rollout restart deploy/{{ include "siclaw.fullname" . }}-runtime`
+   and delete cached AgentBox client cert Secrets to re-issue.
+   {{- else if eq $generateCa "true" }}
+   Source: chart-managed Secret "{{ include "siclaw.runtimeCaSecretName" . }}".
+   Annotated `helm.sh/resource-policy: keep` so it survives `helm uninstall`.
+   To rotate: `kubectl delete secret {{ include "siclaw.runtimeCaSecretName" . }} -n {{ .Release.Namespace }}`
+   then `helm upgrade` (this also requires deleting AgentBox client cert Secrets and recycling AgentBox pods).
+   ⚠️  GitOps users: do NOT run `helm template … | kubectl apply -f -` against a live cluster
+       — `lookup` cannot read the cluster from render-only contexts and would emit a fresh CA
+       every render, overwriting this Secret and breaking mTLS for every running AgentBox.
+       For pre-rendered pipelines, set runtime.tls.generateCa=false and supply runtime.tls.caSecret.
+   {{- end }}

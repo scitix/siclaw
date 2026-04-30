@@ -13,7 +13,7 @@
 import http from "node:http";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 import type { Identity } from "../shared/credential-types.js";
-import { CredentialService, CredentialNotFoundError } from "./credential-service.js";
+import { CredentialService, CredentialNotFoundError, SessionOwnershipError } from "./credential-service.js";
 
 interface CredentialRequestBody {
   source?: string;
@@ -105,6 +105,10 @@ export async function handleCredentialRequest(
       : await service.getHostCredential(id, body.source_id, body.purpose ?? "");
     sendJson(res, 200, payload);
   } catch (err) {
+    if (err instanceof SessionOwnershipError) {
+      sendError(res, 403, err.message);
+      return;
+    }
     if (err instanceof CredentialNotFoundError) {
       sendError(res, 404, err.message);
       return;
@@ -144,6 +148,10 @@ export async function handleCredentialList(
       sendJson(res, 200, { hosts });
     }
   } catch (err) {
+    if (err instanceof SessionOwnershipError) {
+      sendError(res, 403, err.message);
+      return;
+    }
     console.error(`[credential-proxy] list${body.kind} failed:`, err);
     sendError(res, 502, err instanceof Error ? err.message : "Unknown error");
   }
