@@ -71,6 +71,30 @@ export interface SseConsumptionResult {
 const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
 
 /**
+ * Inter-event dispatch jitter — the tightest possible gap between two
+ * timestamps that come from the SSE event loop's natural pacing rather than
+ * any real wall-clock interval. Used by the ttft/thinking dedup below: if
+ * the two values differ by less than this, they are treated as the same
+ * instant and only one is emitted (avoids double-counting on naive sums).
+ *
+ * 50ms is a conservative ceiling for a single Node tick + WS hop; bump it
+ * if you start seeing duplicate ⏳/💭 badges on first-of-turn messages.
+ */
+const NOISE_FLOOR_MS = 50;
+
+/**
+ * Drop negative timing deltas. Same-process measurements are always ≥0, but
+ * cross-process anchors (e.g. portal POST timestamp passed to runtime via
+ * RPC) can briefly produce negatives if the two pods' NTP clocks have drifted
+ * apart. We treat negatives as "unknown" rather than persist them — downstream
+ * (frontend formatter, /metrics/timing aggregation) interprets absence as
+ * unmeasured, which is correct.
+ */
+function nonNegative(ms: number): number | undefined {
+  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
+
+/**
  * Strip pi-agent's `(Empty response: {...})` diagnostic markers that get
  * appended to an assistant message when the model returns content=[]. These
  * are useful in server logs but pollute the persisted trace shown to users.
@@ -313,15 +337,34 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       // (turn start, or the previous tool_execution_end) and this tool's
       // start. This is the model's "I just got new info, deciding what to
       // do next" interval — invisible until we measured it explicitly.
-      const preThinkingMs = nowAtStart - lastBoundaryTime;
+      // nonNegative() drops cross-pod clock-drift artefacts; absence
+      // downstream means "unknown", which is the correct semantics.
+      const preThinkingMs = nonNegative(nowAtStart - lastBoundaryTime);
       pushPending(pendingToolInputs, startToolName, rawToolInput);
       pushPending(pendingToolStartTimes, startToolName, nowAtStart);
-      pushPending(pendingPreThinkingMs, startToolName, preThinkingMs);
+      if (preThinkingMs !== undefined) {
+        pushPending(pendingPreThinkingMs, startToolName, preThinkingMs);
+      }
       lastToolName = startToolName;
       // Surface on the live event so frontend can render 💭 immediately.
-      (evt as Record<string, unknown>).preThinkingMs = preThinkingMs;
+      if (preThinkingMs !== undefined) {
+        (evt as Record<string, unknown>).preThinkingMs = preThinkingMs;
+      }
 
       if (persist) {
+        // pre_thinking_ms is durable telemetry, NOT debug-only. Persisted on
+        // every tool row even when ~0ms because a near-zero value on the 2nd-
+        // Nth tool of a batch is the visible proof that those tools came from
+        // a single model "thinking burst" — not noise to filter out. Once
+        // production rows carry this field, downstream consumers (analytics,
+        // replay, audit reports) may rely on its presence; keep it stable.
+        const startMetadata: Record<string, unknown> = {
+          status: "running",
+          started_at: new Date(nowAtStart).toISOString(),
+        };
+        if (preThinkingMs !== undefined) {
+          startMetadata.pre_thinking_ms = preThinkingMs;
+        }
         dbMessageId = await appendMessage({
           sessionId,
           role: "tool",
@@ -330,11 +373,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
           outcome: null,
           durationMs: null,
-          metadata: {
-            status: "running",
-            started_at: new Date(nowAtStart).toISOString(),
-            pre_thinking_ms: preThinkingMs,
-          },
+          metadata: startMetadata,
         });
         pushPending(pendingToolMessageIds, startToolName, dbMessageId);
         await incrementMessageCount(sessionId);
@@ -393,26 +432,34 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         //   ✍️ output_ms    — first text_delta → message_end (per message)
         //   turn_total_ms    — kept for the last message as audit cross-check
         const nowAtEnd = Date.now();
-        const timing: Record<string, number> = {
-          turn_total_ms: nowAtEnd - turnStartTime,
-        };
+        // turn_total may be slightly negative under cross-pod clock drift
+        // (portal-supplied turnStartTime ahead of runtime's nowAtEnd); drop
+        // it in that case rather than persist garbage.
+        const turnTotal = nonNegative(nowAtEnd - turnStartTime);
+        const timing: Record<string, number> = {};
+        if (turnTotal !== undefined) timing.turn_total_ms = turnTotal;
         if (!firstAssistantPersisted && firstTokenTime !== undefined) {
-          timing.ttft_ms = firstTokenTime - turnStartTime;
+          const ttft = nonNegative(firstTokenTime - turnStartTime);
+          if (ttft !== undefined) timing.ttft_ms = ttft;
         }
         if (pendingThinkingMs !== undefined) {
           // Suppress thinking_ms on the first assistant message when ttft is
           // already on the row — they cover the same interval (turnStart →
-          // first text token), and showing both would let a naive sum
-          // double-count that segment. After the first message, ttft is
-          // omitted, so thinking_ms takes over as the boundary-based gap.
-          if (!(timing.ttft_ms !== undefined && Math.abs(pendingThinkingMs - (timing.ttft_ms as number)) < 50)) {
-            timing.thinking_ms = pendingThinkingMs;
+          // first text token), within event-dispatch jitter. After the first
+          // message, ttft is omitted and thinking_ms takes over.
+          const overlapsTtft =
+            timing.ttft_ms !== undefined &&
+            Math.abs(pendingThinkingMs - timing.ttft_ms) < NOISE_FLOOR_MS;
+          const safeThinking = nonNegative(pendingThinkingMs);
+          if (!overlapsTtft && safeThinking !== undefined) {
+            timing.thinking_ms = safeThinking;
           }
         }
         if (assistantMsgFirstTextTime !== undefined) {
           // Text streaming time — was previously invisible. Captures the
           // model's wall-clock cost of emitting the message body.
-          timing.output_ms = nowAtEnd - assistantMsgFirstTextTime;
+          const out = nonNegative(nowAtEnd - assistantMsgFirstTextTime);
+          if (out !== undefined) timing.output_ms = out;
         }
         // Attach timing onto the live event so the SSE consumer (frontend)
         // can render badges immediately without waiting for DB reload.

@@ -48,10 +48,19 @@ export interface LatencyStats {
   p90: number
 }
 
+/** One tool's stats — `toolName` plus the standard latency summary. */
+export interface ToolLatencyStats extends LatencyStats {
+  toolName: string
+}
+
 export interface TimingStats {
   ttft: LatencyStats
   thinking: LatencyStats
-  bash: LatencyStats
+  /** All tools with at least one duration sample, sorted by `count` DESC.
+   *  The card slices client-side to the user-chosen top 3 / 5 / 10. */
+  tools: ToolLatencyStats[]
+  /** True when the backend hit ROW_LIMIT and the figures are a recent-only sample. */
+  truncated?: boolean
 }
 
 export interface AuditLog {
