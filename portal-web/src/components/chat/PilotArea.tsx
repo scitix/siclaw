@@ -24,6 +24,7 @@ import { Markdown } from "./Markdown"
 import { InputArea } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
+import { ErrorBubble } from "./ErrorBubble"
 import type { PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
 
 /**
@@ -41,8 +42,9 @@ function formatTimingMs(ms: number): string {
 
 /**
  * Inline timing badges shown beneath chat bubbles. Emoji semantics, per spec:
- *   ⏳ ttftMs        — time-to-first-token (assistant rows)
- *   💭 thinkingMs    — model reasoning gap before visible text (assistant rows)
+ *   ⏳ ttftMs        — time-to-first-token (first assistant message of a turn)
+ *   💭 thinkingMs    — model reasoning gap before visible text / before tool
+ *   ✍️ outputMs     — text streaming time (first delta → message_end)
  *   ⚙️ durationMs   — bash/kubectl/skill execution time (tool rows)
  *
  * Badge is omitted entirely when no timing is present, so messages without
@@ -1001,6 +1003,11 @@ function MessageItem({
 }) {
   const isUser = message.role === "user"
   const isTool = message.role === "tool"
+  const isError = message.role === "error"
+
+  if (isError && message.errorDetail) {
+    return <ErrorBubble detail={message.errorDetail} />
+  }
 
   if (message.metadata?.kind === "delegation_status_notice") {
     return <DelegationStatusNotice content={message.content} />

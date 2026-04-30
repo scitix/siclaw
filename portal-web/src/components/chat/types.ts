@@ -1,6 +1,6 @@
 /** Shared types for the Pilot-style chat UI. */
 
-export type MessageRole = "user" | "assistant" | "tool"
+export type MessageRole = "user" | "assistant" | "tool" | "error"
 
 export type ToolStatus = "running" | "success" | "error" | "aborted"
 
@@ -29,6 +29,17 @@ export interface MessageTiming {
   turnTotalMs?: number
 }
 
+/** Wire-compatible with siclaw's ErrorDetail (src/lib/error-envelope.ts) and
+ *  sicore's pkg/model ErrorDetail. See docs/design/error-envelope.md. */
+export interface ErrorDetail {
+  code: string
+  message: string
+  retriable: boolean
+  retryAfterMs?: number
+  requestId?: string
+  details?: unknown
+}
+
 export interface PilotMessage {
   id: string
   role: MessageRole
@@ -51,6 +62,8 @@ export interface PilotMessage {
   isStreaming?: boolean
   /** Hidden from chat bubbles (e.g. update_plan tool messages) */
   hidden?: boolean
+  /** Populated when role === "error". */
+  errorDetail?: ErrorDetail
 }
 
 export interface ContextUsage {

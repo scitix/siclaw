@@ -15,6 +15,12 @@ import {
 } from "../gateway/rest-router.js";
 import type { ResolvedModelBinding } from "../gateway/agent-model-binding.js";
 import { getDb } from "../gateway/db.js";
+import {
+  ErrorCodes,
+  errorBody,
+  isErrorDetail,
+  type ErrorDetail,
+} from "../lib/error-envelope.js";
 
 /** Resolve model binding directly from Portal's own DB. */
 async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
@@ -117,23 +123,37 @@ export function registerChatRoutes(
     // down through chat.send so the runtime uses the same epoch.
     const turnStartMs = Date.now();
     const auth = requireAuth(req, jwtSecret);
-    if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
+    if (!auth) {
+      sendJson(res, 401, errorBody({ code: ErrorCodes.INTERNAL, message: "Authentication required", retriable: false }));
+      return;
+    }
 
     const body = await parseBody<{ text?: string; session_id?: string }>(req);
-    if (!body.text) { sendJson(res, 400, { error: "text is required" }); return; }
+    if (!body.text) {
+      sendJson(res, 400, errorBody({ code: ErrorCodes.BAD_REQUEST, message: "text is required", retriable: false }));
+      return;
+    }
 
     const agentId = params.id;
     const sessionId = body.session_id ?? crypto.randomUUID();
 
     if (!connectionMap.isConnected(agentId)) {
-      sendJson(res, 503, { error: "Agent runtime is not connected" });
+      sendJson(res, 503, errorBody({
+        code: ErrorCodes.CONNECTION_FAILED,
+        message: `Agent runtime is not connected for agent ${agentId}`,
+        retriable: true,
+      }));
       return;
     }
 
     // Resolve agent's bound model + provider config from DB
     const modelBinding = await resolveAgentModelBinding(agentId);
     if (!modelBinding) {
-      sendJson(res, 400, { error: "Agent has no model configured, or the bound provider/model was not found" });
+      sendJson(res, 400, errorBody({
+        code: ErrorCodes.BAD_REQUEST,
+        message: "Agent has no model configured, or the bound provider/model was not found",
+        retriable: false,
+      }));
       return;
     }
 
@@ -160,6 +180,17 @@ export function registerChatRoutes(
       if (envelope.sessionId && envelope.sessionId !== sessionId) return;
 
       const evt = envelope.event;
+
+      // Translate stream_error events to a canonical SSE error frame so the
+      // frontend handles them via the same code path as RPC-level failures.
+      if (evt.type === "stream_error") {
+        const detail = isErrorDetail(evt.error)
+          ? (evt.error as ErrorDetail)
+          : { code: ErrorCodes.STREAM_INTERRUPTED, message: "Stream error", retriable: true };
+        sseWrite(res, "error", detail);
+        return;
+      }
+
       sseWrite(res, "chat.event", evt);
 
       // Stream complete — only on prompt_done (sent by Runtime after ALL agent
@@ -185,7 +216,11 @@ export function registerChatRoutes(
     });
 
     if (!result.ok) {
-      sseWrite(res, "error", { error: result.error ?? "RPC failed" });
+      sseWrite(res, "error", {
+        code: ErrorCodes.INTERNAL,
+        message: result.error ?? "RPC failed",
+        retriable: true,
+      });
       res.end();
       cleanup();
       return;

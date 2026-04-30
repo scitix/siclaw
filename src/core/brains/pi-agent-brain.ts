@@ -71,10 +71,18 @@ export class PiAgentBrain implements BrainSession {
       // by an intentional abort (user Stop, or an extension force-aborting a
       // turn). Re-prompting the original text in that case re-runs input
       // handlers and can corrupt extension state.
+      //
+      // Skip retry when stopReason === "error": pi-agent-core has already
+      // exhausted its transport-level retries by the time it surfaces a
+      // failed turn this way (auth/quota/network give-up). Re-prompting just
+      // hammers the same failure, while each retry emits agent_start /
+      // agent_end pairs that flicker the frontend Thinking indicator on/off
+      // even though stream_error has already shown the user the error bubble.
       let retries = 0;
       while (
         !lastAssistantHadContent &&
         lastAssistantMessage?.stopReason !== "aborted" &&
+        lastAssistantMessage?.stopReason !== "error" &&
         retries < PiAgentBrain.MAX_EMPTY_RETRIES
       ) {
         retries++;
