@@ -73,6 +73,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "siclaw.fullname" . }}-runtime
                   key: portal-secret
+            {{- $caSecret := include "siclaw.runtimeCaSecretRef" . }}
+            {{- if $caSecret }}
+            # mTLS CA — persisted so existing AgentBox client certs survive
+            # Runtime restarts. See runtime-ca-secret.yaml.
+            - name: SICLAW_CA_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $caSecret }}
+                  key: tls.crt
+            - name: SICLAW_CA_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $caSecret }}
+                  key: tls.key
+            {{- end }}
+            # User-supplied env entries come last so callers can override any
+            # of the values above (e.g. swap in SICLAW_CA_CERT_FILE).
             {{- range $key, $value := .Values.runtime.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}

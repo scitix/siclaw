@@ -86,6 +86,34 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
   if (!opts.credentialService) throw new Error("credentialService is required in StartRuntimeOptions");
   const credentialService = opts.credentialService;
 
+  // ── Session Registry resolver ────────────────────────────
+  // Cache misses (e.g. async AgentBox callbacks arriving after a Runtime
+  // restart, before the next chat.send refills the LRU) fall back to Portal,
+  // where chat_sessions.user_id is the source of truth.
+  //
+  // Wrapped in a 5s timeout so a slow / unresponsive Portal can't stall every
+  // internal-api callback for the full FrontendWsClient default (30s). On
+  // timeout we degrade to "" userId, which matches the pre-fallback behaviour.
+  const RESOLVE_SESSION_TIMEOUT_MS = 5000;
+  sessionRegistry.setResolver(async (sessionId) => {
+    try {
+      const rpc = frontendClient.request("chat.resolveSession", { session_id: sessionId });
+      const data = await Promise.race([
+        rpc,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`chat.resolveSession timed out after ${RESOLVE_SESSION_TIMEOUT_MS}ms`)), RESOLVE_SESSION_TIMEOUT_MS),
+        ),
+      ]) as
+        | { found: false }
+        | { found: true; user_id: string; agent_id: string };
+      if (!data.found) return null;
+      return { userId: data.user_id, agentId: data.agent_id };
+    } catch (err) {
+      console.error("[session-registry] resolveSession RPC failed:", err);
+      return null;
+    }
+  });
+
   // ── Certificate Manager ──────────────────────────────────
   const certManager = opts.certManager ?? await CertificateManager.create();
   agentBoxManager.setCertManager(certManager);

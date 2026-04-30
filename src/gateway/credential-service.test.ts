@@ -3,6 +3,7 @@ import {
   CredentialService,
   createCredentialService,
   CredentialNotFoundError,
+  SessionOwnershipError,
 } from "./credential-service.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { Identity } from "../shared/credential-types.js";
@@ -153,6 +154,32 @@ describe("CredentialNotFoundError", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.name).toBe("CredentialNotFoundError");
     expect(err.message).toBe("missing");
+  });
+});
+
+describe("CredentialService cross-agent ownership guard", () => {
+  it("throws SessionOwnershipError when registry resolves session_id to a different agent", async () => {
+    // Registry says sess-1 belongs to agent "other"; identity claims agent "a1".
+    const reg = new SessionRegistry();
+    reg.remember("sess-1", "u-foreign", "other");
+    const fakeFrontend = new FakeFrontendClient();
+    const guarded = new CredentialService(fakeFrontend as unknown as FrontendWsClient, reg);
+
+    await expect(guarded.listClusters({ ...identity, sessionId: "sess-1" }))
+      .rejects.toBeInstanceOf(SessionOwnershipError);
+    // Critical: upstream RPC must not have been invoked.
+    expect(fakeFrontend.calls.find(c => c.method === "credential.list")).toBeUndefined();
+  });
+
+  it("does not throw when sessionId is empty (graceful degradation)", async () => {
+    const reg = new SessionRegistry();
+    const fakeFrontend = new FakeFrontendClient();
+    fakeFrontend.responses.set("credential.list:cluster", { clusters: [] });
+    const guarded = new CredentialService(fakeFrontend as unknown as FrontendWsClient, reg);
+
+    await expect(guarded.listClusters({ ...identity, sessionId: "" }))
+      .resolves.toEqual([]);
+    expect(fakeFrontend.calls[0].params.userId).toBe("");
   });
 });
 

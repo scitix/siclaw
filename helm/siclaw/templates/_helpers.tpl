@@ -77,3 +77,57 @@ in the same namespace don't collide; users can override via
 {{- define "siclaw.dataPvcName" -}}
 {{- default (printf "%s-data" (include "siclaw.fullname" .)) .Values.agentbox.persistence.claimName -}}
 {{- end }}
+
+{{/*
+Name of the chart-managed Runtime CA Secret.
+*/}}
+{{- define "siclaw.runtimeCaSecretName" -}}
+{{- printf "%s-runtime-ca" (include "siclaw.fullname" .) -}}
+{{- end }}
+
+{{/*
+Resolve runtime.tls.generateCa. Returns the literal string "true" or "false".
+Defaults to "true" when the field is missing — critical for `helm upgrade
+--reuse-values` against a release created with a pre-tls chart, where
+.Values.runtime.tls itself is nil.
+*/}}
+{{- define "siclaw.runtimeTls.generateCa" -}}
+{{- $tls := .Values.runtime.tls | default dict -}}
+{{- if hasKey $tls "generateCa" -}}{{- $tls.generateCa -}}{{- else -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Resolve runtime.tls.caSecret. Returns "" when missing.
+*/}}
+{{- define "siclaw.runtimeTls.caSecret" -}}
+{{- $tls := .Values.runtime.tls | default dict -}}
+{{- $tls.caSecret | default "" -}}
+{{- end }}
+
+{{/*
+Resolve the Secret that backs SICLAW_CA_CERT/KEY. caSecret wins when set,
+otherwise the chart-managed name is used. Empty result means TLS is mis-
+configured — callers must guard with siclaw.validateRuntimeTls first.
+*/}}
+{{- define "siclaw.runtimeCaSecretRef" -}}
+{{- $caSecret := include "siclaw.runtimeTls.caSecret" . -}}
+{{- $generateCa := include "siclaw.runtimeTls.generateCa" . -}}
+{{- if $caSecret -}}
+{{- $caSecret -}}
+{{- else if eq $generateCa "true" -}}
+{{- include "siclaw.runtimeCaSecretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail-fast guard. Without a CA Secret the Runtime falls back to an ephemeral
+in-memory CA, and every Runtime restart silently invalidates the client certs
+held by existing AgentBox pods. Refuse to render the chart in that state.
+*/}}
+{{- define "siclaw.validateRuntimeTls" -}}
+{{- $caSecret := include "siclaw.runtimeTls.caSecret" . -}}
+{{- $generateCa := include "siclaw.runtimeTls.generateCa" . -}}
+{{- if and (ne $generateCa "true") (eq $caSecret "") -}}
+{{- fail "runtime.tls misconfigured: set generateCa=true OR caSecret to a kubernetes.io/tls Secret name. Ephemeral CA is not supported in K8s — old AgentBox pods would lose mTLS on every Runtime restart." -}}
+{{- end -}}
+{{- end }}
