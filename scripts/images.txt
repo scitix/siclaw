@@ -1,0 +1,3 @@
+registry-cn-beijing.siflow.cn/k8s/siclaw-portal:yye-feat-trace-store-v2-1cad153
+registry-cn-beijing.siflow.cn/k8s/siclaw-agentbox:yye-feat-trace-store-v2-1cad153
+registry-cn-beijing.siflow.cn/k8s/siclaw-runtime:yye-feat-trace-store-v2-1cad1531

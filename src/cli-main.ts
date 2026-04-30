@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   InteractiveMode,
@@ -12,6 +13,7 @@ import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
 import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
+import { maybeCreateTraceRecorder } from "./core/trace-recorder.js";
 import { tryLoadPortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
 import { materializePortalSkills, cleanupPortalSkills } from "./lib/portal-skill-materializer.js";
 import { materializePortalKnowledge, cleanupPortalKnowledge } from "./lib/portal-knowledge-materializer.js";
@@ -254,6 +256,40 @@ if (memoryIndexer) {
     .catch(err => console.warn("[siclaw] Startup maintenance failed:", err));
 }
 
+// Trace recorder — writes per-prompt JSON + optional DB row via TraceStore.
+// Disable with SICLAW_TRACE_DISABLE=1. Wrap session.prompt so each user-initiated
+// turn yields exactly ONE trace, even when pi-agent internally retries or
+// auto-compacts (which fire their own agent_start/end cycles).
+const osUsername = (() => { try { return os.userInfo().username; } catch { return process.env.USER ?? "unknown"; } })();
+const traceRecorder = await maybeCreateTraceRecorder({
+  sessionId: sessionManager.getSessionId?.() ?? `cli-${Date.now()}`,
+  userId: osUsername,
+  username: osUsername,
+  mode: "cli",
+  brainType: brain.brainType,
+  getSessionStats: () => brain.getSessionStats(),
+  getModel: () => brain.getModel(),
+});
+if (traceRecorder) {
+  traceRecorder.attach(brain);
+  const traceDir = process.env.SICLAW_TRACE_DIR ?? path.join(process.cwd(), ".siclaw", "traces");
+  console.log(`[siclaw] Trace recording → ${path.relative(process.cwd(), traceDir) || traceDir}`);
+
+  const origSessionPrompt = session.prompt.bind(session);
+  (session as unknown as { prompt: (text: string) => Promise<void> }).prompt = async (text: string) => {
+    await traceRecorder.beginPrompt(text);
+    let outcome: "completed" | "error" = "completed";
+    try {
+      await origSessionPrompt(text);
+    } catch (err) {
+      outcome = "error";
+      throw err;
+    } finally {
+      await traceRecorder.endPrompt(outcome);
+    }
+  };
+}
+
 // Debug: subscribe to all session events and write to log file
 if (debugMode) {
   const logFile = path.join(process.cwd(), "siclaw-debug.log");
@@ -364,6 +400,11 @@ if (session.sessionFile) {
   } catch (err) {
     console.warn(`[siclaw] Memory auto-save failed:`, err);
   }
+}
+
+// Close trace recorder — flushes any in-flight trace.
+if (traceRecorder) {
+  try { await traceRecorder.close(); } catch { /* ignore */ }
 }
 
 // Clean up cached debug pods

@@ -39,6 +39,12 @@ import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { parseFrontmatter } from "../gateway/skills/builtin-sync.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { validateKnowledgePackage } from "../shared/knowledge-package.js";
+import { getTraceStore, type TraceListOpts } from "../core/trace-store.js";
+import {
+  INJECTED_PROMPT_KINDS,
+  isInjectedPromptKind,
+  type InjectedPromptKind,
+} from "../core/injected-prompt-kinds.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -1809,6 +1815,155 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         timestamp: m.created_at ? new Date(m.created_at).toISOString() : null,
       })),
     });
+  });
+
+
+  // ================================================================
+  // Agent Traces (per-prompt execution records)
+  // ================================================================
+  //
+  // Storage: process-level TraceStore (SQLite/MySQL/Composite — see
+  // src/core/trace-store.ts). Recorder is the sole writer; this surface is
+  // read + delete only. Mutation (POST/PATCH) is intentionally not exposed
+  // because traces are immutable execution history — letting clients edit
+  // or fabricate rows would break reproducibility and the recorder's
+  // two-phase stub→flush UPSERT lifecycle.
+  //
+  // Authorization:
+  //   - All routes require a Bearer JWT.
+  //   - role=admin sees / can delete any trace.
+  //   - Other users are scoped to rows whose user_id matches auth.userId.
+
+  /** Parse a boolean query parameter. Accepts 1 / true / yes (case-insensitive). */
+  function parseBoolParam(raw: string | undefined): boolean | undefined {
+    if (raw === undefined || raw === "") return undefined;
+    const v = raw.toLowerCase();
+    if (v === "1" || v === "true" || v === "yes") return true;
+    if (v === "0" || v === "false" || v === "no") return false;
+    return undefined;
+  }
+
+  /**
+   * Build a TraceListOpts from a parsed query string, applying the auth-scope
+   * rule: non-admins are silently pinned to their own user_id even if they
+   * pass a different `user_id` query param.
+   */
+  function buildTraceListOpts(query: Record<string, string>, auth: AuthContext): TraceListOpts {
+    const isAdmin = auth.role === "admin";
+    const opts: TraceListOpts = {};
+    if (query.user_id) opts.userId = query.user_id;
+    if (query.username) opts.username = query.username;
+    if (!isAdmin) opts.userId = auth.userId;  // hard scope; overrides any caller-supplied user_id
+    if (query.from) opts.from = query.from;
+    if (query.to) opts.to = query.to;
+    if (query.outcome) opts.outcome = query.outcome;
+    if (query.session_id) opts.sessionId = query.session_id;
+    if (query.mode) opts.mode = query.mode;
+    if (query.dp_status_end) opts.dpStatusEnd = query.dp_status_end;
+    // `is_injected_prompt` query param accepts:
+    //   - csv list of kind keys (e.g. "chip_click,dig_deeper") → IN filter
+    //   - "1" / "true" / "yes"                                 → any non-"none"
+    //   - "0" / "false" / "no"                                 → ["none"]
+    // See src/core/injected-prompt-kinds.ts for the full kind list.
+    const injectedRaw = (query.is_injected_prompt ?? "").trim();
+    if (injectedRaw) {
+      const asBool = parseBoolParam(injectedRaw);
+      if (asBool === false) {
+        opts.isInjectedPrompt = [INJECTED_PROMPT_KINDS.NONE];
+      } else if (asBool === true) {
+        opts.isInjectedPrompt = (Object.values(INJECTED_PROMPT_KINDS) as InjectedPromptKind[])
+          .filter((k) => k !== INJECTED_PROMPT_KINDS.NONE);
+      } else {
+        const kinds = injectedRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+          .filter(isInjectedPromptKind);
+        if (kinds.length > 0) opts.isInjectedPrompt = kinds;
+      }
+    }
+    if (query.min_duration_ms) {
+      const n = parseInt(query.min_duration_ms, 10);
+      if (Number.isFinite(n) && n >= 0) opts.minDurationMs = n;
+    }
+    if (query.limit) {
+      const n = parseInt(query.limit, 10);
+      if (Number.isFinite(n) && n > 0) opts.limit = n;
+    }
+    if (query.cursor_started_at && query.cursor_id) {
+      opts.cursorStartedAt = query.cursor_started_at;
+      opts.cursorId = query.cursor_id;
+    }
+    return opts;
+  }
+
+  // List traces — paginated with keyset cursor.
+  router.get(`${P}/traces`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const store = await getTraceStore();
+    if (!store) {
+      sendJson(res, 503, {
+        error: "Trace store is not configured. Set SICLAW_TRACE_MYSQL_URL or SICLAW_TRACE_SQLITE_ENABLED=1.",
+      });
+      return;
+    }
+
+    const query = parseQuery(req.url ?? "");
+    const opts = buildTraceListOpts(query, auth);
+    const result = await store.list(opts);
+    sendJson(res, 200, {
+      data: result.items,
+      next_cursor: result.nextCursor,
+      filters_applied: opts,
+    });
+  });
+
+  // Get one trace by trace_key, including parsed body JSON.
+  router.get(`${P}/traces/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const store = await getTraceStore();
+    if (!store) { sendJson(res, 503, { error: "Trace store is not configured." }); return; }
+
+    const record = await store.getById(params.id);
+    if (!record) { sendJson(res, 404, { error: "Trace not found" }); return; }
+
+    if (auth.role !== "admin" && record.userId && record.userId !== auth.userId) {
+      sendJson(res, 403, { error: "Forbidden: trace belongs to another user" });
+      return;
+    }
+
+    let body: unknown = null;
+    try { body = JSON.parse(record.bodyJson); }
+    catch { body = { _raw: record.bodyJson, _parseError: true }; }
+
+    const { bodyJson: _omit, ...row } = record;
+    void _omit;
+    sendJson(res, 200, { ...row, body });
+  });
+
+  // Delete one trace. Owners can delete their own; admins can delete any.
+  router.delete(`${P}/traces/:id`, async (req, res, params) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    const store = await getTraceStore();
+    if (!store) { sendJson(res, 503, { error: "Trace store is not configured." }); return; }
+
+    const record = await store.getById(params.id);
+    if (!record) { sendJson(res, 404, { error: "Trace not found" }); return; }
+
+    if (auth.role !== "admin" && record.userId && record.userId !== auth.userId) {
+      sendJson(res, 403, { error: "Forbidden: trace belongs to another user" });
+      return;
+    }
+
+    const ok = await store.deleteById(params.id);
+    if (!ok) { sendJson(res, 404, { error: "Trace not found" }); return; }
+    sendJson(res, 200, { ok: true, id: params.id });
   });
 
 

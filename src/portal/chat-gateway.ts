@@ -201,6 +201,7 @@ export function registerChatRoutes(
     const result = await connectionMap.sendCommand(agentId, "chat.send", {
       agentId,
       userId: auth.userId,
+      username: auth.username,
       text: body.text,
       sessionId,
       modelProvider: modelBinding.modelProvider,

@@ -89,7 +89,9 @@ export async function createTaskNotification(params: {
 }): Promise<{ id: string }> {
   const id = crypto.randomUUID();
   const type = params.status === "success" ? "task_success" : "task_failure";
-  const title = params.title ?? (params.status === "success" ? "Task completed" : "Task failed");
+  const rawTitle = params.title ?? (params.status === "success" ? "Task completed" : "Task failed");
+  // notifications.title is VARCHAR(255) NOT NULL — truncate to avoid MySQL 1406.
+  const title = rawTitle.length > 255 ? rawTitle.slice(0, 255) : rawTitle;
   const message = params.message ?? null;
 
   const db = getDb();

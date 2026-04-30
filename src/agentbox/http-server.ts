@@ -291,7 +291,7 @@ export function createHttpServer(
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
+    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; systemPromptTemplate?: string; modelConfig?: Record<string, unknown>; username?: string };
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -449,6 +449,18 @@ export function createHttpServer(
       } catch { /* best-effort, don't block prompt */ }
     }
 
+    // Mark the explicit trace boundary: ONE user prompt = ONE trace file, even
+    // if pi-agent internally fires multiple agent_start/end cycles (retry or
+    // auto-compaction). beginPrompt is the start; endPrompt fires below in
+    // actuallyFinish() after the whole prompt (including retries) settles.
+    // Forward the displayable username so filenames use "admin" not the hex userId.
+    if (managed._traceRecorder) {
+      try {
+        if (typeof body.username === "string" && body.username) managed._traceRecorder.setUsername(body.username);
+        if (typeof body.text === "string") await managed._traceRecorder.beginPrompt(body.text);
+      } catch (err) { console.warn("[agentbox-http] trace-recorder beginPrompt failed:", err); }
+    }
+
     // Execute prompt asynchronously; notify SSE to close on completion
     console.log(`[agentbox-http] Starting prompt for session ${managed.id} [lang=${detectedLang}]`);
 
@@ -473,6 +485,17 @@ export function createHttpServer(
         outcome: promptOutcome,
         userId: sessionManager.userId,
       });
+
+      // Flush the explicit trace — ONE row per user prompt, even if pi-agent
+      // internally ran multiple agent_start/end cycles (retry, compaction).
+      // actuallyFinish() is the definitive "prompt truly done" point (waits
+      // for auto_compaction_end / auto_retry_end before firing).
+      // Fire-and-forget: don't block SSE close on DB flush.
+      if (managed._traceRecorder) {
+        managed._traceRecorder.endPrompt(promptOutcome).catch((err) => {
+          console.warn("[agentbox-http] trace-recorder endPrompt failed:", err);
+        });
+      }
 
       // Stop buffering
       if (managed._bufferUnsub) {
@@ -717,6 +740,14 @@ export function createHttpServer(
     }
 
     console.log(`[agentbox-http] Steering session ${sessionId}: ${body.text.slice(0, 80)}`);
+    // Record a standalone trace row for this steer BEFORE the brain consumes
+    // it. Steer bypasses /api/prompt (no beginPrompt/endPrompt pair), so
+    // without this DP button clicks ([DP_CONFIRM], [DP_ADJUST], [DP_SKIP],
+    // [DP_REINVESTIGATE]) leave zero audit trail.
+    if (managed._traceRecorder) {
+      try { await managed._traceRecorder.recordSteerEvent(body.text); }
+      catch (err) { console.warn("[agentbox-http] recordSteerEvent failed:", err); }
+    }
     try {
       await managed.brain.steer(body.text);
       sendJson(res, 200, { ok: true });

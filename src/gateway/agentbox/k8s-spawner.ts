@@ -160,6 +160,21 @@ export class K8sSpawner implements BoxSpawner {
       { name: "SICLAW_AGENT_ID", value: agentId },
     ];
 
+    // Forward trace-store config from Runtime's own pod env into spawned
+    // AgentBoxes. The trace recorder lives inside agentbox/session.ts, so the
+    // env must follow the agent — Runtime itself never writes traces.
+    for (const key of [
+      "SICLAW_TRACE_DISABLE",
+      "SICLAW_TRACE_SQLITE_ENABLED",
+      "SICLAW_TRACE_MYSQL_ENABLED",
+      "SICLAW_TRACE_MYSQL_URL",
+      "SICLAW_TRACE_DIR",
+      "SICLAW_TRACE_DB",
+    ]) {
+      const v = process.env[key];
+      if (v !== undefined && v !== "") env.push({ name: key, value: v });
+    }
+
     // Add custom environment variables
     if (boxConfig.env) {
       for (const [key, value] of Object.entries(boxConfig.env)) {

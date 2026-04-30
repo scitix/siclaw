@@ -29,6 +29,8 @@ export interface PromptOptions {
   agentId?: string;
   /** Custom system prompt template from agent settings */
   systemPromptTemplate?: string;
+  /** Displayable username of the caller (for human-readable trace filenames). */
+  username?: string;
   /** Full provider config for dynamic registration (from gateway DB) */
   modelConfig?: {
     name: string;
