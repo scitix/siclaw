@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from "react"
+import { useRef, useEffect, useState, useCallback, useMemo, type MouseEvent } from "react"
 import {
   Terminal,
   User,
@@ -24,7 +24,54 @@ import { Markdown } from "./Markdown"
 import { InputArea } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
-import type { PilotMessage, ContextUsage, ActionChip, PrefixActionChip } from "./types"
+import type { PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
+
+/**
+ * Format a millisecond duration into a compact human-readable string.
+ * <1s → "850ms"; <60s → "3.2s"; ≥60s → "1m 12s".
+ */
+function formatTimingMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ""
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const s = Math.round((ms % 60_000) / 1000)
+  return `${m}m ${s}s`
+}
+
+/**
+ * Inline timing badges shown beneath chat bubbles. Emoji semantics, per spec:
+ *   ⏳ ttftMs        — time-to-first-token (assistant rows)
+ *   💭 thinkingMs    — model reasoning gap before visible text (assistant rows)
+ *   ⚙️ durationMs   — bash/kubectl/skill execution time (tool rows)
+ *
+ * Badge is omitted entirely when no timing is present, so messages without
+ * server-stamped timings (legacy history) render unchanged.
+ */
+function TimingBadges({ timing }: { timing: MessageTiming | undefined }) {
+  if (!timing) return null
+  // Order chosen so the badges read like a timeline left-to-right:
+  //   ⏳ before-first-token (turn anchor)
+  //   💭 thinking (boundary → first delta)
+  //   ✍️ writing (first delta → message_end)
+  //   ⚙️ tool exec (separate from the above; only on tool rows)
+  const items: Array<{ key: string; label: string }> = []
+  if (typeof timing.ttftMs === "number") items.push({ key: "ttft", label: `⏳ ${formatTimingMs(timing.ttftMs)}` })
+  if (typeof timing.thinkingMs === "number") items.push({ key: "think", label: `💭 ${formatTimingMs(timing.thinkingMs)}` })
+  if (typeof timing.outputMs === "number") items.push({ key: "out", label: `✍️ ${formatTimingMs(timing.outputMs)}` })
+  if (typeof timing.durationMs === "number") items.push({ key: "dur", label: `⚙️ ${formatTimingMs(timing.durationMs)}` })
+  if (items.length === 0) return null
+  // `select-text` makes the values copyable so the user can audit timing math
+  // by selecting and pasting. Numbers + units are kept in one span per badge
+  // so a single drag selects the whole figure.
+  return (
+    <div className="flex flex-wrap gap-2 mt-1.5 text-[11px] text-muted-foreground/80 select-text">
+      {items.map((it) => (
+        <span key={it.key} className="font-mono tabular-nums select-text cursor-text">{it.label}</span>
+      ))}
+    </div>
+  )
+}
 
 const DIG_DEEPER_CHIP: PrefixActionChip = {
   kind: "prefix",
@@ -1070,6 +1117,8 @@ function MessageItem({
           <CopyableMessage isUser={isUser} content={textContent} />
         )}
 
+        {!isUser && <TimingBadges timing={message.timing} />}
+
         {renderedSuggestedChips.length > 0 && onChipClick && (
           <div className="flex flex-wrap gap-2 mt-2">
             {renderedSuggestedChips.map((chip) => (
@@ -1485,14 +1534,50 @@ function ToolItem({ message }: { message: PilotMessage }) {
           {message.toolInput && (
             <span className="font-mono text-xs text-muted-foreground truncate min-w-0">{message.toolInput}</span>
           )}
-          {message.toolStatus === "running" && (
-            <Loader2 className="w-3 h-3 animate-spin text-blue-400 ml-auto shrink-0" />
-          )}
-          {message.toolStatus === "success" && (
-            <CheckCircle2 className="w-3.5 h-3.5 text-green-500 ml-auto shrink-0" />
-          )}
-          {message.toolStatus === "error" && <XCircle className="w-3.5 h-3.5 text-red-500 ml-auto shrink-0" />}
-          {message.toolStatus === "aborted" && <Ban className="w-3.5 h-3.5 text-amber-500 ml-auto shrink-0" />}
+          {(() => {
+            // 💭 thinking-before-tool + ⚙️ exec-time. Either, both, or neither
+            // may be present; the first one rendered claims `ml-auto` so the
+            // status icon trails naturally without extra layout branching.
+            const t = message.timing
+            const showThink = typeof t?.thinkingMs === "number"
+            const showDur = typeof t?.durationMs === "number"
+            const hasAnyTiming = showThink || showDur
+            // stopPropagation on mousedown lets the user drag-select the
+            // numbers without the parent <button> capturing it as a click
+            // (which would toggle expand and clear the selection). cursor-text
+            // signals the affordance.
+            const stopSel = (e: MouseEvent) => e.stopPropagation()
+            return (
+              <>
+                {showThink && (
+                  <span
+                    onMouseDown={stopSel}
+                    onClick={stopSel}
+                    className={cn("font-mono text-[11px] text-muted-foreground tabular-nums shrink-0 select-text cursor-text", "ml-auto")}
+                  >
+                    💭 {formatTimingMs(t!.thinkingMs!)}
+                  </span>
+                )}
+                {showDur && (
+                  <span
+                    onMouseDown={stopSel}
+                    onClick={stopSel}
+                    className={cn("font-mono text-[11px] text-muted-foreground tabular-nums shrink-0 select-text cursor-text", showThink ? "ml-2" : "ml-auto")}
+                  >
+                    ⚙️ {formatTimingMs(t!.durationMs!)}
+                  </span>
+                )}
+                {message.toolStatus === "running" && (
+                  <Loader2 className={cn("w-3 h-3 animate-spin text-blue-400 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />
+                )}
+                {message.toolStatus === "success" && (
+                  <CheckCircle2 className={cn("w-3.5 h-3.5 text-green-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />
+                )}
+                {message.toolStatus === "error" && <XCircle className={cn("w-3.5 h-3.5 text-red-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />}
+                {message.toolStatus === "aborted" && <Ban className={cn("w-3.5 h-3.5 text-amber-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />}
+              </>
+            )
+          })()}
         </button>
         {isOpen && (
           <div className="overflow-x-auto bg-secondary/30 max-h-80 overflow-y-auto">

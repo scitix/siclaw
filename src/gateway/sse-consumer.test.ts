@@ -199,7 +199,7 @@ describe("consumeAgentSse — tool execution", () => {
     expect(toolRow.metadata.summary).toBe("concluding");
   });
 
-  it("skips metadata when details contains only blocked/error (already captured by outcome)", async () => {
+  it("drops blocked/error from metadata (already captured by outcome) but keeps timing fields", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "bash", args: {} },
       { type: "tool_execution_end", toolName: "bash",
@@ -207,17 +207,20 @@ describe("consumeAgentSse — tool execution", () => {
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     const toolRow = updateCalls[0];
-    expect(toolRow.metadata).toBeNull();
+    // blocked/error stripped; pre_thinking_ms is the lone surviving field
+    // (always persisted to support 💭 audit on every tool).
+    expect(toolRow.metadata).toEqual({ pre_thinking_ms: expect.any(Number) });
+    expect(toolRow.metadata.error).toBeUndefined();
   });
 
-  it("skips metadata when details is absent", async () => {
+  it("metadata contains only pre_thinking_ms when details is absent", async () => {
     const events = [
       { type: "tool_execution_start", toolName: "kubectl", args: {} },
       { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
     ];
     await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
     const toolRow = updateCalls[0];
-    expect(toolRow.metadata).toBeNull();
+    expect(toolRow.metadata).toEqual({ pre_thinking_ms: expect.any(Number) });
   });
 
   it("redacts secrets inside persisted metadata via JSON round-trip", async () => {
@@ -271,6 +274,113 @@ describe("consumeAgentSse — tool execution", () => {
     const b = toolRows.find((r) => r.toolName === "b");
     expect(a.toolInput).toContain("\"x\":1");
     expect(b.toolInput).toContain("\"y\":2");
+  });
+});
+
+// ── Timing (TTFT / 💭 / ⚙️ / turn total) ──────────────
+
+describe("consumeAgentSse — timing", () => {
+  it("attributes pre-tool thinking only to the first tool of a one-thinking-many-tools batch", async () => {
+    // Simulate: model thinks, emits assistant message with text + 3 tool_use
+    // blocks. The runtime executes them serially. Only the FIRST tool should
+    // see meaningful pre_thinking_ms; the next two should be ~0 because the
+    // boundary advances on each tool_execution_end (no new model thinking
+    // happened between them).
+    const events = [
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "checking pods" } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -A" } },
+      { type: "tool_execution_end", toolName: "bash",
+        result: { content: [{ type: "text", text: "pod1" }] } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -n a" } },
+      { type: "tool_execution_end", toolName: "bash",
+        result: { content: [{ type: "text", text: "pod2" }] } },
+      { type: "tool_execution_start", toolName: "bash", args: { command: "kubectl get pods -n b" } },
+      { type: "tool_execution_end", toolName: "bash",
+        result: { content: [{ type: "text", text: "pod3" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(updateCalls).toHaveLength(3);
+    // Every tool row carries pre_thinking_ms — the badge is auditable on all of them.
+    for (const row of updateCalls) {
+      expect(row.metadata.pre_thinking_ms).toEqual(expect.any(Number));
+      expect(row.metadata.pre_thinking_ms).toBeGreaterThanOrEqual(0);
+    }
+    // Crucially, no double-counting: tools 2 and 3 should be near-zero
+    // because the boundary advanced on the previous tool_execution_end.
+    expect(updateCalls[1].metadata.pre_thinking_ms).toBeLessThan(50);
+    expect(updateCalls[2].metadata.pre_thinking_ms).toBeLessThan(50);
+  });
+
+  it("persists ttft_ms / output_ms / turn_total_ms on the first assistant message; thinking_ms suppressed because it equals ttft", async () => {
+    const events = [
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hello" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const assistantRow = appendCalls.find((c) => c.role === "assistant");
+    expect(assistantRow).toBeDefined();
+    expect(assistantRow.metadata.timing.ttft_ms).toEqual(expect.any(Number));
+    // thinking_ms intentionally absent on first message: ttft already covers
+    // the same boundary→firstToken interval, so a naive sum would otherwise
+    // double-count it.
+    expect(assistantRow.metadata.timing.thinking_ms).toBeUndefined();
+    expect(assistantRow.metadata.timing.output_ms).toEqual(expect.any(Number));
+    expect(assistantRow.metadata.timing.turn_total_ms).toEqual(expect.any(Number));
+  });
+
+  it("uses caller-supplied turnStartTime when provided (portal POST anchor)", async () => {
+    const earlyAnchor = Date.now() - 5000; // simulate portal stamp 5s ago
+    const events = [
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
+    ];
+    await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u",
+      persistMessages: true, turnStartTime: earlyAnchor,
+    });
+    const assistantRow = appendCalls.find((c) => c.role === "assistant");
+    // ttft must reflect the supplied anchor — at least the simulated 5s gap.
+    expect(assistantRow.metadata.timing.ttft_ms).toBeGreaterThanOrEqual(5000);
+  });
+
+  it("emits ttft_ms only on the first assistant message of a turn (avoids double-counting)", async () => {
+    const events = [
+      // First assistant message
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hi" }] } },
+      // Second assistant message in same turn — same turnStart anchor, but
+      // ttft would just repeat the same value, so it must be omitted.
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "more" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "more" }] } },
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    const assistantRows = appendCalls.filter((c) => c.role === "assistant");
+    expect(assistantRows).toHaveLength(2);
+    expect(assistantRows[0].metadata.timing.ttft_ms).toEqual(expect.any(Number));
+    expect(assistantRows[1].metadata.timing.ttft_ms).toBeUndefined();
+    // Both messages still carry thinking_ms + output_ms (their per-message
+    // intervals are independent and additive).
+    expect(assistantRows[1].metadata.timing.thinking_ms).toEqual(expect.any(Number));
+    expect(assistantRows[1].metadata.timing.output_ms).toEqual(expect.any(Number));
+  });
+
+  it("surfaces preThinkingMs and durationMs onto live events for frontend rendering", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "kubectl", args: {} },
+      { type: "tool_execution_end", toolName: "kubectl", result: { content: [{ type: "text", text: "ok" }] } },
+    ];
+    const seen: any[] = [];
+    await consumeAgentSse({
+      client: mkClient(events), sessionId: "s", userId: "u",
+      persistMessages: true,
+      onEvent: (evt) => seen.push(evt),
+    });
+    const startEvt = seen.find((e) => e.type === "tool_execution_start");
+    const endEvt = seen.find((e) => e.type === "tool_execution_end");
+    expect(typeof startEvt.preThinkingMs).toBe("number");
+    expect(typeof endEvt.preThinkingMs).toBe("number");
+    expect(typeof endEvt.durationMs).toBe("number");
   });
 });
 
