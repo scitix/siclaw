@@ -28,6 +28,27 @@ runtime:
   #   Standalone mode: http://siclaw-portal:3003
   #   Upstream mode:     http://upstream-apiserver:8080
   serverUrl: "http://siclaw-portal:3003"
+  # Runtime ↔ AgentBox mTLS CA. Without persistence, every Runtime restart
+  # generates a fresh CA and existing AgentBox pods (which hold client certs
+  # signed by the previous CA) immediately fail mTLS — sessions hang until
+  # those pods are reaped.
+  #
+  # Pick exactly one:
+  #   generateCa: true  — chart genCAs once and stores it in a Secret with
+  #                       helm.sh/resource-policy=keep so upgrades reuse it.
+  #                       NOTE: relies on `helm lookup` to detect the existing
+  #                       Secret. `helm template` / `helm install --dry-run`
+  #                       cannot lookup the cluster and will emit a FRESH CA
+  #                       every render — never pipe their output to
+  #                       `kubectl apply -f -`, you will overwrite the live
+  #                       Secret and break mTLS for all running AgentBoxes.
+  #                       For GitOps / render-then-apply use caSecret instead.
+  #   caSecret: "name"  — bring-your-own kubernetes.io/tls Secret (keys
+  #                       tls.crt / tls.key). Useful with cert-manager,
+  #                       Vault PKI, or any pipeline that pre-renders manifests.
+  tls:
+    generateCa: true
+    caSecret: ""
   resources:
     requests:
       cpu: "100m"

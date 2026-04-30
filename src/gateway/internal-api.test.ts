@@ -271,6 +271,23 @@ describe("handleAgentTasksCreate", () => {
     expect(res.statusCode).toBe(201);
     expect(frontend.calls[0].params.user_id).toBe("");
   });
+
+  it("403 when session_id resolves to a different agent — refuses to audit cross-agent attribution", async () => {
+    const { sessionRegistry } = await import("./session-registry.js");
+    // Register session under agent-2; the calling cert (identity) is agent-1.
+    sessionRegistry.remember("sess-foreign", "u-other", "agent-2");
+    frontend.responses.set("task.create", { id: "should-not-be-called" });
+    const res = new FakeRes();
+    await handleAgentTasksCreate(
+      asReq(new FakeReq(JSON.stringify({ name: "n", schedule: "*/5 * * * *", prompt: "p", session_id: "sess-foreign" }))),
+      asRes(res), identity, frontend as unknown as FrontendWsClient,
+    );
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/ownership/i);
+    // Critical: upstream RPC must NOT have been called with the foreign user's id.
+    expect(frontend.calls.find(c => c.method === "task.create")).toBeUndefined();
+    sessionRegistry.forget("sess-foreign");
+  });
 });
 
 // ── agent tasks: update ──────────────────────────────────

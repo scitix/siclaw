@@ -1861,6 +1861,20 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
 
   // --- chat.* ---
 
+  handlers.set("chat.resolveSession", async (params) => {
+    const db = getDb();
+    // Intentionally NOT filtering on deleted_at — soft-deleted sessions still
+    // need attribution for late-arriving AgentBox callbacks (audit / task
+    // outcomes). The row's user_id is immutable history, regardless of
+    // visibility in the UI.
+    const [rows] = await db.query(
+      `SELECT user_id, agent_id FROM chat_sessions WHERE id = ? LIMIT 1`,
+      [params.session_id],
+    ) as any;
+    if (!rows || rows.length === 0) return { found: false };
+    return { found: true, user_id: rows[0].user_id, agent_id: rows[0].agent_id };
+  });
+
   handlers.set("chat.ensureSession", async (params) => {
     const db = getDb();
     // last_active_at omitted: relies on schema DEFAULT CURRENT_TIMESTAMP for
