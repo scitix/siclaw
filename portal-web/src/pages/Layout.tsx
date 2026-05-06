@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
-import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen, PanelLeftClose, PanelLeftOpen } from "lucide-react"
+import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen, PanelLeftClose, PanelLeftOpen, Sun, Moon } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
+import { useTheme } from "../hooks/useTheme"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
@@ -24,6 +25,7 @@ const COLLAPSED_KEY = "siclaw.sidebar.collapsed"
 
 export function Layout() {
   const location = useLocation()
+  const { theme, toggle: toggleTheme } = useTheme()
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try { return localStorage.getItem(COLLAPSED_KEY) === "1" } catch { return false }
   })
@@ -70,8 +72,20 @@ export function Layout() {
       >
         <div className={`border-b border-border ${collapsed ? "py-3 flex justify-center" : "px-4 py-4 flex items-start justify-between gap-2"}`}>
           {!collapsed && (
-            <div className="min-w-0">
-              <h1 className="text-sm font-bold tracking-wide">SICLAW</h1>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <h1 className="text-sm font-bold tracking-wide">SICLAW</h1>
+                <button
+                  onClick={toggleTheme}
+                  title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+                  aria-label="Toggle theme"
+                  className="h-5 w-5 inline-flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
+                >
+                  {theme === "dark"
+                    ? <Sun className="h-3.5 w-3.5" />
+                    : <Moon className="h-3.5 w-3.5" />}
+                </button>
+              </div>
               <p className="text-[10px] text-muted-foreground mt-0.5 truncate">Agent Runtime Portal</p>
             </div>
           )}
