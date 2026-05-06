@@ -45,6 +45,14 @@ export interface ConsumeAgentSseOptions {
   onEvent?: OnEventCallback;
   /** Abort signal — breaks the loop when triggered. */
   signal?: AbortSignal;
+  /**
+   * Optional explicit turn-start anchor (ms epoch). When provided, used as
+   * the basis for ⏳/💭/✍️/turn_total measurements instead of the local
+   * `Date.now()` taken when consumeAgentSse begins iterating. Portal sets
+   * this at POST receipt so the timing covers the portal→runtime RPC hop
+   * the runtime cannot otherwise see.
+   */
+  turnStartTime?: number;
 }
 
 export interface SseConsumptionResult {
@@ -61,6 +69,30 @@ export interface SseConsumptionResult {
 // ── Implementation ──────────────────────────────────
 
 const EMPTY_REDACTION: RedactionConfig = { patterns: [] };
+
+/**
+ * Inter-event dispatch jitter — the tightest possible gap between two
+ * timestamps that come from the SSE event loop's natural pacing rather than
+ * any real wall-clock interval. Used by the ttft/thinking dedup below: if
+ * the two values differ by less than this, they are treated as the same
+ * instant and only one is emitted (avoids double-counting on naive sums).
+ *
+ * 50ms is a conservative ceiling for a single Node tick + WS hop; bump it
+ * if you start seeing duplicate ⏳/💭 badges on first-of-turn messages.
+ */
+const NOISE_FLOOR_MS = 50;
+
+/**
+ * Drop negative timing deltas. Same-process measurements are always ≥0, but
+ * cross-process anchors (e.g. portal POST timestamp passed to runtime via
+ * RPC) can briefly produce negatives if the two pods' NTP clocks have drifted
+ * apart. We treat negatives as "unknown" rather than persist them — downstream
+ * (frontend formatter, /metrics/timing aggregation) interprets absence as
+ * unmeasured, which is correct.
+ */
+function nonNegative(ms: number): number | undefined {
+  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
 
 /**
  * Strip pi-agent's `(Empty response: {...})` diagnostic markers that get
@@ -139,9 +171,35 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   const pendingToolInputs = new Map<string, string[]>();
   const pendingToolStartTimes = new Map<string, number[]>();
   const pendingToolMessageIds = new Map<string, string[]>();
+  // Per-tool pre-tool-call thinking time captured at tool_execution_start, to
+  // be merged into the row's metadata at tool_execution_end (so the persisted
+  // metadata survives the round-trip without being clobbered by the
+  // extractPersistableDetails extraction from result.details).
+  const pendingPreThinkingMs = new Map<string, number[]>();
 
   let eventCount = 0;
   const startTime = Date.now();
+
+  // ── Per-turn timing capture (for ⏳ TTFT / 💭 thinking / total) ──
+  // turnStartTime: server-side anchor for the whole user→assistant turn.
+  //   Prefer caller-supplied (portal POST timestamp) over local startTime so
+  //   the portal→runtime RPC hop is included in measurements.
+  // firstTokenTime: first model output of any kind (text or tool call) — TTFT.
+  // lastBoundaryTime: latest moment the model was *given input* — turn start
+  //   initially, then bumped to each tool_execution_end. The gap between
+  //   lastBoundaryTime and the next emission (text_delta or tool_execution_start)
+  //   is what we call "model thinking time" — the part the user previously
+  //   couldn't see for tool-call gaps. Single-clock by design.
+  const turnStartTime = opts.turnStartTime ?? startTime;
+  let firstTokenTime: number | undefined;
+  let lastBoundaryTime = turnStartTime;
+  let assistantMsgFirstTextTime: number | undefined;
+  let pendingThinkingMs: number | undefined;
+  // ttft_ms is a turn-scoped anchor (turnStart → first token of the very
+  // first assistant message). Persisting it on subsequent messages would
+  // make a naive UI sum double-count the same interval N times. Tracked
+  // and only emitted once.
+  let firstAssistantPersisted = false;
 
   for await (const event of client.streamEvents(sessionId)) {
     if (signal?.aborted) break;
@@ -179,9 +237,26 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
 
       const toolStartTime = shiftPending(pendingToolStartTimes, toolName);
       const durationMs = toolStartTime != null ? Date.now() - toolStartTime : undefined;
+      const preThinkingMs = shiftPending(pendingPreThinkingMs, toolName);
+      // Surface duration + pre-thinking on the live event for frontend.
+      if (durationMs != null) {
+        (evt as Record<string, unknown>).durationMs = durationMs;
+      }
+      if (preThinkingMs != null) {
+        (evt as Record<string, unknown>).preThinkingMs = preThinkingMs;
+      }
       const toolInput = shiftPending(pendingToolInputs, toolName) || "";
       const existingMessageId = shiftPending(pendingToolMessageIds, toolName);
-      const metadata = extractPersistableDetails(toolResult?.details, redactionConfig);
+      const detailsMeta = extractPersistableDetails(toolResult?.details, redactionConfig);
+      // Merge pre-thinking back in — extractPersistableDetails only looks at
+      // the tool *result*, so we'd otherwise lose what we recorded at
+      // tool_execution_start. We persist the value even when 0/small so the
+      // UI can render a 💭 badge on every tool: a 0ms badge on the 2nd-Nth
+      // tool of a batch makes "one thinking → many tools" auditable.
+      const metadata: Record<string, unknown> | null =
+        preThinkingMs != null
+          ? { ...(detailsMeta ?? {}), pre_thinking_ms: preThinkingMs }
+          : detailsMeta;
       const delegationId = typeof metadata?.delegation_id === "string" ? metadata.delegation_id : null;
 
       if (persist) {
@@ -209,12 +284,29 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       if (toolName === "task_report" && text) {
         taskReportText = text;
       }
+      // Bump the model-input boundary: the model now has the tool result and
+      // any subsequent thinking/text/tool-use is computed from this point.
+      lastBoundaryTime = Date.now();
     }
 
     // ── DB persistence: message_update (accumulate assistant text) ──
     if (eventType === "message_update") {
       const ame = evt.assistantMessageEvent as { type?: string; delta?: string } | undefined;
       if (ame?.type === "text_delta" && ame.delta) {
+        const nowAtDelta = Date.now();
+        if (firstTokenTime === undefined) firstTokenTime = nowAtDelta;
+        if (assistantMsgFirstTextTime === undefined) {
+          assistantMsgFirstTextTime = nowAtDelta;
+          // Boundary-based: covers thinking after the previous tool result
+          // (or from turn start), not just the gap inside one assistant
+          // message. The thinking is fully attributed to *this* text bubble.
+          pendingThinkingMs = nowAtDelta - lastBoundaryTime;
+        }
+        // Bump boundary on every text delta so a tool emitted right after
+        // text doesn't double-count the same thinking interval. The text
+        // bubble already showed 💭 for that gap; the tool's pre-thinking
+        // measures only the (typically tiny) handoff after text emission.
+        lastBoundaryTime = nowAtDelta;
         assistantContent += ame.delta;
         currentMsgText += ame.delta;
       }
@@ -223,18 +315,56 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     // ── message_start: reset per-message accumulator ──
     if (eventType === "message_start") {
       currentMsgText = "";
+      const message = evt.message as Record<string, unknown> | undefined;
+      if (message?.role === "assistant") {
+        // Per-message resets only — the boundary anchor (turn-start /
+        // last tool_execution_end) is intentionally NOT touched here, so
+        // pre-text thinking time still counts gaps that started before
+        // this message_start fired.
+        assistantMsgFirstTextTime = undefined;
+        pendingThinkingMs = undefined;
+      }
     }
 
     // ── tool_execution_start: capture input + start time ──
     if (eventType === "tool_execution_start" || eventType === "tool_start") {
+      const nowAtStart = Date.now();
+      if (firstTokenTime === undefined) firstTokenTime = nowAtStart;
       const startToolName = (evt.toolName as string) || (evt.name as string) || "tool";
       const args = evt.args as Record<string, unknown> | undefined;
       const rawToolInput = args ? JSON.stringify(args) : "";
+      // Pre-tool thinking: gap between the previous model-input boundary
+      // (turn start, or the previous tool_execution_end) and this tool's
+      // start. This is the model's "I just got new info, deciding what to
+      // do next" interval — invisible until we measured it explicitly.
+      // nonNegative() drops cross-pod clock-drift artefacts; absence
+      // downstream means "unknown", which is the correct semantics.
+      const preThinkingMs = nonNegative(nowAtStart - lastBoundaryTime);
       pushPending(pendingToolInputs, startToolName, rawToolInput);
-      pushPending(pendingToolStartTimes, startToolName, Date.now());
+      pushPending(pendingToolStartTimes, startToolName, nowAtStart);
+      if (preThinkingMs !== undefined) {
+        pushPending(pendingPreThinkingMs, startToolName, preThinkingMs);
+      }
       lastToolName = startToolName;
+      // Surface on the live event so frontend can render 💭 immediately.
+      if (preThinkingMs !== undefined) {
+        (evt as Record<string, unknown>).preThinkingMs = preThinkingMs;
+      }
 
       if (persist) {
+        // pre_thinking_ms is durable telemetry, NOT debug-only. Persisted on
+        // every tool row even when ~0ms because a near-zero value on the 2nd-
+        // Nth tool of a batch is the visible proof that those tools came from
+        // a single model "thinking burst" — not noise to filter out. Once
+        // production rows carry this field, downstream consumers (analytics,
+        // replay, audit reports) may rely on its presence; keep it stable.
+        const startMetadata: Record<string, unknown> = {
+          status: "running",
+          started_at: new Date(nowAtStart).toISOString(),
+        };
+        if (preThinkingMs !== undefined) {
+          startMetadata.pre_thinking_ms = preThinkingMs;
+        }
         dbMessageId = await appendMessage({
           sessionId,
           role: "tool",
@@ -243,10 +373,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
           outcome: null,
           durationMs: null,
-          metadata: {
-            status: "running",
-            started_at: new Date().toISOString(),
-          },
+          metadata: startMetadata,
         });
         pushPending(pendingToolMessageIds, startToolName, dbMessageId);
         await incrementMessageCount(sessionId);
@@ -294,6 +421,50 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         }
         resultText = extracted || currentMsgText || resultText;
 
+        // Build timing metadata for this assistant message. Audit-friendly
+        // by construction: every interval is non-overlapping with every
+        // other badge in the same turn, so a naive sum across all chat
+        // bubbles equals turn_total_ms (within event-dispatch noise).
+        //
+        //   ⏳ ttft_ms       — first message only (turn-anchor; would
+        //                       otherwise double-count if put on every msg)
+        //   💭 thinking_ms   — boundary → first text_delta (per message)
+        //   ✍️ output_ms    — first text_delta → message_end (per message)
+        //   turn_total_ms    — kept for the last message as audit cross-check
+        const nowAtEnd = Date.now();
+        // turn_total may be slightly negative under cross-pod clock drift
+        // (portal-supplied turnStartTime ahead of runtime's nowAtEnd); drop
+        // it in that case rather than persist garbage.
+        const turnTotal = nonNegative(nowAtEnd - turnStartTime);
+        const timing: Record<string, number> = {};
+        if (turnTotal !== undefined) timing.turn_total_ms = turnTotal;
+        if (!firstAssistantPersisted && firstTokenTime !== undefined) {
+          const ttft = nonNegative(firstTokenTime - turnStartTime);
+          if (ttft !== undefined) timing.ttft_ms = ttft;
+        }
+        if (pendingThinkingMs !== undefined) {
+          // Suppress thinking_ms on the first assistant message when ttft is
+          // already on the row — they cover the same interval (turnStart →
+          // first text token), within event-dispatch jitter. After the first
+          // message, ttft is omitted and thinking_ms takes over.
+          const overlapsTtft =
+            timing.ttft_ms !== undefined &&
+            Math.abs(pendingThinkingMs - timing.ttft_ms) < NOISE_FLOOR_MS;
+          const safeThinking = nonNegative(pendingThinkingMs);
+          if (!overlapsTtft && safeThinking !== undefined) {
+            timing.thinking_ms = safeThinking;
+          }
+        }
+        if (assistantMsgFirstTextTime !== undefined) {
+          // Text streaming time — was previously invisible. Captures the
+          // model's wall-clock cost of emitting the message body.
+          const out = nonNegative(nowAtEnd - assistantMsgFirstTextTime);
+          if (out !== undefined) timing.output_ms = out;
+        }
+        // Attach timing onto the live event so the SSE consumer (frontend)
+        // can render badges immediately without waiting for DB reload.
+        (evt as Record<string, unknown>).timing = timing;
+
         // Persist assistant message (skip entirely if it's purely an empty-
         // response marker — keeps the trace free of pi-agent diagnostics)
         if (persist && assistantContent) {
@@ -303,11 +474,21 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               sessionId,
               role: "assistant",
               content: redactText(cleaned, redactionConfig),
+              metadata: { timing },
             });
             await incrementMessageCount(sessionId);
+            firstAssistantPersisted = true;
           }
           assistantContent = "";
         }
+        // Reset per-message thinking marker so the next assistant message
+        // gets its own measurement (firstTokenTime stays — turn-scoped).
+        // Note: lastBoundaryTime is NOT touched here — text deltas already
+        // advanced it, and a pure tool-use assistant message (no text)
+        // intentionally leaves the boundary at the previous tool/turn-start
+        // so the *next* tool's pre-thinking covers the full reasoning gap.
+        pendingThinkingMs = undefined;
+        assistantMsgFirstTextTime = undefined;
       } else if (message?.role === "toolResult" && lastToolName === "task_report") {
         // task_report via turn_end (alternative emission path)
         const content = message.content;

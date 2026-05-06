@@ -43,6 +43,28 @@ import { validateKnowledgePackage } from "../shared/knowledge-package.js";
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
 
+/**
+ * Summarise a vector of millisecond latency samples into avg / min / max / p90.
+ * Empty input → `count: 0` and the rest 0; the frontend renders a "no data"
+ * state in that case. p90 uses nearest-rank: index = ceil(n * 0.9) - 1.
+ */
+function summariseLatency(values: number[]): {
+  count: number; avg: number; min: number; max: number; p90: number;
+} {
+  if (values.length === 0) return { count: 0, avg: 0, min: 0, max: 0, p90: 0 };
+  const sorted = [...values].sort((a, b) => a - b);
+  const n = sorted.length;
+  const sum = sorted.reduce((a, b) => a + b, 0);
+  const p90Index = Math.max(0, Math.ceil(n * 0.9) - 1);
+  return {
+    count: n,
+    avg: Math.round(sum / n),
+    min: sorted[0],
+    max: sorted[n - 1],
+    p90: sorted[p90Index],
+  };
+}
+
 // ── Permission check helper ───────────────────────────────────
 
 interface AccessResult {
@@ -2366,6 +2388,128 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     }
 
     sendJson(res, 200, { totalSessions, totalPrompts, byUser });
+  });
+
+  // GET /api/v1/siclaw/metrics/timing
+  // Aggregates per-message timing telemetry stamped by sse-consumer:
+  //   ⏳ ttft     — chat_messages.metadata.timing.ttft_ms (assistant rows)
+  //   💭 thinking — chat_messages.metadata.timing.thinking_ms (assistant)
+  //   ⚙️ tools   — chat_messages.duration_ms grouped by tool_name (top-N
+  //                 by invocation count, sorted DESC). Returned as an array
+  //                 so the dashboard can show top 3 / 5 / 10 client-side.
+  //
+  // Aggregation is done in JS rather than via JSON_EXTRACT/GROUP BY so the
+  // same code path works under MySQL and SQLite without the dialect-helpers
+  // dance — we only read the columns we need (`metadata` / `tool_name` /
+  // `duration_ms`) and bucket in memory.
+  router.get("/api/v1/siclaw/metrics/timing", async (req, res) => {
+    const admin = requireAdmin(req, config.jwtSecret);
+    if (!admin) { sendJson(res, 403, { error: "Forbidden: admin only" }); return; }
+
+    const query = parseQuery(req.url ?? "");
+    const period = query.period || "7d";
+    const rangeMs = PERIODS[period];
+    if (!rangeMs) { sendJson(res, 400, { error: "Invalid period" }); return; }
+    const cutoff = new Date(Date.now() - rangeMs);
+    const userFilter = query.userId || null;
+
+    const db = getDb();
+
+    // Hard cap on rows scanned per query. Each chat_messages.metadata can be
+    // multi-KB JSON (timing + tool details + delegation state); a busy tenant
+    // over a 30-day window can produce hundreds of thousands of rows, and
+    // pulling them all would risk OOM-ing the Portal process. ORDER BY DESC +
+    // LIMIT keeps the most-recent slice when the window is too dense; the
+    // response carries `truncated: true` so the dashboard can show a hint
+    // ("sampled view") rather than the call silently lying.
+    //
+    // TODO(metrics): replace this with a nightly batch job that materialises
+    // a `metrics_timing_daily` table (avg/p90 pre-aggregated per day). The
+    // endpoint then SELECTs <30 rows and the limit becomes irrelevant.
+    const ROW_LIMIT = 50_000;
+
+    // Build the two SELECTs and fire them in parallel — they're independent
+    // and read-only, so awaiting sequentially would just double the response
+    // time without buying anything. On SQLite a long-running JSON-pulling
+    // query can also block other read paths in the same process; Promise.all
+    // returns control to the event loop sooner so /metrics/live and
+    // /metrics/summary stay responsive while this one is in flight.
+
+    // Assistant rows: pull metadata JSON, parse client-side, harvest ttft/thinking.
+    const aParams: unknown[] = [cutoff];
+    let assistantSql = `SELECT m.metadata
+      FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'assistant' AND m.created_at >= ? AND m.metadata IS NOT NULL
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { assistantSql += " AND s.user_id = ?"; aParams.push(userFilter); }
+    assistantSql += " ORDER BY m.created_at DESC LIMIT ?";
+    aParams.push(ROW_LIMIT + 1);
+
+    // Tool rows: bucket duration_ms by tool_name. We pull all tools (not
+    // just bash) so the dashboard can rank by invocation count — the actual
+    // top-N filtering happens client-side so the user can flip 3↔5↔10
+    // without re-querying.
+    const tParams: unknown[] = [cutoff];
+    let toolSql = `SELECT m.tool_name AS toolName, m.duration_ms AS durationMs
+      FROM chat_messages m
+      JOIN chat_sessions s ON m.session_id = s.id
+      WHERE m.role = 'tool' AND m.tool_name IS NOT NULL AND m.duration_ms IS NOT NULL
+        AND m.created_at >= ?
+        AND (s.origin IS NULL OR s.origin NOT IN ('task', 'delegation'))`;
+    if (userFilter) { toolSql += " AND s.user_id = ?"; tParams.push(userFilter); }
+    toolSql += " ORDER BY m.created_at DESC LIMIT ?";
+    tParams.push(ROW_LIMIT + 1);
+
+    const [aResult, tResult] = await Promise.all([
+      db.query(assistantSql, aParams) as Promise<[Array<{ metadata: unknown }>, unknown]>,
+      db.query(toolSql, tParams) as Promise<[Array<{ toolName: string; durationMs: number | null }>, unknown]>,
+    ]);
+    const [aRows] = aResult;
+    const [tRows] = tResult;
+    const assistantTruncated = aRows.length > ROW_LIMIT;
+    const aSlice = assistantTruncated ? aRows.slice(0, ROW_LIMIT) : aRows;
+
+    const ttftValues: number[] = [];
+    const thinkingValues: number[] = [];
+    for (const r of aSlice) {
+      const meta = safeParseJson<Record<string, unknown> | null>(r.metadata, null);
+      const timing = meta?.timing as Record<string, unknown> | undefined;
+      if (!timing) continue;
+      // Filter ≥0: historical rows from before the source-side clamp may
+      // carry negatives produced by cross-process clock drift; this matches
+      // the tool-branch filter below.
+      if (typeof timing.ttft_ms === "number" && timing.ttft_ms >= 0) ttftValues.push(timing.ttft_ms);
+      if (typeof timing.thinking_ms === "number" && timing.thinking_ms >= 0) thinkingValues.push(timing.thinking_ms);
+    }
+
+    const toolsTruncated = tRows.length > ROW_LIMIT;
+    const tSlice = toolsTruncated ? tRows.slice(0, ROW_LIMIT) : tRows;
+
+    // Bucket per tool_name; same negative-value filter as before.
+    const toolBuckets = new Map<string, number[]>();
+    for (const r of tSlice) {
+      const dur = Number(r.durationMs);
+      if (!Number.isFinite(dur) || dur < 0) continue;
+      const bucket = toolBuckets.get(r.toolName);
+      if (bucket) bucket.push(dur);
+      else toolBuckets.set(r.toolName, [dur]);
+    }
+    const tools = Array.from(toolBuckets.entries())
+      .map(([toolName, values]) => ({ toolName, ...summariseLatency(values) }))
+      // Rank by invocation count DESC — matches the "Top Tools" widget below
+      // so the same tool-of-the-day shows up consistently across cards.
+      .sort((a, b) => b.count - a.count);
+
+    sendJson(res, 200, {
+      ttft: summariseLatency(ttftValues),
+      thinking: summariseLatency(thinkingValues),
+      tools,
+      // Tells callers the window was too dense to scan in full and the
+      // figures above reflect a recency-biased sample. Frontend can show a
+      // "sampled view" badge rather than failing the request.
+      truncated: assistantTruncated || toolsTruncated,
+    });
   });
 
   // GET /api/v1/siclaw/metrics/audit
