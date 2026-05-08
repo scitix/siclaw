@@ -155,6 +155,26 @@ describe("siclaw-api misc routes", () => {
     });
   });
 
+  describe("PUT /api/v1/siclaw/agents/:id/chat/sessions/:sid", () => {
+    it("allows explicitly clearing the title", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "s1" }], []])
+        .mockResolvedValueOnce([{}, []])
+        .mockResolvedValueOnce([[{ id: "s1", title: "" }], []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1",
+        method: "PUT",
+        body: { title: "" },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET title = ?");
+      expect(query.mock.calls[1][1][0]).toBe("");
+      expect(body.title).toBe("");
+    });
+  });
+
   describe("DELETE /api/v1/siclaw/agents/:id/chat/sessions/:sid", () => {
     it("returns 401 without auth", async () => {
       const { status } = await runRoute(router, fakeReq({

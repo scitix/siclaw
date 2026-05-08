@@ -15,6 +15,7 @@ import {
   parseBody,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -568,7 +569,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       "chat_sessions",
       ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id"],
       [body.session_id, body.agent_id, body.user_id,
-       body.title || "New Session", body.preview || null, 0, body.origin || null,
+       normalizeChatSessionTitle(body.title), normalizeChatSessionPreview(body.preview), 0, body.origin || null,
        body.parent_session_id ?? null, body.parent_agent_id ?? null,
        body.delegation_id ?? null, body.target_agent_id ?? null],
       ["id"],
@@ -1871,7 +1872,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       "chat_sessions",
       ["id", "agent_id", "user_id", "title", "preview", "message_count", "origin", "parent_session_id", "parent_agent_id", "delegation_id", "target_agent_id"],
       [params.session_id, params.agent_id, params.user_id,
-       params.title || "New Session", params.preview || null, 0, params.origin || null,
+       normalizeChatSessionTitle(params.title), normalizeChatSessionPreview(params.preview), 0, params.origin || null,
        params.parent_session_id ?? null, params.parent_agent_id ?? null,
        params.delegation_id ?? null, params.target_agent_id ?? null],
       ["id"],
