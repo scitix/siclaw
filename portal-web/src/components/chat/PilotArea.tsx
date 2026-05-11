@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo, type MouseEvent } from "react"
+import { useRef, useEffect, useState, useCallback, useMemo } from "react"
 import {
   Terminal,
   User,
@@ -310,8 +310,15 @@ export function PilotArea({
     userScrolledAwayRef.current = distanceFromBottom > 300
   }, [])
 
+  const visibleForCopy = useMemo(() => messages.filter((m) => !m.hidden), [messages])
+
   return (
-    <div className="flex-1 flex flex-col h-full bg-card">
+    <div className="flex-1 flex flex-col h-full bg-card relative">
+      {visibleForCopy.length > 0 && (
+        <div className="absolute top-2 left-3 z-20">
+          <CopySessionButton messages={visibleForCopy} />
+        </div>
+      )}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 lg:px-8 py-8" onScroll={handleScroll}>
         <div className="max-w-5xl mx-auto space-y-8">
           {isLoadingHistory ? (
@@ -1156,35 +1163,152 @@ function DelegationStatusNotice({ content }: { content: string }) {
   )
 }
 
-function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
-  const [copied, setCopied] = useState(false)
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(content).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    })
+// Copy `text` to clipboard. Prefers the async Clipboard API, falls back to a
+// legacy textarea + execCommand path for non-secure origins (HTTP access via
+// host IP — `navigator.clipboard` is undefined there). Returns true on success.
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch (err) {
+    console.warn("[copy] clipboard API failed, falling back:", err)
   }
+  try {
+    const ta = document.createElement("textarea")
+    ta.value = text
+    ta.setAttribute("readonly", "")
+    ta.style.position = "fixed"
+    ta.style.top = "0"
+    ta.style.left = "0"
+    ta.style.opacity = "0"
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand("copy")
+    document.body.removeChild(ta)
+    return ok
+  } catch (err) {
+    console.warn("[copy] fallback failed:", err)
+    return false
+  }
+}
 
+// Tracks "copied" feedback state with a self-cancelling timer so back-to-back
+// clicks don't leave a dangling timeout that clears the green check too early.
+function useCopyFeedback(): [boolean, (text: string) => Promise<void>] {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current)
+  }, [])
+  const copy = useCallback(async (text: string) => {
+    const ok = await copyTextToClipboard(text)
+    if (!ok) return
+    setCopied(true)
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setCopied(false), 2000)
+  }, [])
+  return [copied, copy]
+}
+
+function serializeSessionToText(messages: PilotMessage[]): string {
+  const lines: string[] = []
+  for (const m of messages) {
+    if (m.hidden) continue
+    if (m.metadata?.kind === "delegation_status_notice") continue
+    if (m.role === "user") {
+      lines.push(`You:\n${m.content.trim()}`)
+    } else if (m.role === "assistant") {
+      const body = (m.content ?? "").trim()
+      if (body) lines.push(`Assistant:\n${body}`)
+    } else if (m.role === "tool") {
+      const name = m.toolName ?? "tool"
+      const input = m.toolInput ? `\n$ ${m.toolInput}` : ""
+      const out = (m.content ?? "").trim()
+      lines.push(`[${name}]${input}${out ? `\n${out}` : ""}`)
+    } else if (m.role === "error") {
+      lines.push(`Error: ${(m.content ?? "").trim()}`)
+    }
+  }
+  return lines.join("\n\n")
+}
+
+function CopySessionButton({ messages }: { messages: PilotMessage[] }) {
+  const [copied, copy] = useCopyFeedback()
+  const handleCopy = () => {
+    void copy(serializeSessionToText(messages))
+  }
   return (
-    <div
+    <button
+      type="button"
+      onClick={handleCopy}
+      title="Copy entire session"
+      className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
+    >
+      {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+    </button>
+  )
+}
+
+function CopyIconButton({
+  text,
+  title,
+  className,
+}: {
+  text: string
+  title?: string
+  className?: string
+}) {
+  const [copied, copy] = useCopyFeedback()
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    void copy(text)
+  }
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title={title ?? "Copy"}
       className={cn(
-        "group relative px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 max-w-3xl min-w-0 overflow-hidden",
-        isUser
-          ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
-          : "bg-card border border-border text-foreground rounded-tl-sm",
+        "transition-opacity p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-secondary",
+        className,
       )}
     >
-      <Markdown>{content}</Markdown>
-      {!isUser && (
-        <button
-          onClick={handleCopy}
-          className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-secondary"
-          title="Copy markdown"
-        >
-          {copied ? <Check className="h-3.5 w-3.5 text-green-400" /> : <Copy className="h-3.5 w-3.5" />}
-        </button>
-      )}
+      {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
+  )
+}
+
+function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
+  const [copied, copy] = useCopyFeedback()
+
+  const handleCopy = () => {
+    void copy(content)
+  }
+
+  // Copy button sits OUTSIDE the bubble (below it, aligned right for user /
+  // left for assistant), matching ChatGPT/Claude convention. Avoids any chance
+  // of overlapping message text — even for one-line bubbles.
+  return (
+    <div className={cn("group/msg flex flex-col gap-1 max-w-3xl min-w-0", isUser ? "items-end" : "items-start")}>
+      <div
+        className={cn(
+          "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 min-w-0 overflow-hidden",
+          isUser
+            ? "bg-blue-600 text-white rounded-tr-sm [&_pre]:bg-black/20 [&_pre]:text-white [&_code]:bg-card/15 [&_code]:text-white [&_a]:text-blue-200"
+            : "bg-card border border-border text-foreground rounded-tl-sm",
+        )}
+      >
+        <Markdown>{content}</Markdown>
+      </div>
+      <button
+        onClick={handleCopy}
+        className="opacity-0 group-hover/msg:opacity-100 focus-visible:opacity-100 transition-opacity p-1 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-secondary"
+        title={isUser ? "Copy" : "Copy markdown"}
+      >
+        {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+      </button>
     </div>
   )
 }
@@ -1527,11 +1651,24 @@ function ToolItem({ message }: { message: PilotMessage }) {
 
   return (
     <div className="pl-12 min-w-0">
-      <div className="bg-card border border-border rounded-lg shadow-sm shadow-black/10 overflow-hidden">
-        <button
-          type="button"
-          className="flex items-center gap-2 w-full px-4 py-2 bg-secondary border-b border-border hover:bg-secondary transition-colors cursor-pointer text-left min-w-0"
+      <div className="group/tool bg-card border border-border rounded-lg shadow-sm shadow-black/10 overflow-hidden">
+        {/* Whole row toggles expand. The toolInput span + timing badges
+            stopPropagation on mousedown so drag-select doesn't get hijacked
+            as a click, restoring the original "click anywhere to expand"
+            ergonomics for SREs scanning many tool rows. */}
+        <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={isOpen}
           onClick={() => setExpanded(!expanded)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault()
+              setExpanded(!expanded)
+            }
+          }}
+          className="flex items-center gap-2 w-full px-4 py-2 bg-secondary border-b border-border hover:bg-secondary/80 transition-colors cursor-pointer min-w-0"
+          title={isOpen ? "Collapse" : "Expand"}
         >
           <ChevronRight
             className={cn("w-3.5 h-3.5 text-muted-foreground/70 transition-transform shrink-0", isOpen && "rotate-90")}
@@ -1539,66 +1676,71 @@ function ToolItem({ message }: { message: PilotMessage }) {
           <Terminal className="w-4 h-4 text-muted-foreground shrink-0" />
           <span className="font-mono text-xs font-semibold text-foreground shrink-0">{message.toolName}</span>
           {message.toolInput && (
-            <span className="font-mono text-xs text-muted-foreground truncate min-w-0">{message.toolInput}</span>
+            <span
+              className="font-mono text-xs text-muted-foreground truncate min-w-0 select-text cursor-text"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              {message.toolInput}
+            </span>
           )}
-          {(() => {
-            // 💭 thinking-before-tool + ⚙️ exec-time. Either, both, or neither
-            // may be present; the first one rendered claims `ml-auto` so the
-            // status icon trails naturally without extra layout branching.
-            const t = message.timing
-            const showThink = typeof t?.thinkingMs === "number"
-            const showDur = typeof t?.durationMs === "number"
-            const hasAnyTiming = showThink || showDur
-            // stopPropagation on mousedown lets the user drag-select the
-            // numbers without the parent <button> capturing it as a click
-            // (which would toggle expand and clear the selection). cursor-text
-            // signals the affordance.
-            const stopSel = (e: MouseEvent) => e.stopPropagation()
-            return (
-              <>
-                {showThink && (
-                  <span
-                    onMouseDown={stopSel}
-                    onClick={stopSel}
-                    className={cn("font-mono text-[11px] text-muted-foreground tabular-nums shrink-0 select-text cursor-text", "ml-auto")}
-                  >
-                    💭 {formatTimingMs(t!.thinkingMs!)}
-                  </span>
-                )}
-                {showDur && (
-                  <span
-                    onMouseDown={stopSel}
-                    onClick={stopSel}
-                    className={cn("font-mono text-[11px] text-muted-foreground tabular-nums shrink-0 select-text cursor-text", showThink ? "ml-2" : "ml-auto")}
-                  >
-                    ⚙️ {formatTimingMs(t!.durationMs!)}
-                  </span>
-                )}
-                {message.toolStatus === "running" && (
-                  <Loader2 className={cn("w-3 h-3 animate-spin text-blue-400 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />
-                )}
-                {message.toolStatus === "success" && (
-                  <CheckCircle2 className={cn("w-3.5 h-3.5 text-green-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />
-                )}
-                {message.toolStatus === "error" && <XCircle className={cn("w-3.5 h-3.5 text-red-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />}
-                {message.toolStatus === "aborted" && <Ban className={cn("w-3.5 h-3.5 text-amber-500 shrink-0", hasAnyTiming ? "ml-1.5" : "ml-auto")} />}
-              </>
-            )
-          })()}
-        </button>
+          <div className="ml-auto flex items-center gap-1.5 shrink-0">
+            {(() => {
+              const t = message.timing
+              const showThink = typeof t?.thinkingMs === "number"
+              const showDur = typeof t?.durationMs === "number"
+              return (
+                <>
+                  {showThink && (
+                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums select-text">
+                      💭 {formatTimingMs(t!.thinkingMs!)}
+                    </span>
+                  )}
+                  {showDur && (
+                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums select-text">
+                      ⚙️ {formatTimingMs(t!.durationMs!)}
+                    </span>
+                  )}
+                </>
+              )
+            })()}
+            {message.toolInput && (
+              <CopyIconButton
+                text={message.toolInput}
+                title="Copy command"
+                className="opacity-0 group-hover/tool:opacity-100"
+              />
+            )}
+            {message.toolStatus === "running" && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+            {message.toolStatus === "success" && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
+            {message.toolStatus === "error" && <XCircle className="w-3.5 h-3.5 text-red-500" />}
+            {message.toolStatus === "aborted" && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+          </div>
+        </div>
         {isOpen && (
           <div className="overflow-x-auto bg-secondary/30 max-h-80 overflow-y-auto">
             {message.toolInput && (
-              <div className="px-4 pt-3 pb-2 border-b border-border/50">
-                <pre className="text-xs font-mono leading-relaxed text-foreground whitespace-pre-wrap break-all">
+              <div className="relative group/input px-4 pt-3 pb-2 border-b border-border/50">
+                <pre className="text-xs font-mono leading-relaxed text-foreground whitespace-pre-wrap break-all pr-8">
                   {message.toolInput}
                 </pre>
+                <CopyIconButton
+                  text={message.toolInput}
+                  title="Copy command"
+                  className="absolute top-2 right-2 opacity-0 group-hover/input:opacity-100"
+                />
               </div>
             )}
-            <div className="p-4">
-              <pre className="text-xs font-mono leading-relaxed text-muted-foreground whitespace-pre-wrap">
+            <div className="relative group/output p-4">
+              <pre className="text-xs font-mono leading-relaxed text-muted-foreground whitespace-pre-wrap pr-8">
                 {message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running...")}
               </pre>
+              {message.content && (
+                <CopyIconButton
+                  text={message.content}
+                  title="Copy output"
+                  className="absolute top-2 right-2 opacity-0 group-hover/output:opacity-100"
+                />
+              )}
             </div>
           </div>
         )}
