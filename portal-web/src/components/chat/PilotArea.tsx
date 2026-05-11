@@ -41,37 +41,31 @@ function formatTimingMs(ms: number): string {
 }
 
 /**
- * Inline timing badges shown beneath chat bubbles. Emoji semantics, per spec:
- *   ⏳ ttftMs        — time-to-first-token (first assistant message of a turn)
- *   💭 thinkingMs    — model reasoning gap before visible text / before tool
- *   ✍️ outputMs     — text streaming time (first delta → message_end)
- *   ⚙️ durationMs   — bash/kubectl/skill execution time (tool rows)
- *
- * Badge is omitted entirely when no timing is present, so messages without
- * server-stamped timings (legacy history) render unchanged.
+ * Inline "model time" shown next to the assistant's header. Combines the
+ * three model-side phases (ttft + thinking + output) into one user-facing
+ * figure so chat doesn't surface dashboard-level timing breakdowns.
+ * Dashboard latency stats keep their per-phase split.
  */
-function TimingBadges({ timing }: { timing: MessageTiming | undefined }) {
-  if (!timing) return null
-  // Order chosen so the badges read like a timeline left-to-right:
-  //   ⏳ before-first-token (turn anchor)
-  //   💭 thinking (boundary → first delta)
-  //   ✍️ writing (first delta → message_end)
-  //   ⚙️ tool exec (separate from the above; only on tool rows)
-  const items: Array<{ key: string; label: string }> = []
-  if (typeof timing.ttftMs === "number") items.push({ key: "ttft", label: `⏳ ${formatTimingMs(timing.ttftMs)}` })
-  if (typeof timing.thinkingMs === "number") items.push({ key: "think", label: `💭 ${formatTimingMs(timing.thinkingMs)}` })
-  if (typeof timing.outputMs === "number") items.push({ key: "out", label: `✍️ ${formatTimingMs(timing.outputMs)}` })
-  if (typeof timing.durationMs === "number") items.push({ key: "dur", label: `⚙️ ${formatTimingMs(timing.durationMs)}` })
-  if (items.length === 0) return null
-  // `select-text` makes the values copyable so the user can audit timing math
-  // by selecting and pasting. Numbers + units are kept in one span per badge
-  // so a single drag selects the whole figure.
+function combinedModelMs(timing: MessageTiming | undefined): number | undefined {
+  if (!timing) return undefined
+  // ttftMs already covers user-message → first-token (and contains the
+  // thinking portion). Add outputMs (first-delta → message_end) to get
+  // total model wall-clock. thinkingMs is a subset of ttftMs and is
+  // intentionally not summed to avoid double-counting.
+  const ttft = typeof timing.ttftMs === "number" ? timing.ttftMs : 0
+  const out = typeof timing.outputMs === "number" ? timing.outputMs : 0
+  const total = ttft + out
+  if (total <= 0) return undefined
+  return total
+}
+
+function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
+  const total = combinedModelMs(timing)
+  if (total == null) return null
   return (
-    <div className="flex flex-wrap gap-2 mt-1.5 text-[11px] text-muted-foreground/80 select-text">
-      {items.map((it) => (
-        <span key={it.key} className="font-mono tabular-nums select-text cursor-text">{it.label}</span>
-      ))}
-    </div>
+    <span className="text-xs text-muted-foreground/70 tabular-nums select-text cursor-text">
+      thinking {formatTimingMs(total)}
+    </span>
   )
 }
 
@@ -315,7 +309,7 @@ export function PilotArea({
   return (
     <div className="flex-1 flex flex-col h-full bg-card relative">
       {visibleForCopy.length > 0 && (
-        <div className="absolute top-2 left-3 z-20">
+        <div className="absolute top-2 left-3 z-10">
           <CopySessionButton messages={visibleForCopy} />
         </div>
       )}
@@ -1087,6 +1081,7 @@ function MessageItem({
         <div className="flex items-baseline gap-2 mb-1">
           <span className="text-sm font-semibold text-foreground">{isUser ? "You" : "Siclaw"}</span>
           <span className="text-xs text-muted-foreground/70">{message.timestamp}</span>
+          {!isUser && <ModelTimeLabel timing={message.timing} />}
           {message.isStreaming && !isUser && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/70" />}
         </div>
 
@@ -1130,8 +1125,6 @@ function MessageItem({
         {textContent && (
           <CopyableMessage isUser={isUser} content={textContent} />
         )}
-
-        {!isUser && <TimingBadges timing={message.timing} />}
 
         {renderedSuggestedChips.length > 0 && onChipClick && (
           <div className="flex flex-wrap gap-2 mt-2">
@@ -1304,7 +1297,7 @@ function CopyableMessage({ isUser, content }: { isUser: boolean; content: string
       </div>
       <button
         onClick={handleCopy}
-        className="opacity-0 group-hover/msg:opacity-100 focus-visible:opacity-100 transition-opacity p-1 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-secondary"
+        className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-secondary transition-colors"
         title={isUser ? "Copy" : "Copy markdown"}
       >
         {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
@@ -1690,14 +1683,11 @@ function ToolItem({ message }: { message: PilotMessage }) {
               const showDur = typeof t?.durationMs === "number"
               return (
                 <>
-                  {showThink && (
-                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums select-text">
-                      💭 {formatTimingMs(t!.thinkingMs!)}
-                    </span>
-                  )}
-                  {showDur && (
-                    <span className="font-mono text-[11px] text-muted-foreground tabular-nums select-text">
-                      ⚙️ {formatTimingMs(t!.durationMs!)}
+                  {(showThink || showDur) && (
+                    <span className="text-[11px] text-muted-foreground tabular-nums select-text">
+                      {showThink && <>thinking {formatTimingMs(t!.thinkingMs!)}</>}
+                      {showThink && showDur && ", "}
+                      {showDur && <>running {formatTimingMs(t!.durationMs!)}</>}
                     </span>
                   )}
                 </>
@@ -1707,7 +1697,7 @@ function ToolItem({ message }: { message: PilotMessage }) {
               <CopyIconButton
                 text={message.toolInput}
                 title="Copy command"
-                className="opacity-0 group-hover/tool:opacity-100"
+                className=""
               />
             )}
             {message.toolStatus === "running" && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
@@ -1726,7 +1716,7 @@ function ToolItem({ message }: { message: PilotMessage }) {
                 <CopyIconButton
                   text={message.toolInput}
                   title="Copy command"
-                  className="absolute top-2 right-2 opacity-0 group-hover/input:opacity-100"
+                  className="absolute top-2 right-2"
                 />
               </div>
             )}
@@ -1738,7 +1728,7 @@ function ToolItem({ message }: { message: PilotMessage }) {
                 <CopyIconButton
                   text={message.content}
                   title="Copy output"
-                  className="absolute top-2 right-2 opacity-0 group-hover/output:opacity-100"
+                  className="absolute top-2 right-2"
                 />
               )}
             </div>

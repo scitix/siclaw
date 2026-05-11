@@ -276,8 +276,8 @@ export function AgentChat({ agentId }: AgentChatProps) {
       {/* Session drawer — slides in from left */}
       {showSessions && (
         <>
-          <div className="absolute inset-0 z-10" onClick={() => setShowSessions(false)} />
-          <div className="absolute top-0 left-0 bottom-0 z-20 w-[280px] bg-card border-r border-border shadow-lg shadow-black/20 flex flex-col">
+          <div className="absolute inset-0 z-50 bg-background/60 backdrop-blur-sm" onClick={() => setShowSessions(false)} />
+          <div className="absolute top-0 left-0 bottom-0 z-50 w-[280px] bg-card border-r border-border shadow-lg shadow-black/20 flex flex-col">
             <div className="flex items-center justify-between px-4 py-3 border-b border-border">
               <span className="text-sm font-medium">Recent Sessions</span>
               <button onClick={() => setShowSessions(false)} className="p-1 rounded-md text-muted-foreground hover:text-foreground">
