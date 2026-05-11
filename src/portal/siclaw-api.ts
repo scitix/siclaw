@@ -985,7 +985,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
 
-    // Binary zip upload: Content-Type: application/zip or application/octet-stream
+    // Binary archive upload (zip or tar/tar.gz): Content-Type may be
+    // application/zip, application/x-tar, application/gzip, or application/octet-stream
+    // — the actual format is detected from magic bytes in parseSkillPack.
     // Query params: ?dry_run=true&comment=...
     const query = parseQuery(req.url ?? "");
     const dryRun = query.dry_run === "true";
@@ -999,17 +1001,22 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 400, { error: `Failed to parse skill pack: ${err.message}` });
       return;
     }
-    if (skills.length === 0) { sendJson(res, 400, { error: "No skills found in zip" }); return; }
+    if (skills.length === 0) { sendJson(res, 400, { error: "No skills found in archive" }); return; }
 
     if (dryRun) {
       const diff = await computeImportDiff(auth.orgId, skills);
-      sendJson(res, 200, { dry_run: true, skill_count: skills.length, ...diff });
+      // Admin pack uploads are upsert-only — builtins missing from the pack
+      // are left alone, never deleted. Zero out `deleted` so the dry-run
+      // preview honestly reflects what executing the import would do.
+      sendJson(res, 200, { dry_run: true, skill_count: skills.length, ...diff, deleted: [] });
       return;
     }
 
     try {
-      const result = await executeImport(auth.orgId, skills, auth.userId, comment,
-        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+      const result = await executeImport(auth.orgId, skills, auth.userId, comment, {
+        mode: "upsert",
+        notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+      });
       sendJson(res, 200, result);
     } catch (err: any) {
       sendJson(res, 500, { error: `Import failed: ${err.message}` });
@@ -1032,9 +1039,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
 
     try {
+      // Init: the bundled `skills/core/` is the source of truth. Sync mode
+      // ensures DB matches the image — skills removed upstream go away here.
       const result = await executeImport(auth.orgId, skills, auth.userId,
         body.comment || "Initialize from builtin",
-        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+        {
+          mode: "sync",
+          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+        });
       sendJson(res, 200, result);
     } catch (err: any) {
       sendJson(res, 500, { error: `Init failed: ${err.message}` });
@@ -1080,9 +1092,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const skills = JSON.parse(histRows[0].snapshot);
 
     try {
+      // Rollback: the target version's snapshot IS the desired full state,
+      // so sync mode is required — skills added after that version must be
+      // removed for the rollback to be faithful.
       const result = await executeImport(auth.orgId, skills, auth.userId,
         body.comment || `Rollback to v${body.version}`,
-        (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources));
+        {
+          mode: "sync",
+          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+        });
       sendJson(res, 200, result);
     } catch (err: any) {
       sendJson(res, 500, { error: `Rollback failed: ${err.message}` });

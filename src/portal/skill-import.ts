@@ -2,7 +2,7 @@
  * Skill Import Service — parse, diff, and sync builtin skill packs.
  *
  * Provides three operations:
- *   1. parseSkillPack()     — extract a zip buffer into ParsedSkill[]
+ *   1. parseSkillPack()     — extract a zip/tar archive buffer into ParsedSkill[]
  *   2. computeImportDiff()  — compare incoming skills against DB builtins
  *   3. executeImport()      — apply the diff transactionally + snapshot
  *
@@ -12,7 +12,8 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import AdmZip from "adm-zip";
+import * as tar from "tar";
 import { getDb } from "../gateway/db.js";
 import { parseSkillsDir, type ParsedSkill } from "../gateway/skills/builtin-sync.js";
 
@@ -22,11 +23,16 @@ export type { ParsedSkill };
 // Public types
 // ---------------------------------------------------------------------------
 
+export interface DiffEntry {
+  name: string;
+  description: string;
+}
+
 export interface ImportDiff {
-  added: string[];
-  updated: string[];
-  deleted: Array<{ name: string; bound_agents: Array<{ id: string; name: string }> }>;
-  unchanged: string[];
+  added: DiffEntry[];
+  updated: DiffEntry[];
+  deleted: Array<{ name: string; description: string; bound_agents: Array<{ id: string; name: string }> }>;
+  unchanged: DiffEntry[];
 }
 
 export interface ImportResult extends ImportDiff {
@@ -34,31 +40,81 @@ export interface ImportResult extends ImportDiff {
   version: number;
 }
 
+/**
+ * Import policy for builtins that exist in DB but are absent from the incoming pack.
+ *   - "sync"   — delete them (full mirror; used by init / rollback / bootstrap)
+ *   - "upsert" — leave them untouched (additive upload; used by admin pack upload)
+ */
+export type ImportMode = "sync" | "upsert";
+
 // ---------------------------------------------------------------------------
-// 1. Parse a zip skill pack into structured skill objects
+// 1. Parse a skill pack archive into structured skill objects
 // ---------------------------------------------------------------------------
+
+export type ArchiveFormat = "zip" | "tar";
 
 /**
- * Extract a zip buffer into ParsedSkill[].
+ * Detect archive format from the first bytes of the buffer.
+ * - zip: PK\x03\x04 (local file header)
+ * - tar.gz: gzip magic \x1F\x8B
+ * - tar (uncompressed): "ustar" at offset 257
+ */
+export function detectArchiveFormat(buf: Buffer): ArchiveFormat {
+  if (buf.length >= 4 && buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) {
+    return "zip";
+  }
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    return "tar"; // gzip-wrapped tar — tar.extract auto-detects gzip
+  }
+  if (buf.length >= 262 && buf.slice(257, 262).toString("utf8") === "ustar") {
+    return "tar";
+  }
+  throw new Error("Unsupported archive format (expected zip or tar)");
+}
+
+function extractZip(buf: Buffer, destDir: string): void {
+  const zip = new AdmZip(buf);
+  for (const entry of zip.getEntries()) {
+    // Reject absolute paths and parent-traversal segments — the zip must
+    // not be able to write outside destDir.
+    const name = entry.entryName.replace(/\\/g, "/");
+    if (name.startsWith("/") || name.split("/").includes("..")) {
+      throw new Error(`Unsafe path in zip: ${entry.entryName}`);
+    }
+  }
+  zip.extractAllTo(destDir, /*overwrite*/ true);
+}
+
+async function extractTar(buf: Buffer, destDir: string, tmpDir: string): Promise<void> {
+  const archivePath = path.join(tmpDir, "pack.tar");
+  fs.writeFileSync(archivePath, buf);
+  // tar.extract auto-detects gzip via the stream; default behavior strips
+  // absolute paths and refuses `..` entries, so no extra guard is needed.
+  await tar.extract({ file: archivePath, cwd: destDir });
+}
+
+/**
+ * Extract a skill pack archive (zip or tar / tar.gz) into ParsedSkill[].
  *
  * Handles both layouts:
- *   - Zip root contains skill directories directly
- *   - Zip root contains a single wrapper directory holding the skill dirs
+ *   - Archive root contains skill directories directly
+ *   - Archive root contains a single wrapper directory holding the skill dirs
  */
-export async function parseSkillPack(zipBuffer: Buffer): Promise<ParsedSkill[]> {
+export async function parseSkillPack(archiveBuffer: Buffer): Promise<ParsedSkill[]> {
   const tmpDir = path.join("/tmp", `skill-import-${crypto.randomUUID()}`);
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const extractDir = path.join(tmpDir, "extracted");
+  fs.mkdirSync(extractDir, { recursive: true });
   try {
-    const zipPath = path.join(tmpDir, "pack.zip");
-    fs.writeFileSync(zipPath, zipBuffer);
-
-    const extractDir = path.join(tmpDir, "extracted");
-    fs.mkdirSync(extractDir);
-    execSync(`unzip -q "${zipPath}" -d "${extractDir}"`, { timeout: 30_000 });
+    const format = detectArchiveFormat(archiveBuffer);
+    if (format === "zip") {
+      extractZip(archiveBuffer, extractDir);
+    } else {
+      await extractTar(archiveBuffer, extractDir, tmpDir);
+    }
 
     // Determine the actual skills root directory.
     // If there's a single subdirectory and no meta.json at the extract root,
-    // the zip likely has a wrapper directory — descend into it.
+    // the archive likely has a wrapper directory — descend into it.
     const entries = fs.readdirSync(extractDir, { withFileTypes: true });
     const dirs = entries.filter(e => e.isDirectory());
     let skillsRoot = extractDir;
@@ -88,32 +144,33 @@ export async function computeImportDiff(
 
   // Current builtin skills
   const [builtinRows] = await db.query(
-    "SELECT id, name, specs, scripts FROM skills WHERE org_id = ? AND is_builtin = 1",
+    "SELECT id, name, description, specs, scripts FROM skills WHERE org_id = ? AND is_builtin = 1",
     [orgId],
   ) as any;
-  const builtinMap = new Map<string, { id: string; specs: string; scripts: string }>();
+  const builtinMap = new Map<string, { id: string; description: string; specs: string; scripts: string }>();
   for (const row of builtinRows) {
     builtinMap.set(row.name, row);
   }
 
   const incomingNames = new Set(incoming.map(s => s.name));
-  const added: string[] = [];
-  const updated: string[] = [];
-  const unchanged: string[] = [];
+  const added: DiffEntry[] = [];
+  const updated: DiffEntry[] = [];
+  const unchanged: DiffEntry[] = [];
 
   for (const skill of incoming) {
     const existing = builtinMap.get(skill.name);
+    const entry: DiffEntry = { name: skill.name, description: skill.description };
     if (!existing) {
-      added.push(skill.name);
+      added.push(entry);
     } else {
       // Normalize scripts — DB may store as JSON string or parsed object
       const existingScripts = typeof existing.scripts === "string"
         ? existing.scripts : JSON.stringify(existing.scripts);
       const incomingScripts = JSON.stringify(skill.scripts);
       if (existing.specs !== skill.specs || existingScripts !== incomingScripts) {
-        updated.push(skill.name);
+        updated.push(entry);
       } else {
-        unchanged.push(skill.name);
+        unchanged.push(entry);
       }
     }
   }
@@ -131,6 +188,7 @@ export async function computeImportDiff(
       ) as any;
       deleted.push({
         name,
+        description: row.description ?? "",
         bound_agents: bindRows.map((r: any) => ({ id: r.id, name: r.name })),
       });
     }
@@ -146,16 +204,29 @@ export async function computeImportDiff(
 /**
  * Apply the import diff transactionally, save a history snapshot, and
  * optionally notify affected agents.
+ *
+ * The `mode` field controls how missing-from-pack builtins are handled —
+ * see {@link ImportMode}. No default: every caller must commit to a policy.
  */
 export async function executeImport(
   orgId: string,
   incoming: ParsedSkill[],
   userId: string,
   comment: string,
-  notifyAgentReload?: (agentId: string, resources: string[]) => void,
+  opts: {
+    mode: ImportMode;
+    notifyAgentReload?: (agentId: string, resources: string[]) => void;
+  },
 ): Promise<ImportResult> {
   const db = getDb();
-  const diff = await computeImportDiff(orgId, incoming);
+  const rawDiff = await computeImportDiff(orgId, incoming);
+  // In upsert mode the "deleted" set is informational only — it tells us
+  // which builtins exist in DB but are absent from the pack, and we leave
+  // them alone. We zero it out in the result so callers (and history rows)
+  // truthfully reflect what happened.
+  const diff: ImportDiff = opts.mode === "upsert"
+    ? { ...rawDiff, deleted: [] }
+    : rawDiff;
 
   // Build a name→id map for existing builtins
   const [builtinRows] = await db.query(
@@ -170,8 +241,8 @@ export async function executeImport(
     await conn.beginTransaction();
 
     // --- ADD new builtin skills ---
-    for (const name of diff.added) {
-      const skill = incoming.find(s => s.name === name)!;
+    for (const entry of diff.added) {
+      const skill = incoming.find(s => s.name === entry.name)!;
       const id = crypto.randomUUID();
       await conn.query(
         `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by, is_builtin)
@@ -186,9 +257,9 @@ export async function executeImport(
     }
 
     // --- UPDATE changed builtin skills ---
-    for (const name of diff.updated) {
-      const skill = incoming.find(s => s.name === name)!;
-      const existingId = builtinByName.get(name)!;
+    for (const entry of diff.updated) {
+      const skill = incoming.find(s => s.name === entry.name)!;
+      const existingId = builtinByName.get(entry.name)!;
       // Get next version number
       const [vRows] = await conn.query(
         "SELECT MAX(version) AS v FROM skill_versions WHERE skill_id = ?",
@@ -210,40 +281,44 @@ export async function executeImport(
     }
 
     // --- DELETE removed builtin skills ---
+    // Skipped in upsert mode — diff.deleted has already been zeroed out above
+    // so this loop is a no-op, but the explicit guard keeps intent obvious.
     const affectedAgentIds = new Set<string>();
-    for (const del of diff.deleted) {
-      const existingId = builtinByName.get(del.name)!;
-      // Check for overlay — if one exists, promote it to standalone
-      const [overlayRows] = await conn.query(
-        "SELECT id FROM skills WHERE overlay_of = ?",
-        [existingId],
-      ) as any;
-      if (overlayRows.length > 0) {
-        // Promote overlay: clear overlay_of, keep as regular skill
-        await conn.query("UPDATE skills SET overlay_of = NULL, updated_at = CURRENT_TIMESTAMP WHERE overlay_of = ?", [existingId]);
-        // Migrate agent bindings from builtin → overlay
-        for (const ov of overlayRows) {
-          await conn.query(
-            "UPDATE agent_skills SET skill_id = ? WHERE skill_id = ?",
-            [ov.id, existingId],
-          );
+    if (opts.mode === "sync") {
+      for (const del of rawDiff.deleted) {
+        const existingId = builtinByName.get(del.name)!;
+        // Check for overlay — if one exists, promote it to standalone
+        const [overlayRows] = await conn.query(
+          "SELECT id FROM skills WHERE overlay_of = ?",
+          [existingId],
+        ) as any;
+        if (overlayRows.length > 0) {
+          // Promote overlay: clear overlay_of, keep as regular skill
+          await conn.query("UPDATE skills SET overlay_of = NULL, updated_at = CURRENT_TIMESTAMP WHERE overlay_of = ?", [existingId]);
+          // Migrate agent bindings from builtin → overlay
+          for (const ov of overlayRows) {
+            await conn.query(
+              "UPDATE agent_skills SET skill_id = ? WHERE skill_id = ?",
+              [ov.id, existingId],
+            );
+          }
+        } else {
+          // No overlay — unbind agents
+          await conn.query("DELETE FROM agent_skills WHERE skill_id = ?", [existingId]);
         }
-      } else {
-        // No overlay — unbind agents
-        await conn.query("DELETE FROM agent_skills WHERE skill_id = ?", [existingId]);
+        // Track affected agents for notification
+        for (const agent of del.bound_agents) affectedAgentIds.add(agent.id);
+        // Delete builtin skill (cascades to versions, reviews)
+        await conn.query("DELETE FROM skills WHERE id = ?", [existingId]);
       }
-      // Track affected agents for notification
-      for (const agent of del.bound_agents) affectedAgentIds.add(agent.id);
-      // Delete builtin skill (cascades to versions, reviews)
-      await conn.query("DELETE FROM skills WHERE id = ?", [existingId]);
     }
 
     await conn.commit();
 
     // Notify affected agents outside transaction (fire-and-forget)
-    if (notifyAgentReload) {
+    if (opts.notifyAgentReload) {
       for (const agentId of affectedAgentIds) {
-        notifyAgentReload(agentId, ["skills"]);
+        opts.notifyAgentReload(agentId, ["skills"]);
       }
     }
   } catch (err) {
@@ -265,7 +340,10 @@ export async function executeImport(
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       importId, importVersion, comment || null, snapshot, incoming.length,
-      JSON.stringify(diff.added), JSON.stringify(diff.updated),
+      // History columns historically held string[] of names — preserve that
+      // shape so existing rows and the history-list UI keep working.
+      JSON.stringify(diff.added.map(d => d.name)),
+      JSON.stringify(diff.updated.map(d => d.name)),
       JSON.stringify(diff.deleted.map(d => d.name)), userId,
     ],
   );

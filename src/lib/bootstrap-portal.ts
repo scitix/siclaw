@@ -112,6 +112,8 @@ async function autoInitBuiltinSkillsIfEmpty(): Promise<void> {
     console.log(`[portal] No skills/core/ directory at ${SKILLS_CORE_DIR} — skipping`);
     return;
   }
-  const result = await executeImport("default", skills, "system", "Initial builtin import");
+  // Initial bootstrap on an empty DB — sync mode is fine since there's
+  // nothing to delete by definition.
+  const result = await executeImport("default", skills, "system", "Initial builtin import", { mode: "sync" });
   console.log(`[portal] Imported ${skills.length} builtin skills (added=${result.added.length})`);
 }
