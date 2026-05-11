@@ -633,6 +633,25 @@ describe("chat.ensureSession", () => {
     expect(query.mock.calls[0][1]).toContain("New Session");
   });
 
+  it("truncates long title and preview fields before upsert", async () => {
+    const query = mockQuery([]);
+
+    await getHandler("chat.ensureSession")(
+      {
+        session_id: "sess1",
+        agent_id: "a1",
+        user_id: "u1",
+        title: "t".repeat(300),
+        preview: "p".repeat(600),
+      },
+      "a1",
+    );
+
+    const params = query.mock.calls[0][1];
+    expect(params[3]).toHaveLength(255);
+    expect(params[4]).toHaveLength(500);
+  });
+
   it("persists delegation lineage fields", async () => {
     const query = mockQuery([]);
 

@@ -39,6 +39,11 @@ import { evaluateScriptsAI } from "../gateway/skills/ai-security-reviewer.js";
 import { parseFrontmatter } from "../gateway/skills/builtin-sync.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { validateKnowledgePackage } from "../shared/knowledge-package.js";
+import {
+  normalizeChatSessionPreview,
+  normalizeChatSessionTitle,
+  truncateChatSessionTitle,
+} from "./chat-session-fields.js";
 
 /** Trace viewer message limit — matches siclaw_main.cron-limits.MAX_TRACE_MESSAGES */
 const MAX_TRACE_MESSAGES = 200;
@@ -1329,7 +1334,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
       [
         id, params.id, auth.userId,
-        body.title || "New Session", body.preview || null, 0,
+        normalizeChatSessionTitle(body.title), normalizeChatSessionPreview(body.preview), 0,
       ],
     );
 
@@ -1356,7 +1361,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     const fields: string[] = [];
     const values: unknown[] = [];
-    if ("title" in body) { fields.push("title = ?"); values.push(body.title); }
+    if ("title" in body) { fields.push("title = ?"); values.push(truncateChatSessionTitle(body.title)); }
     if (fields.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
 
     values.push(params.sid);
