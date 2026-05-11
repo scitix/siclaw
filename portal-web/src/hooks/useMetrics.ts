@@ -35,6 +35,34 @@ export interface SummaryData {
   byUser: Array<{ userId: string; sessions: number; messages: number }>
 }
 
+/**
+ * Aggregate stats for one timing series (ttft, thinking, bash). All ms.
+ * `count = 0` signals "no data" — the card should render an empty-state hint
+ * rather than a row of zeros.
+ */
+export interface LatencyStats {
+  count: number
+  avg: number
+  min: number
+  max: number
+  p90: number
+}
+
+/** One tool's stats — `toolName` plus the standard latency summary. */
+export interface ToolLatencyStats extends LatencyStats {
+  toolName: string
+}
+
+export interface TimingStats {
+  ttft: LatencyStats
+  thinking: LatencyStats
+  /** All tools with at least one duration sample, sorted by `count` DESC.
+   *  The card slices client-side to the user-chosen top 3 / 5 / 10. */
+  tools: ToolLatencyStats[]
+  /** True when the backend hit ROW_LIMIT and the figures are a recent-only sample. */
+  truncated?: boolean
+}
+
 export interface AuditLog {
   id: string
   sessionId: string
@@ -80,6 +108,27 @@ export function useLive(userId: string | null): { data: LiveData | null; loading
   }, [userId, fetchOnce])
 
   return { data, loading, error, refresh: fetchOnce }
+}
+
+export function useTimingStats(period: string, userId: string | null): { data: TimingStats | null; loading: boolean; refresh: () => void } {
+  const [data, setData] = useState<TimingStats | null>(null)
+  const [loading, setLoading] = useState(true)
+  const paramsRef = useRef({ period, userId })
+  paramsRef.current = { period, userId }
+
+  const fetchOnce = useCallback(() => {
+    setLoading(true)
+    const { period: p, userId: uid } = paramsRef.current
+    const q = new URLSearchParams({ period: p })
+    if (uid) q.set("userId", uid)
+    return api<TimingStats>(`/siclaw/metrics/timing?${q.toString()}`)
+      .then((d) => { setData(d); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { fetchOnce() }, [period, userId, fetchOnce])
+
+  return { data, loading, refresh: fetchOnce }
 }
 
 export function useSummary(period: string, userId: string | null): { data: SummaryData | null; loading: boolean; refresh: () => void } {

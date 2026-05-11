@@ -116,6 +116,12 @@ export function registerChatRoutes(
 ): void {
   // POST /api/v1/siclaw/agents/:id/chat/send — SSE streaming
   router.post("/api/v1/siclaw/agents/:id/chat/send", async (req, res, params) => {
+    // Capture the earliest possible server-side turn anchor: the moment the
+    // POST request lands at portal. This is closer to "user clicked send"
+    // than the runtime's sse-consumer entry, shaving the portal→runtime RPC
+    // overhead off of timing measurements. Single clock by design — passed
+    // down through chat.send so the runtime uses the same epoch.
+    const turnStartMs = Date.now();
     const auth = requireAuth(req, jwtSecret);
     if (!auth) {
       sendJson(res, 401, errorBody({ code: ErrorCodes.INTERNAL, message: "Authentication required", retriable: false }));
@@ -206,6 +212,7 @@ export function registerChatRoutes(
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
+      turnStartMs,
     });
 
     if (!result.ok) {

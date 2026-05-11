@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useState } from "react"
 import { Loader2, RefreshCw } from "lucide-react"
-import { useLive, useSummary, useUsers } from "../hooks/useMetrics"
+import { useLive, useSummary, useTimingStats, useUsers } from "../hooks/useMetrics"
 import { KpiCards } from "../components/metrics/KpiCards"
 import { RankedTable } from "../components/metrics/RankedTable"
+import { TimingStatsCard } from "../components/metrics/TimingStatsCard"
 import { AuditTable } from "../components/metrics/AuditTable"
 import { GrafanaFrame } from "../components/metrics/GrafanaFrame"
 
@@ -18,14 +19,15 @@ export function Metrics() {
   const { users } = useUsers()
   const { data: live, loading: liveLoading, refresh: refreshLive } = useLive(filterUserId)
   const { data: summary, loading: summaryLoading, refresh: refreshSummary } = useSummary(period, filterUserId)
+  const { data: timing, refresh: refreshTiming } = useTimingStats(period, filterUserId)
 
   const [spinning, setSpinning] = useState(false)
   const handleRefresh = useCallback(() => {
     setSpinning(true)
-    Promise.all([refreshLive(), refreshSummary()]).finally(() => {
+    Promise.all([refreshLive(), refreshSummary(), refreshTiming()]).finally(() => {
       setTimeout(() => setSpinning(false), 600)
     })
-  }, [refreshLive, refreshSummary])
+  }, [refreshLive, refreshSummary, refreshTiming])
 
   const selectedUsername = useMemo(() => {
     if (!userId) return null
@@ -113,6 +115,8 @@ export function Metrics() {
                   toolCallsTotal={(live?.topTools ?? []).reduce((s, t) => s + t.total, 0)}
                   period={period}
                 />
+
+                <TimingStatsCard data={timing} period={period} />
 
                 <div className="grid grid-cols-2 gap-4">
                   <RankedTable

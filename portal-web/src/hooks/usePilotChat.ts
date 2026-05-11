@@ -265,6 +265,30 @@ function findLastMessageIndex<T>(items: T[], predicate: (item: T) => boolean): n
   return -1;
 }
 
+function extractTiming(metadata: Record<string, unknown> | undefined, durationMs: number | null | undefined): import("../components/chat/types").MessageTiming | undefined {
+  // Tool rows: duration_ms (⚙️ exec) is its own column; pre_thinking_ms
+  // (💭 model-thinking-before-this-tool) lives at metadata.pre_thinking_ms.
+  // Assistant rows: timing sub-object inside metadata holds ⏳ ttft, 💭
+  // thinking-before-text, and turn-total.
+  const t: import("../components/chat/types").MessageTiming = {}
+  const rawTiming = metadata?.timing as Record<string, unknown> | undefined
+  if (rawTiming) {
+    if (typeof rawTiming.ttft_ms === "number") t.ttftMs = rawTiming.ttft_ms
+    if (typeof rawTiming.thinking_ms === "number") t.thinkingMs = rawTiming.thinking_ms
+    if (typeof rawTiming.output_ms === "number") t.outputMs = rawTiming.output_ms
+    if (typeof rawTiming.turn_total_ms === "number") t.turnTotalMs = rawTiming.turn_total_ms
+  }
+  // Pre-tool thinking gets surfaced as the same `thinkingMs` field — it's
+  // semantically the same emoji (💭 model reasoning) just attached to a
+  // tool row instead of a text row. UI uses one badge code path either way.
+  // No threshold: a 0/small 💭 on the 2nd-Nth tool of a batch is the visible
+  // proof that they came from one thinking burst (not N independent ones).
+  const preThinking = metadata?.pre_thinking_ms
+  if (typeof preThinking === "number") t.thinkingMs = preThinking
+  if (typeof durationMs === "number" && durationMs >= 0) t.durationMs = durationMs
+  return Object.keys(t).length > 0 ? t : undefined
+}
+
 function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
@@ -279,6 +303,7 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
         recovery_reason: toolIsDelegation ? "stale_delegation_tool" : "stale_running_tool",
       }
     : metadata
+  const timing = extractTiming(metadata, m.duration_ms)
   return {
     id: m.id,
     role: m.role,
@@ -292,6 +317,7 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
     toolStatus,
     metadata: recoveredMetadata,
+    timing,
     hidden: m.hidden || isDelegationEvent,
     fromAgentId: m.from_agent_id ?? null,
     parentSessionId: m.parent_session_id ?? null,
@@ -727,6 +753,11 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const toolInput = formatToolInput(toolName ?? "", args)
           const hidden = toolName === "update_plan"
           const dbMessageId = evt.dbMessageId as string | undefined
+          // 💭 Pre-tool thinking time (gap from previous tool_end / turn-start
+          // to now). Server-stamped; matches the value persisted in the row's
+          // metadata.pre_thinking_ms, so live and reload render identically.
+          const preThinkingMs = typeof evt.preThinkingMs === "number" ? evt.preThinkingMs : undefined
+          const showThinking = preThinkingMs != null
 
           setMessages((prev) => [
             ...prev,
@@ -741,6 +772,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
               timestamp: timeNow(),
               isStreaming: true,
               hidden,
+              ...(showThinking ? { timing: { thinkingMs: preThinkingMs } } : {}),
             },
           ])
           break
@@ -760,6 +792,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const isError = evt.isError as boolean | undefined
           // Use real DB message ID if available (enables metadata persistence)
           const dbMessageId = evt.dbMessageId as string | undefined
+          // ⚙️ Server-stamped tool execution duration (matches duration_ms
+          // column written at the same moment).
+          const durationMs = typeof evt.durationMs === "number" ? evt.durationMs : undefined
 
           setMessages((prev) => {
             const index = dbMessageId
@@ -776,6 +811,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                 toolStatus: isError ? ("error" as const) : ("success" as const),
                 isStreaming: false,
                 ...(toolDetails ? { toolDetails, metadata: toolDetails } : {}),
+                ...(durationMs != null ? { timing: { ...(current.timing ?? {}), durationMs } } : {}),
                 ...(dbMessageId ? { id: dbMessageId } : {}),
               }
               return [
@@ -831,6 +867,26 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const endMsg = evt.message as
             | { role?: string; toolName?: string; details?: Record<string, unknown> }
             | undefined
+          // ⏳/💭/✍️ Server-stamped per-message timing block, attached to
+          // the event by sse-consumer right before persistence.
+          const evtTiming = evt.timing as
+            | { ttft_ms?: number; thinking_ms?: number; output_ms?: number; turn_total_ms?: number }
+            | undefined
+          if (endMsg?.role === "assistant" && evtTiming) {
+            setMessages((prev) => {
+              const idx = findLastMessageIndex(prev, (m) => m.role === "assistant")
+              if (idx < 0) return prev
+              const current = prev[idx]
+              const timing = {
+                ...(current.timing ?? {}),
+                ...(typeof evtTiming.ttft_ms === "number" ? { ttftMs: evtTiming.ttft_ms } : {}),
+                ...(typeof evtTiming.thinking_ms === "number" ? { thinkingMs: evtTiming.thinking_ms } : {}),
+                ...(typeof evtTiming.output_ms === "number" ? { outputMs: evtTiming.output_ms } : {}),
+                ...(typeof evtTiming.turn_total_ms === "number" ? { turnTotalMs: evtTiming.turn_total_ms } : {}),
+              }
+              return [...prev.slice(0, idx), { ...current, timing }, ...prev.slice(idx + 1)]
+            })
+          }
           if (endMsg?.role === "toolResult" && endMsg.details && Object.keys(endMsg.details).length > 0) {
             // Pi-agent brain: tool result details arrive via message_end (not tool_execution_end).
             // Backfill toolDetails onto the matching tool message.
