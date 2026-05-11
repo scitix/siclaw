@@ -89,6 +89,8 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:web": "cd portal-web && npm run build",
+    "build:all": "npm run build && npm run build:web",
     "prepublishOnly": "npm run build && cd portal-web && npm ci && npm run build",
     "dev": "tsx src/cli-main.ts",
     "dev:runtime": "tsx src/gateway-main.ts",
