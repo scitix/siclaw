@@ -23,10 +23,17 @@ vi.mock("../gateway/skills/ai-security-reviewer.js", () => ({
   evaluateScriptsAI: vi.fn().mockResolvedValue({ verdict: "safe", score: 100, notes: "" }),
 }));
 
+vi.mock("./skill-import.js", () => ({
+  parseSkillPack: vi.fn(),
+  computeImportDiff: vi.fn(),
+  executeImport: vi.fn(),
+}));
+
 import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
 import { registerSiclawRoutes } from "./siclaw-api.js";
+import { parseSkillPack, computeImportDiff, executeImport } from "./skill-import.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-siclaw";
@@ -43,11 +50,25 @@ function fakeReq(opts: { url: string; method: string; headers?: Record<string, s
     if (ev === "data" && !em._emitted) {
       em._emitted = true;
       setImmediate(() => {
-        if (opts.body !== undefined) em.emit("data", Buffer.from(JSON.stringify(opts.body)));
+        if (opts.body !== undefined) {
+          // Pass raw bytes through for binary uploads (zip/tar); JSON-encode
+          // anything else so existing JSON-body tests keep working.
+          const chunk = Buffer.isBuffer(opts.body)
+            ? opts.body
+            : Buffer.from(JSON.stringify(opts.body));
+          em.emit("data", chunk);
+        }
         em.emit("end");
       });
     }
     return em;
+  };
+  // Some routes consume the body via `for await (const chunk of req)` instead
+  // of req.on('data'). Implement Symbol.asyncIterator so both code paths work.
+  em[Symbol.asyncIterator] = async function* () {
+    if (opts.body !== undefined) {
+      yield Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(JSON.stringify(opts.body));
+    }
   };
   return em;
 }
@@ -423,6 +444,96 @@ describe("siclaw-api skills", () => {
       }));
       expect(status).toBe(200);
       expect(body.data ?? body.history ?? body).toBeDefined();
+    });
+  });
+
+  // ── Skill pack upload (POST /skills/import) — wire & policy assertions ─
+  //
+  // Unit tests for parseSkillPack / executeImport live in skill-import.test.ts.
+  // Here we mock those modules and assert that the endpoint *wires* them with
+  // the right mode and response shape — guards against a typo-level regression
+  // (e.g. dropping `mode: "upsert"` or the dry-run `deleted: []` spread).
+  describe("POST /api/v1/siclaw/skills/import (zip/tar upload)", () => {
+    const adminToken = signToken("a1", "admin", "admin", JWT_SECRET);
+
+    it("dry_run zeroes out deleted even when DB has builtins absent from pack", async () => {
+      (parseSkillPack as any).mockResolvedValue([
+        { name: "alpha", description: "a", specs: "...", scripts: [], labels: [] },
+      ]);
+      (computeImportDiff as any).mockResolvedValue({
+        added: [{ name: "alpha", description: "a" }],
+        updated: [],
+        unchanged: [],
+        // Diff says these would be deleted under sync mode — endpoint must
+        // hide them in the upsert preview so the admin doesn't see a phantom
+        // "will delete N skills" warning.
+        deleted: [{ name: "stale", description: "old", bound_agents: [] }],
+      });
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills/import?dry_run=true",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/zip",
+        },
+        body: Buffer.from("PK\u0003\u0004placeholder"),
+      }));
+
+      expect(status).toBe(200);
+      expect(body.dry_run).toBe(true);
+      expect(body.added).toEqual([{ name: "alpha", description: "a" }]);
+      expect(body.deleted).toEqual([]);
+      expect(executeImport).not.toHaveBeenCalled();
+    });
+
+    it("non-dry-run path invokes executeImport with mode=upsert", async () => {
+      (parseSkillPack as any).mockResolvedValue([
+        { name: "alpha", description: "a", specs: "...", scripts: [], labels: [] },
+      ]);
+      (executeImport as any).mockResolvedValue({
+        added: [], updated: [], deleted: [], unchanged: [],
+        import_id: "id-1", version: 1,
+      });
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills/import?comment=manual",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${adminToken}`,
+          "content-type": "application/zip",
+        },
+        body: Buffer.from("PK\u0003\u0004placeholder"),
+      }));
+
+      expect(status).toBe(200);
+      expect(executeImport).toHaveBeenCalledTimes(1);
+      // Args: (orgId, skills, userId, comment, opts) — opts must declare upsert.
+      const opts = (executeImport as any).mock.calls[0][4];
+      expect(opts.mode).toBe("upsert");
+    });
+
+    it("rollback invokes executeImport with mode=sync", async () => {
+      // History row with a snapshot JSON.
+      query.mockResolvedValueOnce([[{ snapshot: JSON.stringify([
+        { name: "alpha", description: "a", specs: "...", scripts: [], labels: [] },
+      ]) }], []]);
+      (executeImport as any).mockResolvedValue({
+        added: [], updated: [], deleted: [], unchanged: [],
+        import_id: "id-2", version: 7,
+      });
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills/import/rollback",
+        method: "POST",
+        headers: { authorization: `Bearer ${adminToken}` },
+        body: { version: 3 },
+      }));
+
+      expect(status).toBe(200);
+      expect(executeImport).toHaveBeenCalledTimes(1);
+      const opts = (executeImport as any).mock.calls[0][4];
+      expect(opts.mode).toBe("sync");
     });
   });
 });

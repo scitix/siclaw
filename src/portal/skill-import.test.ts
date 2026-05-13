@@ -327,7 +327,8 @@ describe("parseSkillPack", () => {
 
     await parseSkillPack(zip.toBuffer());
 
-    expect(observedDir).toMatch(/^\/tmp\/skill-import-/);
+    expect(observedDir.startsWith(os.tmpdir())).toBe(true);
+    expect(observedDir).toMatch(/skill-import-/);
     expect(parseSkillsDir).toHaveBeenCalledTimes(1);
     // Extraction dir is cleaned up in the finally block.
     expect(fs.existsSync(observedDir)).toBe(false);
@@ -403,7 +404,8 @@ describe("parseSkillPack", () => {
 
     await parseSkillPack(buf);
 
-    expect(observedDir).toMatch(/^\/tmp\/skill-import-/);
+    expect(observedDir.startsWith(os.tmpdir())).toBe(true);
+    expect(observedDir).toMatch(/skill-import-/);
     expect(extractedFiles).toEqual(expect.arrayContaining(["my-skill", "meta.json"]));
   });
 
@@ -437,7 +439,42 @@ describe("parseSkillPack", () => {
 
   it("rejects gzip buffers that are not actually tar inside", async () => {
     const buf = zlib.gzipSync(Buffer.from("just plain text wrapped in gzip"));
-    await expect(parseSkillPack(buf)).rejects.toThrow();
+    // node-tar reports an "invalid base256 encoding" / "unexpected end" /
+    // "TAR_ENTRY_INVALID" depending on the corruption — match the family,
+    // not the exact wording.
+    await expect(parseSkillPack(buf)).rejects.toThrow(/tar|TAR|invalid|unexpected/i);
+    expect(parseSkillsDir).not.toHaveBeenCalled();
+  });
+
+  it("rejects tar entries with parent-directory traversal", async () => {
+    // node-tar's `filter` runs before extraction. Build a non-PAX tar
+    // (PAX wrappers move the real name out of the first header, defeating
+    // forging), then overwrite the entry name with "../evil.txt" and fix
+    // the header checksum so node-tar accepts the header and invokes our
+    // filter — which must throw.
+    const stage = path.join(os.tmpdir(), `skill-import-test-${crypto.randomUUID()}`);
+    fs.mkdirSync(stage, { recursive: true });
+    let buf: Buffer;
+    try {
+      fs.writeFileSync(path.join(stage, "evil.txt"), "pwned");
+      const chunks: Buffer[] = [];
+      const stream = tar.create({ cwd: stage, portable: true, noPax: true }, ["evil.txt"]);
+      for await (const chunk of stream) chunks.push(chunk as Buffer);
+      buf = Buffer.concat(chunks);
+      // Overwrite entry name (bytes 0..100) with traversal path.
+      Buffer.alloc(100).copy(buf, 0);
+      Buffer.from("../evil.txt", "utf8").copy(buf, 0);
+      // Recompute checksum: zero the field as 8 spaces, sum all 512 bytes,
+      // write as "OOOOOO\0 " (6 octal digits + NUL + space).
+      for (let i = 148; i < 156; i++) buf[i] = 0x20;
+      let sum = 0;
+      for (let i = 0; i < 512; i++) sum += buf[i];
+      Buffer.from(sum.toString(8).padStart(6, "0") + "\0 ", "utf8").copy(buf, 148);
+    } finally {
+      fs.rmSync(stage, { recursive: true, force: true });
+    }
+
+    await expect(parseSkillPack(buf)).rejects.toThrow(/Unsafe path in tar/);
     expect(parseSkillsDir).not.toHaveBeenCalled();
   });
 });

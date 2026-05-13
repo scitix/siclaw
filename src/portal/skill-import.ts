@@ -11,6 +11,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import AdmZip from "adm-zip";
 import * as tar from "tar";
@@ -88,9 +89,28 @@ function extractZip(buf: Buffer, destDir: string): void {
 async function extractTar(buf: Buffer, destDir: string, tmpDir: string): Promise<void> {
   const archivePath = path.join(tmpDir, "pack.tar");
   fs.writeFileSync(archivePath, buf);
-  // tar.extract auto-detects gzip via the stream; default behavior strips
-  // absolute paths and refuses `..` entries, so no extra guard is needed.
-  await tar.extract({ file: archivePath, cwd: destDir });
+  // tar.extract auto-detects gzip via the stream. node-tar v7 already strips
+  // absolute paths and refuses `..` entries; the explicit `filter` is
+  // defense-in-depth so a future dep swap or option drift can't silently
+  // re-enable tar-slip. Throwing inside `filter` gets swallowed by node-tar's
+  // internal callback chain, so we mark the unsafe entry, skip it, and
+  // reject after extraction completes.
+  let unsafeEntry: string | null = null;
+  await tar.extract({
+    file: archivePath,
+    cwd: destDir,
+    filter: (entryPath) => {
+      const normalized = entryPath.replace(/\\/g, "/");
+      if (normalized.startsWith("/") || normalized.split("/").includes("..")) {
+        unsafeEntry ??= entryPath;
+        return false;
+      }
+      return true;
+    },
+  });
+  if (unsafeEntry !== null) {
+    throw new Error(`Unsafe path in tar: ${unsafeEntry}`);
+  }
 }
 
 /**
@@ -101,7 +121,7 @@ async function extractTar(buf: Buffer, destDir: string, tmpDir: string): Promise
  *   - Archive root contains a single wrapper directory holding the skill dirs
  */
 export async function parseSkillPack(archiveBuffer: Buffer): Promise<ParsedSkill[]> {
-  const tmpDir = path.join("/tmp", `skill-import-${crypto.randomUUID()}`);
+  const tmpDir = path.join(os.tmpdir(), `skill-import-${crypto.randomUUID()}`);
   const extractDir = path.join(tmpDir, "extracted");
   fs.mkdirSync(extractDir, { recursive: true });
   try {
@@ -237,6 +257,7 @@ export async function executeImport(
   for (const r of builtinRows) builtinByName.set(r.name, r.id);
 
   const conn = await db.getConnection();
+  const affectedAgentIds = new Set<string>();
   try {
     await conn.beginTransaction();
 
@@ -283,7 +304,6 @@ export async function executeImport(
     // --- DELETE removed builtin skills ---
     // Skipped in upsert mode — diff.deleted has already been zeroed out above
     // so this loop is a no-op, but the explicit guard keeps intent obvious.
-    const affectedAgentIds = new Set<string>();
     if (opts.mode === "sync") {
       for (const del of rawDiff.deleted) {
         const existingId = builtinByName.get(del.name)!;
@@ -314,18 +334,24 @@ export async function executeImport(
     }
 
     await conn.commit();
-
-    // Notify affected agents outside transaction (fire-and-forget)
-    if (opts.notifyAgentReload) {
-      for (const agentId of affectedAgentIds) {
-        opts.notifyAgentReload(agentId, ["skills"]);
-      }
-    }
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
     conn.release();
+  }
+
+  // Notify affected agents outside the transaction. A thrown notify must
+  // not roll back an already-committed write or skip the history INSERT
+  // below, so each call is isolated with its own error swallow + log.
+  if (opts.notifyAgentReload) {
+    for (const agentId of affectedAgentIds) {
+      try {
+        opts.notifyAgentReload(agentId, ["skills"]);
+      } catch (err) {
+        console.error("[skill-import] notifyAgentReload threw:", err);
+      }
+    }
   }
 
   // --- Save snapshot for rollback ---

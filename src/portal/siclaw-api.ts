@@ -299,6 +299,177 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 201, created);
   });
 
+  // ================================================================
+  // Skill Import (builtin pack management)
+  //
+  // Registered BEFORE the `/skills/:id/*` parameterized routes below so
+  // that paths like `/skills/import/rollback` reach the import handler
+  // instead of being shadowed by `POST /skills/:id/rollback` (which would
+  // match with id="import"). The router is first-match-wins.
+  // ================================================================
+
+  // Upload zip with dry_run or execute
+  router.post(`${P}/skills/import`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    // Read raw body
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const body = Buffer.concat(chunks);
+    const contentType = req.headers["content-type"] || "";
+
+    // JSON request: dry_run from builtin directory
+    if (contentType.includes("application/json")) {
+      const json = JSON.parse(body.toString("utf8"));
+      if (json.source === "builtin") {
+        const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
+        const nodePath = await import("node:path");
+        const skills = parseSkillsDir(nodePath.join(process.cwd(), "skills", "core"));
+        if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
+        const { computeImportDiff } = await import("./skill-import.js");
+        const diff = await computeImportDiff(auth.orgId, skills);
+        sendJson(res, 200, { dry_run: true, ...diff });
+        return;
+      }
+      sendJson(res, 400, { error: "Invalid JSON request" });
+      return;
+    }
+
+    // Binary archive upload (zip or tar/tar.gz): Content-Type may be
+    // application/zip, application/x-tar, application/gzip, or application/octet-stream
+    // — the actual format is detected from magic bytes in parseSkillPack.
+    // Query params: ?dry_run=true&comment=...
+    const query = parseQuery(req.url ?? "");
+    const dryRun = query.dry_run === "true";
+    const comment = (query.comment as string) || "";
+
+    const { parseSkillPack, computeImportDiff, executeImport } = await import("./skill-import.js");
+    let skills;
+    try {
+      skills = await parseSkillPack(body);
+    } catch (err: any) {
+      // Log internals (paths, mysql error text, etc.) but return a generic
+      // message — this is reached pre-validation so untrusted callers can
+      // trigger it.
+      console.error("[skills-import] parseSkillPack failed:", err);
+      sendJson(res, 400, { error: "Failed to parse skill pack — must be a valid zip or tar archive" });
+      return;
+    }
+    if (skills.length === 0) { sendJson(res, 400, { error: "No skills found in archive" }); return; }
+
+    if (dryRun) {
+      const diff = await computeImportDiff(auth.orgId, skills);
+      // Admin pack uploads are upsert-only — builtins missing from the pack
+      // are left alone, never deleted. Zero out `deleted` so the dry-run
+      // preview honestly reflects what executing the import would do.
+      sendJson(res, 200, { dry_run: true, skill_count: skills.length, ...diff, deleted: [] });
+      return;
+    }
+
+    try {
+      const result = await executeImport(auth.orgId, skills, auth.userId, comment, {
+        mode: "upsert",
+        notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+      });
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      console.error("[skills-import] executeImport failed:", err);
+      sendJson(res, 500, { error: "Import failed" });
+    }
+  });
+
+  // Init from bundled skills/core/
+  router.post(`${P}/skills/import/init`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const body = await parseBody<{ comment?: string }>(req);
+    const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
+    const { executeImport } = await import("./skill-import.js");
+    const nodePath = await import("node:path");
+
+    const skillsDir = nodePath.join(process.cwd(), "skills", "core");
+    const skills = parseSkillsDir(skillsDir);
+    if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
+
+    try {
+      // Init: the bundled `skills/core/` is the source of truth. Sync mode
+      // ensures DB matches the image — skills removed upstream go away here.
+      const result = await executeImport(auth.orgId, skills, auth.userId,
+        body.comment || "Initialize from builtin",
+        {
+          mode: "sync",
+          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+        });
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      console.error("[skills-import/init] failed:", err);
+      sendJson(res, 500, { error: "Init failed" });
+    }
+  });
+
+  // List import versions (history)
+  router.get(`${P}/skills/import/history`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, version, comment, skill_count, added, updated, deleted, imported_by, created_at
+       FROM skill_import_history ORDER BY version DESC LIMIT 20`,
+    ) as any;
+    for (const row of rows as any[]) {
+      if (row.added !== undefined) row.added = safeParseJson(row.added, []);
+      if (row.updated !== undefined) row.updated = safeParseJson(row.updated, []);
+      if (row.deleted !== undefined) row.deleted = safeParseJson(row.deleted, []);
+    }
+    sendJson(res, 200, { data: rows });
+  });
+
+  // Rollback to a previous import version
+  router.post(`${P}/skills/import/rollback`, async (req, res) => {
+    const auth = requireAdmin(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
+    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
+
+    const body = await parseBody<{ version: number; comment?: string }>(req);
+    if (!body.version) { sendJson(res, 400, { error: "version required" }); return; }
+
+    const db = getDb();
+    const [histRows] = await db.query(
+      "SELECT snapshot FROM skill_import_history WHERE version = ?",
+      [body.version],
+    ) as any;
+    if (histRows.length === 0) { sendJson(res, 404, { error: "Import version not found" }); return; }
+
+    const { executeImport } = await import("./skill-import.js");
+    const skills = JSON.parse(histRows[0].snapshot);
+
+    try {
+      // Rollback: the target version's snapshot IS the desired full state,
+      // so sync mode is required — skills added after that version must be
+      // removed for the rollback to be faithful.
+      const result = await executeImport(auth.orgId, skills, auth.userId,
+        body.comment || `Rollback to v${body.version}`,
+        {
+          mode: "sync",
+          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
+        });
+      sendJson(res, 200, result);
+    } catch (err: any) {
+      console.error("[skills-import/rollback] failed:", err);
+      sendJson(res, 500, { error: "Rollback failed" });
+    }
+  });
+
+  // ================================================================
+  // Skills CRUD (continues — parameterized resource routes)
+  // ================================================================
+
   // Get skill
   router.get(`${P}/skills/:id`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
@@ -950,161 +1121,6 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       row.scripts = safeParseJson(row.scripts, []);
     }
     sendJson(res, 200, row);
-  });
-
-  // ================================================================
-  // Skill Import (builtin pack management)
-  // ================================================================
-
-  // Upload zip with dry_run or execute
-  router.post(`${P}/skills/import`, async (req, res) => {
-    const auth = requireAdmin(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
-    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
-
-    // Read raw body
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    const body = Buffer.concat(chunks);
-    const contentType = req.headers["content-type"] || "";
-
-    // JSON request: dry_run from builtin directory
-    if (contentType.includes("application/json")) {
-      const json = JSON.parse(body.toString("utf8"));
-      if (json.source === "builtin") {
-        const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
-        const nodePath = await import("node:path");
-        const skills = parseSkillsDir(nodePath.join(process.cwd(), "skills", "core"));
-        if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
-        const { computeImportDiff } = await import("./skill-import.js");
-        const diff = await computeImportDiff(auth.orgId, skills);
-        sendJson(res, 200, { dry_run: true, ...diff });
-        return;
-      }
-      sendJson(res, 400, { error: "Invalid JSON request" });
-      return;
-    }
-
-    // Binary archive upload (zip or tar/tar.gz): Content-Type may be
-    // application/zip, application/x-tar, application/gzip, or application/octet-stream
-    // — the actual format is detected from magic bytes in parseSkillPack.
-    // Query params: ?dry_run=true&comment=...
-    const query = parseQuery(req.url ?? "");
-    const dryRun = query.dry_run === "true";
-    const comment = (query.comment as string) || "";
-
-    const { parseSkillPack, computeImportDiff, executeImport } = await import("./skill-import.js");
-    let skills;
-    try {
-      skills = await parseSkillPack(body);
-    } catch (err: any) {
-      sendJson(res, 400, { error: `Failed to parse skill pack: ${err.message}` });
-      return;
-    }
-    if (skills.length === 0) { sendJson(res, 400, { error: "No skills found in archive" }); return; }
-
-    if (dryRun) {
-      const diff = await computeImportDiff(auth.orgId, skills);
-      // Admin pack uploads are upsert-only — builtins missing from the pack
-      // are left alone, never deleted. Zero out `deleted` so the dry-run
-      // preview honestly reflects what executing the import would do.
-      sendJson(res, 200, { dry_run: true, skill_count: skills.length, ...diff, deleted: [] });
-      return;
-    }
-
-    try {
-      const result = await executeImport(auth.orgId, skills, auth.userId, comment, {
-        mode: "upsert",
-        notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
-      });
-      sendJson(res, 200, result);
-    } catch (err: any) {
-      sendJson(res, 500, { error: `Import failed: ${err.message}` });
-    }
-  });
-
-  // Init from bundled skills/core/
-  router.post(`${P}/skills/import/init`, async (req, res) => {
-    const auth = requireAdmin(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
-    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
-
-    const body = await parseBody<{ comment?: string }>(req);
-    const { parseSkillsDir } = await import("../gateway/skills/builtin-sync.js");
-    const { executeImport } = await import("./skill-import.js");
-    const nodePath = await import("node:path");
-
-    const skillsDir = nodePath.join(process.cwd(), "skills", "core");
-    const skills = parseSkillsDir(skillsDir);
-    if (skills.length === 0) { sendJson(res, 400, { error: "No builtin skills found in image" }); return; }
-
-    try {
-      // Init: the bundled `skills/core/` is the source of truth. Sync mode
-      // ensures DB matches the image — skills removed upstream go away here.
-      const result = await executeImport(auth.orgId, skills, auth.userId,
-        body.comment || "Initialize from builtin",
-        {
-          mode: "sync",
-          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
-        });
-      sendJson(res, 200, result);
-    } catch (err: any) {
-      sendJson(res, 500, { error: `Init failed: ${err.message}` });
-    }
-  });
-
-  // List import versions (history)
-  router.get(`${P}/skills/import/history`, async (req, res) => {
-    const auth = requireAdmin(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
-    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
-
-    const db = getDb();
-    const [rows] = await db.query(
-      `SELECT id, version, comment, skill_count, added, updated, deleted, imported_by, created_at
-       FROM skill_import_history ORDER BY version DESC LIMIT 20`,
-    ) as any;
-    for (const row of rows as any[]) {
-      if (row.added !== undefined) row.added = safeParseJson(row.added, []);
-      if (row.updated !== undefined) row.updated = safeParseJson(row.updated, []);
-      if (row.deleted !== undefined) row.deleted = safeParseJson(row.deleted, []);
-    }
-    sendJson(res, 200, { data: rows });
-  });
-
-  // Rollback to a previous import version
-  router.post(`${P}/skills/import/rollback`, async (req, res) => {
-    const auth = requireAdmin(req, config.jwtSecret);
-    if (!auth) { sendJson(res, 403, { error: "Admin only" }); return; }
-    if (!auth.orgId) { sendJson(res, 403, { error: "Organization context required" }); return; }
-
-    const body = await parseBody<{ version: number; comment?: string }>(req);
-    if (!body.version) { sendJson(res, 400, { error: "version required" }); return; }
-
-    const db = getDb();
-    const [histRows] = await db.query(
-      "SELECT snapshot FROM skill_import_history WHERE version = ?",
-      [body.version],
-    ) as any;
-    if (histRows.length === 0) { sendJson(res, 404, { error: "Import version not found" }); return; }
-
-    const { executeImport } = await import("./skill-import.js");
-    const skills = JSON.parse(histRows[0].snapshot);
-
-    try {
-      // Rollback: the target version's snapshot IS the desired full state,
-      // so sync mode is required — skills added after that version must be
-      // removed for the rollback to be faithful.
-      const result = await executeImport(auth.orgId, skills, auth.userId,
-        body.comment || `Rollback to v${body.version}`,
-        {
-          mode: "sync",
-          notifyAgentReload: (agentId, resources) => ctx?.notifySkillAgents?.(agentId, resources),
-        });
-      sendJson(res, 200, result);
-    } catch (err: any) {
-      sendJson(res, 500, { error: `Rollback failed: ${err.message}` });
-    }
   });
 
   // ================================================================

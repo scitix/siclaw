@@ -24,9 +24,11 @@ interface ImportVersion {
   version: number
   comment: string | null
   skill_count: number
-  added: number
-  updated: number
-  deleted: number
+  // Backend persists string[] of skill names in these JSON columns (see
+  // skill_import_history schema). The list UI just shows counts.
+  added: string[]
+  updated: string[]
+  deleted: string[]
   created_at: string
 }
 
@@ -381,14 +383,14 @@ export function SkillImport() {
                         <span className="text-[10px] text-muted-foreground">{v.skill_count} skills</span>
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                        {v.added > 0 && (
-                          <span className="text-[10px] text-green-400">+{v.added} added</span>
+                        {v.added.length > 0 && (
+                          <span className="text-[10px] text-green-400">+{v.added.length} added</span>
                         )}
-                        {v.updated > 0 && (
-                          <span className="text-[10px] text-yellow-400">~{v.updated} updated</span>
+                        {v.updated.length > 0 && (
+                          <span className="text-[10px] text-yellow-400">~{v.updated.length} updated</span>
                         )}
-                        {v.deleted > 0 && (
-                          <span className="text-[10px] text-red-400">-{v.deleted} deleted</span>
+                        {v.deleted.length > 0 && (
+                          <span className="text-[10px] text-red-400">-{v.deleted.length} deleted</span>
                         )}
                         <span className="text-[10px] text-muted-foreground">{new Date(v.created_at).toLocaleString()}</span>
                       </div>
