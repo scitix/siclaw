@@ -18,19 +18,17 @@ interface PreviewResult {
   updated: DiffEntry[]
   deleted: DiffEntry[]
   unchanged: DiffEntry[]
-  total_added: number
-  total_updated: number
-  total_deleted: number
-  total_unchanged: number
 }
 
 interface ImportVersion {
   version: number
   comment: string | null
   skill_count: number
-  added: number
-  updated: number
-  deleted: number
+  // Backend persists string[] of skill names in these JSON columns (see
+  // skill_import_history schema). The list UI just shows counts.
+  added: string[]
+  updated: string[]
+  deleted: string[]
   created_at: string
 }
 
@@ -73,10 +71,24 @@ export function SkillImport() {
 
   // ── File selection ───────────────────────────────────────────
 
+  const ACCEPTED_EXTENSIONS = [".zip", ".tar", ".tar.gz", ".tgz"] as const
+
+  /** Pick the most accurate Content-Type for the upload — the backend
+   *  detects the actual format from magic bytes, but a correct MIME makes
+   *  proxies and dev tooling happier. */
+  const contentTypeForFile = (name: string): string => {
+    const lower = name.toLowerCase()
+    if (lower.endsWith(".zip")) return "application/zip"
+    if (lower.endsWith(".tar.gz") || lower.endsWith(".tgz")) return "application/gzip"
+    if (lower.endsWith(".tar")) return "application/x-tar"
+    return "application/octet-stream"
+  }
+
   const handleFileSelect = (f: File | undefined) => {
     if (!f) return
-    if (!f.name.endsWith(".zip")) {
-      toast.error("Only .zip files are accepted")
+    const lower = f.name.toLowerCase()
+    if (!ACCEPTED_EXTENSIONS.some(ext => lower.endsWith(ext))) {
+      toast.error("Only .zip / .tar / .tar.gz / .tgz files are accepted")
       return
     }
     setFile(f)
@@ -101,7 +113,7 @@ export function SkillImport() {
       const res = await fetch("/api/v1/siclaw/skills/import?dry_run=true", {
         method: "POST",
         headers: {
-          "Content-Type": "application/zip",
+          "Content-Type": contentTypeForFile(file.name),
           ...(token ? { "Authorization": `Bearer ${token}` } : {}),
         },
         body: buffer,
@@ -125,7 +137,7 @@ export function SkillImport() {
     if (!file || !preview) return
     const ok = await confirmDialog({
       title: "Confirm Import",
-      message: `Import skill pack? This will apply ${preview.total_added} added, ${preview.total_updated} updated, and ${preview.total_deleted} deleted skills.`,
+      message: `Import skill pack? This will add ${preview.added.length} and update ${preview.updated.length} skills. Existing builtins not in the pack will be left as-is.`,
       confirmLabel: "Import",
     })
     if (!ok) return
@@ -137,7 +149,7 @@ export function SkillImport() {
       const res = await fetch(`/api/v1/siclaw/skills/import${qs}`, {
         method: "POST",
         headers: {
-          "Content-Type": "application/zip",
+          "Content-Type": contentTypeForFile(file.name),
           ...(token ? { "Authorization": `Bearer ${token}` } : {}),
         },
         body: buffer,
@@ -230,7 +242,7 @@ export function SkillImport() {
           <div className="max-w-2xl space-y-5">
             {/* File drop zone */}
             <div>
-              <label className="block text-sm font-medium mb-2">Skill Pack (.zip)</label>
+              <label className="block text-sm font-medium mb-2">Skill Pack (.zip / .tar / .tar.gz)</label>
               <div
                 onDragOver={e => { e.preventDefault(); setDragOver(true) }}
                 onDragLeave={() => setDragOver(false)}
@@ -247,7 +259,7 @@ export function SkillImport() {
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".zip"
+                  accept=".zip,.tar,.tar.gz,.tgz,application/zip,application/x-tar,application/gzip"
                   className="hidden"
                   onChange={e => handleFileSelect(e.target.files?.[0])}
                 />
@@ -263,7 +275,7 @@ export function SkillImport() {
                   <>
                     <Upload className="h-8 w-8 text-muted-foreground/50" />
                     <div className="text-center">
-                      <p className="text-sm text-muted-foreground">Drag & drop a .zip file or click to select</p>
+                      <p className="text-sm text-muted-foreground">Drag & drop a .zip / .tar / .tar.gz file or click to select</p>
                     </div>
                   </>
                 )}
@@ -311,16 +323,16 @@ export function SkillImport() {
                 {/* Summary counts */}
                 <div className="flex items-center gap-3 flex-wrap">
                   <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] font-medium bg-green-500/15 text-green-400">
-                    <Plus className="h-3 w-3" /> {preview.total_added} added
+                    <Plus className="h-3 w-3" /> {preview.added.length} added
                   </span>
                   <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] font-medium bg-yellow-500/15 text-yellow-400">
-                    <RefreshCw className="h-3 w-3" /> {preview.total_updated} updated
+                    <RefreshCw className="h-3 w-3" /> {preview.updated.length} updated
                   </span>
                   <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] font-medium bg-red-500/15 text-red-400">
-                    <Minus className="h-3 w-3" /> {preview.total_deleted} deleted
+                    <Minus className="h-3 w-3" /> {preview.deleted.length} deleted
                   </span>
                   <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] font-medium bg-secondary text-muted-foreground">
-                    {preview.total_unchanged} unchanged
+                    {preview.unchanged.length} unchanged
                   </span>
                 </div>
 
@@ -371,14 +383,14 @@ export function SkillImport() {
                         <span className="text-[10px] text-muted-foreground">{v.skill_count} skills</span>
                       </div>
                       <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                        {v.added > 0 && (
-                          <span className="text-[10px] text-green-400">+{v.added} added</span>
+                        {v.added.length > 0 && (
+                          <span className="text-[10px] text-green-400">+{v.added.length} added</span>
                         )}
-                        {v.updated > 0 && (
-                          <span className="text-[10px] text-yellow-400">~{v.updated} updated</span>
+                        {v.updated.length > 0 && (
+                          <span className="text-[10px] text-yellow-400">~{v.updated.length} updated</span>
                         )}
-                        {v.deleted > 0 && (
-                          <span className="text-[10px] text-red-400">-{v.deleted} deleted</span>
+                        {v.deleted.length > 0 && (
+                          <span className="text-[10px] text-red-400">-{v.deleted.length} deleted</span>
                         )}
                         <span className="text-[10px] text-muted-foreground">{new Date(v.created_at).toLocaleString()}</span>
                       </div>
