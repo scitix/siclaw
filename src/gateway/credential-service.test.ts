@@ -3,6 +3,7 @@ import {
   CredentialService,
   createCredentialService,
   CredentialNotFoundError,
+  SessionOwnershipError,
 } from "./credential-service.js";
 import type { FrontendWsClient } from "./frontend-ws-client.js";
 import type { Identity } from "../shared/credential-types.js";
@@ -153,6 +154,44 @@ describe("CredentialNotFoundError", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.name).toBe("CredentialNotFoundError");
     expect(err.message).toBe("missing");
+  });
+});
+
+describe("CredentialService cross-agent ownership guard", () => {
+  // All four public methods feed through the same `rpcParams`, so any one
+  // bypassing the guard would leak attribution. Parameterized so a future
+  // refactor cannot accidentally regress only one path.
+  type Method = "listClusters" | "listHosts" | "getClusterCredential" | "getHostCredential";
+  const methods: { name: Method; invoke: (svc: CredentialService, id: Identity) => Promise<unknown> }[] = [
+    { name: "listClusters", invoke: (s, id) => s.listClusters(id) },
+    { name: "listHosts", invoke: (s, id) => s.listHosts(id) },
+    { name: "getClusterCredential", invoke: (s, id) => s.getClusterCredential(id, "c1", "purpose-x") },
+    { name: "getHostCredential", invoke: (s, id) => s.getHostCredential(id, "h1", "purpose-x") },
+  ];
+
+  for (const m of methods) {
+    it(`${m.name} throws SessionOwnershipError when session_id resolves to a different agent`, async () => {
+      const reg = new SessionRegistry();
+      reg.remember("sess-1", "u-foreign", "other");
+      const fakeFrontend = new FakeFrontendClient();
+      const guarded = new CredentialService(fakeFrontend as unknown as FrontendWsClient, reg);
+
+      await expect(m.invoke(guarded, { ...identity, sessionId: "sess-1" }))
+        .rejects.toBeInstanceOf(SessionOwnershipError);
+      // Critical: upstream RPC must not have been invoked under any path.
+      expect(fakeFrontend.calls).toHaveLength(0);
+    });
+  }
+
+  it("does not throw when sessionId is empty (graceful degradation)", async () => {
+    const reg = new SessionRegistry();
+    const fakeFrontend = new FakeFrontendClient();
+    fakeFrontend.responses.set("credential.list:cluster", { clusters: [] });
+    const guarded = new CredentialService(fakeFrontend as unknown as FrontendWsClient, reg);
+
+    await expect(guarded.listClusters({ ...identity, sessionId: "" }))
+      .resolves.toEqual([]);
+    expect(fakeFrontend.calls[0].params.userId).toBe("");
   });
 });
 

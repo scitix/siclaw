@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import http from "node:http";
 import { handleCredentialRequest, handleCredentialList } from "./credential-proxy.js";
-import { CredentialService, CredentialNotFoundError } from "./credential-service.js";
+import { CredentialService, CredentialNotFoundError, SessionOwnershipError } from "./credential-service.js";
 import type { CertificateIdentity } from "./security/cert-manager.js";
 
 // ── Fakes ──────────────────────────────────────────────────
@@ -115,6 +115,15 @@ describe("handleCredentialRequest", () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it("403 when service throws SessionOwnershipError — request never reaches upstream", async () => {
+    service.getClusterCredential.mockRejectedValue(new SessionOwnershipError("session sess-x belongs to agent other, not a1"));
+    const req = new FakeReq(JSON.stringify({ source: "cluster", source_id: "x" }));
+    const res = new FakeRes();
+    await handleCredentialRequest(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/belongs to agent/);
+  });
+
   it("502 when service throws some other error", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     service.getClusterCredential.mockRejectedValue(new Error("upstream is burning"));
@@ -181,6 +190,15 @@ describe("handleCredentialList", () => {
     const res = new FakeRes();
     await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
     expect(res.statusCode).toBe(400);
+  });
+
+  it("403 when service throws SessionOwnershipError on list — request never reaches upstream", async () => {
+    service.listClusters.mockRejectedValue(new SessionOwnershipError("session sess-x belongs to agent other, not a1"));
+    const req = new FakeReq(JSON.stringify({ kind: "cluster" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toMatch(/belongs to agent/);
   });
 
   it("502 on service error", async () => {

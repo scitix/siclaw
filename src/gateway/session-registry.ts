@@ -10,10 +10,10 @@
  *  - AgentBox → Runtime internal-api callbacks carry `sessionId` in the body.
  *    Handlers call `resolveUser(sessionId)` before forwarding to Upstream.
  *
- * This is an in-process LRU. Entries are lost on runtime restart; downstream
- * Upstream calls that land after a restart attribute to an empty user_id until
- * the next chat message re-populates the mapping. Cross-runtime consistency
- * is not required — each runtime serves its own agent pods.
+ * The map is an in-process LRU cache. On miss, an injected resolver (Portal
+ * RPC) is consulted so attribution survives Runtime restarts: the
+ * `chat_sessions` row is the source of truth, and the registry merely
+ * accelerates lookup.
  */
 
 const DEFAULT_CAPACITY = 10_000;
@@ -24,10 +24,27 @@ export interface SessionRecord {
   lastSeen: number;
 }
 
+export type SessionResolver = (
+  sessionId: string,
+) => Promise<{ userId: string; agentId: string } | null>;
+
 export class SessionRegistry {
   private map = new Map<string, SessionRecord>();
+  private resolver?: SessionResolver;
+  /**
+   * In-flight resolver promises keyed by sessionId. Coalesces concurrent
+   * cache misses for the same sid into one upstream RPC — relevant right
+   * after a Runtime restart, when many buffered AgentBox callbacks can
+   * arrive simultaneously and would otherwise fan out N identical RPCs.
+   */
+  private inflight = new Map<string, Promise<SessionRecord | undefined>>();
 
   constructor(private readonly capacity = DEFAULT_CAPACITY) {}
+
+  /** Inject a fallback resolver (e.g. Portal RPC). Pass `undefined` to clear. */
+  setResolver(resolver: SessionResolver | undefined): void {
+    this.resolver = resolver;
+  }
 
   /** Record that `sessionId` belongs to `userId` on `agentId`. Updates recency. */
   remember(sessionId: string, userId: string, agentId: string): void {
@@ -41,28 +58,88 @@ export class SessionRegistry {
     }
   }
 
-  /** Resolve `sessionId` to a userId. Returns empty string when unknown. */
-  resolveUser(sessionId: string | undefined): string {
-    if (!sessionId) return "";
-    const rec = this.map.get(sessionId);
-    if (!rec) return "";
-    rec.lastSeen = Date.now();
-    return rec.userId;
+  /**
+   * Resolve `sessionId` to a userId. On cache miss, calls the injected
+   * resolver and back-fills. Returns empty string when unknown.
+   */
+  async resolveUser(sessionId: string | undefined): Promise<string> {
+    const rec = await this.lookup(sessionId);
+    return rec ? rec.userId : "";
   }
 
-  /** Full record lookup. Returns `undefined` when unknown. */
-  get(sessionId: string | undefined): SessionRecord | undefined {
+  /**
+   * Full record lookup. On cache miss, calls the injected resolver and
+   * back-fills. Returns `undefined` when unknown.
+   */
+  async get(sessionId: string | undefined): Promise<SessionRecord | undefined> {
+    return this.lookup(sessionId);
+  }
+
+  /** Cache-only peek; no fallback. Useful in tests and tight sync paths. */
+  peek(sessionId: string | undefined): SessionRecord | undefined {
     if (!sessionId) return undefined;
     return this.map.get(sessionId);
   }
 
-  /** Drop an entry (e.g. when a session is terminated). */
+  /**
+   * Drop an entry (e.g. when a session is terminated). Also tombstones any
+   * in-flight resolver for the same sid so its eventual response cannot
+   * silently re-insert the entry we just invalidated.
+   */
   forget(sessionId: string): void {
     this.map.delete(sessionId);
+    this.tombstones.add(sessionId);
+    this.inflight.delete(sessionId);
   }
 
   get size(): number {
     return this.map.size;
+  }
+
+  /**
+   * Sessions invalidated while a resolver call was in flight. The resolver
+   * promise must check this set on settle and skip `remember()` — otherwise
+   * an explicit `forget()` can be undone by a racing Portal response.
+   */
+  private tombstones = new Set<string>();
+
+  private async lookup(sessionId: string | undefined): Promise<SessionRecord | undefined> {
+    if (!sessionId) return undefined;
+    const cached = this.map.get(sessionId);
+    if (cached) {
+      cached.lastSeen = Date.now();
+      return cached;
+    }
+    if (!this.resolver) return undefined;
+
+    // Single-flight: piggyback on any in-flight resolver call for this sid.
+    const inflight = this.inflight.get(sessionId);
+    if (inflight) return inflight;
+
+    const resolver = this.resolver;
+    // Snapshot any pre-existing tombstone so this lookup starts fresh; we
+    // only honor tombstones created while THIS resolver call is in flight.
+    this.tombstones.delete(sessionId);
+    const promise = (async () => {
+      try {
+        const fetched = await resolver(sessionId);
+        if (!fetched) return undefined;
+        // If forget() raced us while the RPC was outstanding, do NOT
+        // re-insert. Awaiters of THIS call still get the fetched record so
+        // the in-flight callback can still attribute, but the next miss
+        // will go to Portal afresh.
+        if (this.tombstones.has(sessionId)) {
+          return { ...fetched, lastSeen: Date.now() };
+        }
+        this.remember(sessionId, fetched.userId, fetched.agentId);
+        return this.map.get(sessionId);
+      } finally {
+        this.inflight.delete(sessionId);
+        this.tombstones.delete(sessionId);
+      }
+    })();
+    this.inflight.set(sessionId, promise);
+    return promise;
   }
 }
 

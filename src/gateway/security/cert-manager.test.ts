@@ -100,6 +100,122 @@ describe("CertificateManager.create — loading priority", () => {
     const m = await CertificateManager.create();
     expect(m.getCACertificate()).toContain("BEGIN CERTIFICATE");
   }, 60_000);
+
+  it("uses the loaded CA's actual subject as the issuer of new certs (verifies under OpenSSL/Node)", async () => {
+    clearCaEnv();
+    // Generate a CA whose subject deliberately does NOT match the legacy
+    // hardcoded "Siclaw Runtime CA, O=Siclaw, OU=Security" DN. This mirrors
+    // what Helm `genCA "siclaw-runtime-ca"` produces (CN only, no O/OU).
+    const kp = forge.pki.rsa.generateKeyPair(1024);
+    const ca = forge.pki.createCertificate();
+    ca.publicKey = kp.publicKey;
+    ca.serialNumber = "03";
+    ca.validity.notBefore = new Date();
+    ca.validity.notAfter = new Date(Date.now() + 86400_000);
+    ca.setSubject([{ name: "commonName", value: "siclaw-runtime-ca" }]);
+    ca.setIssuer([{ name: "commonName", value: "siclaw-runtime-ca" }]);
+    ca.setExtensions([{ name: "basicConstraints", cA: true }]);
+    ca.sign(kp.privateKey, forge.md.sha256.create());
+
+    process.env.SICLAW_CA_CERT = forge.pki.certificateToPem(ca);
+    process.env.SICLAW_CA_KEY = forge.pki.privateKeyToPem(kp.privateKey);
+
+    const m = await CertificateManager.create();
+    const bundle = m.issueAgentBoxCertificate("agent-x", "org-x", "box-x");
+
+    // Issuer DN of the issued cert must equal the CA's subject DN; otherwise
+    // X.509 path validation rejects with "unable to verify the first
+    // certificate" (see helm chart-managed CA bug).
+    const issued = forge.pki.certificateFromPem(bundle.cert);
+    const issuerCN = issued.issuer.attributes.find(a => a.name === "commonName")?.value;
+    const issuerO = issued.issuer.attributes.find(a => a.name === "organizationName")?.value;
+    expect(issuerCN).toBe("siclaw-runtime-ca");
+    expect(issuerO).toBeUndefined();
+
+    // The issuer DN must mirror the CA's subject DN exactly — same attribute
+    // count, same names, same values. Anything else breaks chain validation.
+    const dnEntries = (attrs: any[]) =>
+      attrs
+        .map(a => `${a.name}=${a.value}`)
+        .sort()
+        .join(",");
+    expect(dnEntries(issued.issuer.attributes)).toBe(dnEntries(ca.subject.attributes));
+
+    // Signature on the issued cert verifies under the loaded CA's public key.
+    expect(ca.verify(issued)).toBe(true);
+  }, 60_000);
+
+  it("preserves the full CA Subject DN on issued certs (C/ST/L not just CN/O/OU)", async () => {
+    clearCaEnv();
+    // Mirror what cert-manager / Vault PKI / corporate CAs typically produce —
+    // a multi-component DN with country, state, locality. A lossy {CN, O, OU}
+    // projection would drop these and break X.509 chain validation.
+    const kp = forge.pki.rsa.generateKeyPair(1024);
+    const ca = forge.pki.createCertificate();
+    ca.publicKey = kp.publicKey;
+    ca.serialNumber = "05";
+    ca.validity.notBefore = new Date();
+    ca.validity.notAfter = new Date(Date.now() + 86400_000);
+    const fullDn = [
+      { name: "countryName", value: "US" },
+      { name: "stateOrProvinceName", value: "California" },
+      { name: "localityName", value: "San Francisco" },
+      { name: "organizationName", value: "Acme Corp" },
+      { name: "organizationalUnitName", value: "PKI" },
+      { name: "commonName", value: "Acme Internal Root" },
+    ];
+    ca.setSubject(fullDn);
+    ca.setIssuer(fullDn);
+    ca.setExtensions([{ name: "basicConstraints", cA: true }]);
+    ca.sign(kp.privateKey, forge.md.sha256.create());
+
+    process.env.SICLAW_CA_CERT = forge.pki.certificateToPem(ca);
+    process.env.SICLAW_CA_KEY = forge.pki.privateKeyToPem(kp.privateKey);
+
+    const m = await CertificateManager.create();
+    const bundle = m.issueAgentBoxCertificate("agent-y", "org-y", "box-y");
+    const issued = forge.pki.certificateFromPem(bundle.cert);
+
+    // Issued cert's issuer attributes must equal the CA's subject attributes
+    // — same names, same values, same order. Anything dropped breaks chain
+    // validation downstream.
+    const dn = (attrs: any[]) =>
+      attrs.map(a => `${a.name}=${a.value}`).join(",");
+    expect(dn(issued.issuer.attributes)).toBe(dn(ca.subject.attributes));
+
+    // Signature must verify under the CA's public key.
+    expect(ca.verify(issued)).toBe(true);
+  }, 60_000);
+
+  it("accepts a CA whose subject has no Common Name (CN is not required by X.509)", async () => {
+    clearCaEnv();
+    const kp = forge.pki.rsa.generateKeyPair(1024);
+    const ca = forge.pki.createCertificate();
+    ca.publicKey = kp.publicKey;
+    ca.serialNumber = "04";
+    ca.validity.notBefore = new Date();
+    ca.validity.notAfter = new Date(Date.now() + 86400_000);
+    const cnLessDn = [
+      { name: "organizationName", value: "no-cn-org" },
+      { name: "organizationalUnitName", value: "PKI" },
+    ];
+    ca.setSubject(cnLessDn);
+    ca.setIssuer(cnLessDn);
+    ca.setExtensions([{ name: "basicConstraints", cA: true }]);
+    ca.sign(kp.privateKey, forge.md.sha256.create());
+
+    process.env.SICLAW_CA_CERT = forge.pki.certificateToPem(ca);
+    process.env.SICLAW_CA_KEY = forge.pki.privateKeyToPem(kp.privateKey);
+
+    const m = await CertificateManager.create();
+    const bundle = m.issueAgentBoxCertificate("agent-z", "org-z", "box-z");
+    const issued = forge.pki.certificateFromPem(bundle.cert);
+
+    // Issuer DN mirrors the CA's CN-less subject DN.
+    const dn = (attrs: any[]) => attrs.map(a => `${a.name}=${a.value}`).join(",");
+    expect(dn(issued.issuer.attributes)).toBe(dn(ca.subject.attributes));
+    expect(ca.verify(issued)).toBe(true);
+  }, 60_000);
 });
 
 // ── issueAgentBoxCertificate + verifyCertificate round-trip ───────

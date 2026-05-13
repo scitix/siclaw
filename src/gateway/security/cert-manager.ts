@@ -47,10 +47,27 @@ export interface CertificateBundle {
 export class CertificateManager {
   private caCert: string;
   private caKey: string;
+  /**
+   * Subject attributes of the loaded CA, in their original forge form.
+   *
+   * Issued certs MUST reference the exact subject of the signing CA — X.509
+   * path validation does a byte-wise DN comparison. We carry the attribute
+   * array through verbatim (instead of projecting onto a {CN, O, OU} shape)
+   * so external CAs that include C / ST / L / serialNumber / etc.
+   * (cert-manager, Vault PKI, corporate roots) still produce a matching
+   * Issuer↔Subject pair.
+   */
+  private readonly caSubjectAttrs: any[];
 
   private constructor(caCert: string, caKey: string) {
     this.caCert = caCert;
     this.caKey = caKey;
+    const ca = forge.pki.certificateFromPem(caCert);
+    // Carry the CA's subject attribute array verbatim — every field flows
+    // into issued certs as-is. X.509 does not require a Common Name in the
+    // subject, and externally-managed CAs (cert-manager / Vault PKI / org
+    // roots) sometimes omit it; we accept whatever the CA presents.
+    this.caSubjectAttrs = ca.subject.attributes;
   }
 
   /**
@@ -106,7 +123,7 @@ export class CertificateManager {
 
     const cert = CertificateManager.createCertificateStatic({
       subject: { CN: hostname, O: "Siclaw", OU: "Runtime" },
-      issuer: { CN: "Siclaw Runtime CA", O: "Siclaw", OU: "Security" },
+      issuerAttrs: this.caSubjectAttrs,
       publicKey,
       signingKey: this.caKey,
       isCA: false,
@@ -141,7 +158,7 @@ export class CertificateManager {
 
     const cert = CertificateManager.createCertificateStatic({
       subject: { CN: agentId, O: orgId, serialNumber: boxId },
-      issuer: { CN: "Siclaw Runtime CA", O: "Siclaw", OU: "Security" },
+      issuerAttrs: this.caSubjectAttrs,
       publicKey,
       signingKey: this.caKey,
       isCA: false,
@@ -255,12 +272,20 @@ export class CertificateManager {
     if (opts.subject.serialNumber) subjectAttrs.push({ name: "serialNumber", value: opts.subject.serialNumber });
     cert.setSubject(subjectAttrs);
 
-    const issuerData = opts.issuer || opts.subject;
-    const issuerAttrs = [];
-    if (issuerData.CN) issuerAttrs.push({ name: "commonName", value: issuerData.CN });
-    if (issuerData.O) issuerAttrs.push({ name: "organizationName", value: issuerData.O });
-    if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU });
-    cert.setIssuer(issuerAttrs);
+    if (opts.issuerAttrs) {
+      // Byte-exact copy of the CA's subject DN — preserves every attribute
+      // (C / ST / L / serialNumber / …) so X.509 path validation, which does
+      // a byte-wise Issuer↔Subject comparison, accepts the chain.
+      cert.setIssuer(opts.issuerAttrs);
+    } else {
+      // Self-sign or string-shape fallback (used by `generateCA`).
+      const issuerData = opts.issuer || opts.subject;
+      const issuerAttrs = [];
+      if (issuerData.CN) issuerAttrs.push({ name: "commonName", value: issuerData.CN });
+      if (issuerData.O) issuerAttrs.push({ name: "organizationName", value: issuerData.O });
+      if (issuerData.OU) issuerAttrs.push({ name: "organizationalUnitName", value: issuerData.OU });
+      cert.setIssuer(issuerAttrs);
+    }
 
     const extensions: any[] = [
       { name: "basicConstraints", cA: opts.isCA },
@@ -308,7 +333,12 @@ function isIpAddress(s: string): boolean {
 
 interface CertOpts {
   subject: Record<string, string>;
-  issuer: Record<string, string> | null;
+  /**
+   * Byte-exact issuer attributes copied from the signing CA's subject DN.
+   * Takes precedence over `issuer` when set.
+   */
+  issuerAttrs?: any[];
+  issuer?: Record<string, string> | null;
   publicKey: string;
   signingKey: string;
   isCA: boolean;

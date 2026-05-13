@@ -676,6 +676,40 @@ describe("chat.ensureSession", () => {
   });
 });
 
+describe("chat.resolveSession", () => {
+  it("returns found with user_id and agent_id when row exists", async () => {
+    mockQuery([{ user_id: "u1", agent_id: "a1" }]);
+    const result = await getHandler("chat.resolveSession")(
+      { session_id: "sess1" }, "a1",
+    );
+    expect(result).toEqual({ found: true, user_id: "u1", agent_id: "a1" });
+  });
+
+  it("returns found:false when sessionId is unknown", async () => {
+    mockQuery([]);
+    const result = await getHandler("chat.resolveSession")(
+      { session_id: "nope" }, "a1",
+    );
+    expect(result).toEqual({ found: false });
+  });
+
+  it("still resolves attribution for a soft-deleted session — late callbacks must find userId", async () => {
+    // The SQL deliberately omits `AND deleted_at IS NULL` so that audit
+    // attribution does not vanish when a user soft-deletes their chat.
+    // This test pins the invariant: a row whose deleted_at is non-null
+    // still surfaces through chat.resolveSession.
+    const query = mockQuery([{ user_id: "u-deleted", agent_id: "a-deleted" }]);
+    const result = await getHandler("chat.resolveSession")(
+      { session_id: "sess-soft-deleted" }, "a1",
+    );
+    expect(result).toEqual({ found: true, user_id: "u-deleted", agent_id: "a-deleted" });
+    // Defense in depth: the SQL must not mention deleted_at. If anyone
+    // re-adds that predicate in a future "cleanup" PR this regresses.
+    const sql = (query.mock.calls[0][0] as string).toLowerCase();
+    expect(sql).not.toContain("deleted_at");
+  });
+});
+
 describe("chat.appendMessage", () => {
   it("inserts message and bumps session count", async () => {
     const query = mockQuery([], []);
@@ -1260,9 +1294,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 43 handlers", () => {
+  it("registers exactly 44 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(43);
+    expect(handlers.size).toBe(44);
   });
 
   it("all expected handler names are registered", () => {
@@ -1273,7 +1307,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",
