@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { ChartRenderer, tryParseChartSpec } from "./ChartRenderer"
 
 interface MarkdownProps {
   children: string
@@ -20,13 +21,59 @@ function escapeIntraWordUnderscores(text: string): string {
     .join("")
 }
 
+// Allow data: URIs for inline images (e.g. SVG charts produced by render_chart).
+// react-markdown's defaultUrlTransform strips data: from img src as a safety
+// default; we re-allow it for image MIME types only. SVG is rendered as an
+// image (not via <object>), so embedded scripts inside the SVG do not execute.
+const ALLOWED_DATA_IMAGE_MIME = /^data:image\/(svg\+xml|png|jpeg|gif|webp);base64,/i
+function permissiveUrlTransform(uri: string): string {
+  if (ALLOWED_DATA_IMAGE_MIME.test(uri)) return uri
+  // Fall back to default-safe behaviour for everything else.
+  if (/^(https?|mailto|tel|ircs?|xmpp):/i.test(uri)) return uri
+  if (uri.startsWith("/") || uri.startsWith("#") || uri.startsWith("?") || uri.startsWith(".")) return uri
+  return ""
+}
+
+function ChartParseError({ source }: { source: string }) {
+  return (
+    <div className="my-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-100">
+      <div className="font-semibold">图表 JSON 解析失败</div>
+      <div className="mt-1 text-xs opacity-80">
+        请检查 render_chart 返回的 chart 代码块是否被改写或额外转义。
+      </div>
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs font-medium">查看原始 chart 内容</summary>
+        <pre className="mt-2 max-h-56 overflow-auto rounded bg-slate-950 p-3 text-xs text-slate-100">
+          {source}
+        </pre>
+      </details>
+    </div>
+  )
+}
+
 export function Markdown({ children }: MarkdownProps) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      urlTransform={permissiveUrlTransform}
       components={{
-        // Code blocks
+        // Code blocks. ```chart fenced blocks contain a JSON spec emitted by
+        // mcp render_chart; we parse and render via the React ChartRenderer
+        // (theme-aware, no <pre> dark background, no SVG echo from the model).
         pre({ children }) {
+          const child = Array.isArray(children) ? children[0] : children
+          if (
+            child &&
+            typeof child === "object" &&
+            "props" in child &&
+            (child as { props: { className?: string } }).props.className === "language-chart"
+          ) {
+            const raw = (child as { props: { children?: unknown } }).props.children
+            const text = (Array.isArray(raw) ? raw.join("") : String(raw ?? "")).trim()
+            const spec = tryParseChartSpec(text)
+            if (spec) return <ChartRenderer spec={spec} />
+            return <ChartParseError source={text} />
+          }
           return (
             <pre className="bg-slate-900 text-slate-100 rounded-lg p-4 overflow-x-auto my-3 text-sm leading-relaxed">
               {children}
@@ -130,6 +177,16 @@ export function Markdown({ children }: MarkdownProps) {
         // Strong / em
         strong({ children }) {
           return <strong className="font-semibold">{children}</strong>
+        },
+        // Images — explicit width caps so a chart fits the chat bubble.
+        img({ src, alt }) {
+          return (
+            <img
+              src={src}
+              alt={alt ?? ""}
+              className="-mx-5 -my-3.5 max-w-none w-[calc(100%+2.5rem)] h-auto block"
+            />
+          )
         },
       }}
     >
