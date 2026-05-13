@@ -1,0 +1,30 @@
+{
+  "name": "mcp-create-chart",
+  "version": "0.1.0",
+  "description": "Stdio MCP server exposing a chart-spec renderer (pie/bar/line) for Siclaw agents",
+  "type": "module",
+  "bin": {
+    "mcp-create-chart": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "Apache-2.0"
+}

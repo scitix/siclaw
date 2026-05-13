@@ -1,0 +1,29 @@
+# mcp/MCP_LIST.txt
+#
+# Single source of truth for stdio MCP servers shipped in the agentbox image.
+# Dockerfile.agentbox reads this file in a single RUN step to build and
+# symlink each MCP into /usr/local/bin/mcp-<name>.
+#
+# Format: one MCP directory name per line.
+#   - Lines starting with # are comments.
+#   - Blank lines are ignored.
+#   - Leading/trailing whitespace is stripped.
+#
+# Each MCP must follow the standard layout:
+#   mcp/<name>/
+#   ├── package.json          (declares `bin` -> ./dist/index.js)
+#   ├── package-lock.json
+#   ├── tsconfig.json
+#   └── src/
+#       └── index.ts          (#!/usr/bin/env node, uses StdioServerTransport)
+#
+# Build steps applied to every MCP:
+#   1. copy package.json + package-lock.json + tsconfig.json + src/ into /opt/mcp-<name>/
+#   2. run `npm ci && npx tsc && npm prune --omit=dev`
+#   3. chmod +x dist/index.js, chown to agentbox:agentbox
+#   4. symlink /opt/mcp-<name>/dist/index.js -> /usr/local/bin/mcp-<name>
+#
+# To add a new MCP: create mcp/<name>/ following the layout above
+# and append <name> to this file.
+
+create-chart

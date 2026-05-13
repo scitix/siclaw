@@ -72,6 +72,30 @@ COPY skills/extension/ ./skills/extension/
 COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
 
+# Build every stdio MCP listed in mcp/MCP_LIST.txt and symlink each into PATH.
+# To add a new MCP: drop a new mcp/<name>/ directory (standalone npm package
+# with bin -> ./dist/index.js) and append its name to MCP_LIST.txt.
+COPY mcp/ /opt/mcp-staging/
+RUN set -eu \
+    && grep -v '^[[:space:]]*#' /opt/mcp-staging/MCP_LIST.txt | grep -v '^[[:space:]]*$' | tr -d ' \t' | while IFS= read -r name; do \
+         [ -n "$name" ] || continue; \
+         echo "=== Building mcp-$name ==="; \
+         src="/opt/mcp-staging/$name"; dst="/opt/mcp-$name"; \
+         test -d "$src" || { echo "MCP_LIST.txt names '$name' but $src is missing"; exit 1; }; \
+         mkdir -p "$dst"; \
+         cp "$src/package.json" "$src/package-lock.json" "$src/tsconfig.json" "$dst/"; \
+         cp -r "$src/src" "$dst/src"; \
+         cd "$dst"; \
+         npm ci; \
+         npx tsc; \
+         npm prune --omit=dev; \
+         chmod +x dist/index.js; \
+         chown -R agentbox:agentbox "$dst"; \
+         ln -sf "$dst/dist/index.js" "/usr/local/bin/mcp-$name"; \
+         cd /; \
+       done \
+    && rm -rf /opt/mcp-staging
+
 # Directory structure, permissions, SUID/SGID cleanup — single layer
 RUN chmod +x /usr/local/bin/agentbox-entrypoint.sh \
     && mkdir -p ./.siclaw/skills ./.siclaw/credentials/clusters ./.siclaw/credentials/hosts ./.siclaw/config ./.siclaw/user-data \
