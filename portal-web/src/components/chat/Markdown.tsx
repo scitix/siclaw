@@ -1,5 +1,6 @@
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { ChartRenderer, chartSpecLooksIncomplete, tryParseChartSpec } from "./ChartRenderer"
 
 interface MarkdownProps {
   children: string
@@ -20,13 +21,87 @@ function escapeIntraWordUnderscores(text: string): string {
     .join("")
 }
 
+// Allow data: URIs for inline images (e.g. SVG charts produced by render_chart).
+// react-markdown's defaultUrlTransform strips data: from img src as a safety
+// default; we re-allow it for image MIME types only. SVG is rendered as an
+// image (not via <object>), so embedded scripts inside the SVG do not execute.
+const ALLOWED_DATA_IMAGE_MIME = /^data:image\/(svg\+xml|png|jpeg|gif|webp);base64,/i
+function permissiveUrlTransform(uri: string): string {
+  if (ALLOWED_DATA_IMAGE_MIME.test(uri)) return uri
+  // Fall back to default-safe behaviour for everything else.
+  if (/^(https?|mailto|tel|ircs?|xmpp):/i.test(uri)) return uri
+  if (uri.startsWith("/") || uri.startsWith("#") || uri.startsWith("?") || uri.startsWith(".")) return uri
+  return ""
+}
+
+function ChartLoading() {
+  return (
+    <div
+      className="my-3 flex items-center gap-2 rounded-lg border border-border bg-secondary/30 px-4 py-6 text-sm text-muted-foreground"
+      role="status"
+      aria-label="Chart loading"
+    >
+      <svg
+        className="h-4 w-4 animate-spin"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        aria-hidden="true"
+      >
+        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+      </svg>
+      Generating chart…
+    </div>
+  )
+}
+
+function ChartParseError({ source }: { source: string }) {
+  return (
+    <div className="my-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-100">
+      <div className="font-semibold">Failed to parse chart JSON</div>
+      <div className="mt-1 text-xs opacity-80">
+        Check whether the chart block returned by render_chart was rewritten or extra-escaped.
+      </div>
+      <details className="mt-2">
+        <summary className="cursor-pointer text-xs font-medium">View raw chart content</summary>
+        <pre className="mt-2 max-h-56 overflow-auto rounded bg-slate-950 p-3 text-xs text-slate-100">
+          {source}
+        </pre>
+      </details>
+    </div>
+  )
+}
+
 export function Markdown({ children }: MarkdownProps) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      urlTransform={permissiveUrlTransform}
       components={{
-        // Code blocks
+        // Code blocks. ```chart fenced blocks contain a JSON spec emitted by
+        // mcp render_chart; we parse and render via the React ChartRenderer
+        // (theme-aware, no <pre> dark background, no SVG echo from the model).
         pre({ children }) {
+          const child = Array.isArray(children) ? children[0] : children
+          if (
+            child &&
+            typeof child === "object" &&
+            "props" in child &&
+            (child as { props: { className?: string } }).props.className === "language-chart"
+          ) {
+            const raw = (child as { props: { children?: unknown } }).props.children
+            const text = (Array.isArray(raw) ? raw.join("") : String(raw ?? "")).trim()
+            const spec = tryParseChartSpec(text)
+            if (spec) return <ChartRenderer spec={spec} />
+            // Don't show the red parse-failed box mid-stream — ReactMarkdown
+            // re-renders on every token, so an unclosed chart fence flashes
+            // an error for every chart until streaming finishes. Only treat
+            // it as a real error once the JSON has finished arriving.
+            if (chartSpecLooksIncomplete(text)) return <ChartLoading />
+            return <ChartParseError source={text} />
+          }
           return (
             <pre className="bg-slate-900 text-slate-100 rounded-lg p-4 overflow-x-auto my-3 text-sm leading-relaxed">
               {children}
@@ -130,6 +205,16 @@ export function Markdown({ children }: MarkdownProps) {
         // Strong / em
         strong({ children }) {
           return <strong className="font-semibold">{children}</strong>
+        },
+        // Images — explicit width caps so a chart fits the chat bubble.
+        img({ src, alt }) {
+          return (
+            <img
+              src={src}
+              alt={alt ?? ""}
+              className="-mx-5 -my-3.5 max-w-none w-[calc(100%+2.5rem)] h-auto block"
+            />
+          )
         },
       }}
     >
