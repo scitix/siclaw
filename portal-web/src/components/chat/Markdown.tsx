@@ -1,6 +1,6 @@
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-import { ChartRenderer, tryParseChartSpec } from "./ChartRenderer"
+import { ChartRenderer, chartSpecLooksIncomplete, tryParseChartSpec } from "./ChartRenderer"
 
 interface MarkdownProps {
   children: string
@@ -34,15 +34,38 @@ function permissiveUrlTransform(uri: string): string {
   return ""
 }
 
+function ChartLoading() {
+  return (
+    <div
+      className="my-3 flex items-center gap-2 rounded-lg border border-border bg-secondary/30 px-4 py-6 text-sm text-muted-foreground"
+      role="status"
+      aria-label="Chart loading"
+    >
+      <svg
+        className="h-4 w-4 animate-spin"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        aria-hidden="true"
+      >
+        <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+      </svg>
+      Generating chart…
+    </div>
+  )
+}
+
 function ChartParseError({ source }: { source: string }) {
   return (
     <div className="my-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-100">
-      <div className="font-semibold">图表 JSON 解析失败</div>
+      <div className="font-semibold">Failed to parse chart JSON</div>
       <div className="mt-1 text-xs opacity-80">
-        请检查 render_chart 返回的 chart 代码块是否被改写或额外转义。
+        Check whether the chart block returned by render_chart was rewritten or extra-escaped.
       </div>
       <details className="mt-2">
-        <summary className="cursor-pointer text-xs font-medium">查看原始 chart 内容</summary>
+        <summary className="cursor-pointer text-xs font-medium">View raw chart content</summary>
         <pre className="mt-2 max-h-56 overflow-auto rounded bg-slate-950 p-3 text-xs text-slate-100">
           {source}
         </pre>
@@ -72,6 +95,11 @@ export function Markdown({ children }: MarkdownProps) {
             const text = (Array.isArray(raw) ? raw.join("") : String(raw ?? "")).trim()
             const spec = tryParseChartSpec(text)
             if (spec) return <ChartRenderer spec={spec} />
+            // Don't show the red parse-failed box mid-stream — ReactMarkdown
+            // re-renders on every token, so an unclosed chart fence flashes
+            // an error for every chart until streaming finishes. Only treat
+            // it as a real error once the JSON has finished arriving.
+            if (chartSpecLooksIncomplete(text)) return <ChartLoading />
             return <ChartParseError source={text} />
           }
           return (

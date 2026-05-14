@@ -40,7 +40,5 @@ export interface RenderChartResult {
   spec_path: string;
   svg_path: string;
   bytes: number;
-  markdown_embed: string;
-  markdown_embed_raw: string;
   embed_instructions: string;
 }

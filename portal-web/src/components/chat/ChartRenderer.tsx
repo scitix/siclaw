@@ -34,16 +34,47 @@ export type ChartSpec =
   | ({ type: "bar"; data: { categories: string[]; series: BarSeries[] } } & CommonOpts)
   | ({ type: "line"; data: { series: LineSeries[] } } & CommonOpts)
 
+// No grey in the categorical palette — grey is reserved for the "Others"
+// bucket so it reads as a residual rather than a real category. 11 distinct
+// hues cover the max 11 real slices a collapsed pie can have.
 const PALETTE = [
   "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
-  "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+  "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#b6992d", "#d37295",
 ]
+// Neutral grey for the collapsed "Others" slice — legible on both themes.
+const OTHERS_COLOR = "#9aa0a6"
 
 const TITLE_SIZE = 18
 const LEGEND_SIZE = 13
 const AXIS_LABEL_SIZE = 13
 const TICK_SIZE = 12
 const PIE_LABEL_SIZE = 12
+
+// High-cardinality pie data (e.g. a per-namespace Pod count with 20+ entries)
+// renders as a fan of unreadable slivers. Keep the largest slices and roll the
+// long tail into a single "Others" bucket so the chart stays legible.
+const PIE_MAX_SLICES = 12
+
+// othersIndex is the index of the collapsed "Others" slice, or -1 when the
+// data was small enough to render as-is. The caller colours that slice grey.
+export function collapsePieSlices(
+  slices: PieSlice[],
+  max = PIE_MAX_SLICES,
+): { slices: PieSlice[]; othersIndex: number } {
+  if (slices.length <= max) return { slices, othersIndex: -1 }
+  const sorted = [...slices].sort((a, b) => b.value - a.value)
+  const head = sorted.slice(0, max - 1)
+  const tail = sorted.slice(max - 1)
+  const tailTotal = tail.reduce((a, s) => a + Math.max(0, s.value), 0)
+  return {
+    slices: [...head, { label: `Others (${tail.length})`, value: tailTotal }],
+    othersIndex: head.length,
+  }
+}
+
+function pieSliceColor(index: number, othersIndex: number): string {
+  return index === othersIndex ? OTHERS_COLOR : PALETTE[index % PALETTE.length]
+}
 
 // Tailwind class strings centralised so palette tweaks live in one place.
 // dark: variants flip every theme-bound color when an ancestor has `.dark`.
@@ -77,7 +108,8 @@ const THEME_CLASSES = [
 function approxTextWidth(text: string, fontSize: number): number {
   let w = 0
   for (const ch of text) {
-    if (/[一-鿿＀-￯]/.test(ch)) w += fontSize
+    // CJK ideographs + fullwidth forms render roughly square (one em wide).
+    if (/[\u4e00-\u9fff\uff00-\uffef]/.test(ch)) w += fontSize
     else if (/[A-Z0-9]/.test(ch)) w += fontSize * 0.62
     else w += fontSize * 0.52
   }
@@ -209,7 +241,7 @@ function XAxisTitle({ plot, height, label }: { plot: Plot; height: number; label
 }
 
 function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "pie" }>; width: number; height: number }) {
-  const slices = spec.data.slices
+  const { slices, othersIndex } = collapsePieSlices(spec.data.slices)
   const total = slices.reduce((a, s) => a + Math.max(0, s.value), 0)
   if (total <= 0) {
     return (
@@ -244,7 +276,7 @@ function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "p
     const x2 = cx + r * Math.cos(a2)
     const y2 = cy + r * Math.sin(a2)
     const large = sweep > Math.PI ? 1 : 0
-    const color = PALETTE[i % PALETTE.length]
+    const color = pieSliceColor(i, othersIndex)
     if (slices.length === 1 || sweep >= Math.PI * 2 - 1e-6) {
       slicesEls.push(<circle key={`p${i}`} cx={cx} cy={cy} r={r} fill={color} />)
     } else {
@@ -275,7 +307,7 @@ function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "p
   let legY = Math.max(top + 8, top + (innerH - legBlockH) / 2 + LEGEND_SIZE)
   const legendEls: ReactNode[] = []
   labels.forEach((label, i) => {
-    const color = PALETTE[i % PALETTE.length]
+    const color = pieSliceColor(i, othersIndex)
     legendEls.push(
       <rect key={`ls${i}`} x={legX} y={legY - LEGEND_SIZE + 2} width={14} height={14}
             fill={color} rx={2} />,
@@ -473,6 +505,17 @@ async function svgToPngBlob(svg: SVGSVGElement, scale = 2): Promise<Blob> {
   const w = vb && vb.width ? vb.width : svg.clientWidth || 900
   const h = vb && vb.height ? vb.height : svg.clientHeight || 520
 
+  // Sample chart-bg's live fill BEFORE cloning — this is the same color the
+  // user sees on-screen (light: white, dark: slate-900). Used as the canvas
+  // base so if inlineComputedStyles ever fails to carry the bg fill onto the
+  // detached clone (CSS var that doesn't resolve out-of-document, future
+  // refactor swapping <rect> for CSS background, etc.) we still rasterise on
+  // the right base color — light-grey text on white was the worst-case
+  // failure mode the previous hardcoded #ffffff fallback would produce.
+  const bgRect = svg.querySelector<SVGRectElement>(".chart-bg")
+  const liveBg = bgRect ? window.getComputedStyle(bgRect).fill : ""
+  const canvasBg = liveBg && liveBg !== "none" && liveBg !== "transparent" ? liveBg : "#ffffff"
+
   const clone = svg.cloneNode(true) as SVGSVGElement
   inlineComputedStyles(svg, clone)
   clone.setAttribute("xmlns", "http://www.w3.org/2000/svg")
@@ -495,10 +538,9 @@ async function svgToPngBlob(svg: SVGSVGElement, scale = 2): Promise<Blob> {
   canvas.height = Math.round(h * scale)
   const ctx = canvas.getContext("2d")
   if (!ctx) throw new Error("canvas 2d context unavailable")
-  // Fill opaque white so PNGs pasted into WeChat/QQ don't show a transparent
-  // halo when the theme background was dark — chart-bg already paints, but
-  // anti-aliased edges can leak through without this base.
-  ctx.fillStyle = "#ffffff"
+  // Match the on-screen theme so anti-aliased edges and any potential inline
+  // miss still produce a readable PNG (no light-grey-on-white failure mode).
+  ctx.fillStyle = canvasBg
   ctx.fillRect(0, 0, canvas.width, canvas.height)
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
 
@@ -552,9 +594,9 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
       const blob = await svgToPngBlob(svgRef.current, 2)
       const safeTitle = (spec.title ?? `${spec.type}-chart`).replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 60)
       downloadBlob(blob, `${safeTitle || "chart"}.png`)
-      flash("ok", "已下载 PNG")
+      flash("ok", "PNG downloaded")
     } catch {
-      flash("err", "下载失败")
+      flash("err", "Download failed")
     }
   }, [spec.title, spec.type, flash])
 
@@ -563,13 +605,13 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
     try {
       const blob = await svgToPngBlob(svgRef.current, 2)
       const ok = await copyBlobToClipboard(blob)
-      if (ok) flash("ok", "已复制图片，可直接粘贴到微信/QQ")
+      if (ok) flash("ok", "Image copied to clipboard")
       else {
         downloadBlob(blob, "chart.png")
-        flash("ok", "浏览器不支持复制图片，已改为下载 PNG")
+        flash("ok", "Clipboard image copy not supported — downloaded PNG instead")
       }
     } catch {
-      flash("err", "复制失败")
+      flash("err", "Copy failed")
     }
   }, [flash])
 
@@ -601,8 +643,8 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
         <button
           type="button"
           onClick={onCopy}
-          aria-label="复制为 PNG 图片到剪贴板"
-          title="复制为 PNG 图片到剪贴板"
+          aria-label="Copy chart as PNG to clipboard"
+          title="Copy chart as PNG to clipboard"
           className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm hover:bg-white dark:hover:bg-slate-800"
         >
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
@@ -614,8 +656,8 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
         <button
           type="button"
           onClick={onDownload}
-          aria-label="下载 PNG 文件"
-          title="下载 PNG 文件"
+          aria-label="Download chart as PNG"
+          title="Download chart as PNG"
           className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm hover:bg-white dark:hover:bg-slate-800"
         >
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
@@ -642,13 +684,147 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
   )
 }
 
+// Heuristic: does the text look like a fully-streamed JSON object, or are we
+// still mid-stream? During streaming ReactMarkdown re-parses on every token,
+// so the chart fence is rendered before the closing `}` arrives — without
+// this check tryParseChartSpec would return null and Markdown.tsx would flash
+// the red "parse failed" box for every chart until streaming completes.
+// Returns true when the text is empty, doesn't end with `}`, or has more
+// opening braces than closing ones (ignoring braces inside JSON strings).
+export function chartSpecLooksIncomplete(raw: string): boolean {
+  const text = raw.trim()
+  if (!text || !text.endsWith("}")) return true
+  let depth = 0
+  let inStr = false
+  let esc = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (esc) { esc = false; continue }
+    if (inStr) {
+      if (ch === "\\") esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"') inStr = true
+    else if (ch === "{") depth++
+    else if (ch === "}") depth--
+  }
+  return depth !== 0 || inStr
+}
+
+// The chart spec round-trips through the LLM as plain text in the final reply.
+// On a small fraction of generations the model double-escapes non-ASCII —
+// emits a literal backslash-u-XXXX sequence instead of the character (or a
+// single \u escape JSON.parse would decode). JSON.parse then yields the
+// literal 6-char string. Decode such stray escapes so CJK titles/labels render.
+function decodeStrayUnicodeEscapes(s: string): string {
+  if (!s.includes("\\u")) return s
+  return s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+}
+
+// String coercion for model-emitted leaf text: the renderer iterates these
+// with `for..of` (would throw on a number) and draws them verbatim (would
+// show stray unicode escapes). Both hazards are normalised here.
+function toCleanString(v: unknown): string {
+  return decodeStrayUnicodeEscapes(String(v))
+}
+
+function pickCommonOpts(obj: Record<string, unknown>): CommonOpts {
+  const out: CommonOpts = {}
+  for (const k of ["title", "x_label", "y_label"] as const) {
+    if (typeof obj[k] === "string") out[k] = decodeStrayUnicodeEscapes(obj[k] as string)
+  }
+  for (const k of ["width", "height"] as const) {
+    if (typeof obj[k] === "number" && Number.isFinite(obj[k])) out[k] = obj[k] as number
+  }
+  return out
+}
+
+// Coerce a leaf value to a finite number the way the backend handler does
+// (accepts numeric strings), or return null when it can't — JSON.stringify
+// would otherwise serialise a NaN as `null` and the renderer would silently
+// draw wrong data.
+function toFiniteNumber(v: unknown): number | null {
+  const n = typeof v === "number" ? v : Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+// Deep validation + normalisation mirroring backend handler.ts `validate()`.
+// The chart JSON is re-emitted by the LLM in its final reply (not the original
+// tool response), so it crosses a trust boundary even though the MCP tool
+// itself validated input — the model can rewrite, truncate, or corrupt fields
+// during paste. Beyond shape checks this also normalises leaf values: category
+// / series-name fields are coerced to strings (the renderer iterates them with
+// `for..of` and would throw on a number) and numeric fields are coerced to
+// finite numbers (a non-finite value rejects the whole spec). Returning null
+// lets Markdown.tsx fall back to <ChartParseError> instead of crashing the
+// chat bubble inside PieChart/BarChart/LineChart.
 export function tryParseChartSpec(raw: string): ChartSpec | null {
   try {
-    const obj = JSON.parse(raw)
+    const obj = JSON.parse(raw) as Record<string, unknown>
     if (!obj || typeof obj !== "object") return null
-    if (obj.type !== "pie" && obj.type !== "bar" && obj.type !== "line") return null
-    if (!obj.data || typeof obj.data !== "object") return null
-    return obj as ChartSpec
+    const data = obj.data as Record<string, unknown> | undefined
+    if (!data || typeof data !== "object") return null
+    const common = pickCommonOpts(obj)
+
+    if (obj.type === "pie") {
+      const rawSlices = data.slices
+      if (!Array.isArray(rawSlices) || !rawSlices.length) return null
+      const slices: PieSlice[] = []
+      for (let i = 0; i < rawSlices.length; i++) {
+        const s = rawSlices[i] as { label?: unknown; value?: unknown }
+        if (!s || typeof s !== "object") return null
+        const value = toFiniteNumber(s.value)
+        if (value === null) return null
+        slices.push({ label: toCleanString(s.label ?? `slice ${i}`), value })
+      }
+      return { type: "pie", data: { slices }, ...common }
+    }
+
+    if (obj.type === "bar") {
+      const rawCats = data.categories
+      const rawSeries = data.series
+      if (!Array.isArray(rawCats) || !rawCats.length) return null
+      if (!Array.isArray(rawSeries) || !rawSeries.length) return null
+      const categories = rawCats.map(toCleanString)
+      const series: BarSeries[] = []
+      for (let i = 0; i < rawSeries.length; i++) {
+        const s = rawSeries[i] as { name?: unknown; values?: unknown }
+        if (!s || typeof s !== "object" || !Array.isArray(s.values)) return null
+        if (s.values.length !== categories.length) return null
+        const values: number[] = []
+        for (const v of s.values) {
+          const n = toFiniteNumber(v)
+          if (n === null) return null
+          values.push(n)
+        }
+        series.push({ name: toCleanString(s.name ?? `series ${i}`), values })
+      }
+      return { type: "bar", data: { categories, series }, ...common }
+    }
+
+    if (obj.type === "line") {
+      const rawSeries = data.series
+      if (!Array.isArray(rawSeries) || !rawSeries.length) return null
+      const series: LineSeries[] = []
+      for (let i = 0; i < rawSeries.length; i++) {
+        const s = rawSeries[i] as { name?: unknown; points?: unknown }
+        if (!s || typeof s !== "object" || !Array.isArray(s.points) || !s.points.length) return null
+        const points: LinePoint[] = []
+        for (const p of s.points) {
+          const pt = p as { x?: unknown; y?: unknown }
+          if (!pt || typeof pt !== "object") return null
+          const y = toFiniteNumber(pt.y)
+          if (y === null) return null
+          const x = typeof pt.x === "number" ? pt.x : toCleanString(pt.x)
+          points.push({ x, y })
+        }
+        series.push({ name: toCleanString(s.name ?? `series ${i}`), points })
+      }
+      return { type: "line", data: { series }, ...common }
+    }
+
+    return null
   } catch {
     return null
   }

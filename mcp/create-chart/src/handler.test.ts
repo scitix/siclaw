@@ -204,16 +204,17 @@ describe("handleRenderChart", () => {
     expect(ready.endsWith("\n```")).toBe(true);
     // The READY_TO_PASTE block must be the unescaped fenced markdown — no
     // backslash-escaped quotes, no surrounding JSON quotes. This is the whole
-    // point of the envelope: agents copy this verbatim instead of the escaped
-    // markdown_embed JSON string field.
+    // point of the envelope: agents copy this verbatim. METADATA_JSON carries
+    // no embed string field, so there is no escaped form for the model to pick
+    // up and mangle.
     expect(ready).not.toMatch(/\\"/);
     expect(meta.type).toBe("pie");
     expect(typeof meta.chart_id).toBe("string");
     expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
     expect(typeof meta.bytes).toBe("number");
     expect(meta.bytes as number).toBeGreaterThan(0);
-    expect(meta.markdown_embed).toBe(ready);
-    expect(meta.markdown_embed_raw).toBe(ready);
+    expect(meta).not.toHaveProperty("markdown_embed");
+    expect(meta).not.toHaveProperty("markdown_embed_raw");
     expect(meta.embed_instructions).toMatch(/READY_TO_PASTE/);
   });
 
@@ -234,7 +235,7 @@ describe("handleRenderChart", () => {
     expect(spec.data.series[0].values).toEqual([10, 20]);
     expect(spec.title).toBe("Demo");
     expect(spec).not.toHaveProperty("extra_garbage");
-    expect(meta.markdown_embed).toBe(ready);
+    expect(meta).not.toHaveProperty("markdown_embed");
   });
 
   it("persists the spec to CREATE_CHART_ARTIFACT_DIR/chart-render/", async () => {

@@ -65,10 +65,8 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
     spec_path: specPath ?? "",
     svg_path: specPath ?? "",
     bytes: Buffer.byteLength(spec, "utf8"),
-    markdown_embed: markdownEmbed,
-    markdown_embed_raw: markdownEmbed,
     embed_instructions:
-      "Paste the READY_TO_PASTE block verbatim into your reply where the chart should appear. Do not copy the escaped markdown_embed JSON string if READY_TO_PASTE is available. Do not modify the JSON, add backslashes, convert to ```svg, or inline an <img>.",
+      "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",
   };
 
   return {
@@ -137,9 +135,22 @@ export function validate(raw: unknown): RenderChartArgs {
       if (!Array.isArray(item.values)) {
         throw new Error(`render_chart: bar series[${i}].values must be an array`);
       }
+      if (item.values.length !== categories.length) {
+        throw new Error(
+          `render_chart: bar series[${i}].values length (${item.values.length}) must equal categories length (${categories.length})`,
+        );
+      }
       return {
         name: String(item.name ?? `series ${i}`),
-        values: item.values.map((v) => (typeof v === "number" ? v : Number(v))),
+        values: item.values.map((v, j) => {
+          const n = typeof v === "number" ? v : Number(v);
+          if (!Number.isFinite(n)) {
+            throw new Error(
+              `render_chart: bar series[${i}].values[${j}] must be a finite number`,
+            );
+          }
+          return n;
+        }),
       };
     });
     return { type, data: { categories, series }, ...common };
