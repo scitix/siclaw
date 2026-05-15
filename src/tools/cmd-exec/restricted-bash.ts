@@ -246,6 +246,7 @@ In local mode, text processing commands (grep, cut, sort, etc.) only work after 
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
 Multi-cluster: when multiple kubeconfigs are available, pass --kubeconfig=<name> (credential name, NOT file path) to select a cluster. Use cluster_list to discover available names. Never use full file paths in --kubeconfig — they will be blocked. Do NOT use KUBECONFIG= env prefix — only the --kubeconfig=<name> flag is supported.
+Namespace scope: do not broaden a namespace-scoped request to -A/--all-namespaces. If the user asks for the current namespace and the current kubeconfig namespace is not known, ask for the namespace or run a narrow context/namespace check first. Use -A only for explicitly cluster-wide requests, preferably with selectors or compact output.
 
 Rate protection rules for kubectl:
 - "kubectl logs" requires --tail=<N> or --since=<duration>; bare logs without these will be rejected.

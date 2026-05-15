@@ -8,14 +8,18 @@ import {
   DefaultResourceLoader,
   SessionManager,
   AuthStorage,
+  AgentSessionRuntime,
   ModelRegistry,
-  createReadTool,
-  createEditTool,
-  createWriteTool,
-  createGrepTool,
-  createFindTool,
-  createLsTool,
+  SettingsManager,
+  createReadToolDefinition,
+  createEditToolDefinition,
+  createWriteToolDefinition,
+  createGrepToolDefinition,
+  createFindToolDefinition,
+  createLsToolDefinition,
   type AgentSession,
+  type AgentSessionServices,
+  type LoadExtensionsResult,
   type ToolDefinition,
   type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
@@ -120,6 +124,8 @@ export interface CreateSiclawSessionOpts {
 export interface SiclawSessionResult {
   brain: BrainSession;
   session: AgentSession;  // backward compat — only set for pi-agent brain
+  runtime: AgentSessionRuntime;
+  extensionsResult: LoadExtensionsResult;
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
   kubeconfigRef: KubeconfigRef;
@@ -145,6 +151,16 @@ function resolveEmbeddingConfig(): MemoryIndexerOpts | undefined {
   if (!emb) return undefined;
   console.log(`[agent-factory] Embedding config: model=${emb.model} dims=${emb.dimensions}`);
   return emb;
+}
+
+function expandTildePath(value: string): string {
+  if (value === "~") return os.homedir();
+  if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+  return value;
+}
+
+function resolvePiAgentDir(): string {
+  return expandTildePath(process.env.PI_CODING_AGENT_DIR ?? path.join(os.homedir(), ".pi", "agent"));
 }
 
 /**
@@ -253,7 +269,8 @@ export async function createSiclawSession(
 ): Promise<SiclawSessionResult> {
   const config = loadConfig();
 
-  const authStorage = AuthStorage.create();
+  const agentDir = resolvePiAgentDir();
+  const authStorage = AuthStorage.create(path.join(agentDir, "auth.json"));
 
   // Bridge Siclaw-configured apiKey into pi-agent's credential chain (highest priority)
   const defaultLlm = getDefaultLlm();
@@ -273,7 +290,8 @@ export async function createSiclawSession(
     fs.writeFileSync(configPath, JSON.stringify({ providers: config.providers }, null, 2) + "\n");
   }
   const modelsJson = fs.existsSync(configPath) ? configPath : undefined;
-  const modelRegistry = new ModelRegistry(authStorage, modelsJson);
+  const modelRegistry = ModelRegistry.create(authStorage, modelsJson);
+  const settingsManager = SettingsManager.create(process.cwd(), agentDir);
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
@@ -338,7 +356,7 @@ export async function createSiclawSession(
 
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
 
-  const customTools = registry.resolve({
+  const customTools: ToolDefinition[] = registry.resolve({
     mode,
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef,
@@ -413,32 +431,32 @@ export async function createSiclawSession(
   const writeAllowedDirs = [userDataDir];
 
   const restrictedFileTools = [
-    createReadTool(cwd, {
+    createReadToolDefinition(cwd, {
       operations: {
         readFile: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsReadFile(p); },
         access: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
-    createEditTool(cwd, {
+    createEditToolDefinition(cwd, {
       operations: {
         readFile: async (p) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsReadFile(p); },
         writeFile: async (p, c) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsWriteFile(p, c, "utf-8"); },
         access: async (p) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
       },
     }),
-    createWriteTool(cwd, {
+    createWriteToolDefinition(cwd, {
       operations: {
         writeFile: async (p, c) => { assertPathAllowed(p, writeAllowedDirs, "write"); return fsWriteFile(p, c, "utf-8"); },
         mkdir: async (d) => { assertPathAllowed(d, writeAllowedDirs, "write"); await fsMkdir(d, { recursive: true }); },
       },
     }),
-    createGrepTool(cwd, {
+    createGrepToolDefinition(cwd, {
       operations: {
         isDirectory: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.statSync(p).isDirectory(); },
         readFile: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.readFileSync(p, "utf-8"); },
       },
     }),
-    createFindTool(cwd, {
+    createFindToolDefinition(cwd, {
       operations: {
         exists: (p) => { assertPathAllowed(p, readAllowedDirs, "find"); return fs.existsSync(p); },
         glob: (pattern, searchCwd, options) => {
@@ -447,16 +465,17 @@ export async function createSiclawSession(
         },
       },
     }),
-    createLsTool(cwd, {
+    createLsToolDefinition(cwd, {
       operations: {
         exists: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.existsSync(p); },
         stat: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.statSync(p); },
         readdir: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.readdirSync(p); },
       },
     }),
-  ];
+  ] as unknown as ToolDefinition[];
   // Push into customTools so they override framework defaults via extension mechanism
   customTools.push(...restrictedFileTools);
+  const activeToolNames = Array.from(new Set(customTools.map((tool) => tool.name)));
 
   // Skills: when userId is set (local mode), use per-user directory for isolation;
   // otherwise "." collapses to skillsBase/user/ (K8s single-user pod).
@@ -533,6 +552,8 @@ export async function createSiclawSession(
 
   loader = new DefaultResourceLoader({
     cwd,
+    agentDir,
+    settingsManager,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
       const parts = buildAppendSystemPrompt(memoryDir);
@@ -593,13 +614,16 @@ export async function createSiclawSession(
       )
     : undefined;
 
-  const { session, modelFallbackMessage } = await createAgentSession({
-    tools: restrictedFileTools,
+  const { session, modelFallbackMessage, extensionsResult } = await createAgentSession({
+    cwd,
+    agentDir,
+    tools: activeToolNames,
     customTools,
     resourceLoader: loader,
     sessionManager,
     authStorage,
     modelRegistry,
+    settingsManager,
     model: configuredModel,
     thinkingLevel: "high",
   });
@@ -618,6 +642,35 @@ export async function createSiclawSession(
   const guardRegistry = createGuardRegistry(contextWindow);
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
+  const services: AgentSessionServices = {
+    cwd,
+    agentDir,
+    authStorage,
+    settingsManager,
+    modelRegistry,
+    resourceLoader: loader,
+    diagnostics: [],
+  };
+  const runtime = new AgentSessionRuntime(
+    session,
+    services,
+    async (runtimeOptions) => {
+      const recreated = await createSiclawSession({
+        ...opts,
+        sessionManager: runtimeOptions.sessionManager,
+      });
+      return {
+        session: recreated.session,
+        extensionsResult: recreated.extensionsResult,
+        services: recreated.runtime.services,
+        diagnostics: [],
+        modelFallbackMessage: recreated.modelFallbackMessage,
+      };
+    },
+    [],
+    modelFallbackMessage,
+  );
+
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
+  return { brain, session, runtime, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

@@ -417,7 +417,7 @@ describe("compactionSafeguardExtension", () => {
       };
       const ctx = {
         model: undefined, // no model
-        modelRegistry: { getApiKey: vi.fn() },
+        modelRegistry: { getApiKeyAndHeaders: vi.fn() },
       };
 
       const result = await handler(event, ctx);
@@ -442,7 +442,7 @@ describe("compactionSafeguardExtension", () => {
       };
       const ctx = {
         model: { contextWindow: 200000, provider: "test", id: "test-model" },
-        modelRegistry: { getApiKey: vi.fn().mockResolvedValue(undefined) }, // no key
+        modelRegistry: { getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true }) }, // no key
       };
 
       const result = await handler(event, ctx);

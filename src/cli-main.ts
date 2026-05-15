@@ -187,7 +187,7 @@ void debugPodGC.start(credentialsDir).catch((err) => {
 });
 
 // Create session via shared factory
-const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
+const { brain, session, runtime, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
   await createSiclawSession({
     sessionManager,
     mode: "cli",
@@ -331,12 +331,12 @@ if (debugMode) {
 
 // Select run mode
 if (isPrintMode && initialMessage) {
-  await runPrintMode(session, {
+  await runPrintMode(runtime, {
     mode: "text",
     initialMessage,
   });
 } else {
-  const mode = new InteractiveMode(session, { modelFallbackMessage });
+  const mode = new InteractiveMode(runtime, { modelFallbackMessage });
 
   // Workaround: framework's getRegisteredToolDefinition only checks extension-registered
   // tools via extensionRunner.getAllRegisteredTools(), missing SDK custom tools passed

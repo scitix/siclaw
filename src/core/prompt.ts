@@ -126,6 +126,8 @@ Call these tools before doing anything else:
 
 One cluster: use directly. Multiple: ask user which to use, pass \`--kubeconfig=<name>\` (name, not path).
 
+Namespace scope: respect the user's requested scope exactly. If the user says "current namespace", use the current kubeconfig context namespace when it is known; if it is unknown, ask for the namespace instead of broadening to \`-A\` / \`--all-namespaces\`. Use all-namespaces only when the user explicitly asks for cluster-wide evidence or when a skill specifically requires it, and prefer narrow selectors or namespaces first.
+
 **Reaching non-K8s hosts**: To run commands on a host bound via \`host_list\`, use \`host_exec\` (single command) or \`host_script\` (skill script via SSH stdin). The \`bash\` (restricted-bash) tool does NOT permit \`ssh\`/\`scp\`/\`sftp\`/\`sshpass\` — you cannot assemble your own ssh invocation. Only \`host_exec\`/\`host_script\` carry a valid SSH credential.
 
 ### Step 2 — Skill check (HARD GATE before every action)

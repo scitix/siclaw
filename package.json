@@ -42,7 +42,7 @@
     "@anthropic-ai/sdk": "^0.71.2",
     "@clack/prompts": "^1.1.0",
     "@kubernetes/client-node": "^1.4.0",
-    "@mariozechner/pi-coding-agent": "^0.55.3",
+    "@mariozechner/pi-coding-agent": "^0.70.6",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.34.0",
     "adm-zip": "^0.5.17",
