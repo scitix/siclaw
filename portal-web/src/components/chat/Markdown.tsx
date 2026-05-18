@@ -1,4 +1,5 @@
-import ReactMarkdown from "react-markdown"
+import { useMemo } from "react"
+import ReactMarkdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { ChartRenderer, chartSpecLooksIncomplete, tryParseChartSpec } from "./ChartRenderer"
 
@@ -127,158 +128,168 @@ function ChartParseError({ source }: { source: string }) {
   )
 }
 
+// Parses the inner text of a ```chart fence into a chart spec. Each <pre>
+// node react-markdown produces is a separate component instance with its own
+// hook state, so useMemo here keys cleanly off the chunk of JSON text — the
+// returned spec is referentially stable as long as the text is unchanged,
+// which lets ChartRenderer's React.memo short-circuit cleanly while the LLM
+// continues streaming prose after the chart fence has closed.
+function ChartFence({ text }: { text: string }) {
+  const trimmed = text.trim()
+  const spec = useMemo(() => tryParseChartSpec(trimmed), [trimmed])
+  if (spec) return <ChartRenderer spec={spec} />
+  // Don't show the red parse-failed box mid-stream — ReactMarkdown re-renders
+  // on every token, so an unclosed chart fence would otherwise flash the
+  // error box for every chart until streaming finishes. Only treat it as a
+  // real error once the JSON has finished arriving.
+  if (chartSpecLooksIncomplete(trimmed)) return <ChartLoading />
+  return <ChartParseError source={trimmed} />
+}
+
+// Hoisted to module scope so each entry has stable function identity across
+// <Markdown> re-renders. Inlining this object inside the render body produces
+// fresh function references every token, which react-markdown surfaces as a
+// *new component type* for <pre>, <code>, etc., forcing React to unmount and
+// remount the entire chart subtree on every streamed token. That remount is
+// what made the SVG visibly flicker during (and a few seconds after) chart
+// generation while the model continued streaming prose past the chart fence.
+const MARKDOWN_COMPONENTS: Components = {
+  // Code blocks. ```chart fenced blocks contain a JSON spec emitted by mcp
+  // render_chart; we parse and render via the React ChartRenderer (theme-
+  // aware, no <pre> dark background, no SVG echo from the model).
+  //
+  // Every other fenced block — language-tagged or not — is rendered here by
+  // extracting the raw text and drawing one soft-styled <pre>. We do NOT pass
+  // `children` (the inner <code> element) through, because the `code`
+  // component below can't tell block code from inline code (a no-language
+  // fence's <code> carries no className) and would render it as orange inline
+  // text on a slate-900 box — the "black box, yellow text" artifact. Handling
+  // all block code here keeps `code` purely for inline spans.
+  pre({ children }) {
+    const child = Array.isArray(children) ? children[0] : children
+    const isElement =
+      !!child && typeof child === "object" && "props" in child
+    const className = isElement
+      ? (child as { props: { className?: string } }).props.className
+      : undefined
+    const rawChildren = isElement
+      ? (child as { props: { children?: unknown } }).props.children
+      : children
+    const text = Array.isArray(rawChildren)
+      ? rawChildren.join("")
+      : String(rawChildren ?? "")
+
+    if (hasLanguageClass(className, "chart")) {
+      return <ChartFence text={text} />
+    }
+
+    return (
+      <pre className="bg-secondary/60 text-foreground border border-border rounded-lg p-3 overflow-x-auto my-3 text-[13px] leading-relaxed font-mono whitespace-pre-wrap">
+        {text}
+      </pre>
+    )
+  },
+  // Inline code only — block code never reaches here (see `pre` above).
+  code({ children, ...props }) {
+    return (
+      <code
+        className="bg-secondary text-orange-400 px-1.5 py-0.5 rounded text-[13px] font-mono"
+        {...props}
+      >
+        {children}
+      </code>
+    )
+  },
+  p({ children }) {
+    return <p className="mb-2 last:mb-0">{children}</p>
+  },
+  ul({ children }) {
+    return <ul className="list-disc pl-5 mb-2 space-y-1">{children}</ul>
+  },
+  ol({ children }) {
+    return <ol className="list-decimal pl-5 mb-2 space-y-1">{children}</ol>
+  },
+  li({ children }) {
+    return <li className="leading-relaxed">{children}</li>
+  },
+  h1({ children }) {
+    return <h1 className="text-xl font-bold mb-2 mt-3 first:mt-0">{children}</h1>
+  },
+  h2({ children }) {
+    return <h2 className="text-lg font-bold mb-2 mt-3 first:mt-0">{children}</h2>
+  },
+  h3({ children }) {
+    return <h3 className="text-base font-bold mb-1.5 mt-2 first:mt-0">{children}</h3>
+  },
+  a({ href, children }) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-blue-400 hover:underline"
+      >
+        {children}
+      </a>
+    )
+  },
+  blockquote({ children }) {
+    return (
+      <blockquote className="border-l-4 border-border pl-4 my-2 text-muted-foreground italic">
+        {children}
+      </blockquote>
+    )
+  },
+  table({ children }) {
+    return (
+      <div className="overflow-x-auto my-2">
+        <table className="min-w-full text-sm border border-border rounded">
+          {children}
+        </table>
+      </div>
+    )
+  },
+  thead({ children }) {
+    return <thead className="bg-secondary/50">{children}</thead>
+  },
+  th({ children }) {
+    return (
+      <th className="border-b border-border px-3 py-2 text-left font-semibold text-foreground">
+        {children}
+      </th>
+    )
+  },
+  td({ children }) {
+    return (
+      <td className="border-b border-border/50 px-3 py-2 text-foreground">
+        {children}
+      </td>
+    )
+  },
+  hr() {
+    return <hr className="my-3 border-border" />
+  },
+  strong({ children }) {
+    return <strong className="font-semibold">{children}</strong>
+  },
+  // Explicit width caps so a chart fits the chat bubble.
+  img({ src, alt }) {
+    return (
+      <img
+        src={src}
+        alt={alt ?? ""}
+        className="-mx-5 -my-3.5 max-w-none w-[calc(100%+2.5rem)] h-auto block"
+      />
+    )
+  },
+}
+
 export function Markdown({ children }: MarkdownProps) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkDemoteIndentedCode]}
       urlTransform={permissiveUrlTransform}
-      components={{
-        // Code blocks. ```chart fenced blocks contain a JSON spec emitted by
-        // mcp render_chart; we parse and render via the React ChartRenderer
-        // (theme-aware, no <pre> dark background, no SVG echo from the model).
-        //
-        // Every other fenced block — language-tagged or not — is rendered here
-        // by extracting the raw text and drawing one soft-styled <pre>. We do
-        // NOT pass `children` (the inner <code> element) through, because the
-        // `code` component below can't tell block code from inline code (a
-        // no-language fence's <code> carries no className) and would render it
-        // as orange inline text on a slate-900 box — the "black box, yellow
-        // text" artifact. Handling all block code here keeps `code` purely for
-        // inline spans.
-        pre({ children }) {
-          const child = Array.isArray(children) ? children[0] : children
-          const isElement =
-            !!child && typeof child === "object" && "props" in child
-          const className = isElement
-            ? (child as { props: { className?: string } }).props.className
-            : undefined
-          const rawChildren = isElement
-            ? (child as { props: { children?: unknown } }).props.children
-            : children
-          const text = Array.isArray(rawChildren)
-            ? rawChildren.join("")
-            : String(rawChildren ?? "")
-
-          if (hasLanguageClass(className, "chart")) {
-            const trimmed = text.trim()
-            const spec = tryParseChartSpec(trimmed)
-            if (spec) return <ChartRenderer spec={spec} />
-            // Don't show the red parse-failed box mid-stream — ReactMarkdown
-            // re-renders on every token, so an unclosed chart fence flashes
-            // an error for every chart until streaming finishes. Only treat
-            // it as a real error once the JSON has finished arriving.
-            if (chartSpecLooksIncomplete(trimmed)) return <ChartLoading />
-            return <ChartParseError source={trimmed} />
-          }
-
-          return (
-            <pre className="bg-secondary/60 text-foreground border border-border rounded-lg p-3 overflow-x-auto my-3 text-[13px] leading-relaxed font-mono whitespace-pre-wrap">
-              {text}
-            </pre>
-          )
-        },
-        // Inline code only — block code never reaches here (see `pre` above).
-        code({ children, ...props }) {
-          return (
-            <code
-              className="bg-secondary text-orange-400 px-1.5 py-0.5 rounded text-[13px] font-mono"
-              {...props}
-            >
-              {children}
-            </code>
-          )
-        },
-        // Paragraphs
-        p({ children }) {
-          return <p className="mb-2 last:mb-0">{children}</p>
-        },
-        // Lists
-        ul({ children }) {
-          return <ul className="list-disc pl-5 mb-2 space-y-1">{children}</ul>
-        },
-        ol({ children }) {
-          return <ol className="list-decimal pl-5 mb-2 space-y-1">{children}</ol>
-        },
-        li({ children }) {
-          return <li className="leading-relaxed">{children}</li>
-        },
-        // Headings
-        h1({ children }) {
-          return <h1 className="text-xl font-bold mb-2 mt-3 first:mt-0">{children}</h1>
-        },
-        h2({ children }) {
-          return <h2 className="text-lg font-bold mb-2 mt-3 first:mt-0">{children}</h2>
-        },
-        h3({ children }) {
-          return <h3 className="text-base font-bold mb-1.5 mt-2 first:mt-0">{children}</h3>
-        },
-        // Links
-        a({ href, children }) {
-          return (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:underline"
-            >
-              {children}
-            </a>
-          )
-        },
-        // Blockquotes
-        blockquote({ children }) {
-          return (
-            <blockquote className="border-l-4 border-border pl-4 my-2 text-muted-foreground italic">
-              {children}
-            </blockquote>
-          )
-        },
-        // Tables (GFM)
-        table({ children }) {
-          return (
-            <div className="overflow-x-auto my-2">
-              <table className="min-w-full text-sm border border-border rounded">
-                {children}
-              </table>
-            </div>
-          )
-        },
-        thead({ children }) {
-          return <thead className="bg-secondary/50">{children}</thead>
-        },
-        th({ children }) {
-          return (
-            <th className="border-b border-border px-3 py-2 text-left font-semibold text-foreground">
-              {children}
-            </th>
-          )
-        },
-        td({ children }) {
-          return (
-            <td className="border-b border-border/50 px-3 py-2 text-foreground">
-              {children}
-            </td>
-          )
-        },
-        // Horizontal rule
-        hr() {
-          return <hr className="my-3 border-border" />
-        },
-        // Strong / em
-        strong({ children }) {
-          return <strong className="font-semibold">{children}</strong>
-        },
-        // Images — explicit width caps so a chart fits the chat bubble.
-        img({ src, alt }) {
-          return (
-            <img
-              src={src}
-              alt={alt ?? ""}
-              className="-mx-5 -my-3.5 max-w-none w-[calc(100%+2.5rem)] h-auto block"
-            />
-          )
-        },
-      }}
+      components={MARKDOWN_COMPONENTS}
     >
       {escapeIntraWordUnderscores(children)}
     </ReactMarkdown>

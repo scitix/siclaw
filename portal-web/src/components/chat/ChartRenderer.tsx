@@ -23,6 +23,7 @@
 import {
   type CSSProperties,
   type ReactNode,
+  memo,
   useRef,
   useState,
   useCallback,
@@ -697,7 +698,7 @@ interface ChartRendererProps {
 // tooltip (px relative to the chart-area wrapper, already edge-clamped).
 interface HoverState { index: number; left: number; top: number }
 
-export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
+function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [status, setStatus] = useState<null | { kind: "ok" | "err"; text: string }>(null)
@@ -1000,3 +1001,17 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
     </div>
   )
 }
+
+// Wrap with React.memo so the SVG subtree skips reconciliation when the parent
+// re-renders with an equivalent spec. The chart lives inside a streaming chat
+// bubble whose <Markdown> parent re-runs on every token the LLM emits *after*
+// the chart fence closes — without this guard each trailing prose token would
+// rebuild hundreds of SVG nodes, producing visible flicker for the seconds it
+// takes the model to finish the reply. We compare by serialised spec (cheap —
+// specs are small JSON) so a freshly-parsed-but-equal spec object
+// short-circuits identically to a referentially-stable one.
+export const ChartRenderer = memo(ChartRendererImpl, (prev, next) => {
+  if (prev.className !== next.className) return false
+  if (prev.style !== next.style) return false
+  return JSON.stringify(prev.spec) === JSON.stringify(next.spec)
+})
