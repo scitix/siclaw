@@ -151,9 +151,9 @@ function CodeBlock({ language, text }: { language: string; text: string }) {
     void copy(text)
   }
   return (
-    <div className="my-3 overflow-hidden rounded-lg border border-border bg-secondary/60">
-      <div className="flex items-center justify-between border-b border-border/60 bg-secondary/80 px-3 py-1.5">
-        <span className="font-mono text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+    <div className="my-2 overflow-hidden rounded-lg border border-border bg-secondary/60">
+      <div className="flex items-center justify-between border-b border-border/60 bg-secondary/80 px-3 py-0.5">
+        <span className="font-mono text-[11px] font-medium text-muted-foreground">
           {language}
         </span>
         <button
@@ -167,7 +167,7 @@ function CodeBlock({ language, text }: { language: string; text: string }) {
           {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
         </button>
       </div>
-      <pre className="overflow-x-auto p-3 text-[13px] leading-relaxed font-mono text-foreground whitespace-pre-wrap">
+      <pre className="overflow-x-auto px-3 py-2 text-[13px] leading-snug font-mono text-foreground whitespace-pre-wrap">
         {text}
       </pre>
     </div>
