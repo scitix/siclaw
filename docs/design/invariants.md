@@ -35,20 +35,20 @@ TUI has two sub-modes: **standalone** (no Portal in the cwd) and **Portal-paired
 **Invariant**: In local mode (`LocalSpawner`), every AgentBox instance runs in the same Node.js process as Gateway and shares the same working directory and filesystem.
 
 **Consequences**:
-- Any code that writes/deletes files in `./skills/` affects ALL users simultaneously
-- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories (not `core/`), which in a shared filesystem destroys ALL users' personal skills. This is designed for K8s pods with isolated filesystems.
-- Per-user skill sync in local mode must write only to `skills/user/<userId>/` without touching `skills/core/` (global + personal skills from the bundle are both written into the user's directory)
+- Any code that writes/deletes files in `.siclaw/skills/` affects ALL users simultaneously
+- `skillsHandler.materialize()` is **NOT safe** in local mode — it wipes and rebuilds `.siclaw/skills/resolved/`, a single shared directory. LocalSpawner therefore explicitly **skips** the skills handler (see `local-spawner.ts:113-117`) — knowledge sync runs (its handler merges instead of wiping), but skills and MCP sync are intentionally not called.
+- Consequence: in local mode, agents only see skills from `skills/core/` + `skills/platform/` baked into the repo. DB-managed skills (user-created or admin-bound) are **not delivered to local agents**. Multi-tenant skill delivery requires K8s mode (one pod per user with its own emptyDir).
 - Local SQLite (via `node:sqlite`) uses WAL mode with a shared process — local mode is single-process by design; production K8s uses MySQL and has no such constraint
 
-**Source**: `src/gateway/agentbox/local-spawner.ts`, `src/agentbox/resource-handlers.ts:82-97`
+**Source**: `src/gateway/agentbox/local-spawner.ts:113-133`, `src/agentbox/sync-handlers.ts` (skillsHandler.materialize)
 
 ### 1.3 K8s Pod Isolation
 
 **Invariant**: Each K8s AgentBox pod is fully isolated: its own emptyDir volume for skills, its own mTLS client certificate, its own process. Skills sync via `skillsHandler.materialize()` is safe here because there is no shared filesystem.
 
 **Consequences**:
-- The `global/`, `skillset/`, and `user/` skill subdirectories in a pod are managed by resource sync — wiped and rebuilt on every sync. `core/` and `extension/` are baked into the image.
-- Core skills ARE baked into the Docker image (`COPY skills/core/ ./skills/core/` in Dockerfile.agentbox). They are NOT delivered via the skill bundle — see §2.1.
+- The pod's `.siclaw/skills/resolved/` directory is managed by resource sync — wiped and rebuilt by `skillsHandler.materialize()` on every reload. `skills/core/` and `skills/platform/` are baked into the image and read-only.
+- Builtin skills ARE baked into the Docker image (`COPY skills/core/` + `COPY skills/platform/` in Dockerfile.agentbox). Core builtins are also synced into the DB at Gateway startup and flow through the same bundle pipeline as user skills — see §2.1. `skills/core/` on disk is the runtime fallback when `resolved/` doesn't exist (TUI / first-boot).
 - Pod self-destructs after 5 minutes of idle (no SSE connections, no sessions)
 
 **Source**: `src/gateway/agentbox/k8s-spawner.ts`, `src/agentbox/http-server.ts` (IDLE_TIMEOUT_MS)
@@ -105,7 +105,7 @@ The trust boundary remains "whoever can read `.siclaw/local-secrets.json` in the
 ```
 
 - The directory is **ephemeral**: TUI wipes it on `SIGINT` / `SIGTERM` / normal exit.
-- These materializers are **distinct from** `skillsHandler.materialize()` (§1.2). The canonical handler mutates `skills/{global,skillset,user}/` and is unsafe in LocalSpawner's shared filesystem; the Portal-snapshot materializers write only to `.siclaw/.portal-snapshot/` inside the cwd and are scoped to the TUI process. Do not consolidate the two without redesigning the skill-bundle contract.
+- These materializers are **distinct from** `skillsHandler.materialize()` (§1.2). The canonical handler wipes and rebuilds `.siclaw/skills/resolved/` (a single shared path, unsafe in LocalSpawner); the Portal-snapshot materializers write only to `.siclaw/.portal-snapshot/` inside the cwd and are scoped to the TUI process. Do not consolidate the two without redesigning the skill-bundle contract.
 - `agent-factory.ts` picks up these paths via new `portalSkillsDir` / `portalKnowledgeDir` / `portalCredentialsDir` opts; when set, they override `config.paths.*` so the agent's Read tool, `local_script`, and kubectl use Portal content.
 
 **Skill filter** (`src/core/agent-factory.ts`):
@@ -119,42 +119,64 @@ When a Portal snapshot is active, pi-coding-agent's `DefaultResourceLoader` auto
 
 ### 2.1 What a Bundle Contains
 
-**Invariant**: `buildSkillBundle()` packages **only global + skillset (dev only) + personal skills** from the database. When a workspace composer is present, each scope is filtered to the workspace selection. Core (builtin) skills are NEVER included in bundles.
+**Invariant**: The skill bundle endpoint (`POST /api/internal/siclaw/skills/bundle`) packages **the skills bound to the requesting agent** via `agent_skills`, filtered by the agent's `is_production` flag. Builtins flow through the same pipeline — they were synced from `skills/core/` into the DB at Gateway startup with `is_builtin=1`.
 
 ```
-Bundle = selected global skills (DB, published tag) + selected skillset skills (DB, dev only) + selected personal skills (DB)
-Bundle ≠ core skills (baked into image/repo checkout)
+Prod agent → SELECT FROM skill_versions WHERE is_approved=1 AND version=MAX(...)
+              JOIN agent_skills ON ... WHERE agent_id = ?
+              ──────────────────────────────────────────────────
+              Draft / pending_review skills are silently excluded.
+
+Dev agent  → SELECT current specs/scripts FROM skills s
+              JOIN agent_skills ON ... WHERE agent_id = ?
+              ──────────────────────────────────────────────────
+              Draft + installed both delivered.
+
+Overlay    → When an overlay (overlay_of != NULL) exists for a builtin,
+              the bundle returns the overlay's content under the same id/name,
+              and the base builtin is suppressed.
 ```
 
-**Source**: `src/gateway/skills/skill-bundle.ts:1-10`
+**Disk runtime fallback**: when `.siclaw/skills/resolved/` is absent (TUI mode, first boot), the agent reads directly from `skills/core/` on disk. `skills/platform/` is **always** loaded on top — those are platform meta-skills, not in the DB.
 
-### 2.2 Skill Directory Tiers
+**Source**: `src/portal/adapter.ts` (POST /api/internal/siclaw/skills/bundle), `src/agentbox/sync-handlers.ts` (skillsHandler.materialize)
 
-```
-skills/
-├── core/              ← Built-in, read-only, baked into image. Never overwritten by sync.
-├── extension/         ← Builtin overlay (inner projects). Baked into image.
-├── global/            ← Global skills, synced from DB. Supplements/overrides builtin.
-├── skillset/{spaceId}/ ← Skill Space skills, synced from DB. Dev only.
-└── user/{userId}/     ← Personal skills, synced from DB per user.
-```
-
-**Loading priority** (highest wins): `personal` > `skillset` > `global` > `builtin`
-
-### 2.3 Skill Activation Gate
-
-Scripts in a skill follow this workflow before execution is permitted:
+### 2.2 Skill Directory Layout
 
 ```
-draft → (request review) → pending → (AI + static analysis) → approved/rejected
+skills/                          ← Repo / Docker image, read-only at runtime
+├── core/                         ← Builtin diagnostic skills (Docker-baked); synced into DB at Gateway startup
+└── platform/                     ← Platform meta-skills (skill-authoring, manage-skill); never in DB, always loaded
+
+.siclaw/skills/                  ← Runtime working directory
+└── resolved/                     ← Flat dir written by skillsHandler.materialize() from the bundle; single shared path (no per-user segment)
+
+.siclaw/.portal-snapshot/        ← TUI + local Portal only (ephemeral)
+└── skills/                       ← Written by portal-skill-materializer; wiped on TUI exit
 ```
 
-- **Static analysis**: 22 `DANGER_PATTERNS` (Critical 8 / High 8 / Medium 6) in `ScriptEvaluator`
-- **AI analysis**: LLM semantic review with mandatory rule — "Skills MUST be strictly read-only"
-- **Human gate**: `skill_reviewer` role must approve before `published` status
-- Skills with unapproved scripts **cannot** be executed via `local_script`
+There is **no scope-based directory tier**. Skill identity is `(org_id, name)` in the database; `dirName` is derived from `name` at materialize time. The execution chain sees a single flat `resolved/` directory.
 
-**Source**: `src/gateway/skills/script-evaluator.ts`
+### 2.3 Skill Status Lifecycle
+
+A skill has a single `status` column gating its execution eligibility:
+
+```
+draft ──submit──▶ pending_review ──approve──▶ installed
+  ▲                     │                          │
+  │                   reject                      edit
+  │                     │                          │
+  └─────── withdraw ────┘                          ▼
+  └────────────────────────────────────────── (creates new version,
+                                                status → draft)
+```
+
+- **Edit on `installed`** creates a new `skill_versions` row and resets status to `draft` — re-submit required before prod agents see it again
+- **Approve** sets the current version's `is_approved = 1` and `status = installed`
+- **Rollback** copies a target historical version's content into a new version with `status = draft` (must re-review)
+- **Security review** runs on submit: two-phase (static pattern scan + AI semantic analysis) → stored in `skill_reviews`
+
+**Source**: `src/gateway/skills/script-evaluator.ts`, `src/gateway/skills/ai-security-reviewer.ts`, `docs/design/2026-04-13-skill-governance-design.md`
 
 ### 2.4 Skill Script Execution
 
@@ -306,17 +328,18 @@ postReload(context)  Notify active sessions to pick up changes
 ```
 
 - `fetch` is network I/O with retry (3 attempts, exponential backoff: 1s, 2s, 4s)
-- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `global/` + `skillset/` + `user/` subdirs then rebuilds)
+- `materialize` is local filesystem write — **idempotent but destructive for skills** (wipes `.siclaw/skills/resolved/` then rebuilds from the bundle). Empty-bundle protection: if the incoming payload is empty but `resolved/` already has skills, the wipe is skipped.
 - `postReload` calls `brain.reload()` on active sessions
 
 ### 6.2 When to Use Each Handler
 
 | Handler | Safe in LocalSpawner? | Safe in K8s pod? | Notes |
 |---------|----------------------|------------------|-------|
-| `mcpHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
-| `skillsHandler.materialize()` | ❌ No | ✅ Yes | Wipes `global/` + `skillset/` + `user/` subdirs (not `core/`) |
+| `knowledgeHandler.materialize()` | ✅ Yes | ✅ Yes | Merges, does not wipe |
+| `mcpHandler.materialize()` | ❌ No (skipped) | ✅ Yes | Wipes shared MCP config — LocalSpawner skips |
+| `skillsHandler.materialize()` | ❌ No (skipped) | ✅ Yes | Wipes `.siclaw/skills/resolved/` — LocalSpawner skips |
 
-For local mode skills sync, write directly to `skills/user/<userId>/` without delegating to `skillsHandler.materialize()`. Global and personal skills from the bundle are both placed under the user's directory.
+LocalSpawner explicitly calls only `knowledgeHandler` (see `local-spawner.ts:113-133`); the skills and MCP handlers are not invoked. Local-mode agents therefore see only baked builtins (`skills/core/` + `skills/platform/`) for skills and the static MCP config for MCP servers. Multi-tenant skill / MCP delivery requires K8s mode.
 
 ---
 

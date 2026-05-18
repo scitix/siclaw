@@ -130,13 +130,12 @@ the correct access boundaries.
 
 | Path | Owner | Mode | Volume | agentbox | sandbox | Notes |
 |------|-------|------|--------|----------|---------|-------|
-| `skills/core/` | agentbox:agentbox | 0755/0644 | rootfs (baked) | rwx/rw | r-x/r- | Built-in diagnostic skills. Baked into image. |
-| `.siclaw/skills/` | agentbox:agentbox | 0755/0644 | emptyDir | rwx/rw | r-x/r- | Global + skillset + personal skills synced from DB via `skillsHandler.materialize()`. |
+| `skills/core/` | agentbox:agentbox | 0755/0644 | rootfs (baked) | rwx/rw | r-x/r- | Built-in diagnostic skills. Baked into image, synced into DB at Gateway startup. |
+| `skills/platform/` | agentbox:agentbox | 0755/0644 | rootfs (baked) | rwx/rw | r-x/r- | Platform meta-skills (skill-authoring, manage-skill). Baked into image, always loaded, not in DB. |
+| `.siclaw/skills/resolved/` | agentbox:agentbox | 0755/0644 | emptyDir | rwx/rw | r-x/r- | Flat materialized skill set for this agent — written by `skillsHandler.materialize()` from the bundle. |
 | `/app/` (application code) | agentbox:agentbox | 0755/0644 | rootfs | rwx/rw | r-x/r- | Node.js dist, package.json, etc. |
 
-**Skills write flow in K8s mode**: `skill.create` → DB → `notifySkillReload` → AgentBox main
-process (agentbox user) calls `skillsHandler.materialize()` → writes to emptyDir at
-`.siclaw/skills/`. The sandbox user (child processes) only reads from this directory.
+**Skills write flow in K8s mode**: skill edited / approved in Portal → DB updated → Gateway notifies bound AgentBoxes → AgentBox main process (agentbox user) re-fetches the bundle and calls `skillsHandler.materialize()` → writes to emptyDir at `.siclaw/skills/resolved/`. The sandbox user (child processes) only reads from this directory.
 
 Agent needs to **read** skills (SKILL.md, scripts/) to understand and execute them.
 Agent must **never write** to skills — that goes through the skill review gate

@@ -62,13 +62,13 @@ async function main() {
   console.log(`[agentbox] cwd: ${process.cwd()}`);
   console.log(`[agentbox] userDataDir=${userDataDir}`);
   console.log(`[agentbox] skillsDir=${skillsDir}`);
-  for (const tier of ["core", "extension"]) {
-    const dir = path.join(skillsDir, tier);
-    if (fs.existsSync(dir)) {
-      const entries = fs.readdirSync(dir).filter(e => !e.startsWith("."));
-      console.log(`[agentbox] skills/${tier}: ${entries.length} entries${entries.length ? ` (${entries.join(", ")})` : ""}`);
+  {
+    const coreDir = path.join(skillsDir, "core");
+    if (fs.existsSync(coreDir)) {
+      const entries = fs.readdirSync(coreDir).filter(e => !e.startsWith("."));
+      console.log(`[agentbox] skills/core: ${entries.length} entries${entries.length ? ` (${entries.join(", ")})` : ""}`);
     } else {
-      console.warn(`[agentbox] WARNING: skills/${tier} NOT found at ${dir}`);
+      console.warn(`[agentbox] WARNING: skills/core NOT found at ${coreDir}`);
     }
   }
 

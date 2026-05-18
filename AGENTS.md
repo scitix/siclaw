@@ -43,10 +43,14 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
 ## Stable Boundaries
 
 - `LocalSpawner` runs all local AgentBox instances in one process with a shared
-  filesystem. Local skill sync must stay user-scoped and must not wipe shared
-  skill directories such as global/skillset/user trees.
-- Core skills are baked into the Docker image. Workspace skill bundles should
-  include only selected global/dev/personal skills.
+  filesystem. Local mode intentionally **skips** skill materialize (which would
+  wipe the shared `.siclaw/skills/resolved/` directory and clobber other users);
+  the agent reads from `skills/core/` and `skills/platform/` directly.
+- Skills live in a single flat per-org pool (`skills` table, `is_builtin` flag).
+  Bundles deliver the skills bound to the requesting agent via `agent_skills`,
+  filtered by the agent's `is_production` flag — prod agents only see versions
+  where `skill_versions.is_approved = 1`. Builtin skills (`skills/core/`) are
+  synced into the same DB pool at Gateway startup.
 - TUI plus local Portal uses Portal as a read-only snapshot source. TUI startup
   must tolerate missing or unauthorized Portal snapshot access.
 - Shell execution security is layered: OS-level isolation first, whitelist-only

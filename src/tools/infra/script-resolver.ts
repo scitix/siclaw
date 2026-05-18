@@ -7,15 +7,13 @@ function skillsBase(): string {
   return path.resolve(process.cwd(), config.paths.skillsDir);
 }
 
-/** Builtin skills directories (baked into Docker image at skills/core/ and skills/extension/) */
-const BUILTIN_TIERS = ["core", "extension"] as const;
-
+/** Builtin skills directory (baked into Docker image at skills/core/) */
 function builtinCoreDir(): string {
   return path.resolve(process.cwd(), "skills", "core");
 }
 
 function builtinDirs(): string[] {
-  return BUILTIN_TIERS.map(t => path.resolve(process.cwd(), "skills", t));
+  return [builtinCoreDir()];
 }
 
 /** Load disabled builtins list (written by agentbox startup from bundle API) */
@@ -33,7 +31,7 @@ function loadDisabledBuiltins(): Set<string> {
  * Skill scope directories to search (in priority order, CLI fallback).
  * Higher-specificity scopes first: global > builtin.
  */
-const SKILL_SCOPES = ["extension", "global", "core"];
+const SKILL_SCOPES = ["global", "core"];
 
 /** Directory entry with associated scope */
 interface ScopeDir {
@@ -43,7 +41,6 @@ interface ScopeDir {
 
 /** Map scope directory names to SkillScope values */
 const SCOPE_MAP: Record<string, SkillScope> = {
-  extension: "builtin",
   global: "global",
   core: "builtin",
 };
@@ -54,7 +51,7 @@ const SCOPE_MAP: Record<string, SkillScope> = {
  * Priority: global (bundle) > builtin (Docker image).
  * 1. Bundle-materialized resolved/ directory (built by materialize with priority merging)
  * 2. Legacy flat layout (bundle-materialized without scope subdirs)
- * 3. Scope subdirectories (extension > global > core)
+ * 3. Scope subdirectories (global > core)
  * 4. Builtin fallback (skills/core/) — unless disabled
  */
 function getSkillScriptDirs(skill: string): ScopeDir[] {
@@ -69,7 +66,7 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
   const directPath = path.join(base, skill, "scripts");
   if (fs.existsSync(directPath)) return [{ dir: directPath, scope: "global" }];
 
-  // 3. Scope subdirectories (extension > global > core)
+  // 3. Scope subdirectories (global > core)
   const dirs: ScopeDir[] = [];
   for (const scopeName of SKILL_SCOPES) {
     const dir = path.join(base, scopeName, skill, "scripts");
@@ -77,7 +74,7 @@ function getSkillScriptDirs(skill: string): ScopeDir[] {
   }
   if (dirs.length > 0) return dirs;
 
-  // 4. Builtin fallback (skills/{core,extension}/) — for skills not in the bundle
+  // 4. Builtin fallback (skills/core/) — for skills not in the bundle
   const disabled = loadDisabledBuiltins();
   if (!disabled.has(skill)) {
     for (const bDir of builtinDirs()) {
@@ -111,14 +108,14 @@ function getSkillBaseDirs(): string[] {
     return dirs;
   }
 
-  // 2. Scope subdirectories (extension > global > core)
+  // 2. Scope subdirectories (global > core)
   const dirs: string[] = [];
   for (const scope of SKILL_SCOPES) {
     const dir = path.join(base, scope);
     if (fs.existsSync(dir)) dirs.push(dir);
   }
 
-  // 3. Builtin fallback (skills/{core,extension}/ from Docker image)
+  // 3. Builtin fallback (skills/core/ from Docker image)
   for (const bDir of builtinDirs()) {
     if (fs.existsSync(bDir) && !dirs.includes(bDir)) dirs.push(bDir);
   }
@@ -133,14 +130,12 @@ export function skillExistsInBundle(skillName: string): boolean {
   const directDir = path.join(base, skillName);
   if (fs.existsSync(directDir) && fs.statSync(directDir).isDirectory()) return true;
   // Scope subdirectory layout
-  for (const scopeDir of ["extension", "global"]) {
-    const dir = path.join(base, scopeDir, skillName);
-    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
-  }
+  const dir = path.join(base, "global", skillName);
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return true;
   return false;
 }
 
-/** Check if a skill exists as a non-disabled builtin (skills/{core,extension}/) */
+/** Check if a skill exists as a non-disabled builtin (skills/core/) */
 export function skillExistsAsBuiltin(skillName: string): boolean {
   const disabled = loadDisabledBuiltins();
   if (disabled.has(skillName)) return false;

@@ -631,16 +631,13 @@ describe("skill directory resolution", () => {
   function resolveSkillDirs(cwd: string, skillsBase: string): string[] {
     const resolvedSkillsDir = path.join(skillsBase, "resolved");
     const builtinPath = path.resolve(cwd, "skills", "core");
-    const extensionPath = path.resolve(cwd, "skills", "extension");
     const platformPath = path.resolve(cwd, "skills", "platform");
 
     const skillsDirs: string[] = [];
     if (fs.existsSync(resolvedSkillsDir)) {
       skillsDirs.push(resolvedSkillsDir);
-    } else {
-      for (const bDir of [builtinPath, extensionPath]) {
-        if (fs.existsSync(bDir)) skillsDirs.push(bDir);
-      }
+    } else if (fs.existsSync(builtinPath)) {
+      skillsDirs.push(builtinPath);
     }
     if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);
     return skillsDirs;
@@ -660,19 +657,17 @@ describe("skill directory resolution", () => {
   });
 
   // ── 1. server mode: resolved/ exists → use resolved/ + platform/ ──────
-  it("server mode: resolved/ takes priority over core/ and extension/ when it exists", () => {
+  it("server mode: resolved/ takes priority over core/ when it exists", () => {
     const resolvedDir = path.join(skillsBase, "resolved");
     const platformDir = path.join(tmpDir, "skills", "platform");
     fs.mkdirSync(resolvedDir, { recursive: true });
     fs.mkdirSync(platformDir, { recursive: true });
-    // Also create core/ and extension/ to confirm they are NOT included
+    // Also create core/ to confirm it is NOT included
     fs.mkdirSync(path.join(tmpDir, "skills", "core"), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, "skills", "extension"), { recursive: true });
 
     const result = resolveSkillDirs(tmpDir, skillsBase);
     expect(result).toEqual([resolvedDir, platformDir]);
     expect(result).not.toContain(path.join(tmpDir, "skills", "core"));
-    expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
   });
 
   // ── 2. server mode: resolved/ exists, no platform/ → use resolved/ only
@@ -684,21 +679,8 @@ describe("skill directory resolution", () => {
     expect(result).toEqual([resolvedDir]);
   });
 
-  // ── 3. TUI mode: no resolved/ → fallback to core/ + extension/ + platform/
-  it("TUI mode: no resolved/ → falls back to core/ + extension/ + platform/", () => {
-    const coreDir = path.join(tmpDir, "skills", "core");
-    const extensionDir = path.join(tmpDir, "skills", "extension");
-    const platformDir = path.join(tmpDir, "skills", "platform");
-    fs.mkdirSync(coreDir, { recursive: true });
-    fs.mkdirSync(extensionDir, { recursive: true });
-    fs.mkdirSync(platformDir, { recursive: true });
-
-    const result = resolveSkillDirs(tmpDir, skillsBase);
-    expect(result).toEqual([coreDir, extensionDir, platformDir]);
-  });
-
-  // ── 4. TUI mode: no resolved/, no extension/ → core/ + platform/ ──────
-  it("TUI mode: no resolved/, no extension/ → core/ + platform/ only", () => {
+  // ── 3. TUI mode: no resolved/ → fallback to core/ + platform/ ─────────
+  it("TUI mode: no resolved/ → falls back to core/ + platform/", () => {
     const coreDir = path.join(tmpDir, "skills", "core");
     const platformDir = path.join(tmpDir, "skills", "platform");
     fs.mkdirSync(coreDir, { recursive: true });
@@ -706,7 +688,6 @@ describe("skill directory resolution", () => {
 
     const result = resolveSkillDirs(tmpDir, skillsBase);
     expect(result).toEqual([coreDir, platformDir]);
-    expect(result).not.toContain(path.join(tmpDir, "skills", "extension"));
   });
 
   // ── 5. platform always loaded: present in both server and TUI modes ───

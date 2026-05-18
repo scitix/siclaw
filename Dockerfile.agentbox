@@ -68,7 +68,6 @@ RUN npm ci --omit=dev
 # Copy compiled JS + skills + entrypoint (knowledge synced at runtime via bundle API)
 COPY --from=builder /app/dist/ ./dist/
 COPY skills/core/ ./skills/core/
-COPY skills/extension/ ./skills/extension/
 COPY skills/platform/ ./skills/platform/
 COPY docker/agentbox-entrypoint.sh /usr/local/bin/agentbox-entrypoint.sh
 

@@ -12,7 +12,7 @@ import {
 } from "./script-resolver.js";
 
 // script-resolver reads from process.cwd() + config.paths.skillsDir (".siclaw/skills")
-// and process.cwd() + "skills/{core,extension}" for builtins.
+// and process.cwd() + "skills/core" for builtins.
 // We use cwd + temp dirs to avoid polluting the real repo.
 
 let tmpRoot: string;
@@ -115,13 +115,6 @@ describe("resolveSkillScript — path search precedence", () => {
     expect(res!.content).toBe("core-script");
   });
 
-  it("falls back to skills/extension builtin", () => {
-    mkFile(path.join(tmpRoot, "skills/extension/ext-skill/scripts/b.sh"), "ext-script");
-    const res = resolveSkillScript("ext-skill", "b.sh");
-    expect(res).not.toBeNull();
-    expect(res!.scope).toBe("builtin");
-  });
-
   it("respects .disabled-builtins.json", () => {
     mkFile(path.join(tmpRoot, "skills/core/disabled-one/scripts/a.sh"), "x");
     fs.mkdirSync(path.join(tmpRoot, ".siclaw/skills"), { recursive: true });
@@ -155,7 +148,7 @@ describe("listSkillScripts", () => {
 describe("listAllSkillsWithScripts", () => {
   it("returns all skills + their scripts", () => {
     mkFile(path.join(tmpRoot, ".siclaw/skills/global/sk1/scripts/a.sh"));
-    mkFile(path.join(tmpRoot, ".siclaw/skills/extension/sk2/scripts/b.sh"));
+    mkFile(path.join(tmpRoot, "skills/core/sk2/scripts/b.sh"));
     const all = listAllSkillsWithScripts();
     const names = all.map(s => s.skill).sort();
     expect(names).toContain("sk1");

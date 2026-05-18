@@ -456,16 +456,16 @@ describe("createRestrictedBashTool", () => {
 });
 
 describe("isSkillScript", () => {
-  const extSkillsDir = path.join(process.cwd(), "skills", "extension");
+  const coreSkillsDir = path.join(process.cwd(), "skills", "core");
   const mockScript = path.join(
-    extSkillsDir,
-    "roce-perftest-pod",
+    coreSkillsDir,
+    "_test-perftest-pod",
     "scripts",
     "_mock-test.sh"
   );
   const mockPyScript = path.join(
-    extSkillsDir,
-    "roce-check-node-config",
+    coreSkillsDir,
+    "_test-check-node-config",
     "scripts",
     "_mock-test.py"
   );
@@ -478,43 +478,43 @@ describe("isSkillScript", () => {
   });
 
   afterAll(() => {
-    try { fs.rmSync(path.join(extSkillsDir, "roce-perftest-pod"), { recursive: true }); } catch {}
-    try { fs.rmSync(path.join(extSkillsDir, "roce-check-node-config"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(coreSkillsDir, "_test-perftest-pod"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(coreSkillsDir, "_test-check-node-config"), { recursive: true }); } catch {}
   });
 
   // bash/sh prefix
-  it("allows bash skills/extension/ script", () => {
-    expect(isSkillScript("bash skills/extension/roce-perftest-pod/scripts/_mock-test.sh --help")).toBe(true);
+  it("allows bash skills/core/ script", () => {
+    expect(isSkillScript("bash skills/core/_test-perftest-pod/scripts/_mock-test.sh --help")).toBe(true);
   });
 
-  it("allows sh skills/extension/ script", () => {
-    expect(isSkillScript("sh skills/extension/roce-perftest-pod/scripts/_mock-test.sh")).toBe(true);
+  it("allows sh skills/core/ script", () => {
+    expect(isSkillScript("sh skills/core/_test-perftest-pod/scripts/_mock-test.sh")).toBe(true);
   });
 
   it("allows bash with flags before script path", () => {
-    expect(isSkillScript("bash -e skills/extension/roce-perftest-pod/scripts/_mock-test.sh")).toBe(true);
+    expect(isSkillScript("bash -e skills/core/_test-perftest-pod/scripts/_mock-test.sh")).toBe(true);
   });
 
   // direct invocation
-  it("allows direct skills/extension/ script invocation", () => {
-    expect(isSkillScript("skills/extension/roce-perftest-pod/scripts/_mock-test.sh --server-pod pod-a")).toBe(true);
+  it("allows direct skills/core/ script invocation", () => {
+    expect(isSkillScript("skills/core/_test-perftest-pod/scripts/_mock-test.sh --server-pod pod-a")).toBe(true);
   });
 
   it("allows direct invocation with env var prefix", () => {
-    expect(isSkillScript("FOO=1 skills/extension/roce-perftest-pod/scripts/_mock-test.sh")).toBe(true);
+    expect(isSkillScript("FOO=1 skills/core/_test-perftest-pod/scripts/_mock-test.sh")).toBe(true);
   });
 
   // python3 prefix
-  it("allows python3 skills/extension/ script", () => {
-    expect(isSkillScript("python3 skills/extension/roce-check-node-config/scripts/_mock-test.py")).toBe(true);
+  it("allows python3 skills/core/ script", () => {
+    expect(isSkillScript("python3 skills/core/_test-check-node-config/scripts/_mock-test.py")).toBe(true);
   });
 
-  it("allows python skills/extension/ script", () => {
-    expect(isSkillScript("python skills/extension/roce-check-node-config/scripts/_mock-test.py --node x")).toBe(true);
+  it("allows python skills/core/ script", () => {
+    expect(isSkillScript("python skills/core/_test-check-node-config/scripts/_mock-test.py --node x")).toBe(true);
   });
 
   it("allows python3 with flags before script path", () => {
-    expect(isSkillScript("python3 -u skills/extension/roce-check-node-config/scripts/_mock-test.py")).toBe(true);
+    expect(isSkillScript("python3 -u skills/core/_test-check-node-config/scripts/_mock-test.py")).toBe(true);
   });
 
   // blocked
@@ -532,8 +532,8 @@ describe("isSkillScript", () => {
   });
 
   it("blocks path traversal", () => {
-    expect(isSkillScript("bash skills/extension/../../etc/passwd")).toBe(false);
-    expect(isSkillScript("skills/extension/../../etc/passwd")).toBe(false);
+    expect(isSkillScript("bash skills/core/../../etc/passwd")).toBe(false);
+    expect(isSkillScript("skills/core/../../etc/passwd")).toBe(false);
   });
 
   it("blocks bash with no arguments", () => {
@@ -776,16 +776,16 @@ describe("createRestrictedBashTool — find validation", () => {
 
 describe("createRestrictedBashTool — skill script whitelist", () => {
   const tool = createRestrictedBashTool();
-  const extSkillsDir = path.join(process.cwd(), "skills", "extension");
+  const coreSkillsDir = path.join(process.cwd(), "skills", "core");
   const mockScript = path.join(
-    extSkillsDir,
-    "roce-perftest-pod",
+    coreSkillsDir,
+    "_test-perftest-pod",
     "scripts",
     "_mock-test.sh"
   );
   const mockPyScript = path.join(
-    extSkillsDir,
-    "roce-check-node-config",
+    coreSkillsDir,
+    "_test-check-node-config",
     "scripts",
     "_mock-test.py"
   );
@@ -800,24 +800,24 @@ describe("createRestrictedBashTool — skill script whitelist", () => {
   });
 
   afterAll(() => {
-    try { fs.rmSync(path.join(extSkillsDir, "roce-perftest-pod"), { recursive: true }); } catch {}
-    try { fs.rmSync(path.join(extSkillsDir, "roce-check-node-config"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(coreSkillsDir, "_test-perftest-pod"), { recursive: true }); } catch {}
+    try { fs.rmSync(path.join(coreSkillsDir, "_test-check-node-config"), { recursive: true }); } catch {}
   });
 
-  it("allows bash skills/extension/ script", async () => {
+  it("allows bash skills/core/ script", async () => {
     const result = await tool.execute(
       "test-id",
-      { command: "bash skills/extension/roce-perftest-pod/scripts/_mock-test.sh --help" },
+      { command: "bash skills/core/_test-perftest-pod/scripts/_mock-test.sh --help" },
       undefined,
       {} as any
     );
     expect(result.content[0].text).not.toContain("Blocked");
   });
 
-  it("allows direct skills/extension/ script invocation", async () => {
+  it("allows direct skills/core/ script invocation", async () => {
     const result = await tool.execute(
       "test-id",
-      { command: "skills/extension/roce-perftest-pod/scripts/_mock-test.sh --server-pod pod-a" },
+      { command: "skills/core/_test-perftest-pod/scripts/_mock-test.sh --server-pod pod-a" },
       undefined,
       {} as any
     );
@@ -848,7 +848,7 @@ describe("createRestrictedBashTool — skill script whitelist", () => {
   it("blocks path traversal", async () => {
     const result = await tool.execute(
       "test-id",
-      { command: "bash skills/extension/../../etc/passwd" },
+      { command: "bash skills/core/../../etc/passwd" },
       undefined,
       {} as any
     );
@@ -865,10 +865,10 @@ describe("createRestrictedBashTool — skill script whitelist", () => {
     expect(result.content[0].text).toContain("Blocked");
   });
 
-  it("allows python3 skills/extension/ script", async () => {
+  it("allows python3 skills/core/ script", async () => {
     const result = await tool.execute(
       "test-id",
-      { command: "python3 skills/extension/roce-check-node-config/scripts/_mock-test.py --node x" },
+      { command: "python3 skills/core/_test-check-node-config/scripts/_mock-test.py --node x" },
       undefined,
       {} as any
     );

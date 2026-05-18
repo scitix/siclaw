@@ -33,7 +33,6 @@ COPY --from=builder /app/dist/ ./dist/
 
 # Copy builtin skills
 COPY skills/core/ ./skills/core/
-COPY skills/extension/ ./skills/extension/
 
 RUN mkdir -p .siclaw
 

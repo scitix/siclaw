@@ -24,12 +24,17 @@ Gateway + K8sSpawner  (production — one isolated pod per user)
 ### 🔴 Local Mode: Shared Filesystem
 
 `LocalSpawner` runs ALL AgentBox instances **in-process**, sharing one filesystem.
-- `skillsHandler.materialize()` **must NOT be called in local mode** — wipes all users' skills
-- Local skills sync writes only to `skills/user/{userId}/` scoped paths
+- `skillsHandler.materialize()` **must NOT be called in local mode** — would wipe the shared `.siclaw/skills/resolved/` and clobber every other user
+- LocalSpawner intentionally **skips** skill sync entirely (see `local-spawner.ts:113-117`); local agents read directly from `skills/core/` + `skills/platform/`
+- Knowledge sync IS called in LocalSpawner (its handler merges instead of wiping); MCP is also skipped for the same shared-state reason
 
 ### 🔴 Skill Bundle Contract
 
-`buildSkillBundle()` packages **only global + skillset (dev only) + personal skills** selected for the current workspace. Core skills are baked into the Docker image. `materialize()` does NOT restore core skills.
+The skill bundle endpoint (`/api/internal/siclaw/skills/bundle`) delivers **the skills bound to the requesting agent** via `agent_skills`, filtered by the agent's `is_production` flag:
+- **Prod agent**: only the latest `skill_versions` row where `is_approved = 1` (status-gated; draft skills are silently excluded)
+- **Dev agent**: current `skills.specs` / `skills.scripts` (draft + installed both delivered)
+
+Builtin skills (`is_builtin = 1`) flow through the same pipeline — synced from `skills/core/` into the DB at Gateway startup. `materialize()` writes everything into `.siclaw/skills/resolved/` (flat, no per-user segment). The on-disk `skills/core/` directory is the **fallback** when `resolved/` doesn't exist (TUI mode, first boot). The full design lives in `docs/design/2026-04-13-skill-governance-design.md`.
 
 ### 🔴 TUI + Local Portal: Read-Only Snapshot Contract
 

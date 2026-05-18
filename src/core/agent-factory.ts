@@ -525,7 +525,6 @@ export async function createSiclawSession(
   // Fallback: only when resolved/ doesn't exist (TUI mode where Gateway sync
   // never runs). Server modes always have resolved/ created by materialize.
   const builtinPath = path.resolve(cwd, "skills", "core");
-  const extensionPath = path.resolve(cwd, "skills", "extension");
   const platformPath = path.resolve(cwd, "skills", "platform");
 
   const skillsDirs: string[] = [];
@@ -535,10 +534,8 @@ export async function createSiclawSession(
     skillsDirs.push(opts.portalSkillsDir);
   } else if (fs.existsSync(resolvedSkillsDir)) {
     skillsDirs.push(resolvedSkillsDir);
-  } else {
-    for (const bDir of [builtinPath, extensionPath]) {
-      if (fs.existsSync(bDir)) skillsDirs.push(bDir);
-    }
+  } else if (fs.existsSync(builtinPath)) {
+    skillsDirs.push(builtinPath);
   }
   // Platform skills are always loaded (system-level, not user-managed)
   if (fs.existsSync(platformPath)) skillsDirs.push(platformPath);

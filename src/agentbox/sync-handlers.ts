@@ -114,7 +114,6 @@ interface SkillBundlePayload {
     scope: "builtin" | "global";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
-    skillSpaceId?: string;
   }>;
 }
 

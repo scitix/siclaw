@@ -69,22 +69,26 @@ LocalSpawner runs AgentBox HTTP servers in-process, one per user, on ports 4000+
 **Status**: Active
 
 **Context**:
-The skill bundle API (`/api/internal/skills/bundle`) delivers skills to AgentBox instances. Should it include core (built-in) skills?
+The skill bundle API (`/api/internal/siclaw/skills/bundle`) delivers skills to AgentBox instances. How are core (built-in) skills delivered, and how are draft vs approved versions separated?
 
 Options:
-- **Include all**: Bundle contains core + global + personal. Simple for AgentBox (one source of truth). Expensive: Gateway must serialize all core skill files on every request.
-- **Exclude core**: Bundle contains only global + personal. Core skills are baked into the Docker image / repo checkout. AgentBox reads them from disk directly.
+- **Disk-only core**: Bundle excludes builtins; AgentBox reads core from `skills/core/` baked into the image. Two execution sources (disk + bundle) to merge at runtime. Forces a separate "disabled builtins" channel for opt-out.
+- **DB-backed core (current)**: Builtins are synced from `skills/core/` into the DB at Gateway startup (with `is_builtin=1` flag) and flow through the same bundle pipeline as user skills. One source of truth at runtime; per-agent binding and version history work uniformly.
 
 **Decision**:
-Bundles contain **only global + skillset (dev only) + personal skills**. Core skills are baked into the AgentBox Docker image at build time and read from `skills/core/` at runtime. Skillset skills (from Skill Spaces) are included only in dev bundles — they must be promoted to global scope before reaching production.
+Builtins are synced into the DB at Gateway startup and delivered through the unified bundle pipeline. The bundle endpoint filters by `agent_skills` membership and `is_production` flag:
+- **Prod agent** → only `skill_versions` rows where `is_approved = 1` (status-gated)
+- **Dev agent** → current `skills.specs` / `skills.scripts` (draft + installed both delivered)
+
+Overlays (`overlay_of` FK) let a user-created skill replace a builtin's content while sharing the name. The on-disk `skills/core/` directory is only used as the **runtime fallback** when `.siclaw/skills/resolved/` is absent (TUI mode, first boot).
 
 **Consequences**:
-- ✅ Bundle requests are small and fast (no large static skill content)
-- ✅ Core skills are versioned with the code, not the database
-- ⚠️ `skillsHandler.materialize()` does NOT restore core skills — it only writes what's in the bundle
-- ⚠️ In local mode, `materialize()` wipes `skills/global/`, `skills/skillset/`, and `skills/user/` subdirectories, destroying ALL users' personal skills on the shared filesystem — see ADR-002 for why local mode cannot safely call `materialize()`
-- ⚠️ If a user disables a core skill, the `disabledBuiltins` list in the bundle tells AgentBox which core skills to skip
-- ⚠️ Skillset skills are dev-only — untested collaborative work cannot reach production without promotion to global
+- ✅ One pipeline, one schema — builtins, user skills, and overlays all use the same `skills` / `skill_versions` / `skill_reviews` tables and the same review gate
+- ✅ Per-agent binding via `agent_skills` — admins explicitly attach skills to each agent
+- ✅ Prod safety: draft skills cannot reach prod agents (filter at the bundle query)
+- ⚠️ `skillsHandler.materialize()` wipes `.siclaw/skills/resolved/` and rebuilds it from the bundle — destructive when called against a shared filesystem; LocalSpawner explicitly **skips** the skills handler (see `local-spawner.ts:113-117`)
+- ⚠️ In local mode, agents see only `skills/core/` + `skills/platform/` — DB-managed skills are not delivered. This is a known limitation of the multi-user-shared-FS model; multi-tenant skill delivery requires K8s mode
+- ⚠️ Empty-bundle protection: `materialize()` refuses to wipe `resolved/` if the incoming payload is empty but existing content is non-empty (guards against transient Gateway errors)
 
 ---
 
