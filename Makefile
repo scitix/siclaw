@@ -74,7 +74,7 @@ build-portal-web: ## Compile Portal frontend (Vite)
 docker: docker-runtime docker-agentbox docker-portal ## Build all Docker images
 
 docker-runtime: ## Build runtime image
-	docker build -f Dockerfile.gateway $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
+	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
 
 docker-agentbox: ## Build agentbox image
 	docker build -f Dockerfile.agentbox $(DOCKER_LABELS) -t $(AGENTBOX_IMAGE) .
