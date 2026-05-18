@@ -2,6 +2,8 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { RenderChartArgs, RenderChartResult } from "./types.js";
 
+const CHART_SPEC_VERSION = 1;
+
 export const RENDER_CHART_INPUT_SCHEMA = {
   type: "object",
   required: ["type", "data"],
@@ -46,7 +48,7 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
   const args = validate(rawArgs);
   const id = newChartId(args.type);
 
-  const spec = JSON.stringify(args);
+  const spec = JSON.stringify({ ...args, schema_version: CHART_SPEC_VERSION });
   const markdownEmbed = "```chart\n" + spec + "\n```";
 
   let specPath: string | undefined;
@@ -60,10 +62,12 @@ export async function handleRenderChart(rawArgs: unknown): Promise<{
   }
 
   const result: RenderChartResult = {
+    schema_version: CHART_SPEC_VERSION,
     chart_id: id,
     type: args.type,
+    artifact_kind: "chart_spec",
     spec_path: specPath ?? "",
-    svg_path: specPath ?? "",
+    svg_path: "",
     bytes: Buffer.byteLength(spec, "utf8"),
     embed_instructions:
       "Paste the READY_TO_PASTE block above verbatim into your reply where the chart should appear. Do not modify the JSON, add backslashes, escape non-ASCII characters, convert to ```svg, or inline an <img>.",

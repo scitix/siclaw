@@ -21,6 +21,7 @@ import {
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
+import { svgChartToPngDataUrl, tryParseChartSpec } from "./ChartRenderer"
 import { InputArea } from "./InputArea"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
@@ -310,7 +311,7 @@ export function PilotArea({
     <div className="flex-1 flex flex-col h-full bg-card relative">
       {visibleForCopy.length > 0 && (
         <div className="absolute top-2 left-3 z-10">
-          <CopySessionButton messages={visibleForCopy} />
+          <CopySessionButton messages={visibleForCopy} containerRef={scrollContainerRef} />
         </div>
       )}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 lg:px-8 py-8" onScroll={handleScroll}>
@@ -1189,20 +1190,25 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
 
 // Tracks "copied" feedback state with a self-cancelling timer so back-to-back
 // clicks don't leave a dangling timeout that clears the green check too early.
-function useCopyFeedback(): [boolean, (text: string) => Promise<void>] {
+// `flash` lets callers that copy via a custom path (e.g. rich text/html with
+// rasterised charts) still surface the same green-check feedback.
+function useCopyFeedback(): [boolean, (text: string) => Promise<void>, () => void] {
   const [copied, setCopied] = useState(false)
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => () => {
     if (timerRef.current) clearTimeout(timerRef.current)
   }, [])
-  const copy = useCallback(async (text: string) => {
-    const ok = await copyTextToClipboard(text)
-    if (!ok) return
+  const flash = useCallback(() => {
     setCopied(true)
     if (timerRef.current) clearTimeout(timerRef.current)
     timerRef.current = setTimeout(() => setCopied(false), 2000)
   }, [])
-  return [copied, copy]
+  const copy = useCallback(async (text: string) => {
+    const ok = await copyTextToClipboard(text)
+    if (!ok) return
+    flash()
+  }, [flash])
+  return [copied, copy, flash]
 }
 
 function serializeSessionToText(messages: PilotMessage[]): string {
@@ -1213,7 +1219,7 @@ function serializeSessionToText(messages: PilotMessage[]): string {
     if (m.role === "user") {
       lines.push(`You:\n${m.content.trim()}`)
     } else if (m.role === "assistant") {
-      const body = (m.content ?? "").trim()
+      const body = stripChartFences(m.content ?? "")
       if (body) lines.push(`Assistant:\n${body}`)
     } else if (m.role === "tool") {
       const name = m.toolName ?? "tool"
@@ -1227,9 +1233,108 @@ function serializeSessionToText(messages: PilotMessage[]): string {
   return lines.join("\n\n")
 }
 
-function CopySessionButton({ messages }: { messages: PilotMessage[] }) {
-  const [copied, copy] = useCopyFeedback()
-  const handleCopy = () => {
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+}
+
+// Build a text/html rendition of the whole session with each ```chart fenced
+// block swapped for its rasterised PNG. The PNGs are passed in DOM order; an
+// assistant message's fences are mapped to them left-to-right, skipping fences
+// whose JSON failed to parse (those rendered no chart in the DOM, so they did
+// not consume a PNG).
+//
+// KNOWN LIMITATION — this PNG↔fence mapping is best-effort, not exact. It
+// assumes `tryParseChartSpec` succeeding here implies the fence rendered a real
+// `.chart-host svg` in the DOM. That can drift if a fence parsed but the chart
+// did not actually mount (e.g. it was still in the streaming/loading state, or
+// future render-gating changes), in which case later images attach to the
+// wrong message. Acceptable for a copy-to-clipboard convenience; if it ever
+// needs to be exact, walk per-message DOM nodes instead of re-parsing text.
+function serializeSessionToHtml(messages: PilotMessage[], chartUrls: string[]): string {
+  const fenceRe = /```chart\s*([\s\S]*?)```/g
+  let chartIdx = 0
+  const parts: string[] = []
+  for (const m of messages) {
+    if (m.hidden) continue
+    if (m.metadata?.kind === "delegation_status_notice") continue
+    if (m.role === "user") {
+      parts.push(`<p><strong>You:</strong></p><p>${escapeHtml(m.content.trim()).replace(/\n/g, "<br/>")}</p>`)
+    } else if (m.role === "assistant") {
+      const body = (m.content ?? "").trim()
+      if (!body) continue
+      let html = "<p><strong>Assistant:</strong></p>"
+      let last = 0
+      let match: RegExpExecArray | null
+      fenceRe.lastIndex = 0
+      while ((match = fenceRe.exec(body)) !== null) {
+        const before = body.slice(last, match.index).trim()
+        if (before) html += `<p>${escapeHtml(before).replace(/\n/g, "<br/>")}</p>`
+        const parsed = tryParseChartSpec(match[1].trim())
+        if (parsed && chartIdx < chartUrls.length) {
+          html += `<p><img src="${chartUrls[chartIdx++]}" alt="chart" style="max-width:100%;height:auto"/></p>`
+        } else {
+          html += "<p>[chart]</p>"
+        }
+        last = match.index + match[0].length
+      }
+      const tail = body.slice(last).trim()
+      if (tail) html += `<p>${escapeHtml(tail).replace(/\n/g, "<br/>")}</p>`
+      parts.push(html)
+    } else if (m.role === "tool") {
+      const name = m.toolName ?? "tool"
+      const out = (m.content ?? "").trim()
+      parts.push(
+        `<p><strong>[${escapeHtml(name)}]</strong></p>` +
+          (out ? `<pre>${escapeHtml(out)}</pre>` : ""),
+      )
+    } else if (m.role === "error") {
+      parts.push(`<p><strong>Error:</strong> ${escapeHtml((m.content ?? "").trim())}</p>`)
+    }
+  }
+  return `<div>${parts.join("")}</div>`
+}
+
+async function copySessionWithCharts(
+  container: HTMLElement,
+  messages: PilotMessage[],
+): Promise<boolean> {
+  const svgs = Array.from(container.querySelectorAll<SVGSVGElement>('.chart-host svg[role="img"]'))
+  if (svgs.length === 0) return false
+  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
+  try {
+    const chartUrls = await Promise.all(svgs.map((svg) => svgChartToPngDataUrl(svg)))
+    const html = serializeSessionToHtml(messages, chartUrls)
+    const plain = serializeSessionToText(messages)
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/html": new Blob([html], { type: "text/html" }),
+        "text/plain": new Blob([plain], { type: "text/plain" }),
+      }),
+    ])
+    return true
+  } catch (err) {
+    console.warn("[copy] rich session copy failed, falling back to text:", err)
+    return false
+  }
+}
+
+function CopySessionButton({
+  messages,
+  containerRef,
+}: {
+  messages: PilotMessage[]
+  containerRef: React.RefObject<HTMLDivElement | null>
+}) {
+  const [copied, copy, flashCopied] = useCopyFeedback()
+  const handleCopy = async () => {
+    const container = containerRef.current
+    if (container && (await copySessionWithCharts(container, messages))) {
+      flashCopied()
+      return
+    }
     void copy(serializeSessionToText(messages))
   }
   return (
@@ -1273,10 +1378,59 @@ function CopyIconButton({
   )
 }
 
-function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
-  const [copied, copy] = useCopyFeedback()
+// Plain-text fallback for the clipboard: a ```chart fenced JSON block is noise
+// when pasted as text, so swap it for a readable placeholder.
+function stripChartFences(markdown: string): string {
+  return markdown.replace(/```chart\s*[\s\S]*?```/g, "[chart]").replace(/\n{3,}/g, "\n\n").trim()
+}
 
-  const handleCopy = () => {
+// Copy a rendered message bubble as rich text/html with charts rasterised to
+// inline PNGs, plus a text/plain fallback. Returns false when there are no
+// charts or the browser can't do a rich clipboard write, so the caller can
+// fall back to a plain markdown copy. Without this, "copy answer" yielded the
+// raw chart JSON spec instead of the picture the user actually sees.
+async function copyBubbleWithCharts(bubble: HTMLElement, content: string): Promise<boolean> {
+  const charts = Array.from(bubble.querySelectorAll<SVGSVGElement>('.chart-host svg[role="img"]'))
+  if (charts.length === 0) return false
+  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
+  try {
+    const dataUrls = await Promise.all(charts.map((svg) => svgChartToPngDataUrl(svg)))
+    const clone = bubble.cloneNode(true) as HTMLElement
+    const cloneHosts = Array.from(clone.querySelectorAll<HTMLElement>(".chart-host"))
+    cloneHosts.forEach((host, i) => {
+      const img = document.createElement("img")
+      img.src = dataUrls[i] ?? ""
+      img.style.maxWidth = "100%"
+      img.style.height = "auto"
+      host.replaceWith(img)
+    })
+    // Drop any leftover interactive controls (chart toolbars etc.).
+    clone.querySelectorAll("button").forEach((b) => b.remove())
+    const html = `<div>${clone.innerHTML}</div>`
+    const plain = stripChartFences(content)
+    await navigator.clipboard.write([
+      new ClipboardItem({
+        "text/html": new Blob([html], { type: "text/html" }),
+        "text/plain": new Blob([plain], { type: "text/plain" }),
+      }),
+    ])
+    return true
+  } catch (err) {
+    console.warn("[copy] rich chart copy failed, falling back to text:", err)
+    return false
+  }
+}
+
+function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
+  const [copied, copy, flashCopied] = useCopyFeedback()
+  const bubbleRef = useRef<HTMLDivElement | null>(null)
+
+  const handleCopy = async () => {
+    const bubble = bubbleRef.current
+    if (bubble && (await copyBubbleWithCharts(bubble, content))) {
+      flashCopied()
+      return
+    }
     void copy(content)
   }
 
@@ -1286,6 +1440,7 @@ function CopyableMessage({ isUser, content }: { isUser: boolean; content: string
   return (
     <div className={cn("group/msg flex flex-col gap-1 max-w-3xl min-w-0", isUser ? "items-end" : "items-start")}>
       <div
+        ref={bubbleRef}
         className={cn(
           "px-5 py-3.5 rounded-2xl text-[15px] leading-relaxed shadow-sm shadow-black/10 min-w-0 overflow-hidden",
           isUser

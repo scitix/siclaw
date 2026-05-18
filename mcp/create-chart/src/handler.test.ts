@@ -209,6 +209,8 @@ describe("handleRenderChart", () => {
     // up and mangle.
     expect(ready).not.toMatch(/\\"/);
     expect(meta.type).toBe("pie");
+    expect(meta.schema_version).toBe(1);
+    expect(meta.artifact_kind).toBe("chart_spec");
     expect(typeof meta.chart_id).toBe("string");
     expect((meta.chart_id as string).startsWith("pie-")).toBe(true);
     expect(typeof meta.bytes).toBe("number");
@@ -232,6 +234,7 @@ describe("handleRenderChart", () => {
     const inner = ready.replace(/^```chart\n/, "").replace(/\n```$/, "");
     const spec = JSON.parse(inner);
     expect(spec.type).toBe("bar");
+    expect(spec.schema_version).toBe(1);
     expect(spec.data.series[0].values).toEqual([10, 20]);
     expect(spec.title).toBe("Demo");
     expect(spec).not.toHaveProperty("extra_garbage");
@@ -247,10 +250,11 @@ describe("handleRenderChart", () => {
     const expectedDir = path.resolve(tmp, "chart-render");
     expect(existsSync(expectedDir)).toBe(true);
     const expectedFile = path.join(expectedDir, `${meta.chart_id as string}.json`);
-    expect(meta.svg_path).toBe(expectedFile);
+    expect(meta.svg_path).toBe("");
     expect(meta.spec_path).toBe(expectedFile);
     expect(existsSync(expectedFile)).toBe(true);
     const onDisk = JSON.parse(readFileSync(expectedFile, "utf8"));
+    expect(onDisk.schema_version).toBe(1);
     expect(onDisk.type).toBe("line");
     expect(onDisk.data.series[0].points).toEqual([{ x: 1, y: 2 }]);
     expect(readdirSync(expectedDir)).toContain(`${meta.chart_id as string}.json`);

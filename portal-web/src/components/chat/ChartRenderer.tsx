@@ -1,5 +1,5 @@
 /**
- * Client-side chart renderer.
+ * Client-side chart renderer (React + SVG).
  *
  * Receives a JSON spec (emitted by mcp `render_chart` tool) and draws
  * pie/bar/line charts as inline SVG via JSX. Colors use CSS classes so the
@@ -10,70 +10,85 @@
  * copy a real image to the clipboard or download a PNG file (shareable on
  * WeChat / QQ / etc.) — copying the bubble text would only yield the JSON spec.
  *
- * This file is the contract shared with MCP — the MCP tool emits a chart spec
- * matching the ChartSpec union below, fenced as ```chart in markdown.
+ * Interactivity (hover tooltip + crosshair, responsive resize, log-scale
+ * toggle) is layered on top of the static SVG: the tooltip and crosshair are
+ * rendered as a SEPARATE overlay (HTML div + a second pointer-events-none SVG)
+ * so they never end up in the rasterised PNG, which clones only `svgRef`.
+ *
+ * All DOM-free logic (the ChartSpec contract, number/axis math, legend layout,
+ * plot geometry, canvas sizing, the spec parser) lives in `chart-utils.ts` and
+ * is unit-tested there. This file is JSX + browser APIs only.
  */
 
-import { type CSSProperties, type ReactNode, useRef, useState, useCallback } from "react"
+import {
+  type CSSProperties,
+  type ReactNode,
+  useRef,
+  useState,
+  useCallback,
+  useEffect,
+  useMemo,
+} from "react"
+import {
+  type ChartSpec,
+  type Axis,
+  type Plot,
+  type MarkerShapeKind,
+  PALETTE,
+  TITLE_SIZE,
+  LEGEND_SIZE,
+  LEGEND_LINE_H,
+  AXIS_LABEL_SIZE,
+  TICK_SIZE,
+  PIE_LABEL_SIZE,
+  LEGEND_SWATCH,
+  LEGEND_GAP,
+  LEGEND_BETWEEN,
+  LEGEND_MARGIN,
+  seriesDash,
+  seriesShape,
+  barTickLayout,
+  collapsePieSlices,
+  pieSliceColor,
+  approxTextWidth,
+  fmtNumber,
+  niceAxis,
+  logAxis,
+  axisFrac,
+  logPossible,
+  logBeneficial,
+  collectChartValues,
+  layoutLegendRows,
+  computePlot,
+  describeChart,
+  chartCanvasSize,
+} from "./chart-utils"
 
-type PieSlice = { label: string; value: number }
-type BarSeries = { name: string; values: number[] }
-type LinePoint = { x: number | string; y: number }
-type LineSeries = { name: string; points: LinePoint[] }
+// Re-exported so existing import sites (Markdown.tsx, PilotArea.tsx, the test
+// file) can keep importing from "./ChartRenderer" — keeps the refactor's blast
+// radius to this file pair.
+export { collapsePieSlices, tryParseChartSpec, chartSpecLooksIncomplete } from "./chart-utils"
+export type { ChartSpec } from "./chart-utils"
 
-interface CommonOpts {
-  title?: string
-  x_label?: string
-  y_label?: string
-  width?: number
-  height?: number
-}
-
-export type ChartSpec =
-  | ({ type: "pie"; data: { slices: PieSlice[] } } & CommonOpts)
-  | ({ type: "bar"; data: { categories: string[]; series: BarSeries[] } } & CommonOpts)
-  | ({ type: "line"; data: { series: LineSeries[] } } & CommonOpts)
-
-// No grey in the categorical palette — grey is reserved for the "Others"
-// bucket so it reads as a residual rather than a real category. 11 distinct
-// hues cover the max 11 real slices a collapsed pie can have.
-const PALETTE = [
-  "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
-  "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#b6992d", "#d37295",
-]
-// Neutral grey for the collapsed "Others" slice — legible on both themes.
-const OTHERS_COLOR = "#9aa0a6"
-
-const TITLE_SIZE = 18
-const LEGEND_SIZE = 13
-const AXIS_LABEL_SIZE = 13
-const TICK_SIZE = 12
-const PIE_LABEL_SIZE = 12
-
-// High-cardinality pie data (e.g. a per-namespace Pod count with 20+ entries)
-// renders as a fan of unreadable slivers. Keep the largest slices and roll the
-// long tail into a single "Others" bucket so the chart stays legible.
-const PIE_MAX_SLICES = 12
-
-// othersIndex is the index of the collapsed "Others" slice, or -1 when the
-// data was small enough to render as-is. The caller colours that slice grey.
-export function collapsePieSlices(
-  slices: PieSlice[],
-  max = PIE_MAX_SLICES,
-): { slices: PieSlice[]; othersIndex: number } {
-  if (slices.length <= max) return { slices, othersIndex: -1 }
-  const sorted = [...slices].sort((a, b) => b.value - a.value)
-  const head = sorted.slice(0, max - 1)
-  const tail = sorted.slice(max - 1)
-  const tailTotal = tail.reduce((a, s) => a + Math.max(0, s.value), 0)
-  return {
-    slices: [...head, { label: `Others (${tail.length})`, value: tailTotal }],
-    othersIndex: head.length,
+function MarkerShape({
+  shape, cx, cy, size, color,
+}: { shape: MarkerShapeKind; cx: number; cy: number; size: number; color: string }) {
+  if (shape === "square") {
+    return <rect x={cx - size} y={cy - size} width={size * 2} height={size * 2} fill={color} />
   }
-}
-
-function pieSliceColor(index: number, othersIndex: number): string {
-  return index === othersIndex ? OTHERS_COLOR : PALETTE[index % PALETTE.length]
+  if (shape === "triangle") {
+    return (
+      <path d={`M ${cx} ${cy - size * 1.2} L ${cx + size * 1.05} ${cy + size * 0.85} L ${cx - size * 1.05} ${cy + size * 0.85} Z`}
+            fill={color} />
+    )
+  }
+  if (shape === "diamond") {
+    return (
+      <path d={`M ${cx} ${cy - size * 1.3} L ${cx + size * 1.15} ${cy} L ${cx} ${cy + size * 1.3} L ${cx - size * 1.15} ${cy} Z`}
+            fill={color} />
+    )
+  }
+  return <circle cx={cx} cy={cy} r={size} fill={color} />
 }
 
 // Tailwind class strings centralised so palette tweaks live in one place.
@@ -105,110 +120,79 @@ const THEME_CLASSES = [
   "dark:[&_.chart-slice-sep]:stroke-slate-900",
 ].join(" ")
 
-function approxTextWidth(text: string, fontSize: number): number {
-  let w = 0
-  for (const ch of text) {
-    // CJK ideographs + fullwidth forms render roughly square (one em wide).
-    if (/[\u4e00-\u9fff\uff00-\uffef]/.test(ch)) w += fontSize
-    else if (/[A-Z0-9]/.test(ch)) w += fontSize * 0.62
-    else w += fontSize * 0.52
-  }
-  return w
-}
-
-function fmtNumber(n: number): string {
-  if (!Number.isFinite(n)) return String(n)
-  const abs = Math.abs(n)
-  if (abs >= 1000 || (abs > 0 && abs < 0.01)) return n.toExponential(2)
-  return Number.isInteger(n) ? n.toString() : n.toFixed(2)
-}
-
-function niceNum(range: number, round: boolean): number {
-  const exp = Math.floor(Math.log10(range || 1))
-  const f = range / Math.pow(10, exp)
-  let nf: number
-  if (round) {
-    if (f < 1.5) nf = 1
-    else if (f < 3) nf = 2
-    else if (f < 7) nf = 5
-    else nf = 10
-  } else if (f <= 1) nf = 1
-  else if (f <= 2) nf = 2
-  else if (f <= 5) nf = 5
-  else nf = 10
-  return nf * Math.pow(10, exp)
-}
-
-interface Axis { min: number; max: number; ticks: number[] }
-function niceAxis(min: number, max: number, count = 5): Axis {
-  if (!Number.isFinite(min) || !Number.isFinite(max)) {
-    return { min: 0, max: 1, ticks: [0, 0.5, 1] }
-  }
-  if (min === max) {
-    const pad = Math.abs(min) > 0 ? Math.abs(min) * 0.1 : 1
-    min -= pad; max += pad
-  }
-  const range = niceNum(max - min, false)
-  const step = niceNum(range / (count - 1), true)
-  const niceMin = Math.floor(min / step) * step
-  const niceMax = Math.ceil(max / step) * step
-  const ticks: number[] = []
-  for (let v = niceMin; v <= niceMax + step / 2; v += step) {
-    ticks.push(Number(v.toFixed(10)))
-  }
-  return { min: niceMin, max: niceMax, ticks }
-}
-
-interface Plot { left: number; right: number; top: number; bottom: number; w: number; h: number }
-function computePlot(
-  width: number, height: number,
-  hasTitle: boolean, hasLegend: boolean,
-  hasXLabels: boolean, rotateXTicks: boolean,
-  hasYAxisLabel: boolean, hasXAxisLabel: boolean,
-): Plot {
-  const titleH = hasTitle ? 30 : 6
-  const legendH = hasLegend ? 26 : 0
-  const xTickH = hasXLabels ? (rotateXTicks ? 50 : 26) : 8
-  const xLabelH = hasXAxisLabel ? 22 : 0
-  const yLabelW = hasYAxisLabel ? 22 : 0
-  const top = titleH + legendH + 8
-  const bottom = height - xTickH - xLabelH - 8
-  const left = 60 + yLabelW
-  const right = width - 24
-  return { left, right, top, bottom, w: right - left, h: bottom - top }
-}
-
 function Title({ text, width }: { text?: string; width: number }) {
   if (!text) return null
+  // Truncate with an ellipsis when the title is wider than the canvas — a long
+  // title used to spill past both edges at narrow widths.
+  const maxW = width - 32
+  let shown = text
+  if (approxTextWidth(shown, TITLE_SIZE) > maxW) {
+    while (shown.length > 1 && approxTextWidth(shown + "…", TITLE_SIZE) > maxW) {
+      shown = shown.slice(0, -1)
+    }
+    shown = shown.replace(/\s+$/, "") + "…"
+  }
   return (
     <text x={width / 2} y={22} textAnchor="middle" fontSize={TITLE_SIZE} fontWeight={600}
-          className="chart-title">{text}</text>
+          className="chart-title">{shown}</text>
   )
 }
 
-function LegendRow({ width, y, names }: { width: number; y: number; names: string[] }) {
-  const swatch = 12, gap = 6, between = 18
-  const widths = names.map(n => swatch + gap + approxTextWidth(n, LEGEND_SIZE))
-  const totalW = widths.reduce((a, b) => a + b, 0) + (names.length - 1) * between
-  let x = Math.max(16, (width - totalW) / 2)
+// Renders the legend, wrapping to multiple centred rows when the series don't
+// fit on one line. `y` is the baseline of the first row; callers must reserve
+// `layoutLegendRows(...).length` rows of vertical space via computePlot. When
+// `swatch` is supplied it draws the per-series marker (used by line charts to
+// echo the dash + point shape); otherwise a plain colour rect is drawn.
+function LegendRow({
+  width, y, names, swatch,
+}: {
+  width: number
+  y: number
+  names: string[]
+  swatch?: (index: number, cx: number, cy: number) => ReactNode
+}) {
+  const rows = layoutLegendRows(names, width)
   const out: ReactNode[] = []
-  names.forEach((n, i) => {
-    const color = PALETTE[i % PALETTE.length]
-    out.push(
-      <rect key={`s${i}`} x={x} y={y - swatch + 2} width={swatch} height={swatch}
-            fill={color} rx={2} />,
-      <text key={`t${i}`} x={x + swatch + gap} y={y + 2} fontSize={LEGEND_SIZE}
-            className="chart-legend">{n}</text>,
-    )
-    x += widths[i] + between
+  let idx = 0
+  rows.forEach((row, ri) => {
+    const widths = row.map((n) => LEGEND_SWATCH + LEGEND_GAP + approxTextWidth(n, LEGEND_SIZE))
+    const totalW = widths.reduce((a, b) => a + b, 0) + (row.length - 1) * LEGEND_BETWEEN
+    let x = Math.max(LEGEND_MARGIN, (width - totalW) / 2)
+    const rowY = y + ri * LEGEND_LINE_H
+    row.forEach((n, i) => {
+      const color = PALETTE[idx % PALETTE.length]
+      const swCx = x + LEGEND_SWATCH / 2
+      const swCy = rowY - LEGEND_SWATCH / 2 + 2
+      out.push(
+        swatch
+          ? <g key={`s${idx}`}>{swatch(idx, swCx, swCy)}</g>
+          : <rect key={`s${idx}`} x={x} y={rowY - LEGEND_SWATCH + 2} width={LEGEND_SWATCH}
+                  height={LEGEND_SWATCH} fill={color} rx={2} />,
+        <text key={`t${idx}`} x={x + LEGEND_SWATCH + LEGEND_GAP} y={rowY + 2}
+              fontSize={LEGEND_SIZE} className="chart-legend">{n}</text>,
+      )
+      x += widths[i] + LEGEND_BETWEEN
+      idx++
+    })
   })
   return <>{out}</>
+}
+
+function lineLegendSwatch(index: number, cx: number, cy: number): ReactNode {
+  const color = PALETTE[index % PALETTE.length]
+  return (
+    <>
+      <line x1={cx - 7} y1={cy} x2={cx + 7} y2={cy} stroke={color} strokeWidth={2}
+            strokeDasharray={seriesDash(index) || undefined} strokeLinecap="round" />
+      <MarkerShape shape={seriesShape(index)} cx={cx} cy={cy} size={2.6} color={color} />
+    </>
+  )
 }
 
 function YAxis({ plot, axis, label }: { plot: Plot; axis: Axis; label?: string }) {
   const out: ReactNode[] = []
   axis.ticks.forEach((t, i) => {
-    const y = plot.bottom - ((t - axis.min) / (axis.max - axis.min)) * plot.h
+    const y = plot.bottom - axisFrac(axis, t) * plot.h
     out.push(
       <line key={`g${i}`} x1={plot.left} y1={y} x2={plot.right} y2={y}
             strokeWidth={1} className="chart-grid" />,
@@ -216,20 +200,24 @@ function YAxis({ plot, axis, label }: { plot: Plot; axis: Axis; label?: string }
             className="chart-tick">{fmtNumber(t)}</text>,
     )
   })
-  out.push(
-    <line key="ay" x1={plot.left} y1={plot.top} x2={plot.left} y2={plot.bottom}
-          strokeWidth={1} className="chart-axis-line" />,
-    <line key="ax" x1={plot.left} y1={plot.bottom} x2={plot.right} y2={plot.bottom}
-          strokeWidth={1} className="chart-axis-line" />,
-  )
   if (label) {
     const cy = plot.top + plot.h / 2
+    const text = axis.log ? `${label} (log)` : label
     out.push(
       <text key="yl" x={18} y={cy} textAnchor="middle" fontSize={AXIS_LABEL_SIZE}
-            transform={`rotate(-90 18 ${cy})`} className="chart-axis-label">{label}</text>,
+            transform={`rotate(-90 18 ${cy})`} className="chart-axis-label">{text}</text>,
     )
   }
   return <>{out}</>
+}
+
+// A fully-closed rectangular border around the plot area — the scientific
+// plotting convention (Origin / MATLAB) — instead of just left + bottom axes.
+function PlotFrame({ plot }: { plot: Plot }) {
+  return (
+    <rect x={plot.left} y={plot.top} width={plot.w} height={plot.h}
+          fill="none" strokeWidth={1} className="chart-axis-line" />
+  )
 }
 
 function XAxisTitle({ plot, height, label }: { plot: Plot; height: number; label?: string }) {
@@ -240,23 +228,51 @@ function XAxisTitle({ plot, height, label }: { plot: Plot; height: number; label
   )
 }
 
-function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "pie" }>; width: number; height: number }) {
+function NoData({ width, height }: { width: number; height: number }) {
+  return (
+    <text x={width / 2} y={height / 2} textAnchor="middle" fontSize={14}
+          className="chart-tick">no data</text>
+  )
+}
+
+// ---- Hover model -----------------------------------------------------------
+// Each chart renderer returns the drawn SVG plus a hover model the overlay
+// uses to snap a crosshair / tooltip to the data without re-deriving geometry.
+
+interface HoverRow { name: string; color: string; valueLabel: string; yPx?: number }
+interface HoverColumn { xPx: number; xLabel: string; rows: HoverRow[] }
+interface PieHoverSlice {
+  start: number // radians, 0 = top, clockwise
+  end: number
+  label: string
+  valueLabel: string
+  pct: string
+  color: string
+}
+type HoverModel =
+  | { kind: "columns"; plotTop: number; plotBottom: number; columns: HoverColumn[] }
+  | { kind: "pie"; cx: number; cy: number; r: number; slices: PieHoverSlice[] }
+  | null
+
+interface ChartRender { els: ReactNode; hover: HoverModel }
+
+function renderPie(
+  spec: Extract<ChartSpec, { type: "pie" }>, width: number, height: number,
+): ChartRender {
   const { slices, othersIndex } = collapsePieSlices(spec.data.slices)
   const total = slices.reduce((a, s) => a + Math.max(0, s.value), 0)
-  if (total <= 0) {
-    return (
-      <text x={width / 2} y={height / 2} textAnchor="middle" fontSize={14}
-            className="chart-tick">no data</text>
-    )
-  }
+  if (total <= 0) return { els: <NoData width={width} height={height} />, hover: null }
+
   const titleH = spec.title ? 30 : 6
   const padY = 16
   const top = titleH + padY
   const bottom = height - padY
   const innerH = bottom - top
-  const labels = slices.map(s => `${s.label} (${fmtNumber(s.value)}, ${(s.value / total * 100).toFixed(1)}%)`)
+  const labels = slices.map(
+    (s) => `${s.label} (${fmtNumber(s.value)}, ${((s.value / total) * 100).toFixed(1)}%)`,
+  )
   const legendW = Math.min(
-    Math.max(...labels.map(l => approxTextWidth(l, LEGEND_SIZE))) + 28,
+    Math.max(...labels.map((l) => approxTextWidth(l, LEGEND_SIZE))) + 28,
     width * 0.42,
   )
   const pieAreaW = width - legendW - 32
@@ -265,7 +281,9 @@ function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "p
   const r = Math.max(60, Math.min(pieAreaW / 2 - 12, innerH / 2 - 8))
 
   const slicesEls: ReactNode[] = []
+  const hoverSlices: PieHoverSlice[] = []
   let angle = -Math.PI / 2
+  let acc = 0
   slices.forEach((s, i) => {
     const v = Math.max(0, s.value)
     if (v === 0) return
@@ -293,14 +311,23 @@ function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "p
       slicesEls.push(
         <text key={`l${i}`} x={lx} y={ly} textAnchor="middle" dominantBaseline="middle"
               fontSize={PIE_LABEL_SIZE} fontWeight={600} fill="#fff">
-          {(v / total * 100).toFixed(1)}%
+          {((v / total) * 100).toFixed(1)}%
         </text>,
       )
     }
+    hoverSlices.push({
+      start: acc,
+      end: acc + sweep,
+      label: s.label,
+      valueLabel: fmtNumber(s.value),
+      pct: `${((v / total) * 100).toFixed(1)}%`,
+      color,
+    })
+    acc += sweep
     angle = a2
   })
 
-  // Legend column on the right
+  // Legend column on the right.
   const legX = width - legendW - 8
   const lineH = LEGEND_SIZE + 10
   const legBlockH = labels.length * lineH
@@ -317,51 +344,65 @@ function PieChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "p
     legY += lineH
   })
 
-  return <>{slicesEls}{legendEls}</>
+  return {
+    els: <>{slicesEls}{legendEls}</>,
+    hover: { kind: "pie", cx, cy, r, slices: hoverSlices },
+  }
 }
 
-function BarChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "bar" }>; width: number; height: number }) {
+function renderBar(
+  spec: Extract<ChartSpec, { type: "bar" }>,
+  width: number, height: number, useLog: boolean, legendRows: number,
+): ChartRender {
   const { categories, series } = spec.data
   if (!categories.length || !series.length) {
-    return (
-      <text x={width / 2} y={height / 2} textAnchor="middle" fontSize={14}
-            className="chart-tick">no data</text>
-    )
+    return { els: <NoData width={width} height={height} />, hover: null }
   }
   const hasLegend = series.length > 1
-  const approxGroupW = (width - 80) / categories.length
-  const longest = Math.max(...categories.map(c => approxTextWidth(c, TICK_SIZE)))
-  const rotate = longest + 4 > approxGroupW
-  const plot = computePlot(width, height, !!spec.title, hasLegend, true, rotate, !!spec.y_label, !!spec.x_label)
+  const legendNames = series.map((s) => s.name)
+  const { rotate, tickBandH } = barTickLayout(categories, width)
+  const plot = computePlot(
+    width, height, !!spec.title, legendRows, true, rotate,
+    !!spec.y_label, !!spec.x_label, tickBandH,
+  )
 
-  let dataMin = 0, dataMax = 0
-  series.forEach(s => s.values.forEach(v => {
-    if (!Number.isFinite(v)) return
-    if (v < dataMin) dataMin = v
-    if (v > dataMax) dataMax = v
-  }))
-  if (dataMax === 0 && dataMin === 0) dataMax = 1
-  const axis = niceAxis(dataMin, dataMax)
+  const finiteVals: number[] = []
+  series.forEach((s) => s.values.forEach((v) => { if (Number.isFinite(v)) finiteVals.push(v) }))
+
+  let axis: Axis
+  if (useLog) {
+    const pos = finiteVals.filter((v) => v > 0)
+    axis = pos.length ? logAxis(Math.min(...pos), Math.max(...pos)) : niceAxis(0, 1)
+  } else {
+    let dataMin = 0, dataMax = 0
+    finiteVals.forEach((v) => { if (v < dataMin) dataMin = v; if (v > dataMax) dataMax = v })
+    if (dataMax === 0 && dataMin === 0) dataMax = 1
+    axis = niceAxis(dataMin, dataMax)
+  }
   const groupW = plot.w / categories.length
   const groupPad = Math.min(20, groupW * 0.22)
   const barW = (groupW - groupPad) / series.length
-  const zeroY = plot.bottom - ((0 - axis.min) / (axis.max - axis.min)) * plot.h
+  const zeroFrac = axis.log ? 0 : axisFrac(axis, 0)
+  const zeroY = plot.bottom - zeroFrac * plot.h
 
   const els: ReactNode[] = []
+  const columns: HoverColumn[] = []
   categories.forEach((cat, gi) => {
     const gx = plot.left + gi * groupW + groupPad / 2
+    const rows: HoverRow[] = []
     series.forEach((s, si) => {
       const v = s.values[gi] ?? 0
       if (!Number.isFinite(v)) return
-      const y = plot.bottom - ((v - axis.min) / (axis.max - axis.min)) * plot.h
+      const y = plot.bottom - axisFrac(axis, v) * plot.h
       const top = Math.min(y, zeroY)
       const h = Math.abs(y - zeroY)
       const x = gx + si * barW
       const color = PALETTE[si % PALETTE.length]
       els.push(
-        <rect key={`b${gi}-${si}`} x={x} y={top} width={barW - 2} height={h}
+        <rect key={`b${gi}-${si}`} x={x} y={top} width={Math.max(1, barW - 2)} height={h}
               fill={color} rx={2} />,
       )
+      rows.push({ name: s.name, color, valueLabel: fmtNumber(v) })
     })
     const cxLabel = gx + (groupW - groupPad) / 2
     if (rotate) {
@@ -376,69 +417,92 @@ function BarChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "b
               fontSize={TICK_SIZE} className="chart-tick">{cat}</text>,
       )
     }
+    columns.push({ xPx: plot.left + gi * groupW + groupW / 2, xLabel: cat, rows })
   })
 
-  return (
-    <>
-      {hasLegend && <LegendRow width={width} y={(spec.title ? 30 : 6) + 18} names={series.map(s => s.name)} />}
-      <YAxis plot={plot} axis={axis} label={spec.y_label} />
-      {els}
-      <XAxisTitle plot={plot} height={height} label={spec.x_label} />
-    </>
-  )
+  return {
+    els: (
+      <>
+        {hasLegend && <LegendRow width={width} y={(spec.title ? 30 : 6) + 18} names={legendNames} />}
+        <YAxis plot={plot} axis={axis} label={spec.y_label} />
+        {els}
+        <PlotFrame plot={plot} />
+        <XAxisTitle plot={plot} height={height} label={spec.x_label} />
+      </>
+    ),
+    hover: { kind: "columns", plotTop: plot.top, plotBottom: plot.bottom, columns },
+  }
 }
 
-function LineChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "line" }>; width: number; height: number }) {
+function renderLine(
+  spec: Extract<ChartSpec, { type: "line" }>,
+  width: number, height: number, useLog: boolean, legendRows: number,
+): ChartRender {
   const { series } = spec.data
-  const allPoints = series.flatMap(s => s.points)
-  if (!allPoints.length) {
-    return (
-      <text x={width / 2} y={height / 2} textAnchor="middle" fontSize={14}
-            className="chart-tick">no data</text>
-    )
-  }
-  const hasLegend = series.length > 1
+  const allPoints = series.flatMap((s) => s.points)
+  if (!allPoints.length) return { els: <NoData width={width} height={height} />, hover: null }
 
-  const xsNumeric = allPoints.every(p => typeof p.x === "number")
+  const hasLegend = series.length > 1
+  const legendNames = series.map((s) => s.name)
+
+  const xsNumeric = allPoints.every((p) => typeof p.x === "number")
   let xMin = 0, xMax = 1
   let categories: string[] | undefined
   if (xsNumeric) {
-    xMin = Math.min(...allPoints.map(p => p.x as number))
-    xMax = Math.max(...allPoints.map(p => p.x as number))
+    xMin = Math.min(...allPoints.map((p) => p.x as number))
+    xMax = Math.max(...allPoints.map((p) => p.x as number))
     if (xMin === xMax) xMax = xMin + 1
   } else {
     const seen = new Map<string, number>()
-    allPoints.forEach(p => { const k = String(p.x); if (!seen.has(k)) seen.set(k, seen.size) })
+    allPoints.forEach((p) => { const k = String(p.x); if (!seen.has(k)) seen.set(k, seen.size) })
     categories = Array.from(seen.keys())
-    xMin = 0; xMax = Math.max(1, categories.length - 1)
+    xMin = 0
+    xMax = Math.max(1, categories.length - 1)
   }
 
-  const plot = computePlot(width, height, !!spec.title, hasLegend, true, false, !!spec.y_label, !!spec.x_label)
+  const plot = computePlot(width, height, !!spec.title, legendRows, true, false, !!spec.y_label, !!spec.x_label)
 
-  let yMin = Infinity, yMax = -Infinity
-  allPoints.forEach(p => { if (!Number.isFinite(p.y)) return; if (p.y < yMin) yMin = p.y; if (p.y > yMax) yMax = p.y })
-  if (!Number.isFinite(yMin)) { yMin = 0; yMax = 1 }
-  const yAxis = niceAxis(yMin, yMax)
+  const finiteYs = allPoints.map((p) => p.y).filter((y) => Number.isFinite(y))
+  let yAxis: Axis
+  if (useLog) {
+    const pos = finiteYs.filter((y) => y > 0)
+    yAxis = pos.length ? logAxis(Math.min(...pos), Math.max(...pos)) : niceAxis(0, 1)
+  } else {
+    let yMin = Infinity, yMax = -Infinity
+    finiteYs.forEach((y) => { if (y < yMin) yMin = y; if (y > yMax) yMax = y })
+    if (!Number.isFinite(yMin)) { yMin = 0; yMax = 1 }
+    yAxis = niceAxis(yMin, yMax)
+  }
 
   const xToPx = (x: number | string) => {
     const xv = xsNumeric ? (x as number) : categories!.indexOf(String(x))
     return plot.left + ((xv - xMin) / (xMax - xMin)) * plot.w
   }
-  const yToPx = (y: number) => plot.bottom - ((y - yAxis.min) / (yAxis.max - yAxis.min)) * plot.h
+  const yToPx = (y: number) => plot.bottom - axisFrac(yAxis, y) * plot.h
 
+  // epoch-seconds heuristic: render large numeric x as UTC HH:MM (UTC is the
+  // product-wide default — sample timestamps are stored and shown in UTC).
+  const formatX = (x: number | string): string => {
+    if (!xsNumeric) return String(x)
+    const t = x as number
+    if (t > 1e9) {
+      const d = new Date(t * 1000)
+      return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`
+    }
+    return fmtNumber(t)
+  }
+
+  // X tick labels + a faint vertical gridline at every tick (scientific
+  // plotting convention — Origin / MATLAB draw both axes' gridlines).
   const xTickCount = Math.min(8, xsNumeric ? 6 : Math.max(2, categories!.length))
   const xTicks: ReactNode[] = []
   for (let i = 0; i < xTickCount; i++) {
     const t = xMin + ((xMax - xMin) * i) / (xTickCount - 1)
     const px = plot.left + ((t - xMin) / (xMax - xMin)) * plot.w
-    let label: string
-    if (xsNumeric) {
-      if (t > 1e9) {
-        const d = new Date(t * 1000)
-        label = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`
-      } else label = fmtNumber(t)
-    } else label = categories![Math.round(t)] ?? ""
+    const label = xsNumeric ? formatX(t) : (categories![Math.round(t)] ?? "")
     xTicks.push(
+      <line key={`xg${i}`} x1={px} y1={plot.top} x2={px} y2={plot.bottom}
+            strokeWidth={1} className="chart-grid" />,
       <line key={`xt${i}`} x1={px} y1={plot.bottom} x2={px} y2={plot.bottom + 4}
             className="chart-axis-line" />,
       <text key={`xl${i}`} x={px} y={plot.bottom + 18} textAnchor="middle"
@@ -446,37 +510,68 @@ function LineChart({ spec, width, height }: { spec: Extract<ChartSpec, { type: "
     )
   }
 
+  // Lines + markers. Points are sorted along the x axis so an unordered spec
+  // doesn't draw a zig-zag.
   const lines: ReactNode[] = []
   series.forEach((s, si) => {
     const color = PALETTE[si % PALETTE.length]
-    const pts = s.points.filter(p => Number.isFinite(p.y))
+    const pts = s.points
+      .filter((p) => Number.isFinite(p.y))
+      .slice()
+      .sort((a, b) => xToPx(a.x) - xToPx(b.x))
     if (!pts.length) return
-    const d = pts.map((p, i) => `${i === 0 ? "M" : "L"} ${xToPx(p.x).toFixed(2)} ${yToPx(p.y).toFixed(2)}`).join(" ")
+    const d = pts
+      .map((p, i) => `${i === 0 ? "M" : "L"} ${xToPx(p.x).toFixed(2)} ${yToPx(p.y).toFixed(2)}`)
+      .join(" ")
     lines.push(
       <path key={`p${si}`} d={d} fill="none" stroke={color} strokeWidth={2}
+            strokeDasharray={seriesDash(si) || undefined}
             strokeLinejoin="round" strokeLinecap="round" />,
     )
     if (pts.length <= 80) {
+      const shape = seriesShape(si)
       pts.forEach((p, i) => lines.push(
-        <circle key={`d${si}-${i}`} cx={xToPx(p.x)} cy={yToPx(p.y)} r={2.6} fill={color} />,
+        <MarkerShape key={`d${si}-${i}`} shape={shape} cx={xToPx(p.x)} cy={yToPx(p.y)}
+                     size={2.8} color={color} />,
       ))
     }
   })
 
-  return (
-    <>
-      {hasLegend && <LegendRow width={width} y={(spec.title ? 30 : 6) + 18} names={series.map(s => s.name)} />}
-      <YAxis plot={plot} axis={yAxis} label={spec.y_label} />
-      {xTicks}
-      {lines}
-      <XAxisTitle plot={plot} height={height} label={spec.x_label} />
-    </>
-  )
-}
+  // Hover columns: one per distinct x value, in axis order.
+  const columnXs: Array<number | string> = xsNumeric
+    ? Array.from(new Set(allPoints.map((p) => p.x as number))).sort((a, b) => a - b)
+    : categories!
+  const seriesMaps = series.map((s) => {
+    const m = new Map<number | string, number>()
+    s.points.forEach((p) => { if (Number.isFinite(p.y)) m.set(p.x, p.y) })
+    return m
+  })
+  const columns: HoverColumn[] = columnXs.map((x) => {
+    const rows: HoverRow[] = []
+    series.forEach((s, si) => {
+      const y = seriesMaps[si].get(x)
+      if (y == null) return
+      rows.push({ name: s.name, color: PALETTE[si % PALETTE.length], valueLabel: fmtNumber(y), yPx: yToPx(y) })
+    })
+    return { xPx: xToPx(x), xLabel: formatX(x), rows }
+  })
 
-function defaultSize(type: ChartSpec["type"]): { width: number; height: number } {
-  if (type === "pie") return { width: 760, height: 480 }
-  return { width: 900, height: 520 }
+  return {
+    els: (
+      <>
+        {hasLegend && (
+          <LegendRow width={width} y={(spec.title ? 30 : 6) + 18} names={legendNames}
+                     swatch={lineLegendSwatch} />
+        )}
+        <YAxis plot={plot} axis={yAxis} label={spec.y_label} />
+        {xTicks}
+        {lines}
+        <PlotFrame plot={plot} />
+        <XAxisTitle plot={plot} height={height} label={spec.x_label} />
+      </>
+    ),
+    hover: { kind: "columns", plotTop: plot.top, plotBottom: plot.bottom, columns },
+  }
 }
 
 // CSS properties whose values vary by theme and must be copied from the live
@@ -545,8 +640,25 @@ async function svgToPngBlob(svg: SVGSVGElement, scale = 2): Promise<Blob> {
   ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
 
   return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(b => (b ? resolve(b) : reject(new Error("toBlob returned null"))), "image/png")
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))), "image/png")
   })
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error("blob -> data URL failed"))
+    reader.readAsDataURL(blob)
+  })
+}
+
+// Rasterise a live chart SVG to a PNG data URL. Used by the message-level copy
+// button (PilotArea) to embed real images in the text/html clipboard payload —
+// copying the bubble's markdown alone would only yield the raw chart JSON.
+export async function svgChartToPngDataUrl(svg: SVGSVGElement, scale = 2): Promise<string> {
+  const blob = await svgToPngBlob(svg, scale)
+  return await blobToDataUrl(blob)
 }
 
 function downloadBlob(blob: Blob, name: string) {
@@ -570,18 +682,72 @@ async function copyBlobToClipboard(blob: Blob): Promise<boolean> {
   }
 }
 
+const TOOLBAR_BTN =
+  "inline-flex h-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 " +
+  "text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm " +
+  "hover:bg-white dark:hover:bg-slate-800"
+
 interface ChartRendererProps {
   spec: ChartSpec
   className?: string
   style?: CSSProperties
 }
 
+// Active hover target: which column / pie slice, plus where to place the
+// tooltip (px relative to the chart-area wrapper, already edge-clamped).
+interface HoverState { index: number; left: number; top: number }
+
 export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
-  const def = defaultSize(spec.type)
-  const width = spec.width ?? def.width
-  const height = spec.height ?? def.height
+  const hostRef = useRef<HTMLDivElement | null>(null)
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [status, setStatus] = useState<null | { kind: "ok" | "err"; text: string }>(null)
+  const [hover, setHover] = useState<HoverState | null>(null)
+
+  // Responsive: render the chart at the container's real width (capped at the
+  // spec's ideal width so it never upscales) instead of letting a fixed-size
+  // viewBox shrink the whole thing — that shrank the fonts into illegibility
+  // inside a narrow chat bubble. Re-rendering at the measured width keeps text
+  // at a constant on-screen size.
+  const [measuredW, setMeasuredW] = useState<number | null>(null)
+  useEffect(() => {
+    const el = hostRef.current
+    if (!el || typeof ResizeObserver === "undefined") return
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width
+      if (w && w > 0) {
+        setMeasuredW(w)
+        setHover(null)
+      }
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // Single source of truth for sizing — width, canvas height, and the legend
+  // row count that renderBar/renderLine reuse via computePlot. Keeping these
+  // three in one pure function is what prevents the plot-collapse regression.
+  const { width, height, legendRows } = useMemo(
+    () => chartCanvasSize(spec, measuredW),
+    [spec, measuredW],
+  )
+
+  // Log scale: bar and line charts both expose a linear/log toolbar toggle
+  // whenever a log axis is *possible* (all-positive data). In "auto" mode the
+  // axis defaults to log only when it's also *beneficial* (wide spread); the
+  // toggle then pins linear/log explicitly.
+  const chartValues = useMemo(() => collectChartValues(spec), [spec])
+  const logAvailable = useMemo(() => logPossible(chartValues), [chartValues])
+  const logAutoOn = useMemo(() => logBeneficial(chartValues), [chartValues])
+  const [yScalePref, setYScalePref] = useState<"auto" | "linear" | "log">("auto")
+  const effectiveLog =
+    (spec.type === "bar" || spec.type === "line") &&
+    (yScalePref === "log" || (yScalePref === "auto" && logAutoOn))
+
+  const chart = useMemo<ChartRender>(() => {
+    if (spec.type === "pie") return renderPie(spec, width, height)
+    if (spec.type === "bar") return renderBar(spec, width, height, effectiveLog, legendRows)
+    return renderLine(spec, width, height, effectiveLog, legendRows)
+  }, [spec, width, height, effectiveLog, legendRows])
 
   const flash = useCallback((kind: "ok" | "err", text: string) => {
     setStatus({ kind, text })
@@ -615,37 +781,146 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
     }
   }, [flash])
 
+  // Map a pointer event to the nearest data column / pie slice and place the
+  // tooltip. Coordinates are converted from on-screen px into viewBox units so
+  // the snapping stays correct at any rendered size.
+  const onMove = (e: React.MouseEvent) => {
+    const svg = svgRef.current
+    const model = chart.hover
+    if (!svg || !model) return
+    const rect = svg.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    const sx = ((e.clientX - rect.left) / rect.width) * width
+    const sy = ((e.clientY - rect.top) / rect.height) * height
+    let left = e.clientX - rect.left + 14
+    let top = e.clientY - rect.top + 12
+    if (left > rect.width - 190) left = e.clientX - rect.left - 190
+    if (top > rect.height - 96) top = rect.height - 96
+    left = Math.max(4, left)
+    top = Math.max(4, top)
+
+    if (model.kind === "columns") {
+      if (!model.columns.length) return
+      let best = 0
+      let bd = Infinity
+      model.columns.forEach((c, i) => {
+        const d = Math.abs(c.xPx - sx)
+        if (d < bd) { bd = d; best = i }
+      })
+      setHover({ index: best, left, top })
+    } else {
+      const dx = sx - model.cx
+      const dy = sy - model.cy
+      if (Math.hypot(dx, dy) > model.r) { setHover(null); return }
+      // Normalise the pointer angle to 0 = top, clockwise — matching how the
+      // slices accumulate their start/end in renderPie.
+      let a = Math.atan2(dy, dx) + Math.PI / 2
+      while (a < 0) a += Math.PI * 2
+      while (a >= Math.PI * 2) a -= Math.PI * 2
+      const found = model.slices.findIndex((s) => a >= s.start && a < s.end)
+      if (found < 0) { setHover(null); return }
+      setHover({ index: found, left, top })
+    }
+  }
+
+  // Crosshair / highlight overlay drawn in chart coords, but in a SEPARATE
+  // pointer-events-none SVG so it is never picked up by the PNG rasteriser
+  // (which clones svgRef only).
+  let overlay: ReactNode = null
+  let tooltip: ReactNode = null
+  if (hover && chart.hover) {
+    if (chart.hover.kind === "columns") {
+      const col = chart.hover.columns[hover.index]
+      if (col) {
+        overlay = (
+          <>
+            <line x1={col.xPx} y1={chart.hover.plotTop} x2={col.xPx} y2={chart.hover.plotBottom}
+                  stroke="#94a3b8" strokeWidth={1} strokeDasharray="4 3" />
+            {col.rows.map((r, i) =>
+              r.yPx != null ? (
+                <circle key={i} cx={col.xPx} cy={r.yPx} r={4} fill={r.color}
+                        stroke="#fff" strokeWidth={1.5} />
+              ) : null,
+            )}
+          </>
+        )
+        const shown = col.rows.slice(0, 12)
+        tooltip = (
+          <>
+            <div className="mb-1 font-medium text-gray-500 dark:text-gray-400">{col.xLabel}</div>
+            {shown.map((r, i) => (
+              <div key={i} className="flex items-center gap-1.5 leading-snug">
+                <span className="inline-block h-2 w-2 rounded-sm" style={{ background: r.color }} />
+                <span className="text-gray-600 dark:text-gray-300">{r.name}</span>
+                <span className="ml-auto pl-3 font-medium tabular-nums text-gray-900 dark:text-gray-100">
+                  {r.valueLabel}
+                </span>
+              </div>
+            ))}
+            {col.rows.length > shown.length && (
+              <div className="mt-0.5 text-gray-400">+{col.rows.length - shown.length} more</div>
+            )}
+          </>
+        )
+      }
+    } else {
+      const s = chart.hover.slices[hover.index]
+      if (s) {
+        const { cx, cy, r } = chart.hover
+        const rr = r + 3
+        const a1 = s.start - Math.PI / 2
+        const a2 = s.end - Math.PI / 2
+        const large = s.end - s.start > Math.PI ? 1 : 0
+        const d =
+          `M ${(cx + rr * Math.cos(a1)).toFixed(2)} ${(cy + rr * Math.sin(a1)).toFixed(2)} ` +
+          `A ${rr} ${rr} 0 ${large} 1 ${(cx + rr * Math.cos(a2)).toFixed(2)} ${(cy + rr * Math.sin(a2)).toFixed(2)}`
+        overlay = <path d={d} fill="none" stroke={s.color} strokeWidth={3} strokeLinecap="round" />
+        tooltip = (
+          <>
+            <div className="flex items-center gap-1.5 font-medium text-gray-900 dark:text-gray-100">
+              <span className="inline-block h-2 w-2 rounded-sm" style={{ background: s.color }} />
+              {s.label}
+            </div>
+            <div className="mt-0.5 text-gray-600 dark:text-gray-300">
+              {s.valueLabel} · {s.pct}
+            </div>
+          </>
+        )
+      }
+    }
+  }
+
+  const a11yLabel = spec.title || `${spec.type} chart`
+
   return (
     <div
+      ref={hostRef}
       className={`chart-host group relative my-3 w-full ${THEME_CLASSES} ${className ?? ""}`}
       style={{ lineHeight: 0, ...style }}
     >
-      <svg
-        ref={svgRef}
-        xmlns="http://www.w3.org/2000/svg"
-        viewBox={`0 0 ${width} ${height}`}
-        width="100%"
-        height="auto"
-        preserveAspectRatio="xMidYMid meet"
-        fontFamily="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
-        style={{ display: "block" }}
-      >
-        <rect width={width} height={height} className="chart-bg" />
-        <Title text={spec.title} width={width} />
-        {spec.type === "pie" && <PieChart spec={spec} width={width} height={height} />}
-        {spec.type === "bar" && <BarChart spec={spec} width={width} height={height} />}
-        {spec.type === "line" && <LineChart spec={spec} width={width} height={height} />}
-      </svg>
+      {/* Toolbar sits in its own flow row above the chart — never overlaps the
+          title or legend the way an absolutely-positioned overlay did. */}
       <div
-        className="absolute right-2 top-2 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+        className="flex h-7 items-center justify-end gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100"
         style={{ lineHeight: "normal" }}
       >
+        {(spec.type === "bar" || spec.type === "line") && logAvailable && (
+          <button
+            type="button"
+            onClick={() => setYScalePref(effectiveLog ? "linear" : "log")}
+            aria-label="Toggle linear / log Y axis"
+            title="Toggle linear / log Y axis"
+            className={`${TOOLBAR_BTN} px-2 text-[11px] font-medium`}
+          >
+            {effectiveLog ? "Log" : "Linear"}
+          </button>
+        )}
         <button
           type="button"
           onClick={onCopy}
           aria-label="Copy chart as PNG to clipboard"
           title="Copy chart as PNG to clipboard"
-          className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm hover:bg-white dark:hover:bg-slate-800"
+          className={`${TOOLBAR_BTN} w-7`}
         >
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -658,7 +933,7 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
           onClick={onDownload}
           aria-label="Download chart as PNG"
           title="Download chart as PNG"
-          className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm hover:bg-white dark:hover:bg-slate-800"
+          className={`${TOOLBAR_BTN} w-7`}
         >
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor"
                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -668,9 +943,51 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
           </svg>
         </button>
       </div>
+
+      <div className="relative" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+        <svg
+          ref={svgRef}
+          xmlns="http://www.w3.org/2000/svg"
+          viewBox={`0 0 ${width} ${height}`}
+          width="100%"
+          height="auto"
+          preserveAspectRatio="xMidYMid meet"
+          role="img"
+          aria-label={a11yLabel}
+          fontFamily="ui-sans-serif,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif"
+          style={{ display: "block" }}
+        >
+          <title>{a11yLabel}</title>
+          <desc>{describeChart(spec)}</desc>
+          <rect width={width} height={height} className="chart-bg" />
+          <Title text={spec.title} width={width} />
+          {chart.els}
+        </svg>
+
+        {overlay && (
+          <svg
+            className="pointer-events-none absolute inset-0 h-full w-full"
+            viewBox={`0 0 ${width} ${height}`}
+            preserveAspectRatio="xMidYMid meet"
+            aria-hidden="true"
+          >
+            {overlay}
+          </svg>
+        )}
+
+        {tooltip && hover && (
+          <div
+            className="pointer-events-none absolute z-10 max-w-[230px] rounded-md border border-gray-200 bg-white/95 px-2.5 py-1.5 text-[11px] shadow-md dark:border-slate-700 dark:bg-slate-800/95"
+            style={{ left: hover.left, top: hover.top, lineHeight: "normal" }}
+          >
+            {tooltip}
+          </div>
+        )}
+      </div>
+
       {status && (
         <div
-          className={`absolute left-1/2 top-2 -translate-x-1/2 rounded-md px-2.5 py-1 text-xs shadow-sm ${
+          className={`absolute left-1/2 top-9 -translate-x-1/2 rounded-md px-2.5 py-1 text-xs shadow-sm ${
             status.kind === "ok"
               ? "bg-emerald-600 text-white"
               : "bg-red-600 text-white"
@@ -682,150 +999,4 @@ export function ChartRenderer({ spec, className, style }: ChartRendererProps) {
       )}
     </div>
   )
-}
-
-// Heuristic: does the text look like a fully-streamed JSON object, or are we
-// still mid-stream? During streaming ReactMarkdown re-parses on every token,
-// so the chart fence is rendered before the closing `}` arrives — without
-// this check tryParseChartSpec would return null and Markdown.tsx would flash
-// the red "parse failed" box for every chart until streaming completes.
-// Returns true when the text is empty, doesn't end with `}`, or has more
-// opening braces than closing ones (ignoring braces inside JSON strings).
-export function chartSpecLooksIncomplete(raw: string): boolean {
-  const text = raw.trim()
-  if (!text || !text.endsWith("}")) return true
-  let depth = 0
-  let inStr = false
-  let esc = false
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (esc) { esc = false; continue }
-    if (inStr) {
-      if (ch === "\\") esc = true
-      else if (ch === '"') inStr = false
-      continue
-    }
-    if (ch === '"') inStr = true
-    else if (ch === "{") depth++
-    else if (ch === "}") depth--
-  }
-  return depth !== 0 || inStr
-}
-
-// The chart spec round-trips through the LLM as plain text in the final reply.
-// On a small fraction of generations the model double-escapes non-ASCII —
-// emits a literal backslash-u-XXXX sequence instead of the character (or a
-// single \u escape JSON.parse would decode). JSON.parse then yields the
-// literal 6-char string. Decode such stray escapes so CJK titles/labels render.
-function decodeStrayUnicodeEscapes(s: string): string {
-  if (!s.includes("\\u")) return s
-  return s.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-}
-
-// String coercion for model-emitted leaf text: the renderer iterates these
-// with `for..of` (would throw on a number) and draws them verbatim (would
-// show stray unicode escapes). Both hazards are normalised here.
-function toCleanString(v: unknown): string {
-  return decodeStrayUnicodeEscapes(String(v))
-}
-
-function pickCommonOpts(obj: Record<string, unknown>): CommonOpts {
-  const out: CommonOpts = {}
-  for (const k of ["title", "x_label", "y_label"] as const) {
-    if (typeof obj[k] === "string") out[k] = decodeStrayUnicodeEscapes(obj[k] as string)
-  }
-  for (const k of ["width", "height"] as const) {
-    if (typeof obj[k] === "number" && Number.isFinite(obj[k])) out[k] = obj[k] as number
-  }
-  return out
-}
-
-// Coerce a leaf value to a finite number the way the backend handler does
-// (accepts numeric strings), or return null when it can't — JSON.stringify
-// would otherwise serialise a NaN as `null` and the renderer would silently
-// draw wrong data.
-function toFiniteNumber(v: unknown): number | null {
-  const n = typeof v === "number" ? v : Number(v)
-  return Number.isFinite(n) ? n : null
-}
-
-// Deep validation + normalisation mirroring backend handler.ts `validate()`.
-// The chart JSON is re-emitted by the LLM in its final reply (not the original
-// tool response), so it crosses a trust boundary even though the MCP tool
-// itself validated input — the model can rewrite, truncate, or corrupt fields
-// during paste. Beyond shape checks this also normalises leaf values: category
-// / series-name fields are coerced to strings (the renderer iterates them with
-// `for..of` and would throw on a number) and numeric fields are coerced to
-// finite numbers (a non-finite value rejects the whole spec). Returning null
-// lets Markdown.tsx fall back to <ChartParseError> instead of crashing the
-// chat bubble inside PieChart/BarChart/LineChart.
-export function tryParseChartSpec(raw: string): ChartSpec | null {
-  try {
-    const obj = JSON.parse(raw) as Record<string, unknown>
-    if (!obj || typeof obj !== "object") return null
-    const data = obj.data as Record<string, unknown> | undefined
-    if (!data || typeof data !== "object") return null
-    const common = pickCommonOpts(obj)
-
-    if (obj.type === "pie") {
-      const rawSlices = data.slices
-      if (!Array.isArray(rawSlices) || !rawSlices.length) return null
-      const slices: PieSlice[] = []
-      for (let i = 0; i < rawSlices.length; i++) {
-        const s = rawSlices[i] as { label?: unknown; value?: unknown }
-        if (!s || typeof s !== "object") return null
-        const value = toFiniteNumber(s.value)
-        if (value === null) return null
-        slices.push({ label: toCleanString(s.label ?? `slice ${i}`), value })
-      }
-      return { type: "pie", data: { slices }, ...common }
-    }
-
-    if (obj.type === "bar") {
-      const rawCats = data.categories
-      const rawSeries = data.series
-      if (!Array.isArray(rawCats) || !rawCats.length) return null
-      if (!Array.isArray(rawSeries) || !rawSeries.length) return null
-      const categories = rawCats.map(toCleanString)
-      const series: BarSeries[] = []
-      for (let i = 0; i < rawSeries.length; i++) {
-        const s = rawSeries[i] as { name?: unknown; values?: unknown }
-        if (!s || typeof s !== "object" || !Array.isArray(s.values)) return null
-        if (s.values.length !== categories.length) return null
-        const values: number[] = []
-        for (const v of s.values) {
-          const n = toFiniteNumber(v)
-          if (n === null) return null
-          values.push(n)
-        }
-        series.push({ name: toCleanString(s.name ?? `series ${i}`), values })
-      }
-      return { type: "bar", data: { categories, series }, ...common }
-    }
-
-    if (obj.type === "line") {
-      const rawSeries = data.series
-      if (!Array.isArray(rawSeries) || !rawSeries.length) return null
-      const series: LineSeries[] = []
-      for (let i = 0; i < rawSeries.length; i++) {
-        const s = rawSeries[i] as { name?: unknown; points?: unknown }
-        if (!s || typeof s !== "object" || !Array.isArray(s.points) || !s.points.length) return null
-        const points: LinePoint[] = []
-        for (const p of s.points) {
-          const pt = p as { x?: unknown; y?: unknown }
-          if (!pt || typeof pt !== "object") return null
-          const y = toFiniteNumber(pt.y)
-          if (y === null) return null
-          const x = typeof pt.x === "number" ? pt.x : toCleanString(pt.x)
-          points.push({ x, y })
-        }
-        series.push({ name: toCleanString(s.name ?? `series ${i}`), points })
-      }
-      return { type: "line", data: { series }, ...common }
-    }
-
-    return null
-  } catch {
-    return null
-  }
 }
