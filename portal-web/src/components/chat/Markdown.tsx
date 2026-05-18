@@ -1,7 +1,10 @@
 import { useMemo } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { Check, Copy } from "lucide-react"
+import { cn } from "./cn"
 import { ChartRenderer, chartSpecLooksIncomplete, tryParseChartSpec } from "./ChartRenderer"
+import { useCopyFeedback } from "./clipboard"
 
 interface MarkdownProps {
   children: string
@@ -128,6 +131,49 @@ function ChartParseError({ source }: { source: string }) {
   )
 }
 
+// Pull the language slug ("bash", "python", …) out of react-markdown's
+// `language-xxx` className. Falls back to `code` so the header is never empty
+// for bare ``` ``` fences.
+function extractLanguage(className: string | undefined): string {
+  if (!className) return "code"
+  const match = className.match(/language-([\w+\-.]+)/)
+  return match?.[1] ?? "code"
+}
+
+// Fenced code block with a language label (top-left) and a copy button
+// (top-right). Matches the Codex / ChatGPT convention so an SRE can grab a
+// suggested command without dragging a selection. Inline `code` spans are
+// unaffected — react-markdown routes those through the `code` component below.
+function CodeBlock({ language, text }: { language: string; text: string }) {
+  const [copied, copy] = useCopyFeedback()
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    void copy(text)
+  }
+  return (
+    <div className="my-2 overflow-hidden rounded-lg border border-border bg-secondary/60">
+      <div className="flex items-center justify-between border-b border-border/60 bg-secondary/80 px-3 py-0.5">
+        <span className="font-mono text-[11px] font-medium text-muted-foreground">
+          {language}
+        </span>
+        <button
+          type="button"
+          onClick={handleCopy}
+          title="Copy code"
+          className={cn(
+            "transition-opacity p-1 rounded-md text-muted-foreground/70 hover:text-foreground hover:bg-secondary",
+          )}
+        >
+          {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+        </button>
+      </div>
+      <pre className="overflow-x-auto px-3 py-2 text-[13px] leading-snug font-mono text-foreground whitespace-pre-wrap">
+        {text}
+      </pre>
+    </div>
+  )
+}
+
 // Parses the inner text of a ```chart fence into a chart spec. Each <pre>
 // node react-markdown produces is a separate component instance with its own
 // hook state, so useMemo here keys cleanly off the chunk of JSON text — the
@@ -183,11 +229,7 @@ const MARKDOWN_COMPONENTS: Components = {
       return <ChartFence text={text} />
     }
 
-    return (
-      <pre className="bg-secondary/60 text-foreground border border-border rounded-lg p-3 overflow-x-auto my-3 text-[13px] leading-relaxed font-mono whitespace-pre-wrap">
-        {text}
-      </pre>
-    )
+    return <CodeBlock language={extractLanguage(className)} text={text} />
   },
   // Inline code only — block code never reaches here (see `pre` above).
   code({ children, ...props }) {
