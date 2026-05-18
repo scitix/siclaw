@@ -19,6 +19,7 @@ export interface LineSeries {
 }
 
 export interface ChartCommonOpts {
+  schema_version?: 1;
   title?: string;
   width?: number;
   height?: number;
@@ -35,9 +36,15 @@ export type RenderChartArgs =
   | ({ type: "line"; data: { series: LineSeries[] } } & ChartCommonOpts);
 
 export interface RenderChartResult {
+  schema_version: 1;
   chart_id: string;
   type: "pie" | "bar" | "line";
+  artifact_kind: "chart_spec";
   spec_path: string;
+  /**
+   * Kept for backwards-compatible metadata shape. Empty because render_chart
+   * persists a JSON chart spec; the portal renders SVG client-side.
+   */
   svg_path: string;
   bytes: number;
   embed_instructions: string;

@@ -6,6 +6,55 @@ interface MarkdownProps {
   children: string
 }
 
+// CommonMark renders any line indented 4+ spaces as an "indented code block" —
+// a grey monospace box. LLM chat output never intends these (it always fences
+// code with ```), but a stray leading indent on an ordinary sentence makes a
+// plain message render as a code block. This remark plugin rewrites every
+// *indented* code block back into a normal paragraph; *fenced* blocks (which
+// includes ```chart) are detected via the source text and left untouched.
+function remarkDemoteIndentedCode() {
+  return (tree: unknown, file: { value?: unknown }) => {
+    const source = typeof file.value === "string" ? file.value : ""
+    const isFenced = (node: {
+      position?: { start?: { offset?: number } }
+    }): boolean => {
+      const off = node.position?.start?.offset
+      if (off == null) return true // can't tell — keep it as code, the safe default
+      const head = source.slice(off, off + 16).replace(/^[ \t]*/, "")
+      return head.startsWith("```") || head.startsWith("~~~")
+    }
+    const walk = (node: unknown): void => {
+      if (!node || typeof node !== "object") return
+      const children = (node as { children?: unknown }).children
+      if (!Array.isArray(children)) return
+      for (const child of children) {
+        if (
+          child &&
+          typeof child === "object" &&
+          (child as { type?: string }).type === "code" &&
+          !isFenced(child as { position?: { start?: { offset?: number } } })
+        ) {
+          const c = child as {
+            type: string
+            value?: string
+            lang?: unknown
+            meta?: unknown
+            children?: unknown
+          }
+          c.type = "paragraph"
+          c.children = [{ type: "text", value: c.value ?? "" }]
+          delete c.value
+          delete c.lang
+          delete c.meta
+        } else {
+          walk(child)
+        }
+      }
+    }
+    walk(tree)
+  }
+}
+
 /**
  * Escape underscores between word characters to prevent markdown from
  * interpreting them as emphasis markers (e.g. roll_dice.py → italic).
@@ -32,6 +81,10 @@ function permissiveUrlTransform(uri: string): string {
   if (/^(https?|mailto|tel|ircs?|xmpp):/i.test(uri)) return uri
   if (uri.startsWith("/") || uri.startsWith("#") || uri.startsWith("?") || uri.startsWith(".")) return uri
   return ""
+}
+
+function hasLanguageClass(className: string | undefined, language: string): boolean {
+  return className?.split(/\s+/).includes(`language-${language}`) ?? false
 }
 
 function ChartLoading() {
@@ -77,51 +130,60 @@ function ChartParseError({ source }: { source: string }) {
 export function Markdown({ children }: MarkdownProps) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkDemoteIndentedCode]}
       urlTransform={permissiveUrlTransform}
       components={{
         // Code blocks. ```chart fenced blocks contain a JSON spec emitted by
         // mcp render_chart; we parse and render via the React ChartRenderer
         // (theme-aware, no <pre> dark background, no SVG echo from the model).
+        //
+        // Every other fenced block — language-tagged or not — is rendered here
+        // by extracting the raw text and drawing one soft-styled <pre>. We do
+        // NOT pass `children` (the inner <code> element) through, because the
+        // `code` component below can't tell block code from inline code (a
+        // no-language fence's <code> carries no className) and would render it
+        // as orange inline text on a slate-900 box — the "black box, yellow
+        // text" artifact. Handling all block code here keeps `code` purely for
+        // inline spans.
         pre({ children }) {
           const child = Array.isArray(children) ? children[0] : children
-          if (
-            child &&
-            typeof child === "object" &&
-            "props" in child &&
-            (child as { props: { className?: string } }).props.className === "language-chart"
-          ) {
-            const raw = (child as { props: { children?: unknown } }).props.children
-            const text = (Array.isArray(raw) ? raw.join("") : String(raw ?? "")).trim()
-            const spec = tryParseChartSpec(text)
+          const isElement =
+            !!child && typeof child === "object" && "props" in child
+          const className = isElement
+            ? (child as { props: { className?: string } }).props.className
+            : undefined
+          const rawChildren = isElement
+            ? (child as { props: { children?: unknown } }).props.children
+            : children
+          const text = Array.isArray(rawChildren)
+            ? rawChildren.join("")
+            : String(rawChildren ?? "")
+
+          if (hasLanguageClass(className, "chart")) {
+            const trimmed = text.trim()
+            const spec = tryParseChartSpec(trimmed)
             if (spec) return <ChartRenderer spec={spec} />
             // Don't show the red parse-failed box mid-stream — ReactMarkdown
             // re-renders on every token, so an unclosed chart fence flashes
             // an error for every chart until streaming finishes. Only treat
             // it as a real error once the JSON has finished arriving.
-            if (chartSpecLooksIncomplete(text)) return <ChartLoading />
-            return <ChartParseError source={text} />
+            if (chartSpecLooksIncomplete(trimmed)) return <ChartLoading />
+            return <ChartParseError source={trimmed} />
           }
+
           return (
-            <pre className="bg-slate-900 text-slate-100 rounded-lg p-4 overflow-x-auto my-3 text-sm leading-relaxed">
-              {children}
+            <pre className="bg-secondary/60 text-foreground border border-border rounded-lg p-3 overflow-x-auto my-3 text-[13px] leading-relaxed font-mono whitespace-pre-wrap">
+              {text}
             </pre>
           )
         },
-        code({ className, children, ...props }) {
-          const isInline = !className
-          if (isInline) {
-            return (
-              <code
-                className="bg-secondary text-orange-400 px-1.5 py-0.5 rounded text-[13px] font-mono"
-                {...props}
-              >
-                {children}
-              </code>
-            )
-          }
+        // Inline code only — block code never reaches here (see `pre` above).
+        code({ children, ...props }) {
           return (
-            <code className={`font-mono text-[13px] ${className ?? ""}`} {...props}>
+            <code
+              className="bg-secondary text-orange-400 px-1.5 py-0.5 rounded text-[13px] font-mono"
+              {...props}
+            >
               {children}
             </code>
           )

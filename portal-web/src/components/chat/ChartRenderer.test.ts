@@ -7,6 +7,7 @@ describe("tryParseChartSpec", () => {
       '{"type":"pie","data":{"slices":[{"label":"a","value":1},{"label":"b","value":2}]}}',
     )
     expect(spec?.type).toBe("pie")
+    expect(spec?.schema_version).toBe(1)
     expect(spec).toMatchObject({ data: { slices: [{ label: "a", value: 1 }, { label: "b", value: 2 }] } })
   })
 
@@ -28,6 +29,15 @@ describe("tryParseChartSpec", () => {
     expect(tryParseChartSpec("not json")).toBeNull()
     expect(tryParseChartSpec('{"type":"scatter","data":{}}')).toBeNull()
     expect(tryParseChartSpec('{"type":"pie"}')).toBeNull()
+  })
+
+  it("accepts missing schema_version as v1 but rejects unknown versions", () => {
+    expect(
+      tryParseChartSpec('{"schema_version":1,"type":"pie","data":{"slices":[{"label":"a","value":1}]}}')?.schema_version,
+    ).toBe(1)
+    expect(
+      tryParseChartSpec('{"schema_version":2,"type":"pie","data":{"slices":[{"label":"a","value":1}]}}'),
+    ).toBeNull()
   })
 
   // The chart spec round-trips through the LLM as text; the model sometimes
