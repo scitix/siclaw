@@ -35,6 +35,10 @@ function firstMeaningfulLine(source: string): string {
     .find((line) => line && !line.startsWith("%%")) ?? ""
 }
 
+function normalizeMermaidSource(raw: string): string {
+  return raw.trim().replace(/^\s*\d+-(?:content|text):\s*/gm, "")
+}
+
 export function countMermaidEdges(source: string): number {
   return (
     source.match(/(?:-->|---|==>|->>|-->>|-\)|--\)|<-->|<->|--x|--o)/g) ?? []
@@ -42,7 +46,7 @@ export function countMermaidEdges(source: string): number {
 }
 
 export function validateMermaidSource(raw: string): MermaidValidation {
-  const source = raw.trim()
+  const source = normalizeMermaidSource(raw)
   if (!source) return { ok: false, reason: "The Mermaid block is empty." }
   if (source.length > MAX_MERMAID_CHARS) {
     return {

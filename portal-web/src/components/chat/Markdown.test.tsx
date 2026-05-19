@@ -51,6 +51,17 @@ describe("Markdown Mermaid fences", () => {
     })
   })
 
+  it("repairs leaked stream content prefixes inside Mermaid blocks", () => {
+    expect(validateMermaidSource("flowchart TD\n  178-content: A --> B")).toMatchObject({
+      ok: true,
+      source: "flowchart TD\nA --> B",
+    })
+    expect(validateMermaidSource("sequenceDiagram\n  9-text: A->>B: hello")).toMatchObject({
+      ok: true,
+      source: "sequenceDiagram\nA->>B: hello",
+    })
+  })
+
   it("rejects unsupported diagram families and init directives", () => {
     expect(validateMermaidSource("classDiagram\n  A <|-- B")).toMatchObject({
       ok: false,
