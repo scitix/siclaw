@@ -32,6 +32,15 @@ describe("Markdown Mermaid fences", () => {
     expect(html).not.toContain("language-mermaid")
   })
 
+  it("keeps incomplete mermaid fences in loading state while streaming", () => {
+    const html = renderToStaticMarkup(
+      <Markdown isStreaming>{"```mermaid\nflowchart TD\n  A -->"}</Markdown>,
+    )
+
+    expect(html).toContain("Rendering diagram")
+    expect(html).not.toContain("Failed to render Mermaid diagram")
+  })
+
   it("accepts the initial diagram set", () => {
     expect(validateMermaidSource("flowchart TD\n  A --> B")).toMatchObject({
       ok: true,
