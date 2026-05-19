@@ -21,7 +21,9 @@ import {
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
-import { svgChartToPngDataUrl, tryParseChartSpec } from "./ChartRenderer"
+import { tryParseChartSpec } from "./ChartRenderer"
+import { validateMermaidSource } from "./MermaidRenderer"
+import { svgToPngDataUrl } from "./svg-export"
 import { useCopyFeedback } from "./clipboard"
 import { InputArea } from "./InputArea"
 import { SkillCard } from "./SkillCard"
@@ -1166,7 +1168,7 @@ function serializeSessionToText(messages: PilotMessage[]): string {
     if (m.role === "user") {
       lines.push(`You:\n${m.content.trim()}`)
     } else if (m.role === "assistant") {
-      const body = stripChartFences(m.content ?? "")
+      const body = stripVisualizationFences(m.content ?? "")
       if (body) lines.push(`Assistant:\n${body}`)
     } else if (m.role === "tool") {
       const name = m.toolName ?? "tool"
@@ -1187,22 +1189,22 @@ function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;")
 }
 
-// Build a text/html rendition of the whole session with each ```chart fenced
+// Build a text/html rendition of the whole session with each visual fenced
 // block swapped for its rasterised PNG. The PNGs are passed in DOM order; an
 // assistant message's fences are mapped to them left-to-right, skipping fences
-// whose JSON failed to parse (those rendered no chart in the DOM, so they did
-// not consume a PNG).
+// whose source failed validation.
 //
 // KNOWN LIMITATION — this PNG↔fence mapping is best-effort, not exact. It
-// assumes `tryParseChartSpec` succeeding here implies the fence rendered a real
-// `.chart-host svg` in the DOM. That can drift if a fence parsed but the chart
-// did not actually mount (e.g. it was still in the streaming/loading state, or
-// future render-gating changes), in which case later images attach to the
-// wrong message. Acceptable for a copy-to-clipboard convenience; if it ever
-// needs to be exact, walk per-message DOM nodes instead of re-parsing text.
-function serializeSessionToHtml(messages: PilotMessage[], chartUrls: string[]): string {
-  const fenceRe = /```chart\s*([\s\S]*?)```/g
-  let chartIdx = 0
+// assumes `tryParseChartSpec` / `validateMermaidSource` succeeding here implies
+// the fence rendered a real `.chart-host svg` / `.mermaid-host svg` in the DOM.
+// That can drift if a fence parsed but the visual did not actually mount (e.g.
+// it was still in the streaming/loading state, or future render-gating changes),
+// in which case later images attach to the wrong message. Acceptable for a
+// copy-to-clipboard convenience; if it ever needs to be exact, walk per-message
+// DOM nodes instead of re-parsing text.
+function serializeSessionToHtml(messages: PilotMessage[], visualUrls: string[]): string {
+  const fenceRe = /```(chart|mermaid)\s*([\s\S]*?)```/g
+  let visualIdx = 0
   const parts: string[] = []
   for (const m of messages) {
     if (m.hidden) continue
@@ -1219,11 +1221,15 @@ function serializeSessionToHtml(messages: PilotMessage[], chartUrls: string[]): 
       while ((match = fenceRe.exec(body)) !== null) {
         const before = body.slice(last, match.index).trim()
         if (before) html += `<p>${escapeHtml(before).replace(/\n/g, "<br/>")}</p>`
-        const parsed = tryParseChartSpec(match[1].trim())
-        if (parsed && chartIdx < chartUrls.length) {
-          html += `<p><img src="${chartUrls[chartIdx++]}" alt="chart" style="max-width:100%;height:auto"/></p>`
+        const lang = match[1]
+        const raw = match[2].trim()
+        const parsed = lang === "chart" ? Boolean(tryParseChartSpec(raw)) : validateMermaidSource(raw).ok
+        if (parsed && visualIdx < visualUrls.length) {
+          html += `<p><img src="${visualUrls[visualIdx++]}" alt="${lang}" style="max-width:100%;height:auto"/></p>`
+        } else if (lang === "mermaid") {
+          html += "<p>[diagram]</p>"
         } else {
-          html += "<p>[chart]</p>"
+          html += `<p>[${lang}]</p>`
         }
         last = match.index + match[0].length
       }
@@ -1248,12 +1254,14 @@ async function copySessionWithCharts(
   container: HTMLElement,
   messages: PilotMessage[],
 ): Promise<boolean> {
-  const svgs = Array.from(container.querySelectorAll<SVGSVGElement>('.chart-host svg[role="img"]'))
+  const svgs = Array.from(container.querySelectorAll<SVGSVGElement>(
+    '.chart-host svg[role="img"], .mermaid-host svg[role="img"]',
+  ))
   if (svgs.length === 0) return false
   if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
   try {
-    const chartUrls = await Promise.all(svgs.map((svg) => svgChartToPngDataUrl(svg)))
-    const html = serializeSessionToHtml(messages, chartUrls)
+    const visualUrls = await Promise.all(svgs.map((svg) => svgToPngDataUrl(svg)))
+    const html = serializeSessionToHtml(messages, visualUrls)
     const plain = serializeSessionToText(messages)
     await navigator.clipboard.write([
       new ClipboardItem({
@@ -1327,23 +1335,29 @@ function CopyIconButton({
 
 // Plain-text fallback for the clipboard: a ```chart fenced JSON block is noise
 // when pasted as text, so swap it for a readable placeholder.
-function stripChartFences(markdown: string): string {
-  return markdown.replace(/```chart\s*[\s\S]*?```/g, "[chart]").replace(/\n{3,}/g, "\n\n").trim()
+function stripVisualizationFences(markdown: string): string {
+  return markdown
+    .replace(/```chart\s*[\s\S]*?```/g, "[chart]")
+    .replace(/```mermaid\s*[\s\S]*?```/g, "[diagram]")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
 }
 
-// Copy a rendered message bubble as rich text/html with charts rasterised to
+// Copy a rendered message bubble as rich text/html with visualisations rasterised to
 // inline PNGs, plus a text/plain fallback. Returns false when there are no
-// charts or the browser can't do a rich clipboard write, so the caller can
+// visualisations or the browser can't do a rich clipboard write, so the caller can
 // fall back to a plain markdown copy. Without this, "copy answer" yielded the
-// raw chart JSON spec instead of the picture the user actually sees.
+// raw chart JSON spec or Mermaid source instead of the picture the user sees.
 async function copyBubbleWithCharts(bubble: HTMLElement, content: string): Promise<boolean> {
-  const charts = Array.from(bubble.querySelectorAll<SVGSVGElement>('.chart-host svg[role="img"]'))
-  if (charts.length === 0) return false
+  const visuals = Array.from(bubble.querySelectorAll<SVGSVGElement>(
+    '.chart-host svg[role="img"], .mermaid-host svg[role="img"]',
+  ))
+  if (visuals.length === 0) return false
   if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
   try {
-    const dataUrls = await Promise.all(charts.map((svg) => svgChartToPngDataUrl(svg)))
+    const dataUrls = await Promise.all(visuals.map((svg) => svgToPngDataUrl(svg)))
     const clone = bubble.cloneNode(true) as HTMLElement
-    const cloneHosts = Array.from(clone.querySelectorAll<HTMLElement>(".chart-host"))
+    const cloneHosts = Array.from(clone.querySelectorAll<HTMLElement>(".chart-host, .mermaid-host"))
     cloneHosts.forEach((host, i) => {
       const img = document.createElement("img")
       img.src = dataUrls[i] ?? ""
@@ -1354,7 +1368,7 @@ async function copyBubbleWithCharts(bubble: HTMLElement, content: string): Promi
     // Drop any leftover interactive controls (chart toolbars etc.).
     clone.querySelectorAll("button").forEach((b) => b.remove())
     const html = `<div>${clone.innerHTML}</div>`
-    const plain = stripChartFences(content)
+    const plain = stripVisualizationFences(content)
     await navigator.clipboard.write([
       new ClipboardItem({
         "text/html": new Blob([html], { type: "text/html" }),

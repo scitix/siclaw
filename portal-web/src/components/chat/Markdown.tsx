@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm"
 import { Check, Copy } from "lucide-react"
 import { cn } from "./cn"
 import { ChartRenderer, chartSpecLooksIncomplete, tryParseChartSpec } from "./ChartRenderer"
+import { MermaidRenderer } from "./MermaidRenderer"
 import { useCopyFeedback } from "./clipboard"
 
 interface MarkdownProps {
@@ -211,6 +212,11 @@ function ChartFence({ text }: { text: string }) {
   return <ChartParseError source={trimmed} />
 }
 
+function MermaidFence({ text }: { text: string }) {
+  const isStreaming = useContext(ChartStreamingContext)
+  return <MermaidRenderer source={text} isStreaming={isStreaming} />
+}
+
 // Hoisted to module scope so each entry has stable function identity across
 // <Markdown> re-renders. Inlining this object inside the render body produces
 // fresh function references every token, which react-markdown surfaces as a
@@ -246,6 +252,10 @@ const MARKDOWN_COMPONENTS: Components = {
 
     if (hasLanguageClass(className, "chart")) {
       return <ChartFence text={text} />
+    }
+
+    if (hasLanguageClass(className, "mermaid")) {
+      return <MermaidFence text={text} />
     }
 
     return <CodeBlock language={extractLanguage(className)} text={text} />
