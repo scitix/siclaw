@@ -1195,12 +1195,13 @@ function escapeHtml(text: string): string {
 // whose source failed validation.
 //
 // KNOWN LIMITATION — this PNG↔fence mapping is best-effort, not exact. It
-// assumes `tryParseChartSpec` succeeding here implies the fence rendered a real
-// `.chart-host svg` in the DOM. That can drift if a fence parsed but the chart
-// did not actually mount (e.g. it was still in the streaming/loading state, or
-// future render-gating changes), in which case later images attach to the
-// wrong message. Acceptable for a copy-to-clipboard convenience; if it ever
-// needs to be exact, walk per-message DOM nodes instead of re-parsing text.
+// assumes `tryParseChartSpec` / `validateMermaidSource` succeeding here implies
+// the fence rendered a real `.chart-host svg` / `.mermaid-host svg` in the DOM.
+// That can drift if a fence parsed but the visual did not actually mount (e.g.
+// it was still in the streaming/loading state, or future render-gating changes),
+// in which case later images attach to the wrong message. Acceptable for a
+// copy-to-clipboard convenience; if it ever needs to be exact, walk per-message
+// DOM nodes instead of re-parsing text.
 function serializeSessionToHtml(messages: PilotMessage[], visualUrls: string[]): string {
   const fenceRe = /```(chart|mermaid)\s*([\s\S]*?)```/g
   let visualIdx = 0
@@ -1225,6 +1226,8 @@ function serializeSessionToHtml(messages: PilotMessage[], visualUrls: string[]):
         const parsed = lang === "chart" ? Boolean(tryParseChartSpec(raw)) : validateMermaidSource(raw).ok
         if (parsed && visualIdx < visualUrls.length) {
           html += `<p><img src="${visualUrls[visualIdx++]}" alt="${lang}" style="max-width:100%;height:auto"/></p>`
+        } else if (lang === "mermaid") {
+          html += "<p>[diagram]</p>"
         } else {
           html += `<p>[${lang}]</p>`
         }

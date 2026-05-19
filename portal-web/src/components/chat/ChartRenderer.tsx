@@ -710,9 +710,10 @@ function ChartRendererImpl({ spec, className, style, allowPreview = true }: Char
       if (ok) flash("ok", "Image copied to clipboard")
       else {
         downloadBlob(blob, "chart.png")
-        flash("ok", "Clipboard image copy not supported — downloaded PNG instead")
+        flash("ok", "Clipboard image copy unavailable — downloaded PNG instead")
       }
-    } catch {
+    } catch (err) {
+      console.warn("[copy] chart image copy failed:", err)
       flash("err", "Copy failed")
     }
   }, [flash])

@@ -45,6 +45,9 @@ export function countMermaidEdges(source: string): number {
   ).length
 }
 
+// Layered guard before mounting Mermaid output: bound input size/complexity,
+// reject init directives so chat content cannot weaken renderer config, then
+// whitelist only the diagram families Siclaw intentionally supports.
 export function validateMermaidSource(raw: string): MermaidValidation {
   const source = normalizeMermaidSource(raw)
   if (!source) return { ok: false, reason: "The Mermaid block is empty." }
@@ -94,6 +97,9 @@ export function validateMermaidSource(raw: string): MermaidValidation {
 function mermaidConfig() {
   return {
     startOnLoad: false,
+    // This is the load-bearing XSS defense for the SVG later mounted with
+    // dangerouslySetInnerHTML. Chat-authored %%{init}%% directives are rejected
+    // above so a response cannot downgrade this setting.
     securityLevel: "strict",
     maxTextSize: MAX_MERMAID_CHARS,
     maxEdges: MAX_MERMAID_EDGES,
@@ -121,6 +127,9 @@ function mermaidConfig() {
 }
 
 function decorateMermaidSvg(svg: string): string {
+  // Mermaid already parsed/rendered this string under strict mode. Keep this as
+  // a tiny string decoration so we do not need to reparse browser-only SVG DOM
+  // just to add accessibility metadata.
   return svg.replace(/<svg\b[^>]*>/, (tag) => {
     let next = /\brole=/.test(tag)
       ? tag.replace(/\srole=(["']).*?\1/, ' role="img"')
@@ -237,9 +246,10 @@ export function MermaidRenderer({
       if (ok) flash("ok", "Image copied to clipboard")
       else {
         downloadBlob(blob, "mermaid-diagram.png")
-        flash("ok", "Clipboard image copy not supported — downloaded PNG instead")
+        flash("ok", "Clipboard image copy unavailable — downloaded PNG instead")
       }
-    } catch {
+    } catch (err) {
+      console.warn("[copy] Mermaid image copy failed:", err)
       flash("err", "Copy failed")
     }
   }, [flash, getSvg])
@@ -252,7 +262,8 @@ export function MermaidRenderer({
       const base = mermaidDownloadBase(cleanSource, validation.ok ? validation.kind : "diagram")
       downloadBlob(blob, `${base}.png`)
       flash("ok", "PNG downloaded")
-    } catch {
+    } catch (err) {
+      console.warn("[download] Mermaid PNG export failed:", err)
       flash("err", "Download failed")
     }
   }, [cleanSource, flash, getSvg, validation])
@@ -281,9 +292,12 @@ export function MermaidRenderer({
       try {
         const mermaid = (await import("mermaid")).default
         mermaid.initialize(mermaidConfig())
-        const parsed = await mermaid.parse(validation.source, { suppressErrors: true })
+        const parsed = await mermaid.parse(validation.source)
         if (!parsed) throw new Error("Mermaid parser rejected the diagram syntax.")
         const { svg } = await mermaid.render(nextMermaidId(), validation.source)
+        // Dynamic import/render can resolve after a newer source or streaming
+        // state has already triggered another effect; avoid replacing fresh
+        // state with a stale render.
         if (!cancelled) setState({ status: "ready", svg: decorateMermaidSvg(svg) })
       } catch (err) {
         if (cancelled) return

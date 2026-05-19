@@ -1,7 +1,24 @@
 // Browser helpers shared by chat visualisations that render as inline SVG.
 // They intentionally know nothing about ChartSpec or Mermaid syntax.
 
-const INLINEABLE_PROPS = ["fill", "stroke", "stroke-width", "font-family", "font-size", "font-weight"] as const
+// Inline the CSS properties that affect chart/Mermaid appearance before the
+// SVG leaves the document. The <img> used for rasterisation cannot see parent
+// Tailwind classes or Mermaid's in-document stylesheet.
+const INLINEABLE_PROPS = [
+  "fill",
+  "stroke",
+  "stroke-width",
+  "stroke-dasharray",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "marker-end",
+  "marker-start",
+  "marker-mid",
+  "opacity",
+  "font-family",
+  "font-size",
+  "font-weight",
+] as const
 
 function inlineComputedStyles(src: SVGElement, dst: SVGElement) {
   const srcAll = [src, ...Array.from(src.querySelectorAll<SVGElement>("*"))]
@@ -13,6 +30,9 @@ function inlineComputedStyles(src: SVGElement, dst: SVGElement) {
       const v = cs.getPropertyValue(prop)
       if (v) tgt.style.setProperty(prop, v)
     }
+    // Strip class attrs because colors/styles are now inlined. Keeping classes
+    // would bloat the serialized output and require Tailwind/Mermaid CSS in the
+    // consumer's context.
     tgt.removeAttribute("class")
   }
 }
@@ -28,6 +48,11 @@ function svgCanvasSize(svg: SVGSVGElement): { width: number; height: number } {
 }
 
 function svgBackground(svg: SVGSVGElement): string {
+  // Chart SVGs include .chart-bg; sample its live fill before cloning so the
+  // canvas base matches what the user sees, even if future style inlining fails
+  // to carry the background fill onto the detached clone. Mermaid SVGs do not
+  // have .chart-bg and are currently rendered/exported on the intentional white
+  // base from mermaidConfig().
   const bgRect = svg.querySelector<SVGRectElement>(".chart-bg")
   const liveBg = bgRect ? window.getComputedStyle(bgRect).fill : ""
   return liveBg && liveBg !== "none" && liveBg !== "transparent" ? liveBg : "#ffffff"
@@ -78,6 +103,8 @@ function blobToDataUrl(blob: Blob): Promise<string> {
 }
 
 export async function svgToPngDataUrl(svg: SVGSVGElement, scale = 2): Promise<string> {
+  // Used by rich clipboard text/html payloads so copied chat bubbles contain a
+  // real image instead of raw chart JSON or Mermaid source.
   const blob = await svgToPngBlob(svg, scale)
   return await blobToDataUrl(blob)
 }
@@ -98,7 +125,8 @@ export async function copyBlobToClipboard(blob: Blob): Promise<boolean> {
   try {
     await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
     return true
-  } catch {
+  } catch (err) {
+    console.warn("[copy] clipboard image write failed:", err)
     return false
   }
 }
