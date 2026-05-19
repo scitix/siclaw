@@ -10,6 +10,8 @@ import {
   layoutLegendRows,
   computePlot,
   barTickLayout,
+  BAR_TICK_ROTATE_DEG,
+  approxTextWidth,
   legendRowsFor,
   chartCanvasSize,
   seriesDash,
@@ -196,6 +198,29 @@ describe("barTickLayout", () => {
     const l = barTickLayout(cats, 720)
     expect(l.rotate).toBe(true)
     expect(l.tickBandH).toBeGreaterThan(50)
+  })
+
+  it("reserves left margin so a long first rotated label is not clipped", () => {
+    const cats = [
+      "very-long-left-edge-category-name",
+      "b",
+      "c",
+      "d",
+      "e",
+      "f",
+    ]
+    const l = barTickLayout(cats, 460, { hasYAxisLabel: true })
+    expect(l.rotate).toBe(true)
+    expect(l.sidePaddingLeft).toBeGreaterThan(0)
+
+    const plot = computePlot(460, 520, true, 0, true, true, true, true, l.tickBandH, {
+      left: l.sidePaddingLeft,
+      right: l.sidePaddingRight,
+    })
+    const firstAnchor = plot.left + plot.w / cats.length / 2
+    const firstLabelLeft =
+      firstAnchor - approxTextWidth(cats[0], 12) * Math.cos((BAR_TICK_ROTATE_DEG * Math.PI) / 180)
+    expect(firstLabelLeft).toBeGreaterThanOrEqual(6)
   })
 
   it("makes chartCanvasSize grow the canvas to fit a tall rotated tick band", () => {

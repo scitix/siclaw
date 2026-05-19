@@ -255,12 +255,15 @@ export interface Plot { left: number; right: number; top: number; bottom: number
 // caller measures it from the actual longest label (see barTickLayout) so a
 // long category label never overhangs past the canvas bottom. Defaults to the
 // historic fixed value for callers that don't rotate.
+// `xTickSidePadding` reserves left/right plot margins for rotated edge labels;
+// without this, the first long -30deg x label can extend beyond the SVG viewBox.
 export function computePlot(
   width: number, height: number,
   hasTitle: boolean, legendRows: number,
   hasXLabels: boolean, rotateXTicks: boolean,
   hasYAxisLabel: boolean, hasXAxisLabel: boolean,
   rotatedTickH = 50,
+  xTickSidePadding: { left?: number; right?: number } = {},
 ): Plot {
   const titleH = hasTitle ? 30 : 6
   const legendH = legendRows > 0 ? legendRows * LEGEND_LINE_H + 6 : 0
@@ -269,8 +272,8 @@ export function computePlot(
   const yLabelW = hasYAxisLabel ? 22 : 0
   const top = titleH + legendH + 8
   const bottom = height - xTickH - xLabelH - 8
-  const left = 60 + yLabelW
-  const right = width - 24
+  const left = 60 + yLabelW + Math.max(0, xTickSidePadding.left ?? 0)
+  const right = width - 24 - Math.max(0, xTickSidePadding.right ?? 0)
   return { left, right, top, bottom, w: right - left, h: bottom - top }
 }
 
@@ -287,16 +290,45 @@ export const BAR_TICK_BASE_H = 50
 
 export function barTickLayout(
   categories: string[], width: number,
-): { rotate: boolean; tickBandH: number } {
+  opts: { hasYAxisLabel?: boolean } = {},
+): { rotate: boolean; tickBandH: number; sidePaddingLeft: number; sidePaddingRight: number } {
   const longest = categories.reduce(
     (m, c) => Math.max(m, approxTextWidth(c, TICK_SIZE)),
     0,
   )
   const approxGroupW = categories.length ? (width - 80) / categories.length : width
   const rotate = longest + 4 > approxGroupW
-  if (!rotate) return { rotate: false, tickBandH: 26 }
-  const overhang = longest * Math.sin((BAR_TICK_ROTATE_DEG * Math.PI) / 180)
-  return { rotate: true, tickBandH: Math.ceil(BAR_TICK_GAP + overhang + 8) }
+  if (!rotate) return { rotate: false, tickBandH: 26, sidePaddingLeft: 0, sidePaddingRight: 0 }
+  const angle = (BAR_TICK_ROTATE_DEG * Math.PI) / 180
+  const verticalOverhang = longest * Math.sin(angle)
+
+  // Rotated bar labels are end-anchored, so the first label extends up-left
+  // from its category centre. Reserve enough extra left margin for that label
+  // to stay inside the SVG viewport. The right edge does not need symmetric
+  // padding with the current end-anchor geometry, but keep the field explicit
+  // so computePlot has a stable shape if the label anchoring changes later.
+  const first = categories[0] ?? ""
+  const firstW = approxTextWidth(first, TICK_SIZE)
+  const baseLeft = 60 + (opts.hasYAxisLabel ? 22 : 0)
+  const baseRight = width - 24
+  const n = Math.max(1, categories.length)
+  const basePlotW = Math.max(1, baseRight - baseLeft)
+  const firstAnchor = baseLeft + basePlotW / n / 2
+  const edgePad = 8
+  const deficit = firstW * Math.cos(angle) + edgePad - firstAnchor
+  const denom = 1 - 1 / (2 * n)
+  const maxSidePadding = Math.max(0, width * 0.28)
+  const sidePaddingLeft = Math.min(
+    maxSidePadding,
+    Math.max(0, Math.ceil(deficit / denom)),
+  )
+
+  return {
+    rotate: true,
+    tickBandH: Math.ceil(BAR_TICK_GAP + verticalOverhang + 8),
+    sidePaddingLeft,
+    sidePaddingRight: 0,
+  }
 }
 
 export function defaultSize(type: ChartSpec["type"]): { width: number; height: number } {
@@ -339,7 +371,7 @@ export function chartCanvasSize(
   // historic fixed tick band — same "canvas GROWS, plot never collapses"
   // philosophy as the legend-row growth above.
   if (spec.type === "bar") {
-    const { tickBandH } = barTickLayout(spec.data.categories, width)
+    const { tickBandH } = barTickLayout(spec.data.categories, width, { hasYAxisLabel: !!spec.y_label })
     height += Math.max(0, tickBandH - BAR_TICK_BASE_H)
   }
   return { width, height, legendRows }
