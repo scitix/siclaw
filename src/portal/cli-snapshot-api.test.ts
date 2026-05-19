@@ -176,7 +176,31 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.providers.openai.models).toHaveLength(1);
     expect(body.providers.openai.models[0].id).toBe("gpt-4o");
     expect(body.providers.openai.models[0].contextWindow).toBe(128000);
+    expect(body.providers.openai.models[0].compat.supportsDeveloperRole).toBe(true);
     expect(body.default).toEqual({ provider: "openai", modelId: "gpt-4o" });
+  });
+
+  it("marks non-OpenAI compatible providers as not supporting developer-role messages", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-compatible", "default", "compatible", "https://api.example.com/model-api", "sk-test", "openai-completions", 0],
+    );
+    await db.query(
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["m-compatible", "p-compatible", "compatible-chat", "Compatible Chat", 0, 128000, 8192, 1, 0],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot", headers: authedHeaders() }),
+    );
+    expect(status).toBe(200);
+    expect(body.providers.compatible.models[0].compat).toMatchObject({
+      supportsDeveloperRole: false,
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+    });
   });
 
   it("filters out providers with empty or NULL api_key", async () => {
