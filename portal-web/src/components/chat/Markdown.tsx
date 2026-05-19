@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { createContext, useContext, useMemo } from "react"
 import ReactMarkdown, { type Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { Check, Copy } from "lucide-react"
@@ -8,7 +8,10 @@ import { useCopyFeedback } from "./clipboard"
 
 interface MarkdownProps {
   children: string
+  isStreaming?: boolean
 }
+
+const ChartStreamingContext = createContext(false)
 
 // CommonMark renders any line indented 4+ spaces as an "indented code block" —
 // a grey monospace box. LLM chat output never intends these (it always fences
@@ -114,13 +117,19 @@ function ChartLoading() {
   )
 }
 
-function ChartParseError({ source }: { source: string }) {
+function ChartParseError({
+  source,
+  title = "Failed to parse chart JSON",
+  description = "Check whether the chart block returned by render_chart was rewritten or extra-escaped.",
+}: {
+  source: string
+  title?: string
+  description?: string
+}) {
   return (
     <div className="my-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-100">
-      <div className="font-semibold">Failed to parse chart JSON</div>
-      <div className="mt-1 text-xs opacity-80">
-        Check whether the chart block returned by render_chart was rewritten or extra-escaped.
-      </div>
+      <div className="font-semibold">{title}</div>
+      <div className="mt-1 text-xs opacity-80">{description}</div>
       <details className="mt-2">
         <summary className="cursor-pointer text-xs font-medium">View raw chart content</summary>
         <pre className="mt-2 max-h-56 overflow-auto rounded bg-slate-950 p-3 text-xs text-slate-100">
@@ -181,6 +190,7 @@ function CodeBlock({ language, text }: { language: string; text: string }) {
 // which lets ChartRenderer's React.memo short-circuit cleanly while the LLM
 // continues streaming prose after the chart fence has closed.
 function ChartFence({ text }: { text: string }) {
+  const isStreaming = useContext(ChartStreamingContext)
   const trimmed = text.trim()
   const spec = useMemo(() => tryParseChartSpec(trimmed), [trimmed])
   if (spec) return <ChartRenderer spec={spec} />
@@ -188,7 +198,16 @@ function ChartFence({ text }: { text: string }) {
   // on every token, so an unclosed chart fence would otherwise flash the
   // error box for every chart until streaming finishes. Only treat it as a
   // real error once the JSON has finished arriving.
-  if (chartSpecLooksIncomplete(trimmed)) return <ChartLoading />
+  if (chartSpecLooksIncomplete(trimmed)) {
+    if (isStreaming) return <ChartLoading />
+    return (
+      <ChartParseError
+        source={trimmed}
+        title="Chart output incomplete"
+        description="The response finished before a complete chart JSON block arrived."
+      />
+    )
+  }
   return <ChartParseError source={trimmed} />
 }
 
@@ -326,14 +345,16 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 }
 
-export function Markdown({ children }: MarkdownProps) {
+export function Markdown({ children, isStreaming = false }: MarkdownProps) {
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkDemoteIndentedCode]}
-      urlTransform={permissiveUrlTransform}
-      components={MARKDOWN_COMPONENTS}
-    >
-      {escapeIntraWordUnderscores(children)}
-    </ReactMarkdown>
+    <ChartStreamingContext.Provider value={isStreaming}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm, remarkDemoteIndentedCode]}
+        urlTransform={permissiveUrlTransform}
+        components={MARKDOWN_COMPONENTS}
+      >
+        {escapeIntraWordUnderscores(children)}
+      </ReactMarkdown>
+    </ChartStreamingContext.Provider>
   )
 }

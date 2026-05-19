@@ -1125,7 +1125,7 @@ function MessageItem({
         )}
 
         {textContent && (
-          <CopyableMessage isUser={isUser} content={textContent} />
+          <CopyableMessage isUser={isUser} content={textContent} isStreaming={message.isStreaming} />
         )}
 
         {renderedSuggestedChips.length > 0 && onChipClick && (
@@ -1368,7 +1368,15 @@ async function copyBubbleWithCharts(bubble: HTMLElement, content: string): Promi
   }
 }
 
-function CopyableMessage({ isUser, content }: { isUser: boolean; content: string }) {
+function CopyableMessage({
+  isUser,
+  content,
+  isStreaming = false,
+}: {
+  isUser: boolean
+  content: string
+  isStreaming?: boolean
+}) {
   const [copied, copy, flashCopied] = useCopyFeedback()
   const bubbleRef = useRef<HTMLDivElement | null>(null)
 
@@ -1395,7 +1403,7 @@ function CopyableMessage({ isUser, content }: { isUser: boolean; content: string
             : "bg-card border border-border text-foreground rounded-tl-sm",
         )}
       >
-        <Markdown>{content}</Markdown>
+        <Markdown isStreaming={isStreaming}>{content}</Markdown>
       </div>
       <button
         onClick={handleCopy}
@@ -1783,13 +1791,14 @@ function ToolItem({ message }: { message: PilotMessage }) {
               const t = message.timing
               const showThink = typeof t?.thinkingMs === "number"
               const showDur = typeof t?.durationMs === "number"
+              const durationLabel = message.toolStatus === "running" ? "running" : "ran"
               return (
                 <>
                   {(showThink || showDur) && (
                     <span className="text-[11px] text-muted-foreground tabular-nums select-text">
                       {showThink && <>thinking {formatTimingMs(t!.thinkingMs!)}</>}
                       {showThink && showDur && ", "}
-                      {showDur && <>running {formatTimingMs(t!.durationMs!)}</>}
+                      {showDur && <>{durationLabel} {formatTimingMs(t!.durationMs!)}</>}
                     </span>
                   )}
                 </>
