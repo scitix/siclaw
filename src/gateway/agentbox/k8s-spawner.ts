@@ -69,6 +69,19 @@ export class K8sSpawner implements BoxSpawner {
     return `agentbox-${sanitized}`;
   }
 
+  private gatewayUrl(namespace: string): string {
+    if (process.env.SICLAW_GATEWAY_INTERNAL_URL) {
+      return process.env.SICLAW_GATEWAY_INTERNAL_URL;
+    }
+
+    if (process.env.SICLAW_GATEWAY_HOSTNAME) {
+      const port = process.env.SICLAW_INTERNAL_PORT || "3002";
+      return `https://${process.env.SICLAW_GATEWAY_HOSTNAME}:${port}`;
+    }
+
+    return `https://siclaw-runtime.${namespace}.svc.cluster.local:3002`;
+  }
+
   /**
    * Create an AgentBox Pod
    */
@@ -156,7 +169,7 @@ export class K8sSpawner implements BoxSpawner {
     // Environment variables — only bootstrap deps that cannot come from settings.json
     const env: k8s.V1EnvVar[] = [
       { name: "PI_CODING_AGENT_DIR", value: ".siclaw/user-data/agent" },
-      { name: "SICLAW_GATEWAY_URL", value: process.env.SICLAW_GATEWAY_INTERNAL_URL || `https://siclaw-runtime.${namespace}.svc.cluster.local:3002` },
+      { name: "SICLAW_GATEWAY_URL", value: this.gatewayUrl(namespace) },
       { name: "SICLAW_AGENT_ID", value: agentId },
     ];
 

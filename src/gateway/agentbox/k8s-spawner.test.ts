@@ -79,6 +79,12 @@ const deletePodImpl = { set fn(f: (a: any) => Promise<any>) { g.__k8sImpls.delet
 const createSecretImpl = { set fn(f: (a: any) => Promise<any>) { g.__k8sImpls.createNamespacedSecret = f; }, get fn() { return g.__k8sImpls.createNamespacedSecret; } };
 const listPodImpl = { set fn(f: (a: any) => Promise<any>) { g.__k8sImpls.listNamespacedPod = f; }, get fn() { return g.__k8sImpls.listNamespacedPod; } };
 
+const originalGatewayEnv = {
+  SICLAW_GATEWAY_INTERNAL_URL: process.env.SICLAW_GATEWAY_INTERNAL_URL,
+  SICLAW_GATEWAY_HOSTNAME: process.env.SICLAW_GATEWAY_HOSTNAME,
+  SICLAW_INTERNAL_PORT: process.env.SICLAW_INTERNAL_PORT,
+};
+
 // Import SUT after mocks.
 import { K8sSpawner } from "./k8s-spawner.js";
 
@@ -100,6 +106,13 @@ function resetCalls() {
 
 beforeEach(() => {
   resetCalls();
+  for (const key of Object.keys(originalGatewayEnv) as Array<keyof typeof originalGatewayEnv>) {
+    if (originalGatewayEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = originalGatewayEnv[key];
+    }
+  }
   // Reset impls to defaults
   g.__k8sImpls.readNamespacedPod = async () => { throw Object.assign(new Error("not found"), { code: 404 }); };
   g.__k8sImpls.createNamespacedPod = async () => ({});
@@ -183,6 +196,54 @@ describe("K8sSpawner — pod name sanitization + invariant §3 (mTLS K8s-only)",
 });
 
 describe("K8sSpawner — spawn branches", () => {
+  it("injects AgentBox gateway URL from the configured runtime hostname", async () => {
+    process.env.SICLAW_GATEWAY_HOSTNAME = "siclaw-debug-runtime.siclaw-debug.svc.cluster.local";
+    process.env.SICLAW_INTERNAL_PORT = "3002";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.8", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env).toContainEqual({
+      name: "SICLAW_GATEWAY_URL",
+      value: "https://siclaw-debug-runtime.siclaw-debug.svc.cluster.local:3002",
+    });
+  });
+
+  it("lets explicit SICLAW_GATEWAY_INTERNAL_URL override the runtime hostname", async () => {
+    process.env.SICLAW_GATEWAY_INTERNAL_URL = "https://custom-runtime.svc:3002";
+    process.env.SICLAW_GATEWAY_HOSTNAME = "siclaw-debug-runtime.siclaw-debug.svc.cluster.local";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.9", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env).toContainEqual({
+      name: "SICLAW_GATEWAY_URL",
+      value: "https://custom-runtime.svc:3002",
+    });
+  });
+
   it("reuses a Running pod without creating a new one", async () => {
     const cm = new FakeCertManager();
     const s = new K8sSpawner();
