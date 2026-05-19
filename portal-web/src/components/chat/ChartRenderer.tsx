@@ -30,6 +30,7 @@ import {
   useEffect,
   useMemo,
 } from "react"
+import { Maximize2, X } from "lucide-react"
 import {
   type ChartSpec,
   type Axis,
@@ -137,6 +138,15 @@ function Title({ text, width }: { text?: string; width: number }) {
     <text x={width / 2} y={22} textAnchor="middle" fontSize={TITLE_SIZE} fontWeight={600}
           className="chart-title">{shown}</text>
   )
+}
+
+function ellipsizeText(text: string, maxW: number, fontSize: number): string {
+  if (approxTextWidth(text, fontSize) <= maxW) return text
+  let shown = text
+  while (shown.length > 1 && approxTextWidth(`${shown}…`, fontSize) > maxW) {
+    shown = shown.slice(0, -1)
+  }
+  return `${shown.replace(/\s+$/, "")}…`
 }
 
 // Renders the legend, wrapping to multiple centred rows when the series don't
@@ -269,11 +279,12 @@ function renderPie(
   const top = titleH + padY
   const bottom = height - padY
   const innerH = bottom - top
-  const labels = slices.map(
-    (s) => `${s.label} (${fmtNumber(s.value)}, ${((s.value / total) * 100).toFixed(1)}%)`,
-  )
+  const labels = slices.map((s) => {
+    const suffix = ` (${fmtNumber(s.value)}, ${((s.value / total) * 100).toFixed(1)}%)`
+    return { name: s.label, suffix, full: `${s.label}${suffix}` }
+  })
   const legendW = Math.min(
-    Math.max(...labels.map((l) => approxTextWidth(l, LEGEND_SIZE))) + 28,
+    Math.max(...labels.map((l) => approxTextWidth(l.full, LEGEND_SIZE))) + 28,
     width * 0.42,
   )
   const pieAreaW = width - legendW - 32
@@ -334,13 +345,22 @@ function renderPie(
   const legBlockH = labels.length * lineH
   let legY = Math.max(top + 8, top + (innerH - legBlockH) / 2 + LEGEND_SIZE)
   const legendEls: ReactNode[] = []
+  const legendTextW = Math.max(24, legendW - 30)
   labels.forEach((label, i) => {
     const color = pieSliceColor(i, othersIndex)
+    const suffixW = approxTextWidth(label.suffix, LEGEND_SIZE)
+    const nameW = Math.max(24, legendTextW - suffixW)
+    const shown = approxTextWidth(label.full, LEGEND_SIZE) > legendTextW
+      ? `${ellipsizeText(label.name, nameW, LEGEND_SIZE)}${label.suffix}`
+      : label.full
     legendEls.push(
       <rect key={`ls${i}`} x={legX} y={legY - LEGEND_SIZE + 2} width={14} height={14}
             fill={color} rx={2} />,
       <text key={`lt${i}`} x={legX + 22} y={legY + 2} fontSize={LEGEND_SIZE}
-            className="chart-legend">{label}</text>,
+            className="chart-legend">
+        <title>{label.full}</title>
+        {shown}
+      </text>,
     )
     legY += lineH
   })
@@ -361,10 +381,15 @@ function renderBar(
   }
   const hasLegend = series.length > 1
   const legendNames = series.map((s) => s.name)
-  const { rotate, tickBandH } = barTickLayout(categories, width)
+  const { rotate, tickBandH, sidePaddingLeft, sidePaddingRight } = barTickLayout(
+    categories,
+    width,
+    { hasYAxisLabel: !!spec.y_label },
+  )
   const plot = computePlot(
     width, height, !!spec.title, legendRows, true, rotate,
     !!spec.y_label, !!spec.x_label, tickBandH,
+    { left: sidePaddingLeft, right: sidePaddingRight },
   )
 
   const finiteVals: number[] = []
@@ -692,17 +717,19 @@ interface ChartRendererProps {
   spec: ChartSpec
   className?: string
   style?: CSSProperties
+  allowPreview?: boolean
 }
 
 // Active hover target: which column / pie slice, plus where to place the
 // tooltip (px relative to the chart-area wrapper, already edge-clamped).
 interface HoverState { index: number; left: number; top: number }
 
-function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
+function ChartRendererImpl({ spec, className, style, allowPreview = true }: ChartRendererProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [status, setStatus] = useState<null | { kind: "ok" | "err"; text: string }>(null)
   const [hover, setHover] = useState<HoverState | null>(null)
+  const [previewOpen, setPreviewOpen] = useState(false)
 
   // Responsive: render the chart at the container's real width (capped at the
   // spec's ideal width so it never upscales) instead of letting a fixed-size
@@ -766,6 +793,15 @@ function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
       flash("err", "Download failed")
     }
   }, [spec.title, spec.type, flash])
+
+  useEffect(() => {
+    if (!previewOpen) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPreviewOpen(false)
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [previewOpen])
 
   const onCopy = useCallback(async () => {
     if (!svgRef.current) return
@@ -894,11 +930,12 @@ function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
   const a11yLabel = spec.title || `${spec.type} chart`
 
   return (
-    <div
-      ref={hostRef}
-      className={`chart-host group relative my-3 w-full ${THEME_CLASSES} ${className ?? ""}`}
-      style={{ lineHeight: 0, ...style }}
-    >
+    <>
+      <div
+        ref={hostRef}
+        className={`chart-host group relative my-3 w-full ${THEME_CLASSES} ${className ?? ""}`}
+        style={{ lineHeight: 0, ...style }}
+      >
       {/* Toolbar sits in its own flow row above the chart — never overlaps the
           title or legend the way an absolutely-positioned overlay did. */}
       <div
@@ -914,6 +951,17 @@ function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
             className={`${TOOLBAR_BTN} px-2 text-[11px] font-medium`}
           >
             {effectiveLog ? "Log" : "Linear"}
+          </button>
+        )}
+        {allowPreview && (
+          <button
+            type="button"
+            onClick={() => setPreviewOpen(true)}
+            aria-label="Open larger chart preview"
+            title="Open larger chart preview"
+            className={`${TOOLBAR_BTN} w-7`}
+          >
+            <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
         )}
         <button
@@ -998,7 +1046,39 @@ function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
           {status.text}
         </div>
       )}
-    </div>
+      </div>
+
+      {allowPreview && previewOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Chart preview"
+          onClick={() => setPreviewOpen(false)}
+        >
+          <div
+            className="max-h-[92vh] w-[min(1200px,96vw)] overflow-auto rounded-lg border border-gray-200 bg-white p-4 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex items-center justify-between gap-3" style={{ lineHeight: "normal" }}>
+              <div className="min-w-0 truncate text-sm font-medium text-gray-700 dark:text-gray-200">
+                {spec.title || "Chart preview"}
+              </div>
+              <button
+                type="button"
+                onClick={() => setPreviewOpen(false)}
+                aria-label="Close chart preview"
+                title="Close chart preview"
+                className={`${TOOLBAR_BTN} h-8 w-8 shrink-0 opacity-100`}
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
+            </div>
+            <ChartRendererImpl spec={spec} className="my-0" allowPreview={false} />
+          </div>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -1013,5 +1093,6 @@ function ChartRendererImpl({ spec, className, style }: ChartRendererProps) {
 export const ChartRenderer = memo(ChartRendererImpl, (prev, next) => {
   if (prev.className !== next.className) return false
   if (prev.style !== next.style) return false
+  if (prev.allowPreview !== next.allowPreview) return false
   return JSON.stringify(prev.spec) === JSON.stringify(next.spec)
 })
