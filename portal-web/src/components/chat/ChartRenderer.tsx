@@ -65,12 +65,19 @@ import {
   describeChart,
   chartCanvasSize,
 } from "./chart-utils"
+import {
+  copyBlobToClipboard,
+  downloadBlob,
+  safeDownloadName,
+  svgToPngBlob,
+} from "./svg-export"
 
 // Re-exported so existing import sites (Markdown.tsx, PilotArea.tsx, the test
 // file) can keep importing from "./ChartRenderer" — keeps the refactor's blast
 // radius to this file pair.
 export { collapsePieSlices, tryParseChartSpec, chartSpecLooksIncomplete } from "./chart-utils"
 export type { ChartSpec } from "./chart-utils"
+export { svgToPngDataUrl as svgChartToPngDataUrl } from "./svg-export"
 
 function MarkerShape({
   shape, cx, cy, size, color,
@@ -600,114 +607,6 @@ function renderLine(
   }
 }
 
-// CSS properties whose values vary by theme and must be copied from the live
-// DOM onto a clone before serialisation — once the SVG leaves the document
-// (loaded into an <img>) it no longer sees the parent CSS / Tailwind classes.
-const INLINEABLE_PROPS = ["fill", "stroke", "stroke-width", "font-family", "font-size", "font-weight"] as const
-
-function inlineComputedStyles(src: SVGElement, dst: SVGElement) {
-  const srcAll = [src, ...Array.from(src.querySelectorAll<SVGElement>("*"))]
-  const dstAll = [dst, ...Array.from(dst.querySelectorAll<SVGElement>("*"))]
-  for (let i = 0; i < srcAll.length; i++) {
-    const cs = window.getComputedStyle(srcAll[i])
-    const tgt = dstAll[i]
-    for (const prop of INLINEABLE_PROPS) {
-      const v = cs.getPropertyValue(prop)
-      if (v) tgt.style.setProperty(prop, v)
-    }
-    // Strip class attrs — colors are now inlined, classes would just bloat the
-    // serialised output and require Tailwind in the consumer's context.
-    tgt.removeAttribute("class")
-  }
-}
-
-async function svgToPngBlob(svg: SVGSVGElement, scale = 2): Promise<Blob> {
-  const vb = svg.viewBox.baseVal
-  const w = vb && vb.width ? vb.width : svg.clientWidth || 900
-  const h = vb && vb.height ? vb.height : svg.clientHeight || 520
-
-  // Sample chart-bg's live fill BEFORE cloning — this is the same color the
-  // user sees on-screen (light: white, dark: slate-900). Used as the canvas
-  // base so if inlineComputedStyles ever fails to carry the bg fill onto the
-  // detached clone (CSS var that doesn't resolve out-of-document, future
-  // refactor swapping <rect> for CSS background, etc.) we still rasterise on
-  // the right base color — light-grey text on white was the worst-case
-  // failure mode the previous hardcoded #ffffff fallback would produce.
-  const bgRect = svg.querySelector<SVGRectElement>(".chart-bg")
-  const liveBg = bgRect ? window.getComputedStyle(bgRect).fill : ""
-  const canvasBg = liveBg && liveBg !== "none" && liveBg !== "transparent" ? liveBg : "#ffffff"
-
-  const clone = svg.cloneNode(true) as SVGSVGElement
-  inlineComputedStyles(svg, clone)
-  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg")
-  clone.setAttribute("width", String(w))
-  clone.setAttribute("height", String(h))
-
-  const xml = new XMLSerializer().serializeToString(clone)
-  const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml)
-
-  const img = new Image()
-  img.crossOrigin = "anonymous"
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve()
-    img.onerror = () => reject(new Error("SVG rasterisation failed"))
-    img.src = url
-  })
-
-  const canvas = document.createElement("canvas")
-  canvas.width = Math.round(w * scale)
-  canvas.height = Math.round(h * scale)
-  const ctx = canvas.getContext("2d")
-  if (!ctx) throw new Error("canvas 2d context unavailable")
-  // Match the on-screen theme so anti-aliased edges and any potential inline
-  // miss still produce a readable PNG (no light-grey-on-white failure mode).
-  ctx.fillStyle = canvasBg
-  ctx.fillRect(0, 0, canvas.width, canvas.height)
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-
-  return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob returned null"))), "image/png")
-  })
-}
-
-function blobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(String(reader.result))
-    reader.onerror = () => reject(new Error("blob -> data URL failed"))
-    reader.readAsDataURL(blob)
-  })
-}
-
-// Rasterise a live chart SVG to a PNG data URL. Used by the message-level copy
-// button (PilotArea) to embed real images in the text/html clipboard payload —
-// copying the bubble's markdown alone would only yield the raw chart JSON.
-export async function svgChartToPngDataUrl(svg: SVGSVGElement, scale = 2): Promise<string> {
-  const blob = await svgToPngBlob(svg, scale)
-  return await blobToDataUrl(blob)
-}
-
-function downloadBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement("a")
-  a.href = url
-  a.download = name
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-
-async function copyBlobToClipboard(blob: Blob): Promise<boolean> {
-  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
-  try {
-    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
-    return true
-  } catch {
-    return false
-  }
-}
-
 const TOOLBAR_BTN =
   "inline-flex h-7 items-center justify-center rounded-md bg-white/90 dark:bg-slate-800/90 " +
   "text-gray-700 dark:text-gray-100 border border-gray-200 dark:border-slate-700 shadow-sm " +
@@ -786,7 +685,7 @@ function ChartRendererImpl({ spec, className, style, allowPreview = true }: Char
     if (!svgRef.current) return
     try {
       const blob = await svgToPngBlob(svgRef.current, 2)
-      const safeTitle = (spec.title ?? `${spec.type}-chart`).replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 60)
+      const safeTitle = safeDownloadName(spec.title ?? `${spec.type}-chart`, "chart")
       downloadBlob(blob, `${safeTitle || "chart"}.png`)
       flash("ok", "PNG downloaded")
     } catch {

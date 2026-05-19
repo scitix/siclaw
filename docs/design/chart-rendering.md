@@ -54,6 +54,30 @@ ChartRenderer  (portal-web/src/components/chat/ChartRenderer.tsx)
         └── spec.type === "line" → renderLine
 ```
 
+## Mermaid Diagram Rendering
+
+Mermaid is a separate baseline Markdown capability, not a `ChartSpec` type and
+not an MCP requirement. The chat frontend recognises fenced Markdown blocks with
+the language tag `mermaid` and renders the initial supported diagram families:
+
+- `flowchart` / `graph` for process, dependency, cause/effect, and remediation
+  flows.
+- `sequenceDiagram` for cross-component request or event ordering.
+- `timeline` for task lifecycles, incidents, and investigation progress.
+
+Mermaid blocks are rendered client-side with Mermaid's strict security mode and
+bounded text/edge limits. Init/config directives in chat-authored diagrams are
+rejected so a response cannot weaken the renderer's security configuration.
+
+Mermaid diagrams share the frontend SVG export helpers used by charts:
+
+- streaming messages keep a stable loading state instead of repeatedly
+  rendering half-arrived diagrams;
+- rendered diagrams expose source copy, larger preview, PNG clipboard copy, and
+  PNG download controls;
+- message/session rich-copy treats rendered Mermaid SVGs as images, matching the
+  chart copy path.
+
 ### Why the spinner, not a partial chart?
 
 The `chart` fence contains a single JSON object. Until the LLM finishes
@@ -179,9 +203,10 @@ automatically.
 
 ## What the Frontend Does NOT Support
 
-- **Other fence tags**: ` ```mermaid `, ` ```echarts `, etc. fall through to the
-  generic `<pre>` renderer (raw text). Add a separate handler in
-  `MARKDOWN_COMPONENTS` in `Markdown.tsx` if you need them.
+- **Unsupported Mermaid families and other diagram tags**: ` ```echarts `,
+  unsupported Mermaid diagram types, and other diagram DSLs fall through to an
+  error/source view or the generic `<pre>` renderer rather than executing custom
+  rendering logic.
 - **Inline `<img>` tags or `data:` URIs as chart output**: these bypass
   `ChartRenderer` entirely and receive no interactivity (hover tooltip,
   copy/download toolbar, log-scale toggle).
