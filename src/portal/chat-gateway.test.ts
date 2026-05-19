@@ -176,6 +176,47 @@ describe("chat-gateway routes", () => {
         sessionId: "s1",
       }));
     });
+
+    it("forwards model compatibility for OpenAI-compatible gateway chat sends", async () => {
+      query
+        .mockResolvedValueOnce([[{ model_provider: "compatible", model_id: "compatible-chat" }], []])
+        .mockResolvedValueOnce([[{
+          id: "p1",
+          name: "compatible",
+          base_url: "https://api.example.com/model-api",
+          api_key: "k",
+          api_type: "openai-completions",
+        }], []])
+        .mockResolvedValueOnce([[{
+          model_id: "compatible-chat",
+          name: "Compatible Chat",
+          reasoning: 1,
+          context_window: 128000,
+          max_tokens: 4096,
+        }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: { text: "hi", session_id: "s1" },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.modelConfig.models[0].compat).toMatchObject({
+        supportsDeveloperRole: false,
+        supportsUsageInStreaming: true,
+        maxTokensField: "max_tokens",
+      });
+    });
   });
 
   // ── chat.steer ───────────────────────────────────────────

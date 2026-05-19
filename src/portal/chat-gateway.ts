@@ -21,6 +21,7 @@ import {
   isErrorDetail,
   type ErrorDetail,
 } from "../lib/error-envelope.js";
+import { defaultProviderModelCompat } from "../core/model-compat.js";
 
 /** Resolve model binding directly from Portal's own DB. */
 async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
@@ -53,6 +54,7 @@ async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelB
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: m.context_window,
     maxTokens: m.max_tokens,
+    compat: defaultProviderModelCompat({ api: provider.api_type, baseUrl: provider.base_url }),
   }));
 
   return {
@@ -389,4 +391,3 @@ export function registerChatRoutes(
     }
   });
 }
-

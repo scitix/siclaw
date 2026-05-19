@@ -40,6 +40,7 @@ import {
   type SiclawConfig,
 } from "../config.js";
 import { PRESETS } from "../provider-presets.js";
+import { defaultProviderModelCompat } from "../model-compat.js";
 
 // ---------------------------------------------------------------------------
 // Credential type labels
@@ -779,8 +780,6 @@ async function handleAddModel(
   const existingProvider = entries.find(([n]) => n === providerName)?.[1];
   if (!existingProvider) return;
 
-  const isAnthropic = existingProvider.api === "anthropic";
-
   const newModel: ProviderConfig["models"][number] = {
     id: modelId,
     name: modelName || modelId,
@@ -789,11 +788,10 @@ async function handleAddModel(
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
-    compat: {
-      supportsDeveloperRole: !isAnthropic,
-      supportsUsageInStreaming: true,
-      maxTokensField: "max_tokens",
-    },
+    compat: defaultProviderModelCompat({
+      api: existingProvider.api,
+      baseUrl: existingProvider.baseUrl,
+    }),
   };
 
   // Write to config

@@ -15,6 +15,7 @@ import {
   parseBody,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
@@ -449,6 +450,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
             reasoning: !!m.reasoning,
             contextWindow: m.context_window,
             maxTokens: m.max_tokens,
+            compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
           })),
         },
       },
@@ -1037,6 +1039,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: m.context_window,
       maxTokens: m.max_tokens,
+      compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
     }));
     sendJson(res, 200, {
       binding: {
@@ -1455,6 +1458,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
             reasoning: !!m.reasoning,
             contextWindow: m.context_window,
             maxTokens: m.max_tokens,
+            compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
           })),
         },
       },
@@ -1492,6 +1496,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: m.context_window,
       maxTokens: m.max_tokens,
+      compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
     }));
     return {
       binding: {

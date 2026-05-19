@@ -3,6 +3,7 @@
  */
 
 import type { ProviderConfig } from "./config.js";
+import { defaultProviderModelCompat } from "./model-compat.js";
 
 export interface ProviderPreset {
   label: string;
@@ -29,7 +30,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 16384,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "https://api.openai.com/v1" }),
       },
       {
         id: "gpt-4o-mini",
@@ -39,7 +40,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 16384,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "https://api.openai.com/v1" }),
       },
     ],
   },
@@ -57,7 +58,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: { supportsDeveloperRole: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+        compat: defaultProviderModelCompat({ api: "anthropic", baseUrl: "https://api.anthropic.com/v1" }),
       },
       {
         id: "claude-opus-4-20250514",
@@ -67,7 +68,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 200000,
         maxTokens: 16000,
-        compat: { supportsDeveloperRole: false, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+        compat: defaultProviderModelCompat({ api: "anthropic", baseUrl: "https://api.anthropic.com/v1" }),
       },
     ],
   },
@@ -86,7 +87,7 @@ export const PRESETS: ProviderPreset[] = [
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 128000,
         maxTokens: 8192,
-        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+        compat: defaultProviderModelCompat({ api: "openai-completions", baseUrl: "" }),
       },
     ],
   },

@@ -107,9 +107,37 @@ describe("config.getSettings", () => {
     expect(result.providers.openai.baseUrl).toBe("https://api.openai.com");
     expect(result.providers.openai.apiKey).toBe("sk-key");
     expect(result.providers.openai.models).toEqual([
-      { id: "gpt-4", name: "GPT-4", reasoning: false, contextWindow: 128000, maxTokens: 4096 },
+      {
+        id: "gpt-4",
+        name: "GPT-4",
+        reasoning: false,
+        contextWindow: 128000,
+        maxTokens: 4096,
+        compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+      },
     ]);
     expect(result.default).toEqual({ provider: "openai", modelId: "gpt-4" });
+  });
+
+  it("marks OpenAI-compatible gateway settings as not supporting developer-role messages", async () => {
+    mockQuery(
+      [{ model_provider: "compatible", model_id: "compatible-chat" }],
+      [{
+        id: "p-compatible",
+        name: "compatible",
+        base_url: "https://api.example.com/model-api",
+        api_key: "sk-key",
+        api_type: "openai-completions",
+      }],
+      [{ model_id: "compatible-chat", name: "Compatible Chat", reasoning: 0, context_window: 128000, max_tokens: 8192 }],
+    );
+
+    const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
+    expect(result.providers.compatible.models[0].compat).toMatchObject({
+      supportsDeveloperRole: false,
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+    });
   });
 
   it("returns empty providers when agent has no model_provider", async () => {
@@ -151,6 +179,32 @@ describe("config.getModelBinding", () => {
     expect(result.binding.modelConfig.models[0].reasoning).toBe(true);
     expect(result.binding.modelConfig.models[0].input).toEqual(["text"]);
     expect(result.binding.modelConfig.models[0].cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    expect(result.binding.modelConfig.models[0].compat).toMatchObject({
+      supportsDeveloperRole: true,
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+    });
+  });
+
+  it("marks OpenAI-compatible gateway bindings as not supporting developer-role messages", async () => {
+    mockQuery(
+      [{ model_provider: "compatible", model_id: "compatible-chat" }],
+      [{
+        id: "p-compatible",
+        name: "compatible",
+        base_url: "https://api.example.com/model-api",
+        api_key: "sk-key",
+        api_type: "openai-completions",
+      }],
+      [{ model_id: "compatible-chat", name: "Compatible Chat", reasoning: 1, context_window: 128000, max_tokens: 8192 }],
+    );
+
+    const result = await getHandler("config.getModelBinding")({ agentId: "a1" }, "a1");
+    expect(result.binding.modelConfig.models[0].compat).toMatchObject({
+      supportsDeveloperRole: false,
+      supportsUsageInStreaming: true,
+      maxTokensField: "max_tokens",
+    });
   });
 
   it("returns null binding when agent has no model_provider", async () => {

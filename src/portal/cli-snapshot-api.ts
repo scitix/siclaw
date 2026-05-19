@@ -30,6 +30,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
 import { getDb } from "../gateway/db.js";
+import { defaultProviderModelCompat } from "../core/model-compat.js";
 import type {
   CliSnapshotKnowledgeRepo,
   CliSnapshotClusterCredential,
@@ -358,7 +359,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           contextWindow: m.context_window,
           maxTokens: m.max_tokens,
-          compat: { supportsDeveloperRole: true, supportsUsageInStreaming: true, maxTokensField: "max_tokens" },
+          compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
         })),
       };
       // First model flagged is_default wins. If none, first provider's first model is a fallback.
