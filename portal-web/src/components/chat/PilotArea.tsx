@@ -1,4 +1,5 @@
-import { useRef, useEffect, useState, useCallback, useMemo } from "react"
+import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
+import type { KeyboardEvent } from "react"
 import {
   Terminal,
   User,
@@ -214,8 +215,20 @@ export function PilotArea({
 
   // Active prefix chip (e.g. "Dig deeper") shown as atomic pill in the input
   const [activePrefix, setActivePrefix] = useState<PrefixActionChip | null>(null)
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [editingDraft, setEditingDraft] = useState("")
+  const userMessageHistory = useMemo(
+    () =>
+      messages
+        .filter((m) => m.role === "user")
+        .map((m) => getEditableUserText(m.content))
+        .filter(Boolean),
+    [messages],
+  )
   useEffect(() => {
     setActivePrefix(null)
+    setEditingMessageId(null)
+    setEditingDraft("")
   }, [sessionKey])
 
   const lastSentRef = useRef<string | null>(null)
@@ -275,6 +288,38 @@ export function PilotArea({
       .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
   }, [messages, isLoading, dpActive])
   const renderMessages = useMemo(() => withDelegationStatusNotices(messages), [messages])
+  const latestEditableUserMessageId = useMemo(() => {
+    for (let i = renderMessages.length - 1; i >= 0; i--) {
+      const message = renderMessages[i]
+      if (message.hidden || message.role !== "user" || message.isStreaming) continue
+      if (getEditableUserText(message.content)) return message.id
+    }
+    return null
+  }, [renderMessages])
+
+  const startEditingMessage = useCallback((id: string, content: string) => {
+    setActivePrefix(null)
+    setEditingMessageId(id)
+    setEditingDraft(content)
+  }, [])
+
+  const cancelEditingMessage = useCallback(() => {
+    setEditingMessageId(null)
+    setEditingDraft("")
+  }, [])
+
+  const submitEditedMessage = useCallback(() => {
+    const text = editingDraft.trim()
+    if (!text || isLoading) return
+    wrappedSendMessage(text)
+    // wrappedSendMessage records lastSentRef so wrappedAbort can restore the
+    // draft if the user aborts a normal send. For edit-resends the message is
+    // already visible in the conversation, so we don't want abort to re-fill
+    // the input with it.
+    lastSentRef.current = null
+    setEditingMessageId(null)
+    setEditingDraft("")
+  }, [editingDraft, isLoading, wrappedSendMessage])
 
   // Auto-scroll logic
   useEffect(() => {
@@ -361,6 +406,12 @@ export function PilotArea({
                     sendMessage={wrappedSendMessage}
                     showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
                     dpActive={dpActive}
+                    canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                    editingContent={editingMessageId === msg.id ? editingDraft : null}
+                    onStartEditMessage={startEditingMessage}
+                    onEditMessageChange={setEditingDraft}
+                    onCancelEditMessage={cancelEditingMessage}
+                    onSubmitEditMessage={submitEditedMessage}
                     onChipClick={(chip, meta) => {
                       if (meta.isDpCheckpoint) {
                         const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
@@ -414,6 +465,7 @@ export function PilotArea({
         hasMessages={messages.length > 0}
         draft={chipDraft}
         draftSeq={chipSeq}
+        historyMessages={userMessageHistory}
         activePrefix={activePrefix}
         onClearPrefix={() => setActivePrefix(null)}
       />
@@ -524,6 +576,30 @@ function parseActionChipMarker(content: string): { chip: PrefixActionChip | null
   const addPrefix = "\n\nAdditional direction from user: "
   if (rest.startsWith(addPrefix)) rest = rest.slice(addPrefix.length)
   return { chip, text: rest.trim() }
+}
+
+function getVisibleUserText(content: string): string {
+  const { text: afterDeepInvestigation } = parseDeepInvestigation(content)
+  const { text: afterActionChip } = parseActionChipMarker(afterDeepInvestigation)
+  const { text: afterScripts } = parseScriptRefs(afterActionChip)
+  const { text } = parseSkillRef(afterScripts)
+  return text.trim()
+}
+
+function getEditableUserText(content: string): string {
+  return stripCopiedTranscriptHeader(getVisibleUserText(content))
+}
+
+function stripCopiedTranscriptHeader(content: string): string {
+  return content
+    .replace(
+      /^\s*(?:Siclaw|Assistant)\s*\n\s*\d{1,2}:\d{2}\s*\n\s*(?:response|thinking)\s+[\d.]+s\s*\n+/i,
+      "",
+    )
+    .replace(/^\s*(?:Siclaw|Assistant)\s+\d{1,2}:\d{2}\s+(?:response|thinking)\s+[\d.]+s\s+/i, "")
+    .replace(/^\s*You\s*\n\s*\d{1,2}:\d{2}\s*\n+/i, "")
+    .replace(/^\s*You\s+\d{1,2}:\d{2}\s+/i, "")
+    .trim()
 }
 
 type FillActionChip = Extract<ActionChip, { kind: "fill" }>
@@ -995,6 +1071,12 @@ function MessageItem({
   onOpenSkillPanel,
   onOpenSchedulePanel,
   agentId,
+  canEditMessage,
+  editingContent,
+  onStartEditMessage,
+  onEditMessageChange,
+  onCancelEditMessage,
+  onSubmitEditMessage,
 }: {
   message: PilotMessage
   sendMessage?: (text: string) => void
@@ -1005,6 +1087,12 @@ function MessageItem({
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
   agentId?: string
+  canEditMessage?: boolean
+  editingContent?: string | null
+  onStartEditMessage?: (id: string, content: string) => void
+  onEditMessageChange?: (content: string) => void
+  onCancelEditMessage?: () => void
+  onSubmitEditMessage?: () => void
 }) {
   const isUser = message.role === "user"
   const isTool = message.role === "tool"
@@ -1068,6 +1156,8 @@ function MessageItem({
   const renderedSuggestedChips = checkpoint.isCheckpoint
     ? suggestedChips.map(toDpCheckpointFillChip)
     : suggestedChips
+  const editableText = isUser ? getEditableUserText(message.content) : ""
+  const canRenderEditor = !!onEditMessageChange && !!onCancelEditMessage && !!onSubmitEditMessage
 
   return (
     <div className={cn("flex gap-4 group", isUser ? "flex-row-reverse" : "flex-row")}>
@@ -1126,9 +1216,25 @@ function MessageItem({
           </div>
         )}
 
-        {textContent && (
-          <CopyableMessage isUser={isUser} content={textContent} isStreaming={message.isStreaming} />
-        )}
+        {isUser && editingContent != null && canRenderEditor ? (
+          <EditableUserMessage
+            content={editingContent}
+            onChange={onEditMessageChange}
+            onCancel={onCancelEditMessage}
+            onSubmit={onSubmitEditMessage}
+          />
+        ) : textContent ? (
+          <CopyableMessage
+            isUser={isUser}
+            content={textContent}
+            isStreaming={message.isStreaming}
+            onEdit={
+              canEditMessage && editableText
+                ? () => onStartEditMessage?.(message.id, editableText)
+                : undefined
+            }
+          />
+        ) : null}
 
         {renderedSuggestedChips.length > 0 && onChipClick && (
           <div className="flex flex-wrap gap-2 mt-2">
@@ -1386,10 +1492,12 @@ function CopyableMessage({
   isUser,
   content,
   isStreaming = false,
+  onEdit,
 }: {
   isUser: boolean
   content: string
   isStreaming?: boolean
+  onEdit?: (content: string) => void
 }) {
   const [copied, copy, flashCopied] = useCopyFeedback()
   const bubbleRef = useRef<HTMLDivElement | null>(null)
@@ -1419,13 +1527,105 @@ function CopyableMessage({
       >
         <Markdown isStreaming={isStreaming}>{content}</Markdown>
       </div>
-      <button
-        onClick={handleCopy}
-        className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-secondary transition-colors"
-        title={isUser ? "Copy" : "Copy markdown"}
-      >
-        {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
-      </button>
+      <div className={cn("flex items-center gap-1", isUser ? "justify-end" : "justify-start")}>
+        <button
+          onClick={handleCopy}
+          className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-secondary transition-colors"
+          title={isUser ? "Copy" : "Copy markdown"}
+        >
+          {copied ? <Check className="h-3.5 w-3.5 text-green-500" /> : <Copy className="h-3.5 w-3.5" />}
+        </button>
+        {onEdit && (
+          <button
+            onClick={() => onEdit(content)}
+            className="p-1 rounded-md text-muted-foreground/60 hover:text-foreground hover:bg-secondary transition-colors"
+            title="Edit and resend"
+          >
+            <PencilLine className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function EditableUserMessage({
+  content,
+  onChange = () => {},
+  onCancel = () => {},
+  onSubmit = () => {},
+}: {
+  content: string
+  onChange?: (content: string) => void
+  onCancel?: () => void
+  onSubmit?: () => void
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const isComposingRef = useRef(false)
+
+  useLayoutEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    const maxHeight = Math.min(420, Math.max(220, Math.floor(window.innerHeight * 0.46)))
+    el.style.height = "auto"
+    const nextHeight = Math.min(el.scrollHeight, maxHeight)
+    el.style.height = `${nextHeight}px`
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden"
+  }, [content])
+
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(content.length, content.length)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Escape" && !isComposingRef.current && !event.nativeEvent.isComposing) {
+      event.preventDefault()
+      onCancel()
+      return
+    }
+    if (event.key === "Enter" && !event.shiftKey && !isComposingRef.current && !event.nativeEvent.isComposing) {
+      event.preventDefault()
+      onSubmit()
+    }
+  }
+
+  return (
+    <div className="w-[48rem] max-w-full rounded-2xl rounded-tr-sm bg-card border border-border shadow-sm shadow-black/10 p-3">
+      <textarea
+        ref={textareaRef}
+        value={content}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={handleKeyDown}
+        onCompositionStart={() => {
+          isComposingRef.current = true
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false
+        }}
+        className="w-full min-h-[96px] resize-none bg-transparent border-none outline-none p-2 text-[15px] leading-relaxed text-foreground placeholder:text-muted-foreground/70 focus:ring-0"
+        style={{ height: "auto", overflowY: "hidden" }}
+      />
+      <div className="flex items-center justify-end gap-2 pt-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="px-3 py-1.5 rounded-lg border border-border bg-card hover:bg-secondary text-sm text-foreground transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={!content.trim()}
+          className="px-3 py-1.5 rounded-lg bg-foreground text-background hover:bg-foreground/90 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium transition-colors"
+        >
+          Send
+        </button>
+      </div>
     </div>
   )
 }
