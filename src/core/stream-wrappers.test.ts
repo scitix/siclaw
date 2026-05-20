@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   wrapStreamFnTrimToolCallNames,
   wrapStreamFnRepairMalformedToolCallArguments,
+  createRepairMalformedArgsGuard,
   extractBalancedJsonPrefix,
   shouldAttemptMalformedToolCallRepair,
   tryParseMalformedToolCallArguments,
@@ -189,6 +190,44 @@ describe("wrapStreamFnTrimToolCallNames", () => {
 // ── wrapStreamFnRepairMalformedToolCallArguments ─────────────────────────
 
 describe("wrapStreamFnRepairMalformedToolCallArguments", () => {
+  it("recovers valid streamed JSON arguments when final tool call args stay empty", async () => {
+    const partialMessage = {
+      content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: {} }],
+    };
+    const events = [
+      {
+        type: "toolcall_delta",
+        contentIndex: 0,
+        delta: '{"command":"kubectl get pods -A"}',
+        partial: partialMessage,
+        message: partialMessage,
+      },
+      {
+        type: "toolcall_end",
+        contentIndex: 0,
+        toolCall: { id: "call_1", name: "bash", arguments: {} },
+        partial: partialMessage,
+        message: partialMessage,
+      },
+    ];
+    const finalMessage = {
+      content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: {} }],
+    };
+    const mockStream = createMockStream(events, finalMessage);
+    const baseFn = () => mockStream;
+    const wrappedFn = wrapStreamFnRepairMalformedToolCallArguments(baseFn);
+    const stream = wrappedFn("model", {}, {});
+
+    for await (const event of stream) {
+      if (event.type === "toolcall_end") {
+        expect(event.toolCall.arguments).toEqual({ command: "kubectl get pods -A" });
+      }
+    }
+
+    const result = await stream.result();
+    expect(result.content[0].arguments).toEqual({ command: "kubectl get pods -A" });
+  });
+
   it("repairs malformed JSON arguments on toolcall_end", async () => {
     const partialMessage = {
       content: [{ type: "toolCall", id: "call_1", name: "test", arguments: {} }],
@@ -302,5 +341,38 @@ describe("wrapStreamFnRepairMalformedToolCallArguments", () => {
     const result = await stream.result();
     // Should not have been repaired (buffer too large)
     expect(result.content[0].arguments).toEqual({});
+  });
+});
+
+describe("createRepairMalformedArgsGuard", () => {
+  it("keeps valid streamed JSON args for final result repair", () => {
+    const guard = createRepairMalformedArgsGuard();
+    const partialMessage = {
+      content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: {} }],
+    };
+    const endEvent = {
+      type: "toolcall_end",
+      contentIndex: 0,
+      toolCall: { id: "call_1", name: "bash", arguments: {} },
+      partial: partialMessage,
+      message: partialMessage,
+    };
+    const finalMessage = {
+      content: [{ type: "toolCall", id: "call_1", name: "bash", arguments: {} }],
+    };
+
+    guard.reset();
+    guard.processEvent({
+      type: "toolcall_delta",
+      contentIndex: 0,
+      delta: '{"command":"kubectl get nodes"}',
+      partial: partialMessage,
+      message: partialMessage,
+    });
+    guard.processEvent(endEvent);
+    guard.processResult(finalMessage);
+
+    expect(endEvent.toolCall.arguments).toEqual({ command: "kubectl get nodes" });
+    expect(finalMessage.content[0].arguments).toEqual({ command: "kubectl get nodes" });
   });
 });
