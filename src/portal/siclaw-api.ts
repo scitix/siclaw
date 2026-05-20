@@ -70,6 +70,105 @@ function summariseLatency(values: number[]): {
   };
 }
 
+// ── MCP config import / export ────────────────────────────────
+
+interface McpConfigEntry {
+  name?: string;
+  transport?: string;
+  url?: string | null;
+  command?: string | null;
+  args?: string[] | null;
+  env?: Record<string, string> | null;
+  headers?: Record<string, string> | null;
+  description?: string | null;
+  enabled?: boolean;
+}
+
+interface McpConfigBundle { mcpServer?: McpConfigEntry }
+type McpImportAction = "create" | "update" | "unchanged" | "invalid";
+interface McpImportFieldDiff { field: string; before: unknown; after: unknown }
+interface McpImportPreview {
+  action: McpImportAction;
+  name?: string;
+  id?: string;
+  transport?: string;
+  bound_agents?: number;
+  diffs: McpImportFieldDiff[];
+  errors: string[];
+}
+interface ImportMcpConfigResult { created: number; updated: number; unchanged: number; errors?: string[] }
+
+const MCP_DIFF_FIELDS = ["name", "transport", "url", "command", "args", "env", "headers", "description", "enabled"] as const;
+
+function normalizeMcpImportEntry(entry: McpConfigEntry | undefined): string[] {
+  const errors: string[] = [];
+  if (!entry) { errors.push("mcpServer is required"); return errors; }
+  if (!entry.name?.trim()) errors.push("name is required");
+  else if (entry.name.length > 255) errors.push("name too long (max 255)");
+  const t = entry.transport;
+  if (!t) { errors.push("transport is required"); }
+  else if (!["stdio", "sse", "streamable-http"].includes(t)) { errors.push(`unknown transport: ${t}`); }
+  else if (t === "stdio" && !entry.command?.trim()) { errors.push("command is required for stdio transport"); }
+  else if (t !== "stdio" && !entry.url?.trim()) { errors.push("url is required for sse/streamable-http transport"); }
+  if (entry.url && entry.url.length > 500) errors.push("url too long (max 500)");
+  if (entry.command && entry.command.length > 500) errors.push("command too long (max 500)");
+  if (entry.description && entry.description.length > 500) errors.push("description too long (max 500)");
+  return errors;
+}
+
+function mcpEntryDiffs(existing: Record<string, unknown>, desired: McpConfigEntry): McpImportFieldDiff[] {
+  const diffs: McpImportFieldDiff[] = [];
+  for (const f of MCP_DIFF_FIELDS) {
+    const before = existing[f] ?? null;
+    const after = (desired as Record<string, unknown>)[f] ?? null;
+    if (JSON.stringify(before) !== JSON.stringify(after)) diffs.push({ field: f, before, after });
+  }
+  return diffs;
+}
+
+async function buildMcpImportPreview(bundle: McpConfigBundle, orgId: string): Promise<McpImportPreview> {
+  const entry = bundle.mcpServer;
+  const errors = normalizeMcpImportEntry(entry);
+  if (errors.length > 0) return { action: "invalid", diffs: [], errors };
+
+  const db = getDb();
+  const [rows] = await db.query(
+    "SELECT * FROM mcp_servers WHERE org_id = ? AND name = ?",
+    [orgId, entry!.name!.trim()],
+  ) as any;
+
+  if (rows.length === 0) {
+    return { action: "create", name: entry!.name, transport: entry!.transport, diffs: mcpEntryDiffs({}, entry!), errors: [] };
+  }
+
+  const existing = rows[0];
+  existing.args = safeParseJson(existing.args, null);
+  existing.env = safeParseJson(existing.env, null);
+  existing.headers = safeParseJson(existing.headers, null);
+  existing.enabled = !!existing.enabled;
+
+  if (existing.transport !== entry!.transport) {
+    return {
+      action: "invalid", name: entry!.name, id: existing.id,
+      transport: entry!.transport, diffs: [],
+      errors: [`Cannot change transport from "${existing.transport}" to "${entry!.transport}"`],
+    };
+  }
+
+  const [countRows] = await db.query(
+    "SELECT COUNT(*) AS count FROM agent_mcp_servers WHERE mcp_server_id = ?",
+    [existing.id],
+  ) as any;
+  const bound_agents = Number(countRows[0].count);
+
+  const diffs = mcpEntryDiffs(existing, entry!);
+  return {
+    action: diffs.length > 0 ? "update" : "unchanged",
+    name: existing.name, id: existing.id, transport: existing.transport,
+    bound_agents, diffs, errors: [],
+  };
+}
+
 // ── Permission check helper ───────────────────────────────────
 
 interface AccessResult {
@@ -1180,6 +1279,103 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       created.headers = safeParseJson(created.headers, null);
     }
     sendJson(res, 201, created);
+  });
+
+  // Export MCP config bundle
+  router.post(`${P}/mcp/export`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const body = await parseBody<{ mcp_server_id?: string }>(req);
+    if (!body.mcp_server_id) { sendJson(res, 400, { error: "mcp_server_id required" }); return; }
+
+    const db = getDb();
+    const [rows] = await db.query(
+      "SELECT * FROM mcp_servers WHERE id = ? AND org_id = ?",
+      [body.mcp_server_id, auth.orgId],
+    ) as any;
+    if (rows.length === 0) { sendJson(res, 404, { error: "MCP server not found" }); return; }
+
+    const s = rows[0];
+    const entry: McpConfigEntry = {
+      name: s.name,
+      transport: s.transport,
+      ...(s.url ? { url: s.url } : {}),
+      ...(s.command ? { command: s.command } : {}),
+      ...(safeParseJson(s.args, null) ? { args: safeParseJson(s.args, null) } : {}),
+      ...(safeParseJson(s.env, null) ? { env: safeParseJson(s.env, null) } : {}),
+      ...(safeParseJson(s.headers, null) ? { headers: safeParseJson(s.headers, null) } : {}),
+      ...(s.description ? { description: s.description } : {}),
+      enabled: !!s.enabled,
+    };
+    sendJson(res, 200, { data: { mcpServer: entry } });
+  });
+
+  // Preview MCP config import (dry-run)
+  router.post(`${P}/mcp/import/preview`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const body = await parseBody<{ bundle?: McpConfigBundle }>(req);
+    const preview = await buildMcpImportPreview(body.bundle ?? {}, auth.orgId!);
+    sendJson(res, 200, { data: preview });
+  });
+
+  // Apply MCP config import
+  router.post(`${P}/mcp/import`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const body = await parseBody<{ bundle?: McpConfigBundle }>(req);
+    const preview = await buildMcpImportPreview(body.bundle ?? {}, auth.orgId!);
+
+    if (preview.errors.length > 0) {
+      sendJson(res, 400, { error: preview.errors.join("; ") });
+      return;
+    }
+
+    const entry = body.bundle!.mcpServer!;
+    const db = getDb();
+    const result: ImportMcpConfigResult = { created: 0, updated: 0, unchanged: 0 };
+
+    if (preview.action === "create") {
+      const id = crypto.randomUUID();
+      await db.query(
+        `INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          id, auth.orgId, entry.name, entry.transport,
+          entry.url || null, entry.command || null,
+          JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
+          JSON.stringify(entry.headers || null), entry.enabled !== false ? 1 : 0,
+          entry.description || null, auth.userId,
+        ],
+      );
+      result.created = 1;
+    } else if (preview.action === "update") {
+      await db.query(
+        `UPDATE mcp_servers SET
+         name = ?, url = ?, command = ?, args = ?, env = ?, headers = ?,
+         description = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?`,
+        [
+          entry.name, entry.url || null, entry.command || null,
+          JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
+          JSON.stringify(entry.headers || null),
+          entry.description || null, entry.enabled !== false ? 1 : 0,
+          preview.id,
+        ],
+      );
+      ctx?.notifyMcpAgents?.(preview.id!, ["mcp"]);
+      result.updated = 1;
+    } else {
+      result.unchanged = 1;
+    }
+
+    sendJson(res, 200, { data: result });
   });
 
   // Get MCP server

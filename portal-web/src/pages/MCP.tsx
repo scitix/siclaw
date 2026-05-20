@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo } from "react"
-import { Plus, Trash2, Loader2, Plug, Pencil, Power, Search, X } from "lucide-react"
+import { useState, useEffect, useMemo, useRef } from "react"
+import { Plus, Trash2, Loader2, Plug, Pencil, Power, Search, X, Download, Upload, Check, ChevronRight } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -25,6 +25,32 @@ interface McpServer {
   updated_at: string
 }
 
+interface McpConfigEntry {
+  name?: string
+  transport?: string
+  url?: string | null
+  command?: string | null
+  args?: string[] | null
+  env?: Record<string, string> | null
+  headers?: Record<string, string> | null
+  description?: string | null
+  enabled?: boolean
+}
+
+interface McpConfigBundle { mcpServer?: McpConfigEntry }
+
+interface McpImportFieldDiff { field: string; before: unknown; after: unknown }
+
+interface McpImportPreview {
+  action: "create" | "update" | "unchanged" | "invalid"
+  name?: string
+  id?: string
+  transport?: string
+  bound_agents?: number
+  diffs: McpImportFieldDiff[]
+  errors: string[]
+}
+
 const TRANSPORT_OPTIONS: { value: McpTransport; label: string }[] = [
   { value: "streamable-http", label: "Streamable HTTP" },
   { value: "sse", label: "SSE" },
@@ -35,6 +61,23 @@ const TRANSPORT_LABELS: Record<McpTransport, string> = {
   "streamable-http": "Streamable HTTP",
   sse: "SSE",
   stdio: "Stdio",
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+
+function downloadJson(filename: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url; a.download = filename
+  document.body.appendChild(a); a.click(); a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+function formatDiffValue(v: unknown): string {
+  if (v === null || v === undefined) return "—"
+  if (typeof v === "object") return JSON.stringify(v)
+  return String(v)
 }
 
 // ── KV Editor ──────────────────────────────────────────────────────
@@ -131,7 +174,6 @@ function McpForm({ server, onSave, onCancel }: {
     <div className="p-4 rounded-lg border border-border bg-card space-y-3">
       <p className="text-sm font-medium">{isEditing ? "Edit MCP Server" : "New MCP Server"}</p>
 
-      {/* Transport selector */}
       <div className="space-y-1.5">
         <label className="text-xs font-medium text-muted-foreground">Transport</label>
         <div className="flex gap-1.5">
@@ -153,7 +195,6 @@ function McpForm({ server, onSave, onCancel }: {
         </div>
       </div>
 
-      {/* Name + Description */}
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground">Name *</label>
@@ -165,7 +206,6 @@ function McpForm({ server, onSave, onCancel }: {
         </div>
       </div>
 
-      {/* Transport-specific fields */}
       {transport === "stdio" ? (
         <div className="space-y-3">
           <div className="grid grid-cols-2 gap-3">
@@ -190,12 +230,271 @@ function McpForm({ server, onSave, onCancel }: {
         </div>
       )}
 
-      {/* Actions */}
       <div className="flex gap-2">
         <button onClick={handleSave} disabled={saving || !canSave} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">
           {saving ? "..." : isEditing ? "Save" : "Create"}
         </button>
         <button onClick={onCancel} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+      </div>
+    </div>
+  )
+}
+
+// ── Export Dialog ──────────────────────────────────────────────────
+
+function ExportMcpConfigDialog({ server, onClose }: { server: McpServer | null; onClose: () => void }) {
+  const [downloading, setDownloading] = useState(false)
+  const toast = useToast()
+
+  if (!server) return null
+
+  const handleDownload = async () => {
+    setDownloading(true)
+    try {
+      const res = await api<{ data: McpConfigBundle }>("/siclaw/mcp/export", {
+        method: "POST",
+        body: { mcp_server_id: server.id },
+      })
+      downloadJson(`${server.name}-mcp-config.json`, res.data)
+    } catch (err: any) {
+      toast.error(err.message || "Export failed")
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-lg border border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+          <h2 className="text-sm font-semibold">Export Config — {server.name}</h2>
+          <button onClick={onClose} className="p-1 rounded text-muted-foreground hover:text-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="p-4 space-y-3">
+          <div className="rounded-md bg-secondary/40 border border-border px-3 py-2.5 text-xs text-muted-foreground leading-relaxed">
+            Downloads this MCP server as a reusable config file. Plain values are included; re-enter any sensitive credentials after import.
+          </div>
+          <div className="flex justify-end gap-2">
+            <button onClick={onClose} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="flex items-center gap-1.5 h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50"
+            >
+              {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+              Download
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Import Preview Panel ───────────────────────────────────────────
+
+const ACTION_STYLES: Record<string, string> = {
+  create: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+  update: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",
+  unchanged: "bg-secondary text-muted-foreground",
+  invalid: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",
+}
+
+function ImportPreviewPanel({ preview }: { preview: McpImportPreview }) {
+  return (
+    <div className="rounded-md border border-border bg-secondary/20 p-3 space-y-2.5 text-sm">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className={`px-2 py-0.5 text-[11px] font-medium rounded ${ACTION_STYLES[preview.action]}`}>
+          {preview.action.toUpperCase()}
+        </span>
+        {preview.name && <span className="font-mono text-sm font-medium">{preview.name}</span>}
+        {preview.transport && (
+          <span className="px-2 py-0.5 text-[10px] font-mono rounded border border-border text-muted-foreground">
+            {TRANSPORT_LABELS[preview.transport as McpTransport] || preview.transport}
+          </span>
+        )}
+        {(preview.bound_agents ?? 0) > 0 && (
+          <span className="text-xs text-amber-600 dark:text-amber-400">
+            {preview.bound_agents} agent{preview.bound_agents! > 1 ? "s" : ""} affected
+          </span>
+        )}
+      </div>
+
+      {preview.errors.length > 0 && (
+        <div className="space-y-1">
+          {preview.errors.map((e, i) => (
+            <p key={i} className="text-xs text-red-600 dark:text-red-400 flex items-start gap-1">
+              <X className="h-3 w-3 mt-0.5 shrink-0" />{e}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {preview.diffs.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-xs font-medium text-muted-foreground">Changes</p>
+          <div className="rounded border border-border overflow-hidden">
+            <table className="w-full text-xs">
+              <thead className="bg-secondary/60">
+                <tr>
+                  <th className="px-2 py-1 text-left font-medium text-muted-foreground w-28">Field</th>
+                  <th className="px-2 py-1 text-left font-medium text-muted-foreground">Before</th>
+                  <th className="px-2 py-1 text-center font-medium text-muted-foreground w-4">
+                    <ChevronRight className="h-3 w-3 mx-auto" />
+                  </th>
+                  <th className="px-2 py-1 text-left font-medium text-muted-foreground">After</th>
+                </tr>
+              </thead>
+              <tbody>
+                {preview.diffs.map((d) => (
+                  <tr key={d.field} className="border-t border-border/50">
+                    <td className="px-2 py-1 font-mono text-muted-foreground">{d.field}</td>
+                    <td className="px-2 py-1 font-mono text-red-600 dark:text-red-400 max-w-[140px] truncate" title={formatDiffValue(d.before)}>
+                      {formatDiffValue(d.before)}
+                    </td>
+                    <td className="px-1 py-1 text-muted-foreground/40 text-center">→</td>
+                    <td className="px-2 py-1 font-mono text-emerald-600 dark:text-emerald-400 max-w-[140px] truncate" title={formatDiffValue(d.after)}>
+                      {formatDiffValue(d.after)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {preview.action === "unchanged" && preview.errors.length === 0 && (
+        <p className="text-xs text-muted-foreground flex items-center gap-1">
+          <Check className="h-3 w-3 text-emerald-500" /> No changes — server config is already up to date.
+        </p>
+      )}
+    </div>
+  )
+}
+
+// ── Import Dialog ──────────────────────────────────────────────────
+
+function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; onImported: () => void }) {
+  const [configText, setConfigText] = useState("")
+  const [fileName, setFileName] = useState("")
+  const [preview, setPreview] = useState<McpImportPreview | null>(null)
+  const [previewing, setPreviewing] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const toast = useToast()
+
+  const parseBundle = (): { ok: boolean; bundle?: McpConfigBundle; error?: string } => {
+    if (!configText.trim()) return { ok: false, error: "Paste or upload a config file" }
+    try {
+      const parsed = JSON.parse(configText)
+      return { ok: true, bundle: parsed }
+    } catch {
+      return { ok: false, error: "Invalid JSON" }
+    }
+  }
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setFileName(file.name)
+    file.text().then(setConfigText).catch(() => toast.error("Failed to read file"))
+  }
+
+  const handlePreview = async () => {
+    const { ok, bundle, error } = parseBundle()
+    if (!ok) { toast.error(error!); return }
+    setPreviewing(true); setPreview(null)
+    try {
+      const res = await api<{ data: McpImportPreview }>("/siclaw/mcp/import/preview", {
+        method: "POST",
+        body: { bundle },
+      })
+      setPreview(res.data)
+    } catch (err: any) {
+      toast.error(err.message || "Preview failed")
+    } finally {
+      setPreviewing(false)
+    }
+  }
+
+  const handleApply = async () => {
+    const { ok, bundle, error } = parseBundle()
+    if (!ok) { toast.error(error!); return }
+    setApplying(true)
+    try {
+      const res = await api<{ data: { created: number; updated: number; unchanged: number } }>("/siclaw/mcp/import", {
+        method: "POST",
+        body: { bundle },
+      })
+      const { created, updated, unchanged } = res.data
+      const parts = [created && `${created} created`, updated && `${updated} updated`, unchanged && `${unchanged} unchanged`].filter(Boolean)
+      toast.success(`Import complete: ${parts.join(", ")}`)
+      onImported(); onClose()
+    } catch (err: any) {
+      toast.error(err.message || "Import failed")
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  const canApply = preview !== null && preview.errors.length === 0 && preview.action !== "invalid" && preview.action !== "unchanged"
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
+      <div className="w-full max-w-lg rounded-lg border border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+          <h2 className="text-sm font-semibold">Import MCP Config</h2>
+          <button onClick={onClose} className="p-1 rounded text-muted-foreground hover:text-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="p-4 space-y-3">
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-medium text-muted-foreground">Config JSON</label>
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                className="flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border text-muted-foreground hover:text-foreground"
+              >
+                <Upload className="h-3 w-3" /> {fileName || "Upload file"}
+              </button>
+              <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={handleFileChange} />
+            </div>
+            <textarea
+              value={configText}
+              onChange={(e) => { setConfigText(e.target.value); setPreview(null) }}
+              placeholder='{"mcpServer": {"name": "...", "transport": "stdio", ...}}'
+              rows={6}
+              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none"
+            />
+          </div>
+
+          {preview && <ImportPreviewPanel preview={preview} />}
+
+          <div className="flex justify-end gap-2">
+            <button onClick={onClose} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+            <button
+              onClick={handlePreview}
+              disabled={previewing || !configText.trim()}
+              className="h-8 px-4 text-sm rounded-md border border-border text-foreground disabled:opacity-50"
+            >
+              {previewing ? <Loader2 className="h-3.5 w-3.5 animate-spin inline mr-1" /> : null}Preview
+            </button>
+            <button
+              onClick={handleApply}
+              disabled={applying || !canApply}
+              className="flex items-center gap-1.5 h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50"
+            >
+              {applying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+              Apply
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -212,11 +511,10 @@ export function MCP() {
   const toast = useToast()
   const confirmDialog = useConfirm()
 
-  // Create / Edit
   const [showCreate, setShowCreate] = useState(false)
   const [editingServer, setEditingServer] = useState<McpServer | null>(null)
-
-  // Action loading states
+  const [exportTarget, setExportTarget] = useState<McpServer | null>(null)
+  const [showImport, setShowImport] = useState(false)
   const [toggling, setToggling] = useState<string | null>(null)
 
   const fetchServers = async () => {
@@ -326,9 +624,20 @@ export function MCP() {
           </p>
         </div>
         {isAdmin && (
-          <button onClick={() => { setShowCreate(true); setEditingServer(null) }} className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90">
-            <Plus className="h-3.5 w-3.5" /> New Server
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowImport(true)}
+              className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md border border-border text-foreground hover:bg-secondary"
+            >
+              <Upload className="h-3.5 w-3.5" /> Import Config
+            </button>
+            <button
+              onClick={() => { setShowCreate(true); setEditingServer(null) }}
+              className="flex items-center gap-1.5 h-8 px-3 text-sm rounded-md bg-primary text-primary-foreground hover:opacity-90"
+            >
+              <Plus className="h-3.5 w-3.5" /> New Server
+            </button>
+          </div>
         )}
       </div>
 
@@ -388,7 +697,6 @@ export function MCP() {
           <div className="px-6 py-4 space-y-2">
             {filtered.map((server) => (
               <div key={server.id} className="rounded-lg border border-border/50">
-                {/* Server row */}
                 <div className="flex items-center justify-between p-3 hover:bg-secondary/30 transition-colors">
                   <div className="flex items-center gap-3 flex-1 min-w-0">
                     <span className={`h-2 w-2 rounded-full shrink-0 ${server.enabled ? "bg-green-500" : "bg-muted-foreground/40"}`} />
@@ -404,7 +712,7 @@ export function MCP() {
                       {TRANSPORT_LABELS[server.transport] || server.transport}
                     </span>
                     <span className="text-xs text-muted-foreground font-mono max-w-[200px] truncate hidden sm:block">
-                      {server.url || server.command || "\u2014"}
+                      {server.url || server.command || "—"}
                     </span>
                     {isAdmin && (
                       <div className="flex items-center gap-1">
@@ -419,6 +727,13 @@ export function MCP() {
                           title={server.enabled ? "Disable" : "Enable"}
                         >
                           {toggling === server.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Power className="h-3.5 w-3.5" />}
+                        </button>
+                        <button
+                          onClick={() => setExportTarget(server)}
+                          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+                          title="Export config"
+                        >
+                          <Download className="h-3.5 w-3.5" />
                         </button>
                         <button
                           onClick={() => { setEditingServer(server); setShowCreate(false) }}
@@ -439,7 +754,6 @@ export function MCP() {
                   </div>
                 </div>
 
-                {/* Edit form (inline below the server row) */}
                 {editingServer?.id === server.id && (
                   <div className="border-t border-border/50 p-3 bg-secondary/10">
                     <McpForm
@@ -454,6 +768,13 @@ export function MCP() {
           </div>
         )}
       </div>
+
+      {exportTarget && (
+        <ExportMcpConfigDialog server={exportTarget} onClose={() => setExportTarget(null)} />
+      )}
+      {showImport && (
+        <ImportMcpConfigDialog onClose={() => setShowImport(false)} onImported={fetchServers} />
+      )}
     </div>
   )
 }
