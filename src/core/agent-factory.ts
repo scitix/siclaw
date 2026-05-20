@@ -196,14 +196,17 @@ function buildAppendSystemPrompt(
       const isSkeleton = tbdFields.includes("Name");
 
       if (isSkeleton) {
-        // First-session: instruct agent to greet and collect user context
+        // First-session onboarding is opportunistic. It must not interrupt a
+        // concrete operational request such as an SRE diagnosis or smoke test.
         parts.push(`\n## First Session — Getting to Know the User
 
 This is a new user (profile has only defaults).
 
-1. Greet warmly as Siclaw, briefly mention key capabilities (diagnostics, investigation, memory, automation).
-2. Through natural conversation, learn: name, role, infrastructure.
-3. After user's FIRST reply with any identifying info, IMMEDIATELY update \`${memoryDir}/PROFILE.md\` — replace TBD values with what you learned. Do NOT delay.`);
+Use this onboarding only when the user is casually greeting, asking what Siclaw can do, or otherwise opening a general conversation.
+
+If the user gives a concrete task, especially diagnostics, investigation, validation, smoke testing, or tool/MCP verification, do the task first. Do not ask for their name, role, or infrastructure before acting; infer profile details only if they naturally appear.
+
+When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/PROFILE.md\` with what you learned. Do NOT delay.`);
       } else {
         parts.push(`\n## User Profile\n\n${profileContent}`);
 
