@@ -6,6 +6,7 @@
  */
 
 import type { FrontendWsClient } from "./frontend-ws-client.js";
+import { normalizeChatSessionTitle } from "./chat-session-fields.js";
 
 export interface ChatSessionLineageInput {
   /** Parent chat session for delegated child sessions. Null/undefined for normal top-level chat. */
@@ -116,7 +117,7 @@ export async function ensureChatSession(
 ): Promise<void> {
   const payload: Record<string, unknown> = {
     session_id: sessionId, agent_id: agentId, user_id: userId,
-    title, preview, origin,
+    title: normalizeChatSessionTitle(title), preview, origin,
   };
   if (lineage) {
     payload.parent_session_id = lineage.parentSessionId ?? null;

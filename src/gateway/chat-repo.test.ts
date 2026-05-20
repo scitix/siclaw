@@ -89,6 +89,12 @@ describe("ensureChatSession", () => {
       target_agent_id: "target-agent",
     });
   });
+
+  it("truncates overlong titles before sending them to the upstream repo", async () => {
+    await ensureChatSession("sid", "agent", "user", "t".repeat(300));
+
+    expect(fake.calls[0].params.title).toHaveLength(255);
+  });
 });
 
 describe("appendMessage", () => {
