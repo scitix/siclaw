@@ -1,6 +1,6 @@
 import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check, ArrowRight, PencilLine, FileText } from "lucide-react"
 import type { ContextUsage, PrefixActionChip } from "./types"
-import { useState, useCallback, useRef, useEffect } from "react"
+import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react"
 import type { KeyboardEvent } from "react"
 import { cn } from "./cn"
 
@@ -44,6 +44,7 @@ interface InputAreaProps {
   hasMessages?: boolean
   draft?: string | null
   draftSeq?: number
+  historyMessages?: string[]
   activePrefix?: PrefixActionChip | null
   onClearPrefix?: () => void
 }
@@ -61,6 +62,7 @@ export function InputArea({
   hasMessages,
   draft,
   draftSeq,
+  historyMessages = [],
   activePrefix,
   onClearPrefix,
 }: InputAreaProps) {
@@ -69,10 +71,24 @@ export function InputArea({
   const [isAborting, setIsAborting] = useState(false)
   const isComposingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const historyCursorRef = useRef<number | null>(null)
+  const draftBeforeHistoryRef = useRef("")
+
+  useLayoutEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    const maxHeight = Math.min(320, Math.max(180, Math.floor(window.innerHeight * 0.36)))
+    el.style.height = "auto"
+    const nextHeight = Math.min(el.scrollHeight, maxHeight)
+    el.style.height = `${nextHeight}px`
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden"
+  }, [value, activePrefix, pendingMessages])
 
   // When external draft changes, populate input and focus
   useEffect(() => {
     if (draft) {
+      historyCursorRef.current = null
+      draftBeforeHistoryRef.current = draft
       setValue(draft)
       setTimeout(() => {
         const el = textareaRef.current
@@ -117,11 +133,79 @@ export function InputArea({
 
     onSend(fullMessage.trim())
     setValue("")
+    historyCursorRef.current = null
+    draftBeforeHistoryRef.current = ""
     onClearPrefix?.()
   }, [value, disabled, onSend, deepInvestigation, activePrefix, onClearPrefix])
 
+  const navigateHistory = useCallback(
+    (direction: "previous" | "next") => {
+      if (activePrefix || historyMessages.length === 0) return false
+
+      const current = historyCursorRef.current
+      if (direction === "previous") {
+        const next = current == null ? historyMessages.length - 1 : Math.max(0, current - 1)
+        if (current == null) draftBeforeHistoryRef.current = value
+        historyCursorRef.current = next
+        setValue(historyMessages[next] ?? "")
+      } else {
+        if (current == null) return false
+        if (current >= historyMessages.length - 1) {
+          historyCursorRef.current = null
+          setValue(draftBeforeHistoryRef.current)
+        } else {
+          const next = current + 1
+          historyCursorRef.current = next
+          setValue(historyMessages[next] ?? "")
+        }
+      }
+
+      setTimeout(() => {
+        const el = textareaRef.current
+        if (!el) return
+        const end = el.value.length
+        el.focus()
+        el.setSelectionRange(end, end)
+      }, 0)
+      return true
+    },
+    [activePrefix, historyMessages, value],
+  )
+
+  const resetHistoryNavigation = useCallback((nextValue: string) => {
+    historyCursorRef.current = null
+    draftBeforeHistoryRef.current = nextValue
+  }, [])
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      const isPlainArrow =
+        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !isComposingRef.current &&
+        !e.nativeEvent.isComposing
+
+      if (isPlainArrow) {
+        const el = textareaRef.current
+        if (el && el.selectionStart === el.selectionEnd) {
+          const beforeCursor = el.value.slice(0, el.selectionStart)
+          const afterCursor = el.value.slice(el.selectionEnd)
+          const atFirstLine = !beforeCursor.includes("\n")
+          const atLastLine = !afterCursor.includes("\n")
+          const didNavigate =
+            e.key === "ArrowUp"
+              ? atFirstLine && navigateHistory("previous")
+              : atLastLine && navigateHistory("next")
+          if (didNavigate) {
+            e.preventDefault()
+            return
+          }
+        }
+      }
+
       // Backspace at cursor=0 with active prefix → atomic delete of the pill
       if (e.key === "Backspace" && activePrefix && !isComposingRef.current) {
         const el = textareaRef.current
@@ -136,7 +220,7 @@ export function InputArea({
         handleSend()
       }
     },
-    [handleSend, activePrefix, onClearPrefix],
+    [handleSend, activePrefix, onClearPrefix, navigateHistory],
   )
 
   const hasContent = value.trim() || !!activePrefix
@@ -257,7 +341,10 @@ export function InputArea({
                 value={value}
                 onFocus={() => setIsFocused(true)}
                 onBlur={() => setIsFocused(false)}
-                onChange={(e) => setValue(e.target.value)}
+                onChange={(e) => {
+                  setValue(e.target.value)
+                  resetHistoryNavigation(e.target.value)
+                }}
                 onKeyDown={handleKeyDown}
                 onCompositionStart={() => {
                   isComposingRef.current = true
@@ -271,9 +358,9 @@ export function InputArea({
                     : activePrefix?.placeholder ?? "Reply..."
                 }
                 disabled={disabled}
-                className="w-full bg-transparent border-none outline-none px-6 py-3 pr-14 text-[15px] text-foreground placeholder:text-muted-foreground/70 focus:ring-0 focus:outline-none resize-none min-h-[48px] max-h-[200px] disabled:cursor-not-allowed"
+                className="w-full bg-transparent border-none outline-none px-6 py-3 pr-14 text-[15px] text-foreground placeholder:text-muted-foreground/70 focus:ring-0 focus:outline-none resize-none min-h-[48px] disabled:cursor-not-allowed"
                 rows={1}
-                style={{ height: "auto" }}
+                style={{ height: "auto", overflowY: "hidden" }}
               />
             </div>
 
