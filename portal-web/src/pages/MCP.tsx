@@ -1,5 +1,5 @@
-import { useState, useEffect, useMemo, useRef } from "react"
-import { Plus, Trash2, Loader2, Plug, Pencil, Power, Search, X, Download, Upload, Check, ChevronRight } from "lucide-react"
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react"
+import { Plus, Trash2, Loader2, Plug, Pencil, Power, Search, X, Download, Upload, Check } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -74,10 +74,75 @@ function downloadJson(filename: string, data: unknown) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-function formatDiffValue(v: unknown): string {
-  if (v === null || v === undefined) return "—"
-  if (typeof v === "object") return JSON.stringify(v)
+function formatFieldValue(v: unknown): string {
+  if (v === null || v === undefined) return ""
+  if (typeof v === "object") return JSON.stringify(v, null, 2)
+  if (typeof v === "boolean") return v ? "true" : "false"
   return String(v)
+}
+
+type DiffLine = { type: "same" | "add" | "remove"; content: string }
+
+function computeLineDiff(before: unknown, after: unknown): DiffLine[] {
+  const bStr = formatFieldValue(before)
+  const aStr = formatFieldValue(after)
+  const bLines = bStr === "" ? [] : bStr.split("\n")
+  const aLines = aStr === "" ? [] : aStr.split("\n")
+  const m = bLines.length, n = aLines.length
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0))
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = bLines[i - 1] === aLines[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1])
+  const result: DiffLine[] = []
+  let i = m, j = n
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && bLines[i - 1] === aLines[j - 1]) {
+      result.unshift({ type: "same", content: bLines[i - 1] })
+      i--; j--
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      result.unshift({ type: "add", content: aLines[j - 1] })
+      j--
+    } else {
+      result.unshift({ type: "remove", content: bLines[i - 1] })
+      i--
+    }
+  }
+  return result
+}
+
+const TRUNCATE_CHARS = 100
+
+function DiffLineRow({ dl }: { dl: DiffLine }) {
+  const [expanded, setExpanded] = useState(false)
+  const isLong = dl.content.length > TRUNCATE_CHARS
+  const bg = dl.type === "add" ? "bg-emerald-50 dark:bg-emerald-950/25"
+    : dl.type === "remove" ? "bg-red-50 dark:bg-red-950/25" : ""
+  const textColor = dl.type === "add" ? "text-emerald-700 dark:text-emerald-400"
+    : dl.type === "remove" ? "text-red-600 dark:text-red-400" : "text-foreground/60"
+  const marker = dl.type === "add" ? "+" : dl.type === "remove" ? "-" : " "
+  return (
+    <div className={`flex items-baseline ${bg} min-w-0`}>
+      <span className={`select-none px-2 py-0.5 shrink-0 font-bold ${textColor}`}>{marker}</span>
+      <div
+        className={`flex-1 py-0.5 min-w-0 font-mono text-xs ${expanded ? "whitespace-pre-wrap break-all" : "overflow-hidden"}`}
+        style={!expanded ? {
+          whiteSpace: "nowrap",
+          WebkitMaskImage: isLong ? "linear-gradient(to right, black 82%, transparent 100%)" : undefined,
+          maskImage: isLong ? "linear-gradient(to right, black 82%, transparent 100%)" : undefined,
+        } : undefined}
+      >
+        <span className={textColor}>{dl.content || " "}</span>
+      </div>
+      {isLong && !expanded && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="shrink-0 px-2 py-0.5 text-[10px] text-blue-500 hover:text-blue-700 hover:underline whitespace-nowrap"
+        >
+          view details
+        </button>
+      )}
+    </div>
+  )
 }
 
 // ── KV Editor ──────────────────────────────────────────────────────
@@ -333,35 +398,29 @@ function ImportPreviewPanel({ preview }: { preview: McpImportPreview }) {
       )}
 
       {preview.diffs.length > 0 && (
-        <div className="space-y-1">
+        <div className="space-y-1.5">
           <p className="text-xs font-medium text-muted-foreground">Changes</p>
           <div className="rounded border border-border overflow-hidden">
-            <table className="w-full text-xs">
-              <thead className="bg-secondary/60">
-                <tr>
-                  <th className="px-2 py-1 text-left font-medium text-muted-foreground w-28">Field</th>
-                  <th className="px-2 py-1 text-left font-medium text-muted-foreground">Before</th>
-                  <th className="px-2 py-1 text-center font-medium text-muted-foreground w-4">
-                    <ChevronRight className="h-3 w-3 mx-auto" />
-                  </th>
-                  <th className="px-2 py-1 text-left font-medium text-muted-foreground">After</th>
-                </tr>
-              </thead>
-              <tbody>
-                {preview.diffs.map((d) => (
-                  <tr key={d.field} className="border-t border-border/50">
-                    <td className="px-2 py-1 font-mono text-muted-foreground">{d.field}</td>
-                    <td className="px-2 py-1 font-mono text-red-600 dark:text-red-400 max-w-[140px] truncate" title={formatDiffValue(d.before)}>
-                      {formatDiffValue(d.before)}
-                    </td>
-                    <td className="px-1 py-1 text-muted-foreground/40 text-center">→</td>
-                    <td className="px-2 py-1 font-mono text-emerald-600 dark:text-emerald-400 max-w-[140px] truncate" title={formatDiffValue(d.after)}>
-                      {formatDiffValue(d.after)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            {preview.diffs.map((d, di) => {
+              const diffLines = computeLineDiff(d.before, d.after)
+              const hasChanges = diffLines.some((l) => l.type !== "same")
+              if (!hasChanges) return null
+              const onlyRemoves = diffLines.every((l) => l.type !== "add")
+              return (
+                <div key={d.field} className={di > 0 ? "border-t border-border/50" : undefined}>
+                  <div className="bg-secondary/60 px-2 py-1 text-[11px] font-mono text-muted-foreground select-none">
+                    @@ <span className="text-foreground/80 font-semibold">{d.field}</span> @@
+                  </div>
+                  {diffLines.map((dl, li) => <DiffLineRow key={li} dl={dl} />)}
+                  {onlyRemoves && (
+                    <div className="flex items-baseline bg-secondary/10 font-mono text-xs text-muted-foreground/50">
+                      <span className="select-none px-2 py-0.5">+</span>
+                      <span className="py-0.5 italic">(will be unset)</span>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </div>
         </div>
       )}
@@ -377,6 +436,27 @@ function ImportPreviewPanel({ preview }: { preview: McpImportPreview }) {
 
 // ── Import Dialog ──────────────────────────────────────────────────
 
+const RESIZE_EDGE_PX = 6
+
+// Collapse consecutive blank lines to at most one, and remove all trailing blank lines.
+function compactJson(text: string) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n")
+  const out: string[] = []
+  let blankRun = 0
+  for (const line of lines) {
+    if (line.trim() === "") {
+      blankRun++
+      if (blankRun === 1) out.push("")  // keep at most one blank line
+    } else {
+      blankRun = 0
+      out.push(line)
+    }
+  }
+  // Strip trailing blank lines
+  while (out.length > 0 && out[out.length - 1].trim() === "") out.pop()
+  return out.join("\n")
+}
+
 function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; onImported: () => void }) {
   const [configText, setConfigText] = useState("")
   const [fileName, setFileName] = useState("")
@@ -384,7 +464,50 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
   const [previewing, setPreviewing] = useState(false)
   const [applying, setApplying] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  const previewRef = useRef<HTMLDivElement>(null)
   const toast = useToast()
+
+  // Width is always explicit; height starts as auto (content-driven) and only
+  // becomes fixed once the user drags a resize handle.
+  const [dialogWidth, setDialogWidth] = useState(() => Math.min(700, Math.round(window.innerWidth * 0.85)))
+  const [fixedHeight, setFixedHeight] = useState<number | null>(null)
+  const resizeDrag = useRef<{
+    edge: string; startX: number; startY: number; startW: number; startH: number
+  } | null>(null)
+  // Tracks whether a resize drag moved the mouse; swallows the spurious backdrop
+  // click that fires when mouseup lands outside the dialog.
+  const didResizeDrag = useRef(false)
+
+  const startResize = (e: React.MouseEvent, edge: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    // Read actual rendered dimensions so the starting size is always correct,
+    // regardless of whether height is auto or fixed.
+    const el = dialogRef.current!
+    resizeDrag.current = { edge, startX: e.clientX, startY: e.clientY, startW: el.offsetWidth, startH: el.offsetHeight }
+
+    const onMove = (me: MouseEvent) => {
+      const d = resizeDrag.current
+      if (!d) return
+      didResizeDrag.current = true
+      const dx = me.clientX - d.startX
+      const dy = me.clientY - d.startY
+      if (d.edge.includes("e")) setDialogWidth(Math.max(480, d.startW + dx))
+      else if (d.edge.includes("w")) setDialogWidth(Math.max(480, d.startW - dx))
+      if (d.edge.includes("s")) setFixedHeight(Math.max(320, d.startH + dy))
+      else if (d.edge.includes("n")) setFixedHeight(Math.max(320, d.startH - dy))
+    }
+    const onUp = () => {
+      resizeDrag.current = null
+      window.removeEventListener("mousemove", onMove)
+      window.removeEventListener("mouseup", onUp)
+    }
+    window.addEventListener("mousemove", onMove)
+    window.addEventListener("mouseup", onUp)
+  }
 
   const parseBundle = (): { ok: boolean; bundle?: McpConfigBundle; error?: string } => {
     if (!configText.trim()) return { ok: false, error: "Paste or upload a config file" }
@@ -400,7 +523,7 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
     const file = e.target.files?.[0]
     if (!file) return
     setFileName(file.name)
-    file.text().then(setConfigText).catch(() => toast.error("Failed to read file"))
+    file.text().then((t) => setConfigText(compactJson(t))).catch(() => toast.error("Failed to read file"))
   }
 
   const handlePreview = async () => {
@@ -442,17 +565,63 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
 
   const canApply = preview !== null && preview.errors.length === 0 && preview.action !== "invalid" && preview.action !== "unchanged"
 
+  // Grow textarea to fit content; cap at 55 vh so the dialog doesn't overflow.
+  useLayoutEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = "auto"
+    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.55))}px`
+  }, [configText])
+
+  // Auto-scroll to preview panel once it appears in the DOM.
+  useLayoutEffect(() => {
+    if (preview) previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [preview])
+
+  const e = RESIZE_EDGE_PX
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-lg border border-border bg-card shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => { if (didResizeDrag.current) { didResizeDrag.current = false; return } onClose() }}>
+      <div
+        ref={dialogRef}
+        className="relative flex flex-col rounded-lg border border-border bg-card shadow-xl overflow-hidden"
+        style={{
+          width: dialogWidth,
+          ...(fixedHeight !== null ? { height: fixedHeight } : {}),
+          maxWidth: "calc(100vw - 32px)",
+          maxHeight: "calc(100vh - 32px)",
+        }}
+        onClick={(ev) => ev.stopPropagation()}
+      >
+        {/* ── Resize handles ── */}
+        {/* edges */}
+        <div style={{ position: "absolute", inset: `0 ${e}px auto ${e}px`, height: e, cursor: "ns-resize", zIndex: 10 }} onMouseDown={(ev) => startResize(ev, "n")} />
+        <div style={{ position: "absolute", inset: `auto ${e}px 0 ${e}px`, height: e, cursor: "ns-resize", zIndex: 10 }} onMouseDown={(ev) => startResize(ev, "s")} />
+        <div style={{ position: "absolute", inset: `${e}px auto ${e}px 0`, width: e, cursor: "ew-resize", zIndex: 10 }} onMouseDown={(ev) => startResize(ev, "w")} />
+        <div style={{ position: "absolute", inset: `${e}px 0 ${e}px auto`, width: e, cursor: "ew-resize", zIndex: 10 }} onMouseDown={(ev) => startResize(ev, "e")} />
+        {/* corners */}
+        <div style={{ position: "absolute", top: 0, left: 0, width: e * 2, height: e * 2, cursor: "nwse-resize", zIndex: 11 }} onMouseDown={(ev) => startResize(ev, "nw")} />
+        <div style={{ position: "absolute", top: 0, right: 0, width: e * 2, height: e * 2, cursor: "nesw-resize", zIndex: 11 }} onMouseDown={(ev) => startResize(ev, "ne")} />
+        <div style={{ position: "absolute", bottom: 0, left: 0, width: e * 2, height: e * 2, cursor: "nesw-resize", zIndex: 11 }} onMouseDown={(ev) => startResize(ev, "sw")} />
+        <div style={{ position: "absolute", bottom: 0, right: 0, width: e * 2, height: e * 2, cursor: "nwse-resize", zIndex: 11 }} onMouseDown={(ev) => startResize(ev, "se")} />
+
+        {/* ── Header ── */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
           <h2 className="text-sm font-semibold">Import MCP Config</h2>
           <button onClick={onClose} className="p-1 rounded text-muted-foreground hover:text-foreground">
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="p-4 space-y-3">
+        {/* ── Scrollable body ──
+            When height is auto (no user resize yet): give body an explicit max-height
+            so content can scroll instead of overflowing the viewport.
+            When height is fixed (user has resized): use flex-1 to fill remaining space. */}
+        <div
+          ref={bodyRef}
+          className={`overflow-y-auto p-4 space-y-3 ${fixedHeight !== null ? "flex-1 min-h-0" : ""}`}
+          style={fixedHeight === null ? { maxHeight: "calc(100vh - 180px)" } : undefined}
+        >
           <div className="space-y-1.5">
             <div className="flex items-center gap-2">
               <label className="text-xs font-medium text-muted-foreground">Config JSON</label>
@@ -466,34 +635,37 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
               <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={handleFileChange} />
             </div>
             <textarea
+              ref={textareaRef}
               value={configText}
-              onChange={(e) => { setConfigText(e.target.value); setPreview(null) }}
+              onChange={(e) => { setConfigText(compactJson(e.target.value)); setPreview(null) }}
               placeholder='{"mcpServer": {"name": "...", "transport": "stdio", ...}}'
-              rows={6}
-              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none"
+              rows={1}
+              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none overflow-hidden"
+              style={{ minHeight: "2rem" }}
             />
           </div>
 
-          {preview && <ImportPreviewPanel preview={preview} />}
+          {preview && <div ref={previewRef}><ImportPreviewPanel preview={preview} /></div>}
+        </div>
 
-          <div className="flex justify-end gap-2">
-            <button onClick={onClose} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
-            <button
-              onClick={handlePreview}
-              disabled={previewing || !configText.trim()}
-              className="h-8 px-4 text-sm rounded-md border border-border text-foreground disabled:opacity-50"
-            >
-              {previewing ? <Loader2 className="h-3.5 w-3.5 animate-spin inline mr-1" /> : null}Preview
-            </button>
-            <button
-              onClick={handleApply}
-              disabled={applying || !canApply}
-              className="flex items-center gap-1.5 h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50"
-            >
-              {applying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
-              Apply
-            </button>
-          </div>
+        {/* ── Footer ── */}
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-border shrink-0">
+          <button onClick={onClose} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
+          <button
+            onClick={handlePreview}
+            disabled={previewing || !configText.trim()}
+            className="h-8 px-4 text-sm rounded-md border border-border text-foreground disabled:opacity-50"
+          >
+            {previewing ? <Loader2 className="h-3.5 w-3.5 animate-spin inline mr-1" /> : null}Preview
+          </button>
+          <button
+            onClick={handleApply}
+            disabled={applying || !canApply}
+            className="flex items-center gap-1.5 h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50"
+          >
+            {applying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+            Apply
+          </button>
         </div>
       </div>
     </div>

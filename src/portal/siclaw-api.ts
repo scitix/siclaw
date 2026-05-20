@@ -120,7 +120,10 @@ function mcpEntryDiffs(existing: Record<string, unknown>, desired: McpConfigEntr
   const diffs: McpImportFieldDiff[] = [];
   for (const f of MCP_DIFF_FIELDS) {
     const before = existing[f] ?? null;
-    const after = (desired as Record<string, unknown>)[f] ?? null;
+    let after = (desired as Record<string, unknown>)[f] ?? null;
+    // Mirror the actual import write: omitted `enabled` is treated as true,
+    // matching `entry.enabled !== false ? 1 : 0` in the INSERT/UPDATE path.
+    if (f === "enabled" && after === null) after = true;
     if (JSON.stringify(before) !== JSON.stringify(after)) diffs.push({ field: f, before, after });
   }
   return diffs;
