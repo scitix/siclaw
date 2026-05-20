@@ -12,6 +12,7 @@ import {
   validateKubectlInPipeline,
 } from "./restricted-bash.js";
 import { extractPipeline } from "../infra/command-validator.js";
+import { preExecSecurity } from "../infra/security-pipeline.js";
 
 describe("extractCommands", () => {
   it("splits pipe", () => {
@@ -395,15 +396,17 @@ describe("createRestrictedBashTool", () => {
     ];
 
     for (const cmd of allowedCmds) {
-      it(`allows: ${cmd}`, async () => {
-        const result = await tool.execute(
-          "test-id",
-          { command: cmd },
-          undefined,
-          {} as any
-        );
-        const text = result.content[0].text;
-        expect(text).not.toContain("Blocked");
+      // Validate only the security gate — do NOT execute the command.
+      // Calling tool.execute() would spawn a real subprocess (e.g. kubectl
+      // trying to reach a cluster) which hangs in CI and hits the 5 s timeout.
+      it(`allows: ${cmd}`, () => {
+        const pre = preExecSecurity(cmd, {
+          context: "local",
+          extraAllowed: new Set(["kubectl"]),
+          isAllowed: isSkillScript,
+          pipelineValidators: [validateKubectlInPipeline],
+        });
+        expect(pre.error).toBeNull();
       });
     }
   });
