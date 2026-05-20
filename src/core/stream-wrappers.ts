@@ -214,6 +214,29 @@ type ToolCallArgumentRepair = {
   trailingSuffix: string;
 };
 
+function parseToolCallArgumentObject(raw: string): Record<string, unknown> | undefined {
+  if (!raw.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasUnsafeTrailingToolCallArgumentSuffix(raw: string): boolean {
+  const jsonPrefix = extractBalancedJsonPrefix(raw);
+  if (!jsonPrefix) return false;
+  const suffix = raw.slice(raw.indexOf(jsonPrefix) + jsonPrefix.length).trim();
+  if (!suffix) return false;
+  return (
+    suffix.length > MAX_TOOLCALL_REPAIR_TRAILING_CHARS ||
+    !TOOLCALL_REPAIR_ALLOWED_TRAILING_RE.test(suffix)
+  );
+}
+
 /**
  * Try to parse and repair malformed tool call arguments.
  * Returns undefined if the JSON is already valid or cannot be repaired.
@@ -245,6 +268,12 @@ export function tryParseMalformedToolCallArguments(raw: string): ToolCallArgumen
   }
 }
 
+function shouldReplaceToolCallArguments(value: unknown): boolean {
+  if (value == null) return true;
+  if (typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.keys(value).length === 0;
+}
+
 function repairToolCallArgumentsInMessage(
   message: unknown,
   contentIndex: number,
@@ -257,18 +286,18 @@ function repairToolCallArgumentsInMessage(
   if (!block || typeof block !== "object") return;
   const typedBlock = block as { type?: unknown; arguments?: unknown };
   if (!isToolCallBlockType(typedBlock.type)) return;
+  if (!shouldReplaceToolCallArguments(typedBlock.arguments)) return;
   typedBlock.arguments = repairedArgs;
 }
 
-function clearToolCallArgumentsInMessage(message: unknown, contentIndex: number): void {
-  if (!message || typeof message !== "object") return;
-  const content = (message as { content?: unknown }).content;
-  if (!Array.isArray(content)) return;
-  const block = content[contentIndex];
-  if (!block || typeof block !== "object") return;
-  const typedBlock = block as { type?: unknown; arguments?: unknown };
-  if (!isToolCallBlockType(typedBlock.type)) return;
-  typedBlock.arguments = {};
+function repairToolCallArguments(
+  toolCall: unknown,
+  repairedArgs: Record<string, unknown>,
+): void {
+  if (!toolCall || typeof toolCall !== "object") return;
+  const typedToolCall = toolCall as { arguments?: unknown };
+  if (!shouldReplaceToolCallArguments(typedToolCall.arguments)) return;
+  typedToolCall.arguments = repairedArgs;
 }
 
 function repairMalformedToolCallArgumentsInMessage(
@@ -333,22 +362,28 @@ function wrapStreamRepairMalformedToolCallArguments(stream: any): any {
               return result;
             }
             partialJsonByIndex.set(event.contentIndex, nextPartialJson);
+            if (hasUnsafeTrailingToolCallArgumentSuffix(nextPartialJson)) {
+              repairedArgsByIndex.delete(event.contentIndex);
+            }
             if (shouldAttemptMalformedToolCallRepair(nextPartialJson, event.delta)) {
-              const repair = tryParseMalformedToolCallArguments(nextPartialJson);
+              const parsedArgs = parseToolCallArgumentObject(nextPartialJson);
+              const repair = parsedArgs
+                ? { args: parsedArgs, trailingSuffix: "" }
+                : tryParseMalformedToolCallArguments(nextPartialJson);
               if (repair) {
                 repairedArgsByIndex.set(event.contentIndex, repair.args);
                 repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repair.args);
                 repairToolCallArgumentsInMessage(event.message, event.contentIndex, repair.args);
                 if (!loggedRepairIndices.has(event.contentIndex)) {
                   loggedRepairIndices.add(event.contentIndex);
-                  console.warn(
-                    `[stream-wrappers] repairing malformed tool call arguments after ${repair.trailingSuffix.length} trailing chars`,
-                  );
+                  if (repair.trailingSuffix.length > 0) {
+                    console.warn(
+                      `[stream-wrappers] repairing malformed tool call arguments after ${repair.trailingSuffix.length} trailing chars`,
+                    );
+                  }
                 }
               } else {
                 repairedArgsByIndex.delete(event.contentIndex);
-                clearToolCallArgumentsInMessage(event.partial, event.contentIndex);
-                clearToolCallArgumentsInMessage(event.message, event.contentIndex);
               }
             }
           }
@@ -359,9 +394,7 @@ function wrapStreamRepairMalformedToolCallArguments(stream: any): any {
           ) {
             const repairedArgs = repairedArgsByIndex.get(event.contentIndex);
             if (repairedArgs) {
-              if (event.toolCall && typeof event.toolCall === "object") {
-                (event.toolCall as { arguments?: unknown }).arguments = repairedArgs;
-              }
+              repairToolCallArguments(event.toolCall, repairedArgs);
               repairToolCallArgumentsInMessage(event.partial, event.contentIndex, repairedArgs);
               repairToolCallArgumentsInMessage(event.message, event.contentIndex, repairedArgs);
             }
@@ -462,22 +495,28 @@ export function createRepairMalformedArgsGuard(): OutputGuard {
           return;
         }
         partialJsonByIndex.set(e.contentIndex, nextPartialJson);
+        if (hasUnsafeTrailingToolCallArgumentSuffix(nextPartialJson)) {
+          repairedArgsByIndex.delete(e.contentIndex);
+        }
         if (shouldAttemptMalformedToolCallRepair(nextPartialJson, e.delta)) {
-          const repair = tryParseMalformedToolCallArguments(nextPartialJson);
+          const parsedArgs = parseToolCallArgumentObject(nextPartialJson);
+          const repair = parsedArgs
+            ? { args: parsedArgs, trailingSuffix: "" }
+            : tryParseMalformedToolCallArguments(nextPartialJson);
           if (repair) {
             repairedArgsByIndex.set(e.contentIndex, repair.args);
             repairToolCallArgumentsInMessage(e.partial, e.contentIndex, repair.args);
             repairToolCallArgumentsInMessage(e.message, e.contentIndex, repair.args);
             if (!loggedRepairIndices.has(e.contentIndex)) {
               loggedRepairIndices.add(e.contentIndex);
-              guardLog("repair-malformed-args", "repaired", {
-                trailingChars: repair.trailingSuffix.length,
-              });
+              if (repair.trailingSuffix.length > 0) {
+                guardLog("repair-malformed-args", "repaired", {
+                  trailingChars: repair.trailingSuffix.length,
+                });
+              }
             }
           } else {
             repairedArgsByIndex.delete(e.contentIndex);
-            clearToolCallArgumentsInMessage(e.partial, e.contentIndex);
-            clearToolCallArgumentsInMessage(e.message, e.contentIndex);
           }
         }
       }
@@ -488,9 +527,7 @@ export function createRepairMalformedArgsGuard(): OutputGuard {
       ) {
         const repairedArgs = repairedArgsByIndex.get(e.contentIndex);
         if (repairedArgs) {
-          if (e.toolCall && typeof e.toolCall === "object") {
-            (e.toolCall as { arguments?: unknown }).arguments = repairedArgs;
-          }
+          repairToolCallArguments(e.toolCall, repairedArgs);
           repairToolCallArgumentsInMessage(e.partial, e.contentIndex, repairedArgs);
           repairToolCallArgumentsInMessage(e.message, e.contentIndex, repairedArgs);
         }
