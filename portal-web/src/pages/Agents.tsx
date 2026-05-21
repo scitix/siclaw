@@ -58,11 +58,11 @@ export function Agents() {
     setAgents((prev) => prev.filter((a) => a.id !== id))
   }
 
-  const handleCopy = async (agent: Agent) => {
+  const handleFork = async (agent: Agent) => {
     try {
-      const newAgent = await api<Agent>(`/agents/${agent.id}/copy`, { method: "POST" })
-      setAgents((prev) => [newAgent, ...prev])
-      toast.success(`Copied as "${newAgent.name}"`)
+      const forked = await api<Agent>(`/agents/${agent.id}/fork`, { method: "POST" })
+      setAgents((prev) => [forked, ...prev])
+      toast.success(`Forked as "${forked.name}"`)
     } catch (err: any) { toast.error(err.message) }
   }
 
@@ -206,7 +206,7 @@ export function Agents() {
                 {/* Actions */}
                 <div className="flex items-center gap-0.5 shrink-0">
                   <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
-                  <Tooltip content="Duplicate"><button onClick={(e) => { e.stopPropagation(); handleCopy(a) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Copy className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Fork"><button onClick={(e) => { e.stopPropagation(); handleFork(a) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Copy className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Clear Memory"><button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=basic`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Delete"><button onClick={(e) => { e.stopPropagation(); handleDelete(a.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-4 w-4" /></button></Tooltip>

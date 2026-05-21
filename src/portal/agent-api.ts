@@ -7,7 +7,7 @@
 
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
-import { insertIgnorePrefix } from "../gateway/dialect-helpers.js";
+import { insertIgnorePrefix, isUniqueViolation } from "../gateway/dialect-helpers.js";
 import {
   sendJson,
   parseBody,
@@ -344,8 +344,8 @@ export function registerAgentRoutes(
     });
   });
 
-  // POST /api/v1/agents/:id/copy — duplicate agent + resource bindings (admin only)
-  router.post("/api/v1/agents/:id/copy", async (req, res, params) => {
+  // POST /api/v1/agents/:id/fork — fork agent + resource bindings (admin only)
+  router.post("/api/v1/agents/:id/fork", async (req, res, params) => {
     const auth = requireAdmin(req, res, jwtSecret);
     if (!auth) return;
 
@@ -360,7 +360,10 @@ export function registerAgentRoutes(
     const source = sourceRows[0];
 
     const newId = crypto.randomUUID();
-    const newName = `${source.name} (copy)`;
+    // Hash the source name + a random salt so the suffix is stable-looking but collision-free
+    const salt = crypto.randomBytes(8).toString("hex");
+    const suffix = crypto.createHash("sha256").update(source.name + salt).digest("hex").slice(0, 6);
+    const newName = `${source.name}-${suffix}`;
 
     const conn = await db.getConnection();
     try {
@@ -447,6 +450,10 @@ export function registerAgentRoutes(
       await conn.commit();
     } catch (err) {
       await conn.rollback();
+      if (isUniqueViolation(err)) {
+        sendJson(res, 409, { error: `Agent name "${newName}" is already taken. Please try again — a new suffix will be generated.` });
+        return;
+      }
       throw err;
     } finally {
       conn.release();
