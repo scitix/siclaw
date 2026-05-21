@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 import { useNavigate } from "react-router-dom"
-import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, Clock, BoltIcon, BookOpen } from "lucide-react"
+import { Plus, Bot, Trash2, Loader2, MessageSquare, Settings, Eraser, Zap, Plug, Server, Clock, BoltIcon, BookOpen, Copy } from "lucide-react"
 import { api, clearAgentMemory } from "../api"
 import { useToast } from "../components/toast"
 import { Tooltip } from "../components/tooltip"
@@ -56,6 +56,14 @@ export function Agents() {
     if (!(await confirmDialog({ title: "Delete Agent", message: "Are you sure you want to delete this agent? This cannot be undone.", destructive: true, confirmLabel: "Delete" }))) return
     await api(`/agents/${id}`, { method: "DELETE" })
     setAgents((prev) => prev.filter((a) => a.id !== id))
+  }
+
+  const handleFork = async (agent: Agent) => {
+    try {
+      const forked = await api<Agent>(`/agents/${agent.id}/fork`, { method: "POST" })
+      setAgents((prev) => [forked, ...prev])
+      toast.success(`Forked as "${forked.name}"`)
+    } catch (err: any) { toast.error(err.message) }
   }
 
   const handleClearMemory = async (id: string) => {
@@ -198,6 +206,7 @@ export function Agents() {
                 {/* Actions */}
                 <div className="flex items-center gap-0.5 shrink-0">
                   <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Fork"><button onClick={(e) => { e.stopPropagation(); handleFork(a) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Copy className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Clear Memory"><button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=basic`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Delete"><button onClick={(e) => { e.stopPropagation(); handleDelete(a.id) }} className="p-1.5 rounded-md hover:bg-destructive/20 text-muted-foreground hover:text-red-400"><Trash2 className="h-4 w-4" /></button></Tooltip>

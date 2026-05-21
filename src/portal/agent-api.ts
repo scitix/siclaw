@@ -7,7 +7,7 @@
 
 import crypto from "node:crypto";
 import { getDb } from "../gateway/db.js";
-import { insertIgnorePrefix } from "../gateway/dialect-helpers.js";
+import { insertIgnorePrefix, isUniqueViolation } from "../gateway/dialect-helpers.js";
 import {
   sendJson,
   parseBody,
@@ -342,6 +342,125 @@ export function registerAgentRoutes(
       channels,
       knowledge_repos: knowledgeRepos,
     });
+  });
+
+  // POST /api/v1/agents/:id/fork — fork agent + resource bindings (admin only)
+  router.post("/api/v1/agents/:id/fork", async (req, res, params) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+
+    const db = getDb();
+    const sourceId = params.id;
+
+    const [sourceRows] = await db.query("SELECT * FROM agents WHERE id = ?", [sourceId]) as any;
+    if (sourceRows.length === 0) {
+      sendJson(res, 404, { error: "Agent not found" });
+      return;
+    }
+    const source = sourceRows[0];
+
+    const newId = crypto.randomUUID();
+    // Hash the source name + a random salt so the suffix is stable-looking but collision-free
+    const salt = crypto.randomBytes(8).toString("hex");
+    const suffix = crypto.createHash("sha256").update(source.name + salt).digest("hex").slice(0, 6);
+    const newName = `${source.name}-${suffix}`;
+
+    const conn = await db.getConnection();
+    try {
+      await conn.beginTransaction();
+
+      await conn.query(
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          newId,
+          newName,
+          source.description,
+          source.status,
+          source.model_provider,
+          source.model_id,
+          source.system_prompt,
+          source.is_production,
+          source.icon,
+          source.color,
+          auth.userId,
+        ],
+      );
+
+      // Copy skill bindings
+      const [skillRows] = await conn.query(
+        "SELECT skill_id FROM agent_skills WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of skillRows) {
+        await conn.query(
+          `${insertIgnorePrefix(db)} INTO agent_skills (agent_id, skill_id) VALUES (?, ?)`,
+          [newId, row.skill_id],
+        );
+      }
+
+      // Copy MCP server bindings
+      const [mcpRows] = await conn.query(
+        "SELECT mcp_server_id FROM agent_mcp_servers WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of mcpRows) {
+        await conn.query(
+          "INSERT INTO agent_mcp_servers (agent_id, mcp_server_id) VALUES (?, ?)",
+          [newId, row.mcp_server_id],
+        );
+      }
+
+      // Copy cluster bindings
+      const [clusterRows] = await conn.query(
+        "SELECT cluster_id FROM agent_clusters WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of clusterRows) {
+        await conn.query(
+          "INSERT INTO agent_clusters (agent_id, cluster_id) VALUES (?, ?)",
+          [newId, row.cluster_id],
+        );
+      }
+
+      // Copy host bindings
+      const [hostRows] = await conn.query(
+        "SELECT host_id FROM agent_hosts WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of hostRows) {
+        await conn.query(
+          "INSERT INTO agent_hosts (agent_id, host_id) VALUES (?, ?)",
+          [newId, row.host_id],
+        );
+      }
+
+      // Copy knowledge repo bindings
+      const [knowledgeRows] = await conn.query(
+        "SELECT repo_id FROM agent_knowledge_repos WHERE agent_id = ?",
+        [sourceId],
+      ) as any;
+      for (const row of knowledgeRows) {
+        await conn.query(
+          "INSERT INTO agent_knowledge_repos (agent_id, repo_id) VALUES (?, ?)",
+          [newId, row.repo_id],
+        );
+      }
+
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      if (isUniqueViolation(err)) {
+        sendJson(res, 409, { error: `Agent name "${newName}" is already taken. Please try again — a new suffix will be generated.` });
+        return;
+      }
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    const [newRows] = await db.query("SELECT * FROM agents WHERE id = ?", [newId]) as any;
+    sendJson(res, 201, newRows[0]);
   });
 
   // ================================================================
