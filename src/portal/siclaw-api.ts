@@ -1315,67 +1315,75 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, { data: { mcpServer: entry } });
   });
 
-  // Preview MCP config import (dry-run)
+  // Preview MCP config import (dry-run) — accepts bundles[] (multi) or bundle (legacy single)
   router.post(`${P}/mcp/import/preview`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
     if (await guardAccess(res, config, auth, "write")) return;
 
-    const body = await parseBody<{ bundle?: McpConfigBundle }>(req);
-    const preview = await buildMcpImportPreview(body.bundle ?? {}, auth.orgId!);
-    sendJson(res, 200, { data: preview });
+    const body = await parseBody<{ bundle?: McpConfigBundle; bundles?: McpConfigBundle[] }>(req);
+    const bundles = body.bundles ?? (body.bundle ? [body.bundle] : [{}]);
+    const previews = await Promise.all(bundles.map((b) => buildMcpImportPreview(b, auth.orgId!)));
+    sendJson(res, 200, { data: previews });
   });
 
-  // Apply MCP config import
+  // Apply MCP config import — accepts bundles[] (multi) or bundle (legacy single)
   router.post(`${P}/mcp/import`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
     if (await guardAccess(res, config, auth, "write")) return;
 
-    const body = await parseBody<{ bundle?: McpConfigBundle }>(req);
-    const preview = await buildMcpImportPreview(body.bundle ?? {}, auth.orgId!);
+    const body = await parseBody<{ bundle?: McpConfigBundle; bundles?: McpConfigBundle[] }>(req);
+    const bundles = body.bundles ?? (body.bundle ? [body.bundle] : [{}]);
 
-    if (preview.errors.length > 0) {
-      sendJson(res, 400, { error: preview.errors.join("; ") });
+    // Preview all first — reject the entire batch if any entry has errors
+    const previews = await Promise.all(bundles.map((b) => buildMcpImportPreview(b, auth.orgId!)));
+    const allErrors = previews.flatMap((p) => p.errors);
+    if (allErrors.length > 0) {
+      sendJson(res, 400, { error: allErrors.join("; ") });
       return;
     }
 
-    const entry = body.bundle!.mcpServer!;
     const db = getDb();
     const result: ImportMcpConfigResult = { created: 0, updated: 0, unchanged: 0 };
 
-    if (preview.action === "create") {
-      const id = crypto.randomUUID();
-      await db.query(
-        `INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          id, auth.orgId, entry.name, entry.transport,
-          entry.url || null, entry.command || null,
-          JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
-          JSON.stringify(entry.headers || null), entry.enabled !== false ? 1 : 0,
-          entry.description || null, auth.userId,
-        ],
-      );
-      result.created = 1;
-    } else if (preview.action === "update") {
-      await db.query(
-        `UPDATE mcp_servers SET
-         name = ?, url = ?, command = ?, args = ?, env = ?, headers = ?,
-         description = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [
-          entry.name, entry.url || null, entry.command || null,
-          JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
-          JSON.stringify(entry.headers || null),
-          entry.description || null, entry.enabled !== false ? 1 : 0,
-          preview.id,
-        ],
-      );
-      ctx?.notifyMcpAgents?.(preview.id!, ["mcp"]);
-      result.updated = 1;
-    } else {
-      result.unchanged = 1;
+    for (let i = 0; i < bundles.length; i++) {
+      const preview = previews[i];
+      const entry = bundles[i].mcpServer!;
+
+      if (preview.action === "create") {
+        const id = crypto.randomUUID();
+        await db.query(
+          `INSERT INTO mcp_servers (id, org_id, name, transport, url, command, args, env, headers, enabled, description, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            id, auth.orgId, entry.name, entry.transport,
+            entry.url || null, entry.command || null,
+            JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
+            JSON.stringify(entry.headers || null), entry.enabled !== false ? 1 : 0,
+            entry.description || null, auth.userId,
+          ],
+        );
+        result.created++;
+      } else if (preview.action === "update") {
+        await db.query(
+          `UPDATE mcp_servers SET
+           name = ?, url = ?, command = ?, args = ?, env = ?, headers = ?,
+           description = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?`,
+          [
+            entry.name, entry.url || null, entry.command || null,
+            JSON.stringify(entry.args || null), JSON.stringify(entry.env || null),
+            JSON.stringify(entry.headers || null),
+            entry.description || null, entry.enabled !== false ? 1 : 0,
+            preview.id,
+          ],
+        );
+        ctx?.notifyMcpAgents?.(preview.id!, ["mcp"]);
+        result.updated++;
+      } else {
+        result.unchanged++;
+      }
     }
 
     sendJson(res, 200, { data: result });

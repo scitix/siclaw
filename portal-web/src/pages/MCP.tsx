@@ -457,10 +457,31 @@ function compactJson(text: string) {
   return out.join("\n")
 }
 
+function mergeUploadedFiles(files: { name: string; text: string }[]): string {
+  if (files.length === 0) return ""
+  const all: unknown[] = []
+  for (const f of files) {
+    try {
+      const parsed = JSON.parse(f.text)
+      if (Array.isArray(parsed)) {
+        all.push(...parsed.filter((x) => x && typeof x === "object"))
+      } else if (parsed && typeof parsed === "object") {
+        all.push(parsed)
+      }
+    } catch {
+      // fall back to raw text so the user can see the problematic content
+      return f.text
+    }
+  }
+  if (all.length === 0) return ""
+  if (all.length === 1) return JSON.stringify(all[0], null, 2)
+  return JSON.stringify(all, null, 2)
+}
+
 function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; onImported: () => void }) {
   const [configText, setConfigText] = useState("")
-  const [fileName, setFileName] = useState("")
-  const [preview, setPreview] = useState<McpImportPreview | null>(null)
+  const [uploadedFiles, setUploadedFiles] = useState<{ name: string; text: string }[]>([])
+  const [previews, setPreviews] = useState<McpImportPreview[]>([])
   const [previewing, setPreviewing] = useState(false)
   const [applying, setApplying] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -509,33 +530,57 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
     window.addEventListener("mouseup", onUp)
   }
 
-  const parseBundle = (): { ok: boolean; bundle?: McpConfigBundle; error?: string } => {
+  const parseBundles = (): { ok: boolean; bundles?: McpConfigBundle[]; error?: string } => {
     if (!configText.trim()) return { ok: false, error: "Paste or upload a config file" }
     try {
       const parsed = JSON.parse(configText)
-      return { ok: true, bundle: parsed }
+      if (Array.isArray(parsed)) {
+        const bundles = parsed.filter((x) => x && typeof x === "object") as McpConfigBundle[]
+        if (bundles.length === 0) return { ok: false, error: "Array contains no valid entries" }
+        return { ok: true, bundles }
+      }
+      if (parsed && typeof parsed === "object") return { ok: true, bundles: [parsed] }
+      return { ok: false, error: "Expected a JSON object or array" }
     } catch {
       return { ok: false, error: "Invalid JSON" }
     }
   }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setFileName(file.name)
-    file.text().then((t) => setConfigText(compactJson(t))).catch(() => toast.error("Failed to read file"))
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
+    e.target.value = ""
+    Promise.all(files.map((f) => f.text().then((t) => ({ name: f.name, text: t }))))
+      .then((newFiles) => {
+        setUploadedFiles((prev) => {
+          const updated = [...prev, ...newFiles]
+          setConfigText(compactJson(mergeUploadedFiles(updated)))
+          setPreviews([])
+          return updated
+        })
+      })
+      .catch(() => toast.error("Failed to read file"))
+  }
+
+  const removeFile = (idx: number) => {
+    setUploadedFiles((prev) => {
+      const updated = prev.filter((_, i) => i !== idx)
+      setConfigText(updated.length === 0 ? "" : compactJson(mergeUploadedFiles(updated)))
+      setPreviews([])
+      return updated
+    })
   }
 
   const handlePreview = async () => {
-    const { ok, bundle, error } = parseBundle()
+    const { ok, bundles, error } = parseBundles()
     if (!ok) { toast.error(error!); return }
-    setPreviewing(true); setPreview(null)
+    setPreviewing(true); setPreviews([])
     try {
-      const res = await api<{ data: McpImportPreview }>("/siclaw/mcp/import/preview", {
+      const res = await api<{ data: McpImportPreview[] }>("/siclaw/mcp/import/preview", {
         method: "POST",
-        body: { bundle },
+        body: { bundles },
       })
-      setPreview(res.data)
+      setPreviews(res.data)
     } catch (err: any) {
       toast.error(err.message || "Preview failed")
     } finally {
@@ -544,13 +589,13 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
   }
 
   const handleApply = async () => {
-    const { ok, bundle, error } = parseBundle()
+    const { ok, bundles, error } = parseBundles()
     if (!ok) { toast.error(error!); return }
     setApplying(true)
     try {
       const res = await api<{ data: { created: number; updated: number; unchanged: number } }>("/siclaw/mcp/import", {
         method: "POST",
-        body: { bundle },
+        body: { bundles },
       })
       const { created, updated, unchanged } = res.data
       const parts = [created && `${created} created`, updated && `${updated} updated`, unchanged && `${unchanged} unchanged`].filter(Boolean)
@@ -563,7 +608,9 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
     }
   }
 
-  const canApply = preview !== null && preview.errors.length === 0 && preview.action !== "invalid" && preview.action !== "unchanged"
+  const canApply = previews.length > 0 &&
+    previews.every((p) => p.errors.length === 0) &&
+    previews.some((p) => p.action === "create" || p.action === "update")
 
   // Grow textarea to fit content; cap at 55 vh so the dialog doesn't overflow.
   useLayoutEffect(() => {
@@ -575,8 +622,8 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
 
   // Auto-scroll to preview panel once it appears in the DOM.
   useLayoutEffect(() => {
-    if (preview) previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-  }, [preview])
+    if (previews.length > 0) previewRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [previews])
 
   const e = RESIZE_EDGE_PX
 
@@ -623,29 +670,48 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
           style={fixedHeight === null ? { maxHeight: "calc(100vh - 180px)" } : undefined}
         >
           <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center flex-wrap gap-1.5">
               <label className="text-xs font-medium text-muted-foreground">Config JSON</label>
+              {uploadedFiles.map((f, i) => (
+                <span key={i} className="flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border bg-secondary text-muted-foreground">
+                  <Upload className="h-3 w-3 shrink-0" />
+                  <span className="max-w-[200px] truncate">{f.name}</span>
+                  <button
+                    type="button"
+                    onClick={() => removeFile(i)}
+                    className="ml-0.5 rounded hover:text-foreground"
+                    aria-label={`Remove ${f.name}`}
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              ))}
               <button
                 type="button"
                 onClick={() => fileRef.current?.click()}
                 className="flex items-center gap-1 px-2 py-0.5 text-[11px] rounded border border-border text-muted-foreground hover:text-foreground"
               >
-                <Upload className="h-3 w-3" /> {fileName || "Upload file"}
+                <Upload className="h-3 w-3" />
+                {uploadedFiles.length === 0 ? "Upload file" : "Add more files"}
               </button>
-              <input ref={fileRef} type="file" accept=".json,application/json" className="hidden" onChange={handleFileChange} />
+              <input ref={fileRef} type="file" accept=".json,application/json" multiple className="hidden" onChange={handleFileChange} />
             </div>
             <textarea
               ref={textareaRef}
               value={configText}
-              onChange={(e) => { setConfigText(compactJson(e.target.value)); setPreview(null) }}
-              placeholder='{"mcpServer": {"name": "...", "transport": "stdio", ...}}'
+              onChange={(e) => { setConfigText(compactJson(e.target.value)); setPreviews([]) }}
+              placeholder='{"mcpServer": {"name": "...", "transport": "stdio", ...}}  or  [{...}, {...}]'
               rows={1}
               className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none overflow-hidden"
               style={{ minHeight: "2rem" }}
             />
           </div>
 
-          {preview && <div ref={previewRef}><ImportPreviewPanel preview={preview} /></div>}
+          {previews.length > 0 && (
+            <div ref={previewRef} className="space-y-2">
+              {previews.map((p, i) => <ImportPreviewPanel key={i} preview={p} />)}
+            </div>
+          )}
         </div>
 
         {/* ── Footer ── */}
@@ -653,7 +719,7 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
           <button onClick={onClose} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground">Cancel</button>
           <button
             onClick={handlePreview}
-            disabled={previewing || !configText.trim()}
+            disabled={previewing || !configText.trim() || applying}
             className="h-8 px-4 text-sm rounded-md border border-border text-foreground disabled:opacity-50"
           >
             {previewing ? <Loader2 className="h-3.5 w-3.5 animate-spin inline mr-1" /> : null}Preview
