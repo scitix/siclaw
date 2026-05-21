@@ -1,9 +1,10 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Outlet, Link, useLocation } from "react-router-dom"
 import { Bot, MessageSquare, Zap, Plug, Settings, LogOut, Server, Monitor, ChevronDown, ChevronRight, Cpu, Users, Radio, BarChart3, BookOpen, PanelLeftClose, PanelLeftOpen, Sun, Moon } from "lucide-react"
 import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 import { useTheme } from "../hooks/useTheme"
+import { Chat } from "./Chat"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
@@ -26,6 +27,12 @@ const COLLAPSED_KEY = "siclaw.sidebar.collapsed"
 export function Layout() {
   const location = useLocation()
   const { theme, toggle: toggleTheme } = useTheme()
+  // Lazy keep-alive: mount Chat only after the user first visits /chat so that
+  // hidden API calls (agents, sessions, messages) don't fire on unrelated pages.
+  // Once mounted it stays in the DOM so SSE streams survive sidebar navigation.
+  const hasChatMountedRef = useRef(false)
+  const isOnChat = location.pathname.startsWith("/chat")
+  if (isOnChat) hasChatMountedRef.current = true
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try { return localStorage.getItem(COLLAPSED_KEY) === "1" } catch { return false }
   })
@@ -190,7 +197,18 @@ export function Layout() {
         </button>
       </aside>
       <main className="flex-1 overflow-hidden">
-        <Outlet />
+        {/* Lazy keep-alive: Chat is only rendered after the user first visits
+            /chat, then stays mounted so SSE streams survive sidebar navigation. */}
+        {hasChatMountedRef.current && (
+          <div className={isOnChat ? "h-full" : "hidden"}>
+            <Chat />
+          </div>
+        )}
+        {!isOnChat && (
+          <div className="h-full">
+            <Outlet />
+          </div>
+        )}
       </main>
     </div>
   )

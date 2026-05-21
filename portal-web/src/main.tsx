@@ -14,7 +14,6 @@ import { Skills } from "./pages/Skills"
 import { SkillDetail } from "./pages/SkillDetail"
 import { MCP } from "./pages/MCP"
 import { Models } from "./pages/Models"
-import { Chat } from "./pages/Chat"
 import { MyTasks } from "./pages/MyTasks"
 import { TaskRuns } from "./pages/TaskRuns"
 import { TaskRunDetail } from "./pages/TaskRunDetail"
@@ -40,7 +39,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <Route index element={<Navigate to="/agents" replace />} />
         <Route path="agents" element={<Agents />} />
         <Route path="agents/:id" element={<AgentDetail />} />
-        <Route path="chat" element={<Chat />} />
+        <Route path="chat" element={null} />
         <Route path="skills" element={<Skills />} />
         <Route path="skills/import" element={<SkillImport />} />
         <Route path="skills/new" element={<SkillDetail />} />

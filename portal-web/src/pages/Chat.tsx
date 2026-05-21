@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { useSearchParams } from "react-router-dom"
+import { useSearchParams, useLocation } from "react-router-dom"
 import { Bot, Loader2, MessageSquare } from "lucide-react"
 import { api } from "../api"
 import { AgentChat } from "../components/AgentChat"
@@ -10,9 +10,20 @@ interface Agent {
 
 export function Chat() {
   const [searchParams, setSearchParams] = useSearchParams()
+  const location = useLocation()
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedAgentId, setSelectedAgentId] = useState<string>(searchParams.get("agent") || "")
+
+  // Sync agent selection when the URL's ?agent= param changes (e.g. deep link
+  // navigation while the component is always mounted in Layout).
+  const agentFromUrl = searchParams.get("agent")
+  useEffect(() => {
+    if (agentFromUrl && agentFromUrl !== selectedAgentId) {
+      setSelectedAgentId(agentFromUrl)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentFromUrl])
 
   useEffect(() => {
     api<{ data: Agent[] }>("/agents")
@@ -30,7 +41,9 @@ export function Chat() {
 
   const handleSelectAgent = (agentId: string) => {
     setSelectedAgentId(agentId)
-    setSearchParams({ agent: agentId })
+    if (location.pathname.startsWith("/chat")) {
+      setSearchParams({ agent: agentId })
+    }
   }
 
   if (loading) {

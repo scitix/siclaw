@@ -166,6 +166,10 @@ export function registerChatRoutes(
       "Connection": "keep-alive",
       "X-Accel-Buffering": "no",
     });
+    // Disable Nagle algorithm so each SSE frame is sent as its own TCP segment
+    // rather than waiting up to 40 ms for coalescing. Small text_delta frames
+    // are exactly the case Nagle hurts most.
+    res.socket?.setNoDelay(true);
 
     // Subscribe to chat events for this agent, filter by sessionId
     let unsubscribe: (() => void) | null = null;

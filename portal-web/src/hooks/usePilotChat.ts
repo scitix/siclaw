@@ -1160,6 +1160,16 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           }
         } finally {
           if (abortControllerRef.current === controller) abortControllerRef.current = null
+          // Unconditionally mark this session as no longer streaming in the cache.
+          // If the user navigated away while the stream was running, the isActive
+          // checks above skip setStreaming(false) — but the cache entry must still
+          // be cleared so that switching back to this session triggers a DB load
+          // (which has the complete, persisted messages) instead of restoring a
+          // stale cache snapshot that shows "streaming" forever.
+          if (streamSessionId) {
+            const cached = messagesCacheRef.current.get(streamSessionId)
+            if (cached) cached.streaming = false
+          }
         }
       })()
     },
