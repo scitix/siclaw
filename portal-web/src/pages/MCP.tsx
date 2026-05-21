@@ -51,6 +51,15 @@ interface McpImportPreview {
   errors: string[]
 }
 
+interface McpImportBatchSummary {
+  total: number
+  create: number
+  update: number
+  unchanged: number
+  invalid: number
+  error: number
+}
+
 const TRANSPORT_OPTIONS: { value: McpTransport; label: string }[] = [
   { value: "streamable-http", label: "Streamable HTTP" },
   { value: "sse", label: "SSE" },
@@ -434,9 +443,63 @@ function ImportPreviewPanel({ preview }: { preview: McpImportPreview }) {
   )
 }
 
+// ── Batch Import Preview Panel ─────────────────────────────────────
+
+function computeBatchSummary(items: McpImportPreview[]): McpImportBatchSummary {
+  return {
+    total: items.length,
+    create: items.filter((p) => p.action === "create").length,
+    update: items.filter((p) => p.action === "update").length,
+    unchanged: items.filter((p) => p.action === "unchanged").length,
+    invalid: items.filter((p) => p.action === "invalid").length,
+    error: items.filter((p) => p.errors.length > 0).length,
+  }
+}
+
+function BatchImportPreviewPanel({ items }: { items: McpImportPreview[] }) {
+  const summary = computeBatchSummary(items)
+  const hasErrors = items.some((p) => p.errors.length > 0)
+
+  return (
+    <div className="space-y-3">
+      <div className={`rounded-md border p-3 text-sm ${hasErrors ? "border-red-200 bg-red-50/70 dark:border-red-900/60 dark:bg-red-950/20" : "border-border bg-secondary/20"}`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">Batch preview</span>
+          <span className="px-2 py-0.5 text-[11px] rounded bg-background border border-border">
+            {summary.total} total
+          </span>
+          <span className={`px-2 py-0.5 text-[11px] rounded ${ACTION_STYLES.create}`}>
+            {summary.create} create
+          </span>
+          <span className={`px-2 py-0.5 text-[11px] rounded ${ACTION_STYLES.update}`}>
+            {summary.update} update
+          </span>
+          <span className={`px-2 py-0.5 text-[11px] rounded ${ACTION_STYLES.unchanged}`}>
+            {summary.unchanged} unchanged
+          </span>
+          {(summary.invalid > 0 || summary.error > 0) && (
+            <span className={`px-2 py-0.5 text-[11px] rounded ${ACTION_STYLES.invalid}`}>
+              {summary.error || summary.invalid} error
+            </span>
+          )}
+        </div>
+        {hasErrors && (
+          <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+            Fix the errors above before applying.
+          </p>
+        )}
+      </div>
+      {items.map((p, i) => <ImportPreviewPanel key={i} preview={p} />)}
+    </div>
+  )
+}
+
 // ── Import Dialog ──────────────────────────────────────────────────
 
 const RESIZE_EDGE_PX = 6
+const MCP_IMPORT_EDITOR_EMPTY_HEIGHT = 352
+const MCP_IMPORT_EDITOR_MIN_HEIGHT = 224
+const MCP_IMPORT_EDITOR_MAX_VIEWPORT_RATIO = 0.55
 
 // Collapse consecutive blank lines to at most one, and remove all trailing blank lines.
 function compactJson(text: string) {
@@ -612,12 +675,15 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
     previews.every((p) => p.errors.length === 0) &&
     previews.some((p) => p.action === "create" || p.action === "update")
 
-  // Grow textarea to fit content; cap at 55 vh so the dialog doesn't overflow.
+  // Grow textarea to fit content; empty textarea shows a taller min-height for better UX.
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el) return
+    const maxHeight = Math.max(MCP_IMPORT_EDITOR_MIN_HEIGHT, Math.round(window.innerHeight * MCP_IMPORT_EDITOR_MAX_VIEWPORT_RATIO))
+    const contentHeight = configText.trim() ? el.scrollHeight : Math.max(el.scrollHeight, MCP_IMPORT_EDITOR_EMPTY_HEIGHT)
     el.style.height = "auto"
-    el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.55))}px`
+    el.style.height = `${Math.min(contentHeight, maxHeight)}px`
+    el.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden"
   }, [configText])
 
   // Auto-scroll to preview panel once it appears in the DOM.
@@ -666,7 +732,7 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
             When height is fixed (user has resized): use flex-1 to fill remaining space. */}
         <div
           ref={bodyRef}
-          className={`overflow-y-auto p-4 space-y-3 ${fixedHeight !== null ? "flex-1 min-h-0" : ""}`}
+          className={`overflow-y-auto p-4 pr-3 space-y-3 ${fixedHeight !== null ? "flex-1 min-h-0" : ""}`}
           style={fixedHeight === null ? { maxHeight: "calc(100vh - 180px)" } : undefined}
         >
           <div className="space-y-1.5">
@@ -701,15 +767,16 @@ function ImportMcpConfigDialog({ onClose, onImported }: { onClose: () => void; o
               value={configText}
               onChange={(e) => { setConfigText(compactJson(e.target.value)); setPreviews([]) }}
               placeholder='{"mcpServer": {"name": "...", "transport": "stdio", ...}}  or  [{...}, {...}]'
+              spellCheck={false}
               rows={1}
-              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none overflow-hidden"
-              style={{ minHeight: "2rem" }}
+              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none"
+              style={{ minHeight: `${configText.trim() ? MCP_IMPORT_EDITOR_MIN_HEIGHT : MCP_IMPORT_EDITOR_EMPTY_HEIGHT}px` }}
             />
           </div>
 
           {previews.length > 0 && (
-            <div ref={previewRef} className="space-y-2">
-              {previews.map((p, i) => <ImportPreviewPanel key={i} preview={p} />)}
+            <div ref={previewRef}>
+              <BatchImportPreviewPanel items={previews} />
             </div>
           )}
         </div>
