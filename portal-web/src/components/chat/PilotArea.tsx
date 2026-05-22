@@ -396,38 +396,41 @@ export function PilotArea({
 
               {renderMessages
                 .filter((m) => !m.hidden)
-                .map((msg) => (
-                  <Fragment key={msg.id}>
-                    {isSteeredMessage(msg) && <SteeredConversationDivider />}
-                    <MessageItem
-                      message={msg}
-                      sendMessage={wrappedSendMessage}
-                      showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
-                      dpActive={dpActive}
-                      canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
-                      editingContent={editingMessageId === msg.id ? editingDraft : null}
-                      onStartEditMessage={startEditingMessage}
-                      onEditMessageChange={setEditingDraft}
-                      onCancelEditMessage={cancelEditingMessage}
-                      onSubmitEditMessage={submitEditedMessage}
-                      onChipClick={(chip, meta) => {
-                        if (meta.isDpCheckpoint) {
-                          const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
-                          if (prefixChip) {
-                            setActivePrefix(prefixChip)
-                            setChipDraft(null)
-                            return
+                .map((msg) => {
+                  const steerDivider = getSteerDivider(msg)
+                  return (
+                    <Fragment key={msg.id}>
+                      {steerDivider && <SteerConversationDivider state={steerDivider} />}
+                      <MessageItem
+                        message={msg}
+                        sendMessage={wrappedSendMessage}
+                        showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                        dpActive={dpActive}
+                        canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                        editingContent={editingMessageId === msg.id ? editingDraft : null}
+                        onStartEditMessage={startEditingMessage}
+                        onEditMessageChange={setEditingDraft}
+                        onCancelEditMessage={cancelEditingMessage}
+                        onSubmitEditMessage={submitEditedMessage}
+                        onChipClick={(chip, meta) => {
+                          if (meta.isDpCheckpoint) {
+                            const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
+                            if (prefixChip) {
+                              setActivePrefix(prefixChip)
+                              setChipDraft(null)
+                              return
+                            }
                           }
-                        }
-                        setChipSeq((s) => s + 1)
-                        setChipDraft(chip.insertText + " ")
-                      }}
-                      onOpenSkillPanel={onOpenSkillPanel}
-                      onOpenSchedulePanel={onOpenSchedulePanel}
-                      agentId={agentId}
-                    />
-                  </Fragment>
-                ))}
+                          setChipSeq((s) => s + 1)
+                          setChipDraft(chip.insertText + " ")
+                        }}
+                        onOpenSkillPanel={onOpenSkillPanel}
+                        onOpenSchedulePanel={onOpenSchedulePanel}
+                        agentId={agentId}
+                      />
+                    </Fragment>
+                  )
+                })}
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
                   to trace the root cause upstream. Hidden while a prefix chip is active. */}
@@ -500,20 +503,50 @@ function ThinkingIndicator() {
   )
 }
 
-function isSteeredMessage(message: PilotMessage): boolean {
-  return (
-    message.role === "user" &&
-    message.metadata?.kind === "steer" &&
-    message.metadata?.steer_status === "steered"
-  )
+function getSteerDivider(message: PilotMessage): {
+  label: string
+  className: string
+  lineClassName: string
+  Icon?: typeof Loader2
+  iconClassName?: string
+} | null {
+  if (message.role !== "user" || message.metadata?.kind !== "steer") return null
+
+  switch (message.metadata?.steer_status) {
+    case "steered":
+      return {
+        label: "Steered conversation",
+        className: "text-muted-foreground/70",
+        lineClassName: "bg-border/70",
+      }
+    case "failed":
+      return {
+        label: "Follow-up not delivered",
+        className: "text-red-400/80",
+        lineClassName: "bg-red-400/25",
+        Icon: XCircle,
+      }
+    default:
+      return {
+        label: "Queued follow-up",
+        className: "text-blue-400/80",
+        lineClassName: "bg-blue-400/25",
+        Icon: Loader2,
+        iconClassName: "animate-spin",
+      }
+  }
 }
 
-function SteeredConversationDivider() {
+function SteerConversationDivider({ state }: { state: NonNullable<ReturnType<typeof getSteerDivider>> }) {
+  const Icon = state.Icon
   return (
-    <div className="flex items-center gap-3 text-sm text-muted-foreground/70">
-      <div className="h-px flex-1 bg-border/70" />
-      <span className="shrink-0">Steered conversation</span>
-      <div className="h-px flex-1 bg-border/70" />
+    <div className={cn("flex items-center gap-3 text-sm", state.className)}>
+      <div className={cn("h-px flex-1", state.lineClassName)} />
+      <span className="shrink-0 inline-flex items-center gap-1.5">
+        {Icon && <Icon className={cn("h-3.5 w-3.5", state.iconClassName)} />}
+        {state.label}
+      </span>
+      <div className={cn("h-px flex-1", state.lineClassName)} />
     </div>
   )
 }
