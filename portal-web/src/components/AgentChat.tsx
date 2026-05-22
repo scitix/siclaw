@@ -115,7 +115,6 @@ function SessionSidebar({
   const normal = search ? filtered : filtered.filter((s) => !s.pinned_at)
   const visibleNormal = search || showMore ? normal : normal.slice(0, DEFAULT_VISIBLE_SESSIONS)
   const extraCount = search ? 0 : Math.max(0, normal.length - DEFAULT_VISIBLE_SESSIONS)
-  const visibleSessions = search ? filtered : [...pinned, ...visibleNormal]
 
   const handleStartRename = (s: ChatSession) => {
     setRenamingId(s.id)
@@ -139,6 +138,68 @@ function SessionSidebar({
     setRenamingId(null)
     setRenameValue("")
   }
+
+  const renderSessionRow = (s: ChatSession) => (
+    <div
+      key={s.id}
+      onClick={() => { if (renamingId !== s.id) onSelect(s.id) }}
+      className={`group mx-2 my-0.5 flex h-10 items-center gap-2 rounded-md px-3 cursor-pointer transition-colors ${
+        activeSessionId === s.id
+          ? "bg-secondary text-foreground"
+          : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+      }`}
+    >
+      {renamingId === s.id ? (
+        <div className="flex items-center gap-1 flex-1 min-w-0" onClick={e => e.stopPropagation()}>
+          <input
+            value={renameValue}
+            onChange={e => setRenameValue(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") handleSaveRename(); if (e.key === "Escape") handleCancelRename(); }}
+            autoFocus
+            className="flex-1 h-7 px-2 text-[13px] rounded-md border border-border bg-background min-w-0"
+          />
+          <button onClick={handleSaveRename} title="Save" className="p-1 rounded-md hover:bg-secondary text-green-400"><Check className="h-3.5 w-3.5" /></button>
+          <button onClick={handleCancelRename} title="Cancel" className="p-1 rounded-md hover:bg-secondary text-muted-foreground"><X className="h-3.5 w-3.5" /></button>
+        </div>
+      ) : (
+        <>
+          <span className={`flex-1 min-w-0 truncate text-[13px] ${activeSessionId === s.id ? "font-semibold" : "font-medium"}`}>
+            {s.title || "Untitled"}
+          </span>
+          {hasUnseenActivity(s, activeSessionId) && (
+            <span className="h-2 w-2 shrink-0 rounded-full bg-blue-500" title="Updated" />
+          )}
+          {s.pinned_at && (
+            <Pin
+              className={`h-3.5 w-3.5 shrink-0 text-muted-foreground/70 ${activeSessionId === s.id ? "hidden" : "group-hover:hidden"}`}
+              aria-label="Pinned"
+            />
+          )}
+          <span
+            className={`shrink-0 text-[12px] text-muted-foreground/70 ${activeSessionId === s.id ? "hidden" : "group-hover:hidden"}`}
+            title={formatSessionTooltip(s)}
+          >
+            {formatSessionAge(s, now)}
+          </span>
+          <div className={`shrink-0 items-center gap-0.5 ${activeSessionId === s.id ? "flex" : "hidden group-hover:flex"}`}>
+            <button
+              onClick={e => { e.stopPropagation(); onTogglePinned(s) }}
+              title={s.pinned_at ? "Unpin session" : "Pin session"}
+              className={`p-1 rounded-md hover:bg-background/60 ${s.pinned_at ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+            >
+              <Pin className="h-3.5 w-3.5" />
+            </button>
+            <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} title="Rename" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-foreground">
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+            <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} title="Delete session" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-red-400">
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -169,61 +230,26 @@ function SessionSidebar({
           </p>
         ) : (
           <>
-            {visibleSessions.map(s => (
-              <div
-                key={s.id}
-                onClick={() => { if (renamingId !== s.id) onSelect(s.id) }}
-                className={`group mx-2 my-0.5 flex h-10 items-center gap-2 rounded-md px-3 cursor-pointer transition-colors ${
-                  activeSessionId === s.id
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
-                }`}
-              >
-                {renamingId === s.id ? (
-                  <div className="flex items-center gap-1 flex-1 min-w-0" onClick={e => e.stopPropagation()}>
-                    <input
-                      value={renameValue}
-                      onChange={e => setRenameValue(e.target.value)}
-                      onKeyDown={e => { if (e.key === "Enter") handleSaveRename(); if (e.key === "Escape") handleCancelRename(); }}
-                      autoFocus
-                      className="flex-1 h-7 px-2 text-[13px] rounded-md border border-border bg-background min-w-0"
-                    />
-                    <button onClick={handleSaveRename} title="Save" className="p-1 rounded-md hover:bg-secondary text-green-400"><Check className="h-3.5 w-3.5" /></button>
-                    <button onClick={handleCancelRename} title="Cancel" className="p-1 rounded-md hover:bg-secondary text-muted-foreground"><X className="h-3.5 w-3.5" /></button>
-                  </div>
-                ) : (
-                  <>
-                    <span className={`flex-1 min-w-0 truncate text-[13px] ${activeSessionId === s.id ? "font-semibold" : "font-medium"}`}>
-                      {s.title || "Untitled"}
-                    </span>
-                    {hasUnseenActivity(s, activeSessionId) && (
-                      <span className="h-2 w-2 shrink-0 rounded-full bg-blue-500" title="Updated" />
-                    )}
-                    <span
-                      className={`shrink-0 text-[12px] text-muted-foreground/70 ${activeSessionId === s.id ? "hidden" : "group-hover:hidden"}`}
-                      title={formatSessionTooltip(s)}
-                    >
-                      {formatSessionAge(s, now)}
-                    </span>
-                    <div className={`shrink-0 items-center gap-0.5 ${activeSessionId === s.id ? "flex" : "hidden group-hover:flex"}`}>
-                      <button
-                        onClick={e => { e.stopPropagation(); onTogglePinned(s) }}
-                        title={s.pinned_at ? "Unpin session" : "Pin session"}
-                        className={`p-1 rounded-md hover:bg-background/60 ${s.pinned_at ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                      >
-                        <Pin className="h-3.5 w-3.5" />
-                      </button>
-                      <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} title="Rename" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-foreground">
-                        <Pencil className="h-3.5 w-3.5" />
-                      </button>
-                      <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} title="Delete session" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-red-400">
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+            {search ? (
+              filtered.map(renderSessionRow)
+            ) : (
+              <>
+                {pinned.length > 0 && (
+                  <div className="pt-3 pb-1">
+                    <div className="px-4 pb-1 text-[12px] font-medium text-muted-foreground/70">
+                      Pinned
                     </div>
-                  </>
+                    {pinned.map(renderSessionRow)}
+                  </div>
                 )}
-              </div>
-            ))}
+                {pinned.length > 0 && normal.length > 0 && (
+                  <div className="px-4 pt-3 pb-1 text-[12px] font-medium text-muted-foreground/70">
+                    Recent
+                  </div>
+                )}
+                {visibleNormal.map(renderSessionRow)}
+              </>
+            )}
             {!search && extraCount > 0 && !showMore && (
               <button
                 type="button"
