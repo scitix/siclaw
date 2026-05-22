@@ -154,6 +154,67 @@ const THINKING_TIPS = [
   "Working on it...",
 ]
 
+const EDITED_MESSAGE_HIDE_STORAGE_PREFIX = "siclaw.editedHiddenMessages.v1"
+
+type EditableMessageCandidate = {
+  id: string
+  role?: string
+  content?: string
+  hidden?: boolean
+  isStreaming?: boolean
+  metadata?: Record<string, unknown>
+}
+
+function editedMessageHideStorageKey(sessionKey: string): string {
+  return `${EDITED_MESSAGE_HIDE_STORAGE_PREFIX}:${sessionKey}`
+}
+
+function readHiddenEditedMessageIds(sessionKey: string | null | undefined): Set<string> {
+  if (!sessionKey || sessionKey === "__new__" || typeof window === "undefined") return new Set()
+  try {
+    const raw = window.sessionStorage.getItem(editedMessageHideStorageKey(sessionKey))
+    const parsed = raw ? JSON.parse(raw) : []
+    return new Set(Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function writeHiddenEditedMessageIds(sessionKey: string | null | undefined, ids: ReadonlySet<string>): void {
+  if (!sessionKey || sessionKey === "__new__" || typeof window === "undefined") return
+  window.sessionStorage.setItem(editedMessageHideStorageKey(sessionKey), JSON.stringify([...ids]))
+}
+
+export function hideEditedUserMessageBubbles<T extends { id: string; role?: string; hidden?: boolean }>(
+  messages: readonly T[],
+  hiddenEditedMessageIds: ReadonlySet<string>,
+): T[] {
+  return messages.filter(
+    (message) => !message.hidden && !(message.role === "user" && hiddenEditedMessageIds.has(message.id)),
+  )
+}
+
+function canEditWhileLoading(message: EditableMessageCandidate): boolean {
+  return message.metadata?.kind === "steer" && message.metadata?.steer_status !== "pending"
+}
+
+function canEditUserMessageNow(message: EditableMessageCandidate | undefined, isLoading: boolean): boolean {
+  if (!message || message.hidden || message.role !== "user" || message.isStreaming) return false
+  if (!getEditableUserText(message.content ?? "")) return false
+  return !isLoading || canEditWhileLoading(message)
+}
+
+export function findLatestEditableUserMessageId(
+  messages: readonly EditableMessageCandidate[],
+  isLoading: boolean,
+): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (canEditUserMessageNow(message, isLoading)) return message.id
+  }
+  return null
+}
+
 export interface PilotAreaProps {
   messages: PilotMessage[]
   isLoading: boolean
@@ -213,6 +274,9 @@ export function PilotArea({
   const [activePrefix, setActivePrefix] = useState<PrefixActionChip | null>(null)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [editingDraft, setEditingDraft] = useState("")
+  const [hiddenEditedMessageIds, setHiddenEditedMessageIds] = useState<Set<string>>(() =>
+    readHiddenEditedMessageIds(sessionKey),
+  )
   const userMessageHistory = useMemo(
     () =>
       messages
@@ -225,6 +289,7 @@ export function PilotArea({
     setActivePrefix(null)
     setEditingMessageId(null)
     setEditingDraft("")
+    setHiddenEditedMessageIds(readHiddenEditedMessageIds(sessionKey))
   }, [sessionKey])
 
   const lastSentRef = useRef<string | null>(null)
@@ -284,15 +349,14 @@ export function PilotArea({
       .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
   }, [messages, isLoading, dpActive])
   const renderMessages = useMemo(() => withDelegationStatusNotices(messages), [messages])
-  const latestEditableUserMessageId = useMemo(() => {
-    for (let i = renderMessages.length - 1; i >= 0; i--) {
-      const message = renderMessages[i]
-      if (message.hidden || message.role !== "user" || message.isStreaming) continue
-      if (message.metadata?.kind === "steer") continue
-      if (getEditableUserText(message.content)) return message.id
-    }
-    return null
-  }, [renderMessages])
+  const visibleRenderMessages = useMemo(
+    () => hideEditedUserMessageBubbles(renderMessages, hiddenEditedMessageIds),
+    [renderMessages, hiddenEditedMessageIds],
+  )
+  const latestEditableUserMessageId = useMemo(
+    () => findLatestEditableUserMessageId(visibleRenderMessages, isLoading),
+    [visibleRenderMessages, isLoading],
+  )
 
   const startEditingMessage = useCallback((id: string, content: string) => {
     setActivePrefix(null)
@@ -307,7 +371,17 @@ export function PilotArea({
 
   const submitEditedMessage = useCallback(() => {
     const text = editingDraft.trim()
-    if (!text || isLoading) return
+    const editedMessage = visibleRenderMessages.find((message) => message.id === editingMessageId)
+    if (!text || !canEditUserMessageNow(editedMessage, isLoading)) return
+    const editedMessageId = editingMessageId
+    if (editedMessageId) {
+      setHiddenEditedMessageIds((prev) => {
+        const next = new Set(prev)
+        next.add(editedMessageId)
+        writeHiddenEditedMessageIds(sessionKey, next)
+        return next
+      })
+    }
     wrappedSendMessage(text)
     // wrappedSendMessage records lastSentRef so wrappedAbort can restore the
     // draft if the user aborts a normal send. For edit-resends the message is
@@ -316,7 +390,7 @@ export function PilotArea({
     lastSentRef.current = null
     setEditingMessageId(null)
     setEditingDraft("")
-  }, [editingDraft, isLoading, wrappedSendMessage])
+  }, [editingDraft, editingMessageId, isLoading, sessionKey, visibleRenderMessages, wrappedSendMessage])
 
   // Auto-scroll logic
   useEffect(() => {
@@ -394,8 +468,7 @@ export function PilotArea({
                 </div>
               )}
 
-              {renderMessages
-                .filter((m) => !m.hidden)
+              {visibleRenderMessages
                 .map((msg) => {
                   const steerDivider = getSteerDivider(msg)
                   return (
@@ -406,7 +479,7 @@ export function PilotArea({
                         sendMessage={wrappedSendMessage}
                         showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
                         dpActive={dpActive}
-                        canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                        canEditMessage={msg.id === latestEditableUserMessageId}
                         editingContent={editingMessageId === msg.id ? editingDraft : null}
                         onStartEditMessage={startEditingMessage}
                         onEditMessageChange={setEditingDraft}
