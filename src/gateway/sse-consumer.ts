@@ -13,7 +13,7 @@
 
 import { ErrorCodes } from "../lib/error-envelope.js";
 import { AgentBoxClient } from "./agentbox/client.js";
-import { appendMessage, incrementMessageCount, updateMessage } from "./chat-repo.js";
+import { appendMessage, incrementMessageCount, markSteerConsumed, updateMessage } from "./chat-repo.js";
 import { redactText, type RedactionConfig } from "./output-redactor.js";
 
 // ── Public types ────────────────────────────────────
@@ -323,6 +323,19 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // this message_start fired.
         assistantMsgFirstTextTime = undefined;
         pendingThinkingMs = undefined;
+      } else if (persist && message?.role === "user") {
+        const content = message.content;
+        const text = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? (content as Array<{ type?: string; text?: string }>)
+                .filter((c) => c.type === "text")
+                .map((c) => c.text ?? "")
+                .join("")
+            : "";
+        if (text.trim()) {
+          dbMessageId = (await markSteerConsumed({ sessionId, content: text })) ?? undefined;
+        }
       }
     }
 

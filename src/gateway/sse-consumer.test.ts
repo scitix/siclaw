@@ -8,7 +8,9 @@ import { AgentBoxClient } from "./agentbox/client.js";
 
 const appendCalls: any[] = [];
 const updateCalls: any[] = [];
+const markSteerCalls: any[] = [];
 let appendCounter = 0;
+let nextMarkedSteerId: string | null = "msg-steer";
 
 vi.mock("./chat-repo.js", () => ({
   appendMessage: vi.fn(async (msg: any) => {
@@ -17,6 +19,10 @@ vi.mock("./chat-repo.js", () => ({
   }),
   updateMessage: vi.fn(async (msg: any) => {
     updateCalls.push(msg);
+  }),
+  markSteerConsumed: vi.fn(async (msg: any) => {
+    markSteerCalls.push(msg);
+    return nextMarkedSteerId;
   }),
   incrementMessageCount: vi.fn(async () => {}),
   ensureChatSession: vi.fn(async () => {}),
@@ -41,7 +47,9 @@ function mkClient(events: unknown[]): AgentBoxClient {
 beforeEach(() => {
   appendCalls.length = 0;
   updateCalls.length = 0;
+  markSteerCalls.length = 0;
   appendCounter = 0;
+  nextMarkedSteerId = "msg-steer";
 });
 
 // ── Tests ──────────────────────────────────────────────
@@ -57,6 +65,34 @@ describe("consumeAgentSse — empty stream", () => {
 });
 
 describe("consumeAgentSse — assistant message flow", () => {
+  it("marks persisted steer messages consumed when a user message_start arrives", async () => {
+    const onEvent = vi.fn();
+    const events = [
+      { type: "message_start", message: { role: "user", content: [{ type: "text", text: "try this next" }] } },
+    ];
+
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent,
+    });
+
+    expect(markSteerCalls).toEqual([{ sessionId: "sid", content: "try this next" }]);
+    expect(onEvent).toHaveBeenCalledWith(events[0], "message_start", { dbMessageId: "msg-steer" });
+  });
+
+  it("does not mark user message_start events when persistence is disabled", async () => {
+    const events = [
+      { type: "message_start", message: { role: "user", content: "not persisted" } },
+    ];
+
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u" });
+
+    expect(markSteerCalls).toHaveLength(0);
+  });
+
   it("accumulates text deltas across message_update events and returns the concatenated result", async () => {
     const events = [
       { type: "message_start" },

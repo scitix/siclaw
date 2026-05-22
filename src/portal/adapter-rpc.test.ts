@@ -835,6 +835,50 @@ describe("chat.updateMessage", () => {
   });
 });
 
+describe("chat.markSteerConsumed", () => {
+  it("marks the oldest matching pending steer row as steered", async () => {
+    const query = mockQuery([
+      { id: "m1", metadata: JSON.stringify({ kind: "steer", steer_status: "steered" }) },
+      { id: "m2", metadata: JSON.stringify({ kind: "steer", steer_status: "pending", queued_at: "2026-05-22T00:00:00.000Z" }) },
+      { id: "m3", metadata: JSON.stringify({ kind: "steer", steer_status: "pending" }) },
+    ], [], []);
+
+    const result = await getHandler("chat.markSteerConsumed")(
+      { session_id: "sess1", content: "follow up" },
+      "a1",
+    );
+
+    expect(result).toEqual({ id: "m2" });
+    expect(query).toHaveBeenCalledTimes(3);
+    expect(query.mock.calls[0][0]).toContain("WHERE session_id = ? AND role = 'user' AND content = ?");
+    expect(query.mock.calls[0][1]).toEqual(["sess1", "follow up"]);
+    expect(query.mock.calls[1][0]).toContain("UPDATE chat_messages SET metadata");
+    expect(JSON.parse(query.mock.calls[1][1][0])).toMatchObject({
+      kind: "steer",
+      steer_status: "steered",
+      queued_at: "2026-05-22T00:00:00.000Z",
+      steered_at: expect.any(String),
+    });
+    expect(query.mock.calls[1][1].slice(1)).toEqual(["m2", "sess1"]);
+    expect(query.mock.calls[2][0]).toContain("UPDATE chat_sessions SET last_active_at");
+  });
+
+  it("returns null when no pending steer row matches", async () => {
+    const query = mockQuery([
+      { id: "m1", metadata: JSON.stringify({ kind: "steer", steer_status: "steered" }) },
+      { id: "m2", metadata: JSON.stringify({ kind: "delegation_event" }) },
+    ]);
+
+    const result = await getHandler("chat.markSteerConsumed")(
+      { session_id: "sess1", content: "follow up" },
+      "a1",
+    );
+
+    expect(result).toEqual({ id: null });
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("chat.updateDelegationToolMessage", () => {
   it("updates async delegation tool rows by delegation id", async () => {
     const query = mockQuery([], []);
@@ -1348,9 +1392,9 @@ describe("metrics.auditDetail", () => {
 // ================================================================
 
 describe("buildAdapterRpcHandlers", () => {
-  it("registers exactly 44 handlers", () => {
+  it("registers exactly 45 handlers", () => {
     const handlers = buildAdapterRpcHandlers();
-    expect(handlers.size).toBe(44);
+    expect(handlers.size).toBe(45);
   });
 
   it("all expected handler names are registered", () => {
@@ -1361,7 +1405,7 @@ describe("buildAdapterRpcHandlers", () => {
       "config.getSystemConfig", "config.setSystemConfig", "config.getDefaultModel",
       "credential.list", "credential.get", "credential.checkAccess",
       "credential.resourceManifest", "credential.hostSearch",
-      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.updateMessage", "chat.updateDelegationToolMessage", "chat.getMessages",
+      "chat.ensureSession", "chat.resolveSession", "chat.appendMessage", "chat.updateMessage", "chat.markSteerConsumed", "chat.updateDelegationToolMessage", "chat.getMessages",
       "task.listActive", "task.getStatus", "task.list", "task.create",
       "task.update", "task.delete", "task.runRecord", "task.runStart",
       "task.runFinalize", "task.updateMeta", "task.fireNow", "task.notify", "task.prune",

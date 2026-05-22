@@ -13,7 +13,7 @@ import type {
   ContextUsage,
   ErrorDetail,
 } from "../components/chat/types"
-import { findPendingSteerIndex, removePendingAt, extractUserMessageText } from "./steer-pending"
+import { extractUserMessageText } from "./steer-pending"
 
 /** Parse an unknown payload into an ErrorDetail with backward-compat fallbacks.
  *  See docs/design/error-envelope.md §4. */
@@ -90,7 +90,6 @@ interface UsePilotChatReturn {
   dpActive: boolean
   contextUsage: ContextUsage | null
   isCompacting: boolean
-  pendingMessages: string[]
   hasMore: boolean
   loadingMore: boolean
   send: (text: string) => void
@@ -98,7 +97,6 @@ interface UsePilotChatReturn {
   abort: () => void
   loadMore: () => void
   setDpActive: (active: boolean) => void
-  removePending: (index: number) => void
   exitDp: () => void
 }
 
@@ -201,6 +199,10 @@ function formatToolInput(toolName: string, args?: Record<string, unknown>): stri
 /** Reduce individual progress events into accumulated investigation state */
 function timeNow(): string {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function randomMessageId(prefix: string): string {
+  return `${prefix}-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36)}`
 }
 
 function tryParseJson(s: string): Record<string, unknown> | undefined {
@@ -326,6 +328,28 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     timestamp: formatPortalTimestamp(m.created_at),
     isStreaming: toolStatus === "running",
   }
+}
+
+function makePendingSteerMessage(text: string): PilotMessage {
+  return {
+    id: randomMessageId("steer"),
+    role: "user",
+    content: text,
+    timestamp: timeNow(),
+    metadata: {
+      kind: "steer",
+      steer_status: "pending",
+    },
+  }
+}
+
+function isPendingSteerMessage(message: PilotMessage, text?: string): boolean {
+  return (
+    message.role === "user" &&
+    message.metadata?.kind === "steer" &&
+    message.metadata?.steer_status !== "steered" &&
+    (text == null || message.content.trim() === text.trim())
+  )
 }
 
 function hasRunningPersistedMessages(messages: PilotMessage[]): boolean {
@@ -457,7 +481,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const [streamText, setStreamText] = useState("")
   const [dpActive, setDpActive] = useState(false)
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
-  const [pendingMessages, setPendingMessages] = useState<string[]>([])
   const [hasMore, setHasMore] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const pageRef = useRef(1)
@@ -629,7 +652,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           recoveredStreamingRef.current = false
           setStreaming(false)
           streamingRef.current = false
-          setPendingMessages([])
           return
         }
       } catch (err) {
@@ -836,26 +858,44 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
               }
             | undefined
 
-          // Show steer (user) messages injected mid-conversation.
-          // The initial prompt's user message is already displayed by send(),
-          // so only create a PilotMessage if the text is in pendingMessages (= steer).
+          // Mark a previously submitted follow-up as truly consumed by the
+          // runtime. The user bubble entered the message list when the user
+          // clicked send; this event only moves it from pending → steered.
           if (msg?.role === "user") {
             const text = extractUserMessageText(msg.content)
             if (text) {
-              setPendingMessages((prev) => {
-                const idx = findPendingSteerIndex(prev, text)
-                if (idx < 0) return prev // not a steer — already displayed
-                // Steer message: add to chat and remove from pending
-                setMessages((msgs) => [
-                  ...msgs,
+              const dbMessageId = typeof evt.dbMessageId === "string" ? evt.dbMessageId : undefined
+              setMessages((prev) => {
+                let idx = dbMessageId
+                  ? prev.findIndex((message) => message.id === dbMessageId)
+                  : -1
+                if (idx < 0) {
+                  idx = prev.findIndex((message) => isPendingSteerMessage(message, text))
+                }
+                if (idx >= 0) {
+                  const current = prev[idx]
+                  const next: PilotMessage = {
+                    ...current,
+                    ...(dbMessageId ? { id: dbMessageId } : {}),
+                    metadata: {
+                      ...(current.metadata ?? {}),
+                      kind: "steer",
+                      steer_status: "steered",
+                    },
+                  }
+                  return [...prev.slice(0, idx), next, ...prev.slice(idx + 1)]
+                }
+                if (!dbMessageId) return prev
+                return [
+                  ...prev,
                   {
-                    id: `msg-${Date.now()}`,
+                    id: dbMessageId,
                     role: "user" as const,
                     content: text,
                     timestamp: timeNow(),
+                    metadata: { kind: "steer", steer_status: "steered" },
                   },
-                ])
-                return removePendingAt(prev, idx)
+                ]
               })
             }
           }
@@ -934,7 +974,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             streamingRef.current = false
             recoveredStreamingRef.current = false
           }
-          setPendingMessages([])
           break
 
         // --- Agent start (agent started processing) ---
@@ -951,7 +990,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           setStreaming(false)
           streamingRef.current = false
           recoveredStreamingRef.current = false
-          setPendingMessages([])
           // Update context usage from agent_end event
           const cu = evt.contextUsage as ContextUsage | undefined
           if (cu) {
@@ -994,13 +1032,72 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     }
   }, [agentId, sessionId, hasMore, loadingMore])
 
+  const submitSteer = useCallback(
+    (text: string) => {
+      if (!sessionId) return
+      const optimistic = makePendingSteerMessage(text)
+      setMessages((prev) => [...prev, optimistic])
+
+      chatSteer(agentId, sessionId, text)
+        .then((res) => {
+          const persisted = res.message
+          if (!persisted) return
+          setMessages((prev) => {
+            let idx = prev.findIndex((message) => message.id === optimistic.id)
+            if (idx < 0) {
+              idx = prev.findIndex((message) => message.id === persisted.id)
+            }
+            if (idx < 0) return prev
+            const current = prev[idx]
+            const nextMetadata = {
+              ...(persisted.metadata ?? {}),
+              ...(current.metadata?.steer_status === "steered" ? current.metadata : {}),
+            }
+            const next: PilotMessage = {
+              ...current,
+              id: persisted.id,
+              content: persisted.content,
+              metadata: nextMetadata,
+              timestamp: persisted.created_at ? formatPortalTimestamp(persisted.created_at) : current.timestamp,
+            }
+            return [...prev.slice(0, idx), next, ...prev.slice(idx + 1)]
+          })
+        })
+        .catch((err) => {
+          console.error("[usePilotChat] steer error:", err)
+          setMessages((prev) => {
+            const idx = prev.findIndex((message) => message.id === optimistic.id)
+            if (idx < 0) return prev
+            const current = prev[idx]
+            const failed: PilotMessage = {
+              ...current,
+              metadata: {
+                ...(current.metadata ?? {}),
+                kind: "steer",
+                steer_status: "failed",
+              },
+            }
+            return [...prev.slice(0, idx), failed, ...prev.slice(idx + 1)]
+          })
+          const body = (err as { body?: unknown }).body
+          const detail = body !== undefined
+            ? parseErrorDetail(body)
+            : {
+                code: "INTERNAL_ERROR",
+                message: err instanceof Error ? err.message : "Failed to steer",
+                retriable: true,
+              }
+          setMessages((prev) => [...prev, makeErrorMessage(detail)])
+        })
+    },
+    [agentId, sessionId],
+  )
+
   // --- Send a message ---
   const send = useCallback(
     (text: string) => {
       if ((streamingRef.current || hasPendingDelegationSynthesis(messages)) && sessionId) {
-        // While streaming, send as steer
-        chatSteer(agentId, sessionId, text).catch((err) => console.error("[usePilotChat] steer error:", err))
-        setPendingMessages((prev) => [...prev, text])
+        submitSteer(text)
         return
       }
 
@@ -1107,7 +1204,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                     setStreaming(false)
                     streamingRef.current = false
                     recoveredStreamingRef.current = false
-                    setPendingMessages([])
                   }
                   // Update cache: mark stream as finished so switching back shows final state
                   if (streamSessionId) { const cached = messagesCacheRef.current.get(streamSessionId); if (cached) cached.streaming = false }
@@ -1173,35 +1269,21 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         }
       })()
     },
-    [agentId, sessionId, messages, handleChatEvent],
+    [agentId, sessionId, messages, handleChatEvent, submitSteer],
   )
 
   // --- Steer ---
   const steer = useCallback(
     (text: string) => {
-      if (!sessionId) return
-      chatSteer(agentId, sessionId, text).catch((err) => {
-        console.error("[usePilotChat] steer error:", err)
-        const body = (err as { body?: unknown }).body
-        const detail = body !== undefined
-          ? parseErrorDetail(body)
-          : {
-              code: "INTERNAL_ERROR",
-              message: err instanceof Error ? err.message : "Failed to steer",
-              retriable: true,
-            }
-        setMessages((prev) => [...prev, makeErrorMessage(detail)])
-      })
-      setPendingMessages((prev) => [...prev, text])
+      submitSteer(text)
     },
-    [agentId, sessionId],
+    [submitSteer],
   )
 
   // --- Abort ---
   const abort = useCallback(async () => {
     if (!sessionId) return
     isAbortingRef.current = true
-    setPendingMessages([])
     // Mark all streaming messages as complete visually
     setMessages((prev) =>
       prev.map((m) =>
@@ -1223,11 +1305,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     recoveredStreamingRef.current = false
   }, [agentId, sessionId])
 
-  // --- Remove pending ---
-  const removePending = useCallback((index: number) => {
-    setPendingMessages((prev) => [...prev.slice(0, index), ...prev.slice(index + 1)])
-  }, [])
-
   // --- Exit DP ---
   const exitDp = useCallback(() => {
     if (sessionId) {
@@ -1243,7 +1320,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     dpActive,
     contextUsage,
     isCompacting,
-    pendingMessages,
     hasMore,
     loadingMore,
     send,
@@ -1251,7 +1327,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     abort,
     loadMore,
     setDpActive,
-    removePending,
     exitDp,
   }
 }

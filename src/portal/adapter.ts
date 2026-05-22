@@ -1947,6 +1947,38 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     return { ok: true };
   });
 
+  handlers.set("chat.markSteerConsumed", async (params) => {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT id, metadata FROM chat_messages
+       WHERE session_id = ? AND role = 'user' AND content = ?
+       ORDER BY created_at ASC, id ASC`,
+      [params.session_id, params.content ?? ""],
+    ) as any;
+
+    for (const row of rows as any[]) {
+      const metadata = safeParseJson(row.metadata, null) as Record<string, unknown> | null;
+      if (metadata?.kind !== "steer" || metadata.steer_status === "steered") continue;
+
+      const nextMetadata = {
+        ...metadata,
+        steer_status: "steered",
+        steered_at: new Date().toISOString(),
+      };
+      await db.query(
+        `UPDATE chat_messages SET metadata = ? WHERE id = ? AND session_id = ?`,
+        [jsonParam(nextMetadata), row.id, params.session_id],
+      );
+      await db.query(
+        `UPDATE chat_sessions SET last_active_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [params.session_id],
+      );
+      return { id: row.id };
+    }
+
+    return { id: null };
+  });
+
   handlers.set("chat.updateDelegationToolMessage", async (params) => {
     const db = getDb();
     await db.query(

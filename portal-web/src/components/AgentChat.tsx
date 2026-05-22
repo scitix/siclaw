@@ -331,8 +331,6 @@ export function AgentChat({ agentId }: AgentChatProps) {
               sendMessage={handleSend}
               abortResponse={pilot.abort}
               contextUsage={pilot.contextUsage}
-              pendingMessages={pilot.pendingMessages}
-              onRemovePending={pilot.removePending}
               dpActive={pilot.dpActive}
               onSetDpActive={pilot.setDpActive}
               sessionKey={activeSessionId}

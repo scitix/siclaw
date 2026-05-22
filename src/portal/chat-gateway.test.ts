@@ -242,6 +242,10 @@ describe("chat-gateway routes", () => {
 
     it("forwards to runtime and returns 200 on ok", async () => {
       connMap.sendCommand = vi.fn().mockResolvedValue({ ok: true });
+      query
+        .mockResolvedValueOnce([[{ id: "s1" }], []])
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[], []]);
       const res = await runRoute(router, fakeReq({
         url: "/api/v1/siclaw/agents/a1/chat/steer",
         method: "POST",
@@ -252,10 +256,24 @@ describe("chat-gateway routes", () => {
       expect(connMap.sendCommand).toHaveBeenCalledWith("a1", "chat.steer", expect.objectContaining({
         sessionId: "s1", text: "redirect",
       }));
+      expect(query.mock.calls[1][0]).toContain("INSERT INTO chat_messages");
+      expect(JSON.parse(query.mock.calls[1][1][3])).toMatchObject({
+        kind: "steer",
+        steer_status: "pending",
+      });
+      expect(JSON.parse(res._body).message).toMatchObject({
+        role: "user",
+        content: "redirect",
+      });
     });
 
     it("returns 502 when runtime RPC fails", async () => {
       connMap.sendCommand = vi.fn().mockResolvedValue({ ok: false, error: "nope" });
+      query
+        .mockResolvedValueOnce([[{ id: "s1" }], []])
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[], []]);
       const res = await runRoute(router, fakeReq({
         url: "/api/v1/siclaw/agents/a1/chat/steer",
         method: "POST",
@@ -263,6 +281,19 @@ describe("chat-gateway routes", () => {
         body: { session_id: "s1", text: "x" },
       }));
       expect(res._status).toBe(502);
+      expect(query.mock.calls[3][0]).toContain("UPDATE chat_messages SET metadata");
+    });
+
+    it("returns 404 when steering a session that does not belong to the user", async () => {
+      query.mockResolvedValueOnce([[], []]);
+      const res = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/steer",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: { session_id: "missing", text: "x" },
+      }));
+      expect(res._status).toBe(404);
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
     });
   });
 

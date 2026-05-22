@@ -37,8 +37,6 @@ interface InputAreaProps {
   disabled?: boolean
   isLoading?: boolean
   contextUsage?: ContextUsage | null
-  pendingMessages?: string[]
-  onRemovePending?: (index: number) => void
   dpActive?: boolean
   onSetDpActive?: (active: boolean) => void
   hasMessages?: boolean
@@ -55,8 +53,6 @@ export function InputArea({
   disabled,
   isLoading,
   contextUsage,
-  pendingMessages,
-  onRemovePending,
   dpActive,
   onSetDpActive,
   hasMessages,
@@ -82,7 +78,7 @@ export function InputArea({
     const nextHeight = Math.min(el.scrollHeight, maxHeight)
     el.style.height = `${nextHeight}px`
     el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden"
-  }, [value, activePrefix, pendingMessages])
+  }, [value, activePrefix])
 
   // When external draft changes, populate input and focus
   useEffect(() => {
@@ -313,28 +309,6 @@ export function InputArea({
               </div>
             )}
 
-            {/* Pending steer messages */}
-            {pendingMessages && pendingMessages.length > 0 && (
-              <div className="flex flex-col gap-1 px-4 pb-1">
-                {pendingMessages.map((msg, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-200 text-xs text-amber-400"
-                  >
-                    <span className="flex-1 truncate">{msg}</span>
-                    <button
-                      type="button"
-                      className="p-0.5 rounded hover:bg-amber-500/100/20 transition-colors shrink-0"
-                      onClick={() => onRemovePending?.(i)}
-                      title="Remove this instruction"
-                    >
-                      <X className="w-3 h-3" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
             <div className="relative w-full">
               <textarea
                 ref={textareaRef}
@@ -368,7 +342,7 @@ export function InputArea({
               <button
                 onClick={handleSend}
                 className="absolute right-3 bottom-3 p-2 rounded-lg bg-blue-600 text-white shadow-md hover:bg-blue-700 transition-all"
-                title="Send steer instruction"
+                title="Send follow-up"
               >
                 <ArrowUp className="w-5 h-5" />
               </button>

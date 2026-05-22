@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
+import { Fragment, useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
 import type { KeyboardEvent } from "react"
 import {
   Terminal,
@@ -164,8 +164,6 @@ export interface PilotAreaProps {
   sendMessage: (text: string) => void
   abortResponse?: () => void
   contextUsage?: ContextUsage | null
-  pendingMessages?: string[]
-  onRemovePending?: (index: number) => void
   dpActive?: boolean
   onSetDpActive?: (active: boolean) => void
   sessionKey?: string | null
@@ -184,8 +182,6 @@ export function PilotArea({
   sendMessage,
   abortResponse,
   contextUsage,
-  pendingMessages,
-  onRemovePending,
   dpActive,
   onSetDpActive,
   sessionKey,
@@ -292,6 +288,7 @@ export function PilotArea({
     for (let i = renderMessages.length - 1; i >= 0; i--) {
       const message = renderMessages[i]
       if (message.hidden || message.role !== "user" || message.isStreaming) continue
+      if (message.metadata?.kind === "steer") continue
       if (getEditableUserText(message.content)) return message.id
     }
     return null
@@ -400,34 +397,36 @@ export function PilotArea({
               {renderMessages
                 .filter((m) => !m.hidden)
                 .map((msg) => (
-                  <MessageItem
-                    key={msg.id}
-                    message={msg}
-                    sendMessage={wrappedSendMessage}
-                    showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
-                    dpActive={dpActive}
-                    canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
-                    editingContent={editingMessageId === msg.id ? editingDraft : null}
-                    onStartEditMessage={startEditingMessage}
-                    onEditMessageChange={setEditingDraft}
-                    onCancelEditMessage={cancelEditingMessage}
-                    onSubmitEditMessage={submitEditedMessage}
-                    onChipClick={(chip, meta) => {
-                      if (meta.isDpCheckpoint) {
-                        const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
-                        if (prefixChip) {
-                          setActivePrefix(prefixChip)
-                          setChipDraft(null)
-                          return
+                  <Fragment key={msg.id}>
+                    {isSteeredMessage(msg) && <SteeredConversationDivider />}
+                    <MessageItem
+                      message={msg}
+                      sendMessage={wrappedSendMessage}
+                      showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                      dpActive={dpActive}
+                      canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                      editingContent={editingMessageId === msg.id ? editingDraft : null}
+                      onStartEditMessage={startEditingMessage}
+                      onEditMessageChange={setEditingDraft}
+                      onCancelEditMessage={cancelEditingMessage}
+                      onSubmitEditMessage={submitEditedMessage}
+                      onChipClick={(chip, meta) => {
+                        if (meta.isDpCheckpoint) {
+                          const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
+                          if (prefixChip) {
+                            setActivePrefix(prefixChip)
+                            setChipDraft(null)
+                            return
+                          }
                         }
-                      }
-                      setChipSeq((s) => s + 1)
-                      setChipDraft(chip.insertText + " ")
-                    }}
-                    onOpenSkillPanel={onOpenSkillPanel}
-                    onOpenSchedulePanel={onOpenSchedulePanel}
-                    agentId={agentId}
-                  />
+                        setChipSeq((s) => s + 1)
+                        setChipDraft(chip.insertText + " ")
+                      }}
+                      onOpenSkillPanel={onOpenSkillPanel}
+                      onOpenSchedulePanel={onOpenSchedulePanel}
+                      agentId={agentId}
+                    />
+                  </Fragment>
                 ))}
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
@@ -458,8 +457,6 @@ export function PilotArea({
         disabled={false}
         isLoading={isLoading}
         contextUsage={contextUsage}
-        pendingMessages={pendingMessages}
-        onRemovePending={onRemovePending}
         dpActive={dpActive}
         onSetDpActive={onSetDpActive}
         hasMessages={messages.length > 0}
@@ -499,6 +496,24 @@ function ThinkingIndicator() {
           {THINKING_TIPS[tipIndex]}
         </span>
       </div>
+    </div>
+  )
+}
+
+function isSteeredMessage(message: PilotMessage): boolean {
+  return (
+    message.role === "user" &&
+    message.metadata?.kind === "steer" &&
+    message.metadata?.steer_status === "steered"
+  )
+}
+
+function SteeredConversationDivider() {
+  return (
+    <div className="flex items-center gap-3 text-sm text-muted-foreground/70">
+      <div className="h-px flex-1 bg-border/70" />
+      <span className="shrink-0">Steered conversation</span>
+      <div className="h-px flex-1 bg-border/70" />
     </div>
   )
 }

@@ -47,6 +47,11 @@ export interface UpdateMessageInput {
   delegationId?: string | null;
 }
 
+export interface MarkSteerConsumedInput {
+  sessionId: string;
+  content: string;
+}
+
 export interface UpdateDelegationToolMessageInput {
   sessionId: string;
   toolName: string;
@@ -207,6 +212,15 @@ export async function updateMessage(msg: UpdateMessageInput): Promise<void> {
     duration_ms: msg.durationMs ?? null,
     delegation_id: msg.delegationId ?? null,
   });
+}
+
+/** Mark the first pending steer user message with matching content as consumed by runtime. */
+export async function markSteerConsumed(msg: MarkSteerConsumedInput): Promise<string | null> {
+  const result = await getClient().request("chat.markSteerConsumed", {
+    session_id: msg.sessionId,
+    content: msg.content,
+  });
+  return typeof result.id === "string" ? result.id : null;
 }
 
 /** Update the parent async delegation tool row after its background batch finishes. */

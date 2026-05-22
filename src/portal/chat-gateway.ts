@@ -111,6 +111,62 @@ function sseWrite(res: import("node:http").ServerResponse, event: string, data: 
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+function steerMetadata(status: "pending" | "failed"): Record<string, unknown> {
+  return {
+    kind: "steer",
+    steer_status: status,
+    created_at: new Date().toISOString(),
+  };
+}
+
+async function appendPendingSteerMessage(
+  agentId: string,
+  userId: string,
+  sessionId: string,
+  text: string,
+): Promise<{
+  id: string;
+  session_id: string;
+  role: "user";
+  content: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}> {
+  const db = getDb();
+  const [sessionRows] = await db.query(
+    "SELECT id FROM chat_sessions WHERE id = ? AND agent_id = ? AND user_id = ? AND deleted_at IS NULL",
+    [sessionId, agentId, userId],
+  ) as any;
+  if (!Array.isArray(sessionRows) || sessionRows.length === 0) {
+    throw Object.assign(new Error("Session not found"), { statusCode: 404 });
+  }
+
+  const id = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  const metadata = steerMetadata("pending");
+  await db.query(
+    `INSERT INTO chat_messages (id, session_id, role, content, metadata)
+     VALUES (?, ?, 'user', ?, ?)`,
+    [id, sessionId, text, JSON.stringify(metadata)],
+  );
+  await db.query(
+    `UPDATE chat_sessions
+     SET message_count = message_count + 1, last_active_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [sessionId],
+  );
+
+  return { id, session_id: sessionId, role: "user", content: text, metadata, created_at: createdAt };
+}
+
+async function markSteerMessageFailed(sessionId: string, messageId: string): Promise<void> {
+  const db = getDb();
+  await db.query(
+    `UPDATE chat_messages SET metadata = ? WHERE id = ? AND session_id = ?`,
+    [JSON.stringify({ ...steerMetadata("failed"), failed_at: new Date().toISOString() }), messageId, sessionId],
+  );
+}
+
 export function registerChatRoutes(
   router: RestRouter,
   connectionMap: RuntimeConnectionMap,
@@ -244,6 +300,17 @@ export function registerChatRoutes(
     const body = await parseBody<{ session_id?: string; text?: string }>(req);
     if (!body.session_id || !body.text) { sendJson(res, 400, { error: "session_id and text are required" }); return; }
 
+    let message: Awaited<ReturnType<typeof appendPendingSteerMessage>>;
+    try {
+      message = await appendPendingSteerMessage(params.id, auth.userId, body.session_id, body.text);
+    } catch (err) {
+      const statusCode = typeof (err as { statusCode?: unknown }).statusCode === "number"
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+      sendJson(res, statusCode, { error: err instanceof Error ? err.message : "Failed to persist steer message" });
+      return;
+    }
+
     const result = await connectionMap.sendCommand(params.id, "chat.steer", {
       agentId: params.id,
       userId: auth.userId,
@@ -251,7 +318,13 @@ export function registerChatRoutes(
       text: body.text,
     });
 
-    sendJson(res, result.ok ? 200 : 502, result);
+    if (!result.ok) {
+      await markSteerMessageFailed(body.session_id, message.id).catch(() => {});
+      sendJson(res, 502, { ...result, message });
+      return;
+    }
+
+    sendJson(res, 200, { ...result, message });
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/abort — abort current execution

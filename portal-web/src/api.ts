@@ -123,8 +123,20 @@ export function chatSSE(
   return { abort: () => controller.abort() }
 }
 
-export async function chatSteer(agentId: string, sessionId: string, text: string): Promise<void> {
-  await api(`/siclaw/agents/${agentId}/chat/steer`, {
+export interface ChatSteerResponse {
+  ok?: boolean
+  message?: {
+    id: string
+    session_id?: string
+    role: "user"
+    content: string
+    metadata?: Record<string, unknown>
+    created_at?: string
+  }
+}
+
+export async function chatSteer(agentId: string, sessionId: string, text: string): Promise<ChatSteerResponse> {
+  return api(`/siclaw/agents/${agentId}/chat/steer`, {
     method: "POST",
     body: { session_id: sessionId, text },
   })

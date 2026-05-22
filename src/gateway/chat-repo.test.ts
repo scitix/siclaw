@@ -5,6 +5,7 @@ import {
   appendMessage,
   appendDelegationEvent,
   updateMessage,
+  markSteerConsumed,
   updateDelegationToolMessage,
   incrementMessageCount,
   getMessages,
@@ -279,6 +280,29 @@ describe("updateMessage", () => {
         duration_ms: 42,
       },
     });
+  });
+});
+
+describe("markSteerConsumed", () => {
+  it("marks a persisted steer row as consumed and returns the row id", async () => {
+    fake.responses.set("chat.markSteerConsumed", { id: "msg-steer" });
+
+    const id = await markSteerConsumed({ sessionId: "sid", content: "follow up" });
+
+    expect(id).toBe("msg-steer");
+    expect(fake.calls[0]).toEqual({
+      method: "chat.markSteerConsumed",
+      params: {
+        session_id: "sid",
+        content: "follow up",
+      },
+    });
+  });
+
+  it("returns null when the adapter has no matching pending steer row", async () => {
+    fake.responses.set("chat.markSteerConsumed", { id: null });
+
+    await expect(markSteerConsumed({ sessionId: "sid", content: "missing" })).resolves.toBeNull();
   });
 });
 
