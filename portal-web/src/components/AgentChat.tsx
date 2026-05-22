@@ -296,9 +296,35 @@ export function AgentChat({ agentId }: AgentChatProps) {
 
   // Auto-title: track whether we already titled this session
   const titledSessionRef = useRef<string | null>(null)
+  const activeSessionIdRef = useRef<string | null>(null)
+  const wasStreamingRef = useRef(false)
 
   // Pilot-style chat hook
   const pilot = usePilotChat({ agentId, sessionId: activeSessionId })
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId
+  }, [activeSessionId])
+
+  const loadSessions = useCallback(async (): Promise<ChatSession[]> => {
+    const res = await api<{ data: ChatSession[] }>(`/siclaw/agents/${agentId}/chat/sessions`)
+    const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as any) : []
+    return sortSessions(items)
+  }, [agentId])
+
+  const refreshSessions = useCallback(async (opts?: { selectDefault?: boolean; silent?: boolean }) => {
+    try {
+      const sorted = await loadSessions()
+      setSessions(sorted)
+      if (opts?.selectDefault && sorted.length > 0 && !activeSessionIdRef.current) {
+        setActiveSessionId(sorted[0].id)
+      }
+      return sorted
+    } catch (err: any) {
+      if (!opts?.silent) toast.error(err.message || "Failed to load sessions")
+      return null
+    }
+  }, [loadSessions, toast])
 
   // Fetch sessions
   useEffect(() => {
@@ -306,12 +332,10 @@ export function AgentChat({ agentId }: AgentChatProps) {
     async function fetchSessions() {
       try {
         setLoading(true)
-        const res = await api<{ data: ChatSession[] }>(`/siclaw/agents/${agentId}/chat/sessions`)
-        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as any) : []
+        const sorted = await loadSessions()
         if (!cancelled) {
-          const sorted = sortSessions(items)
           setSessions(sorted)
-          if (sorted.length > 0 && !activeSessionId) {
+          if (sorted.length > 0 && !activeSessionIdRef.current) {
             setActiveSessionId(sorted[0].id)
           }
         }
@@ -325,7 +349,28 @@ export function AgentChat({ agentId }: AgentChatProps) {
     return () => {
       cancelled = true
     }
-  }, [agentId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [agentId, loadSessions, toast])
+
+  useEffect(() => {
+    if (!showSessions) return
+    let stopped = false
+    const poll = () => {
+      if (!stopped) void refreshSessions({ silent: true })
+    }
+    poll()
+    const id = window.setInterval(poll, 3000)
+    return () => {
+      stopped = true
+      window.clearInterval(id)
+    }
+  }, [showSessions, refreshSessions])
+
+  useEffect(() => {
+    if (wasStreamingRef.current && !pilot.streaming) {
+      void refreshSessions({ silent: true })
+    }
+    wasStreamingRef.current = pilot.streaming
+  }, [pilot.streaming, refreshSessions])
 
   // Auto-generate title from first user message (only if still default name)
   useEffect(() => {
