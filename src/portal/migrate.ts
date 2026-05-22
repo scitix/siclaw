@@ -286,6 +286,8 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     target_agent_id CHAR(36) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_active_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_viewed_at TIMESTAMP NULL DEFAULT NULL,
+    pinned_at TIMESTAMP NULL DEFAULT NULL,
     deleted_at TIMESTAMP NULL DEFAULT NULL
   )`,
 
@@ -455,6 +457,7 @@ async function createIndexes(): Promise<void> {
   const db = getDb();
   // chat_sessions
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_user", "user_id, last_active_at");
+  await ensureIndex(db, "chat_sessions", "idx_chat_sessions_user_pinned", "user_id, pinned_at, last_active_at");
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_agent", "agent_id");
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_origin", "origin");
   await ensureIndex(db, "chat_sessions", "idx_chat_sessions_parent", "parent_session_id, created_at");
@@ -500,6 +503,8 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "target_agent_id", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "last_viewed_at", "TIMESTAMP NULL DEFAULT NULL");
+  await safeAlterTable(db, "chat_sessions", "pinned_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "from_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_messages", "delegation_id", "CHAR(36) DEFAULT NULL");
@@ -518,6 +523,7 @@ export async function runPortalMigrations(): Promise<void> {
 
   // Data backfill (safe to run repeatedly).
   await db.query("UPDATE chat_sessions SET origin = 'task' WHERE origin = 'cron'");
+  await db.query("UPDATE chat_sessions SET last_viewed_at = last_active_at WHERE last_viewed_at IS NULL");
   await db.query("UPDATE skills SET is_builtin = 1 WHERE created_by = 'system' AND is_builtin = 0");
 
   console.log("[portal-migrate] All tables ready");

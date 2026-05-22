@@ -68,6 +68,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     // legacy idempotence.
     const expectedIndexes = [
       "idx_chat_sessions_user",
+      "idx_chat_sessions_user_pinned",
       "idx_chat_sessions_agent",
       "idx_chat_sessions_origin",
       "idx_chat_sessions_parent",
@@ -144,9 +145,13 @@ describe("runPortalMigrations on SQLite :memory:", () => {
 
     // Later-added index co-exists with the pre-populated legacy index.
     const [idxRows] = await db.query<Array<{ name: string }>>(
-      "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_chat_sessions_user', 'idx_chat_sessions_agent')",
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_chat_sessions_user', 'idx_chat_sessions_agent', 'idx_chat_sessions_user_pinned')",
     );
-    expect(idxRows.map((r) => r.name).sort()).toEqual(["idx_chat_sessions_agent", "idx_chat_sessions_user"]);
+    expect(idxRows.map((r) => r.name).sort()).toEqual([
+      "idx_chat_sessions_agent",
+      "idx_chat_sessions_user",
+      "idx_chat_sessions_user_pinned",
+    ]);
   });
 
   it("is idempotent when run twice", async () => {
@@ -188,6 +193,8 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "parent_agent_id",
       "delegation_id",
       "target_agent_id",
+      "last_viewed_at",
+      "pinned_at",
     ]));
 
     const [messageRows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(chat_messages)");

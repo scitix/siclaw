@@ -141,6 +141,22 @@ describe("siclaw-api misc routes", () => {
       expect(status).toBe(200);
       expect(body.data ?? body.sessions ?? body).toBeDefined();
     });
+
+    it("orders pinned sessions first and then by last activity", async () => {
+      query
+        .mockResolvedValueOnce([[{ count: 2 }], []])
+        .mockResolvedValueOnce([[{ id: "pinned" }, { id: "active" }], []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions",
+        method: "GET",
+      }));
+
+      expect(status).toBe(200);
+      expect(body.data.map((s: { id: string }) => s.id)).toEqual(["pinned", "active"]);
+      expect(query.mock.calls[1][0]).toContain("pinned_at DESC");
+      expect(query.mock.calls[1][0]).toContain("last_active_at DESC");
+    });
   });
 
   describe("POST /api/v1/siclaw/agents/:id/chat/sessions", () => {
@@ -172,6 +188,40 @@ describe("siclaw-api misc routes", () => {
       expect(query.mock.calls[1][0]).toContain("UPDATE chat_sessions SET title = ?");
       expect(query.mock.calls[1][1][0]).toBe("");
       expect(body.title).toBe("");
+    });
+
+    it("toggles pin state without requiring a title change", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "s1" }], []])
+        .mockResolvedValueOnce([{}, []])
+        .mockResolvedValueOnce([[{ id: "s1", pinned_at: "2026-05-22 01:02:03" }], []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1",
+        method: "PUT",
+        body: { pinned: true },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[1][0]).toContain("pinned_at = CURRENT_TIMESTAMP");
+      expect(body.pinned_at).toBe("2026-05-22 01:02:03");
+    });
+
+    it("marks sessions viewed for active-dot acknowledgement", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "s1" }], []])
+        .mockResolvedValueOnce([{}, []])
+        .mockResolvedValueOnce([[{ id: "s1", last_viewed_at: "2026-05-22 01:02:03" }], []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/sessions/s1",
+        method: "PUT",
+        body: { viewed: true },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[1][0]).toContain("last_viewed_at = CURRENT_TIMESTAMP");
+      expect(body.last_viewed_at).toBe("2026-05-22 01:02:03");
     });
   });
 

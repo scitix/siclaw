@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History } from "lucide-react"
+import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History, Pin } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { useConfirm } from "./confirm-dialog"
@@ -14,12 +14,83 @@ interface ChatSession {
   title?: string
   created_at: string
   updated_at?: string
+  last_active_at?: string
+  last_viewed_at?: string | null
+  pinned_at?: string | null
+  message_count?: number
 }
 
 // ── Session Sidebar ────────────────────────────────────────
 
+const DEFAULT_VISIBLE_SESSIONS = 5
+
+function parsePortalTimestamp(value?: string | null): Date | null {
+  if (!value) return null
+  const isoish = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
+    ? `${value.replace(" ", "T")}Z`
+    : value
+  const ms = Date.parse(isoish)
+  return Number.isFinite(ms) ? new Date(ms) : null
+}
+
+function sessionActivityDate(session: ChatSession): Date | null {
+  return parsePortalTimestamp(session.last_active_at ?? session.updated_at ?? session.created_at)
+}
+
+function formatSessionAge(session: ChatSession, now = new Date()): string {
+  const activity = sessionActivityDate(session)
+  if (!activity) return ""
+  const diffMs = Math.max(0, now.getTime() - activity.getTime())
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diffMs < minute) return "now"
+  if (diffMs < hour) return `${Math.max(1, Math.floor(diffMs / minute))}m`
+  if (diffMs < day) return `${Math.floor(diffMs / hour)}h`
+  if (diffMs < 7 * day) return `${Math.floor(diffMs / day)}d`
+  const sameYear = activity.getFullYear() === now.getFullYear()
+  return activity.toLocaleDateString(undefined, sameYear
+    ? { month: "short", day: "numeric" }
+    : { year: "numeric", month: "short", day: "numeric" })
+}
+
+function formatSessionTooltip(session: ChatSession): string {
+  const activity = sessionActivityDate(session)
+  if (!activity) return ""
+  return activity.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
+function sortSessions(sessions: ChatSession[]): ChatSession[] {
+  return [...sessions].sort((a, b) => {
+    const aPinned = a.pinned_at ? 0 : 1
+    const bPinned = b.pinned_at ? 0 : 1
+    if (aPinned !== bPinned) return aPinned - bPinned
+    const aPinnedAt = parsePortalTimestamp(a.pinned_at)?.getTime() ?? 0
+    const bPinnedAt = parsePortalTimestamp(b.pinned_at)?.getTime() ?? 0
+    if (aPinnedAt !== bPinnedAt) return bPinnedAt - aPinnedAt
+    const aActive = sessionActivityDate(a)?.getTime() ?? 0
+    const bActive = sessionActivityDate(b)?.getTime() ?? 0
+    if (aActive !== bActive) return bActive - aActive
+    return (parsePortalTimestamp(b.created_at)?.getTime() ?? 0) - (parsePortalTimestamp(a.created_at)?.getTime() ?? 0)
+  })
+}
+
+function hasUnseenActivity(session: ChatSession, activeSessionId: string | null): boolean {
+  if (session.id === activeSessionId) return false
+  const activeAt = sessionActivityDate(session)?.getTime()
+  if (!activeAt) return false
+  const viewedAt = parsePortalTimestamp(session.last_viewed_at)?.getTime()
+  return viewedAt == null ? Boolean(session.message_count && session.message_count > 0) : activeAt > viewedAt
+}
+
 function SessionSidebar({
-  sessions, activeSessionId, agentId, onSelect, onNew, onDelete, onRenamed,
+  sessions, activeSessionId, agentId, onSelect, onNew, onDelete, onRenamed, onTogglePinned,
 }: {
   sessions: ChatSession[]
   activeSessionId: string | null
@@ -28,15 +99,23 @@ function SessionSidebar({
   onNew: () => void
   onDelete: (id: string) => void
   onRenamed: (id: string, title: string) => void
+  onTogglePinned: (session: ChatSession) => void
 }) {
   const toast = useToast()
   const [search, setSearch] = useState("")
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState("")
+  const [showMore, setShowMore] = useState(false)
+  const now = new Date()
 
   const filtered = search
     ? sessions.filter(s => (s.title || "").toLowerCase().includes(search.toLowerCase()))
-    : sessions
+    : sortSessions(sessions)
+  const pinned = search ? [] : filtered.filter((s) => s.pinned_at)
+  const normal = search ? filtered : filtered.filter((s) => !s.pinned_at)
+  const visibleNormal = search || showMore ? normal : normal.slice(0, DEFAULT_VISIBLE_SESSIONS)
+  const extraCount = search ? 0 : Math.max(0, normal.length - DEFAULT_VISIBLE_SESSIONS)
+  const visibleSessions = search ? filtered : [...pinned, ...visibleNormal]
 
   const handleStartRename = (s: ChatSession) => {
     setRenamingId(s.id)
@@ -54,6 +133,11 @@ function SessionSidebar({
     } catch (err: any) {
       toast.error(err.message)
     }
+  }
+
+  const handleCancelRename = () => {
+    setRenamingId(null)
+    setRenameValue("")
   }
 
   return (
@@ -84,44 +168,81 @@ function SessionSidebar({
             {search ? "No matches" : "No sessions"}
           </p>
         ) : (
-          filtered.map(s => (
-            <div
-              key={s.id}
-              onClick={() => { if (renamingId !== s.id) onSelect(s.id) }}
-              className={`group flex items-center justify-between px-3 py-2.5 cursor-pointer border-b border-border/20 transition-colors ${
-                activeSessionId === s.id
-                  ? "bg-secondary/50 text-foreground"
-                  : "text-muted-foreground hover:text-foreground hover:bg-secondary/30"
-              }`}
-            >
-              {renamingId === s.id ? (
-                <div className="flex items-center gap-1 flex-1 min-w-0" onClick={e => e.stopPropagation()}>
-                  <input
-                    value={renameValue}
-                    onChange={e => setRenameValue(e.target.value)}
-                    onKeyDown={e => { if (e.key === "Enter") handleSaveRename(); if (e.key === "Escape") setRenamingId(null); }}
-                    autoFocus
-                    className="flex-1 h-6 px-1.5 text-[12px] rounded border border-border bg-background min-w-0"
-                  />
-                  <button onClick={handleSaveRename} title="Save" className="p-0.5 rounded hover:bg-secondary text-green-400"><Check className="h-3 w-3" /></button>
-                  <button onClick={() => setRenamingId(null)} title="Cancel" className="p-0.5 rounded hover:bg-secondary text-muted-foreground"><X className="h-3 w-3" /></button>
-                </div>
-              ) : (
-                <>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-[13px] truncate">{s.title || "Untitled"}</p>
-                    <p className="text-[10px] text-muted-foreground/60">
-                      {new Date(s.created_at).toLocaleDateString()}
-                    </p>
+          <>
+            {visibleSessions.map(s => (
+              <div
+                key={s.id}
+                onClick={() => { if (renamingId !== s.id) onSelect(s.id) }}
+                className={`group mx-2 my-0.5 flex h-10 items-center gap-2 rounded-md px-3 cursor-pointer transition-colors ${
+                  activeSessionId === s.id
+                    ? "bg-secondary text-foreground"
+                    : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
+                }`}
+              >
+                {renamingId === s.id ? (
+                  <div className="flex items-center gap-1 flex-1 min-w-0" onClick={e => e.stopPropagation()}>
+                    <input
+                      value={renameValue}
+                      onChange={e => setRenameValue(e.target.value)}
+                      onKeyDown={e => { if (e.key === "Enter") handleSaveRename(); if (e.key === "Escape") handleCancelRename(); }}
+                      autoFocus
+                      className="flex-1 h-7 px-2 text-[13px] rounded-md border border-border bg-background min-w-0"
+                    />
+                    <button onClick={handleSaveRename} title="Save" className="p-1 rounded-md hover:bg-secondary text-green-400"><Check className="h-3.5 w-3.5" /></button>
+                    <button onClick={handleCancelRename} title="Cancel" className="p-1 rounded-md hover:bg-secondary text-muted-foreground"><X className="h-3.5 w-3.5" /></button>
                   </div>
-                  <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5 transition-opacity">
-                    <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} title="Rename" className="p-1 rounded hover:bg-secondary text-muted-foreground"><Pencil className="h-3 w-3" /></button>
-                    <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} title="Delete" className="p-1 rounded hover:bg-destructive/20 hover:text-red-400 text-muted-foreground"><Trash2 className="h-3 w-3" /></button>
-                  </div>
-                </>
-              )}
-            </div>
-          ))
+                ) : (
+                  <>
+                    <span className={`flex-1 min-w-0 truncate text-[13px] ${activeSessionId === s.id ? "font-semibold" : "font-medium"}`}>
+                      {s.title || "Untitled"}
+                    </span>
+                    {hasUnseenActivity(s, activeSessionId) && (
+                      <span className="h-2 w-2 shrink-0 rounded-full bg-blue-500" title="Updated" />
+                    )}
+                    <span
+                      className={`shrink-0 text-[12px] text-muted-foreground/70 ${activeSessionId === s.id ? "hidden" : "group-hover:hidden"}`}
+                      title={formatSessionTooltip(s)}
+                    >
+                      {formatSessionAge(s, now)}
+                    </span>
+                    <div className={`shrink-0 items-center gap-0.5 ${activeSessionId === s.id ? "flex" : "hidden group-hover:flex"}`}>
+                      <button
+                        onClick={e => { e.stopPropagation(); onTogglePinned(s) }}
+                        title={s.pinned_at ? "Unpin session" : "Pin session"}
+                        className={`p-1 rounded-md hover:bg-background/60 ${s.pinned_at ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                      >
+                        <Pin className="h-3.5 w-3.5" />
+                      </button>
+                      <button onClick={e => { e.stopPropagation(); handleStartRename(s) }} title="Rename" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-foreground">
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button onClick={e => { e.stopPropagation(); onDelete(s.id) }} title="Delete session" className="p-1 rounded-md hover:bg-background/60 text-muted-foreground hover:text-red-400">
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            ))}
+            {!search && extraCount > 0 && !showMore && (
+              <button
+                type="button"
+                onClick={() => setShowMore(true)}
+                className="mx-3 mt-2 px-2 py-1 text-[13px] text-muted-foreground/80 hover:text-foreground transition-colors"
+              >
+                Show more
+              </button>
+            )}
+            {!search && showMore && extraCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowMore(false)}
+                className="mx-3 mt-2 px-2 py-1 text-[13px] text-muted-foreground/80 hover:text-foreground transition-colors"
+              >
+                Show less
+              </button>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -162,9 +283,10 @@ export function AgentChat({ agentId }: AgentChatProps) {
         const res = await api<{ data: ChatSession[] }>(`/siclaw/agents/${agentId}/chat/sessions`)
         const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as any) : []
         if (!cancelled) {
-          setSessions(items)
-          if (items.length > 0 && !activeSessionId) {
-            setActiveSessionId(items[0].id)
+          const sorted = sortSessions(items)
+          setSessions(sorted)
+          if (sorted.length > 0 && !activeSessionId) {
+            setActiveSessionId(sorted[0].id)
           }
         }
       } catch (err: any) {
@@ -194,7 +316,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
     titledSessionRef.current = activeSessionId
     const title = userMsg.content.slice(0, 40).trim() || "Chat"
     setSessions((prev) =>
-      prev.map((s) => (s.id === activeSessionId ? { ...s, title } : s)),
+      sortSessions(prev.map((s) => (s.id === activeSessionId ? { ...s, title } : s))),
     )
     // Persist to DB
     api(`/siclaw/agents/${agentId}/chat/sessions/${activeSessionId}`, {
@@ -211,7 +333,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
   const handleNewSession = useCallback(async () => {
     try {
       const session = await api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
-      setSessions((prev) => [session, ...prev])
+      setSessions((prev) => sortSessions([session, ...prev]))
       setActiveSessionId(session.id)
     } catch (err: any) {
       toast.error(err.message || "Failed to create session")
@@ -241,6 +363,32 @@ export function AgentChat({ agentId }: AgentChatProps) {
     [agentId, activeSessionId, toast, confirmDialog],
   )
 
+  const acknowledgeSession = useCallback(async (sid: string) => {
+    const viewedAt = new Date().toISOString()
+    setSessions((prev) => sortSessions(prev.map((s) => s.id === sid ? { ...s, last_viewed_at: viewedAt } : s)))
+    try {
+      const updated = await api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions/${sid}`, {
+        method: "PUT",
+        body: { viewed: true },
+      })
+      setSessions((prev) => sortSessions(prev.map((s) => s.id === sid ? updated : s)))
+    } catch (err: any) {
+      toast.error(err.message || "Failed to update session")
+    }
+  }, [agentId, toast])
+
+  const handleSelectSession = useCallback((sid: string) => {
+    setActiveSessionId(sid)
+    void acknowledgeSession(sid)
+  }, [acknowledgeSession])
+
+  useEffect(() => {
+    if (!activeSessionId) return
+    const current = sessions.find((s) => s.id === activeSessionId)
+    if (!current || !hasUnseenActivity(current, null)) return
+    void acknowledgeSession(activeSessionId)
+  }, [activeSessionId, acknowledgeSession, sessions])
+
   // Wrap send to also handle first-message session creation
   const handleSend = useCallback(
     (text: string) => {
@@ -248,7 +396,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
         // Create a new session first, then send
         api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
           .then((session) => {
-            setSessions((prev) => [session, ...prev])
+            setSessions((prev) => sortSessions([session, ...prev]))
             setActiveSessionId(session.id)
             // Short delay to let state propagate
             setTimeout(() => pilot.send(text), 50)
@@ -258,10 +406,33 @@ export function AgentChat({ agentId }: AgentChatProps) {
           })
         return
       }
+      const now = new Date().toISOString()
+      setSessions((prev) => sortSessions(prev.map((s) =>
+        s.id === activeSessionId ? { ...s, last_active_at: now, last_viewed_at: now } : s,
+      )))
       pilot.send(text)
     },
     [activeSessionId, agentId, pilot, toast],
   )
+
+  const handleTogglePinned = useCallback(async (session: ChatSession) => {
+    const pinned = !session.pinned_at
+    const pinnedAt = pinned ? new Date().toISOString() : null
+    const previous = sessions
+    setSessions((prev) => sortSessions(prev.map((s) =>
+      s.id === session.id ? { ...s, pinned_at: pinnedAt } : s,
+    )))
+    try {
+      const updated = await api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions/${session.id}`, {
+        method: "PUT",
+        body: { pinned },
+      })
+      setSessions((prev) => sortSessions(prev.map((s) => s.id === session.id ? updated : s)))
+    } catch (err: any) {
+      setSessions(previous)
+      toast.error(err.message || "Failed to update session")
+    }
+  }, [agentId, sessions, toast])
 
   if (loading) {
     return (
@@ -288,10 +459,11 @@ export function AgentChat({ agentId }: AgentChatProps) {
               sessions={sessions}
               activeSessionId={activeSessionId}
               agentId={agentId}
-              onSelect={(id) => { setActiveSessionId(id); setShowSessions(false) }}
+              onSelect={(id) => { handleSelectSession(id); setShowSessions(false) }}
               onNew={() => { handleNewSession(); setShowSessions(false) }}
               onDelete={handleDeleteSession}
-              onRenamed={(sid, title) => setSessions(prev => prev.map(s => s.id === sid ? { ...s, title } : s))}
+              onRenamed={(sid, title) => setSessions(prev => sortSessions(prev.map(s => s.id === sid ? { ...s, title } : s)))}
+              onTogglePinned={handleTogglePinned}
             />
           </div>
         </>

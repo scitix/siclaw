@@ -1548,7 +1548,11 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         `SELECT * FROM chat_sessions
          WHERE agent_id = ? AND user_id = ? AND deleted_at IS NULL
            AND (origin IS NULL OR origin NOT IN ('task', 'delegation'))
-         ORDER BY last_active_at DESC LIMIT ? OFFSET ?`,
+         ORDER BY CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
+                  pinned_at DESC,
+                  last_active_at DESC,
+                  created_at DESC
+         LIMIT ? OFFSET ?`,
         [params.id, auth.userId, pageSize, offset],
       ),
     ]) as [any, any];
@@ -1571,8 +1575,8 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const db = getDb();
 
     await db.query(
-      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, last_active_at)
-       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      `INSERT INTO chat_sessions (id, agent_id, user_id, title, preview, message_count, last_active_at, last_viewed_at)
+       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
       [
         id, params.id, auth.userId,
         normalizeChatSessionTitle(body.title), normalizeChatSessionPreview(body.preview), 0,
@@ -1603,6 +1607,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const fields: string[] = [];
     const values: unknown[] = [];
     if ("title" in body) { fields.push("title = ?"); values.push(truncateChatSessionTitle(body.title)); }
+    if ("pinned" in body) {
+      if (typeof body.pinned !== "boolean") { sendJson(res, 400, { error: "pinned must be a boolean" }); return; }
+      fields.push(body.pinned ? "pinned_at = CURRENT_TIMESTAMP" : "pinned_at = NULL");
+    }
+    if ("viewed" in body) {
+      if (typeof body.viewed !== "boolean") { sendJson(res, 400, { error: "viewed must be a boolean" }); return; }
+      fields.push(body.viewed ? "last_viewed_at = CURRENT_TIMESTAMP" : "last_viewed_at = NULL");
+    }
     if (fields.length === 0) { sendJson(res, 400, { error: "Nothing to update" }); return; }
 
     values.push(params.sid);
