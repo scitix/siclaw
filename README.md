@@ -4,7 +4,7 @@
 
 # Siclaw
 
-**Read-only investigation copilot for SRE teams**
+**Read-only investigation copilot for DevOps and SRE teams**
 
 [![npm](https://img.shields.io/npm/v/siclaw?logo=npm)](https://www.npmjs.com/package/siclaw)
 [![CI](https://github.com/scitix/siclaw/actions/workflows/ci.yml/badge.svg)](https://github.com/scitix/siclaw/actions/workflows/ci.yml)
