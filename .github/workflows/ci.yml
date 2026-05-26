@@ -28,7 +28,11 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - run: npm ci
+      - run: PYTHONPATH=services/ocr-backend python -m unittest discover -s services/ocr-backend -p '*_test.py'
       - run: npm test
 
   portal-web-test:

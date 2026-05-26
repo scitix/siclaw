@@ -1,0 +1,5 @@
+paddlepaddle>=3.0.0,<4.0.0
+paddleocr>=3.0.0,<4.0.0
+opencv-python-headless>=4.8.0,<5.0.0
+Pillow>=10.0.0,<12.0.0
+pypdf>=4.0.0,<7.0.0

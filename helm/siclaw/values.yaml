@@ -23,6 +23,7 @@ database:
 # first, so multiple replicas of the same release would continuously fight.
 # Scale horizontally by deploying multiple releases with distinct identities.
 runtime:
+  enabled: true
   portalSecret: ""      # Runtime → Portal/Upstream API auth (X-Auth-Token on phone-home WS)
   # Where Runtime gets Agent/Credential info from:
   #   Standalone mode: http://siclaw-portal:3003
@@ -76,6 +77,68 @@ portal:
       cpu: "500m"
       memory: "512Mi"
   env: {}
+
+# -- OCR backend for Portal image/PDF attachment preprocessing
+ocr:
+  enabled: true
+  replicas: 1
+  # Set when OCR is provided by another service. If enabled=false and this is
+  # empty, Portal treats OCR as unavailable and keeps chat sends recoverable.
+  externalUrl: ""
+  timeoutMs: 120000
+  image:
+    # Empty repository uses image.registry + image.tag as siclaw-ocr:<tag>.
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  service:
+    port: 8088
+  device: "cpu"
+  preload: true
+  enableStructure: false
+  # Per-Pod admitted in-flight OCR requests. PaddleOCR inference is serialized
+  # inside each backend process; requests above this limit receive HTTP 503.
+  maxConcurrency: 1
+  # Per-attachment OCR text characters that Portal may inject into the prompt.
+  maxEvidenceTextChars: 32768
+  # Total OCR evidence characters that Portal may inject for one chat turn.
+  maxTotalEvidenceTextChars: 65536
+  # Hard process-level watchdog for a single OCR request. If PaddleOCR hangs past
+  # this window, the backend exits and Kubernetes restarts the container.
+  hardTimeoutMs: 150000
+  # PDF inputs are capped before PaddleOCR runs so a long paper does not occupy
+  # OCR workers and delay screenshot/table requests. Set 0 to disable.
+  maxPdfPages: 10
+  # Decoded image pixel cap before OCR runs. Set 0 to disable.
+  maxImagePixels: 50000000
+  textDetectionModelName: "PP-OCRv5_mobile_det"
+  textRecognitionModelName: "PP-OCRv5_mobile_rec"
+  textDetLimitSideLen: ""
+  maxRequestBytes: "10485760"
+  cache:
+    # Cache PaddleOCR/PaddleX model downloads across container restarts in the
+    # same Pod. This does not store user uploads or OCR text.
+    enabled: true
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+  env: {}
+  networkPolicy:
+    enabled: false
+    # Extra Kubernetes NetworkPolicy from entries for OCR-only/shared-service
+    # deployments. Example:
+    # ingressFrom:
+    #   - namespaceSelector:
+    #       matchLabels:
+    #         kubernetes.io/metadata.name: sicore
+    #     podSelector:
+    #       matchLabels:
+    #         app.kubernetes.io/name: sicore-apiserver
+    ingressFrom: []
 
 # -- AgentBox (spawned at runtime by K8s spawner)
 agentbox:

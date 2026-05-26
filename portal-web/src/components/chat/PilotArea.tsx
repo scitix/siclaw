@@ -27,10 +27,12 @@ import { validateMermaidSource } from "./MermaidRenderer"
 import { svgToPngDataUrl } from "./svg-export"
 import { useCopyFeedback } from "./clipboard"
 import { InputArea } from "./InputArea"
+import { ImageAttachmentPreview } from "./ImageAttachmentPreview"
 import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
 import { ErrorBubble } from "./ErrorBubble"
-import type { PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
+import { stripAttachmentOcrEvidence } from "./user-message-text"
+import type { ChatAttachment, PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
 
 /**
  * Format a millisecond duration into a compact human-readable string.
@@ -161,7 +163,7 @@ export interface PilotAreaProps {
   hasMore?: boolean
   loadingMore?: boolean
   onLoadMore?: () => void
-  sendMessage: (text: string) => void
+  sendMessage: (text: string, attachments?: ChatAttachment[]) => void
   abortResponse?: () => void
   contextUsage?: ContextUsage | null
   pendingMessages?: string[]
@@ -233,9 +235,9 @@ export function PilotArea({
 
   const lastSentRef = useRef<string | null>(null)
   const wrappedSendMessage = useCallback(
-    (text: string) => {
+    (text: string, attachments?: ChatAttachment[]) => {
       if (!isLoading) lastSentRef.current = text
-      sendMessage(text)
+      sendMessage(text, attachments)
     },
     [sendMessage, isLoading],
   )
@@ -579,7 +581,7 @@ function parseActionChipMarker(content: string): { chip: PrefixActionChip | null
 }
 
 function getVisibleUserText(content: string): string {
-  const { text: afterDeepInvestigation } = parseDeepInvestigation(content)
+  const { text: afterDeepInvestigation } = parseDeepInvestigation(stripAttachmentOcrEvidence(content))
   const { text: afterActionChip } = parseActionChipMarker(afterDeepInvestigation)
   const { text: afterScripts } = parseScriptRefs(afterActionChip)
   const { text } = parseSkillRef(afterScripts)
@@ -1131,7 +1133,7 @@ function MessageItem({
 
   // Parse references from user messages
   const { isDeepInvestigation, text: afterDeepInv } = isUser
-    ? parseDeepInvestigation(message.content)
+    ? parseDeepInvestigation(stripAttachmentOcrEvidence(message.content))
     : { isDeepInvestigation: false, text: message.content }
   const { chip: actionChip, text: afterChip } = isUser
     ? parseActionChipMarker(afterDeepInv)
@@ -1216,6 +1218,14 @@ function MessageItem({
           </div>
         )}
 
+        {isUser && message.attachments && message.attachments.length > 0 && (
+          <ImageAttachmentPreview
+            attachments={message.attachments}
+            className="mb-2 max-w-[560px] justify-end"
+            tileClassName="h-32 w-56"
+          />
+        )}
+
         {isUser && editingContent != null && canRenderEditor ? (
           <EditableUserMessage
             content={editingContent}
@@ -1234,6 +1244,10 @@ function MessageItem({
                 : undefined
             }
           />
+        ) : isUser && message.attachments && message.attachments.length > 0 ? (
+          <div className="rounded-xl bg-muted px-3 py-2 text-sm text-muted-foreground">
+            (No content)
+          </div>
         ) : null}
 
         {renderedSuggestedChips.length > 0 && onChipClick && (

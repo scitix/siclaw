@@ -1,0 +1,43 @@
+FROM python:3.11-slim-bookworm
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=${PIP_INDEX_URL} \
+    PADDLEOCR_BACKEND_HOST=0.0.0.0 \
+    PADDLEOCR_BACKEND_PORT=8088 \
+    PADDLEOCR_DEVICE=cpu \
+    PADDLEOCR_PRELOAD=1 \
+    SICLAW_OCR_MAX_CONCURRENCY=1 \
+    SICLAW_OCR_HARD_TIMEOUT_MS=150000 \
+    SICLAW_OCR_MAX_PDF_PAGES=10 \
+    SICLAW_OCR_ENABLE_STRUCTURE=0
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libglib2.0-0 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY services/ocr-backend/requirements.txt ./
+RUN python -m pip install --upgrade pip \
+    && pip install -r requirements.txt
+
+# PaddleOCR 3.x pulls opencv-contrib-python, which requires libGL at import
+# time even though the service runs headless.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY services/ocr-backend/server.py services/ocr-backend/parse_once.py ./
+
+EXPOSE 8088
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/healthz', timeout=3).read()" || exit 1
+
+CMD ["python", "server.py"]

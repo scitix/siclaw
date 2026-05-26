@@ -1,3 +1,4 @@
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -123,3 +124,4 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "siclaw.dataPvcName" . }}
         {{- end }}
+{{- end }}

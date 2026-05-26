@@ -7,6 +7,7 @@ import {
   sendJson,
   parseBody,
   parseQuery,
+  RequestBodyTooLargeError,
   requireAuth,
   requireAdmin,
 } from "./rest-router.js";
@@ -180,6 +181,14 @@ describe("parseBody", () => {
     const p = parseBody(req);
     req.emit("error", new Error("socket hangup"));
     await expect(p).rejects.toThrow("socket hangup");
+  });
+
+  it("rejects when body exceeds the configured size limit", async () => {
+    const req = new FakeReq() as any;
+    const p = parseBody(req, { maxBytes: 4 });
+    req.emit("data", Buffer.from("12345"));
+    req.emit("end");
+    await expect(p).rejects.toBeInstanceOf(RequestBodyTooLargeError);
   });
 });
 

@@ -44,7 +44,21 @@ spec:
                 secretKeyRef:
                   name: {{ include "siclaw.fullname" . }}-portal
                   key: portal-secret
-            {{- range $key, $value := .Values.portal.env }}
+            {{- $ocr := .Values.ocr | default dict }}
+            {{- $ocrService := $ocr.service | default dict }}
+            {{- $ocrPort := $ocrService.port | default 8088 }}
+            {{- if or $ocr.enabled $ocr.externalUrl }}
+            - name: SICLAW_OCR_BACKEND_URL
+              value: {{ default (printf "http://%s:%v/parse" (include "siclaw.ocrServiceName" .) $ocrPort) $ocr.externalUrl | quote }}
+            - name: SICLAW_OCR_TIMEOUT_MS
+              value: {{ $ocr.timeoutMs | quote }}
+            - name: SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS
+              value: {{ $ocr.maxEvidenceTextChars | quote }}
+            - name: SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS
+              value: {{ $ocr.maxTotalEvidenceTextChars | default 65536 | quote }}
+            {{- end }}
+            {{- $portalEnv := omit (.Values.portal.env | default dict) "SICLAW_OCR_BACKEND_URL" "SICLAW_OCR_TIMEOUT_MS" "SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS" "SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS" }}
+            {{- range $key, $value := $portalEnv }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}

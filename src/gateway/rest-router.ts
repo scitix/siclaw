@@ -94,11 +94,40 @@ export function sendJson(res: http.ServerResponse, status: number, data: unknown
   res.end(body);
 }
 
-export async function parseBody<T>(req: http.IncomingMessage): Promise<T> {
+export class RequestBodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`Request body exceeds ${maxBytes} byte limit`);
+    this.name = "RequestBodyTooLargeError";
+  }
+}
+
+export async function parseBody<T>(
+  req: http.IncomingMessage,
+  options: { maxBytes?: number } = {},
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let bytes = 0;
+    let settled = false;
+
+    function fail(err: Error): void {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    }
+
+    req.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (options.maxBytes != null && bytes > options.maxBytes) {
+        fail(new RequestBodyTooLargeError(options.maxBytes));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (settled) return;
+      settled = true;
       try {
         const body = Buffer.concat(chunks).toString("utf-8");
         resolve(body ? JSON.parse(body) as T : {} as T);
@@ -106,7 +135,7 @@ export async function parseBody<T>(req: http.IncomingMessage): Promise<T> {
         reject(new Error("Invalid JSON body"));
       }
     });
-    req.on("error", reject);
+    req.on("error", (err) => fail(err instanceof Error ? err : new Error(String(err))));
   });
 }
 

@@ -1,4 +1,4 @@
-{{- if .Values.agentbox.persistence.enabled }}
+{{- if and (eq (include "siclaw.runtime.enabled" .) "true") .Values.agentbox.persistence.enabled }}
 # Shared data PVC — user memory, investigations, sessions.
 # Mounted by Runtime and every AgentBox pod; Runtime writes per-user
 # subdirectories (users/{userId}/{agentId}/) and AgentBox pods mount via subPath.

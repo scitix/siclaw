@@ -113,7 +113,9 @@
     "docker:build:runtime": "docker build -f Dockerfile.runtime -t siclaw/siclaw-runtime:latest .",
     "docker:build:portal": "docker build -f Dockerfile.portal -t siclaw/siclaw-portal:latest .",
     "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw/siclaw-agentbox:latest .",
+    "docker:build:ocr": "docker build -f Dockerfile.ocr -t siclaw/siclaw-ocr:latest .",
     "docker:push:runtime": "docker push siclaw/siclaw-runtime:latest",
+    "docker:push:ocr": "docker push siclaw/siclaw-ocr:latest",
     "docker:push:agentbox": "docker push siclaw/siclaw-agentbox:latest"
   }
 }

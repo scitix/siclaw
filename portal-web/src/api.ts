@@ -123,10 +123,10 @@ export function chatSSE(
   return { abort: () => controller.abort() }
 }
 
-export async function chatSteer(agentId: string, sessionId: string, text: string): Promise<void> {
+export async function chatSteer(agentId: string, sessionId: string, text: string, attachments?: unknown[]): Promise<void> {
   await api(`/siclaw/agents/${agentId}/chat/steer`, {
     method: "POST",
-    body: { session_id: sessionId, text },
+    body: { session_id: sessionId, text, attachments },
   })
 }
 
