@@ -1,0 +1,9 @@
+# Standalone Siclaw without OCR.
+#
+# Use this when Portal + Runtime should run normally but pasted image/PDF
+# attachments should not call an OCR backend. Attachment sends stay recoverable:
+# Portal injects an OCR-unavailable note instead of contacting a missing Service.
+
+ocr:
+  enabled: false
+  externalUrl: ""

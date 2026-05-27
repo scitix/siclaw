@@ -1,0 +1,21 @@
+# OCR-only deployment profile.
+#
+# Use this when Siclaw provides the shared OCR addon service for another
+# caller, such as Sicore's Siclaw proxy. It deploys only the OCR backend and
+# its ClusterIP Service; no Portal, Runtime, Runtime RBAC, Runtime CA, or
+# Runtime test hook is rendered.
+
+runtime:
+  enabled: false
+
+portal:
+  enabled: false
+
+ocr:
+  enabled: true
+  replicas: 4
+  maxConcurrency: 1
+  maxPdfPages: 10
+
+metrics:
+  enabled: false

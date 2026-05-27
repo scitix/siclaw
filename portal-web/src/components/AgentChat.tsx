@@ -7,7 +7,7 @@ import { usePilotChat } from "../hooks/usePilotChat"
 import { PilotArea } from "./chat/PilotArea"
 import { SkillPanel } from "./chat/SkillPanel"
 import { SchedulePanel } from "./chat/SchedulePanel"
-import type { PilotMessage } from "./chat/types"
+import type { ChatAttachment, PilotMessage } from "./chat/types"
 
 interface ChatSession {
   id: string
@@ -243,7 +243,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
 
   // Wrap send to also handle first-message session creation
   const handleSend = useCallback(
-    (text: string) => {
+    (text: string, attachments?: ChatAttachment[]) => {
       if (!activeSessionId) {
         // Create a new session first, then send
         api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
@@ -251,14 +251,14 @@ export function AgentChat({ agentId }: AgentChatProps) {
             setSessions((prev) => [session, ...prev])
             setActiveSessionId(session.id)
             // Short delay to let state propagate
-            setTimeout(() => pilot.send(text), 50)
+            setTimeout(() => pilot.send(text, attachments), 50)
           })
           .catch((err: any) => {
             toast.error(err.message || "Failed to create session")
           })
         return
       }
-      pilot.send(text)
+      pilot.send(text, attachments)
     },
     [activeSessionId, agentId, pilot, toast],
   )

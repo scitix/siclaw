@@ -1,0 +1,113 @@
+{{- $ocr := .Values.ocr | default dict -}}
+{{- $image := $ocr.image | default dict -}}
+{{- $service := $ocr.service | default dict -}}
+{{- $cache := $ocr.cache | default dict -}}
+{{- $cacheEnabled := true -}}
+{{- if hasKey $cache "enabled" -}}
+{{- $cacheEnabled = $cache.enabled -}}
+{{- end -}}
+{{- $port := $service.port | default 8088 -}}
+{{- if $ocr.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "siclaw.ocrServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "ocr") | nindent 4 }}
+spec:
+  replicas: {{ $ocr.replicas }}
+  selector:
+    matchLabels:
+      {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "ocr") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "ocr") | nindent 8 }}
+    spec:
+      containers:
+        - name: ocr
+          image: {{ include "siclaw.ocrImage" . }}
+          imagePullPolicy: {{ $image.pullPolicy | default .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: PADDLEOCR_BACKEND_HOST
+              value: "0.0.0.0"
+            - name: PADDLEOCR_BACKEND_PORT
+              value: {{ $port | quote }}
+            - name: PADDLEOCR_DEVICE
+              value: {{ $ocr.device | quote }}
+            - name: PADDLEOCR_PRELOAD
+              value: {{ ternary "1" "0" $ocr.preload | quote }}
+            - name: PADDLEOCR_MAX_REQUEST_BYTES
+              value: {{ $ocr.maxRequestBytes | quote }}
+            - name: SICLAW_OCR_MAX_CONCURRENCY
+              value: {{ $ocr.maxConcurrency | quote }}
+            - name: SICLAW_OCR_HARD_TIMEOUT_MS
+              value: {{ $ocr.hardTimeoutMs | quote }}
+            - name: SICLAW_OCR_MAX_PDF_PAGES
+              value: {{ $ocr.maxPdfPages | default 10 | quote }}
+            - name: SICLAW_OCR_MAX_IMAGE_PIXELS
+              value: {{ $ocr.maxImagePixels | default 50000000 | quote }}
+            - name: SICLAW_OCR_ENABLE_STRUCTURE
+              value: {{ ternary "1" "0" $ocr.enableStructure | quote }}
+            {{- if $ocr.textDetectionModelName }}
+            - name: PADDLEOCR_TEXT_DETECTION_MODEL_NAME
+              value: {{ $ocr.textDetectionModelName | quote }}
+            {{- end }}
+            {{- if $ocr.textRecognitionModelName }}
+            - name: PADDLEOCR_TEXT_RECOGNITION_MODEL_NAME
+              value: {{ $ocr.textRecognitionModelName | quote }}
+            {{- end }}
+            {{- if $ocr.textDetLimitSideLen }}
+            - name: PADDLEOCR_TEXT_DET_LIMIT_SIDE_LEN
+              value: {{ $ocr.textDetLimitSideLen | quote }}
+            {{- end }}
+            - name: PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT
+              value: "0"
+            - name: FLAGS_use_mkldnn
+              value: "0"
+            {{- range $key, $value := $ocr.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          resources:
+            {{- toYaml $ocr.resources | nindent 12 }}
+          {{- if $cacheEnabled }}
+          volumeMounts:
+            - name: paddlex-cache
+              mountPath: /root/.paddlex
+            - name: paddleocr-cache
+              mountPath: /root/.paddleocr
+          {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            timeoutSeconds: 3
+            periodSeconds: 10
+            failureThreshold: 30
+      {{- if $cacheEnabled }}
+      volumes:
+        - name: paddlex-cache
+          emptyDir: {}
+        - name: paddleocr-cache
+          emptyDir: {}
+      {{- end }}
+{{- end }}

@@ -1,0 +1,21 @@
+{{- $ocr := .Values.ocr | default dict -}}
+{{- $service := $ocr.service | default dict -}}
+{{- $port := $service.port | default 8088 -}}
+{{- if $ocr.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "siclaw.ocrServiceName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "siclaw.labels" (dict "ctx" . "component" "ocr") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "siclaw.selectorLabels" (dict "ctx" . "component" "ocr") | nindent 4 }}
+{{- end }}

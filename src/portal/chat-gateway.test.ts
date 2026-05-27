@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
 
@@ -74,6 +74,10 @@ function makeConnMap(overrides: Partial<RuntimeConnectionMap> = {}): RuntimeConn
 }
 
 beforeEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+});
 
 describe("chat-gateway routes", () => {
   let router: ReturnType<typeof createRestRouter>;
@@ -175,6 +179,265 @@ describe("chat-gateway routes", () => {
         text: "hi",
         sessionId: "s1",
       }));
+    });
+
+    it("calls OCR backend for chat attachments and forwards extracted evidence", async () => {
+      vi.stubEnv("SICLAW_OCR_BACKEND_URL", "http://siclaw-ocr-backend:8088/parse");
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          kind: "terminal",
+          language: "en",
+          route: "text",
+          confidence: 0.93,
+          text: "kubectl get pods\npod-a Running",
+          warnings: [],
+        }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "这个终端截图是什么问题",
+          session_id: "s1",
+          attachments: [{
+            kind: "image",
+            filename: "terminal.png",
+            mimeType: "image/png",
+            data: "aGVsbG8=",
+          }],
+        },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://siclaw-ocr-backend:8088/parse",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            "content-type": "application/json",
+            "x-request-id": expect.any(String),
+          }),
+        }),
+      );
+      const ocrBody = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+      expect(ocrBody.request_id).toBe(fetchMock.mock.calls[0][1].headers["x-request-id"]);
+      expect(ocrBody.kind_hint).toBe("auto");
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.text).toContain("这个终端截图是什么问题");
+      expect(command.text).toContain("OCR evidence extracted by Siclaw");
+      expect(command.text).toContain("kubectl get pods");
+    });
+
+    it("truncates OCR evidence before injecting it into the prompt", async () => {
+      vi.stubEnv("SICLAW_OCR_BACKEND_URL", "http://siclaw-ocr-backend:8088/parse");
+      vi.stubEnv("SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS", "12");
+      vi.stubEnv("SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS", "2000");
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          kind: "document",
+          language: "en",
+          route: "text",
+          confidence: 0.95,
+          text: "abcdefghijklmnopqrstuvwxyz",
+          warnings: [],
+        }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "read this",
+          session_id: "s1",
+          attachments: [{
+            kind: "pdf",
+            filename: "long.pdf",
+            mimeType: "application/pdf",
+            data: "aGVsbG8=",
+          }],
+        },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.text).toContain("abcdefghijkl");
+      expect(command.text).toContain("OCR text truncated after 12 characters; original length 26 characters.");
+      expect(command.text).not.toContain("mnopqrstuvwxyz");
+    });
+
+    it("truncates aggregate OCR evidence before injecting it into the prompt", async () => {
+      vi.stubEnv("SICLAW_OCR_BACKEND_URL", "http://siclaw-ocr-backend:8088/parse");
+      vi.stubEnv("SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS", "2000");
+      vi.stubEnv("SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS", "180");
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          kind: "document",
+          language: "en",
+          route: "text",
+          confidence: 0.95,
+          text: "x".repeat(500),
+          warnings: [],
+        }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "read this",
+          session_id: "s1",
+          attachments: [{
+            kind: "pdf",
+            filename: "long.pdf",
+            mimeType: "application/pdf",
+            data: "aGVsbG8=",
+          }],
+        },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.text).toContain("OCR evidence truncated after 180 total characters");
+      expect(command.text.length).toBeLessThan(600);
+    });
+
+    it("starts the SSE response before waiting for OCR", async () => {
+      vi.stubEnv("SICLAW_OCR_BACKEND_URL", "http://siclaw-ocr-backend:8088/parse");
+      let resolveFetch: ((value: unknown) => void) | undefined;
+      const fetchMock = vi.fn(() => new Promise((resolve) => { resolveFetch = resolve; }));
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "read this",
+          session_id: "s1",
+          attachments: [{
+            kind: "image",
+            filename: "terminal.png",
+            mimeType: "image/png",
+            data: "aGVsbG8=",
+          }],
+        },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      expect(res.writeHead).toHaveBeenCalledWith(200, expect.objectContaining({
+        "Content-Type": "text/event-stream",
+      }));
+      expect(connMap.sendCommand).not.toHaveBeenCalled();
+
+      resolveFetch?.({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          kind: "terminal",
+          language: "en",
+          route: "text",
+          confidence: 0.95,
+          text: "kubectl get pods",
+          warnings: [],
+        }),
+      });
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      expect(connMap.sendCommand).toHaveBeenCalled();
+    });
+
+    it("keeps attachment sends recoverable when OCR backend is not configured", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      query
+        .mockResolvedValueOnce([[{ model_provider: "openai", model_id: "gpt-4" }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: {
+          text: "",
+          session_id: "s1",
+          attachments: [{
+            kind: "image",
+            filename: "terminal.png",
+            mimeType: "image/png",
+            data: "aGVsbG8=",
+          }],
+        },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.text).toContain("Please analyze the attached file(s).");
+      expect(command.text).toContain("OCR unavailable: OCR backend is not configured");
     });
 
     it("forwards model compatibility for OpenAI-compatible gateway chat sends", async () => {

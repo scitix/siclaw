@@ -1,6 +1,6 @@
 Thank you for installing {{ include "siclaw.fullname" . }}!
 
-{{- if .Values.agentbox.persistence.enabled }}
+{{- if and (eq (include "siclaw.runtime.enabled" .) "true") .Values.agentbox.persistence.enabled }}
 
 ℹ️  User data persistence is enabled.
    Chart-managed PVC: "{{ include "siclaw.dataPvcName" . }}" (ReadWriteMany).
@@ -10,6 +10,7 @@ Thank you for installing {{ include "siclaw.fullname" . }}!
    Gateway will create per-user subdirectories automatically.
 {{- end }}
 
+{{- if eq (include "siclaw.runtime.enabled" .) "true" }}
 ℹ️  Runtime mTLS CA
    {{- $caSecret := include "siclaw.runtimeTls.caSecret" . }}
    {{- $generateCa := include "siclaw.runtimeTls.generateCa" . }}
@@ -27,3 +28,4 @@ Thank you for installing {{ include "siclaw.fullname" . }}!
        every render, overwriting this Secret and breaking mTLS for every running AgentBox.
        For pre-rendered pipelines, set runtime.tls.generateCa=false and supply runtime.tls.caSecret.
    {{- end }}
+{{- end }}

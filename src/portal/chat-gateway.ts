@@ -10,6 +10,7 @@ import http from "node:http";
 import {
   sendJson,
   parseBody,
+  RequestBodyTooLargeError,
   requireAuth,
   type RestRouter,
 } from "../gateway/rest-router.js";
@@ -22,6 +23,255 @@ import {
   type ErrorDetail,
 } from "../lib/error-envelope.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
+
+interface ChatAttachment {
+  kind?: string;
+  filename?: string;
+  mimeType?: string;
+  mime_type?: string;
+  data?: string;
+}
+
+interface ChatRequestBody {
+  text?: string;
+  session_id?: string;
+  attachments?: ChatAttachment[];
+}
+
+const MAX_CHAT_ATTACHMENTS = 4;
+const MAX_ATTACHMENT_BASE64_CHARS = 8 * 1024 * 1024;
+const MAX_CHAT_REQUEST_BODY_BYTES = MAX_CHAT_ATTACHMENTS * MAX_ATTACHMENT_BASE64_CHARS + 512 * 1024;
+const OCR_DEFAULT_TIMEOUT_MS = 120_000;
+const OCR_DEFAULT_MAX_EVIDENCE_TEXT_CHARS = 32 * 1024;
+const OCR_DEFAULT_MAX_TOTAL_EVIDENCE_TEXT_CHARS = 64 * 1024;
+const ATTACHMENT_ONLY_PROMPT = "Please analyze the attached file(s).";
+const SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
+
+function ocrBackendUrl(): string | undefined {
+  return process.env.SICLAW_OCR_BACKEND_URL?.trim() || undefined;
+}
+
+function ocrTimeoutMs(): number {
+  const raw = process.env.SICLAW_OCR_TIMEOUT_MS?.trim();
+  if (!raw) return OCR_DEFAULT_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : OCR_DEFAULT_TIMEOUT_MS;
+}
+
+function ocrMaxEvidenceTextChars(): number {
+  const raw = process.env.SICLAW_OCR_MAX_EVIDENCE_TEXT_CHARS?.trim();
+  if (!raw) return OCR_DEFAULT_MAX_EVIDENCE_TEXT_CHARS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : OCR_DEFAULT_MAX_EVIDENCE_TEXT_CHARS;
+}
+
+function ocrMaxTotalEvidenceTextChars(): number {
+  const raw = process.env.SICLAW_OCR_MAX_TOTAL_EVIDENCE_TEXT_CHARS?.trim();
+  if (!raw) return OCR_DEFAULT_MAX_TOTAL_EVIDENCE_TEXT_CHARS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : OCR_DEFAULT_MAX_TOTAL_EVIDENCE_TEXT_CHARS;
+}
+
+function normalizeChatAttachments(raw: unknown): ChatAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(0, MAX_CHAT_ATTACHMENTS).filter((item): item is ChatAttachment => {
+    if (!item || typeof item !== "object") return false;
+    const candidate = item as ChatAttachment;
+    const mimeType = normalizeMimeType(candidate.mimeType ?? candidate.mime_type, candidate.filename);
+    const isImage = candidate.kind === "image" && SUPPORTED_IMAGE_MIME_TYPES.has(mimeType);
+    const isPdf = candidate.kind === "pdf" && mimeType === "application/pdf";
+    return (isImage || isPdf)
+      && typeof candidate.filename === "string"
+      && typeof candidate.data === "string"
+      && candidate.data.length > 0
+      && candidate.data.length <= MAX_ATTACHMENT_BASE64_CHARS;
+  }).map((attachment) => ({
+    ...attachment,
+    filename: safeAttachmentFilename(attachment.filename),
+  }));
+}
+
+function normalizeMimeType(raw: string | undefined, filename: string | undefined): string {
+  const mimeType = (raw ?? "").trim().toLowerCase();
+  if (mimeType === "application/pdf") return mimeType;
+  if (SUPPORTED_IMAGE_MIME_TYPES.has(mimeType)) return mimeType;
+
+  const lowerName = (filename ?? "").toLowerCase();
+  if (lowerName.endsWith(".pdf")) return "application/pdf";
+  if (lowerName.endsWith(".png")) return "image/png";
+  if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) return "image/jpeg";
+  if (lowerName.endsWith(".webp")) return "image/webp";
+  return mimeType;
+}
+
+function safeAttachmentFilename(value: string | undefined): string {
+  const basename = (value ?? "attachment")
+    .split(/[\\/]/)
+    .filter(Boolean)
+    .pop() ?? "attachment";
+  const cleaned = basename.replace(/[\r\n\t]/g, "_").trim();
+  return cleaned.slice(0, 160) || "attachment";
+}
+
+function safeLogValue(value: unknown): string {
+  const text = String(value ?? "-").trim() || "-";
+  return text
+    .slice(0, 160)
+    .replace(/[^\p{L}\p{N}._:/@-]+/gu, "_");
+}
+
+async function appendOcrEvidence(text: string, attachments: ChatAttachment[] | undefined): Promise<string> {
+  const normalizedAttachments = normalizeChatAttachments(attachments);
+  if (normalizedAttachments.length === 0) return text;
+
+  const backendUrl = ocrBackendUrl();
+  const sections = await Promise.all(normalizedAttachments.map(async (attachment) => {
+    const mimeType = normalizeMimeType(attachment.mimeType ?? attachment.mime_type, attachment.filename);
+    const kindHint = ocrKindHint(attachment, mimeType);
+    const started = Date.now();
+    const requestId = crypto.randomUUID();
+    if (!backendUrl) {
+      return `### ${attachment.filename}\nOCR unavailable: OCR backend is not configured`;
+    }
+    try {
+      const res = await fetch(backendUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": requestId,
+        },
+        body: JSON.stringify({
+          request_id: requestId,
+          input: attachment.filename,
+          kind_hint: kindHint,
+          language_hint: "auto",
+          expected_output: "siclaw_screenshot_evidence_v1",
+          source: {
+            type: "file_base64",
+            data: attachment.data,
+            filename: attachment.filename,
+            mime_type: mimeType,
+          },
+        }),
+        signal: AbortSignal.timeout(ocrTimeoutMs()),
+      });
+
+      const responseText = await res.text();
+      const elapsedMs = Date.now() - started;
+      if (!res.ok) {
+        const reason = summarizeOcrError(responseText);
+        console.warn(`[portal-chat] OCR failed for ${safeLogValue(attachment.filename)}: HTTP ${res.status} request_id=${requestId} kind_hint=${safeLogValue(kindHint)} elapsed_ms=${elapsedMs}${reason ? ` ${reason}` : ""}`);
+        return `### ${attachment.filename}\nOCR failed: HTTP ${res.status}${reason ? ` - ${reason}` : ""}`;
+      }
+
+      let evidence: Record<string, unknown>;
+      try {
+        evidence = responseText ? JSON.parse(responseText) as Record<string, unknown> : {};
+      } catch (err) {
+        console.warn(
+          `[portal-chat] OCR malformed response for ${safeLogValue(attachment.filename)}: request_id=${requestId} `
+          + `kind_hint=${safeLogValue(kindHint)} elapsed_ms=${elapsedMs} error=${safeLogValue(errorMessage(err))}`,
+        );
+        return `### ${attachment.filename}\nOCR failed: malformed backend response`;
+      }
+      console.log(
+        `[portal-chat] OCR parsed ${safeLogValue(attachment.filename)}: request_id=${requestId} kind_hint=${safeLogValue(kindHint)} `
+        + `kind=${String(evidence.kind ?? "unknown")} route=${String(evidence.route ?? "unknown")} `
+        + `elapsed_ms=${elapsedMs}`,
+      );
+      const warnings = Array.isArray(evidence.warnings)
+        ? evidence.warnings.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        : [];
+      const boundedText = boundedOcrEvidenceText(evidence.text);
+      const warningLines = boundedText.warning ? [...warnings, boundedText.warning] : warnings;
+      return [
+        `### ${attachment.filename}`,
+        `kind: ${String(evidence.kind ?? "unknown")}`,
+        `route: ${String(evidence.route ?? "unknown")}`,
+        `language: ${String(evidence.language ?? "unknown")}`,
+        `confidence: ${String(evidence.confidence ?? "unknown")}`,
+        `elapsed_ms: ${elapsedMs}`,
+        warningLines.length ? `warnings: ${warningLines.join("; ")}` : "",
+        "",
+        boundedText.text,
+      ].filter((line) => line !== "").join("\n");
+    } catch (err) {
+      const elapsedMs = Date.now() - started;
+      console.warn(
+        `[portal-chat] OCR exception for ${safeLogValue(attachment.filename)}: request_id=${requestId} `
+        + `kind_hint=${safeLogValue(kindHint)} elapsed_ms=${elapsedMs} error=${safeLogValue(errorMessage(err))}`,
+      );
+      return `### ${attachment.filename}\nOCR failed: ${errorMessage(err)}`;
+    }
+  }));
+
+  return [
+    text.trim() || ATTACHMENT_ONLY_PROMPT,
+    "",
+    "[System: The user pasted image or PDF attachment(s). OCR evidence extracted by Siclaw is below. Use it as evidence, preserve exact command/table text when possible, and mention if OCR appears incomplete or uncertain.]",
+    "",
+    boundedOcrEvidenceSections(sections),
+  ].join("\n");
+}
+
+function ocrKindHint(attachment: ChatAttachment, mimeType: string): string {
+  const filename = (attachment.filename ?? "").toLowerCase();
+  if (mimeType === "application/pdf" || filename.endsWith(".pdf")) return "pdf";
+  return "auto";
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  return String(err);
+}
+
+function summarizeOcrError(raw: string): string {
+  if (!raw.trim()) return "";
+  try {
+    const parsed = JSON.parse(raw) as { error?: unknown };
+    if (typeof parsed.error === "string") return parsed.error.slice(0, 500);
+  } catch {
+    // Fall through to plain text summary.
+  }
+  return raw.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function boundedOcrEvidenceText(raw: unknown): { text: string; warning?: string } {
+  const text = String(raw ?? "").trim();
+  if (!text) return { text: "(no OCR text extracted)" };
+
+  const maxChars = ocrMaxEvidenceTextChars();
+  if (text.length <= maxChars) return { text };
+
+  return {
+    text: `${text.slice(0, maxChars).trimEnd()}\n\n[OCR evidence truncated after ${maxChars} characters; original length ${text.length} characters.]`,
+    warning: `OCR text truncated after ${maxChars} characters; original length ${text.length} characters.`,
+  };
+}
+
+function boundedOcrEvidenceSections(sections: string[]): string {
+  const evidence = sections.join("\n\n");
+  const maxChars = ocrMaxTotalEvidenceTextChars();
+  if (evidence.length <= maxChars) return evidence;
+  return `${evidence.slice(0, maxChars).trimEnd()}\n\n[OCR evidence truncated after ${maxChars} total characters; original length ${evidence.length} characters.]`;
+}
+
+async function parseChatRequestBody(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<ChatRequestBody | null> {
+  try {
+    return await parseBody<ChatRequestBody>(req, { maxBytes: MAX_CHAT_REQUEST_BODY_BYTES });
+  } catch (err) {
+    const tooLarge = err instanceof RequestBodyTooLargeError;
+    sendJson(res, tooLarge ? 413 : 400, errorBody({
+      code: ErrorCodes.BAD_REQUEST,
+      message: tooLarge ? err.message : "Invalid JSON body",
+      retriable: false,
+    }));
+    return null;
+  }
+}
 
 /** Resolve model binding directly from Portal's own DB. */
 async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
@@ -130,9 +380,10 @@ export function registerChatRoutes(
       return;
     }
 
-    const body = await parseBody<{ text?: string; session_id?: string }>(req);
-    if (!body.text) {
-      sendJson(res, 400, errorBody({ code: ErrorCodes.BAD_REQUEST, message: "text is required", retriable: false }));
+    const body = await parseChatRequestBody(req, res);
+    if (!body) return;
+    if (!body.text && !normalizeChatAttachments(body.attachments).length) {
+      sendJson(res, 400, errorBody({ code: ErrorCodes.BAD_REQUEST, message: "text or supported attachment is required", retriable: false }));
       return;
     }
 
@@ -209,11 +460,13 @@ export function registerChatRoutes(
       }
     });
 
+    const promptText = await appendOcrEvidence(body.text ?? "", body.attachments);
+
     // Send chat.send command
     const result = await connectionMap.sendCommand(agentId, "chat.send", {
       agentId,
       userId: auth.userId,
-      text: body.text,
+      text: promptText,
       sessionId,
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
@@ -241,14 +494,16 @@ export function registerChatRoutes(
     const auth = requireAuth(req, jwtSecret);
     if (!auth) { sendJson(res, 401, { error: "Authentication required" }); return; }
 
-    const body = await parseBody<{ session_id?: string; text?: string }>(req);
-    if (!body.session_id || !body.text) { sendJson(res, 400, { error: "session_id and text are required" }); return; }
+    const body = await parseChatRequestBody(req, res);
+    if (!body) return;
+    if (!body.session_id || (!body.text && !normalizeChatAttachments(body.attachments).length)) { sendJson(res, 400, { error: "session_id and text or attachments are required" }); return; }
+    const promptText = await appendOcrEvidence(body.text ?? "", body.attachments);
 
     const result = await connectionMap.sendCommand(params.id, "chat.steer", {
       agentId: params.id,
       userId: auth.userId,
       sessionId: body.session_id,
-      text: body.text,
+      text: promptText,
     });
 
     sendJson(res, result.ok ? 200 : 502, result);

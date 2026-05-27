@@ -63,10 +63,43 @@ Usage: {{ include "siclaw.image" (dict "component" "gateway" "ctx" .) }}
 {{- end }}
 
 {{/*
+Resolve runtime.enabled. Returns the literal string "true" or "false".
+Defaults to "true" when the field is missing so helm upgrade --reuse-values
+keeps older Runtime releases enabled.
+*/}}
+{{- define "siclaw.runtime.enabled" -}}
+{{- $runtime := .Values.runtime | default dict -}}
+{{- if hasKey $runtime "enabled" -}}{{- $runtime.enabled -}}{{- else -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Build agentbox image string — same registry/tag as gateway, different component name.
 */}}
 {{- define "siclaw.agentboxImage" -}}
 {{- include "siclaw.image" (dict "component" "agentbox" "ctx" .) -}}
+{{- end }}
+
+{{/*
+Build OCR image string. Allows the independently deployed OCR service to move
+faster than the main Portal/Runtime images when desired.
+*/}}
+{{- define "siclaw.ocrImage" -}}
+{{- $ocr := .Values.ocr | default dict -}}
+{{- $image := $ocr.image | default dict -}}
+{{- $repo := $image.repository | default "" -}}
+{{- $tag := $image.tag | default .Values.image.tag -}}
+{{- if $repo -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- else -}}
+{{- include "siclaw.image" (dict "component" "ocr" "ctx" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the OCR backend Service.
+*/}}
+{{- define "siclaw.ocrServiceName" -}}
+{{- printf "%s-ocr-backend" (include "siclaw.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end }}
 
 {{/*

@@ -32,6 +32,7 @@ database:
 
 # Runtime points to Portal (not Upstream)
 runtime:
+  enabled: true
   replicas: 1
   serverUrl: "http://siclaw-portal:3003"
   jwtSecret: ""       # REQUIRED: --set runtime.jwtSecret=...
@@ -47,6 +48,9 @@ portal:
     type: NodePort
     port: 3003
     nodePort: 31003   # Access Portal UI at http://<node-ip>:31003
+
+ocr:
+  enabled: true
 
 agentbox:
   persistence:

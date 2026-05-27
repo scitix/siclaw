@@ -1,8 +1,10 @@
-import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check, ArrowRight, PencilLine, FileText } from "lucide-react"
-import type { ContextUsage, PrefixActionChip } from "./types"
+import { ArrowUp, ArrowDown, Square, X, Loader2, SearchCode, Plus, Check, ArrowRight, PencilLine, FileText, Paperclip } from "lucide-react"
+import type { ChatAttachment, ContextUsage, PrefixActionChip } from "./types"
 import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react"
-import type { KeyboardEvent } from "react"
+import type { ClipboardEvent, KeyboardEvent } from "react"
 import { cn } from "./cn"
+import { ImageAttachmentPreview } from "./ImageAttachmentPreview"
+import { useToast } from "../toast"
 
 /** Format token count: 0 -> "0", 1234 -> "1.2k" */
 function formatTokens(n: number): string {
@@ -32,7 +34,7 @@ function PrefixChipIcon({ chip }: { chip: PrefixActionChip }) {
 }
 
 interface InputAreaProps {
-  onSend: (message: string) => void
+  onSend: (message: string, attachments?: ChatAttachment[]) => void
   onAbort?: () => void
   disabled?: boolean
   isLoading?: boolean
@@ -47,6 +49,51 @@ interface InputAreaProps {
   historyMessages?: string[]
   activePrefix?: PrefixActionChip | null
   onClearPrefix?: () => void
+}
+
+const MAX_PASTED_IMAGE_BYTES = 6 * 1024 * 1024
+const MAX_PASTED_PDF_BYTES = 6 * 1024 * 1024
+const MAX_ATTACHMENTS = 4
+const ACCEPTED_ATTACHMENT_TYPES = ".png,.jpg,.jpeg,.webp,.pdf,image/png,image/jpeg,image/webp,application/pdf"
+const SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/webp"])
+
+function readFileBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const value = String(reader.result ?? "")
+      resolve(value.includes(",") ? value.slice(value.indexOf(",") + 1) : value)
+    }
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read attachment"))
+    reader.readAsDataURL(file)
+  })
+}
+
+function pastedImageName(file: File, index: number): string {
+  if (file.name) return file.name
+  const ext = file.type === "image/jpeg" ? "jpg" : file.type === "image/webp" ? "webp" : "png"
+  return `pasted-image-${index + 1}.${ext}`
+}
+
+function pastedPdfName(file: File, index: number): string {
+  return file.name || `pasted-document-${index + 1}.pdf`
+}
+
+function normalizedAttachmentMimeType(file: File): string {
+  const mimeType = file.type.toLowerCase()
+  if (mimeType === "application/pdf" || SUPPORTED_IMAGE_MIME_TYPES.has(mimeType)) return mimeType
+
+  const lowerName = file.name.toLowerCase()
+  if (lowerName.endsWith(".pdf")) return "application/pdf"
+  if (lowerName.endsWith(".png")) return "image/png"
+  if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) return "image/jpeg"
+  if (lowerName.endsWith(".webp")) return "image/webp"
+  return mimeType
+}
+
+function isSupportedPastedFile(file: File): boolean {
+  const mimeType = normalizedAttachmentMimeType(file)
+  return SUPPORTED_IMAGE_MIME_TYPES.has(mimeType) || mimeType === "application/pdf"
 }
 
 export function InputArea({
@@ -67,10 +114,13 @@ export function InputArea({
   onClearPrefix,
 }: InputAreaProps) {
   const [value, setValue] = useState("")
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([])
   const [isFocused, setIsFocused] = useState(false)
   const [isAborting, setIsAborting] = useState(false)
+  const toast = useToast()
   const isComposingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const historyCursorRef = useRef<number | null>(null)
   const draftBeforeHistoryRef = useRef("")
 
@@ -111,10 +161,62 @@ export function InputArea({
 
   const [showActionMenu, setShowActionMenu] = useState(false)
 
+  const addFiles = useCallback((files: File[]) => {
+    const supportedFiles = files.filter(isSupportedPastedFile)
+    if (supportedFiles.length === 0) {
+      if (files.length > 0) toast.error("Only PNG, JPEG, WebP, and PDF attachments are supported.")
+      return
+    }
+    const unsupportedCount = files.length - supportedFiles.length
+    if (unsupportedCount > 0) {
+      toast.error(`${unsupportedCount} unsupported attachment${unsupportedCount === 1 ? "" : "s"} skipped.`)
+    }
+
+    void Promise.allSettled(supportedFiles.map(async (file, index) => {
+      const mimeType = normalizedAttachmentMimeType(file)
+      const isPdf = mimeType === "application/pdf"
+      const filename = isPdf ? pastedPdfName(file, index) : pastedImageName(file, index)
+      const maxBytes = isPdf ? MAX_PASTED_PDF_BYTES : MAX_PASTED_IMAGE_BYTES
+      if (file.size > maxBytes) {
+        throw new Error(`${filename} is too large`)
+      }
+      return {
+        kind: isPdf ? "pdf" as const : "image" as const,
+        filename,
+        mimeType,
+        data: await readFileBase64(file),
+      }
+    }))
+      .then((results) => {
+        const next: ChatAttachment[] = []
+        const errors: string[] = []
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            next.push(result.value)
+          } else {
+            errors.push(result.reason instanceof Error ? result.reason.message : "Failed to read attachment")
+          }
+        }
+        if (next.length > 0) {
+          const availableSlots = Math.max(0, MAX_ATTACHMENTS - attachments.length)
+          const accepted = next.slice(0, availableSlots)
+          const skipped = next.length - accepted.length
+          if (skipped > 0) {
+            toast.error(`Attachment limit is ${MAX_ATTACHMENTS}; ${skipped} file${skipped === 1 ? "" : "s"} skipped.`)
+          }
+          if (accepted.length > 0) setAttachments((prev) => [...prev, ...accepted].slice(0, MAX_ATTACHMENTS))
+        }
+        for (const error of errors) toast.error(error)
+      })
+      .catch((err) => {
+        toast.error(err instanceof Error ? err.message : "Failed to read attachment")
+      })
+  }, [attachments.length, toast])
+
   const handleSend = useCallback(async () => {
     const text = value.trim()
     if (disabled) return
-    if (!text && !activePrefix) return
+    if (!text && !activePrefix && attachments.length === 0) return
 
     let fullMessage = ""
     if (deepInvestigation) {
@@ -131,12 +233,25 @@ export function InputArea({
       fullMessage += text
     }
 
-    onSend(fullMessage.trim())
+    onSend(fullMessage.trim(), attachments.length > 0 ? attachments : undefined)
     setValue("")
+    setAttachments([])
     historyCursorRef.current = null
     draftBeforeHistoryRef.current = ""
     onClearPrefix?.()
-  }, [value, disabled, onSend, deepInvestigation, activePrefix, onClearPrefix])
+  }, [value, disabled, onSend, deepInvestigation, activePrefix, onClearPrefix, attachments])
+
+  const handlePaste = useCallback((e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = Array.from(e.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => !!file)
+      .filter(isSupportedPastedFile)
+
+    if (files.length === 0) return
+    e.preventDefault()
+    addFiles(files)
+  }, [addFiles])
 
   const navigateHistory = useCallback(
     (direction: "previous" | "next") => {
@@ -223,7 +338,7 @@ export function InputArea({
     [handleSend, activePrefix, onClearPrefix, navigateHistory],
   )
 
-  const hasContent = value.trim() || !!activePrefix
+  const hasContent = !!value.trim() || !!activePrefix || attachments.length > 0
 
   return (
     <>
@@ -239,6 +354,18 @@ export function InputArea({
             {/* Toolbar */}
             <div className="flex items-center gap-1 px-4 pt-3 pb-1 min-w-0">
               <div className="relative">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept={ACCEPTED_ATTACHMENT_TYPES}
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    const files = Array.from(e.currentTarget.files ?? [])
+                    if (files.length > 0) addFiles(files)
+                    e.currentTarget.value = ""
+                  }}
+                />
                 <button
                   type="button"
                   onClick={() => setShowActionMenu(!showActionMenu)}
@@ -259,6 +386,18 @@ export function InputArea({
                     <div className="fixed inset-0 z-10" onClick={() => setShowActionMenu(false)} />
                     <div className="absolute bottom-full left-0 mb-1 bg-card rounded-xl shadow-xl shadow-black/20 border border-border z-20 w-[220px]">
                       <div className="py-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowActionMenu(false)
+                            fileInputRef.current?.click()
+                          }}
+                          className="flex items-center gap-3 w-full px-3 py-2.5 text-left hover:bg-secondary transition-colors"
+                        >
+                          <Paperclip className="w-4 h-4 text-muted-foreground shrink-0" />
+                          <span className="flex-1 text-sm text-foreground">Add photos & files</span>
+                        </button>
+
                         {/* Deep Investigation */}
                         <button
                           type="button"
@@ -335,6 +474,15 @@ export function InputArea({
               </div>
             )}
 
+            {attachments.length > 0 && (
+              <ImageAttachmentPreview
+                attachments={attachments}
+                className="px-4 pb-2"
+                tileClassName="h-28 w-44"
+                onRemove={(idx) => setAttachments((prev) => prev.filter((_, i) => i !== idx))}
+              />
+            )}
+
             <div className="relative w-full">
               <textarea
                 ref={textareaRef}
@@ -346,6 +494,7 @@ export function InputArea({
                   resetHistoryNavigation(e.target.value)
                 }}
                 onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
                 onCompositionStart={() => {
                   isComposingRef.current = true
                 }}
@@ -364,7 +513,7 @@ export function InputArea({
               />
             </div>
 
-            {isLoading && value.trim() ? (
+            {isLoading && (value.trim() || attachments.length > 0 || activePrefix) ? (
               <button
                 onClick={handleSend}
                 className="absolute right-3 bottom-3 p-2 rounded-lg bg-blue-600 text-white shadow-md hover:bg-blue-700 transition-all"

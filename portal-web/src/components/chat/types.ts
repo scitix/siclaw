@@ -44,6 +44,7 @@ export interface PilotMessage {
   id: string
   role: MessageRole
   content: string
+  attachments?: ChatAttachment[]
   toolName?: string
   toolInput?: string
   /** Raw parsed tool input, when available, for structured cards. */
@@ -75,6 +76,13 @@ export interface ContextUsage {
   cacheReadTokens: number
   cacheWriteTokens: number
   cost: number
+}
+
+export interface ChatAttachment {
+  kind: "image" | "pdf"
+  filename: string
+  mimeType: string
+  data: string
 }
 
 /**
