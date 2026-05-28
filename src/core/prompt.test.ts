@@ -1,0 +1,40 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { buildSreSystemPrompt } from "./prompt.js";
+
+const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
+
+afterEach(() => {
+  if (ORIGINAL_MEMORY_ENABLED === undefined) {
+    delete process.env.SICLAW_MEMORY_ENABLED;
+  } else {
+    process.env.SICLAW_MEMORY_ENABLED = ORIGINAL_MEMORY_ENABLED;
+  }
+});
+
+describe("buildSreSystemPrompt memory flag", () => {
+  it("keeps bundled memory instructions when memory is enabled", () => {
+    delete process.env.SICLAW_MEMORY_ENABLED;
+
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).toContain("memory_search");
+    expect(prompt).toContain("memory_get");
+    expect(prompt).toContain("remember context from previous sessions");
+    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).not.toContain("{{memoryIntro}}");
+    expect(prompt).not.toContain("{{memorySection}}");
+  });
+
+  it("removes bundled memory instructions when memory is disabled", () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).not.toContain("memory_search");
+    expect(prompt).not.toContain("memory_get");
+    expect(prompt).not.toContain("remember context from previous sessions");
+    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).not.toContain("{{memoryIntro}}");
+    expect(prompt).not.toContain("{{memorySection}}");
+  });
+});

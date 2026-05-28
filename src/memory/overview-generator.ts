@@ -8,18 +8,20 @@ import path from "node:path";
 export interface OverviewOpts {
   reposDir?: string;
   docsDir?: string;
+  memoryEnabled?: boolean;
 }
 
 /**
  * Build a concise knowledge overview from content directories.
  * Scans repos/ and docs/ only. Past investigations live under
  * memory/investigations/ but are intentionally NOT auto-injected into the
- * prompt — the agent pulls them on demand via the `memory_search` tool.
+ * prompt; when memory is enabled the agent can pull them on demand via
+ * `memory_search`.
  * Pure sync filesystem scan — no DB dependency.
  * Returns empty string if no knowledge files exist.
  */
 export function buildKnowledgeOverview(opts: OverviewOpts): string {
-  const { reposDir, docsDir } = opts;
+  const { reposDir, docsDir, memoryEnabled = true } = opts;
   const TOTAL_BUDGET = 1200;
 
   const repoEntries = reposDir ? scanRepos(reposDir) : [];
@@ -72,7 +74,9 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
   }
 
   // --- Footer ---
-  parts.push('\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.');
+  parts.push(memoryEnabled
+    ? '\n\nUse `read` to view files in repos/ or docs/, or `memory_search` to find specific facts.'
+    : '\n\nUse `read` to view files in repos/ or docs/.');
 
   return parts.join("");
 }
@@ -210,4 +214,3 @@ function scanDocs(docsDir: string): DocEntry[] {
   entries.sort((a, b) => b.fileCount - a.fileCount || (a.category === "(root)" ? 1 : -1));
   return entries;
 }
-

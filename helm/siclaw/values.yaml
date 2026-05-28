@@ -57,6 +57,10 @@ runtime:
     limits:
       cpu: "2"
       memory: "2Gi"
+  memory:
+    # Disabled by default for Sicore-integrated production deployments. Enabling
+    # this re-exposes memory_search/memory_get and session memory auto-save.
+    enabled: false
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)

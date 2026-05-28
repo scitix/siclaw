@@ -4,6 +4,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { MemoryIndexer } from "../../memory/index.js";
+import { isMemoryEnabled } from "../../core/config.js";
 
 interface MemorySearchParams {
   query: string;
@@ -111,5 +112,5 @@ export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createMemorySearchTool(refs.memoryIndexer!),
   platform: true,
-  available: (refs) => !!refs.memoryIndexer,
+  available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer,
 };

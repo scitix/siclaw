@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
+import { isMemoryEnabled } from "../../core/config.js";
 
 interface MemoryGetParams {
   path: string;
@@ -117,5 +118,5 @@ export const registration: ToolEntry = {
   category: "query",
   create: (refs) => createMemoryGetTool(refs.memoryDir!),
   platform: true,
-  available: (refs) => !!refs.memoryIndexer && !!refs.memoryDir,
+  available: (refs) => isMemoryEnabled() && !!refs.memoryIndexer && !!refs.memoryDir,
 };

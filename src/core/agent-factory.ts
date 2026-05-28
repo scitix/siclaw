@@ -34,7 +34,7 @@ import agentExtension from "./extensions/agent.js";
 import { PiAgentBrain } from "./brains/pi-agent-brain.js";
 import type { BrainSession } from "./brain-session.js";
 import { McpClientManager } from "./mcp-client.js";
-import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm } from "./config.js";
+import { loadConfig, getEmbeddingConfig, getConfigPath, getDefaultLlm, isMemoryEnabled } from "./config.js";
 import { createGuardRegistry, installGuardPipeline } from "./guard-pipeline.js";
 
 import type { SessionMode, KubeconfigRef, MemoryRef, DpStateRef, MutableDpStateRef } from "./types.js";
@@ -173,13 +173,13 @@ function truncateWithBudget(content: string, maxChars: number): string {
  * lazy index (name + description + path) and the model reads SKILL.md on demand.
  */
 function buildAppendSystemPrompt(
-  memoryDir: string,
+  memoryDir: string | null,
 ): string[] {
   const parts: string[] = [];
 
   // Load PROFILE.md (user profile for personalized interactions)
-  const profileFile = path.join(memoryDir, "PROFILE.md");
-  if (fs.existsSync(profileFile)) {
+  const profileFile = memoryDir ? path.join(memoryDir, "PROFILE.md") : null;
+  if (profileFile && fs.existsSync(profileFile)) {
     let profileContent = fs.readFileSync(profileFile, "utf-8").trim();
     if (profileContent) {
       profileContent = truncateWithBudget(profileContent, 5_000);
@@ -231,7 +231,7 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   const config_ = loadConfig();
   const reposDir_ = path.resolve(process.cwd(), config_.paths.reposDir);
   const docsDir_ = path.resolve(process.cwd(), config_.paths.docsDir);
-  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_ });
+  const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir });
   if (overview) {
     parts.push(overview);
   }
@@ -248,6 +248,24 @@ function assertPathAllowed(absolutePath: string, allowedDirs: string[], operatio
       `${operation} blocked: "${absolutePath}" is outside allowed directories. ` +
       `Allowed: ${allowedDirs.join(", ")}`
     );
+  }
+}
+
+function isPathInsideDir(absolutePath: string, dir: string): boolean {
+  const resolved = path.resolve(absolutePath);
+  const resolvedDir = path.resolve(dir);
+  return resolved === resolvedDir || resolved.startsWith(resolvedDir + path.sep);
+}
+
+function assertToolPathAllowed(
+  absolutePath: string,
+  allowedDirs: string[],
+  operation: string,
+  blockedMemoryDir: string | null,
+): void {
+  assertPathAllowed(absolutePath, allowedDirs, operation);
+  if (blockedMemoryDir && isPathInsideDir(absolutePath, blockedMemoryDir)) {
+    throw new Error(`${operation} blocked: Siclaw memory is disabled.`);
   }
 }
 
@@ -283,6 +301,7 @@ export async function createSiclawSession(
   const agentId: string | null = opts?.agentId ?? null;
   const sessionIdRef: { current: string } = { current: "" };
   const mode = opts?.mode ?? "web";
+  const memoryEnabled = isMemoryEnabled();
   // Mutable ref — populated after memoryIndexer is created (below) so memory-
   // consuming tools can retrieve past investigations and persist new ones.
   const memoryRef: MemoryRef = {};
@@ -299,40 +318,46 @@ export async function createSiclawSession(
   const userDataDir = path.resolve(cwd, config.paths.userDataDir);
   const memoryDir = path.join(userDataDir, "memory");
 
-  // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
-  // opens its sqlite DB inside memoryDir, and before buildAppendSystemPrompt
-  // reads PROFILE.md below. Previously the mkdir happened later in the function,
-  // so a fresh install saw ERR_SQLITE_ERROR on first run and lost memory tools
-  // for that session.
-  if (!fs.existsSync(memoryDir)) {
-    fs.mkdirSync(memoryDir, { recursive: true });
-  }
-  const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
-  if (!fs.existsSync(skeletonProfilePath)) {
-    fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+  if (memoryEnabled) {
+    // Ensure memoryDir and skeleton PROFILE.md exist before the memory indexer
+    // opens its sqlite DB inside memoryDir, and before buildAppendSystemPrompt
+    // reads PROFILE.md below. Previously the mkdir happened later in the function,
+    // so a fresh install saw ERR_SQLITE_ERROR on first run and lost memory tools
+    // for that session.
+    if (!fs.existsSync(memoryDir)) {
+      fs.mkdirSync(memoryDir, { recursive: true });
+    }
+    const skeletonProfilePath = path.join(memoryDir, "PROFILE.md");
+    if (!fs.existsSync(skeletonProfilePath)) {
+      fs.writeFileSync(skeletonProfilePath, `# User Profile\n- **Name**: TBD\n- **Role**: TBD\n- **Infrastructure**: TBD\n- **Preferences**: TBD\n- **Language**: English\n`);
+    }
   }
 
   // ── Memory indexer init (before resolve — memory tools use `available` guard) ──
   // TIMING: must run before DefaultResourceLoader construction (L~478) so that
   // the memoryFlushExtension lambda captures the initialized .current value.
   const memoryIndexerRef: { current: MemoryIndexer | undefined } = { current: undefined };
-  let memoryIndexer: MemoryIndexer | undefined = opts?.memoryIndexer;
-  try {
-    if (memoryIndexer) {
-      memoryIndexerRef.current = memoryIndexer;
-      console.log(`[agent-factory] Reusing shared memory indexer for ${memoryDir}`);
-    } else {
-      const embeddingOpts = resolveEmbeddingConfig();
-      memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
-      memoryIndexerRef.current = memoryIndexer;
-      await memoryIndexer.sync();
-      memoryIndexer.startWatching();
-      console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
+  let memoryIndexer: MemoryIndexer | undefined = memoryEnabled ? opts?.memoryIndexer : undefined;
+  if (memoryEnabled) {
+    try {
+      if (memoryIndexer) {
+        memoryIndexerRef.current = memoryIndexer;
+        console.log(`[agent-factory] Reusing shared memory indexer for ${memoryDir}`);
+      } else {
+        const embeddingOpts = resolveEmbeddingConfig();
+        memoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+        memoryIndexerRef.current = memoryIndexer;
+        await memoryIndexer.sync();
+        memoryIndexer.startWatching();
+        console.log(`[agent-factory] Memory indexer initialized for ${memoryDir}`);
+      }
+      memoryRef.indexer = memoryIndexer;
+      memoryRef.dir = memoryDir;
+    } catch (err) {
+      console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
     }
-    memoryRef.indexer = memoryIndexer;
-    memoryRef.dir = memoryDir;
-  } catch (err) {
-    console.warn(`[agent-factory] Memory indexer init failed, continuing without:`, err);
+  } else {
+    console.log(`[agent-factory] Memory disabled by SICLAW_MEMORY_ENABLED`);
   }
 
   // ── Tool Registry: declarative resolution ──
@@ -347,8 +372,8 @@ export async function createSiclawSession(
       kubeconfigRef, userId, agentId, sessionIdRef,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
-      memoryIndexer,
-      memoryDir,
+      memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
+      memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
       delegateToAgentsExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsExecutor : undefined,
@@ -414,47 +439,53 @@ export async function createSiclawSession(
     ...(opts?.portalSkillsDir ? [opts.portalSkillsDir] : []),
   ];
   const writeAllowedDirs = [userDataDir];
+  const blockedMemoryDir = memoryEnabled ? null : memoryDir;
 
   const restrictedFileTools = [
     createReadTool(cwd, {
       operations: {
-        readFile: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsReadFile(p); },
-        access: async (p) => { assertPathAllowed(p, readAllowedDirs, "read"); return fsAccess(p, fs.constants.R_OK); },
+        readFile: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsReadFile(p); },
+        access: async (p) => { assertToolPathAllowed(p, readAllowedDirs, "read", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK); },
       },
     }),
     createEditTool(cwd, {
       operations: {
-        readFile: async (p) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsReadFile(p); },
-        writeFile: async (p, c) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsWriteFile(p, c, "utf-8"); },
-        access: async (p) => { assertPathAllowed(p, writeAllowedDirs, "edit"); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
+        readFile: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsReadFile(p); },
+        writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
+        access: async (p) => { assertToolPathAllowed(p, writeAllowedDirs, "edit", blockedMemoryDir); return fsAccess(p, fs.constants.R_OK | fs.constants.W_OK); },
       },
     }),
     createWriteTool(cwd, {
       operations: {
-        writeFile: async (p, c) => { assertPathAllowed(p, writeAllowedDirs, "write"); return fsWriteFile(p, c, "utf-8"); },
-        mkdir: async (d) => { assertPathAllowed(d, writeAllowedDirs, "write"); await fsMkdir(d, { recursive: true }); },
+        writeFile: async (p, c) => { assertToolPathAllowed(p, writeAllowedDirs, "write", blockedMemoryDir); return fsWriteFile(p, c, "utf-8"); },
+        mkdir: async (d) => { assertToolPathAllowed(d, writeAllowedDirs, "write", blockedMemoryDir); await fsMkdir(d, { recursive: true }); },
       },
     }),
     createGrepTool(cwd, {
       operations: {
-        isDirectory: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.statSync(p).isDirectory(); },
-        readFile: (p) => { assertPathAllowed(p, readAllowedDirs, "grep"); return fs.readFileSync(p, "utf-8"); },
+        isDirectory: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedMemoryDir); return fs.statSync(p).isDirectory(); },
+        readFile: (p) => { assertToolPathAllowed(p, readAllowedDirs, "grep", blockedMemoryDir); return fs.readFileSync(p, "utf-8"); },
       },
     }),
     createFindTool(cwd, {
       operations: {
-        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "find"); return fs.existsSync(p); },
+        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "find", blockedMemoryDir); return fs.existsSync(p); },
         glob: (pattern, searchCwd, options) => {
-          assertPathAllowed(searchCwd, readAllowedDirs, "find");
-          return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore }).slice(0, options.limit);
+          assertToolPathAllowed(searchCwd, readAllowedDirs, "find", blockedMemoryDir);
+          return globSync(pattern, { cwd: searchCwd, absolute: true, dot: true, ignore: options.ignore })
+            .filter((p) => !blockedMemoryDir || !isPathInsideDir(p, blockedMemoryDir))
+            .slice(0, options.limit);
         },
       },
     }),
     createLsTool(cwd, {
       operations: {
-        exists: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.existsSync(p); },
-        stat: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.statSync(p); },
-        readdir: (p) => { assertPathAllowed(p, readAllowedDirs, "ls"); return fs.readdirSync(p); },
+        exists: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir); return fs.existsSync(p); },
+        stat: (p) => { assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir); return fs.statSync(p); },
+        readdir: (p) => {
+          assertToolPathAllowed(p, readAllowedDirs, "ls", blockedMemoryDir);
+          return fs.readdirSync(p).filter((entry) => !blockedMemoryDir || !isPathInsideDir(path.join(p, entry), blockedMemoryDir));
+        },
       },
     }),
   ];
@@ -538,7 +569,7 @@ export async function createSiclawSession(
     cwd,
     systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
     appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(memoryDir);
+      const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null);
       if (agentSystemPromptAppend) {
         parts.push("\n\n" + agentSystemPromptAppend);
       }
@@ -548,7 +579,7 @@ export async function createSiclawSession(
     extensionFactories: [
       contextPruningExtension,
       compactionSafeguardExtension,
-      (api) => memoryFlushExtension(api, memoryIndexerRef.current),
+      ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
       (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
       (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
       ...cliOnlyFactories,

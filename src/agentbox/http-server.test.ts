@@ -48,6 +48,7 @@ vi.mock("../core/config.js", () => ({
       },
     },
   }),
+  isMemoryEnabled: () => true,
 }));
 
 // Make sync-handlers a no-op registry.

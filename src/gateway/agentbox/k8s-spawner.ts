@@ -172,6 +172,9 @@ export class K8sSpawner implements BoxSpawner {
       { name: "SICLAW_GATEWAY_URL", value: this.gatewayUrl(namespace) },
       { name: "SICLAW_AGENT_ID", value: agentId },
     ];
+    if (process.env.SICLAW_MEMORY_ENABLED !== undefined) {
+      env.push({ name: "SICLAW_MEMORY_ENABLED", value: process.env.SICLAW_MEMORY_ENABLED });
+    }
 
     // Add custom environment variables
     if (boxConfig.env) {
