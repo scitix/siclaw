@@ -415,6 +415,17 @@ export class AgentBoxSessionManager {
     return path.join(userDataDir, "memory");
   }
 
+  private async createSharedMemoryIndexer(memoryDir: string): Promise<MemoryIndexer> {
+    if (!fs.existsSync(memoryDir)) {
+      fs.mkdirSync(memoryDir, { recursive: true });
+    }
+    const embeddingOpts = getEmbeddingConfig() ?? undefined;
+    const indexer = await createMemoryIndexer(memoryDir, embeddingOpts);
+    await indexer.sync();
+    indexer.startWatching();
+    return indexer;
+  }
+
   /**
    * Lazily initialize shared components (memory indexer, MCP manager).
    * Called on first getOrCreate(). Idempotent.
@@ -433,13 +444,7 @@ export class AgentBoxSessionManager {
 
     // ── Memory indexer ──
     try {
-      if (!fs.existsSync(memoryDir)) {
-        fs.mkdirSync(memoryDir, { recursive: true });
-      }
-      const embeddingOpts = getEmbeddingConfig() ?? undefined;
-      this._sharedMemoryIndexer = await createMemoryIndexer(memoryDir, embeddingOpts);
-      await this._sharedMemoryIndexer.sync();
-      this._sharedMemoryIndexer.startWatching();
+      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
       console.log(`[agentbox-session] Shared memory indexer initialized for ${memoryDir}`);
     } catch (err) {
       console.warn(`[agentbox-session] Shared memory indexer init failed:`, err);
@@ -1964,9 +1969,8 @@ Always end with a final report even if evidence is incomplete.`;
   /**
    * Reset the shared memory indexer.
    * Called after Gateway has cleared memory files on PVC.
-   * Triggers a sync so the existing indexer detects deleted files and
-   * cleans up its DB records. We keep the same indexer instance alive
-   * because active sessions hold direct references to it via tool closures.
+   * Gateway deletes the full memory/ directory, including .memory.db, so a
+   * live AgentBox must close the old sqlite handle and build a fresh indexer.
    */
   async resetMemory(): Promise<void> {
     if (!isMemoryEnabled()) {
@@ -1988,13 +1992,18 @@ Always end with a final report even if evidence is incomplete.`;
     }
 
     try {
-      // sync() detects deleted .md files and cleans up files/chunks tables
-      await this._sharedMemoryIndexer.sync();
-      // investigations table is NOT cleaned by sync — clear it explicitly
-      this._sharedMemoryIndexer.clearInvestigations();
-      console.log(`[agentbox-session] Memory indexer re-synced after PVC cleanup`);
+      this._sharedMemoryIndexer.close();
     } catch (err) {
-      console.warn(`[agentbox-session] Memory indexer sync after reset failed:`, err);
+      console.warn(`[agentbox-session] Memory indexer close before reset failed:`, err);
+    }
+    this._sharedMemoryIndexer = null;
+
+    try {
+      const memoryDir = this.getMemoryDir();
+      this._sharedMemoryIndexer = await this.createSharedMemoryIndexer(memoryDir);
+      console.log(`[agentbox-session] Memory indexer rebuilt after PVC cleanup`);
+    } catch (err) {
+      console.warn(`[agentbox-session] Memory indexer rebuild after reset failed:`, err);
     }
   }
 }

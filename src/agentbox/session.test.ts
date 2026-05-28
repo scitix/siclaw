@@ -780,13 +780,20 @@ describe("AgentBoxSessionManager — resetMemory", () => {
     await expect(mgr.resetMemory()).resolves.toBeUndefined();
   });
 
-  it("calls sync + clearInvestigations on the shared indexer after init", async () => {
+  it("closes and rebuilds the shared indexer after Gateway deletes the memory dir", async () => {
     const mgr = new AgentBoxSessionManager();
     // Trigger shared init via getOrCreate
     await mgr.getOrCreate("sess-1");
+
+    const firstIndexer = await (createMemoryIndexer as any).mock.results[0].value;
+
     await mgr.resetMemory();
-    // We can't directly observe through the mock without exposing it, but
-    // we can verify no throw and activeCount is preserved.
+
+    expect(firstIndexer.close).toHaveBeenCalledTimes(1);
+    expect(createMemoryIndexer).toHaveBeenCalledTimes(2);
+    const secondIndexer = await (createMemoryIndexer as any).mock.results[1].value;
+    expect(secondIndexer.sync).toHaveBeenCalledTimes(1);
+    expect(secondIndexer.startWatching).toHaveBeenCalledTimes(1);
     expect(mgr.activeCount()).toBe(1);
   });
 });
