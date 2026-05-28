@@ -20,6 +20,9 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).toContain("memory_search");
     expect(prompt).toContain("memory_get");
     expect(prompt).toContain("remember context from previous sessions");
+    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).not.toContain("{{memoryIntro}}");
+    expect(prompt).not.toContain("{{memorySection}}");
   });
 
   it("removes bundled memory instructions when memory is disabled", () => {
@@ -30,5 +33,8 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).not.toContain("memory_search");
     expect(prompt).not.toContain("memory_get");
     expect(prompt).not.toContain("remember context from previous sessions");
+    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).not.toContain("{{memoryIntro}}");
+    expect(prompt).not.toContain("{{memorySection}}");
   });
 });

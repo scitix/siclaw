@@ -27,12 +27,15 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
   const modeLabel = MODE_LABELS[mode ?? "cli"] ?? "Web UI";
   const settingsPath = mode === "cli" ? "`/setup`" : "sidebar **Settings**";
   const credentialsPath = mode === "cli" ? "`/setup` → Credentials" : "**Settings → Credentials**";
+  const memoryEnabled = isMemoryEnabled();
 
   // Variable substitution
   let prompt = template
     .replace(/\{\{mode\}\}/g, modeLabel)
     .replace(/\{\{settingsPath\}\}/g, settingsPath)
-    .replace(/\{\{credentialsPath\}\}/g, credentialsPath);
+    .replace(/\{\{credentialsPath\}\}/g, credentialsPath)
+    .replace(/\{\{memoryIntro\}\}/g, memoryEnabled ? MEMORY_INTRO : "")
+    .replace(/\{\{memorySection\}\}/g, memoryEnabled ? MEMORY_SECTION : "");
 
   // Mode-conditional blocks: strip the non-matching mode block
   const keepMode = mode === "web" ? "web" : "cli";
@@ -49,12 +52,6 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
 
   // Append hardcoded safety section — NOT overridable by agent templates
   prompt += SAFETY_SECTION(credentialsPath);
-
-  if (!isMemoryEnabled()) {
-    prompt = prompt
-      .replace(" You remember context from previous sessions and grow more helpful over time.", "")
-      .replace(/\n### Memory — Search On Demand\n\nUse `memory_search`[\s\S]*?(?=\n## Environment & Configuration)/, "");
-  }
 
   return prompt;
 }
@@ -95,7 +92,15 @@ Respond in the user's language. \`[System: respond in X]\` overrides to language
 // ---------------------------------------------------------------------------
 // Bundled default template — overridable via agent settings
 // ---------------------------------------------------------------------------
-const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help your user manage and troubleshoot their infrastructure — Kubernetes clusters, cloud resources, and DevOps workflows. You are competent, direct, and warm. You remember context from previous sessions and grow more helpful over time.
+const MEMORY_INTRO = " You remember context from previous sessions and grow more helpful over time.";
+
+const MEMORY_SECTION = `
+
+### Memory — Search On Demand
+
+Use \`memory_search\` **on demand** when symptoms suggest a previously-seen issue — search for past investigations, what was tried, what the root cause was. Use \`memory_get\` to pull details when a match looks relevant. Don't search reflexively — search purposefully.`;
+
+const DEFAULT_TEMPLATE = `You are Siclaw, a personal SRE AI assistant. You help your user manage and troubleshoot their infrastructure — Kubernetes clusters, cloud resources, and DevOps workflows. You are competent, direct, and warm.{{memoryIntro}}
 
 ## Core Behavior
 
@@ -172,10 +177,7 @@ Internal infrastructure knowledge lives as a flat markdown wiki at \`.siclaw/kno
 
 Pages are semantic — they describe what components are and how they fail, not the commands to run. Translate what you learn into concrete checks using skills (preferred) and bash.
 
-### Memory — Search On Demand
-
-Use \`memory_search\` **on demand** when symptoms suggest a previously-seen issue — search for past investigations, what was tried, what the root cause was. Use \`memory_get\` to pull details when a match looks relevant. Don't search reflexively — search purposefully.
-
+{{memorySection}}
 ## Environment & Configuration
 
 Siclaw {{mode}} session. All configuration via {{settingsPath}} (Models, Credentials). Config file \`.siclaw/config/settings.json\` is auto-managed — don't edit manually.
