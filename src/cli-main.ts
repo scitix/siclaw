@@ -6,7 +6,7 @@ import {
   SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
-import { loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
+import { isMemoryEnabled, loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
@@ -218,7 +218,7 @@ const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryInd
         .filter((e) => (e.isDirectory() || e.isSymbolicLink()) && !e.name.startsWith("_")).length;
     } catch { /* skip */ }
   }
-  const memoryActive = fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
+  const memoryActive = isMemoryEnabled() && fs.existsSync(path.resolve(process.cwd(), loadConfig().paths.userDataDir, "memory"));
 
   // Count credentials
   let credCount = 0;
@@ -353,7 +353,7 @@ if (isPrintMode && initialMessage) {
 
 // -- Cleanup on exit --
 // Auto-save session memory (mirrors AgentBox release flow)
-if (session.sessionFile) {
+if (isMemoryEnabled() && session.sessionFile) {
   const sessionDir = path.dirname(session.sessionFile);
   const memoryDir = path.resolve(process.cwd(), config.paths.userDataDir, "memory");
   try {

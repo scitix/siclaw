@@ -108,6 +108,7 @@ vi.mock("../memory/session-summarizer.js", () => ({
 // Scoped config mock — points paths to the per-test temp dir.
 let _cfgUserDataDir = "";
 let _cfgCredentialsDir = ".siclaw/credentials";
+let _memoryEnabled = true;
 
 vi.mock("../core/config.js", () => ({
   loadConfig: () => ({
@@ -120,10 +121,13 @@ vi.mock("../core/config.js", () => ({
     providers: {},
   }),
   getEmbeddingConfig: () => null,
+  isMemoryEnabled: () => _memoryEnabled,
 }));
 
 // Import SUT after mocks
 import { AgentBoxSessionManager } from "./session.js";
+import { createMemoryIndexer } from "../memory/index.js";
+import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 
 function installDelegationPersistenceRecorder(mgr: AgentBoxSessionManager): void {
   const g = globalThis as any;
@@ -145,6 +149,7 @@ let origCwd: string;
 let tmpDir: string;
 
 beforeEach(() => {
+  vi.clearAllMocks();
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -154,6 +159,7 @@ beforeEach(() => {
   process.chdir(tmpDir);
   _cfgUserDataDir = path.join(tmpDir, "user-data");
   _cfgCredentialsDir = path.join(tmpDir, ".siclaw/credentials");
+  _memoryEnabled = true;
   (globalThis as any).__frameworkEntriesState.entries = []; // default: new session
   (globalThis as any).__createSessionCalls.length = 0;
   (globalThis as any).__fakeBrainFactories.length = 0;
@@ -218,6 +224,17 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     const mgr = new AgentBoxSessionManager();
     await mgr.getOrCreate("sess-1");
     expect(lastCreateSiclawSession.calls[0].mode).toBe("web");
+  });
+
+  it("does not initialize memory or create memory dir when memory is disabled", async () => {
+    _memoryEnabled = false;
+    const mgr = new AgentBoxSessionManager();
+
+    await mgr.getOrCreate("sess-1");
+
+    expect(createMemoryIndexer).not.toHaveBeenCalled();
+    expect(lastCreateSiclawSession.calls[0].memoryIndexer).toBeUndefined();
+    expect(fs.existsSync(path.join(_cfgUserDataDir, "memory"))).toBe(false);
   });
 
   it("hides delegation tools by default", async () => {
@@ -586,6 +603,16 @@ describe("AgentBoxSessionManager — release", () => {
     await mgr.getOrCreate("sess-1");
     await mgr.release("sess-1");
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not auto-save session memory when memory is disabled", async () => {
+    _memoryEnabled = false;
+    const mgr = new AgentBoxSessionManager();
+
+    await mgr.getOrCreate("sess-1");
+    await mgr.release("sess-1");
+
+    expect(saveSessionKnowledge).not.toHaveBeenCalled();
   });
 
   it("release skips delete when a new getOrCreate has replaced the session mid-release", async () => {

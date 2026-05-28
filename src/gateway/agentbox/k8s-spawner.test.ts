@@ -83,6 +83,7 @@ const originalGatewayEnv = {
   SICLAW_GATEWAY_INTERNAL_URL: process.env.SICLAW_GATEWAY_INTERNAL_URL,
   SICLAW_GATEWAY_HOSTNAME: process.env.SICLAW_GATEWAY_HOSTNAME,
   SICLAW_INTERNAL_PORT: process.env.SICLAW_INTERNAL_PORT,
+  SICLAW_MEMORY_ENABLED: process.env.SICLAW_MEMORY_ENABLED,
 };
 
 // Import SUT after mocks.
@@ -241,6 +242,29 @@ describe("K8sSpawner — spawn branches", () => {
     expect(env).toContainEqual({
       name: "SICLAW_GATEWAY_URL",
       value: "https://custom-runtime.svc:3002",
+    });
+  });
+
+  it("passes the runtime memory flag into AgentBox pods", async () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+
+    const cm = new FakeCertManager();
+    const s = new K8sSpawner({ namespace: "siclaw-debug" });
+    s.setCertManager(cm as any);
+
+    let reads = 0;
+    readPodImpl.fn = async () => {
+      reads++;
+      if (reads === 1) throw Object.assign(new Error("nf"), { code: 404 });
+      return { status: { phase: "Running", podIP: "10.0.0.10", conditions: [{ type: "Ready", status: "True" }] }, metadata: { labels: {} } };
+    };
+
+    await s.spawn({ agentId: "default" });
+
+    const env = calls.createNamespacedPod[0].body.spec.containers[0].env;
+    expect(env).toContainEqual({
+      name: "SICLAW_MEMORY_ENABLED",
+      value: "false",
     });
   });
 

@@ -50,6 +50,8 @@ spec:
               value: {{ include "siclaw.agentboxImage" . }}
             - name: SICLAW_GATEWAY_HOSTNAME
               value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
+            - name: SICLAW_MEMORY_ENABLED
+              value: {{ ternary "true" "false" .Values.runtime.memory.enabled | quote }}
             {{- if .Values.agentbox.persistence.enabled }}
             - name: SICLAW_PERSISTENCE_ENABLED
               value: "true"

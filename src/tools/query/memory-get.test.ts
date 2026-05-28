@@ -2,9 +2,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createMemoryGetTool } from "./memory-get.js";
+import { createMemoryGetTool, registration } from "./memory-get.js";
 
 let dir: string;
+const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
 
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-get-test-"));
@@ -12,6 +13,11 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(dir, { recursive: true, force: true });
+  if (ORIGINAL_MEMORY_ENABLED === undefined) {
+    delete process.env.SICLAW_MEMORY_ENABLED;
+  } else {
+    process.env.SICLAW_MEMORY_ENABLED = ORIGINAL_MEMORY_ENABLED;
+  }
 });
 
 describe("memory_get tool", () => {
@@ -19,6 +25,11 @@ describe("memory_get tool", () => {
     const tool = createMemoryGetTool(dir);
     expect(tool.name).toBe("memory_get");
     expect(tool.label).toBe("Memory Get");
+  });
+
+  it("is unavailable when memory is disabled", () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+    expect(registration.available?.({ memoryIndexer: {}, memoryDir: dir } as any)).toBe(false);
   });
 
   it("returns error on empty path", async () => {

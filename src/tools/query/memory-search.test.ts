@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { createMemorySearchTool } from "./memory-search.js";
+import { afterEach, describe, it, expect } from "vitest";
+import { createMemorySearchTool, registration } from "./memory-search.js";
+
+const ORIGINAL_MEMORY_ENABLED = process.env.SICLAW_MEMORY_ENABLED;
+
+afterEach(() => {
+  if (ORIGINAL_MEMORY_ENABLED === undefined) {
+    delete process.env.SICLAW_MEMORY_ENABLED;
+  } else {
+    process.env.SICLAW_MEMORY_ENABLED = ORIGINAL_MEMORY_ENABLED;
+  }
+});
 
 function makeIndexer(result: any) {
   return {
@@ -12,6 +22,11 @@ describe("memory_search tool", () => {
     const tool = createMemorySearchTool(makeIndexer({ chunks: [], totalFiles: 0, totalChunks: 0 }));
     expect(tool.name).toBe("memory_search");
     expect(tool.label).toBe("Memory Search");
+  });
+
+  it("is unavailable when memory is disabled", () => {
+    process.env.SICLAW_MEMORY_ENABLED = "false";
+    expect(registration.available?.({ memoryIndexer: makeIndexer({}) } as any)).toBe(false);
   });
 
   it("returns empty query error", async () => {

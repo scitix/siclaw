@@ -33,7 +33,7 @@ import type { BrainSession } from "../core/brain-session.js";
 import type { McpClientManager } from "../core/mcp-client.js";
 import { createMemoryIndexer, type MemoryIndexer } from "../memory/index.js";
 import { saveSessionKnowledge } from "../memory/session-summarizer.js";
-import { loadConfig, getEmbeddingConfig } from "../core/config.js";
+import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
 import type {
@@ -422,6 +422,12 @@ export class AgentBoxSessionManager {
   private async ensureSharedComponents(): Promise<void> {
     if (this._sharedInitialized) return;
     this._sharedInitialized = true;
+
+    if (!isMemoryEnabled()) {
+      this._sharedMemoryIndexer = null;
+      console.log(`[agentbox-session] Memory disabled by SICLAW_MEMORY_ENABLED`);
+      return;
+    }
 
     const memoryDir = this.getMemoryDir();
 
@@ -1458,10 +1464,11 @@ Always end with a final report even if evidence is incomplete.`;
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
 
-    // Ensure memory directory exists
-    const memoryDir = this.getMemoryDir();
-    if (!fs.existsSync(memoryDir)) {
-      fs.mkdirSync(memoryDir, { recursive: true });
+    if (isMemoryEnabled()) {
+      const memoryDir = this.getMemoryDir();
+      if (!fs.existsSync(memoryDir)) {
+        fs.mkdirSync(memoryDir, { recursive: true });
+      }
     }
 
     // continueRecent with proper cwd + sessionDir — restores the correct
@@ -1527,7 +1534,7 @@ Always end with a final report even if evidence is incomplete.`;
     result.sessionIdRef.current = id;
 
     // New session: sync memory index, then purge stale investigations (chained to avoid race)
-    if (isNewSession && this._sharedMemoryIndexer) {
+    if (isMemoryEnabled() && isNewSession && this._sharedMemoryIndexer) {
       const memDir = this.getMemoryDir();
       this._sharedMemoryIndexer.sync()
         .then(() => this._sharedMemoryIndexer!.purgeStaleInvestigations(memDir, { skipSync: true }))
@@ -1774,8 +1781,9 @@ Always end with a final report even if evidence is incomplete.`;
   /**
    * Release a session after prompt completion.
    *
-   * Performs memory auto-save (if new messages since last save), syncs the
-   * shared memory index, then removes the session from the in-memory map.
+   * When memory is enabled, performs memory auto-save (if new messages since
+   * last save) and syncs the shared memory index, then removes the session
+   * from the in-memory map.
    * Shared components (memory indexer, MCP) are NOT destroyed.
    *
    * The session can be transparently restored from JSONL on the next getOrCreate().
@@ -1787,22 +1795,26 @@ Always end with a final report even if evidence is incomplete.`;
     console.log(`[agentbox-session] Releasing session: ${sessionId}`);
 
     // 1. Auto-save session memory (dedup: only if new messages since last save)
-    try {
-      const sessionDir = this.getSessionDir(sessionId);
-      const memoryDir = this.getMemoryDir();
-      const currentMessageCount = this.countJsonlMessages(sessionDir);
+    if (isMemoryEnabled()) {
+      try {
+        const sessionDir = this.getSessionDir(sessionId);
+        const memoryDir = this.getMemoryDir();
+        const currentMessageCount = this.countJsonlMessages(sessionDir);
 
-      if (currentMessageCount > managed._lastSavedMessageCount) {
-        const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
-        if (saved) {
-          managed._lastSavedMessageCount = currentMessageCount;
-          console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
+        if (currentMessageCount > managed._lastSavedMessageCount) {
+          const saved = await saveSessionKnowledge({ sessionDir, memoryDir });
+          if (saved) {
+            managed._lastSavedMessageCount = currentMessageCount;
+            console.log(`[agentbox-session] Memory auto-saved for ${sessionId}: ${saved.map(f => path.basename(f)).join(", ")}`);
+          }
+        } else {
+          console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
         }
-      } else {
-        console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (no new messages)`);
+      } catch (err) {
+        console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
       }
-    } catch (err) {
-      console.warn(`[agentbox-session] Memory auto-save failed for ${sessionId}:`, err);
+    } else {
+      console.log(`[agentbox-session] Skipping memory auto-save for ${sessionId} (memory disabled)`);
     }
 
     // 2. Shutdown per-session MCP connections
@@ -1815,7 +1827,7 @@ Always end with a final report even if evidence is incomplete.`;
     }
 
     // 3. Sync shared memory index to pick up the new summary file
-    if (this._sharedMemoryIndexer) {
+    if (isMemoryEnabled() && this._sharedMemoryIndexer) {
       await this._sharedMemoryIndexer.sync().catch((err) => {
         console.warn(`[agentbox-session] Memory sync on release failed:`, err);
       });
@@ -1957,6 +1969,19 @@ Always end with a final report even if evidence is incomplete.`;
    * because active sessions hold direct references to it via tool closures.
    */
   async resetMemory(): Promise<void> {
+    if (!isMemoryEnabled()) {
+      if (this._sharedMemoryIndexer) {
+        try {
+          this._sharedMemoryIndexer.close();
+        } catch (err) {
+          console.warn(`[agentbox-session] Memory indexer close during disabled reset failed:`, err);
+        }
+        this._sharedMemoryIndexer = null;
+      }
+      console.log(`[agentbox-session] Memory disabled; resetMemory is a no-op`);
+      return;
+    }
+
     if (!this._sharedMemoryIndexer) {
       console.log(`[agentbox-session] No memory indexer to reset`);
       return;

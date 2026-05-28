@@ -19,8 +19,6 @@
  */
 
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import http from "node:http";
 import https from "node:https";
 import type { RuntimeConfig } from "./config.js";
@@ -38,6 +36,7 @@ import type { FrontendWsClient } from "./frontend-ws-client.js";
 import { createMtlsMiddleware } from "./security/mtls-middleware.js";
 import type { BoxSpawner } from "./agentbox/spawner.js";
 import { checkMetricsAuth } from "../shared/metrics.js";
+import { clearAgentMemory } from "./memory-cleanup.js";
 import {
   handleSettings,
   handleMcpServers,
@@ -313,30 +312,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const agentId = params.agentId as string;
     if (!agentId) throw new Error("agentId required");
 
-    // Memory is agent-scoped (one pod per agent). Path mirrors the k8s-spawner
-    // subPath layout: `/app/.siclaw/user-data/agents/{agentId}/memory`.
-    const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 63);
-    const userDataBase = "/app/.siclaw/user-data";
-    const memoryDir = path.resolve(userDataBase, "agents", sanitize(agentId), "memory");
-
-    // Delete memory files
-    let deletedFiles = 0;
-    if (fs.existsSync(memoryDir)) {
-      const investigationsDir = path.join(memoryDir, "investigations");
-      if (fs.existsSync(investigationsDir)) {
-        const invFiles = fs.readdirSync(investigationsDir).filter((f: string) => f.endsWith(".md"));
-        deletedFiles += invFiles.length;
-        fs.rmSync(investigationsDir, { recursive: true });
-      }
-      for (const entry of fs.readdirSync(memoryDir)) {
-        if (entry === "PROFILE.md") continue;
-        const fullPath = path.join(memoryDir, entry);
-        if (fs.statSync(fullPath).isFile() && !entry.startsWith(".memory.db")) {
-          fs.unlinkSync(fullPath);
-          if (entry.endsWith(".md")) deletedFiles++;
-        }
-      }
-    }
+    const { memoryDir, deletedFiles } = clearAgentMemory(agentId);
 
     console.log(`[rpc] agent.clearMemory: deleted ${deletedFiles} files in ${memoryDir}`);
 

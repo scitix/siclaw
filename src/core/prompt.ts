@@ -1,3 +1,5 @@
+import { isMemoryEnabled } from "./config.js";
+
 const MODE_LABELS: Record<string, string> = {
   cli: "TUI",
   web: "Web UI",
@@ -47,6 +49,12 @@ export function buildSreSystemPrompt(mode?: "cli" | "web" | "channel" | "task", 
 
   // Append hardcoded safety section — NOT overridable by agent templates
   prompt += SAFETY_SECTION(credentialsPath);
+
+  if (!isMemoryEnabled()) {
+    prompt = prompt
+      .replace(" You remember context from previous sessions and grow more helpful over time.", "")
+      .replace(/\n### Memory — Search On Demand\n\nUse `memory_search`[\s\S]*?(?=\n## Environment & Configuration)/, "");
+  }
 
   return prompt;
 }

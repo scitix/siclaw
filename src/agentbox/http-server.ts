@@ -11,7 +11,7 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
-import { loadConfig } from "../core/config.js";
+import { isMemoryEnabled, loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
 import { GatewayClient } from "./gateway-client.js";
@@ -414,7 +414,7 @@ export function createHttpServer(
     // Prepending would break marker detection in pi-agent extension input handlers
     // (e.g., [System: respond in Chinese]\n[Deep Investigation]\n... fails startsWith check).
     const detectedLang = detectLanguage(body.text);
-    if (detectedLang !== "English") {
+    if (detectedLang !== "English" && isMemoryEnabled()) {
       // Only two DP markers remain after the refactor: activation and exit.
       const dpMarkers = [DP_ACTIVATION_MARKER, `${DP_EXIT_MARKER}\n`];
       const matchedMarker = dpMarkers.find(m => promptText.startsWith(m));
