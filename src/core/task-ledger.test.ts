@@ -18,6 +18,28 @@ describe("TaskLedger — snapshot / hydrate (durability)", () => {
     expect(b.create({ subject: "t3", description: "" }).id).toBe("3");
   });
 
+  it("allCompleted() is true only when non-empty and every task completed", () => {
+    const l = new TaskLedger();
+    expect(l.allCompleted()).toBe(false);          // empty
+    l.create({ subject: "a", description: "" });    // #1 pending
+    l.create({ subject: "b", description: "" });    // #2 pending
+    expect(l.allCompleted()).toBe(false);
+    l.update("1", { status: "completed" });
+    expect(l.allCompleted()).toBe(false);           // #2 still pending
+    l.update("2", { status: "completed" });
+    expect(l.allCompleted()).toBe(true);
+  });
+
+  it("clear() empties tasks but keeps the id sequence (next id continues, no reuse)", () => {
+    const l = new TaskLedger();
+    l.create({ subject: "a", description: "" });    // #1
+    l.create({ subject: "b", description: "" });    // #2
+    l.clear();
+    expect(l.size).toBe(0);
+    expect(l.allCompleted()).toBe(false);
+    expect(l.create({ subject: "c", description: "" }).id).toBe("3"); // continues, not "1"
+  });
+
   it("deleteLedger drops the shared ledger; getOrCreateLedger then returns a fresh one", () => {
     resetLedgers();
     const l1 = getOrCreateLedger("sess-x");
