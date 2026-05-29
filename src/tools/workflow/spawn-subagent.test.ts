@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { createSpawnSubagentTool } from "./spawn-subagent.js";
+import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 import type { ToolRefs, SpawnSubagentRequest, SpawnSubagentResult } from "../../core/tool-registry.js";
 
 function makeRefs(executor: ToolRefs["spawnSubagentExecutor"]): ToolRefs {
@@ -42,18 +43,31 @@ describe("spawn_subagent tool", () => {
     expect((r.details as any).status).toBe("done");
   });
 
-  it("passes run_in_background and surfaces a launched job", async () => {
+  // Background is gated by RUN_IN_BACKGROUND_ENABLED (subagent-registry). While OFF, a
+  // run_in_background:true request must NOT reach the executor as a background launch — the
+  // param isn't advertised and execute() hard-forces runInBackground:false. When the flag is
+  // later flipped on, the same call must launch a job. One test covers both states.
+  it("gates run_in_background behind RUN_IN_BACKGROUND_ENABLED", async () => {
     let captured: SpawnSubagentRequest | undefined;
     const executor = vi.fn(async (req: SpawnSubagentRequest): Promise<SpawnSubagentResult> => {
       captured = req;
-      return { status: "launched", summary: "launched", childSessionId: "child-9", toolCalls: 0, durationMs: 0, jobId: "job-9" };
+      return req.runInBackground
+        ? { status: "launched", summary: "launched", childSessionId: "child-9", toolCalls: 0, durationMs: 0, jobId: "job-9" }
+        : { status: "done", summary: "probed", childSessionId: "child-9", toolCalls: 1, durationMs: 5 };
     });
     const tool = createSpawnSubagentTool(makeRefs(executor));
     const r = await tool.execute("call-bg", { description: "probe net", prompt: "probe all nodes", run_in_background: true });
-    expect(captured?.runInBackground).toBe(true);
-    expect((r.details as any).status).toBe("launched");
-    expect((r.details as any).job_id).toBe("job-9");
-    expect(text(r)).toMatch(/do NOT poll/i);
+
+    if (RUN_IN_BACKGROUND_ENABLED) {
+      expect(captured?.runInBackground).toBe(true);
+      expect((r.details as any).status).toBe("launched");
+      expect((r.details as any).job_id).toBe("job-9");
+      expect(text(r)).toMatch(/do NOT poll/i);
+    } else {
+      // Flag OFF: request is forced foreground regardless of the param.
+      expect(captured?.runInBackground).toBe(false);
+      expect((r.details as any).status).toBe("done");
+    }
   });
 
   it("rejects an unknown subagent_type without calling the executor", async () => {

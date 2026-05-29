@@ -10,6 +10,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
+import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 
 export function createJobStopTool(
   refs: ToolRefs,
@@ -46,5 +47,7 @@ export const registration: ToolEntry = {
   create: (refs) => createJobStopTool(refs),
   modes: ["web", "channel", "cli"],
   platform: true,
-  available: (refs) => Boolean(refs.subagentJobStopExecutor),
+  // Gated OFF with background jobs (RUN_IN_BACKGROUND_ENABLED) — no job_id can exist
+  // when run_in_background is hidden, so the tool stays unregistered until that lands.
+  available: (refs) => RUN_IN_BACKGROUND_ENABLED && Boolean(refs.subagentJobStopExecutor),
 };

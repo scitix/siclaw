@@ -163,23 +163,35 @@ TodoWrite cannot. The cost (ids, file-locking, persistence) is paid once.
   - TUI (pi `InteractiveMode`): inject the notification as a queued user message / steering at the next
     turn boundary. This is the one genuinely new wiring point.
 
-### ⚠️ Implementation status (v1) & TODO — background completion notification NOT done
+### ⚠️ Implementation status (v1) — background is BUILT but flag-gated OFF (no completion notification yet)
 
-**Implemented:** background launch (`spawn_subagent run_in_background` → `{status:"launched", job_id}`),
-the in-memory job table (`subagentJobs`), `job_stop`, the Jobs bar + drill-in to the child session,
-session-release gating (`_backgroundWorkCount` keeps the AgentBox alive until jobs finish), and full
-child-session transcript persistence.
+**Master switch:** `RUN_IN_BACKGROUND_ENABLED` in `src/core/subagent-registry.ts` (currently `false`).
+It gates three surfaces at once so the half-feature is never exposed to the model:
+- `spawn_subagent` — the `run_in_background` parameter is omitted from the schema and the matching
+  description sentence is dropped (`buildDescription()`); `execute` also hard-forces `runInBackground:false`.
+- `job_stop` — its `available()` returns `false`, so the tool is never registered (no `job_id` can exist
+  while background is off anyway).
+- `src/core/prompt.ts` — the "Background work" bullet was removed (no over-promising "you'll be notified").
 
-**NOT implemented (deferred):** the **completion notification back to the parent model**. On completion
-`startBackgroundSubagent` only updates `job.status`; the child's `summary` is **dropped** for the parent
-model, and there is **no** queue / steer / injected message. (The old `notifyParentOfDelegationBatch` +
-`runSyntheticParentPrompt` path that did this for the legacy delegation batch was removed with the
-`delegate_to_agent(s)` cleanup; the `DELEGATION_BATCH_COMPLETE_EVENT` reference above is stale.) So a
-background result reaches the **UI** (child session + delegation card) but **never the orchestrating
-model** — the prompt's "you'll be notified" is currently aspirational, and `job_output` (CC's
-`TaskOutput`) is not provided.
+Flip the flag to `true` (after the notification below lands) and all three return automatically.
 
-**Why deferred:** pi 0.73 **native parallel** foreground `spawn_subagent` covers the common SRE cases
+**Built and kept intact behind the flag:** background launch (`startBackgroundSubagent` →
+`{status:"launched", job_id}`), the in-memory job table (`subagentJobs`), the `job_stop` executor + tool,
+the Jobs bar + drill-in to the child session, session-release gating (`_backgroundWorkCount` keeps the
+AgentBox alive until jobs finish), and full child-session transcript persistence. None of this is deleted —
+only the model-facing entry points are gated.
+
+**Still NOT built (the reason it's gated):** the **completion notification back to the parent model**. On
+completion `startBackgroundSubagent` only updates `job.status`; the child's `summary` is **dropped** for
+the parent model, and there is **no** queue / steer / injected message. (The old
+`notifyParentOfDelegationBatch` + `runSyntheticParentPrompt` path that did this for the legacy delegation
+batch was removed with the `delegate_to_agent(s)` cleanup; the `DELEGATION_BATCH_COMPLETE_EVENT` reference
+above is stale.) So a background result would reach the **UI** (child session + delegation card) but
+**never the orchestrating model**, and `job_output` (CC's `TaskOutput`) is not provided. Exposing it in
+this state is a net negative (dropped result, prompt that lies, session held up to the runtime cap), which
+is why the flag is OFF rather than the param simply documented as discouraged.
+
+**Why gated rather than shipped:** pi 0.73 **native parallel** foreground `spawn_subagent` covers the common SRE cases
 (fan-out the same check across N nodes; multi-step investigation) — the parent waits and synthesizes
 inline, which is what the user is waiting for anyway. Genuine async is only needed for **long
 (minutes-scale) operations kicked off mid-conversation that the user wants to keep chatting through**
@@ -191,8 +203,9 @@ turn boundary** via a pending-notification queue — `enqueuePendingNotification
 terminal state + a per-task `notified` flag + drain into the turn (`query.ts`). Our version: on job
 completion, deliver the child summary to the parent model (steer if mid-turn, else inject a user-role
 notification on the next turn), persist it to the parent session (refresh-safe), and dedup with a
-`notified` flag. **Until then: keep `run_in_background` discouraged in the prompt and route long unattended
-work to cron** (do not promise an in-conversation notification).
+`notified` flag, then flip `RUN_IN_BACKGROUND_ENABLED` to `true`. **Until then: `run_in_background` is
+gated OFF entirely (not just discouraged) and long unattended work routes to cron** (`manage_schedule` +
+`task_report`) — nothing promises an in-conversation notification.
 
 ## 8. Parallel + ordered orchestration (how it all composes)
 

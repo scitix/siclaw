@@ -29,6 +29,19 @@ export interface SubagentType {
 /** Tools no sub-agent may ever call, regardless of type. Prevents recursion. */
 export const SUBAGENT_ALWAYS_DENIED_TOOLS = ["spawn_subagent"] as const;
 
+/**
+ * Master switch for `spawn_subagent`'s background mode (and the `job_stop` tool).
+ *
+ * OFF by default: the Job runtime (startBackgroundSubagent / subagentJobs) and the
+ * Portal Jobs bar are fully built and kept intact, but `run_in_background` is NOT
+ * exposed to the model and `job_stop` is NOT registered — because background jobs
+ * currently have no completion notification back to the parent model (the result is
+ * dropped, the prompt would over-promise, and the session is held; see design §7).
+ * Flip to `true` only after implementing that notification — then the param, the
+ * job_stop tool, and the prompt guidance all return automatically.
+ */
+export const RUN_IN_BACKGROUND_ENABLED = false;
+
 export const DEFAULT_SUBAGENT_TYPE = "general-purpose";
 
 const GENERAL_PURPOSE: SubagentType = {

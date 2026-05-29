@@ -16,7 +16,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs, SpawnSubagentResult } from "../../core/tool-registry.js";
-import { getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE } from "../../core/subagent-registry.js";
+import { getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 
 interface SpawnSubagentParams {
   description: string;
@@ -46,9 +46,12 @@ function buildDescription(): string {
     "command; for an investigation, hand over the question. Terse command-style prompts produce shallow, " +
     "generic work. Never delegate understanding — don't write 'based on your findings, decide X'; give " +
     "concrete targets, paths, and what to check.\n\n" +
-    "Sub-agents cannot spawn their own sub-agents (one level deep). With run_in_background you are notified " +
-    "on completion — do NOT poll the job or fabricate its results; report status until the notification " +
-    "arrives.\n\nAvailable subagent_type values:\n" +
+    "Sub-agents cannot spawn their own sub-agents (one level deep)." +
+    (RUN_IN_BACKGROUND_ENABLED
+      ? " With run_in_background you are notified on completion — do NOT poll the job or fabricate its " +
+        "results; report status until the notification arrives."
+      : "") +
+    "\n\nAvailable subagent_type values:\n" +
     lines.join("\n")
   );
 }
@@ -73,12 +76,18 @@ export function createSpawnSubagentTool(
         description: `Which sub-agent type to use. Default: ${DEFAULT_SUBAGENT_TYPE}.`,
       })),
       model: Type.Optional(Type.String({ description: "Optional model override for this sub-agent." })),
-      run_in_background: Type.Optional(Type.Boolean({
-        description:
-          "Run the sub-agent in the background instead of waiting. You are notified when it completes — " +
-          "do NOT poll. Use only for genuinely independent work you can proceed without. " +
-          "Returns a job_id you can pass to job_stop to cancel it.",
-      })),
+      // run_in_background is gated OFF (RUN_IN_BACKGROUND_ENABLED) until background jobs notify the
+      // parent model on completion — until then it's foreground-only (see subagent-registry).
+      ...(RUN_IN_BACKGROUND_ENABLED
+        ? {
+            run_in_background: Type.Optional(Type.Boolean({
+              description:
+                "Run the sub-agent in the background instead of waiting. You are notified when it completes — " +
+                "do NOT poll. Use only for genuinely independent work you can proceed without. " +
+                "Returns a job_id you can pass to job_stop to cancel it.",
+            })),
+          }
+        : {}),
     }),
     async execute(toolCallId, rawParams, signal, onUpdate) {
       if (!executor) return errorResult("spawn_subagent is not available in this runtime.");
@@ -116,7 +125,7 @@ export function createSpawnSubagentTool(
         prompt,
         subagentType: type.agentType,
         model: p.model?.trim() || undefined,
-        runInBackground: p.run_in_background === true,
+        runInBackground: RUN_IN_BACKGROUND_ENABLED && p.run_in_background === true,
         parentSessionId: refs.sessionIdRef.current,
         parentAgentId: refs.agentId,
         userId: refs.userId,
