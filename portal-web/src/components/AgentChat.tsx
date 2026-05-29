@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react"
-import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History } from "lucide-react"
+import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History, Info } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { useConfirm } from "./confirm-dialog"
@@ -313,6 +313,15 @@ export function AgentChat({ agentId }: AgentChatProps) {
           <History className="h-4 w-4" />
         </button>
         <div className="ml-auto flex items-center gap-1">
+          {activeSessionId && hasPlan(pilot.messages) && (
+            <button
+              onClick={() => setShowPlan((v) => !v)}
+              className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
+              title={showPlan ? "Hide plan" : "Show plan"}
+            >
+              <Info className="h-4 w-4" />
+            </button>
+          )}
           <button
             onClick={handleNewSession}
             className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
@@ -327,48 +336,42 @@ export function AgentChat({ agentId }: AgentChatProps) {
       <div className="flex flex-1 overflow-hidden">
         {activeSessionId ? (
           <>
-            <PilotArea
-              agentId={agentId}
-              messages={pilot.messages}
-              isLoading={pilot.streaming}
-              hasMore={pilot.hasMore}
-              loadingMore={pilot.loadingMore}
-              onLoadMore={pilot.loadMore}
-              sendMessage={handleSend}
-              abortResponse={pilot.abort}
-              contextUsage={pilot.contextUsage}
-              pendingMessages={pilot.pendingMessages}
-              onRemovePending={pilot.removePending}
-              dpActive={pilot.dpActive}
-              onSetDpActive={pilot.setDpActive}
-              sessionKey={activeSessionId}
-              onOpenSkillPanel={(msg) => {
-                setSchedulePanelMsg(null)
-                setSkillPanelMsg(msg)
-              }}
-              onOpenSchedulePanel={(msg) => {
-                setSkillPanelMsg(null)
-                setSchedulePanelMsg(msg)
-              }}
-              onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
-            />
+            <div className="relative flex flex-1 min-w-0">
+              <PilotArea
+                agentId={agentId}
+                messages={pilot.messages}
+                isLoading={pilot.streaming}
+                hasMore={pilot.hasMore}
+                loadingMore={pilot.loadingMore}
+                onLoadMore={pilot.loadMore}
+                sendMessage={handleSend}
+                abortResponse={pilot.abort}
+                contextUsage={pilot.contextUsage}
+                pendingMessages={pilot.pendingMessages}
+                onRemovePending={pilot.removePending}
+                dpActive={pilot.dpActive}
+                onSetDpActive={pilot.setDpActive}
+                sessionKey={activeSessionId}
+                onOpenSkillPanel={(msg) => {
+                  setSchedulePanelMsg(null)
+                  setSkillPanelMsg(msg)
+                }}
+                onOpenSchedulePanel={(msg) => {
+                  setSkillPanelMsg(null)
+                  setSchedulePanelMsg(msg)
+                }}
+                onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
+              />
+              {/* Plan: a floating overlay panel, toggled from the top bar's plan button. */}
+              {showPlan && hasPlan(pilot.messages) && (
+                <PlanPanel messages={pilot.messages} onClose={() => setShowPlan(false)} />
+              )}
+            </div>
             {skillPanelMsg && (
               <SkillPanel message={skillPanelMsg} onClose={() => setSkillPanelMsg(null)} />
             )}
             {schedulePanelMsg && (
               <SchedulePanel message={schedulePanelMsg} onClose={() => setSchedulePanelMsg(null)} />
-            )}
-            {showPlan && hasPlan(pilot.messages) && (
-              <PlanPanel messages={pilot.messages} onClose={() => setShowPlan(false)} />
-            )}
-            {!showPlan && hasPlan(pilot.messages) && (
-              <button
-                onClick={() => setShowPlan(true)}
-                title="Show plan"
-                className="shrink-0 border-l border-border px-1 text-[10px] text-muted-foreground hover:text-foreground [writing-mode:vertical-rl]"
-              >
-                Plan
-              </button>
             )}
             {subagentDrill && agentId && (
               <SubagentTranscript
