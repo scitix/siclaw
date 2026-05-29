@@ -7,6 +7,10 @@ import { usePilotChat } from "../hooks/usePilotChat"
 import { PilotArea } from "./chat/PilotArea"
 import { SkillPanel } from "./chat/SkillPanel"
 import { SchedulePanel } from "./chat/SchedulePanel"
+import { PlanPanel } from "./plan/PlanPanel"
+import { hasPlan } from "./plan/foldPlan"
+import { SubagentTranscript } from "./plan/SubagentTranscript"
+import { JobsBar } from "./plan/JobsBar"
 import type { ChatAttachment, PilotMessage } from "./chat/types"
 
 interface ChatSession {
@@ -146,6 +150,8 @@ export function AgentChat({ agentId }: AgentChatProps) {
   // Panel state
   const [skillPanelMsg, setSkillPanelMsg] = useState<PilotMessage | null>(null)
   const [schedulePanelMsg, setSchedulePanelMsg] = useState<PilotMessage | null>(null)
+  const [showPlan, setShowPlan] = useState(true)
+  const [subagentDrill, setSubagentDrill] = useState<{ childSessionId: string; status?: string; label?: string } | null>(null)
 
   // Auto-title: track whether we already titled this session
   const titledSessionRef = useRef<string | null>(null)
@@ -344,12 +350,34 @@ export function AgentChat({ agentId }: AgentChatProps) {
                 setSkillPanelMsg(null)
                 setSchedulePanelMsg(msg)
               }}
+              onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
             />
             {skillPanelMsg && (
               <SkillPanel message={skillPanelMsg} onClose={() => setSkillPanelMsg(null)} />
             )}
             {schedulePanelMsg && (
               <SchedulePanel message={schedulePanelMsg} onClose={() => setSchedulePanelMsg(null)} />
+            )}
+            {showPlan && hasPlan(pilot.messages) && (
+              <PlanPanel messages={pilot.messages} onClose={() => setShowPlan(false)} />
+            )}
+            {!showPlan && hasPlan(pilot.messages) && (
+              <button
+                onClick={() => setShowPlan(true)}
+                title="Show plan"
+                className="shrink-0 border-l border-border px-1 text-[10px] text-muted-foreground hover:text-foreground [writing-mode:vertical-rl]"
+              >
+                Plan
+              </button>
+            )}
+            {subagentDrill && agentId && (
+              <SubagentTranscript
+                agentId={agentId}
+                childSessionId={subagentDrill.childSessionId}
+                status={subagentDrill.status}
+                label={subagentDrill.label}
+                onClose={() => setSubagentDrill(null)}
+              />
             )}
           </>
         ) : (
@@ -359,6 +387,13 @@ export function AgentChat({ agentId }: AgentChatProps) {
           </div>
         )}
       </div>
+
+      {activeSessionId && (
+        <JobsBar
+          messages={pilot.messages}
+          onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
+        />
+      )}
     </div>
   )
 }

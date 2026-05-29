@@ -1,5 +1,6 @@
-import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
+import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect, Fragment } from "react"
 import type { KeyboardEvent } from "react"
+import { formatToolInput } from "../../hooks/usePilotChat"
 import {
   Terminal,
   User,
@@ -173,6 +174,7 @@ export interface PilotAreaProps {
   sessionKey?: string | null
   onOpenSkillPanel?: (msg: PilotMessage) => void
   onOpenSchedulePanel?: (msg: PilotMessage) => void
+  onOpenSubagent?: (childSessionId: string, status?: string, label?: string) => void
   agentId?: string
 }
 
@@ -193,6 +195,7 @@ export function PilotArea({
   sessionKey,
   onOpenSkillPanel,
   onOpenSchedulePanel,
+  onOpenSubagent,
   agentId,
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -401,9 +404,14 @@ export function PilotArea({
 
               {renderMessages
                 .filter((m) => !m.hidden)
-                .map((msg) => (
+                .map((msg) => {
+                const childSessionId = msg.metadata?.kind === "delegation_event"
+                  ? (msg.metadata as Record<string, unknown>).child_session_id
+                  : undefined
+                const subStatus = (msg.metadata as Record<string, unknown> | undefined)?.status
+                return (
+                <Fragment key={msg.id}>
                   <MessageItem
-                    key={msg.id}
                     message={msg}
                     sendMessage={wrappedSendMessage}
                     showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
@@ -430,7 +438,20 @@ export function PilotArea({
                     onOpenSchedulePanel={onOpenSchedulePanel}
                     agentId={agentId}
                   />
-                ))}
+                  {typeof childSessionId === "string" && onOpenSubagent && (
+                    <div className="pl-12 -mt-1 mb-2">
+                      <button
+                        type="button"
+                        onClick={() => onOpenSubagent(childSessionId as string, typeof subStatus === "string" ? subStatus : undefined, "Sub-agent")}
+                        className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+                      >
+                        View sub-agent transcript →
+                      </button>
+                    </div>
+                  )}
+                </Fragment>
+                )
+                })}
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
                   to trace the root cause upstream. Hidden while a prefix chip is active. */}
@@ -1027,7 +1048,7 @@ function agentWorkSummary(message: PilotMessage): {
     target: rawTarget,
     targetLabel: isSelfDelegation ? "self sub-agent" : (targetName ? `${targetName} · ${rawTarget}` : rawTarget),
     isSelfDelegation,
-    scope: stringValue(args.scope) ?? stringValue(metadata.scope) ?? message.toolInput,
+    scope: stringValue(args.description) ?? stringValue(args.scope) ?? stringValue(args.prompt) ?? stringValue(metadata.scope) ?? message.toolInput,
     summary: normalizeAgentWorkSummary(stringValue(result.summary) ?? stringValue(message.content)),
     fullSummary: normalizeAgentWorkSummary(
       stringValue(details.full_summary) ??
@@ -1038,6 +1059,8 @@ function agentWorkSummary(message: PilotMessage): {
     childSessionId:
       stringValue(result.session_id) ??
       stringValue(result.sessionId) ??
+      stringValue(result.child_session_id) ??
+      stringValue(details.child_session_id) ??
       stringValue(metadata.child_session_id),
     toolCalls: numberValue(result.tool_calls) ?? numberValue(result.toolCalls),
     duration: compactDuration(durationMs ?? message.metadata?.durationMs as number | undefined),
@@ -1112,7 +1135,7 @@ function MessageItem({
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
     }
-    if (message.toolName === "delegate_to_agent" || message.metadata?.kind === "agent_work") {
+    if (message.toolName === "delegate_to_agent" || message.toolName === "spawn_subagent" || message.metadata?.kind === "agent_work") {
       return <AgentWorkCard message={message} />
     }
     if (message.toolName === "skill_preview" && !message.isStreaming) {
@@ -1644,12 +1667,72 @@ function EditableUserMessage({
   )
 }
 
+interface SubagentStepView {
+  kind: "assistant" | "tool"
+  text?: string
+  toolName?: string
+  toolInput?: string
+  content?: string
+  outcome?: string
+  durationMs?: number | null
+}
+
+/**
+ * Renders a sub-agent's execution like a mini main-agent run: reasoning text as
+ * Markdown, and each tool call via the SAME ToolItem component the main timeline
+ * uses (collapsible, formatted input/output, status + timing) — so it matches the
+ * main agent's execution view.
+ */
+function SubagentSteps({ steps }: { steps: SubagentStepView[] }) {
+  if (!steps?.length) return null
+  return (
+    <div className="space-y-3">
+      {steps.map((s, i) =>
+        s.kind === "assistant" ? (
+          <div key={i} className="text-sm text-foreground">
+            <Markdown>{s.text ?? ""}</Markdown>
+          </div>
+        ) : (
+          (() => {
+            // Format the command header exactly like the main agent (formatToolInput),
+            // parsing the (redacted) args JSON we forwarded.
+            const args = parseJsonRecord(s.toolInput ?? "") ?? undefined
+            const header = formatToolInput(s.toolName ?? "", args) || s.toolInput
+            return (
+              <ToolItem
+                key={i}
+                nested
+                message={{
+                  id: `substep-${i}`,
+                  role: "tool",
+                  content: s.content ?? "",
+                  toolName: s.toolName ?? "tool",
+                  toolArgs: args,
+                  toolInput: header,
+                  toolStatus: s.outcome === "error" ? "error" : "success",
+                  timestamp: "",
+                  ...(s.durationMs != null ? { timing: { durationMs: s.durationMs } } : {}),
+                }}
+              />
+            )
+          })()
+        ),
+      )}
+    </div>
+  )
+}
+
 function AgentWorkCard({ message }: { message: PilotMessage }) {
   const work = agentWorkSummary(message)
-  const [expanded, setExpanded] = useState(message.isStreaming ?? false)
-  const isOpen = message.isStreaming || expanded
+  const steps = (message.toolDetails?.steps as SubagentStepView[] | undefined) ?? []
+  const isRunning = message.toolStatus === "running" || message.isStreaming
+  const isSpawn = message.toolName === "spawn_subagent"
+  // Collapsed by default — the user expands the card when they want to see the
+  // execution. (Legacy delegate cards keep auto-opening while streaming.)
+  const [expanded, setExpanded] = useState(false)
+  const isOpen = isSpawn ? expanded : message.isStreaming || expanded
   const tone = statusTone(work.status)
-  const title = work.isSelfDelegation ? "Delegated investigation" : "Expert collaboration"
+  const title = isSpawn ? "Sub-agent" : work.isSelfDelegation ? "Delegated investigation" : "Expert collaboration"
 
   return (
     <div className="pl-12 min-w-0">
@@ -1667,14 +1750,23 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="text-sm font-semibold text-foreground shrink-0">{title}</span>
-              <span className={cn("px-2 py-0.5 rounded-full border text-[11px] font-medium", tone.className)}>
+              <span className={cn("text-sm font-semibold text-foreground", isSpawn ? "truncate" : "shrink-0")}>
+                {isSpawn ? (work.scope || "Sub-agent") : title}
+              </span>
+              {isSpawn && (
+                <span className="shrink-0 px-1.5 py-0.5 rounded-full border border-purple-500/30 bg-purple-500/10 text-purple-400 text-[10px] font-medium">
+                  sub-agent
+                </span>
+              )}
+              <span className={cn("shrink-0 px-2 py-0.5 rounded-full border text-[11px] font-medium", tone.className)}>
                 {tone.label}
               </span>
             </div>
-            <div className="text-xs text-muted-foreground truncate">
-              {work.targetLabel}{work.scope ? ` · ${work.scope}` : ""}
-            </div>
+            {!isSpawn && (
+              <div className="text-xs text-muted-foreground truncate">
+                {`${work.targetLabel}${work.scope ? ` · ${work.scope}` : ""}`}
+              </div>
+            )}
           </div>
           {message.toolStatus === "running" && (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
@@ -1683,41 +1775,52 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
 
         {isOpen && (
           <div className="p-4 space-y-3 bg-secondary/20 border-t border-border">
-            <div className="grid gap-2">
-              <div className="rounded-lg border border-border bg-card/70 p-3">
-                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
-                  {work.isSelfDelegation ? "Target" : "Target agent"}
-                </div>
-                <div className="text-sm text-foreground truncate">{work.targetLabel}</div>
-              </div>
-            </div>
-            {work.scope && (
+            {isSpawn ? (
+              // The card is just the sub-agent's execution process; the conclusion is
+              // surfaced by the parent in the main conversation, so no report here.
               <div>
-                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Scope</div>
-                <p className="text-sm text-foreground whitespace-pre-wrap">{work.scope}</p>
+                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Execution</div>
+                {steps.length > 0 ? (
+                  <SubagentSteps steps={steps} />
+                ) : isRunning ? (
+                  <div className="text-xs text-muted-foreground flex items-center gap-2">
+                    <Loader2 className="w-3 h-3 animate-spin" /> Sub-agent working…
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground/60">(no execution recorded)</div>
+                )}
               </div>
+            ) : (
+              <>
+                <div className="grid gap-2">
+                  <div className="rounded-lg border border-border bg-card/70 p-3">
+                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
+                      {work.isSelfDelegation ? "Target" : "Target agent"}
+                    </div>
+                    <div className="text-sm text-foreground truncate">{work.targetLabel}</div>
+                  </div>
+                </div>
+                {work.scope && (
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Scope</div>
+                    <p className="text-sm text-foreground whitespace-pre-wrap">{work.scope}</p>
+                  </div>
+                )}
+                {work.summary && (
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Capsule sent to parent</div>
+                    <div className="text-sm text-foreground"><Markdown>{work.summary}</Markdown></div>
+                  </div>
+                )}
+                {work.fullSummary && work.fullSummary !== work.summary && (
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Full sub-agent report</div>
+                    <div className="text-sm text-foreground max-h-96 overflow-y-auto pr-2"><Markdown>{work.fullSummary}</Markdown></div>
+                  </div>
+                )}
+                <AgentToolTraceList trace={work.toolTrace} defaultOpen={isRunning} />
+              </>
             )}
-            {work.summary && (
-              <div>
-                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
-                  Capsule sent to parent
-                </div>
-                <div className="text-sm text-foreground">
-                  <Markdown>{work.summary}</Markdown>
-                </div>
-              </div>
-            )}
-            {work.fullSummary && work.fullSummary !== work.summary && (
-              <div>
-                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
-                  Full sub-agent report
-                </div>
-                <div className="text-sm text-foreground max-h-96 overflow-y-auto pr-2">
-                  <Markdown>{work.fullSummary}</Markdown>
-                </div>
-              </div>
-            )}
-            <AgentToolTraceList trace={work.toolTrace} />
             <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
               {work.toolCalls != null && (
                 <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-card border border-border">
@@ -1751,10 +1854,10 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
 
 type AgentWorkBatchTask = ReturnType<typeof agentWorkBatchSummary>["tasks"][number]
 
-function AgentToolTraceList({ trace }: { trace: AgentToolTrace[] }) {
+function AgentToolTraceList({ trace, defaultOpen }: { trace: AgentToolTrace[]; defaultOpen?: boolean }) {
   if (trace.length === 0) return null
   return (
-    <details className="rounded-lg border border-border/70 bg-card/40">
+    <details open={defaultOpen} className="rounded-lg border border-border/70 bg-card/40">
       <summary className="cursor-pointer select-none px-3 py-2 text-[10px] uppercase tracking-wide text-muted-foreground hover:text-foreground">
         Tool trace
       </summary>
@@ -1976,12 +2079,12 @@ function AgentWorkBatchRow({ task }: { task: AgentWorkBatchTask }) {
   )
 }
 
-function ToolItem({ message }: { message: PilotMessage }) {
+function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const isOpen = message.isStreaming || expanded
 
   return (
-    <div className="pl-12 min-w-0">
+    <div className={nested ? "min-w-0" : "pl-12 min-w-0"}>
       <div className="group/tool bg-card border border-border rounded-lg shadow-sm shadow-black/10 overflow-hidden">
         {/* Whole row toggles expand. The toolInput span + timing badges
             stopPropagation on mousedown so drag-select doesn't get hijacked

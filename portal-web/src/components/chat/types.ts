@@ -50,6 +50,8 @@ export interface PilotMessage {
   /** Raw parsed tool input, when available, for structured cards. */
   toolArgs?: Record<string, unknown>
   toolStatus?: ToolStatus
+  /** pi tool-call id — correlates live tool_execution_update events to the right (parallel) tool message. */
+  toolCallId?: string
   /** Structured details from tool result metadata */
   toolDetails?: Record<string, unknown>
   metadata?: Record<string, unknown>

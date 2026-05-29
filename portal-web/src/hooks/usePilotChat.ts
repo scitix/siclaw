@@ -123,7 +123,7 @@ const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"]
 const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents"])
 
 /** Format tool args into a readable one-liner for display */
-function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
+export function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
   if (!args) return ""
   const name = toolName.toLowerCase()
   if (name === "bash" || name === "shell" || name === "command") {
@@ -324,6 +324,9 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     toolArgs,
     toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
     toolStatus,
+    // Persisted tool result details (e.g. sub-agent steps, child_session_id) live in
+    // metadata; surface them as toolDetails so cards recover their content on refresh.
+    toolDetails: m.role === "tool" ? (recoveredMetadata ?? undefined) : undefined,
     metadata: recoveredMetadata,
     timing,
     hidden: m.hidden || isDelegationEvent,
@@ -776,6 +779,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
               toolName: toolName ?? "tool",
               toolArgs: args,
               toolInput,
+              toolCallId: evt.toolCallId as string | undefined,
               toolStatus: "running" as const,
               timestamp: timeNow(),
               isStreaming: true,
@@ -783,6 +787,24 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
               ...(showThinking ? { timing: { thinkingMs: preThinkingMs } } : {}),
             },
           ])
+          break
+        }
+
+        // --- Tool execution update (live partial result, e.g. spawn_subagent streaming its progress) ---
+        case "tool_execution_update": {
+          const toolCallId = evt.toolCallId as string | undefined
+          const partial = evt.partialResult as
+            | { content?: Array<{ type: string; text?: string }>; details?: Record<string, unknown> }
+            | undefined
+          if (!toolCallId || !partial?.details) break
+          setMessages((prev) => {
+            const i = prev.findIndex((m) => m.role === "tool" && m.toolCallId === toolCallId)
+            if (i < 0) return prev
+            const updated = [...prev]
+            const merged = { ...(updated[i].toolDetails ?? {}), ...partial.details }
+            updated[i] = { ...updated[i], toolDetails: merged, metadata: { ...(updated[i].metadata ?? {}), ...partial.details } }
+            return updated
+          })
           break
         }
 
