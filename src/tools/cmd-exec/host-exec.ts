@@ -32,9 +32,10 @@ export function createHostExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinitio
     label: "Host Exec",
     description: `Execute a single diagnostic command on a non-Kubernetes host via SSH.
 
-Use this for hosts NOT managed by Kubernetes — bare-metal nodes, jump hosts,
-storage nodes — where kubectl can't reach. The host must be bound to this agent
-in the Portal (visible via host_list).
+Use this (not the bash tool, which cannot ssh) for hosts NOT managed by
+Kubernetes — bare-metal nodes, jump hosts, storage nodes — where kubectl can't
+reach. Only host_exec / host_script carry a valid SSH credential. The host must
+be bound to this agent in the Portal (visible via host_list).
 
 Allowed commands match node_exec's whitelist (network, RDMA, GPU, hardware,
 kernel, process, file read-only, text processing, logs/services, container,

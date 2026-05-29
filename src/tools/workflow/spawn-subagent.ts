@@ -36,11 +36,19 @@ function errorResult(message: string) {
 function buildDescription(): string {
   const lines = listSubagentTypes().map((t) => `- ${t.agentType}: ${t.whenToUse}`);
   return (
-    "Delegate ONE bounded task to an isolated sub-agent and get its findings back inline. " +
-    "The sub-agent starts fresh — its only context is the prompt you give it, so brief it fully " +
-    "(what to do, success criteria, what evidence to collect). To work several independent tasks " +
-    "in parallel, emit multiple spawn_subagent calls in a single turn. Sub-agents cannot spawn " +
-    "their own sub-agents.\n\nAvailable subagent_type values:\n" +
+    "Launch an isolated sub-agent to handle ONE bounded task and get its findings back. Use it to " +
+    "parallelize independent work — emit several spawn_subagent calls in a single turn — or to keep a " +
+    "large investigation's raw output out of your own context. Do NOT use it for a single quick lookup " +
+    "you can do yourself in one tool call, and never redo work a sub-agent is already doing.\n\n" +
+    "Writing the prompt: the sub-agent starts fresh and sees ONLY your prompt — brief it like a smart " +
+    "colleague who just walked in. State the goal and why it matters, what you already know or have ruled " +
+    "out, the exact target/scope, and what evidence to report back. For a lookup, hand over the exact " +
+    "command; for an investigation, hand over the question. Terse command-style prompts produce shallow, " +
+    "generic work. Never delegate understanding — don't write 'based on your findings, decide X'; give " +
+    "concrete targets, paths, and what to check.\n\n" +
+    "Sub-agents cannot spawn their own sub-agents (one level deep). With run_in_background you are notified " +
+    "on completion — do NOT poll the job or fabricate its results; report status until the notification " +
+    "arrives.\n\nAvailable subagent_type values:\n" +
     lines.join("\n")
   );
 }

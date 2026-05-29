@@ -35,7 +35,7 @@ export function createNodeExecTool(kubeconfigRef?: KubeconfigRef, userId?: strin
   return {
     name: "node_exec",
     label: "Node Exec",
-    description: `Execute diagnostic commands directly on a Kubernetes node.
+    description: `Execute a single diagnostic command directly on a Kubernetes node. For multi-step scripts (pipes, loops, functions), use node_script instead.
 Creates a privileged debug pod with nsenter to run the command in the host's full namespaces (mount, UTS, IPC, network, PID).
 The pod is automatically cleaned up after execution (--rm).
 

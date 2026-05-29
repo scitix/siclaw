@@ -54,14 +54,22 @@ describe("task tools", () => {
     expect(events[2]).toMatchObject({ action: "delete", taskId: "1" });
   });
 
-  it("task_list shows ready vs blocked with waiting-on ids", async () => {
+  it("task_list shows ready vs blocked with waiting-on ids (deps set via task_update)", async () => {
     const c = createTaskCreateTool(TLID);
     await c.execute("c1", { subject: "n", description: "" });               // #1
-    await c.execute("c2", { subject: "correlate", description: "", blockedBy: ["1"] }); // #2
+    await c.execute("c2", { subject: "correlate", description: "" });       // #2
+    // Dependencies are set after creation by real id (CC-aligned), never at create time.
+    await createTaskUpdateTool(TLID).execute("u1", { id: "2", addBlockedBy: ["1"] });
     const r = await createTaskListTool(TLID).execute("l1", {});
     const out = text(r);
     expect(out).toMatch(/#1.*ready/i);
     expect(out).toMatch(/#2.*blocked/i);
     expect(out).toContain("waiting on #1");
+  });
+
+  it("task_update on an unknown id returns an error result (not a silent ok)", async () => {
+    const r = await createTaskUpdateTool(TLID).execute("u1", { id: "999", status: "completed" });
+    expect((r as any).details?.error).toBe(true);
+    expect(text(r)).toContain("not found");
   });
 });

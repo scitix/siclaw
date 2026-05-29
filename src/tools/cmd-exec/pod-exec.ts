@@ -31,7 +31,7 @@ export function createPodExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition
   return {
     name: "pod_exec",
     label: "Pod Exec",
-    description: `Execute a diagnostic command inside a running Kubernetes pod via kubectl exec.
+    description: `Execute a single diagnostic command inside a running Kubernetes pod via kubectl exec. For multi-step scripts, use pod_script instead.
 
 Runs a single whitelisted command directly inside the target pod's container.
 The command runs in the pod's own environment — it uses whatever tools are available in the container image.

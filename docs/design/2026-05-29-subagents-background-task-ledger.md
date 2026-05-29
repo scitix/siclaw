@@ -77,8 +77,14 @@ finishes, task `#3` is marked `completed`. Neither structure embeds the other.
 ### Contract
 - **Entry:** `{ id, subject, description, activeForm?, status, owner?, blocks[], blockedBy[], metadata? }`.
   `status ∈ {pending, in_progress, completed}`; `deleted` is a hard-delete action.
-- **Tools:** `task_create`, `task_update` (status / owner / addBlocks / addBlockedBy / metadata),
-  `task_list`, `task_get`.
+- **Tools:** `task_create` (`subject` / `description` / `activeForm?` / `owner?`), `task_update`
+  (status / owner / addBlocks / addBlockedBy / metadata), `task_list`, `task_get`.
+- **Dependencies are set after creation, never at create time (CC-aligned).** `task_create` takes **no**
+  `blockedBy` — it returns the new id and the task starts with empty `blocks`/`blockedBy`. The model wires
+  ordering with `task_update addBlockedBy`, referencing the **real ids returned by `task_create`**. This
+  mirrors Claude Code's `TaskCreate`/`TaskUpdate` split and removes the impossible "predict a sibling id
+  during a parallel create" step that otherwise produces dangling `blockedBy` references. `task_update`
+  against an unknown id returns an **error** result (not a silent no-op), so a bad id surfaces immediately.
 - **Id allocation:** numeric, monotonic per `taskListId`, serialized by the persistence layer (DB
   transaction in gateway modes; a local lock in TUI) — concurrency-safe when parent and sub-agents write
   the same list.
@@ -153,8 +159,8 @@ TodoWrite cannot. The cost (ids, file-locking, persistence) is paid once.
 
 The parent orchestrates; sub-agents execute; the ledger records.
 
-1. `task_create` the work, with `blockedBy` for ordering (e.g. `correlate` blocked by `nodes`, `pods`,
-   `net`).
+1. `task_create` each unit of work (bare — no `blockedBy`), then `task_update addBlockedBy` to wire
+   ordering using the returned ids (e.g. `correlate` blocked by `nodes`, `pods`, `net`).
 2. For each ready (unblocked) task, `spawn_subagent` — emit them **in one turn** to run in parallel
    (or `run_in_background` for independent long work).
 3. As each child returns, mark its task `completed` (the child or the parent); dependents unblock.

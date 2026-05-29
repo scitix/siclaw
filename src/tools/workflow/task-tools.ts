@@ -13,6 +13,7 @@ import { getOrCreateLedger, type LedgerTask, type TaskStatus, type TaskView } fr
 import type { TaskEvent } from "../../shared/task-events.js";
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
+const err = (text: string) => ({ content: [{ type: "text" as const, text }], details: { error: true } });
 
 function emitUpsert(emit: SessionEventEmitter | undefined, taskListId: string, task: LedgerTask): void {
   emit?.({ kind: "task_event", taskListId, action: "upsert", task } satisfies TaskEvent);
@@ -32,17 +33,23 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
     renderCall: (_a, theme) => title(theme, "task_create"),
     renderResult: renderTextResult,
     description:
-      "Add a task to the plan (the task ledger). Use for multi-step or multi-target work. " +
-      "Set blockedBy to ids of tasks that must finish first (advisory ordering).",
+      "Add a task to the plan (the per-session task ledger) and return its id. Use it proactively for " +
+      "non-trivial work: 3+ distinct steps, the same work across multiple targets, or when the user gives " +
+      "several things to do — create the main steps up front. Skip it for a single trivial step (no " +
+      "ceremony).\n" +
+      "Fields: subject (short imperative title), description (what to do), activeForm (present-continuous " +
+      "form shown in the spinner), owner (optional, e.g. a sub-agent name).\n" +
+      "Dependencies are NOT set here: task_create returns each task's id; order dependent steps afterward " +
+      "with task_update addBlockedBy, referencing those returned ids (never guess ids). Call task_list " +
+      "first to avoid creating duplicate tasks.",
     parameters: Type.Object({
       subject: Type.String({ description: "Short imperative title" }),
       description: Type.String({ description: "What needs to be done" }),
       activeForm: Type.Optional(Type.String({ description: "Present-continuous form for spinners" })),
       owner: Type.Optional(Type.String({ description: "Who works this (e.g. a sub-agent name)" })),
-      blockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task ids that must complete first" })),
     }),
     async execute(_id, raw) {
-      const p = raw as { subject: string; description: string; activeForm?: string; owner?: string; blockedBy?: string[] };
+      const p = raw as { subject: string; description: string; activeForm?: string; owner?: string };
       const t = getOrCreateLedger(taskListId).create(p);
       emitUpsert(emit, taskListId, t);
       return ok(`Created task #${t.id}: ${t.subject}`);
@@ -57,8 +64,15 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
     renderCall: (_a, theme) => title(theme, "task_update"),
     renderResult: renderTextResult,
     description:
-      "Update a task: set status (pending/in_progress/completed), owner, add blockers, or delete it " +
-      "(status=deleted). Mark a task completed as soon as it is done so dependents unblock.",
+      "Update a task in the plan: set status (pending/in_progress/completed), subject/description/" +
+      "activeForm/owner, add a dependency (addBlockedBy), or delete it (status=deleted). " +
+      "An unknown id returns an error.\n" +
+      "Status workflow pending -> in_progress -> completed: mark a task in_progress before you start it, " +
+      "and completed as soon as it is FULLY done so dependents unblock — do not batch completions. Only " +
+      "mark completed when truly finished; if you hit errors, blockers, partial work, or failing checks, " +
+      "keep it in_progress (optionally add a new task for the blocker).\n" +
+      "Set ordering with addBlockedBy using the real ids from task_create / task_list, " +
+      "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.",
     parameters: Type.Object({
       id: Type.String(),
       status: Type.Optional(Type.Union([
@@ -85,7 +99,7 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       if (p.status === "deleted") {
         const removed = ledger.delete(p.id);
         if (removed) emitDelete(emit, taskListId, p.id);
-        return ok(removed ? `Deleted task #${p.id}` : `Task #${p.id} not found`);
+        return removed ? ok(`Deleted task #${p.id}`) : err(`Task #${p.id} not found — call task_list to see valid ids.`);
       }
       const updated = ledger.update(p.id, {
         status: p.status,
@@ -95,8 +109,9 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
         owner: p.owner,
         addBlockedBy: p.addBlockedBy,
       });
-      if (updated) emitUpsert(emit, taskListId, updated);
-      return ok(updated ? `Updated task #${p.id} (status: ${updated.status})` : `Task #${p.id} not found`);
+      if (!updated) return err(`Task #${p.id} not found — call task_list to see valid ids.`);
+      emitUpsert(emit, taskListId, updated);
+      return ok(`Updated task #${p.id} (status: ${updated.status})`);
     },
   };
 }
