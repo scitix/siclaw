@@ -36,7 +36,7 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
       "Add a task to the plan (the per-session task ledger) and return its id. Use it proactively for " +
       "non-trivial work: 3+ distinct steps, the same work across multiple targets, or when the user gives " +
       "several things to do — create the main steps up front. Skip it for a single trivial step (no " +
-      "ceremony).\n" +
+      "ceremony). Complete the current plan before starting a new one.\n" +
       "Fields: subject (short imperative title), description (what to do), activeForm (present-continuous " +
       "form shown in the spinner), owner (optional, e.g. a sub-agent name).\n" +
       "Dependencies are NOT set here: task_create returns each task's id; order dependent steps afterward " +
@@ -72,7 +72,10 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       "mark completed when truly finished; if you hit errors, blockers, partial work, or failing checks, " +
       "keep it in_progress (optionally add a new task for the blocker).\n" +
       "Set ordering with addBlockedBy using the real ids from task_create / task_list, " +
-      "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.",
+      "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.\n" +
+      "Keep the plan scoped to the current work: remove tasks that are no longer relevant entirely with " +
+      "status=deleted — e.g. when a plan is finished and you start a new one, clear the old tasks rather " +
+      "than letting the list grow (the conversation keeps the history).",
     parameters: Type.Object({
       id: Type.String(),
       status: Type.Optional(Type.Union([
