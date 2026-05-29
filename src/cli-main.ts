@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
+  AgentSessionRuntime,
   InteractiveMode,
   runPrintMode,
   SessionManager,
+  type CreateAgentSessionRuntimeFactory,
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
 import { isMemoryEnabled, loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
@@ -186,22 +188,46 @@ void debugPodGC.start(credentialsDir).catch((err) => {
   console.warn("[siclaw] DebugPodGC start failed:", err);
 });
 
-// Create session via shared factory
-const { brain, session, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
-  await createSiclawSession({
-    sessionManager,
-    mode: "cli",
-    kubeconfigRef: { credentialsDir },
-    portalSkillsDir,
-    portalKnowledgeDir,
-    portalCredentialsDir,
-    // When the snapshot is scoped to an agent that carries a custom
-    // system_prompt, swap out siclaw's default SRE prompt for the agent's.
-    systemPromptTemplate: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
-    portalActiveAgent: portalSnapshot?.activeAgent ?? null,
-    portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
-    portalUrl: portalSnapshot?.portalUrl,
-  });
+// Create session via shared factory. Opts are factored out so the runtime's
+// session-replacement factory (/new, /resume, /fork) can recreate an
+// equivalent siclaw session against a different SessionManager.
+const buildSiclawOpts = (sm: SessionManager) => ({
+  sessionManager: sm,
+  mode: "cli" as const,
+  kubeconfigRef: { credentialsDir },
+  portalSkillsDir,
+  portalKnowledgeDir,
+  portalCredentialsDir,
+  // When the snapshot is scoped to an agent that carries a custom
+  // system_prompt, swap out siclaw's default SRE prompt for the agent's.
+  systemPromptTemplate: portalSnapshot?.activeAgent?.systemPrompt ?? undefined,
+  portalActiveAgent: portalSnapshot?.activeAgent ?? null,
+  portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
+  portalUrl: portalSnapshot?.portalUrl,
+});
+
+const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
+  await createSiclawSession(buildSiclawOpts(sessionManager));
+
+// pi 0.73 drives the TUI through an AgentSessionRuntime rather than a bare
+// AgentSession. The factory recreates a full siclaw session on session switch.
+const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager: sm }) => {
+  const recreated = await createSiclawSession(buildSiclawOpts(sm));
+  return {
+    session: recreated.session,
+    services: recreated.services,
+    extensionsResult: recreated.extensionsResult,
+    diagnostics: [],
+    modelFallbackMessage: recreated.modelFallbackMessage,
+  };
+};
+const runtime = new AgentSessionRuntime(
+  session,
+  services,
+  createRuntime,
+  [],
+  modelFallbackMessage,
+);
 
 // P1-1: Startup status summary
 {
@@ -331,22 +357,25 @@ if (debugMode) {
 
 // Select run mode
 if (isPrintMode && initialMessage) {
-  await runPrintMode(session, {
+  await runPrintMode(runtime, {
     mode: "text",
     initialMessage,
   });
 } else {
-  const mode = new InteractiveMode(session, { modelFallbackMessage });
+  const mode = new InteractiveMode(runtime, { modelFallbackMessage });
 
   // Workaround: framework's getRegisteredToolDefinition only checks extension-registered
   // tools via extensionRunner.getAllRegisteredTools(), missing SDK custom tools passed
-  // through createAgentSession({ customTools }). Without this patch, custom tool output
-  // is captured by the LLM but never rendered in the interactive UI because the
-  // ToolExecutionComponent receives toolDefinition=undefined and skips all rendering.
-  const customToolMap = new Map(customTools.map((t) => [t.name, t]));
-  const origGetDef = (mode as any).getRegisteredToolDefinition.bind(mode);
-  (mode as any).getRegisteredToolDefinition = (toolName: string) =>
-    origGetDef(toolName) ?? customToolMap.get(toolName);
+  // through createAgentSessionFromServices({ customTools }). Without this patch, custom
+  // tool output is captured by the LLM but never rendered in the interactive UI because
+  // the ToolExecutionComponent receives toolDefinition=undefined and skips all rendering.
+  const origGetDef = (mode as any).getRegisteredToolDefinition;
+  if (typeof origGetDef === "function") {
+    const customToolMap = new Map(customTools.map((t) => [t.name, t]));
+    const boundGetDef = origGetDef.bind(mode);
+    (mode as any).getRegisteredToolDefinition = (toolName: string) =>
+      boundGetDef(toolName) ?? customToolMap.get(toolName);
+  }
 
   await mode.run();
 }

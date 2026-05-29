@@ -323,7 +323,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
 
@@ -351,7 +351,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
 
@@ -389,7 +389,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
 
@@ -417,7 +417,7 @@ describe("compactionSafeguardExtension", () => {
       };
       const ctx = {
         model: undefined, // no model
-        modelRegistry: { getApiKey: vi.fn() },
+        modelRegistry: { getApiKeyAndHeaders: vi.fn() },
       };
 
       const result = await handler(event, ctx);
@@ -442,7 +442,7 @@ describe("compactionSafeguardExtension", () => {
       };
       const ctx = {
         model: { contextWindow: 200000, provider: "test", id: "test-model" },
-        modelRegistry: { getApiKey: vi.fn().mockResolvedValue(undefined) }, // no key
+        modelRegistry: { getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: false, error: "no key" }) }, // no key
       };
 
       const result = await handler(event, ctx);
@@ -467,7 +467,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
       // Empty → cancel; tool-failure section only matters for the real summary path.
@@ -495,7 +495,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
       // Empty → cancel; file-ops only land in the real summary path.
@@ -536,7 +536,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
 
@@ -564,7 +564,7 @@ describe("compactionSafeguardExtension", () => {
         },
         signal: new AbortController().signal,
       };
-      const ctx = { model: undefined, modelRegistry: { getApiKey: vi.fn() } };
+      const ctx = { model: undefined, modelRegistry: { getApiKeyAndHeaders: vi.fn() } };
 
       const result = await handler(event, ctx);
 

@@ -620,13 +620,15 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       return { cancel: true };
     }
 
-    const apiKey = await ctx.modelRegistry.getApiKey(model);
-    if (!apiKey) {
+    const resolvedAuth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+    if (!resolvedAuth.ok || !resolvedAuth.apiKey) {
       console.warn(
         "[compaction-safeguard] No API key available; cancelling compaction to preserve history.",
       );
       return { cancel: true };
     }
+    const apiKey = resolvedAuth.apiKey;
+    const headers = resolvedAuth.headers;
 
     try {
       const contextWindowTokens = resolveContextWindowTokens(model);
@@ -683,6 +685,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   messages: pruned.droppedMessagesList,
                   model,
                   apiKey,
+                  headers,
                   signal,
                   reserveTokens: Math.max(1, Math.floor(preparation.settings.reserveTokens)),
                   maxChunkTokens: droppedMaxChunkTokens,
@@ -748,6 +751,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   messages: messagesToSummarize,
                   model,
                   apiKey,
+                  headers,
                   signal,
                   reserveTokens,
                   maxChunkTokens,
@@ -770,6 +774,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
               messages: turnPrefixMessages,
               model,
               apiKey,
+              headers,
               signal,
               reserveTokens,
               maxChunkTokens,
