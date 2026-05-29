@@ -93,6 +93,29 @@ export class TaskLedger {
     return !t || t.status === "completed";
   }
 
+  /** Number of tasks — used to decide whether a fresh ledger needs rehydration. */
+  get size(): number {
+    return this.tasks.size;
+  }
+
+  /** Serialize all tasks for a durable snapshot. */
+  snapshot(): LedgerTask[] {
+    return [...this.tasks.values()].map((t) => ({ ...t, blockedBy: [...t.blockedBy] }));
+  }
+
+  /** Replace all tasks from a persisted snapshot and restore the id sequence so
+   *  new task_create ids continue past the highest restored id. */
+  hydrate(tasks: LedgerTask[]): void {
+    this.tasks.clear();
+    let maxSeq = 0;
+    for (const t of tasks) {
+      this.tasks.set(t.id, { ...t, blockedBy: [...(t.blockedBy ?? [])] });
+      const n = Number(t.id);
+      if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
+    }
+    this.seq = maxSeq;
+  }
+
   list(): TaskView[] {
     const out: TaskView[] = [];
     for (const task of this.tasks.values()) {
@@ -122,6 +145,11 @@ export function getOrCreateLedger(taskListId: string): TaskLedger {
     ledgers.set(taskListId, l);
   }
   return l;
+}
+
+/** Drop one ledger — called on permanent session closure to bound memory. */
+export function deleteLedger(taskListId: string): void {
+  ledgers.delete(taskListId);
 }
 
 /** Test helper — clears all ledgers. */

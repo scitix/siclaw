@@ -48,6 +48,7 @@ import type {
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
+import { getOrCreateLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
 import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -400,6 +401,33 @@ export class AgentBoxSessionManager {
    */
   private async persistTaskEvent(sessionId: string, event: TaskEvent): Promise<void> {
     await this.persistAppendMessage(buildTaskEventChatMessage(sessionId, event));
+  }
+
+  // ── Backend task-ledger durability (design §14) ────────────────────────────
+  // The ledger is in-memory (task-ledger.ts), keyed by taskListId == session id.
+  // The module map survives session release within a process; these helpers add
+  // a PV-backed snapshot so the plan also survives a full pod/process restart.
+  private ledgerFile(taskListId: string): string {
+    return path.join(this.getSessionDir(taskListId), ".plan-ledger.json");
+  }
+
+  /** Best-effort: write the current ledger snapshot to the PV session dir. */
+  private persistLedgerSnapshot(taskListId: string): void {
+    const tasks = getOrCreateLedger(taskListId).snapshot();
+    void fs.promises
+      .writeFile(this.ledgerFile(taskListId), JSON.stringify(tasks), "utf8")
+      .catch((err) => console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err));
+  }
+
+  /** Restore the ledger from the PV snapshot — only when the in-memory copy is
+   *  empty (i.e. after a process restart; a release-survived ledger is kept). */
+  private rehydrateLedger(taskListId: string): void {
+    const ledger = getOrCreateLedger(taskListId);
+    if (ledger.size > 0) return;
+    try {
+      const tasks = JSON.parse(fs.readFileSync(this.ledgerFile(taskListId), "utf8")) as LedgerTask[];
+      if (Array.isArray(tasks) && tasks.length > 0) ledger.hydrate(tasks);
+    } catch { /* no snapshot (new session) — fine */ }
   }
 
   private async persistUpdateMessage(message: DelegationUpdateMessagePayload): Promise<void> {
@@ -774,6 +802,10 @@ export class AgentBoxSessionManager {
         void this.persistTaskEvent(id, event).catch((err) =>
           console.warn(`[agentbox-session] task_event persist failed for ${id}:`, err),
         );
+        // Snapshot the (shared) ledger to the PV session dir so the backend plan
+        // survives a pod/process restart — keyed by the event's taskListId (the
+        // parent's id, even when a sub-agent mutated a task it owns).
+        this.persistLedgerSnapshot(event.taskListId ?? id);
       }
       if (extraEventSubs.size === 0) {
         extraEventBuffer.push(event);
@@ -787,6 +819,11 @@ export class AgentBoxSessionManager {
       } else for (const sub of extraEventSubs) { try { sub(event); } catch { /* best-effort */ } }
     };
 
+    // Rehydrate the task ledger before the agent runs. The module-level ledger
+    // map survives session release within a process; this restores it after a
+    // full pod/process restart from the PV snapshot. taskListId == session id.
+    this.rehydrateLedger(id);
+
     const result = await createSiclawSession({
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
@@ -796,6 +833,9 @@ export class AgentBoxSessionManager {
       agentId: this.agentId ?? null,
       knowledgeIndexer: this.knowledgeIndexer,
       systemPromptTemplate,
+      // Stable per-session ledger key so the plan survives release/rebuild
+      // (a fresh random id would orphan the prior in-memory ledger every turn).
+      taskListId: id,
       sessionEventEmitter: emitExtraEvent,
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
@@ -1186,6 +1226,9 @@ export class AgentBoxSessionManager {
         }
       }
       this.sessions.delete(sessionId);
+      // Permanent closure — drop the in-memory ledger so it doesn't accumulate
+      // (the durable snapshot + Portal task_events remain for history/recovery).
+      deleteLedger(sessionId);
       emitDiagnostic({ type: "session_released", sessionId });
     }
   }

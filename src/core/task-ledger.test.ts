@@ -1,5 +1,32 @@
 import { describe, it, expect } from "vitest";
-import { TaskLedger, getOrCreateLedger, resetLedgers } from "./task-ledger.js";
+import { TaskLedger, getOrCreateLedger, deleteLedger, resetLedgers } from "./task-ledger.js";
+
+describe("TaskLedger — snapshot / hydrate (durability)", () => {
+  it("round-trips tasks and restores the id sequence so new ids continue past the max", () => {
+    const a = new TaskLedger();
+    a.create({ subject: "t1", description: "" });            // #1
+    a.create({ subject: "t2", description: "" });            // #2
+    a.update("2", { status: "in_progress", addBlockedBy: ["1"] });
+    const snap = a.snapshot();
+
+    const b = new TaskLedger();
+    b.hydrate(snap);
+    expect(b.size).toBe(2);
+    expect(b.get("2")?.status).toBe("in_progress");
+    expect(b.get("2")?.blockedBy).toEqual(["1"]);
+    // next create must not collide with restored ids
+    expect(b.create({ subject: "t3", description: "" }).id).toBe("3");
+  });
+
+  it("deleteLedger drops the shared ledger; getOrCreateLedger then returns a fresh one", () => {
+    resetLedgers();
+    const l1 = getOrCreateLedger("sess-x");
+    l1.create({ subject: "a", description: "" });
+    expect(getOrCreateLedger("sess-x")).toBe(l1);   // same instance while alive
+    deleteLedger("sess-x");
+    expect(getOrCreateLedger("sess-x").size).toBe(0); // fresh, empty
+  });
+});
 
 describe("TaskLedger", () => {
   it("creates tasks with monotonic numeric ids and pending status", () => {
