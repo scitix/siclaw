@@ -32,7 +32,7 @@ export interface PlanTaskView extends PlanTask {
 
 interface TaskEventMeta {
   kind: "task_event"
-  action: "upsert" | "delete"
+  action: "upsert" | "delete" | "reset"
   taskId?: string
   task?: {
     id: string
@@ -56,6 +56,11 @@ export function foldPlan(messages: PilotMessage[]): PlanTaskView[] {
   for (const msg of messages) {
     const ev = asTaskEvent(msg.metadata)
     if (!ev) continue
+    if (ev.action === "reset") {
+      // Plan finished and was auto-cleared — drop everything before this point.
+      map.clear()
+      continue
+    }
     if (ev.action === "delete") {
       if (ev.taskId) map.delete(String(ev.taskId))
       continue
@@ -93,7 +98,8 @@ export function foldPlan(messages: PilotMessage[]): PlanTaskView[] {
   })
 }
 
-/** True when there is any task to show (used to decide whether to surface the plan panel). */
+/** True when the CURRENT plan has tasks (used to surface the plan panel/toggle).
+ *  Fold-based so an auto-cleared (reset) plan correctly hides the panel. */
 export function hasPlan(messages: PilotMessage[]): boolean {
-  return messages.some((m) => asTaskEvent(m.metadata) !== null)
+  return foldPlan(messages).length > 0
 }

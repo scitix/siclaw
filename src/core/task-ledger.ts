@@ -98,6 +98,19 @@ export class TaskLedger {
     return this.tasks.size;
   }
 
+  /** True when the plan is non-empty and every task is completed (auto-clear trigger). */
+  allCompleted(): boolean {
+    if (this.tasks.size === 0) return false;
+    for (const t of this.tasks.values()) if (t.status !== "completed") return false;
+    return true;
+  }
+
+  /** Clear all tasks but KEEP the id sequence (high-water-mark) so the next plan's
+   *  ids continue and never collide with cleared ones (CC resetTaskList parity). */
+  clear(): void {
+    this.tasks.clear();
+  }
+
   /** Serialize all tasks for a durable snapshot. */
   snapshot(): LedgerTask[] {
     return [...this.tasks.values()].map((t) => ({ ...t, blockedBy: [...t.blockedBy] }));

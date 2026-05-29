@@ -105,6 +105,14 @@ finishes, task `#3` is marked `completed`. Neither structure embeds the other.
   only ready tasks.
 - **No gating:** the ledger never blocks tool use or completion; it is a record + an observable (UI panel
   / TUI render).
+- **Auto-clear when a plan completes (CC V2 `resetTaskList` parity):** once **every** task is `completed`,
+  the ledger is cleared after a short delay (`LEDGER_AUTOCLEAR_MS`, ~5s — matches CC's `HIDE_DELAY_MS`).
+  A new pending task before the timer fires cancels the clear. The clear emits a `task_event` with
+  `action: "reset"` (persisted + streamed), so the backend ledger, the live SSE consumers, `foldPlan`, and
+  refresh all reset together; the id sequence is **preserved** so the next plan's ids never reuse cleared
+  ones. This keeps the plan scoped to the current work instead of accumulating completed tasks across
+  multiple plans in one session. The model may also remove a task explicitly with `status=deleted`
+  (no-longer-relevant / created-in-error), the same per-task curation CC V2's TaskUpdate exposes.
 
 ### Why Tasks-v2 instead of TodoWrite
 Going straight to v2 avoids building, then discarding, the simpler single-`in_progress` checklist.

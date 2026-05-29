@@ -14,7 +14,9 @@ import type { LedgerTask } from "../core/task-ledger.js";
 export interface TaskEvent {
   kind: "task_event";
   taskListId: string;
-  action: "upsert" | "delete";
+  /** "reset" clears the whole plan (emitted ~5s after every task completes —
+   *  CC V2 parity, see resetTaskList). */
+  action: "upsert" | "delete" | "reset";
   /** Full snapshot for upsert (the UI/agentbox replaces the task by id). */
   task?: LedgerTask;
   /** Target id for delete. */
@@ -36,9 +38,11 @@ export function buildTaskEventChatMessage(
   event: TaskEvent,
 ): DelegationAppendMessagePayload {
   const content =
-    event.action === "delete"
-      ? `task #${event.taskId} deleted`
-      : `task #${event.task?.id} [${event.task?.status}] ${event.task?.subject}`;
+    event.action === "reset"
+      ? "plan cleared"
+      : event.action === "delete"
+        ? `task #${event.taskId} deleted`
+        : `task #${event.task?.id} [${event.task?.status}] ${event.task?.subject}`;
   return {
     sessionId,
     role: "user",

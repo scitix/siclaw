@@ -2,11 +2,32 @@ import { describe, it, expect } from "vitest"
 import { foldPlan, hasPlan } from "./foldPlan"
 import type { PilotMessage } from "../chat/types"
 
-function ev(action: "upsert" | "delete", payload: Record<string, unknown>, id = Math.random().toString()): PilotMessage {
+function ev(action: "upsert" | "delete" | "reset", payload: Record<string, unknown> = {}, id = Math.random().toString()): PilotMessage {
   return { id, role: "user", content: "", timestamp: 0, metadata: { kind: "task_event", action, ...payload } } as unknown as PilotMessage
 }
 
 describe("foldPlan", () => {
+  it("reset clears the plan; a new plan after it stands alone (no accumulation)", () => {
+    const msgs = [
+      ev("upsert", { task: { id: "1", subject: "old A", status: "completed", blockedBy: [] } }),
+      ev("upsert", { task: { id: "2", subject: "old B", status: "completed", blockedBy: [] } }),
+      ev("reset"),
+      ev("upsert", { task: { id: "3", subject: "new plan", status: "in_progress", blockedBy: [] } }),
+    ]
+    const plan = foldPlan(msgs)
+    expect(plan).toHaveLength(1)
+    expect(plan[0]).toMatchObject({ id: "3", subject: "new plan", group: "in_progress" })
+  })
+
+  it("reset with nothing after leaves an empty plan", () => {
+    const msgs = [
+      ev("upsert", { task: { id: "1", subject: "done", status: "completed", blockedBy: [] } }),
+      ev("reset"),
+    ]
+    expect(foldPlan(msgs)).toEqual([])
+    expect(hasPlan(msgs)).toBe(false) // cleared plan → toggle + panel hide
+  })
+
   it("ignores non-task_event messages", () => {
     const msgs: PilotMessage[] = [
       { id: "1", role: "assistant", content: "hi", timestamp: 0 } as unknown as PilotMessage,
