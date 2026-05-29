@@ -163,6 +163,37 @@ TodoWrite cannot. The cost (ids, file-locking, persistence) is paid once.
   - TUI (pi `InteractiveMode`): inject the notification as a queued user message / steering at the next
     turn boundary. This is the one genuinely new wiring point.
 
+### ⚠️ Implementation status (v1) & TODO — background completion notification NOT done
+
+**Implemented:** background launch (`spawn_subagent run_in_background` → `{status:"launched", job_id}`),
+the in-memory job table (`subagentJobs`), `job_stop`, the Jobs bar + drill-in to the child session,
+session-release gating (`_backgroundWorkCount` keeps the AgentBox alive until jobs finish), and full
+child-session transcript persistence.
+
+**NOT implemented (deferred):** the **completion notification back to the parent model**. On completion
+`startBackgroundSubagent` only updates `job.status`; the child's `summary` is **dropped** for the parent
+model, and there is **no** queue / steer / injected message. (The old `notifyParentOfDelegationBatch` +
+`runSyntheticParentPrompt` path that did this for the legacy delegation batch was removed with the
+`delegate_to_agent(s)` cleanup; the `DELEGATION_BATCH_COMPLETE_EVENT` reference above is stale.) So a
+background result reaches the **UI** (child session + delegation card) but **never the orchestrating
+model** — the prompt's "you'll be notified" is currently aspirational, and `job_output` (CC's
+`TaskOutput`) is not provided.
+
+**Why deferred:** pi 0.73 **native parallel** foreground `spawn_subagent` covers the common SRE cases
+(fan-out the same check across N nodes; multi-step investigation) — the parent waits and synthesizes
+inline, which is what the user is waiting for anyway. Genuine async is only needed for **long
+(minutes-scale) operations kicked off mid-conversation that the user wants to keep chatting through**
+(e.g. a cluster-wide RoCE `ib_write_bw` sweep, packet captures, soak tests), and that niche overlaps the
+**cron / scheduled-task** path (`manage_schedule` + `task_report`). Not worth the machinery yet.
+
+**TODO when we do build it (mirror CC):** CC delivers completion as a **user-role message at the next
+turn boundary** via a pending-notification queue — `enqueuePendingNotification` (messageQueueManager) on
+terminal state + a per-task `notified` flag + drain into the turn (`query.ts`). Our version: on job
+completion, deliver the child summary to the parent model (steer if mid-turn, else inject a user-role
+notification on the next turn), persist it to the parent session (refresh-safe), and dedup with a
+`notified` flag. **Until then: keep `run_in_background` discouraged in the prompt and route long unattended
+work to cron** (do not promise an in-conversation notification).
+
 ## 8. Parallel + ordered orchestration (how it all composes)
 
 The parent orchestrates; sub-agents execute; the ledger records.
