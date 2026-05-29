@@ -258,6 +258,13 @@ function isDelegationTool(toolName?: string | null): boolean {
   return Boolean(toolName && DELEGATED_TOOL_NAMES.has(toolName))
 }
 
+// Task-ledger tools are plumbing for the Plan panel — their tool cards are noise
+// in the conversation (the panel already shows the resulting plan), so hide them.
+const TASK_TOOL_NAMES = new Set(["task_create", "task_update", "task_list", "task_get"])
+function isTaskTool(toolName?: string | null): boolean {
+  return Boolean(toolName && TASK_TOOL_NAMES.has(toolName))
+}
+
 function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
   if (m.role !== "tool") return undefined;
   if (isStaleRunningTool(m)) return "error";
@@ -301,6 +308,8 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
   const isDelegationEvent = metadata?.kind === "delegation_event"
+  // task_event rows are folded into the Plan panel (foldPlan); never show them as chat bubbles.
+  const isTaskEvent = metadata?.kind === "task_event"
   const staleRunning = isStaleRunningTool(m)
   const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)
@@ -329,7 +338,7 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     toolDetails: m.role === "tool" ? (recoveredMetadata ?? undefined) : undefined,
     metadata: recoveredMetadata,
     timing,
-    hidden: m.hidden || isDelegationEvent,
+    hidden: m.hidden || isDelegationEvent || isTaskEvent || isTaskTool(m.tool_name),
     fromAgentId: m.from_agent_id ?? null,
     parentSessionId: m.parent_session_id ?? null,
     delegationId: m.delegation_id ?? null,
@@ -708,6 +717,24 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     (evt: Record<string, unknown>) => {
       const eventType = evt.type as string
 
+      // Live task-ledger event — it carries `kind` (not `type`), so it never matches the
+      // switch below. Append it as a hidden message whose metadata foldPlan replays, so the
+      // Plan panel updates during the turn (not only after a reload picks up the persisted row).
+      if (evt.kind === "task_event") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `taskev-live-${prev.length}`,
+            role: "user" as const,
+            content: "",
+            hidden: true,
+            metadata: evt,
+            timestamp: timeNow(),
+          },
+        ])
+        return
+      }
+
       switch (eventType) {
         // --- Text streaming (simplified brain: agent_message is the portal gateway's text event) ---
         case "agent_message": {
@@ -762,7 +789,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const toolName = evt.toolName as string | undefined
           const args = evt.args as Record<string, unknown> | undefined
           const toolInput = formatToolInput(toolName ?? "", args)
-          const hidden = toolName === "update_plan"
+          const hidden = toolName === "update_plan" || isTaskTool(toolName)
           const dbMessageId = evt.dbMessageId as string | undefined
           // 💭 Pre-tool thinking time (gap from previous tool_end / turn-start
           // to now). Server-stamped; matches the value persisted in the row's
