@@ -123,10 +123,8 @@ function makeFakeSession(id: string) {
     _aborted: false,
     skillsDirs: [] as string[],
     mode: "web" as const,
-    delegationToolsEnabled: false,
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
-    _activeDelegationControls: new Set(),
     _promptInflight: null,
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
     dpStateRef: { active: false },
@@ -144,15 +142,14 @@ function makeFakeSessionManager() {
     activeCount: () => sessions.size,
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
-    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, options?: { enableDelegationTools?: boolean }) => {
-      getOrCreateCalls.push({ id, options });
+    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown) => {
+      getOrCreateCalls.push({ id });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
         s = makeFakeSession(key);
         sessions.set(key, s);
       }
-      s.delegationToolsEnabled = options?.enableDelegationTools === true;
       return s;
     },
     close: async (id: string) => { sessions.delete(id); },
@@ -239,59 +236,6 @@ describe("http-server — prompt + session lifecycle", () => {
     expect(r.data.ok).toBe(true);
     expect(r.data.sessionId).toBe("default");
     expect(sm.sessions.has("default")).toBe(true);
-  });
-
-  it("POST /api/prompt keeps delegation tools hidden for normal chat", async () => {
-    const r = await getJson(port, "/api/prompt", "POST", { text: "normal question", sessionId: "normal" });
-
-    expect(r.status).toBe(200);
-    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
-      id: "normal",
-      options: { enableDelegationTools: false },
-    });
-  });
-
-  it("POST /api/prompt exposes delegation tools for visible Deep Investigation activation", async () => {
-    const r = await getJson(port, "/api/prompt", "POST", {
-      text: "[Deep Investigation]\ncheck the cluster",
-      sessionId: "dp",
-    });
-
-    expect(r.status).toBe(200);
-    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
-      id: "dp",
-      options: { enableDelegationTools: true },
-    });
-  });
-
-  it("POST /api/prompt keeps delegation tools exposed while persisted DP mode is active", async () => {
-    sm.getPersistedDpState = vi.fn(() => ({ active: true }));
-
-    const r = await getJson(port, "/api/prompt", "POST", {
-      text: "continue investigation",
-      sessionId: "dp-persisted",
-    });
-
-    expect(r.status).toBe(200);
-    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
-      id: "dp-persisted",
-      options: { enableDelegationTools: true },
-    });
-  });
-
-  it("POST /api/prompt hides delegation tools on DP exit even when persisted state is active", async () => {
-    sm.getPersistedDpState = vi.fn(() => ({ active: true }));
-
-    const r = await getJson(port, "/api/prompt", "POST", {
-      text: "[DP_EXIT]\nback to normal",
-      sessionId: "dp-exit",
-    });
-
-    expect(r.status).toBe(200);
-    expect(sm.getOrCreateCalls.at(-1)).toMatchObject({
-      id: "dp-exit",
-      options: { enableDelegationTools: false },
-    });
   });
 
   it("POST /api/prompt rejects missing text", async () => {
@@ -401,46 +345,6 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(r.status).toBe(200);
     expect(r.data).toEqual({ ok: true, pending: true });
     expect(s._aborted).toBe(true);
-  });
-
-  it("POST /api/sessions/:id/abort cascades forceStop to in-flight delegation controls", async () => {
-    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-cascade" });
-    const s = sm.sessions.get("ab-cascade")!;
-    // Simulate two concurrent delegation batches with 3 + 2 sub-agents.
-    const batchA = [
-      { forceStop: vi.fn() },
-      { forceStop: vi.fn() },
-      { forceStop: vi.fn() },
-    ];
-    const batchB = [
-      { forceStop: vi.fn() },
-      { forceStop: vi.fn() },
-    ];
-    s._activeDelegationControls.add(batchA);
-    s._activeDelegationControls.add(batchB);
-
-    const r = await getJson(port, "/api/sessions/ab-cascade/abort", "POST");
-
-    expect(r.status).toBe(200);
-    for (const c of [...batchA, ...batchB]) {
-      expect(c.forceStop).toHaveBeenCalledTimes(1);
-    }
-    expect(s._aborted).toBe(true);
-  });
-
-  it("POST /api/sessions/:id/abort tolerates a forceStop that throws (best-effort cascade)", async () => {
-    await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab-throw" });
-    const s = sm.sessions.get("ab-throw")!;
-    const ok = { forceStop: vi.fn() };
-    const broken = { forceStop: vi.fn(() => { throw new Error("kaboom"); }) };
-    s._activeDelegationControls.add([broken, ok]);
-
-    const r = await getJson(port, "/api/sessions/ab-throw/abort", "POST");
-
-    expect(r.status).toBe(200);
-    expect(broken.forceStop).toHaveBeenCalledTimes(1);
-    // Still cascades to siblings even after one throws.
-    expect(ok.forceStop).toHaveBeenCalledTimes(1);
   });
 
   it("POST /api/prompt returns 409 when _promptInflight is held even if _promptDone flipped back", async () => {

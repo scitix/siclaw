@@ -101,25 +101,10 @@ export interface CreateSiclawSessionOpts {
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
    * push custom events into the parent session's SSE stream (used by
-   * `delegate_to_agent` / `delegate_to_agents` to forward child-agent events
-   * so the frontend can render them in a nested block).
+   * `spawn_subagent` to forward child-agent events so the frontend can render
+   * them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
-  /**
-   * Optional runtime bridge for `delegate_to_agent`. When absent, the tool is
-   * hidden from the model by the registry availability guard.
-   */
-  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
-  /**
-   * Optional runtime bridge for notify-driven batch same-agent delegation.
-   */
-  delegateToAgentsExecutor?: import("./tool-registry.js").DelegateToAgentsExecutor;
-  /**
-   * Expose same-agent delegation tools to the model for this session. Keep this
-   * false in normal chat so Deep Investigation internals do not leak through
-   * the callable tool schema.
-   */
-  enableDelegationTools?: boolean;
   /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
   taskListId?: string;
   /** Runtime bridge that spawns a sub-agent (design §6). Injected by the agentbox. */
@@ -393,8 +378,6 @@ export async function createSiclawSession(
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
-      delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
-      delegateToAgentsExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsExecutor : undefined,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       subagentJobStopExecutor: opts?.subagentJobStopExecutor,
     },

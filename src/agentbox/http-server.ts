@@ -81,29 +81,6 @@ async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   });
 }
 
-function startsDeepInvestigation(text: string): boolean {
-  return text.startsWith(DP_ACTIVATION_MARKER);
-}
-
-function startsDpExit(text: string): boolean {
-  return text.startsWith(`${DP_EXIT_MARKER}\n`) || text.trim() === DP_EXIT_MARKER;
-}
-
-function shouldEnableDelegationTools(
-  text: string,
-  sessionId: string | undefined,
-  sessionManager: AgentBoxSessionManager,
-): boolean {
-  if (startsDpExit(text)) return false;
-  if (startsDeepInvestigation(text)) return true;
-  if (!sessionId) return false;
-
-  const live = sessionManager.get(sessionId)?.dpStateRef?.active;
-  if (live === true) return true;
-
-  return sessionManager.getPersistedDpState(sessionId)?.active === true;
-}
-
 /**
  * Send JSON response
  */
@@ -298,10 +275,7 @@ export function createHttpServer(
       return;
     }
 
-    const enableDelegationTools = shouldEnableDelegationTools(body.text, body.sessionId, sessionManager);
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, {
-      enableDelegationTools,
-    });
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped
@@ -592,7 +566,7 @@ export function createHttpServer(
     }
     // Replay extra (tool-pushed) events that arrived before SSE connected.
     // These are tagged events like { type: "subagent_event", ... } from
-    // the delegate_to_agent[s] sub-agent bridge.
+    // the spawn_subagent bridge.
     for (const event of managed._extraEventBuffer) {
       writeEvent(event);
     }
@@ -787,15 +761,9 @@ export function createHttpServer(
     console.trace(`[agentbox-http] Abort stack trace for session ${sessionId}`);
     managed._aborted = true;
 
-    // Cascade abort to in-flight delegation batches: without this, sub-agents
-    // continue running for up to DELEGATED_AGENT_MAX_RUNTIME_MS (10 min) and
-    // their capsule rows land in chat history after the user already hit stop.
-    for (const controls of managed._activeDelegationControls) {
-      for (const control of controls) {
-        try { control.forceStop?.(); } catch { /* swallow — best-effort cascade */ }
-      }
-    }
-
+    // Foreground sub-agents are cancelled via the parent brain's abort signal
+    // (threaded into runSpawnedSubagent); background sub-agent jobs are cancelled
+    // explicitly via the job_stop tool and block session release until they settle.
     const outcome = await abortBrainForHttp(managed.brain, sessionId);
     if (outcome === "failed") {
       sendJson(res, 500, { error: "Abort failed" });
