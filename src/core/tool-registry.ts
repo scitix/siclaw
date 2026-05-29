@@ -27,107 +27,7 @@ export type ResolvedToolDefinition = ToolDefinition & {
   requiresUserApproval?: boolean;
 };
 
-export interface DelegateToAgentRequest {
-  /** Target agent id. "self" means spawn a same-agent sub-session. */
-  agentId: string;
-  /** Specific task for the delegated agent. */
-  scope: string;
-  /** Optional compact context selected by the caller model. */
-  contextSummary?: string;
-  /** Parent chat/session metadata for lineage and UI grouping. */
-  parentSessionId: string;
-  parentAgentId: string | null;
-  userId: string;
-  /** Stable id tying the parent tool call and delegated child sessions together. */
-  delegationId?: string;
-  /** 1-based task index inside a batch delegation. */
-  taskIndex?: number;
-  /** Total delegated tasks in the batch. */
-  totalTasks?: number;
-}
-
-export type DelegateToAgentStatus = "done" | "partial" | "failed" | "timed_out";
-
-export interface DelegateToAgentToolTraceEntry {
-  toolName: string;
-  toolInput?: string | null;
-  outcome: "success" | "error" | "blocked";
-  durationMs: number | null;
-  contentPreview?: string;
-  startedAt?: string;
-  endedAt?: string;
-}
-
-export interface DelegateToAgentResult {
-  /** Execution status for UI recovery and parent-agent interpretation. */
-  status?: DelegateToAgentStatus;
-  /** Budgeted capsule returned to the parent agent as model-visible tool content. */
-  summary: string;
-  /** Full sub-agent final report for UI/debug persistence; not sent in model-visible tool content. */
-  fullSummary?: string;
-  summaryTruncated?: boolean;
-  sessionId: string;
-  toolCalls: number;
-  durationMs: number;
-  /** Lightweight UI trace. Full redacted output is persisted in the child execution session. */
-  toolTrace?: DelegateToAgentToolTraceEntry[];
-  /** Audit/UI-only source for partial delegated results. Not intended for parent model context. */
-  partialSource?: "steered" | "runtime_fallback";
-  /** Audit/UI-only tool name that was still active when a partial fallback was produced. */
-  interruptedTool?: string;
-}
-
-export type DelegateToAgentExecutor = (
-  request: DelegateToAgentRequest,
-) => Promise<DelegateToAgentResult>;
-
-export interface DelegateToAgentsTaskRequest {
-  index: number;
-  agentId: string;
-  scope: string;
-  contextSummary?: string;
-}
-
-export interface DelegateToAgentsRequest {
-  delegationId: string;
-  parentSessionId: string;
-  parentAgentId: string | null;
-  userId: string;
-  tasks: DelegateToAgentsTaskRequest[];
-}
-
-export interface DelegateToAgentsTaskStartResult {
-  index: number;
-  status: "running";
-  agent_id: string;
-  scope: string;
-  summary: string;
-  tool_calls: 0;
-  duration_ms: 0;
-}
-
-export interface DelegateToAgentsStartResult {
-  status: "running";
-  delegation_id: string;
-  /**
-   * False while the batch is still running. The model must wait for the
-   * delegation.batch_complete notification before treating delegated evidence as
-   * available.
-   */
-  results_available: false;
-  next_event: "delegation.batch_complete";
-  parent_instruction: string;
-  tasks: DelegateToAgentsTaskStartResult[];
-  total_tool_calls: 0;
-  duration_ms: 0;
-}
-
-export type DelegateToAgentsExecutor = (
-  request: DelegateToAgentsRequest,
-) => Promise<DelegateToAgentsStartResult>;
-
-// ── spawn_subagent (design §6) — the v2 sub-agent contract. Independent of the
-//    legacy DelegateToAgent* shape above. ──
+// ── spawn_subagent (design §6) — the sub-agent contract. ──
 
 /** "launched" is the immediate return for a background spawn; it is never a terminal/persisted status. */
 export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
@@ -231,16 +131,6 @@ export interface ToolRefs {
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
-  /**
-   * Optional delegation executor. When absent, delegate_to_agent stays out of
-   * the resolved tool list, so the model never sees a non-working tool.
-   */
-  delegateToAgentExecutor?: DelegateToAgentExecutor;
-  /**
-   * Optional batch delegation executor. The model sees one batch tool; the
-   * runtime handles background execution and parent-session notification.
-   */
-  delegateToAgentsExecutor?: DelegateToAgentsExecutor;
   /**
    * Optional spawn_subagent executor (design §6). When absent, spawn_subagent
    * stays out of the resolved tool list so the model never sees a non-working tool.

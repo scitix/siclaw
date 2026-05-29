@@ -29,11 +29,7 @@ import { registration as memoryGet } from "./query/memory-get.js";
 // workflow — investigation_feedback / deep_search / propose_hypotheses /
 // end_investigation removed as part of the DP state-machine teardown
 // (see docs/design/2026-04-24-dp-mode-refactor-design.md §6.6).
-// delegate_to_agent / delegate_to_agents are registered but hidden until a runtime executor is
-// injected; this keeps the contract multi-agent-ready without exposing a
-// non-working path to the model.
-import { registration as delegateToAgent } from "./workflow/delegate-to-agent.js";
-import { registration as delegateToAgents } from "./workflow/delegate-to-agents.js";
+// Sub-agent fan-out is handled by spawn_subagent (+ job_stop) below.
 import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
@@ -53,7 +49,7 @@ export const allToolEntries: ToolEntry[] = [
   clusterList, clusterProbe, clusterInfo, hostList,
   resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
-  delegateToAgent, delegateToAgents, saveFeedback, manageSchedule, taskReport, skillPreview,
+  saveFeedback, manageSchedule, taskReport, skillPreview,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
   spawnSubagent, jobStop,
 ];

@@ -67,20 +67,6 @@ async function callAll(handlers: Map<string, Handler[]>, event: string, ...args:
   return results;
 }
 
-function delegationCompleteMessage(capsule = "node evidence."): string {
-  return [
-    "[Delegation Batch Complete]",
-    "Delegation ID: delegation-1",
-    "Status: done",
-    "",
-    "Evidence capsules:",
-    "- Agent 1 (done)",
-    `  Capsule: ${capsule}`,
-    "",
-    "Synthesize these capsules into the current investigation. Do not call more tools in this turn unless the user explicitly asks; if evidence is incomplete, say what is still uncertain.",
-  ].join("\n");
-}
-
 describe("deepInvestigationExtension — registration surface", () => {
   it("registers /dp command, Ctrl+I shortcut, --dp flag, dp-mode renderer, and no tools", () => {
     const { api, commands, shortcuts, flags, renderers, handlers } = makeApi();
@@ -114,12 +100,8 @@ describe("deepInvestigationExtension — activation via [Deep Investigation] mar
     expect(transform).toBeDefined();
     expect(transform.text).toContain("Deep Investigation mode");  // preamble
     expect(transform.text).toContain("Do not ask the user to choose A/B/C after every message");
-    expect(transform.text).toContain('delegate_to_agent with agent_id="self"');
-    expect(transform.text).toContain("prefer delegate_to_agents with 1-3 tasks");
-    expect(transform.text).toContain("Do not call one sub-agent, wait for it");
-    expect(transform.text).toContain('delegate_to_agents result with status="running" as a launch acknowledgement only');
-    expect(transform.text).toContain("do not attribute parent-collected evidence to sub-agents");
-    expect(transform.text).toContain("[Delegation Batch Complete]");
+    expect(transform.text).toContain("use spawn_subagent to run them concurrently");
+    expect(transform.text).toContain("Do not spawn one sub-agent, wait for it");
     expect(transform.text).toContain("Do not render any visible choice list in the markdown");
     expect(transform.text).toContain("<!-- hypothesis-checkpoint -->");
     expect(transform.text).toContain("<!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->");
@@ -334,185 +316,6 @@ describe("deepInvestigationExtension — context filter", () => {
   });
 });
 
-describe("deepInvestigationExtension — delegation synthesis barrier", () => {
-  it("blocks tool calls after delegated results arrive until the parent synthesizes them", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        { role: "user", content: "check cluster" },
-        { role: "assistant", content: "I started delegated checks." },
-        {
-          role: "user",
-          content: delegationCompleteMessage(),
-        },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "bash",
-      input: { command: "kubectl get pods" },
-    }))[0] as any;
-
-    expect(res.block).toBe(true);
-    expect(res.reason).toContain("synthesize the delegated evidence");
-  });
-
-  it("allows tool calls after a visible assistant synthesis follows the delegated event", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        { role: "user", content: "check cluster" },
-        {
-          role: "user",
-          content: delegationCompleteMessage(),
-        },
-        { role: "assistant", content: "The delegated evidence points to node pressure. Next I will validate events." },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "bash",
-      input: { command: "kubectl get events" },
-    }))[0] as any;
-
-    expect(res.block).toBeUndefined();
-  });
-
-  it("does not enable the barrier outside Deep Investigation mode", async () => {
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api);
-
-    await callAll(handlers, "context", {
-      messages: [
-        {
-          role: "user",
-          content: delegationCompleteMessage(),
-        },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "bash",
-      input: { command: "kubectl get pods" },
-    }))[0] as any;
-
-    expect(res.block).toBeUndefined();
-  });
-
-  it("does not trigger when a normal user prompt merely mentions the delegation marker", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        {
-          role: "user",
-          content: "When [Delegation Batch Complete] appears later, synthesize the result.",
-        },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "cluster_info",
-      input: {},
-    }))[0] as any;
-
-    expect(res.block).toBeUndefined();
-  });
-
-  it("does not trigger from the DP activation prompt text itself", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    const results = await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    const transform = results.find((r: any) => r?.action === "transform") as any;
-
-    await callAll(handlers, "context", {
-      messages: [
-        {
-          role: "user",
-          content: transform.text,
-        },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "cluster_info",
-      input: {},
-    }))[0] as any;
-
-    expect(res.block).toBeUndefined();
-  });
-
-  it("clears stale delegated-result pressure when a real user turn arrives later", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        { role: "user", content: "old question" },
-        { role: "assistant", content: "I started delegated checks." },
-        { role: "user", content: delegationCompleteMessage() },
-        { role: "user", content: "new question: collect baseline first" },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "cluster_info",
-      input: {},
-    }))[0] as any;
-
-    expect(res.block).toBeUndefined();
-  });
-
-  it("session_start clears stale delegated-result and checkpoint guard state", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        { role: "user", content: delegationCompleteMessage() },
-        ...Array.from({ length: 20 }, (_, index) => ({
-          role: "tool",
-          content: `tool result ${index + 1}`,
-        })),
-      ],
-    });
-    let res = (await callAll(handlers, "tool_call", {
-      toolName: "bash",
-      input: { command: "kubectl get pods" },
-    }))[0] as any;
-    expect(res.block).toBe(true);
-
-    await callAll(handlers, "session_start", {}, makeCtx());
-    await callAll(handlers, "input", { text: "[Deep Investigation]\nnew session question" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [{ role: "user", content: "new session question" }],
-    });
-
-    res = (await callAll(handlers, "tool_call", {
-      toolName: "cluster_info",
-      input: {},
-    }))[0] as any;
-    expect(res.block).toBeUndefined();
-  });
-});
-
 describe("deepInvestigationExtension — investigation checkpoint budget", () => {
   it("blocks the next tool call after twenty DP tool results without visible synthesis", async () => {
     const stateRef: MutableDpStateRef = { active: false };
@@ -638,35 +441,5 @@ describe("deepInvestigationExtension — investigation checkpoint budget", () =>
     }))[0] as any;
 
     expect(res.block).toBeUndefined();
-  });
-
-  it("prioritizes delegated-result synthesis over the generic checkpoint budget", async () => {
-    const stateRef: MutableDpStateRef = { active: false };
-    const { api, handlers } = makeApi();
-    deepInvestigationExtension(api, undefined, stateRef);
-
-    await callAll(handlers, "input", { text: "[Deep Investigation]\ncheck cluster" }, makeCtx());
-    await callAll(handlers, "context", {
-      messages: [
-        { role: "user", content: "check cluster" },
-        { role: "assistant", content: "I started delegated checks." },
-        ...Array.from({ length: 20 }, (_, index) => ({
-          role: "tool",
-          content: `tool result ${index + 1}`,
-        })),
-        {
-          role: "user",
-          content: delegationCompleteMessage(),
-        },
-      ],
-    });
-
-    const res = (await callAll(handlers, "tool_call", {
-      toolName: "bash",
-      input: { command: "kubectl get events" },
-    }))[0] as any;
-
-    expect(res.block).toBe(true);
-    expect(res.reason).toContain("Delegated investigation results are ready");
   });
 });
