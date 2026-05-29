@@ -38,6 +38,11 @@ import { registration as saveFeedback } from "./workflow/save-feedback.js";
 import { registration as manageSchedule } from "./workflow/manage-schedule.js";
 import { registration as taskReport } from "./workflow/task-report.js";
 import { registration as skillPreview } from "./workflow/skill-preview.js";
+import {
+  taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
+} from "./workflow/task-tools.js";
+import { registration as spawnSubagent } from "./workflow/spawn-subagent.js";
+import { registration as jobStop } from "./workflow/job-stop.js";
 
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
@@ -49,4 +54,6 @@ export const allToolEntries: ToolEntry[] = [
   resolvePodNetns, memorySearch, memoryGet,
   // ── workflow ──
   delegateToAgent, delegateToAgents, saveFeedback, manageSchedule, taskReport, skillPreview,
+  taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
+  spawnSubagent, jobStop,
 ];

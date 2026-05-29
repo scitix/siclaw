@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { buildKnowledgeOverview } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
@@ -119,6 +120,12 @@ export interface CreateSiclawSessionOpts {
    * the callable tool schema.
    */
   enableDelegationTools?: boolean;
+  /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
+  taskListId?: string;
+  /** Runtime bridge that spawns a sub-agent (design §6). Injected by the agentbox. */
+  spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
+  /** Runtime bridge that cancels a background sub-agent job (design §7). Injected by the agentbox. */
+  subagentJobStopExecutor?: import("./tool-registry.js").SubagentJobStopExecutor;
 }
 
 export interface SiclawSessionResult {
@@ -374,10 +381,13 @@ export async function createSiclawSession(
 
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
 
+  // Shared task-ledger id; sub-agents pass the parent's id to share its ledger.
+  const taskListId = opts?.taskListId ?? randomUUID();
+
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef,
+      kubeconfigRef, userId, agentId, sessionIdRef, taskListId,
       memoryRef, dpStateRef,
       knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
@@ -385,6 +395,8 @@ export async function createSiclawSession(
       sessionEventEmitter: opts?.sessionEventEmitter,
       delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
       delegateToAgentsExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsExecutor : undefined,
+      spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      subagentJobStopExecutor: opts?.subagentJobStopExecutor,
     },
     allowedTools,
   });

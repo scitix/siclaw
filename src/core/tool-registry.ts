@@ -126,6 +126,87 @@ export type DelegateToAgentsExecutor = (
   request: DelegateToAgentsRequest,
 ) => Promise<DelegateToAgentsStartResult>;
 
+// ── spawn_subagent (design §6) — the v2 sub-agent contract. Independent of the
+//    legacy DelegateToAgent* shape above. ──
+
+/** "launched" is the immediate return for a background spawn; it is never a terminal/persisted status. */
+export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
+
+export interface SpawnSubagentRequest {
+  /** Short UI label for the spawned task. */
+  description: string;
+  /** The bounded task briefing — the child's only context besides its system prompt. */
+  prompt: string;
+  /** Resolved sub-agent type id (see subagent-registry). */
+  subagentType: string;
+  /** Optional model override; defaults to the type's model / parent inherit. */
+  model?: string;
+  /** When true, run detached and notify the parent on completion (do not block). */
+  runInBackground: boolean;
+  /** Parent lineage + shared ledger. */
+  parentSessionId: string;
+  parentAgentId: string | null;
+  userId: string;
+  taskListId: string;
+  /** Stable id tying the parent tool call to the child session (lineage/observability). */
+  spawnId: string;
+}
+
+export interface SpawnSubagentResult {
+  status: SpawnSubagentStatus;
+  /** Budgeted capsule returned to the parent as model-visible tool content. */
+  summary: string;
+  /** Full child report for UI/debug persistence; not model-visible. */
+  fullSummary?: string;
+  /** The child's own persisted session id, for UI drill-in. */
+  childSessionId: string;
+  toolCalls: number;
+  durationMs: number;
+  partialSource?: "steered" | "runtime_fallback";
+  interruptedTool?: string;
+  /** Set when status === "launched": the background job id, usable with job_stop. */
+  jobId?: string;
+  /** The sub-agent's execution steps (reasoning + tool calls), so the UI can show a collapsed log after completion. */
+  steps?: SubagentStep[];
+}
+
+/** One step of a sub-agent's run — its reasoning text or a tool call — for a main-agent-like live view. */
+export interface SubagentStep {
+  kind: "assistant" | "tool";
+  /** assistant: the reasoning/answer text for this step. */
+  text?: string;
+  /** tool: name + input + result preview + outcome. */
+  toolName?: string;
+  toolInput?: string;
+  content?: string;
+  outcome?: "success" | "error";
+  durationMs?: number | null;
+}
+
+/** Live progress pushed as a foreground sub-agent works, so the UI streams its execution in real time. */
+export interface SpawnSubagentProgress {
+  status: "running";
+  toolCalls: number;
+  /** Ordered steps so far (assistant reasoning + tool calls), rendered live like the main agent. */
+  steps: SubagentStep[];
+  /** Latest activity line, e.g. the tool currently running. */
+  activity?: string;
+}
+
+export type SpawnSubagentExecutor = (
+  request: SpawnSubagentRequest,
+  onProgress?: (progress: SpawnSubagentProgress) => void,
+  signal?: AbortSignal,
+) => Promise<SpawnSubagentResult>;
+
+export interface SubagentJobStopResult {
+  stopped: boolean;
+  message: string;
+}
+
+/** Cancels a running background sub-agent job (design §7: job_stop). */
+export type SubagentJobStopExecutor = (jobId: string) => Promise<SubagentJobStopResult>;
+
 /**
  * Callback a tool can invoke to push a custom event into the parent session's
  * SSE stream (e.g., forwarding a spawned sub-agent's events so the frontend
@@ -141,6 +222,8 @@ export interface ToolRefs {
   /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
   agentId: string | null;
   sessionIdRef: { current: string };
+  /** Shared task-ledger id. A session and the sub-agents it spawns share one taskListId. */
+  taskListId: string;
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   knowledgeIndexer?: MemoryIndexer;
@@ -158,6 +241,13 @@ export interface ToolRefs {
    * runtime handles background execution and parent-session notification.
    */
   delegateToAgentsExecutor?: DelegateToAgentsExecutor;
+  /**
+   * Optional spawn_subagent executor (design §6). When absent, spawn_subagent
+   * stays out of the resolved tool list so the model never sees a non-working tool.
+   */
+  spawnSubagentExecutor?: SpawnSubagentExecutor;
+  /** Cancels a running background sub-agent job (design §7). Enables the job_stop tool. */
+  subagentJobStopExecutor?: SubagentJobStopExecutor;
 }
 
 /** Declarative registration for a single tool. */

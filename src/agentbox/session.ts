@@ -26,7 +26,16 @@ import type {
   DelegateToAgentResult,
   DelegateToAgentStatus,
   DelegateToAgentToolTraceEntry,
+  SpawnSubagentExecutor,
+  SpawnSubagentProgress,
+  SubagentStep,
+  SpawnSubagentRequest,
+  SpawnSubagentResult,
+  SpawnSubagentStatus,
+  SubagentJobStopExecutor,
+  SubagentJobStopResult,
 } from "../core/tool-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE } from "../core/subagent-registry.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
@@ -36,6 +45,7 @@ import { saveSessionKnowledge } from "../memory/session-summarizer.js";
 import { loadConfig, getEmbeddingConfig, isMemoryEnabled } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { buildRedactionConfigForModelConfig, redactText, type RedactionConfig } from "../shared/output-redactor.js";
+import { detectLanguage } from "../shared/detect-language.js";
 import type {
   DelegationAppendMessagePayload,
   DelegationEventPayload,
@@ -45,6 +55,7 @@ import type {
   DelegationToolUpdatePayload,
   DelegationUpdateMessagePayload,
 } from "../shared/delegation-persistence.js";
+import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -488,6 +499,93 @@ Always end with a final report even if evidence is incomplete.`;
     return async (request) => this.startDelegatedAgents(request);
   }
 
+  /** In-flight + recent background sub-agent jobs, keyed by jobId (= spawn tool call id). */
+  private subagentJobs = new Map<string, {
+    jobId: string;
+    childSessionId: string;
+    status: "running" | "stopped" | SpawnSubagentStatus;
+    description: string;
+    abort?: () => void;
+    startedAt: number;
+  }>();
+
+  private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
+    return async (request, onProgress, signal) =>
+      request.runInBackground
+        ? this.startBackgroundSubagent(request)
+        : this.runSpawnedSubagent(request, undefined, onProgress, signal);
+  }
+
+  private createSubagentJobStopExecutor(): SubagentJobStopExecutor {
+    return async (jobId) => this.stopSubagentJob(jobId);
+  }
+
+  /**
+   * Launch a sub-agent detached (design §7). Returns immediately with status
+   * "launched"; the child's terminal event (persisted to the parent session by
+   * runSpawnedSubagent) is the completion notification. Background work blocks
+   * session release until it finishes.
+   */
+  private startBackgroundSubagent(request: SpawnSubagentRequest): SpawnSubagentResult {
+    const childSessionId = randomUUID();
+    const jobId = request.spawnId;
+    this.subagentJobs.set(jobId, {
+      jobId,
+      childSessionId,
+      status: "running",
+      description: request.description,
+      startedAt: Date.now(),
+    });
+
+    const parent = this.sessions.get(request.parentSessionId);
+    if (parent) {
+      parent._backgroundWorkCount++;
+      if (parent._releaseTimer) {
+        clearTimeout(parent._releaseTimer);
+        parent._releaseTimer = null;
+      }
+    }
+
+    void this.runSpawnedSubagent(request, { childSessionId, jobId })
+      .then((res) => {
+        const job = this.subagentJobs.get(jobId);
+        if (job && job.status === "running") job.status = res.status;
+      })
+      .catch((err) => {
+        console.warn(`[agentbox-session] background sub-agent ${jobId} failed:`, err);
+        const job = this.subagentJobs.get(jobId);
+        if (job && job.status === "running") job.status = "failed";
+      })
+      .finally(() => {
+        const current = this.sessions.get(request.parentSessionId);
+        if (current) {
+          current._backgroundWorkCount = Math.max(0, current._backgroundWorkCount - 1);
+          if (current._backgroundWorkCount === 0 && current._promptDone) {
+            this.scheduleRelease(current.id);
+          }
+        }
+      });
+
+    return {
+      status: "launched",
+      summary: "launched",
+      childSessionId,
+      toolCalls: 0,
+      durationMs: 0,
+      jobId,
+    };
+  }
+
+  private async stopSubagentJob(jobId: string): Promise<SubagentJobStopResult> {
+    const job = this.subagentJobs.get(jobId);
+    if (!job) return { stopped: false, message: `No background job "${jobId}".` };
+    if (job.status !== "running") return { stopped: false, message: `Job "${jobId}" is not running (${job.status}).` };
+    if (!job.abort) return { stopped: false, message: `Job "${jobId}" is starting up; try again shortly.` };
+    job.abort();
+    job.status = "stopped";
+    return { stopped: true, message: `Stopping background sub-agent "${jobId}".` };
+  }
+
   private async persistDelegationEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
     if (!this.gatewayClient) return { ok: false };
     return this.gatewayClient.sendDelegationPersistenceEvent(event);
@@ -517,6 +615,15 @@ Always end with a final report even if evidence is incomplete.`;
   private async persistAppendMessage(message: DelegationAppendMessagePayload): Promise<string> {
     const result = await this.persistDelegationEvent({ type: "delegation.append_message", message });
     return result.id ?? "";
+  }
+
+  /**
+   * Persist a task-ledger mutation as a chat_message (metadata.kind === "task_event"),
+   * reusing the delegation append channel. The Web UI folds these into the plan on load,
+   * so the plan survives refresh (design §14, Approach A). Best-effort.
+   */
+  private async persistTaskEvent(sessionId: string, event: TaskEvent): Promise<void> {
+    await this.persistAppendMessage(buildTaskEventChatMessage(sessionId, event));
   }
 
   private async persistUpdateMessage(message: DelegationUpdateMessagePayload): Promise<void> {
@@ -1426,6 +1533,287 @@ Always end with a final report even if evidence is incomplete.`;
   }
 
   /**
+   * spawn_subagent executor (design §6). Foreground/blocking: create a child
+   * sub-session of the same agent core under the selected agent-type, run the
+   * bounded task, and return its final report inline. The child shares the
+   * parent's task ledger (taskListId) and is NOT given spawn_subagent (no recursion).
+   *
+   * Observability (design §13): the child runs as its own persisted session with
+   * lineage; every tool call and assistant message is streamed-and-persisted; and a
+   * terminal event is ALWAYS emitted (including on failure/timeout) so the full
+   * record — and the reason it failed — survives for UI drill-in.
+   */
+  private async runSpawnedSubagent(
+    request: SpawnSubagentRequest,
+    opts?: { childSessionId?: string; jobId?: string },
+    onProgress?: (progress: SpawnSubagentProgress) => void,
+    signal?: AbortSignal,
+  ): Promise<SpawnSubagentResult> {
+    const startedAt = Date.now();
+    const childSessionId = opts?.childSessionId ?? randomUUID();
+    const childSessionDir = this.getSessionDir(childSessionId);
+    const childSessionManager = SessionManager.continueRecent(process.cwd(), childSessionDir);
+    const config = loadConfig();
+    const kubeconfigRef: KubeconfigRef = {
+      credentialsDir: this.credentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir),
+      credentialBroker: this.credentialBroker,
+    };
+    const type = getSubagentType(request.subagentType) ?? getSubagentType(DEFAULT_SUBAGENT_TYPE)!;
+    const agentId = request.parentAgentId ?? this.agentId ?? null;
+
+    const child = await createSiclawSession({
+      sessionManager: childSessionManager,
+      kubeconfigRef,
+      mode: "web",
+      memoryIndexer: this._sharedMemoryIndexer ?? undefined,
+      userId: this.userId,
+      agentId,
+      knowledgeIndexer: this.knowledgeIndexer,
+      // Share the parent's task ledger so the child can own/complete tasks.
+      taskListId: request.taskListId,
+      // The agent-type's prompt flavour for this child.
+      systemPromptAppend: type.systemPromptAddendum,
+      // Deliberately omit spawnSubagentExecutor + delegate executors → the child
+      // never sees spawn_subagent (no recursion).
+    });
+    child.sessionIdRef.current = childSessionId;
+
+    // Use the same model the parent's delegated agents use, when configured.
+    // (request.model per-call override is accepted by the tool but not yet
+    // applied here — a follow-on once model-by-alias resolution is wired.)
+    if (this.delegationModelProvider && this.delegationModelConfig && child.brain.registerProvider) {
+      child.brain.registerProvider(this.delegationModelProvider, this.delegationModelConfig);
+    }
+    if (this.delegationModelProvider && this.delegationModelId) {
+      const model = child.brain.findModel(this.delegationModelProvider, this.delegationModelId);
+      if (model) await child.brain.setModel(model);
+    }
+
+    // Cancellation: stopRequested is set by either the parent's abort signal
+    // (main "stop" button → the spawn_subagent tool's signal) or job_stop.
+    let stopRequested = false;
+    const requestStop = (reason: string) => {
+      stopRequested = true;
+      void abortBrainBestEffort(child.brain, reason);
+    };
+    if (signal) {
+      if (signal.aborted) requestStop(`parent aborted ${childSessionId}`);
+      else signal.addEventListener("abort", () => requestStop(`parent aborted ${childSessionId}`), { once: true });
+    }
+    // Wire job cancellation (job_stop) into this run once the child exists.
+    if (opts?.jobId) {
+      const job = this.subagentJobs.get(opts.jobId);
+      if (job) {
+        job.childSessionId = childSessionId;
+        job.abort = () => requestStop(`job_stop ${childSessionId}`);
+      }
+    }
+
+    // ── Transcript persistence (design §13). Serialized via a promise queue so
+    //    writes land in order; a write failure disables the trace but never the run. ──
+    const delegationId = request.spawnId;
+    const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
+    const lineage = { parentSessionId: request.parentSessionId, parentAgentId: agentId, delegationId, targetAgentId: agentId };
+    let persistTrace = Boolean(agentId && request.userId && request.parentSessionId);
+    let persistQueue: Promise<void> = Promise.resolve();
+    const enqueuePersist = (op: () => Promise<void>) => {
+      if (!persistTrace) return;
+      persistQueue = persistQueue.then(op).catch((err) => {
+        persistTrace = false;
+        console.warn(`[agentbox-session] sub-agent trace persistence disabled for ${childSessionId}:`, err);
+      });
+    };
+
+    if (persistTrace && agentId) {
+      try {
+        await this.persistEnsureChatSession(
+          childSessionId,
+          agentId,
+          request.userId,
+          `Sub-agent: ${request.description}`,
+          redactText(request.prompt, redactionConfig).slice(0, 500),
+          "subagent",
+          lineage,
+        );
+        await this.persistAppendMessage({
+          sessionId: childSessionId,
+          role: "user",
+          content: redactText(request.prompt, redactionConfig),
+          fromAgentId: agentId,
+          parentSessionId: request.parentSessionId,
+          delegationId,
+          targetAgentId: agentId,
+        });
+      } catch (err) {
+        persistTrace = false;
+        console.warn(`[agentbox-session] could not initialize sub-agent trace ${childSessionId}:`, err);
+      }
+    }
+
+    const extractEventText = (content: unknown): string =>
+      Array.isArray(content)
+        ? content.filter((c: any) => c?.type === "text").map((c: any) => c.text as string).join("")
+        : "";
+
+    let finalText = "";
+    let toolCalls = 0;
+    let status: SpawnSubagentStatus = "done";
+    const pendingTools = new Map<string, { startMs: number; toolName: string; toolInput?: string }>();
+    // Ordered steps (assistant reasoning + tool calls) streamed to the parent UI so the
+    // card shows the sub-agent's execution live, like a mini main-agent run.
+    const liveSteps: SubagentStep[] = [];
+    const emitProgress = (activity?: string) =>
+      onProgress?.({ status: "running", toolCalls, steps: liveSteps.map((s) => ({ ...s })), activity });
+
+    const unsubscribe = child.brain.subscribe((event: any) => {
+      if (event?.type === "tool_execution_start" || event?.type === "tool_start") {
+        toolCalls++;
+        const toolName = (event.toolName as string) || (event.name as string) || "tool";
+        const id = String(event.toolCallId ?? event.toolUseID ?? `${toolName}-${toolCalls}`);
+        pendingTools.set(id, {
+          startMs: Date.now(),
+          toolName,
+          toolInput: event.args ? redactText(JSON.stringify(event.args), redactionConfig) : undefined,
+        });
+        emitProgress(`Running ${toolName}…`);
+      }
+      if (event?.type === "tool_execution_end" || event?.type === "tool_end") {
+        const id = String(event.toolCallId ?? event.toolUseID ?? "");
+        const pending = pendingTools.get(id);
+        pendingTools.delete(id);
+        const toolName = (event.toolName as string) || (event.name as string) || pending?.toolName || "tool";
+        const durationMs = pending ? Date.now() - pending.startMs : null;
+        const outcome: "success" | "error" = event.isError ? "error" : "success";
+        const resultText = redactText(extractEventText(event.result?.content), redactionConfig).slice(0, 4000);
+        liveSteps.push({ kind: "tool", toolName, toolInput: pending?.toolInput, content: resultText.slice(0, 1000), outcome, durationMs });
+        emitProgress(`Finished ${toolName}`);
+        enqueuePersist(async () => {
+          await this.persistAppendMessage({
+            sessionId: childSessionId,
+            role: "tool",
+            content: resultText,
+            toolName,
+            toolInput: pending?.toolInput,
+            outcome,
+            durationMs,
+            fromAgentId: agentId,
+            parentSessionId: request.parentSessionId,
+            delegationId,
+            targetAgentId: agentId,
+          });
+        });
+      }
+      if (event?.type === "message_end" && event.message?.role === "assistant") {
+        const text = extractEventText(event.message.content).trim();
+        if (text) {
+          finalText = text;
+          liveSteps.push({ kind: "assistant", text: redactText(text, redactionConfig) });
+          emitProgress();
+          enqueuePersist(async () => {
+            await this.persistAppendMessage({
+              sessionId: childSessionId,
+              role: "assistant",
+              content: redactText(text, redactionConfig),
+              fromAgentId: agentId,
+              parentSessionId: request.parentSessionId,
+              delegationId,
+              targetAgentId: agentId,
+            });
+          });
+        }
+      }
+    });
+
+    let interruptedTool: string | undefined;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("spawn_subagent_timeout")), DELEGATED_AGENT_MAX_RUNTIME_MS),
+      );
+      await Promise.race([child.brain.prompt(this.buildSpawnedSubagentPrompt(request)), timeoutPromise]);
+    } catch (err) {
+      interruptedTool = [...pendingTools.values()][0]?.toolName;
+      if (stopRequested) {
+        status = "partial";
+        finalText = finalText
+          ? `Sub-agent cancelled by job_stop. Partial report:\n\n${finalText}`
+          : "Sub-agent cancelled by job_stop before producing a report.";
+      } else if (err instanceof Error && err.message === "spawn_subagent_timeout") {
+        status = "timed_out";
+        await abortBrainBestEffort(child.brain, `spawned sub-agent ${childSessionId}`);
+        finalText = finalText
+          ? `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms. Partial report:\n\n${finalText}`
+          : `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms with no output.`;
+      } else {
+        status = "failed";
+        finalText = finalText || `Sub-agent failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } finally {
+      unsubscribe();
+      await child.mcpManager?.shutdown().catch((err) =>
+        console.warn(`[agentbox-session] spawned sub-agent MCP shutdown failed for ${childSessionId}:`, err),
+      );
+    }
+
+    // If job_stop aborted but prompt() resolved instead of throwing, reflect it.
+    if (stopRequested && status === "done") {
+      status = "partial";
+      finalText = finalText
+        ? `Sub-agent cancelled by job_stop. Partial report:\n\n${finalText}`
+        : "Sub-agent cancelled by job_stop before producing a report.";
+    }
+
+    if (!finalText) {
+      if (status === "done") status = "failed";
+      finalText = "(sub-agent produced no output)";
+    }
+
+    const bundle = buildDelegateSummaryBundle(finalText);
+    const durationMs = Date.now() - startedAt;
+
+    // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
+    enqueuePersist(async () => {
+      await this.persistAppendDelegationEvent({
+        parentSessionId: request.parentSessionId,
+        parentAgentId: agentId,
+        userId: request.userId,
+        delegationId,
+        childSessionId,
+        targetAgentId: agentId,
+        status,
+        capsule: bundle.capsule,
+        fullSummary: bundle.fullSummary,
+        summaryTruncated: bundle.truncated,
+        scope: request.prompt,
+        toolCalls,
+        durationMs,
+        interruptedTool,
+      });
+    });
+    await persistQueue;
+
+    return {
+      status,
+      summary: bundle.capsule,
+      fullSummary: bundle.fullSummary,
+      childSessionId,
+      toolCalls,
+      durationMs,
+      interruptedTool,
+      steps: liveSteps,
+    };
+  }
+
+  private buildSpawnedSubagentPrompt(request: SpawnSubagentRequest): string {
+    // Make the sub-agent answer in the user's language (same mechanism the main
+    // agent uses): detect from the briefing the parent wrote and inject the directive.
+    const lang = detectLanguage(`${request.description}\n${request.prompt}`);
+    const langDirective = lang !== "English" ? `[System: respond in ${lang}]\n` : "";
+    return `${langDirective}Task: ${request.description}\n\n${request.prompt.trim()}\n\n` +
+      `Complete this task now and end with a concise findings report — the caller only sees your ` +
+      `final report, not your intermediate steps. Do not ask for confirmation.`;
+  }
+
+  /**
    * Get or create a session.
    * Each gateway sessionId maps to its own pi-coding-agent session directory,
    * so pod restarts correctly restore the matching conversation context.
@@ -1508,6 +1896,13 @@ Always end with a final report even if evidence is incomplete.`;
     const EXTRA_EVENT_BUFFER_CAP = 1000;
     let extraEventBufferOverflowed = false;
     const emitExtraEvent = (event: Record<string, unknown>) => {
+      // Task ledger events are persisted (refresh recovery, design §14 Approach A)
+      // in addition to being streamed live below.
+      if (isTaskEvent(event)) {
+        void this.persistTaskEvent(id, event).catch((err) =>
+          console.warn(`[agentbox-session] task_event persist failed for ${id}:`, err),
+        );
+      }
       if (extraEventSubs.size === 0) {
         extraEventBuffer.push(event);
         if (extraEventBuffer.length > EXTRA_EVENT_BUFFER_CAP) {
@@ -1532,6 +1927,10 @@ Always end with a final report even if evidence is incomplete.`;
       sessionEventEmitter: emitExtraEvent,
       delegateToAgentExecutor: enableDelegationTools ? this.createDelegateToAgentExecutor() : undefined,
       delegateToAgentsExecutor: enableDelegationTools ? this.createDelegateToAgentsExecutor() : undefined,
+      // spawn_subagent is available in normal chat (top-level sessions only — child
+      // sessions above omit this executor, so sub-agents cannot recurse).
+      spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
+      subagentJobStopExecutor: this.createSubagentJobStopExecutor(),
       enableDelegationTools,
     });
 
