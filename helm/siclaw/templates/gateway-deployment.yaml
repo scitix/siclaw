@@ -52,6 +52,12 @@ spec:
               value: "{{ include "siclaw.fullname" . }}-runtime.{{ .Release.Namespace }}.svc.cluster.local"
             - name: SICLAW_MEMORY_ENABLED
               value: {{ ternary "true" "false" .Values.runtime.memory.enabled | quote }}
+            {{- if .Values.runtime.subagentConcurrency }}
+            # Forwarded by the runtime spawner into each AgentBox pod; if unset the
+            # agentbox falls back to its built-in default (5).
+            - name: SICLAW_SUBAGENT_CONCURRENCY
+              value: {{ .Values.runtime.subagentConcurrency | quote }}
+            {{- end }}
             {{- if .Values.agentbox.persistence.enabled }}
             - name: SICLAW_PERSISTENCE_ENABLED
               value: "true"

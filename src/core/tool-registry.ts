@@ -85,7 +85,8 @@ export interface SubagentStep {
 
 /** Live progress pushed as a foreground sub-agent works, so the UI streams its execution in real time. */
 export interface SpawnSubagentProgress {
-  status: "running";
+  /** "queued" = waiting for a concurrency slot (not yet running); "running" = actively executing. */
+  status: "queued" | "running";
   toolCalls: number;
   /** Ordered steps so far (assistant reasoning + tool calls), rendered live like the main agent. */
   steps: SubagentStep[];

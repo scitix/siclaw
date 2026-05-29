@@ -42,6 +42,23 @@ export const SUBAGENT_ALWAYS_DENIED_TOOLS = ["spawn_subagent"] as const;
  */
 export const RUN_IN_BACKGROUND_ENABLED = false;
 
+/** Default cap on sub-agent child sessions running concurrently in one AgentBox. */
+export const DEFAULT_SUBAGENT_CONCURRENCY = 5;
+
+/**
+ * Max sub-agent child sessions allowed to run at once within a single AgentBox,
+ * from `SICLAW_SUBAGENT_CONCURRENCY` (default {@link DEFAULT_SUBAGENT_CONCURRENCY}).
+ * pi runs a tool-call batch unbounded, so a wide fan-out would otherwise spin up
+ * one child agent + one LLM stream per target from a single pod; this bounds it.
+ * Invalid / non-positive values fall back to the default.
+ */
+export function getSubagentConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SICLAW_SUBAGENT_CONCURRENCY;
+  if (raw == null || raw.trim() === "") return DEFAULT_SUBAGENT_CONCURRENCY;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_SUBAGENT_CONCURRENCY;
+}
+
 export const DEFAULT_SUBAGENT_TYPE = "general-purpose";
 
 const GENERAL_PURPOSE: SubagentType = {

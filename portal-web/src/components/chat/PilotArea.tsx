@@ -835,6 +835,8 @@ function compactDuration(ms?: number): string | undefined {
 
 function statusTone(status?: string): { label: string; className: string } {
   switch (status) {
+    case "queued":
+      return { label: "Queued", className: "bg-muted text-muted-foreground border-border" }
     case "running":
     case "pending":
       return { label: status === "pending" ? "Pending" : "Running", className: "bg-blue-500/10 text-blue-400 border-blue-500/30" }
@@ -1725,7 +1727,11 @@ function SubagentSteps({ steps }: { steps: SubagentStepView[] }) {
 function AgentWorkCard({ message }: { message: PilotMessage }) {
   const work = agentWorkSummary(message)
   const steps = (message.toolDetails?.steps as SubagentStepView[] | undefined) ?? []
-  const isRunning = message.toolStatus === "running" || message.isStreaming
+  // Queued = waiting for a concurrency slot. pi paints the whole fan-out batch as
+  // "running" at once (one tool_execution_start each), so without this the queued
+  // children would falsely show a spinner; the backend flips status to "queued".
+  const isQueued = work.status === "queued"
+  const isRunning = !isQueued && (message.toolStatus === "running" || message.isStreaming)
   const isSpawn = message.toolName === "spawn_subagent"
   // Collapsed by default — the user expands the card when they want to see the
   // execution. (Legacy delegate cards keep auto-opening while streaming.)
@@ -1768,9 +1774,11 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
               </div>
             )}
           </div>
-          {message.toolStatus === "running" && (
+          {isQueued ? (
+            <Clock className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+          ) : isRunning ? (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400 shrink-0" />
-          )}
+          ) : null}
         </button>
 
         {isOpen && (
@@ -1782,6 +1790,11 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
                 <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Execution</div>
                 {steps.length > 0 ? (
                   <SubagentSteps steps={steps} />
+                ) : isQueued ? (
+                  <div className="text-xs text-muted-foreground flex items-center gap-2">
+                    <Clock className="w-3 h-3" />
+                    {stringValue(message.toolDetails?.activity) ?? "Waiting for a free slot…"}
+                  </div>
                 ) : isRunning ? (
                   <div className="text-xs text-muted-foreground flex items-center gap-2">
                     <Loader2 className="w-3 h-3 animate-spin" /> Sub-agent working…

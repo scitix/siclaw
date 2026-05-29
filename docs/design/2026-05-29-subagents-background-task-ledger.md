@@ -41,6 +41,17 @@ runs multiple tool calls in one assistant turn concurrently (`executeToolCallsPa
 via `ToolDefinition.executionMode: "sequential"`. Consequence: sub-agent fan-out parallelism comes from
 the model emitting N `spawn_subagent` calls in one turn — no batch-array tool needed.
 
+**Concurrency cap (siclaw-side, since pi has none).** `Promise.all` runs the whole batch unbounded, and
+each `spawn_subagent` is a full in-process child agent (own LLM stream + kubectl/bash) sharing one
+AgentBox pod. So an N-target fan-out would spin up N child agents + N LLM streams at once → provider 429s
+and pod pressure. siclaw therefore wraps the foreground spawn executor in a per-pod
+`ConcurrencyLimiter` (`src/core/concurrency-limiter.ts`), bounded by `SICLAW_SUBAGENT_CONCURRENCY`
+(default `DEFAULT_SUBAGENT_CONCURRENCY = 5`, see `subagent-registry.ts`). Excess spawns **queue** (FIFO,
+slot released even on throw) rather than being rejected — the model still emits N calls and gets N
+reports; they just don't all execute simultaneously. The cap is per-AgentBox (shared across a pod's
+sessions), applied only to foreground spawns; background launches return immediately and are gated off
+anyway (§7).
+
 **The executor is dependency-blind — this shapes the whole orchestration model.** A turn is either
 all-parallel or all-serial; there is no partial ordering *within* a turn and no notion of one tool call
 depending on another. pi never sees the ledger's `blockedBy`. Therefore **dependencies are not enforced

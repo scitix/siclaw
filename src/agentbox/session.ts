@@ -27,7 +27,8 @@ import type {
   SubagentJobStopExecutor,
   SubagentJobStopResult,
 } from "../core/tool-registry.js";
-import { getSubagentType, DEFAULT_SUBAGENT_TYPE } from "../core/subagent-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency } from "../core/subagent-registry.js";
+import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
 import type { BrainSession } from "../core/brain-session.js";
@@ -281,6 +282,13 @@ export class AgentBoxSessionManager {
   /** Pending plan auto-clear timers, keyed by taskListId (all tasks completed → clear after delay). */
   private ledgerHideTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  /**
+   * Bounds concurrent foreground sub-agent child sessions across this AgentBox
+   * (a wide fan-out emits N spawn_subagent calls that pi runs unbounded). Shared
+   * by every session in the pod so the cap is per-pod, not per-conversation.
+   */
+  private subagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
+
   /** In-flight + recent background sub-agent jobs, keyed by jobId (= spawn tool call id). */
   private subagentJobs = new Map<string, {
     jobId: string;
@@ -292,10 +300,33 @@ export class AgentBoxSessionManager {
   }>();
 
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
-    return async (request, onProgress, signal) =>
-      request.runInBackground
-        ? this.startBackgroundSubagent(request)
-        : this.runSpawnedSubagent(request, undefined, onProgress, signal);
+    return async (request, onProgress, signal) => {
+      if (request.runInBackground) return this.startBackgroundSubagent(request);
+      // Cap concurrent foreground children: a wide fan-out queues past the limit
+      // instead of spinning up one child agent + LLM stream per target at once.
+      const lim = this.subagentLimiter;
+      if (lim.atCapacity) {
+        console.log(
+          `[agentbox-session] sub-agent "${request.description}" queued — ` +
+          `${lim.activeCount}/${lim.limit} running, ${lim.pendingCount + 1} waiting (SICLAW_SUBAGENT_CONCURRENCY=${lim.limit})`,
+        );
+        // Tell the UI this child is waiting for a slot, not running — otherwise pi's
+        // batch tool_execution_start already painted it as "running" (spinner).
+        onProgress?.({
+          status: "queued",
+          toolCalls: 0,
+          steps: [],
+          activity: `Waiting for a free slot (${lim.limit} sub-agents run at a time)…`,
+        });
+      }
+      return lim.run(() => {
+        console.log(`[agentbox-session] sub-agent "${request.description}" started — ${lim.activeCount}/${lim.limit} running`);
+        // Flip a previously-queued card to "running" immediately on slot acquisition,
+        // before the child's first tool call emits progress (avoids a stale "Queued").
+        onProgress?.({ status: "running", toolCalls: 0, steps: [] });
+        return this.runSpawnedSubagent(request, undefined, onProgress, signal);
+      });
+    };
   }
 
   private createSubagentJobStopExecutor(): SubagentJobStopExecutor {
