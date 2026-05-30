@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveRequiredKubeconfig, resolveKubeconfigByName, resolveKubeconfigPath } from "./kubeconfig-resolver.js";
+import { resolveRequiredKubeconfig, resolveKubeconfigPath } from "./kubeconfig-resolver.js";
 import type { CredentialBroker, ClusterLocalInfo } from "../../agentbox/credential-broker.js";
 
 /**
@@ -56,7 +56,7 @@ describe("resolveRequiredKubeconfig", () => {
     const result = resolveRequiredKubeconfig({ broker }, undefined);
     expect("error" in result).toBe(true);
     if ("error" in result) {
-      expect(result.error).toContain("Multiple kubeconfigs");
+      expect(result.error).toContain("Multiple clusters");
       expect(result.error).toContain("prod");
       expect(result.error).toContain("staging");
       expect(result.availableNames).toEqual(["prod", "staging"]);
@@ -86,22 +86,6 @@ describe("resolveRequiredKubeconfig", () => {
   });
 });
 
-describe("resolveKubeconfigByName", () => {
-  it("throws when broker is absent", () => {
-    expect(() => resolveKubeconfigByName({}, "prod")).toThrow("not loaded");
-  });
-
-  it("throws when cluster has no path (metadata only)", () => {
-    const broker = makeBroker([{ meta: { name: "prod", is_production: true } }]);
-    expect(() => resolveKubeconfigByName({ broker }, "prod")).toThrow("not loaded");
-  });
-
-  it("returns the path for a loaded cluster", () => {
-    const broker = makeBroker([PROD]);
-    expect(resolveKubeconfigByName({ broker }, "prod")).toBe(PROD.path);
-  });
-});
-
 describe("resolveKubeconfigPath", () => {
   it("returns null when broker is absent", () => {
     expect(resolveKubeconfigPath({})).toBeNull();
@@ -119,6 +103,6 @@ describe("resolveKubeconfigPath", () => {
 
   it("throws when multiple kubeconfigs are loaded", () => {
     const broker = makeBroker([PROD, STAGING]);
-    expect(() => resolveKubeconfigPath({ broker })).toThrow("Multiple kubeconfigs");
+    expect(() => resolveKubeconfigPath({ broker })).toThrow("Multiple clusters");
   });
 });

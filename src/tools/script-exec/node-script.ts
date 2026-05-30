@@ -25,7 +25,7 @@ interface NodeScriptParams {
   script: string;
   args?: string;
   netns?: string;
-  kubeconfig?: string;
+  cluster?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -58,6 +58,8 @@ Parameters:
 - skill: Skill name (e.g. "node-logs"). If omitted, looks in user scripts
 - script: Script filename (e.g. "get-node-logs.sh")
 - args: Optional arguments to pass to the script
+- netns: Optional network namespace id to enter a pod's netns on the node (from resolve_pod_netns)
+- cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - image: Debug container image (default: SICLAW_DEBUG_IMAGE)
 - timeout_seconds: Timeout (default: 180, max: 300)
 
@@ -81,9 +83,9 @@ Examples:
           description: 'Network namespace name (from resolve_pod_netns). When set, script runs inside that netns via "ip netns exec".',
         }),
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
       image: Type.Optional(
@@ -101,7 +103,7 @@ Examples:
       const params = rawParams as NodeScriptParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "node_script");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_script");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -109,7 +111,7 @@ Examples:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -150,8 +152,8 @@ Examples:
         };
       }
 
-      const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
+      const clusterKey = params.cluster || "default";
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
       // Security: shell-escape each argument to prevent injection via args parameter

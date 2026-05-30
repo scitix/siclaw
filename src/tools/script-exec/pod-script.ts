@@ -19,7 +19,7 @@ interface PodScriptParams {
   skill?: string;
   script: string;
   args?: string;
-  kubeconfig?: string;
+  cluster?: string;
   timeout_seconds?: number;
 }
 
@@ -55,6 +55,7 @@ Parameters:
 - skill: Skill name. If omitted, looks in user scripts
 - script: Script filename
 - args: Optional arguments to pass to the script
+- cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
@@ -79,9 +80,9 @@ Examples:
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -94,7 +95,7 @@ Examples:
       const params = rawParams as PodScriptParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "pod_script");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_script");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -102,7 +103,7 @@ Examples:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],

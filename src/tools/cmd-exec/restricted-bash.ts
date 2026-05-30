@@ -16,8 +16,8 @@ import {
   parseArgs,
   validateCommandRestrictions,
 } from "../infra/command-sets.js";
-import { resolveKubeconfigByName, resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
-import { ensureKubeconfigsForCommand, KUBECONFIG_NAME_CHARS } from "../infra/ensure-kubeconfigs.js";
+import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
+import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 import { sanitizeEnv } from "../infra/sanitize-env.js";
 import {
   extractCommands as _extractCommands,
@@ -78,6 +78,17 @@ export function validateKubectlInPipeline(commands: string[]): string | null {
       return JSON.stringify({
         error: `kubectl subcommand "${subcommand || "(empty)"}" is not allowed in read-only mode.`,
         allowed: [...SAFE_SUBCOMMANDS],
+      }, null, 2);
+    }
+
+    // The inline --kubeconfig flag is removed — selecting a cluster is done via the
+    // tool's `cluster` parameter (whole-command KUBECONFIG injection). This also
+    // closes the file-path-in-flag footgun. To query a different cluster, make a
+    // separate bash call with that `cluster`.
+    if (args.some((a) => a === "--kubeconfig" || a.startsWith("--kubeconfig="))) {
+      return JSON.stringify({
+        error: "The --kubeconfig flag is not supported.",
+        hint: "Set the `cluster` parameter to the target cluster's name (from cluster_list) instead. For multiple clusters, make a separate bash call per cluster.",
       }, null, 2);
     }
 
@@ -222,6 +233,7 @@ const SENSITIVE_PATH_RE = [
 
 interface RestrictedBashParams {
   command: string;
+  cluster?: string;
   timeout_seconds?: number;
 }
 
@@ -245,7 +257,7 @@ kubectl is restricted to read-only subcommands: get, describe, logs, top, events
 In local mode, text processing commands (grep, cut, sort, etc.) only work after a pipe — direct file access is blocked. Use dedicated read/grep/glob tools for file operations.
 All other binaries are blocked — except bash/sh/python3 invoking scripts under skills/.
 
-Multi-cluster: when multiple kubeconfigs are available, pass --kubeconfig=<name> (credential name, NOT file path) to select a cluster. Use cluster_list to discover available names. Never use full file paths in --kubeconfig — they will be blocked. Do NOT use KUBECONFIG= env prefix — only the --kubeconfig=<name> flag is supported.
+Selecting a cluster: for kubectl commands, set the \`cluster\` parameter to the target cluster's credential name (from cluster_list) — its kubeconfig is injected automatically so plain "kubectl get ..." works. Omit \`cluster\` for non-Kubernetes commands. To query several clusters, make a separate call per cluster. The --kubeconfig flag and KUBECONFIG= env prefix are not supported — use the \`cluster\` parameter.
 
 Rate protection rules for kubectl:
 - "kubectl logs" requires --tail=<N> or --since=<duration>; bare logs without these will be rejected.
@@ -266,6 +278,13 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       command: Type.String({
         description: "Shell command to execute, e.g. 'kubectl get pods -n default -o wide'",
       }),
+      cluster: Type.Optional(
+        Type.String({
+          description:
+            "Cluster name (from cluster_list) for kubectl commands — its kubeconfig " +
+            "is injected so plain 'kubectl ...' works. Omit for non-Kubernetes shell commands (grep, jq, skill scripts, etc.).",
+        })
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 60, max: 300)",
@@ -283,15 +302,35 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
         };
       }
 
-      // Async prefetch: load any clusters named by --kubeconfig=<name> into the
+      // Async prefetch: load the cluster named by the `cluster` param into the
       // broker registry before the synchronous resolver runs.
-      try {
-        await ensureKubeconfigsForCommand(kubeconfigRef?.credentialBroker, command, "restricted_bash");
-      } catch (err) {
-        return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-          details: { error: true, reason: "kubeconfig_ensure_failed" },
-        };
+      if (params.cluster) {
+        try {
+          await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "restricted_bash");
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+            details: { error: true, reason: "kubeconfig_ensure_failed" },
+          };
+        }
+      }
+
+      // Resolve the selected cluster to a KUBECONFIG path. The `cluster` param is
+      // the explicit, model-facing way to target a cluster (matching node_exec /
+      // pod_exec etc.); when set we inject its kubeconfig so plain `kubectl ...`
+      // works without an inline flag. When omitted, KUBECONFIG stays /dev/null so
+      // non-Kubernetes shell commands run fine and a kubectl call fails clearly,
+      // prompting the model to pass `cluster` (it decides — no command sniffing).
+      let selectedKubeconfigPath = "/dev/null";
+      if (params.cluster) {
+        const r = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
+        if ("error" in r) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: true, message: r.error, available_clusters: r.availableNames }) }],
+            details: { error: true, reason: "unknown_cluster" },
+          };
+        }
+        selectedKubeconfigPath = r.path ?? "/dev/null";
       }
 
       // Pre-exec security: validate command + determine output sanitizer
@@ -327,41 +366,14 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
             ...sanitizeEnv(process.env as Record<string, string>),
             SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
             ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            // Auto-resolve KUBECONFIG when single cluster; /dev/null when ambiguous.
-            // Unlike other tools, restricted-bash has no `kubeconfig` param — the agent
-            // uses inline `--kubeconfig=<name>` which is resolved by the regex below.
-            // When ambiguous, kubectl fails with a connection error, prompting the agent
-            // to use cluster_list and add --kubeconfig=<name>.
-            KUBECONFIG: (() => {
-              const r = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, undefined);
-              if ("path" in r && r.path) return r.path;
-              if ("error" in r) {
-                // Intentional: restricted-bash has no kubeconfig param, so we let
-                // kubectl fail naturally against /dev/null when the user didn't
-                // pick a cluster. Logging helps diagnose when the model keeps
-                // hitting this without using cluster_list.
-                console.log(`[restricted-bash] KUBECONFIG auto-resolve: ${r.error}`);
-              }
-              return "/dev/null";
-            })(),
+            // KUBECONFIG from the resolved `cluster` param (see above): the cluster's
+            // kubeconfig when set, else /dev/null. Inline --kubeconfig is rejected by
+            // validation, so the `cluster` param is the only way to select a cluster.
+            KUBECONFIG: selectedKubeconfigPath,
           },
         };
 
-        // Resolve --kubeconfig=<name> (no path separators) to actual file path.
-        // All names must already be loaded into the broker via ensureKubeconfigsForCommand
-        // which runs at the top of this execute(). We reuse the same name-char
-        // regex here as ensureKubeconfigsForCommand so ensure and replace agree
-        // on which strings count as cluster names.
-        let finalCommand = command;
-        if (kubeconfigRef?.credentialBroker) {
-          finalCommand = command.replace(
-            new RegExp(`--kubeconfig=(${KUBECONFIG_NAME_CHARS})`, "g"),
-            (_match, name) => {
-              const resolved = resolveKubeconfigByName({ broker: kubeconfigRef.credentialBroker }, name);
-              return resolved ? `--kubeconfig=${resolved}` : _match;
-            },
-          );
-        }
+        const finalCommand = command;
 
         // In production (K8s pods), run child processes as sandbox user.
         // sudo's SUID elevates to root, then drops to sandbox.
