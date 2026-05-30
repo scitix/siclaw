@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { buildKnowledgeOverview } from "./overview-generator.js";
+import { buildKnowledgeOverview, buildKnowledgeWikiCatalog } from "./overview-generator.js";
 
 describe("buildKnowledgeOverview", () => {
   let tmpDir: string;
@@ -51,8 +51,8 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(repo, "go.mod"), "module x");
 
     const result = buildKnowledgeOverview({ reposDir });
-    expect(result).toContain("## Knowledge Overview");
-    expect(result).toContain("### Code Repositories");
+    expect(result).toContain("# Knowledge Overview");
+    expect(result).toContain("## Code Repositories");
     expect(result).toContain("my-service");
     expect(result).toContain("3"); // file count
     expect(result).toContain(".ts"); // top extension
@@ -159,7 +159,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(arch, "overview.md"), "# Overview");
 
     const result = buildKnowledgeOverview({ docsDir });
-    expect(result).toContain("### Documentation");
+    expect(result).toContain("## Documentation");
     expect(result).toContain("runbooks");
     expect(result).toContain("architecture");
   });
@@ -170,7 +170,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(docsDir, "faq.md"), "# FAQ");
 
     const result = buildKnowledgeOverview({ docsDir });
-    expect(result).toContain("### Documentation");
+    expect(result).toContain("## Documentation");
     expect(result).toContain("(root)");
     expect(result).toContain("| 2 |");
   });
@@ -191,9 +191,9 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(runbooks, "deploy.md"), "# Deploy");
 
     const result = buildKnowledgeOverview({ reposDir, docsDir });
-    expect(result).toContain("### Code Repositories");
+    expect(result).toContain("## Code Repositories");
     expect(result).toContain("api-svc");
-    expect(result).toContain("### Documentation");
+    expect(result).toContain("## Documentation");
     expect(result).toContain("runbooks");
     expect(result).not.toContain("### Recent Investigations");
     expect(result).not.toContain("### Accumulated Knowledge");
@@ -231,7 +231,7 @@ describe("buildKnowledgeOverview", () => {
     fs.writeFileSync(path.join(repo, "main.ts"), "");
 
     const result = buildKnowledgeOverview({ reposDir });
-    expect(result).toContain("### Code Repositories");
+    expect(result).toContain("## Code Repositories");
     expect(result).not.toContain("### Recent Investigations");
     expect(result).not.toContain("Pod CrashLoopBackOff");
     expect(result).not.toContain("Patterns:");
@@ -262,5 +262,52 @@ describe("buildKnowledgeOverview", () => {
 
     const result = buildKnowledgeOverview({ reposDir, docsDir });
     expect(result.length).toBeLessThanOrEqual(1200 + 150);
+  });
+});
+
+describe("buildKnowledgeWikiCatalog", () => {
+  let tmpDir: string;
+  let knowledgeDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-test-"));
+    knowledgeDir = path.join(tmpDir, "knowledge");
+    fs.mkdirSync(knowledgeDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("returns empty when no dir or no index.md", () => {
+    expect(buildKnowledgeWikiCatalog(undefined)).toBe("");
+    expect(buildKnowledgeWikiCatalog(knowledgeDir)).toBe(""); // dir exists but no index.md
+  });
+
+  it("returns empty for a blank index.md", () => {
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), "   \n  \n");
+    expect(buildKnowledgeWikiCatalog(knowledgeDir)).toBe("");
+  });
+
+  it("injects the index catalog verbatim under a Knowledge Wiki heading", () => {
+    const index = "- [[roce-modes]] — RoCE modes and failures\n- [[gpu-xid]] — XID error codes";
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), index);
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("# Knowledge Wiki");
+    expect(out).toContain("there is no search tool");
+    expect(out).toContain("[[roce-modes]]");
+    expect(out).toContain("[[gpu-xid]]");
+    expect(out).not.toContain("truncated");
+  });
+
+  it("truncates an oversized index and points to the full file", () => {
+    const big = Array.from({ length: 500 }, (_, i) => `- [[page-${i}]] — description number ${i} with some padding text`).join("\n");
+    fs.writeFileSync(path.join(knowledgeDir, "index.md"), big);
+    const out = buildKnowledgeWikiCatalog(knowledgeDir);
+    expect(out).toContain("# Knowledge Wiki");
+    expect(out).toContain("Catalog truncated");
+    expect(out).toContain(".siclaw/knowledge/index.md");
+    // Budgeted: well under the full size.
+    expect(out.length).toBeLessThan(big.length);
   });
 });

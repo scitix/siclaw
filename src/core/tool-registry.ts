@@ -127,7 +127,6 @@ export interface ToolRefs {
   taskListId: string;
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
-  knowledgeIndexer?: MemoryIndexer;
   memoryIndexer?: MemoryIndexer;
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
@@ -148,7 +147,7 @@ export interface ToolEntry {
 
   /**
    * Factory function — receives shared refs, returns a ToolDefinition.
-   * If your tool accesses optional refs (memoryIndexer, memoryDir, knowledgeIndexer),
+   * If your tool accesses optional refs (memoryIndexer, memoryDir),
    * you MUST provide an `available` guard that checks them. The registry calls
    * `available` before `create` — the guard is the safety net for `!` assertions.
    */

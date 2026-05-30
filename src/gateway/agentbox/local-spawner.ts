@@ -15,7 +15,6 @@ import { createHttpServer } from "../../agentbox/http-server.js";
 import { AgentBoxSessionManager } from "../../agentbox/session.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";
 import { syncResource } from "../../agentbox/resource-sync.js";
-import type { MemoryIndexer } from "../../memory/index.js";
 import type { CertificateManager } from "../security/cert-manager.js";
 
 interface LocalBox {
@@ -33,9 +32,6 @@ export class LocalSpawner implements BoxSpawner {
   private basePort: number;
   private nextPort: number;
 
-  /** Injected knowledge base indexer (set via setKnowledgeIndexer) */
-  private knowledgeIndexer: MemoryIndexer | null = null;
-
   /** Certificate manager for signing agentbox client certs */
   private readonly certManager: CertificateManager;
   /** Gateway internal mTLS URL (e.g. https://127.0.0.1:3002) */
@@ -46,11 +42,6 @@ export class LocalSpawner implements BoxSpawner {
     this.gatewayInternalUrl = gatewayInternalUrl;
     this.basePort = basePort;
     this.nextPort = basePort;
-  }
-
-  /** Inject knowledge base indexer for local knowledge_search */
-  setKnowledgeIndexer(indexer: MemoryIndexer): void {
-    this.knowledgeIndexer = indexer;
   }
 
   async spawn(config: AgentBoxConfig): Promise<AgentBoxHandle> {
@@ -88,9 +79,6 @@ export class LocalSpawner implements BoxSpawner {
 
     const sessionManager = new AgentBoxSessionManager();
     sessionManager.agentId = agentId;
-    if (this.knowledgeIndexer) {
-      sessionManager.knowledgeIndexer = this.knowledgeIndexer;
-    }
     // Agent-scoped credentials directory — shared across callers of this agent.
     sessionManager.credentialsDir = path.resolve(
       process.cwd(),
