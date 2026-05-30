@@ -78,7 +78,11 @@ function parseBooleanEnv(value: string | undefined, defaultValue: boolean): bool
 }
 
 export function isMemoryEnabled(): boolean {
-  return parseBooleanEnv(process.env.SICLAW_MEMORY_ENABLED, true);
+  // Off by default — memory (memory_search/memory_get + session auto-save) is an
+  // opt-in feature. Enable explicitly via SICLAW_MEMORY_ENABLED=true (helm:
+  // runtime.memory.enabled). When the env is unset (local dev, TUI, tests) memory
+  // stays disabled so no memory-facing prompt text or tools leak in.
+  return parseBooleanEnv(process.env.SICLAW_MEMORY_ENABLED, false);
 }
 
 // ---------------------------------------------------------------------------
