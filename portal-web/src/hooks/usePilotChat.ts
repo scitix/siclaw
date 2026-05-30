@@ -765,9 +765,20 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const ame = evt.assistantMessageEvent as { type: string; delta?: string } | undefined
           if (ame?.type === "text_delta" && ame.delta) {
             setMessages((prev) => {
-              const last = prev[prev.length - 1]
-              if (last?.isStreaming && last.role === "assistant") {
-                return [...prev.slice(0, -1), { ...last, content: last.content + ame.delta }]
+              // Append to the assistant bubble that is still streaming, even if tool
+              // rows were pushed after it: one assistant turn can be text → tool call
+              // → more text, and that text must stay in ONE bubble (otherwise a
+              // markdown table spanning the tool call splits across two bubbles and
+              // renders broken until reload). message_end clears isStreaming, so this
+              // only ever finds the CURRENT turn's bubble — separate turns still get
+              // their own bubble.
+              for (let i = prev.length - 1; i >= 0; i--) {
+                const m = prev[i]
+                if (m.isStreaming && m.role === "assistant") {
+                  const updated = [...prev]
+                  updated[i] = { ...m, content: m.content + ame.delta }
+                  return updated
+                }
               }
               return [
                 ...prev,
