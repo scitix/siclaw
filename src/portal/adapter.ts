@@ -164,7 +164,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       // and what cluster_list returns to the agent). Look up by name first,
       // then use the resolved id for the binding check.
       const [rows] = await db.query(
-        "SELECT id, name, kubeconfig FROM clusters WHERE name = ?",
+        "SELECT id, name, kubeconfig, debug_image, is_production, api_server, description FROM clusters WHERE name = ?",
         [body.source_id],
       ) as any;
       if (rows.length === 0) {
@@ -196,6 +196,12 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
           name: cluster.name,
           type: "kubeconfig",
           files: [{ name: "cluster.kubeconfig", content: cluster.kubeconfig }],
+          metadata: {
+            is_production: !!cluster.is_production,
+            ...(cluster.debug_image ? { debug_image: cluster.debug_image } : {}),
+            ...(cluster.api_server ? { api_server: cluster.api_server } : {}),
+            ...(cluster.description ? { description: cluster.description } : {}),
+          },
           ttl_seconds: 300,
         },
       });
@@ -1726,7 +1732,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       // source_id is the cluster's NAME. Look up by name first, then use the
       // resolved UUID for the agent-binding check.
       const [rows] = await db.query(
-        "SELECT id, name, kubeconfig FROM clusters WHERE name = ?",
+        "SELECT id, name, kubeconfig, debug_image, is_production, api_server, description FROM clusters WHERE name = ?",
         [params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Cluster not found");
@@ -1744,6 +1750,12 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           name: cluster.name,
           type: "kubeconfig",
           files: [{ name: "cluster.kubeconfig", content: cluster.kubeconfig }],
+          metadata: {
+            is_production: !!cluster.is_production,
+            ...(cluster.debug_image ? { debug_image: cluster.debug_image } : {}),
+            ...(cluster.api_server ? { api_server: cluster.api_server } : {}),
+            ...(cluster.description ? { description: cluster.description } : {}),
+          },
           ttl_seconds: 300,
         },
       };
