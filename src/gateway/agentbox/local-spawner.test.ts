@@ -45,7 +45,6 @@ vi.mock("../../agentbox/session.js", () => ({
   AgentBoxSessionManager: class {
     userId?: string;
     agentId?: string;
-    knowledgeIndexer?: unknown;
     credentialsDir?: string;
     credentialBroker = { dispose: () => { sessionManagerShutdownCalls.push("broker.dispose"); } };
     async closeAll(): Promise<void> { sessionManagerShutdownCalls.push("closeAll"); }
@@ -169,24 +168,6 @@ describe("LocalSpawner — list, get, stop, cleanup", () => {
     await spawner.spawn({ agentId: "a2" });
     await spawner.cleanup();
     expect(await spawner.list()).toEqual([]);
-  });
-});
-
-describe("LocalSpawner — knowledge indexer injection", () => {
-  it("setKnowledgeIndexer stores the indexer for later use", async () => {
-    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const fakeIndexer = { id: "ki" };
-    spawner.setKnowledgeIndexer(fakeIndexer as any);
-    const handle = await spawner.spawn({ agentId: "a1" });
-    const box = (spawner as any).boxes.get(handle.boxId);
-    expect(box.sessionManager.knowledgeIndexer).toBe(fakeIndexer);
-  });
-
-  it("does NOT set knowledgeIndexer on sessionManager when none injected", async () => {
-    const spawner = new LocalSpawner(new FakeCertManager() as any, "https://127.0.0.1:3002", 5000);
-    const handle = await spawner.spawn({ agentId: "a1" });
-    const box = (spawner as any).boxes.get(handle.boxId);
-    expect(box.sessionManager.knowledgeIndexer).toBeUndefined();
   });
 });
 

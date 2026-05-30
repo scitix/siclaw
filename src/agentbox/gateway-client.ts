@@ -124,14 +124,6 @@ export class GatewayClient {
   }
 
   /**
-   * Search the team knowledge base
-   */
-  async searchKnowledge(query: string, topK = 5, minScore = 0.35): Promise<import("../memory/types.js").MemorySearchResult> {
-    const url = `/api/internal/knowledge-search?query=${encodeURIComponent(query)}&topK=${topK}&minScore=${minScore}`;
-    return this.request(url, "GET");
-  }
-
-  /**
    * Send background delegation persistence/audit events to Runtime.
    *
    * AgentBox must not import Gateway DB/RPC modules directly: in K8s it runs in

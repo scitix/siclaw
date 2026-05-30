@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { buildKnowledgeOverview } from "../memory/overview-generator.js";
+import { buildKnowledgeOverview, buildKnowledgeWikiCatalog } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
   createAgentSessionServices,
@@ -64,8 +64,6 @@ export interface CreateSiclawSessionOpts {
   userId?: string;
   /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
   agentId?: string | null;
-  /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
-  knowledgeIndexer?: MemoryIndexer;
   /**
    * Absolute path to a directory that a local Portal snapshot has materialized
    * skills into. CLI mode only: when set, the agent session loads builtin
@@ -174,6 +172,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string | null,
+  knowledgeDir?: string,
 ): string[] {
   const parts: string[] = [];
 
@@ -234,6 +233,13 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
   const overview = buildKnowledgeOverview({ reposDir: reposDir_, docsDir: docsDir_, memoryEnabled: !!memoryDir });
   if (overview) {
     parts.push(overview);
+  }
+
+  // Knowledge wiki catalog (.siclaw/knowledge/index.md) injected directly so the
+  // agent sees available pages without an eager Read and pulls pages on demand.
+  const wikiCatalog = buildKnowledgeWikiCatalog(knowledgeDir ?? path.resolve(process.cwd(), config_.paths.knowledgeDir));
+  if (wikiCatalog) {
+    parts.push(wikiCatalog);
   }
 
   return parts;
@@ -374,7 +380,6 @@ export async function createSiclawSession(
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId,
       memoryRef, dpStateRef,
-      knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
@@ -582,7 +587,7 @@ export async function createSiclawSession(
     resourceLoaderOptions: {
       systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
       appendSystemPromptOverride: () => {
-        const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null);
+        const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir);
         if (agentSystemPromptAppend) {
           parts.push("\n\n" + agentSystemPromptAppend);
         }

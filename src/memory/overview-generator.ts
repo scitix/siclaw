@@ -31,12 +31,12 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     return "";
   }
 
-  const parts: string[] = ["## Knowledge Overview"];
+  const parts: string[] = ["# Knowledge Overview"];
   let currentLen = parts[0].length;
 
   // --- Code Repositories (~400 chars budget) ---
   if (repoEntries.length > 0) {
-    const header = "\n\n### Code Repositories\n| Repo | Files | Top languages |\n|------|-------|--------------|";
+    const header = "\n\n## Code Repositories\n| Repo | Files | Top languages |\n|------|-------|--------------|";
 
     const rows: string[] = [];
     let sectionLen = header.length;
@@ -56,7 +56,7 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
 
   // --- Documentation (~300 chars budget) ---
   if (docEntries.length > 0) {
-    const header = "\n\n### Documentation\n| Category | Files |\n|----------|-------|";
+    const header = "\n\n## Documentation\n| Category | Files |\n|----------|-------|";
 
     const rows: string[] = [];
     let sectionLen = header.length;
@@ -79,6 +79,58 @@ export function buildKnowledgeOverview(opts: OverviewOpts): string {
     : '\n\nUse `read` to view files in repos/ or docs/.');
 
   return parts.join("");
+}
+
+/** Max chars of the knowledge wiki index injected into the prompt before truncation. */
+const KNOWLEDGE_WIKI_BUDGET = 4000;
+
+/**
+ * Inject the knowledge wiki's page catalog into the system prompt.
+ *
+ * The wiki is a flat markdown directory at `knowledgeDir` whose `index.md` lists
+ * every page with a one-line description (and `[[links]]`). We surface that index
+ * directly so the agent sees the catalog in context — no eager Read of index.md,
+ * no search tool — and then Reads only the specific page(s) it needs on demand.
+ *
+ * Returns "" when there is no wiki (no index.md). Budgeted: an oversized index is
+ * truncated with a pointer to read the full file.
+ */
+export function buildKnowledgeWikiCatalog(knowledgeDir?: string): string {
+  if (!knowledgeDir) return "";
+  const indexPath = path.join(knowledgeDir, "index.md");
+  let index: string;
+  try {
+    index = fs.readFileSync(indexPath, "utf-8").trim();
+  } catch {
+    return "";
+  }
+  if (!index) return "";
+
+  let catalog = index;
+  let truncated = false;
+  if (catalog.length > KNOWLEDGE_WIKI_BUDGET) {
+    catalog = catalog.slice(0, KNOWLEDGE_WIKI_BUDGET);
+    // Drop a trailing partial line so the catalog ends cleanly.
+    const lastNl = catalog.lastIndexOf("\n");
+    if (lastNl > 0) catalog = catalog.slice(0, lastNl);
+    truncated = true;
+  }
+
+  return [
+    "# Knowledge Wiki",
+    "",
+    "Internal infrastructure knowledge lives as markdown pages under `.siclaw/knowledge/`. " +
+    "The page catalog is below — there is no search tool. Read only the page(s) relevant to the task " +
+    "with the Read tool (`.siclaw/knowledge/<name>.md`), read whole pages (each is self-contained), and " +
+    "follow any `[[other-page]]` link the same way. Don't read unrelated pages. Pages are semantic — they " +
+    "describe what components are and how they fail, not the commands to run; translate what you learn into " +
+    "concrete checks using skills (preferred) and bash.",
+    "",
+    catalog,
+    ...(truncated
+      ? ["", "_(Catalog truncated — read `.siclaw/knowledge/index.md` for the complete list.)_"]
+      : []),
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------------------

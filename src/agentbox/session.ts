@@ -165,9 +165,6 @@ export class AgentBoxSessionManager {
   /** Optional agentId — set by LocalSpawner / K8s spawner; used for metrics labeling */
   agentId?: string;
 
-  /** Optional knowledge base indexer — set by LocalSpawner for knowledge_search tool */
-  knowledgeIndexer?: MemoryIndexer;
-
   /** Optional credential broker — set by http-server for on-demand credential acquisition */
   credentialBroker?: import("./credential-broker.js").CredentialBroker;
 
@@ -538,7 +535,6 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
-      knowledgeIndexer: this.knowledgeIndexer,
       // Share the parent's task ledger so the child can own/complete tasks.
       taskListId: request.taskListId,
       // The agent-type's prompt flavour for this child.
@@ -893,7 +889,6 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
-      knowledgeIndexer: this.knowledgeIndexer,
       systemPromptTemplate,
       // Stable per-session ledger key so the plan survives release/rebuild
       // (a fresh random id would orphan the prior in-memory ledger every turn).
