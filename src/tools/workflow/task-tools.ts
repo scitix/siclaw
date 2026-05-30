@@ -33,15 +33,33 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
     renderCall: (_a, theme) => title(theme, "task_create"),
     renderResult: renderTextResult,
     description:
-      "Add a task to the plan (the per-session task ledger) and return its id. Use it proactively for " +
-      "non-trivial work: 3+ distinct steps, the same work across multiple targets, or when the user gives " +
-      "several things to do — create the main steps up front. Skip it for a single trivial step (no " +
-      "ceremony).\n" +
-      "Fields: subject (short imperative title), description (what to do), activeForm (present-continuous " +
-      "form shown in the spinner), owner (optional, e.g. a sub-agent name).\n" +
-      "Dependencies are NOT set here: task_create returns each task's id; order dependent steps afterward " +
-      "with task_update addBlockedBy, referencing those returned ids (never guess ids). Call task_list " +
-      "first to avoid creating duplicate tasks.",
+      "Create a task in the plan (the per-session task ledger) and return its id. A live plan tracks your " +
+      "progress, organizes a complex investigation, and shows the user where you are.\n\n" +
+      "## When to use (proactively)\n" +
+      "- The request needs 3+ distinct steps, or the same check across several targets (e.g. several nodes).\n" +
+      "- The user gives several things to do (a numbered or comma-separated list).\n" +
+      "- A single question turns out to need a real investigation — create the main steps up front, as " +
+      "soon as you see it is multi-step, BEFORE diving into tool calls. Don't wait until you're deep in.\n\n" +
+      "## When NOT to use\n" +
+      "- A single, straightforward, or purely informational request — just answer it, no ceremony.\n" +
+      "- Fewer than 3 trivial steps.\n\n" +
+      "## What belongs in the ledger\n" +
+      "Create tasks ONLY for steps you will carry out yourself — read-only diagnosis and verification. Do " +
+      "NOT add remediation, physical hardware work, or anything that needs the user or another team (you " +
+      "can't execute them, so the plan would never complete); put those in your recommendation instead.\n\n" +
+      "## Fields\n" +
+      "subject (short imperative title), description (what to do), activeForm (present-continuous form " +
+      "shown in the spinner), owner (optional, e.g. a sub-agent name).\n\n" +
+      "## Tips\n" +
+      "- Call task_list first to avoid creating duplicate tasks.\n" +
+      "- Dependencies are NOT set here: task_create returns each task's id; order dependent steps " +
+      "afterward with task_update addBlockedBy, referencing those returned ids (never guess ids).\n\n" +
+      "## Example\n" +
+      "User: \"why has GPU training been failing on the cluster lately?\" — one question, but answering it " +
+      "well needs several checks. Up front, create: (1) check node/pod status & recent events, (2) check " +
+      "GPU health, (3) check RDMA/network, (4) check storage, (5) correlate evidence into a root cause. " +
+      "Then work them — mark each in_progress as you start and completed as you finish (task_update). The " +
+      "fix goes in your final answer, not as a task.",
     parameters: Type.Object({
       subject: Type.String({ description: "Short imperative title" }),
       description: Type.String({ description: "What needs to be done" }),
@@ -67,10 +85,14 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       "Update a task in the plan: set status (pending/in_progress/completed), subject/description/" +
       "activeForm/owner, add a dependency (addBlockedBy), or delete it (status=deleted). " +
       "An unknown id returns an error.\n" +
-      "Status workflow pending -> in_progress -> completed: mark a task in_progress before you start it, " +
-      "and completed as soon as it is FULLY done so dependents unblock — do not batch completions. Only " +
-      "mark completed when truly finished; if you hit errors, blockers, partial work, or failing checks, " +
-      "keep it in_progress (optionally add a new task for the blocker).\n" +
+      "Status workflow pending -> in_progress -> completed: mark a task in_progress right before you start " +
+      "it, keeping only ONE task in_progress at a time, and completed as soon as it is FULLY done so " +
+      "dependents unblock — do not batch completions. Only mark completed when truly finished; if you hit " +
+      "errors, blockers, partial work, or failing checks, keep it in_progress.\n" +
+      "Keep the plan a living mirror of the work: when the investigation reveals a new thread or root-cause " +
+      "lead (e.g. you set out to check RDMA but the evidence points at the GPU driver), task_create a NEW " +
+      "task for it — do NOT repurpose or re-label an existing task to cram in the new finding. The plan " +
+      "should grow to match what you are actually doing.\n" +
       "Set ordering with addBlockedBy using the real ids from task_create / task_list, " +
       "e.g. {\"id\":\"2\",\"addBlockedBy\":[\"1\"]}. If unsure of a task's current state, task_get it first.\n" +
       "Remove a task that is no longer relevant or was created in error with status=deleted. " +
