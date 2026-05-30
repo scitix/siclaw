@@ -46,21 +46,11 @@ CRITICAL RESPONSE RULES:
 - NEVER ask the user to do anything to complete the operation — it is already completed automatically.
 - Exception: "list" action returns current schedules as text.
 
-Use this tool when the user asks you to:
-- View current scheduled tasks (e.g. "view tasks", "what scheduled tasks are there", "list schedules") → action: "list"
-- Set up a recurring/scheduled task (e.g. "run a health check every morning") → action: "create"
-- Modify an existing schedule's timing or description → action: "update"
-- Rename a schedule → action: "rename"
-- Stop/pause a scheduled task (e.g. "stop this task", "pause") → action: "pause" (NOT delete!)
-- Resume/restart a paused task (e.g. "start task", "resume") → action: "resume"
-- Permanently delete a scheduled task (e.g. "delete task") → action: "delete"
-
-IMPORTANT: When the user says "stop", "pause", use "pause" — NOT "delete".
-Only use "delete" when the user explicitly says "delete".
+Use this tool whenever the user wants to view or change scheduled tasks. Pick the action that matches their intent (see the action enum). One distinction matters: pausing/stopping a schedule is reversible (action "pause") while deleting is permanent (action "delete") — only delete when the user clearly wants it gone for good, not when they just want it stopped or paused.
 
 Parameters:
 - action: "create", "update", "delete", "pause", "resume", or "rename"
-- id: the schedule ID. If unknown, pass the name instead — the UI will resolve it.
+- id: the schedule ID (UUID) — only when you have the exact ID from a prior "list" result; otherwise omit and use name.
 - name: schedule name (used for create, update, or to find a schedule when id is unknown)
 - newName: new name for rename action
 - description: what the scheduled task should do (natural language — the bot will execute this as a prompt)
