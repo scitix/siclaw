@@ -279,6 +279,40 @@ describe("registerHostRoutes", () => {
     });
   });
 
+  describe("POST /api/v1/hosts/test-connection (unsaved form data)", () => {
+    it("tests a direct host from submitted form data", async () => {
+      dialSshChainMock.mockResolvedValueOnce({ client: {}, teardown: vi.fn() });
+      runCommandMock.mockResolvedValueOnce({ stdout: "ok\n", stderr: "", exitCode: 0 });
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "pw" },
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+    });
+
+    it("returns 400 without ip", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { auth_type: "password", password: "pw" },
+      }));
+      expect(status).toBe(400);
+    });
+
+    it("rejects a managed test with no jump host", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.9", auth_type: "managed" },
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.message).toMatch(/managed.*requires a jump host/i);
+    });
+  });
+
   describe("validateJumpChain", () => {
     // Minimal fake db: each host id maps to its jump_host_id (or absent = not found).
     const chainDb = (map: Record<string, string | null>): any => ({

@@ -117,6 +117,59 @@ async function resolveHostDialChain(db: Db, startId: string): Promise<DialHop[]>
   return targetFirst.reverse();
 }
 
+interface HostFormBody {
+  ip?: string;
+  port?: number;
+  username?: string;
+  auth_type?: string;
+  password?: string;
+  private_key?: string;
+  passphrase?: string;
+  jump_host_id?: string | null;
+}
+
+/** Build the target DialHop from submitted (unsaved) form data. */
+function hopFromForm(b: HostFormBody): DialHop {
+  const host = b.ip ?? "";
+  const port = b.port ?? 22;
+  const username = b.username || "root";
+  const authType = b.auth_type || "password";
+  if (authType === "managed") {
+    return { host, port, username, auth: { managed: true, ...(b.passphrase ? { passphrase: b.passphrase } : {}) } };
+  }
+  if (authType === "key") {
+    if (!b.private_key) throw new Error('auth_type="key" requires a private_key to test');
+    return { host, port, username, auth: { privateKey: b.private_key, ...(b.passphrase ? { passphrase: b.passphrase } : {}) } };
+  }
+  if (!b.password) throw new Error('auth_type="password" requires a password to test');
+  return { host, port, username, auth: { password: b.password } };
+}
+
+/** Dial a resolved hop chain and run `echo ok`; never throws. */
+async function runConnectionTest(hops: DialHop[]): Promise<{ ok: boolean; message: string }> {
+  const timeoutMs = 10000;
+  let dialed;
+  try {
+    dialed = await dialSshChain(hops, { timeoutMs });
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  }
+  try {
+    const result = await runCommand(dialed.client, "echo ok", { timeoutMs });
+    const ok = result.exitCode === 0 && result.stdout.trim() === "ok";
+    return {
+      ok,
+      message: ok
+        ? `SSH connection OK${hops.length > 1 ? ` (via ${hops.length - 1} jump host(s))` : ""}`
+        : `Unexpected probe result (exit ${result.exitCode}): ${result.stdout}${result.stderr}`.trim(),
+    };
+  } catch (err) {
+    return { ok: false, message: err instanceof Error ? err.message : String(err) };
+  } finally {
+    dialed.teardown();
+  }
+}
+
 export function registerHostRoutes(router: RestRouter, jwtSecret: string, connectionMap: RuntimeConnectionMap): void {
   // GET /api/v1/hosts — list all (no secrets)
   router.get("/api/v1/hosts", async (req, res) => {
@@ -314,28 +367,36 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
       sendJson(res, 200, { ok: false, message: err instanceof Error ? err.message : String(err) });
       return;
     }
+    sendJson(res, 200, await runConnectionTest(hops));
+  });
 
-    const timeoutMs = 10000;
-    let dialed;
+  // POST /api/v1/hosts/test-connection — test using submitted (unsaved) form
+  // data, so an operator can validate what they typed before saving. The jump
+  // chain is resolved from saved hosts (jump_host_id); the target hop uses the
+  // inline credentials in the request.
+  router.post("/api/v1/hosts/test-connection", async (req, res) => {
+    const auth = requireAdmin(req, res, jwtSecret);
+    if (!auth) return;
+
+    const body = await parseBody<HostFormBody>(req);
+    if (!body.ip) {
+      sendJson(res, 400, { error: "ip is required" });
+      return;
+    }
+    if (body.auth_type === "managed" && !body.jump_host_id) {
+      sendJson(res, 200, { ok: false, message: 'auth_type="managed" requires a jump host' });
+      return;
+    }
+
+    const db = getDb();
+    let hops: DialHop[];
     try {
-      dialed = await dialSshChain(hops, { timeoutMs });
+      const jumpChain = body.jump_host_id ? await resolveHostDialChain(db, body.jump_host_id) : [];
+      hops = [...jumpChain, hopFromForm(body)];
     } catch (err) {
       sendJson(res, 200, { ok: false, message: err instanceof Error ? err.message : String(err) });
       return;
     }
-    try {
-      const result = await runCommand(dialed.client, "echo ok", { timeoutMs });
-      const ok = result.exitCode === 0 && result.stdout.trim() === "ok";
-      sendJson(res, 200, {
-        ok,
-        message: ok
-          ? `SSH connection OK${hops.length > 1 ? ` (via ${hops.length - 1} jump host(s))` : ""}`
-          : `Unexpected probe result (exit ${result.exitCode}): ${result.stdout}${result.stderr}`.trim(),
-      });
-    } catch (err) {
-      sendJson(res, 200, { ok: false, message: err instanceof Error ? err.message : String(err) });
-    } finally {
-      dialed.teardown();
-    }
+    sendJson(res, 200, await runConnectionTest(hops));
   });
 }
