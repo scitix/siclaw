@@ -51,7 +51,7 @@ The script runs in the host's full namespaces (mount, UTS, IPC, network, PID) �
 Use this for complex node-level diagnostics that need scripts (pipes, loops, functions), not just single commands.
 For single commands, use node_exec instead.
 
-Scripts must come from a skill's scripts/ directory or from user-uploaded scripts.
+Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
 Parameters:
 - node: Target Kubernetes node name
@@ -74,7 +74,7 @@ Examples:
           description: "Skill name (omit to use user scripts)",
         }),
       ),
-      script: Type.String({ description: "Script filename" }),
+      script: Type.String({ description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md. Use it verbatim — do not guess or modify the name." }),
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),

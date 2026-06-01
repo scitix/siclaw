@@ -47,7 +47,7 @@ export function createHostScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinit
     description: `Execute a skill or user script on a non-Kubernetes host via SSH.
 
 The script is piped via stdin into the remote shell — no file transfer needed.
-Scripts must come from a skill's scripts/ directory or from user-uploaded scripts.
+Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
 Use this for complex non-K8s host diagnostics that need scripts (pipes, loops,
 functions), not just single commands. For single commands, use host_exec.
@@ -71,7 +71,7 @@ Examples:
           description: "Skill name (omit to use user scripts)",
         }),
       ),
-      script: Type.String({ description: "Script filename" }),
+      script: Type.String({ description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md. Use it verbatim — do not guess or modify the name." }),
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),

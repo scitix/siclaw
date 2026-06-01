@@ -34,6 +34,23 @@ afterEach(() => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
+describe("resolveScript — not found returns the skill's SKILL.md", () => {
+  it("appends SKILL.md content to a 'script not found' error so the model can self-correct", () => {
+    mkFile(path.join(tmpRoot, ".siclaw/skills/global/my-skill/scripts/run-perftest.py"), "print('x')");
+    mkFile(
+      path.join(tmpRoot, ".siclaw/skills/global/my-skill/SKILL.md"),
+      "# My Skill\nRun run-perftest.py with --server-node and --client-node.",
+    );
+    const r = resolveScript({ skill: "my-skill", script: "run-node-perftest.py" });
+    expect("error" in r).toBe(true);
+    const err = (r as { error: string }).error;
+    expect(err).toContain("not found in skill");
+    expect(err).toContain("run-perftest.py"); // available list
+    expect(err).toContain('SKILL.md for "my-skill"'); // injected hint header
+    expect(err).toContain("--server-node and --client-node"); // SKILL.md body content
+  });
+});
+
 describe("resolveScript — validation", () => {
   it("returns error when script is missing", () => {
     const r = resolveScript({ script: "" });

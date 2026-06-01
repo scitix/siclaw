@@ -249,6 +249,32 @@ export function listAllSkillsWithScripts(): Array<{
 }
 
 /**
+ * Read a skill's SKILL.md (the file beside its scripts/ dir), truncated. Returned
+ * verbatim so a "script not found" error can hand the model the skill's real
+ * instructions — exact script names + usage — instead of letting it guess again.
+ * Returns null when the skill has no readable SKILL.md.
+ */
+export function readSkillMd(skill: string, maxChars = 6000): string | null {
+  for (const { dir } of getSkillScriptDirs(skill)) {
+    try {
+      const md = fs.readFileSync(path.join(path.dirname(dir), "SKILL.md"), "utf-8");
+      return md.length > maxChars ? `${md.slice(0, maxChars)}\n…[SKILL.md truncated]` : md;
+    } catch {
+      /* no SKILL.md in this dir — try the next */
+    }
+  }
+  return null;
+}
+
+/** Suffix appended to a "script not found" error: the skill's SKILL.md, if any. */
+export function skillMdHint(skill: string): string {
+  const md = readSkillMd(skill);
+  return md
+    ? `\n\n--- SKILL.md for "${skill}" (use the exact script name and usage from here, do not guess) ---\n${md}`
+    : "";
+}
+
+/**
  * Unified entry point: resolve a script from skill scripts.
  * Requires a skill name.
  */
@@ -285,7 +311,7 @@ export function resolveScript(params: {
     const available = listSkillScripts(skill);
     if (available.length > 0) {
       return {
-        error: `Script "${script}" not found in skill "${skill}". Available: ${available.join(", ")}`,
+        error: `Script "${script}" not found in skill "${skill}". Available: ${available.join(", ")}${skillMdHint(skill)}`,
       };
     }
     const allSkills = listAllSkillsWithScripts();

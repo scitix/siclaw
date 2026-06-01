@@ -15,6 +15,7 @@ import {
   resolveSkillScript,
   listSkillScripts,
   listAllSkillsWithScripts,
+  skillMdHint,
 } from "../infra/script-resolver.js";
 import { emitDiagnostic } from "../../shared/diagnostic-events.js";
 
@@ -69,7 +70,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         description: "Skill name (e.g. 'find-node', 'roce-perftest-pod')",
       }),
       script: Type.String({
-        description: "Script filename within the skill (e.g. 'find-node.sh', 'run-perftest.py')",
+        description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md (e.g. 'find-node.sh', 'run-perftest.py'). Use it verbatim — do not guess or modify the name.",
       }),
       args: Type.Optional(
         Type.String({
@@ -112,7 +113,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         const available = listSkillScripts(skill);
         let hint: string;
         if (available.length > 0) {
-          hint = `Available scripts for "${skill}": ${available.join(", ")}`;
+          hint = `Available scripts for "${skill}": ${available.join(", ")}${skillMdHint(skill)}`;
         } else {
           // List all skills that DO have scripts to help the LLM
           const allSkillsWithScripts = listAllSkillsWithScripts();
