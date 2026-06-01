@@ -478,6 +478,14 @@ export class AgentBoxSessionManager {
         this.ledgerHideTimers.delete(taskListId);
         const ledger = getOrCreateLedger(taskListId);
         if (!ledger.allCompleted()) return; // a new task arrived; abort the clear
+        // Don't clear while a sub-agent shares this ledger and is still running:
+        // its task completions are invisible to allCompleted() (children have no
+        // sessionEventEmitter), so clearing now would wipe the parent's live plan
+        // out from under the in-flight child. Re-arm and retry once they finish.
+        if (this.subagentLimiter.activeCount > 0) {
+          this.scheduleLedgerAutoClear(taskListId, emit);
+          return;
+        }
         ledger.clear();
         emit({ kind: "task_event", taskListId, action: "reset" });
       }, LEDGER_AUTOCLEAR_MS);
