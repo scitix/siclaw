@@ -39,8 +39,6 @@ export interface SpawnSubagentRequest {
   prompt: string;
   /** Resolved sub-agent type id (see subagent-registry). */
   subagentType: string;
-  /** Optional model override; defaults to the type's model / parent inherit. */
-  model?: string;
   /** When true, run detached and notify the parent on completion (do not block). */
   runInBackground: boolean;
   /** Parent lineage + shared ledger. */

@@ -556,8 +556,6 @@ export class AgentBoxSessionManager {
     child.sessionIdRef.current = childSessionId;
 
     // Use the same model the parent's delegated agents use, when configured.
-    // (request.model per-call override is accepted by the tool but not yet
-    // applied here — a follow-on once model-by-alias resolution is wired.)
     if (this.delegationModelProvider && this.delegationModelConfig && child.brain.registerProvider) {
       child.brain.registerProvider(this.delegationModelProvider, this.delegationModelConfig);
     }
@@ -722,6 +720,7 @@ export class AgentBoxSessionManager {
           : `Sub-agent timed out after ${DELEGATED_AGENT_MAX_RUNTIME_MS}ms with no output.`;
       } else {
         status = "failed";
+        console.warn(`[agentbox-session] sub-agent ${childSessionId} failed:`, err);
         finalText = finalText || `Sub-agent failed: ${err instanceof Error ? err.message : String(err)}`;
       }
     } finally {
