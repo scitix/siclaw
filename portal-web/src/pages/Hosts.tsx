@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Plus, Monitor, Trash2, Loader2, Settings } from "lucide-react"
+import { Plus, Monitor, Trash2, Loader2, Settings, Zap } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
@@ -20,8 +20,23 @@ export function Hosts() {
   const [editForm, setEditForm] = useState({ ...emptyForm })
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [testingHostId, setTestingHostId] = useState<string | null>(null)
   const toast = useToast()
   const confirmDialog = useConfirm()
+
+  // Test connectivity of an already-saved host (dials its full jump chain).
+  const handleTestHost = async (id: string) => {
+    setTestingHostId(id)
+    try {
+      const r = await api<{ ok: boolean; message: string }>(`/hosts/${id}/test`, { method: "POST", body: {} })
+      if (r.ok) toast.success(r.message || "SSH connection OK")
+      else toast.error(r.message || "Connection failed")
+    } catch (err: any) {
+      toast.error(err.message)
+    } finally {
+      setTestingHostId(null)
+    }
+  }
 
   // Test a connection using the (possibly unsaved) form values, so the operator
   // can validate what they typed before saving. The jump chain is resolved
@@ -236,6 +251,9 @@ export function Hosts() {
                     <p className="text-xs text-muted-foreground">{h.username}@{h.ip}:{h.port} · {h.auth_type}{h.jump_host_id ? ` · via ${hosts.find((j) => j.id === h.jump_host_id)?.name ?? "jump"}` : ""}{h.description ? ` · ${h.description}` : ""}</p>
                   </div>
                   <div className="flex items-center gap-1">
+                    <button onClick={(e) => { e.stopPropagation(); handleTestHost(h.id) }} disabled={testingHostId === h.id} title="Test connection" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50">
+                      {testingHostId === h.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+                    </button>
                     <button onClick={(e) => { e.stopPropagation(); startEditHost(h) }} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
                       <Settings className="h-4 w-4" />
                     </button>
