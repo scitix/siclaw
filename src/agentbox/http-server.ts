@@ -11,6 +11,7 @@ import https from "node:https";
 import type { TLSSocket } from "node:tls";
 import type { AgentBoxSessionManager } from "./session.js";
 import type { SessionMode } from "../core/types.js";
+import type { AgentMode } from "../core/tool-registry.js";
 import { isMemoryEnabled, loadConfig } from "../core/config.js";
 import { emitDiagnostic } from "../shared/diagnostic-events.js";
 import { checkMetricsAuth } from "../shared/metrics.js"; // also registers metrics subscriber (side-effect)
@@ -41,6 +42,24 @@ const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 const BODY_TIMEOUT_MS = 30_000; // 30s
 const DP_ACTIVATION_MARKER = "[Deep Investigation]\n";
 const DP_EXIT_MARKER = "[DP_EXIT]";
+
+/**
+ * Resolve the session's active operating mode for this prompt, so getOrCreate can
+ * build (or rebuild) the agent with mode-scoped tools (e.g. the plan tools are
+ * hidden in DP). Mirrors the DP on/off rules: an explicit marker wins, otherwise
+ * fall back to the live then persisted DP state.
+ */
+function resolveActiveMode(
+  text: string,
+  sessionId: string | undefined,
+  sessionManager: AgentBoxSessionManager,
+): AgentMode {
+  if (text.startsWith(DP_EXIT_MARKER)) return "normal";
+  if (text.startsWith(DP_ACTIVATION_MARKER)) return "dp";
+  if (!sessionId) return "normal";
+  if (sessionManager.get(sessionId)?.dpStateRef?.active === true) return "dp";
+  return sessionManager.getPersistedDpState(sessionId)?.active === true ? "dp" : "normal";
+}
 
 async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -275,7 +294,8 @@ export function createHttpServer(
       return;
     }
 
-    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate);
+    const activeMode = resolveActiveMode(body.text, body.sessionId, sessionManager);
+    const managed = await sessionManager.getOrCreate(body.sessionId, body.mode, body.systemPromptTemplate, activeMode);
     if (!managed._promptDone || managed._promptInflight) {
       // _promptInflight covers the synthetic-parent-prompt path that may
       // be holding the brain even when _promptDone has already flipped

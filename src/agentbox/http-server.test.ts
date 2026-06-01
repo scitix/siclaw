@@ -142,8 +142,8 @@ function makeFakeSessionManager() {
     activeCount: () => sessions.size,
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
-    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown) => {
-      getOrCreateCalls.push({ id });
+    getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, activeMode?: unknown) => {
+      getOrCreateCalls.push({ id, activeMode });
       const key = id ?? "default";
       let s = sessions.get(key);
       if (!s) {
@@ -242,6 +242,19 @@ describe("http-server — prompt + session lifecycle", () => {
     const r = await getJson(port, "/api/prompt", "POST", {});
     expect(r.status).toBe(400);
     expect(r.data.error).toMatch(/Missing.*text/);
+  });
+
+  it("resolves the active operating mode from DP markers and passes it to getOrCreate", async () => {
+    const lastMode = () => sm.getOrCreateCalls[sm.getOrCreateCalls.length - 1].activeMode;
+
+    await getJson(port, "/api/prompt", "POST", { text: "[Deep Investigation]\nwhy is X failing", sessionId: "dp-a" });
+    expect(lastMode()).toBe("dp");
+
+    await getJson(port, "/api/prompt", "POST", { text: "[DP_EXIT]\nthanks", sessionId: "exit-a" });
+    expect(lastMode()).toBe("normal");
+
+    await getJson(port, "/api/prompt", "POST", { text: "plain question", sessionId: "plain-a" });
+    expect(lastMode()).toBe("normal");
   });
 
   it("POST /api/prompt rejects a second prompt while the session is still running", async () => {

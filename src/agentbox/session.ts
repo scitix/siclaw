@@ -26,6 +26,7 @@ import type {
   SpawnSubagentStatus,
   SubagentJobStopExecutor,
   SubagentJobStopResult,
+  AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency } from "../core/subagent-registry.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
@@ -99,6 +100,8 @@ export interface ManagedSession {
   skillsDirs: string[];
   /** Session mode — determines which system skills are loaded */
   mode: SessionMode;
+  /** Active operating mode (normal/dp/…) this agent was built for — drives rebuild on change. */
+  activeMode: AgentMode;
   /** MCP client manager — per-session, shut down on release/close */
   mcpManager?: McpClientManager;
   /** Memory indexer — shared at AgentBox level, NOT per-session */
@@ -791,6 +794,7 @@ export class AgentBoxSessionManager {
     sessionId?: string,
     mode?: SessionMode,
     systemPromptTemplate?: string,
+    activeMode: AgentMode = "normal",
   ): Promise<ManagedSession> {
     const id = sessionId || this.defaultSessionId;
 
@@ -803,7 +807,16 @@ export class AgentBoxSessionManager {
         existing._releaseTimer = null;
         console.log(`[agentbox-session] Cancelled pending release for session ${id}`);
       }
-      return existing;
+      // Reuse unless the operating mode changed mid-session (e.g. user toggled Deep
+      // Investigation): rebuild so tools scoped by `availableModes` are re-resolved.
+      // Don't rebuild mid-first-prompt (_promptDone false).
+      if (existing.activeMode === activeMode || !existing._promptDone) {
+        return existing;
+      }
+      console.log(
+        `[agentbox-session] Rebuilding session ${id} for mode change ${existing.activeMode} -> ${activeMode}`,
+      );
+      await this.release(id);
     }
 
     // Ensure shared components are ready
@@ -886,6 +899,7 @@ export class AgentBoxSessionManager {
       sessionManager: frameworkSessionManager,
       kubeconfigRef,
       mode: effectiveMode,
+      activeMode,
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId: this.agentId ?? null,
@@ -929,6 +943,7 @@ export class AgentBoxSessionManager {
       _aborted: false,
       skillsDirs: result.skillsDirs,
       mode: effectiveMode,
+      activeMode,
       // Per-session references point to shared instances (not owned by session)
       mcpManager: result.mcpManager,
       memoryIndexer: result.memoryIndexer,

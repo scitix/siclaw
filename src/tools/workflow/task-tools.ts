@@ -188,23 +188,29 @@ export function createTaskGetTool(taskListId: string): ToolDefinition {
   };
 }
 
+// The plan/task ledger is hidden in Deep Investigation mode — DP structures work
+// via hypothesis checkpoints, and a parallel plan conflicts with that (availableModes).
 export const taskCreateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskCreateTool(refs.taskListId, refs.sessionEventEmitter),
   platform: true,
+  availableModes: ["normal"],
 };
 export const taskUpdateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskUpdateTool(refs.taskListId, refs.sessionEventEmitter),
   platform: true,
+  availableModes: ["normal"],
 };
 export const taskListRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskListTool(refs.taskListId),
   platform: true,
+  availableModes: ["normal"],
 };
 export const taskGetRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskGetTool(refs.taskListId),
   platform: true,
+  availableModes: ["normal"],
 };

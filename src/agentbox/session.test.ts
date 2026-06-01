@@ -184,6 +184,26 @@ describe("AgentBoxSessionManager — getOrCreate", () => {
     expect(s.id).toBe("default");
   });
 
+  it("rebuilds the session when the active operating mode changes", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const s1 = await mgr.getOrCreate("sess-1", undefined, undefined, "normal");
+    expect(s1.activeMode).toBe("normal");
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+    expect(lastCreateSiclawSession.calls[0].activeMode).toBe("normal");
+
+    // Same mode → reuse, no rebuild.
+    const s2 = await mgr.getOrCreate("sess-1", undefined, undefined, "normal");
+    expect(s2).toBe(s1);
+    expect(lastCreateSiclawSession.calls).toHaveLength(1);
+
+    // Mode change (normal → dp) → rebuild with a fresh agent built for "dp".
+    const s3 = await mgr.getOrCreate("sess-1", undefined, undefined, "dp");
+    expect(s3).not.toBe(s1);
+    expect(s3.activeMode).toBe("dp");
+    expect(lastCreateSiclawSession.calls).toHaveLength(2);
+    expect(lastCreateSiclawSession.calls[1].activeMode).toBe("dp");
+  });
+
   it("cancels a pending release timer when the session is re-requested", async () => {
     const mgr = new AgentBoxSessionManager();
     const s = await mgr.getOrCreate("sess-1");

@@ -179,7 +179,28 @@ export interface ToolEntry {
    * Omit = always available.
    */
   available?: (refs: ToolRefs) => boolean;
+
+  /**
+   * Operating modes that expose this tool. Omit = available in every mode (the
+   * common case). Otherwise the tool is shown only when the session's active mode
+   * is in this list:
+   * - `["normal"]` — hidden in Deep Investigation (e.g. the plan/task tools, whose
+   *   structure conflicts with DP's hypothesis-checkpoint flow).
+   * - `["dp"]` — only inside Deep Investigation (a DP-exclusive tool).
+   * - `["normal", "dp"]` — both (same as omitting).
+   * This is a general mode axis (orthogonal to SessionMode): DP is the first mode;
+   * future modes are added to `AgentMode` and tagged here. The session is rebuilt
+   * when the active mode changes, so this is honoured even mid-session.
+   */
+  availableModes?: AgentMode[];
 }
+
+/**
+ * The agent's active operating mode within a session — a general, extensible axis
+ * orthogonal to SessionMode. `"normal"` is the default; `"dp"` is Deep Investigation.
+ * Add new modes here (and resolve them where the active mode is computed).
+ */
+export type AgentMode = "normal" | "dp";
 
 export class ToolRegistry {
   private entries: ToolEntry[] = [];
@@ -198,13 +219,16 @@ export class ToolRegistry {
     mode: SessionMode;
     refs: ToolRefs;
     allowedTools?: string[] | null;
+    /** Active operating mode (normal/dp/…). Filters tools by `availableModes`. */
+    activeMode?: AgentMode;
   }): ResolvedToolDefinition[] {
-    const { mode, refs, allowedTools } = opts;
+    const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // 1. mode filter + available check (create not called yet)
+    // 1. session-mode + operating-mode + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&
+        (!e.availableModes || e.availableModes.includes(activeMode)) &&
         (!e.available || e.available(refs)),
     );
 

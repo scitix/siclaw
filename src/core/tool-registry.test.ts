@@ -125,6 +125,20 @@ describe("ToolRegistry", () => {
     }
   });
 
+  it("availableModes scopes a tool to the active operating mode", () => {
+    const reg = new ToolRegistry();
+    reg.register(
+      { category: "workflow", create: () => stubToolDef("task_create"), availableModes: ["normal"] },
+      { category: "workflow", create: () => stubToolDef("dp_only"), availableModes: ["dp"] },
+      { category: "query", create: () => stubToolDef("bash") }, // both
+    );
+    const names = (activeMode?: "normal" | "dp") =>
+      reg.resolve({ mode: "web", refs: stubRefs(), activeMode }).map((t) => t.name);
+    expect(names("normal")).toEqual(["task_create", "bash"]);
+    expect(names("dp")).toEqual(["dp_only", "bash"]);
+    expect(names()).toEqual(["task_create", "bash"]); // default = normal
+  });
+
   it("annotates tools that require explicit user approval", () => {
     const reg = new ToolRegistry();
     reg.register(
