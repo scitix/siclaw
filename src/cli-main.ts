@@ -13,7 +13,7 @@ import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
 import { saveSessionKnowledge } from "./memory/session-summarizer.js";
 // topic-consolidator import removed — consolidation disabled
-import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
+import { debugPodCache } from "./tools/infra/debug-pod.js";
 import { tryLoadPortalSnapshot, loadPortalSnapshotDetailed } from "./lib/portal-snapshot-client.js";
 import { materializePortalSkills, cleanupPortalSkills } from "./lib/portal-skill-materializer.js";
 import { materializePortalKnowledge, cleanupPortalKnowledge } from "./lib/portal-knowledge-materializer.js";
@@ -183,10 +183,7 @@ const sessionManager = continueSession
 const config = loadConfig();
 const credentialsDir = portalCredentialsDir ?? path.resolve(process.cwd(), config.paths.credentialsDir);
 
-// Start background GC for orphaned debug pods (best-effort; silently skips if no cluster)
-void debugPodGC.start(credentialsDir).catch((err) => {
-  console.warn("[siclaw] DebugPodGC start failed:", err);
-});
+// Orphaned debug pods self-clean via their Job's ttlSecondsAfterFinished — no GC needed.
 
 // Create session via shared factory. Opts are factored out so the runtime's
 // session-replacement factory (/new, /resume, /fork) can recreate an

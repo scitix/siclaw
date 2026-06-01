@@ -1,15 +1,41 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   buildDebugPodLabels,
+  buildDebugJobManifest,
   DebugPodCache,
   LABEL_COMPONENT,
   LABEL_USER_ID,
   LABEL_TARGET_NODE,
   LABEL_MANAGED_BY,
+  LABEL_DEBUG_ID,
   COMPONENT_DEBUG_POD,
   MANAGED_BY_SICLAW,
   DEBUG_POD_RESOURCE_LIMITS,
+  DEBUG_JOB_FINISHED_TTL_SECONDS,
 } from "./debug-pod.js";
+
+describe("buildDebugJobManifest — self-cleaning Job", () => {
+  const labels = { ...buildDebugPodLabels("u", "node-1"), [LABEL_DEBUG_ID]: "abcd1234" };
+  const m = buildDebugJobManifest("node-debug-abcd1234", labels, "busybox:1.36", 600, "node-1") as any;
+
+  it("is a Job that the cluster auto-deletes after it finishes", () => {
+    expect(m.apiVersion).toBe("batch/v1");
+    expect(m.kind).toBe("Job");
+    expect(m.spec.activeDeadlineSeconds).toBe(600);          // hard run cap
+    expect(m.spec.ttlSecondsAfterFinished).toBe(DEBUG_JOB_FINISHED_TTL_SECONDS); // self-clean
+    expect(m.spec.backoffLimit).toBe(0);                     // no retries
+  });
+
+  it("carries the privileged host-namespace debug pod template, pinned to the node", () => {
+    const pod = m.spec.template.spec;
+    expect(pod.nodeName).toBe("node-1");
+    expect(pod.hostPID).toBe(true);
+    expect(pod.restartPolicy).toBe("Never");
+    expect(pod.containers[0].securityContext.privileged).toBe(true);
+    expect(pod.containers[0].command).toEqual(["sleep", "infinity"]);
+    expect(m.spec.template.metadata.labels[LABEL_DEBUG_ID]).toBe("abcd1234"); // resolvable pod
+  });
+});
 
 describe("buildDebugPodLabels", () => {
   it("returns all required label keys", () => {
@@ -91,7 +117,7 @@ describe("DebugPodCache — lock + eviction mechanics", () => {
     const factory = async () => {
       callCount++;
       await new Promise((r) => setTimeout(r, 10));
-      cache.set("u", "c", "n", "pod-1", "ns", {} as any, 60_000);
+      cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
     };
     const [a, b, c] = await Promise.all([
       cache.getOrCreate("u", "c", "n", factory),
@@ -108,7 +134,7 @@ describe("DebugPodCache — lock + eviction mechanics", () => {
   });
 
   it("get returns cached entry", () => {
-    cache.set("u", "c", "n", "pod-1", "ns", {} as any, 60_000);
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
     const got = cache.get("u", "c", "n");
     expect(got?.podName).toBe("pod-1");
     expect(cache.size).toBe(1);
@@ -119,7 +145,7 @@ describe("DebugPodCache — lock + eviction mechanics", () => {
   });
 
   it("touch resets idle timer", () => {
-    cache.set("u", "c", "n", "pod-1", "ns", {} as any, 60_000);
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
     const e1 = cache.get("u", "c", "n");
     const originalTimer = e1?.idleTimer;
     cache.touch("u", "c", "n", 30_000);
@@ -132,23 +158,23 @@ describe("DebugPodCache — lock + eviction mechanics", () => {
   });
 
   it("remove deletes cache entry but does not delete pod", () => {
-    cache.set("u", "c", "n", "pod-1", "ns", {} as any, 60_000);
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
     expect(cache.size).toBe(1);
     cache.remove("u", "c", "n");
     expect(cache.size).toBe(0);
   });
 
   it("set replaces previous entry (clears old timer)", () => {
-    cache.set("u", "c", "n", "pod-1", "ns", {} as any, 60_000);
-    cache.set("u", "c", "n", "pod-2", "ns", {} as any, 60_000);
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
+    cache.set("u", "c", "n", "job-pod-2", "pod-2", "ns", {} as any, 60_000);
     expect(cache.size).toBe(1);
     expect(cache.get("u", "c", "n")?.podName).toBe("pod-2");
   });
 
   it("different triples get isolated entries", () => {
-    cache.set("u1", "c1", "n1", "pod-A", "ns", {} as any, 60_000);
-    cache.set("u1", "c1", "n2", "pod-B", "ns", {} as any, 60_000);
-    cache.set("u2", "c1", "n1", "pod-C", "ns", {} as any, 60_000);
+    cache.set("u1", "c1", "n1", "job-pod-A", "pod-A", "ns", {} as any, 60_000);
+    cache.set("u1", "c1", "n2", "job-pod-B", "pod-B", "ns", {} as any, 60_000);
+    cache.set("u2", "c1", "n1", "job-pod-C", "pod-C", "ns", {} as any, 60_000);
     expect(cache.size).toBe(3);
     expect(cache.get("u1", "c1", "n1")?.podName).toBe("pod-A");
     expect(cache.get("u1", "c1", "n2")?.podName).toBe("pod-B");
@@ -172,7 +198,7 @@ describe("DebugPodCache — getOrCreate failure paths", () => {
 
     // Subsequent call with successful factory works
     const factory2 = async () => {
-      cache.set("u", "c", "n", "pod-ok", "ns", {} as any, 60_000);
+      cache.set("u", "c", "n", "job-pod-ok", "pod-ok", "ns", {} as any, 60_000);
     };
     const res = await cache.getOrCreate("u", "c", "n", factory2);
     expect(res.pod?.podName).toBe("pod-ok");
@@ -192,7 +218,7 @@ describe("DebugPodCache — getOrCreate failure paths", () => {
     // Wait a tick then start second caller (it should wait on lock)
     await new Promise((r) => setTimeout(r, 1));
     const p2 = cache.getOrCreate("u", "c", "n", async () => {
-      cache.set("u", "c", "n", "pod-late", "ns", {} as any, 60_000);
+      cache.set("u", "c", "n", "job-pod-late", "pod-late", "ns", {} as any, 60_000);
     });
 
     factoryDone!();
