@@ -604,6 +604,12 @@ function inferHostMetaFromResponse(response: CredentialResponse, fallbackName: s
     auth_type: authType,
     is_production: isProduction,
     ...(typeof metadata.description === "string" ? { description: metadata.description } : {}),
+    // Optional: name of the next-hop bastion for a ProxyJump chain. The
+    // management server resolves any internal id to the host name before
+    // sending; acquireSshTarget recurses on it. Absent for direct hosts.
+    ...(typeof metadata.jump_host === "string" && metadata.jump_host.length > 0
+      ? { jump_host: metadata.jump_host }
+      : {}),
   };
 }
 

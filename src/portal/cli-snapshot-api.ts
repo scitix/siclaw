@@ -29,7 +29,7 @@ import type http from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import type { RestRouter } from "../gateway/rest-router.js";
 import { sendJson } from "../gateway/rest-router.js";
-import { getDb } from "../gateway/db.js";
+import { getDb, type Db } from "../gateway/db.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
 import type {
   CliSnapshotKnowledgeRepo,
@@ -142,7 +142,45 @@ interface HostRow {
   auth_type: string;
   password: string | null;
   private_key: string | null;
+  passphrase: string | null;
   description: string | null;
+  jump_host_id: string | null;
+  jump_host_name: string | null;
+}
+
+/** Cap a target + up to 3 bastions — mirrors ssh-client MAX_JUMP_DEPTH. */
+const SNAPSHOT_MAX_JUMP_DEPTH = 3;
+
+/**
+ * Given the agent-bound host rows, append any jump hosts referenced (≤3 hops)
+ * that aren't already in the set, so each ProxyJump chain's credentials are
+ * present in the snapshot even when the bastion isn't directly bound. Resolves
+ * each appended host's own jump_host_name too (for nested chains).
+ */
+async function expandJumpHosts(db: Db, rows: HostRow[]): Promise<HostRow[]> {
+  const byName = new Map<string, HostRow>(rows.map((r) => [r.name, r]));
+  // Seed the frontier with bound hosts that reference a jump host.
+  let frontier = rows.filter((r) => r.jump_host_id);
+  for (let depth = 0; depth < SNAPSHOT_MAX_JUMP_DEPTH && frontier.length > 0; depth++) {
+    const ids = Array.from(new Set(frontier.map((r) => r.jump_host_id).filter((id): id is string => !!id)));
+    if (ids.length === 0) break;
+    const placeholders = ids.map(() => "?").join(", ");
+    const [jumpRows] = await db.query<HostRow[]>(
+      `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.password, h.private_key, h.passphrase,
+              h.description, h.jump_host_id, hj.name AS jump_host_name
+       FROM hosts h LEFT JOIN hosts hj ON h.jump_host_id = hj.id
+       WHERE h.id IN (${placeholders})`,
+      ids,
+    );
+    const next: HostRow[] = [];
+    for (const jr of jumpRows) {
+      if (byName.has(jr.name)) continue;
+      byName.set(jr.name, jr);
+      if (jr.jump_host_id) next.push(jr);
+    }
+    frontier = next;
+  }
+  return Array.from(byName.values());
 }
 
 interface AgentRow {
@@ -320,18 +358,27 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       : await db.query<ClusterRow[]>(
           "SELECT name, kubeconfig, description FROM clusters WHERE kubeconfig IS NOT NULL AND kubeconfig != '' ORDER BY name",
         );
-    const [hostRows] = activeAgentId
+    const HOST_COLS =
+      "h.name, h.ip, h.port, h.username, h.auth_type, h.password, h.private_key, h.passphrase, h.description, h.jump_host_id, hj.name AS jump_host_name";
+    const [hostRowsRaw] = activeAgentId
       ? await db.query<HostRow[]>(
-          `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.password, h.private_key, h.description
+          `SELECT ${HOST_COLS}
            FROM hosts h
            JOIN agent_hosts ah ON ah.host_id = h.id
+           LEFT JOIN hosts hj ON h.jump_host_id = hj.id
            WHERE ah.agent_id = ?
            ORDER BY h.name`,
           [activeAgentId],
         )
       : await db.query<HostRow[]>(
-          "SELECT name, ip, port, username, auth_type, password, private_key, description FROM hosts ORDER BY name",
+          `SELECT ${HOST_COLS} FROM hosts h LEFT JOIN hosts hj ON h.jump_host_id = hj.id ORDER BY h.name`,
         );
+    // When agent-scoped, pull in jump hosts referenced by bound hosts (≤3 hops)
+    // so each ProxyJump chain's credentials are present in the snapshot even if
+    // the bastion isn't itself bound to the agent.
+    const hostRows = activeAgentId
+      ? await expandJumpHosts(db, hostRowsRaw)
+      : hostRowsRaw;
 
     // Group models under their provider name.
     const modelsByProviderId = new Map<string, ModelRow[]>();
@@ -437,7 +484,9 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           authType: h.auth_type,
           password: h.auth_type === "password" ? h.password : null,
           privateKey: h.auth_type === "key" ? h.private_key : null,
+          passphrase: h.auth_type === "key" ? h.passphrase : null,
           description: h.description,
+          jumpHost: h.jump_host_name,
         })),
     };
 

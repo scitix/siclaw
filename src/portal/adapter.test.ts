@@ -226,7 +226,8 @@ describe("registerAdapterRoutes — is_production filter", () => {
     it("returns 403 when binding-check finds no matching-env row", async () => {
       query
         .mockResolvedValueOnce([[{ id: "h-id", name: "h1", ip: "10.0.0.1", port: 22, username: "u", auth_type: "key", password: null, private_key: "K" }], []])
-        .mockResolvedValueOnce([[], []]);
+        .mockResolvedValueOnce([[], []])  // direct binding: none
+        .mockResolvedValueOnce([[], []]); // transitive jump check: no bound hosts → not a jump of any
       const { status, body } = await runRoute(router, fakeReq({
         url: "/api/internal/siclaw/credential-request",
         method: "POST",
