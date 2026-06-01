@@ -9,9 +9,9 @@ export interface RuntimeConfig {
   internalPort: number;
   /** Bind host */
   host: string;
-  /** Management server URL (Portal or SiCore) — provides Agent info, credentials, permissions */
+  /** Management server URL (Portal or an external management server) — provides Agent info, credentials, permissions */
   serverUrl: string;
-  /** Portal/SiCore's secret — Runtime presents this when phone-homing to the management server */
+  /** The management server's secret — Runtime presents this when phone-homing to the management server */
   portalSecret: string;
 }
 

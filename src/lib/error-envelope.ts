@@ -1,5 +1,5 @@
 // Error envelope — see docs/design/error-envelope.md.
-// Wire-compatible with sicore's pkg/model/response.go ErrorDetail.
+// Wire-compatible with the management server's ErrorDetail (pkg/model/response.go).
 
 export type ErrorDetail = {
   code: string;
@@ -13,7 +13,7 @@ export type ErrorDetail = {
 // REST body wrapper. SSE error frames carry ErrorDetail directly (event name discriminates).
 export type ErrorEnvelope = { error: ErrorDetail };
 
-// Codes mirror sicore ErrCode* where applicable, plus a few siclaw-specific ones.
+// Codes mirror the management server's ErrCode* where applicable, plus a few siclaw-specific ones.
 // Add new codes here only when actually emitted from code; see design doc §2.
 export const ErrorCodes = {
   INTERNAL: "INTERNAL_ERROR",

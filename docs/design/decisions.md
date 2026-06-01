@@ -491,11 +491,10 @@ scheme:
 
 **Update (2026-06, feat/ssh-managed-jump): managed auth now supported.**
 The original decision excluded "managed" target auth (last-hop key read off the
-bastion) as a community anti-pattern. Reversed by product decision to align with
-sicore, which supports it as a first-class form. siclaw now supports
+bastion) as a community anti-pattern. Reversed by product decision to support a credential-on-bastion form. siclaw now supports
 `auth_type="managed"`: the target stores no credential; `ssh-dial` reads the first
 readable `~/.ssh/id_*` off the bastion at dial time and uses it for the final hop
 (target username + optional passphrase from the host record). Constraints: a managed
 host **requires a jump host**; the key is **not** broker-materialized (it lives on
 the bastion and transits agentbox memory) — an explicit, documented tradeoff vs.
-explicit per-hop credentials. Mechanism mirrors sicore `internal/connector/managed_jump.go`.
+explicit per-hop credentials. Mechanism: read the first readable `~/.ssh/id_*` off the bastion for the final hop.

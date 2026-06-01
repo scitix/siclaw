@@ -30,7 +30,7 @@ import {
   type SshRunOptions,
 } from "./ssh-dial.js";
 
-/** Mirrors sicore connector maxJumpDepth — caps a target + up to 3 bastions. */
+/** Caps a target + up to 3 bastions. */
 const MAX_JUMP_DEPTH = 3;
 
 // ── Types ───────────────────────────────────────────────────────────

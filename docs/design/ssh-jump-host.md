@@ -18,7 +18,7 @@ external management server.
   bastion. Each bastion is itself a managed host row with its own credentials —
   equivalent to ssh_config `ProxyJump <named-host>`. Multi-level = a chain of
   references.
-- **Depth is capped at 3** (`MAX_JUMP_DEPTH`), mirroring sicore's connector.
+- **Depth is capped at 3** (`MAX_JUMP_DEPTH`).
   Cycles are rejected. The cap and cycle guard are enforced both on write
   (`validateJumpChain` in `host-api.ts`) and at acquire/dial time, because a row
   can be edited into a cycle after a child already references it.
@@ -31,8 +31,8 @@ The credential boundaries (`adapter.ts` WS-RPC + REST mirrors, `cli-snapshot-api
 carry the bastion's **host name**, never an internal id. The management server
 resolves `jump_host_id → name` at the boundary; the broker stores it as
 `HostMeta.jump_host` and `acquireSshTarget` recurses by name. This keeps the
-execution layer (`ssh-dial.ts`, broker-free) ignorant of any source system, so a
-sicore-style id model never leaks into siclaw's standard SSH layer.
+execution layer (`ssh-dial.ts`, broker-free) ignorant of any source system, so an
+upstream id model never leaks into siclaw's standard SSH layer.
 
 ## Execution contract
 

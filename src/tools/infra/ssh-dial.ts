@@ -91,11 +91,11 @@ export function makeHostVerifier(host: string, port: number): (key: Buffer, cb: 
   };
 }
 
-// ── Managed-target key discovery (mirrors sicore managed_jump.go) ───
+// ── Managed-target key discovery ───────────────────────────────────
 
 /**
  * Shell one-liner run on the bastion to emit the first readable standard SSH
- * private key. Mirrors sicore's candidate list. Exits 3 if none is readable.
+ * private key (standard SSH key locations). Exits 3 if none is readable.
  */
 const MANAGED_KEY_FETCH_CMD =
   'for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_dsa"; ' +

@@ -177,12 +177,12 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     // the background and stream events back to Portal via the chat.event
     // WS channel.
     //
-    // Why: sicore's WS RPC carries a fixed 30s timeout. Coupling the ack
+    // Why: the management server's WS RPC carries a fixed 30s timeout. Coupling the ack
     // to "agentbox is ready and prompt() returned" forced that timeout to
     // cover worst-case cold-start (image pull, container start, ready
     // probe), which routinely exceeds 30s and produced spurious
     // CONNECTION_TIMEOUT bubbles even when the runtime was healthy. Once
-    // the bubble fires, sicore tears down the SSE response and the
+    // the bubble fires, the management server tears down the SSE response and the
     // delayed reply (which still arrives later) is dropped — leaving a
     // ghost session in DB and a confused user.
     //
@@ -510,7 +510,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     res.end(JSON.stringify({ error: "Not found" }));
   });
 
-  // Runtime no longer accepts inbound WS connections — Portal/SiCore drive
+  // Runtime no longer accepts inbound WS connections — Portal / the management server drive
   // RPCs over the phone-home WS owned by FrontendWsClient. The HTTP server
   // here serves only /api/health and the internal mTLS endpoints.
   httpServer.keepAliveTimeout = 500;

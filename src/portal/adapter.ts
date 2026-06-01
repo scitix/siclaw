@@ -32,7 +32,7 @@ function jsonParam(value: unknown): string | null {
 // Shared by the HTTP routes (registerAdapterRoutes) and the WS-RPC handlers
 // (buildAdapterRpcHandlers) so the two transports can't drift.
 
-/** Mirrors sicore connector maxJumpDepth + ssh-client MAX_JUMP_DEPTH. */
+/** Matches ssh-client MAX_JUMP_DEPTH (target + up to 3 bastions). */
 const ADAPTER_MAX_JUMP_DEPTH = 3;
 
 interface HostCredentialRow {
