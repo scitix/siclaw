@@ -228,9 +228,13 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       const filteredStderr = filterPodNoise(execResult.stderr);
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
+      const out = execResult.stdout.trim();
+      // Show the output as a shell would, with the exit code as a trailing annotation
+      // (not a prefix that replaces the body), so a non-zero exit with no output —
+      // e.g. `grep` with no match — reads as an empty result, not a failure.
       const stdout = isError
-        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
-        : execResult.stdout.trim();
+        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
+        : out;
       return {
         content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },

@@ -414,7 +414,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
       } catch (err: any) {
         const errStderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${err.stdout?.trim() ?? ""}`, pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
+          content: [{ type: "text", text: postExecSecurity(`${err.stdout?.trim() || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, pre.action, { stderr: errStderr || undefined, hasSensitiveKubectl: pre.hasSensitiveKubectl }) }],
           details: { exitCode: err.code, error: true },
         };
       }

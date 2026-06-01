@@ -49,6 +49,11 @@ function saveTempFile(text: string): string {
  */
 export function processToolOutput(text: string): string {
   const clean = sanitizeOutput(text);
+  // Empty output is a real, unambiguous result (e.g. a grep with no match) — surface
+  // it like a shell would (nothing printed) rather than an empty string, which renders
+  // as a stuck "Running" card and tempts the model to assume the output was hidden
+  // elsewhere and invent a file path to read.
+  if (clean.trim().length === 0) return "(no output)";
   if (clean.length <= MAX_CHARS) return clean;
 
   const fullPath = saveTempFile(clean);

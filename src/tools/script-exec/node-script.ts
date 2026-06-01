@@ -196,9 +196,10 @@ Examples:
       const filteredStderr = filterPodNoise(execResult.stderr);
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
+      const out = execResult.stdout.trim();
       const stdout = isError
-        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
-        : execResult.stdout.trim();
+        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
+        : out;
       return {
         content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: filteredStderr || undefined }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },

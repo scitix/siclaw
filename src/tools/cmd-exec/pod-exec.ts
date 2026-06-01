@@ -184,7 +184,7 @@ Examples:
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
         return {
-          content: [{ type: "text", text: postExecSecurity(`Exit code: ${exitCode}\n${stdout}`, pre.action, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
           details: { exitCode, error: true },
         };
       }
