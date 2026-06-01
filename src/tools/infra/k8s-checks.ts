@@ -48,6 +48,42 @@ export async function checkNodeReady(
 /** Terminal pod phases — once a pod reaches one of these, it won't change. */
 const TERMINAL_PHASES = new Set(["Succeeded", "Failed"]);
 
+/**
+ * Container `waiting.reason`s a Pending pod will NOT recover from on its own —
+ * bad/unpullable image or a container that can't be created. Polling past these
+ * just blocks until the wait deadline, so we fail fast on them instead.
+ */
+const FATAL_WAITING_REASONS = new Set([
+  "ImagePullBackOff", "ErrImageNeverPull", "InvalidImageName",
+  "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
+  "CrashLoopBackOff",
+]);
+
+/**
+ * Inspect a pod's `.status` for a startup failure that won't self-heal (unpullable
+ * image, unschedulable, container config error) so the caller can fail fast rather
+ * than wait out the full timeout. Returns a human-readable reason, or null when the
+ * pod is merely still starting (Pending / ContainerCreating).
+ */
+function detectFatalPodStartupFailure(status: any): string | null {
+  const scheduled = (status?.conditions ?? []).find((c: any) => c?.type === "PodScheduled");
+  if (scheduled?.status === "False" && scheduled?.reason === "Unschedulable") {
+    return `Unschedulable — ${scheduled.message ?? "no node can run the pod"}`;
+  }
+  const containers = [
+    ...(status?.initContainerStatuses ?? []),
+    ...(status?.containerStatuses ?? []),
+  ];
+  for (const cs of containers) {
+    const reason = cs?.state?.waiting?.reason;
+    if (reason && FATAL_WAITING_REASONS.has(reason)) {
+      const msg = cs.state.waiting.message;
+      return `${reason}${msg ? ` — ${msg}` : ""}`;
+    }
+  }
+  return null;
+}
+
 /** Adaptive polling constants — start fast (500ms) and back off to 5s cap. */
 const POLL_INITIAL_MS = 500;
 const POLL_MAX_MS = 5_000;
@@ -81,6 +117,7 @@ export async function waitForPodDone(
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("Aborted");
 
+    let fatalReason: string | null = null;
     try {
       const { stdout } = await execFileAsync(
         "kubectl",
@@ -88,19 +125,24 @@ export async function waitForPodDone(
           ...(kubeconfigPath ? [`--kubeconfig=${kubeconfigPath}`] : []),
           "get", "pod", podName,
           ...(namespace ? ["-n", namespace] : []),
-          "-o", "jsonpath={.status.phase}",
+          "-o", "json",
         ],
         { timeout: KUBECTL_TIMEOUT, env },
       );
-      const phase = stdout.trim();
+      const status = JSON.parse(stdout)?.status ?? {};
+      const phase = (status.phase ?? "").trim();
       if (targetPhase === "Running") {
         if (phase === "Running" || TERMINAL_PHASES.has(phase)) return phase;
       } else {
         if (TERMINAL_PHASES.has(phase)) return phase;
       }
+      // Still Pending — but is it a failure that won't self-heal (image pull /
+      // scheduling / container config)? If so, stop waiting and fail fast.
+      fatalReason = detectFatalPodStartupFailure(status);
     } catch {
-      // kubectl transient error — keep polling
+      // pod not created yet / transient kubectl or JSON parse error — keep polling
     }
+    if (fatalReason) throw new Error(`Pod "${podName}" cannot start: ${fatalReason}`);
 
     // Abortable sleep — wake up immediately on abort signal
     await new Promise<void>((resolve) => {

@@ -476,8 +476,13 @@ export async function runInDebugPod(
             opts.signal,
           );
 
+          // Pod startup gets its OWN bounded budget (config.debugPodStartupTimeout),
+          // not the command's timeoutMs — so a pod stuck pulling/scheduling fails fast
+          // within ~a minute instead of holding the tool call for the full command
+          // timeout. detectFatalPodStartupFailure also short-circuits known fatal
+          // reasons (ImagePullBackOff / Unschedulable / config errors) even sooner.
           const phase = await waitForPodDone(
-            podName, opts.timeoutMs, env.childEnv, opts.signal,
+            podName, config.debugPodStartupTimeout * 1000, env.childEnv, opts.signal,
             env.kubeconfigPath ?? undefined, debugNamespace, "Running",
           );
 
