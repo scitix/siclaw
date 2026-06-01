@@ -1,29 +1,37 @@
 /**
- * SSH client wrapper around ssh2 — used by host_exec and host_script.
+ * SSH client for host_exec / host_script.
  *
  * Two responsibilities:
- *   1. acquireSshTarget: ensure the broker has materialized a host's credential
- *      file, then read enough metadata to build an SshTarget for ssh2.connect.
- *   2. sshExec: open one TCP connection per call, run a single command (or pipe
- *      a script via stdin), enforce TOFU host-key check, return stdout/stderr
- *      with timeout + AbortSignal handling.
+ *   1. acquireSshTarget: drive the CredentialBroker to materialize a host's
+ *      credential file(s), then assemble an SshTarget — recursively following
+ *      `meta.jump_host` to build a ProxyJump chain (depth capped at 3, with a
+ *      cycle guard).
+ *   2. sshExec: resolve the target (+ its jump chain) to inline hops and run a
+ *      single command on the final host via ssh-dial's dialSshChain + runCommand.
  *
- * TOFU host-key cache is process-scoped (a module-level Map). Same agentbox pod
- * = consistent fingerprints across calls; pod restart = TOFU resets. We do NOT
- * persist known_hosts to disk — DESIGN decision #4. Stronger validation (an
- * expected_fingerprint column on hosts) is a future option.
+ * Dialing, multi-hop tunneling (forwardOut + sock), the TOFU host-key cache and
+ * output handling all live in ssh-dial.ts (broker-free, shared with the Portal
+ * connection test). See that module for the ProxyJump mechanics.
  *
- * Memory hygiene: password files are read as Buffer and zeroed after the
- * connect call returns. ssh2's `password` config field is typed `string`, so
- * once we hand it over the password lives as a V8 interned string until GC —
- * this is an accepted residual risk (DESIGN risk #3).
+ * Memory hygiene: password / passphrase files are read as Buffers and zeroed
+ * after we copy them to strings. ssh2's password/passphrase fields are typed
+ * `string`, so once handed over they live as V8 interned strings until GC — an
+ * accepted residual risk. Private keys are passed through as Buffers.
  */
 
-import crypto from "node:crypto";
 import { promises as fsp } from "node:fs";
-import { Client, type ConnectConfig } from "ssh2";
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";
 import { ensureHostForTool } from "./ensure-kubeconfigs.js";
+import {
+  dialSshChain,
+  runCommand,
+  type DialHop,
+  type SshRunResult,
+  type SshRunOptions,
+} from "./ssh-dial.js";
+
+/** Mirrors sicore connector maxJumpDepth — caps a target + up to 3 bastions. */
+const MAX_JUMP_DEPTH = 3;
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -31,41 +39,24 @@ export interface SshTarget {
   host: string;
   port: number;
   username: string;
-  auth: { type: "key"; privateKeyPath: string }
-      | { type: "password"; passwordPath: string };
+  auth:
+    | { type: "key"; privateKeyPath: string; passphrasePath?: string }
+    | { type: "password"; passwordPath: string };
+  /** Next hop toward this target (the bastion), when reached via ProxyJump. */
+  jumpHost?: SshTarget;
 }
 
-export interface SshExecResult {
-  stdout: string;
-  stderr: string;
-  /** null when the remote process was killed by a signal. */
-  exitCode: number | null;
-  signal?: string;
-  truncated?: boolean;
-}
+// Re-exported so host_exec / host_script keep importing these from here.
+export type SshExecResult = SshRunResult;
+export type SshExecOptions = SshRunOptions;
 
-export interface SshExecOptions {
-  timeoutMs: number;
-  signal?: AbortSignal;
-  /** Script content piped to remote stdin. host_script uses this; host_exec doesn't. */
-  stdin?: string;
-}
-
-// ── TOFU host-key cache (process-scoped) ────────────────────────────
-
-/** Map<"<host>:<port>", base64 sha256 fingerprint>. Reset on pod restart. */
-const seenHostKeys = new Map<string, string>();
-
-function fingerprint(keyBuffer: Buffer): string {
-  return crypto.createHash("sha256").update(keyBuffer).digest("base64");
-}
-
-// ── acquireSshTarget ────────────────────────────────────────────────
+// ── acquireSshTarget (recursive over the jump chain) ────────────────
 
 /**
  * Drive the broker to ensure host credentials are on disk, then assemble an
- * SshTarget. Throws with an actionable message if the host is not bound or
- * its credential file isn't materialized.
+ * SshTarget. If the host's metadata names a `jump_host`, recurse to acquire the
+ * bastion and attach it as `target.jumpHost` (depth ≤ 3, cycle-guarded). Throws
+ * with an actionable message if a host is not bound or not materialized.
  */
 export async function acquireSshTarget(
   broker: CredentialBroker | undefined,
@@ -75,6 +66,23 @@ export async function acquireSshTarget(
   if (!broker) {
     throw new Error("Credential broker required for host_exec / host_script");
   }
+  return acquireSshTargetInner(broker, hostName, purpose, new Set<string>(), 0);
+}
+
+async function acquireSshTargetInner(
+  broker: CredentialBroker,
+  hostName: string,
+  purpose: string,
+  visited: Set<string>,
+  depth: number,
+): Promise<SshTarget> {
+  if (visited.has(hostName)) {
+    throw new Error(`Host "${hostName}" forms a jump-host cycle: ${[...visited, hostName].join(" → ")}`);
+  }
+  if (depth > MAX_JUMP_DEPTH) {
+    throw new Error(`Jump-host chain for "${hostName}" exceeds max depth ${MAX_JUMP_DEPTH}`);
+  }
+
   await ensureHostForTool(broker, hostName, purpose);
 
   const info = broker.getHostLocalInfo(hostName);
@@ -92,155 +100,89 @@ export async function acquireSshTarget(
     throw new Error(`Host "${hostName}" credential file with suffix ${wantedSuffix} not found`);
   }
 
-  return {
-    host: meta.ip,
-    port: meta.port,
-    username: meta.username,
-    auth: meta.auth_type === "key"
-      ? { type: "key", privateKeyPath: credPath }
-      : { type: "password", passwordPath: credPath },
-  };
+  let auth: SshTarget["auth"];
+  if (meta.auth_type === "key") {
+    const passphrasePath = info.filePaths.find((p) => p.endsWith(".passphrase"));
+    auth = { type: "key", privateKeyPath: credPath, ...(passphrasePath ? { passphrasePath } : {}) };
+  } else {
+    auth = { type: "password", passwordPath: credPath };
+  }
+
+  const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth };
+
+  if (meta.jump_host) {
+    const nextVisited = new Set(visited);
+    nextVisited.add(hostName);
+    target.jumpHost = await acquireSshTargetInner(broker, meta.jump_host, purpose, nextVisited, depth + 1);
+  }
+
+  return target;
 }
 
 // ── sshExec ─────────────────────────────────────────────────────────
 
-const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB, matches spawnAsync
-
 /**
- * Open an SSH connection to `target`, exec `command`, optionally feed
- * `options.stdin` to the remote process. Resolves with stdout/stderr/exitCode.
- *
- * Failure modes (all reject the returned promise):
- *   - connection error: bad host, refused, unreachable
- *   - auth failure: bad key, bad password
- *   - host key mismatch: TOFU cache says the fingerprint changed
- *   - timeout: options.timeoutMs elapsed
- *   - abort: options.signal fired
- *
- * Resource discipline: every code path that resolves/rejects also calls
- * conn.end() and removes its own listeners. A `settled` guard ensures the
- * promise never settles twice (ssh2 emits multiple events on close paths).
+ * Resolve `target` (+ its jump chain) to inline hops, dial the chain, exec
+ * `command` on the final host, and tear the chain down. Single-hop targets are
+ * just a one-element chain. All failure modes (connect/auth error, host-key
+ * mismatch, forwardOut failure, timeout, abort) reject the returned promise.
  */
 export async function sshExec(
   target: SshTarget,
   command: string,
   options: SshExecOptions,
 ): Promise<SshExecResult> {
-  const conn = new Client();
-  const config = await buildConnectConfig(target, options.timeoutMs);
-
-  return new Promise<SshExecResult>((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const cleanup = () => {
-      if (timer) clearTimeout(timer);
-      timer = null;
-      if (options.signal) options.signal.removeEventListener("abort", onAbort);
-      conn.removeAllListeners();
-    };
-
-    const settleResolve = (r: SshExecResult) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      try { conn.end(); } catch { /* ignore */ }
-      resolve(r);
-    };
-
-    const settleReject = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      try { conn.end(); } catch { /* ignore */ }
-      reject(err);
-    };
-
-    const onAbort = () => settleReject(new Error("Aborted"));
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    timer = setTimeout(
-      () => settleReject(new Error(`SSH timeout after ${options.timeoutMs}ms`)),
-      options.timeoutMs,
-    );
-
-    conn.on("ready", () => {
-      conn.exec(command, (err, stream) => {
-        if (err) return settleReject(err);
-
-        const stdoutChunks: Buffer[] = [];
-        const stderrChunks: Buffer[] = [];
-        let totalSize = 0;
-        let truncated = false;
-        const append = (chunks: Buffer[], chunk: Buffer) => {
-          totalSize += chunk.length;
-          if (totalSize > MAX_OUTPUT) { truncated = true; return; }
-          chunks.push(chunk);
-        };
-
-        stream.on("close", (code: number | null, signal?: string) => {
-          settleResolve({
-            stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-            stderr: Buffer.concat(stderrChunks).toString("utf8"),
-            exitCode: code,
-            ...(signal ? { signal } : {}),
-            ...(truncated ? { truncated: true } : {}),
-          });
-        });
-        stream.on("data", (chunk: Buffer) => append(stdoutChunks, chunk));
-        stream.stderr.on("data", (chunk: Buffer) => append(stderrChunks, chunk));
-
-        if (options.stdin !== undefined) {
-          stream.stdin.end(options.stdin);
-        }
-      });
-    });
-
-    conn.on("error", (err) => settleReject(err));
-
-    try {
-      conn.connect(config);
-    } catch (err) {
-      settleReject(err instanceof Error ? err : new Error(String(err)));
-    }
+  const hops = await targetToHops(target);
+  const { client, teardown } = await dialSshChain(hops, {
+    timeoutMs: options.timeoutMs,
+    signal: options.signal,
   });
+  try {
+    return await runCommand(client, command, options);
+  } finally {
+    teardown();
+  }
 }
 
-// ── Internal: assemble ssh2 ConnectConfig with TOFU verifier ───────
+// ── Internal: SshTarget chain → inline DialHop[] ────────────────────
 
-async function buildConnectConfig(
-  target: SshTarget,
-  timeoutMs: number,
-): Promise<ConnectConfig> {
-  const cacheKey = `${target.host}:${target.port}`;
-
-  const config: ConnectConfig = {
-    host: target.host,
-    port: target.port,
-    username: target.username,
-    readyTimeout: timeoutMs,
-    hostVerifier: (key: Buffer, cb: (ok: boolean) => void) => {
-      const fp = fingerprint(key);
-      const seen = seenHostKeys.get(cacheKey);
-      if (!seen) {
-        seenHostKeys.set(cacheKey, fp);
-        cb(true);
-        return;
-      }
-      cb(seen === fp);
-    },
-  };
-
-  if (target.auth.type === "key") {
-    config.privateKey = await fsp.readFile(target.auth.privateKeyPath);
-  } else {
-    const pwBuf = await fsp.readFile(target.auth.passwordPath);
-    // ssh2's password is typed string. Once we toString() it lives as a V8
-    // interned string until GC — accepted residual risk (DESIGN risk #3).
-    // We do zero the file Buffer though.
-    config.password = pwBuf.toString("utf8").replace(/\s+$/u, "");
-    pwBuf.fill(0);
+/**
+ * Flatten an SshTarget (+ jumpHost chain) into the order dialSshChain expects:
+ * [outermost bastion, …, final target]. Reads each hop's materialized
+ * credential file(s) into inline material.
+ */
+async function targetToHops(target: SshTarget): Promise<DialHop[]> {
+  // Walk target → jumpHost producing [target, bastion, …], then reverse so the
+  // directly-reachable outermost bastion is dialed first.
+  const targetFirst: SshTarget[] = [];
+  for (let t: SshTarget | undefined = target, d = 0; t; t = t.jumpHost, d++) {
+    if (d > MAX_JUMP_DEPTH) {
+      throw new Error(`Jump-host chain exceeds max depth ${MAX_JUMP_DEPTH}`);
+    }
+    targetFirst.push(t);
   }
+  const ordered = targetFirst.reverse();
+  return Promise.all(ordered.map((t) => hopFromTarget(t)));
+}
 
-  return config;
+async function hopFromTarget(t: SshTarget): Promise<DialHop> {
+  if (t.auth.type === "key") {
+    const privateKey = await fsp.readFile(t.auth.privateKeyPath);
+    let passphrase: string | undefined;
+    if (t.auth.passphrasePath) {
+      const buf = await fsp.readFile(t.auth.passphrasePath);
+      passphrase = buf.toString("utf8").replace(/\s+$/u, "");
+      buf.fill(0);
+    }
+    return {
+      host: t.host,
+      port: t.port,
+      username: t.username,
+      auth: { privateKey, ...(passphrase ? { passphrase } : {}) },
+    };
+  }
+  const pwBuf = await fsp.readFile(t.auth.passwordPath);
+  const password = pwBuf.toString("utf8").replace(/\s+$/u, "");
+  pwBuf.fill(0);
+  return { host: t.host, port: t.port, username: t.username, auth: { password } };
 }
