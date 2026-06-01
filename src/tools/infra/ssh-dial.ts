@@ -122,13 +122,26 @@ function fetchManagedKeyFromJump(jump: Client, timeoutMs: number): Promise<Buffe
         reject(err);
         return;
       }
+      // Cap the captured key — any real private key is a few KB; this guards
+      // against a misbehaving/hostile bastion streaming unbounded output.
+      const MAX_KEY_BYTES = 256 * 1024;
       const chunks: Buffer[] = [];
-      stream.on("data", (c: Buffer) => chunks.push(c));
+      let total = 0;
+      let tooBig = false;
+      stream.on("data", (c: Buffer) => {
+        total += c.length;
+        if (total > MAX_KEY_BYTES) { tooBig = true; return; }
+        chunks.push(c);
+      });
       stream.stderr.on("data", () => { /* discard */ });
       stream.on("close", (code: number | null) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (tooBig) {
+          reject(new Error(`managed key fetch aborted: jump host returned more than ${MAX_KEY_BYTES} bytes`));
+          return;
+        }
         const key = Buffer.concat(chunks);
         if (code === 0 && key.length > 0) resolve(key);
         else reject(new Error("no readable SSH private key found on jump host (~/.ssh/id_{ed25519,rsa,ecdsa,dsa})"));
@@ -250,9 +263,11 @@ export function dialSshChain(hops: DialHop[], opts: { timeoutMs: number; signal?
           const dialNext = (mk?: Buffer) => connectHop(index + 1, stream as unknown as Duplex, mk);
           if ("managed" in next.auth) {
             // Source the managed target's key from THIS hop (the bastion) before
-            // dialing it through the freshly-opened tunnel.
+            // dialing it through the freshly-opened tunnel. Guard against the
+            // chain having been torn down (abort/timeout) while the async fetch
+            // was in flight, so we don't spawn an untracked client post-teardown.
             fetchManagedKeyFromJump(client, opts.timeoutMs)
-              .then(dialNext)
+              .then((mk) => { if (!settled) dialNext(mk); })
               .catch((e) => fail(new Error(`managed key fetch from ${hop.host} failed: ${e instanceof Error ? e.message : String(e)}`)));
           } else {
             dialNext();

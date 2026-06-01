@@ -46,14 +46,24 @@ host:port and shared with the single-hop path.
 
 ## Authorization contract (security-sensitive)
 
-Binding an agent to a target host **transitively authorizes transit through that
-target's jump chain**: `credential.get` for a bastion succeeds if the bastion is
-the jump host (within depth 3) of some directly-bound host
-(`isJumpOfBoundHost`). The agent never receives a bastion's credential material —
-keys/passwords stay server-side or in 0600 broker files — it only gains network
-reachability through the bastion. The `is_production` constraint applies to the
-directly-bound entry host only; bastions inherit reachability (so a test bastion
-may legitimately front a prod target).
+Binding an agent to a target host **transitively authorizes its whole jump
+chain**: `credential.get` for a bastion succeeds if the bastion is the jump host
+(within depth 3) of some directly-bound host (`isJumpOfBoundHost`).
+
+**What the agentbox receives.** The agentbox authenticates *every* hop itself, so
+an **explicit-credential** bastion's key/password is materialized onto the
+agentbox (0600 broker files) exactly like any bound host — it is *not* kept
+server-side-only. The sole exception is a **managed** target, whose key stays on
+the bastion and is read at dial time (see below).
+
+**Blast radius — binding a target hands that agentbox the credentials of every
+explicit bastion in its chain.** And because `is_production` is enforced only on
+the directly-bound entry host (not on transitively-pulled bastions), binding a
+*test* target whose chain includes a *prod* bastion materializes that prod
+bastion's key onto a *test* agentbox. This is the intended trust model: keep a
+chain within one trust tier, or use `managed` so the key never leaves the bastion.
+The agent still cannot point a materialized bastion key at an arbitrary host —
+`host_exec`/`host_script` targets must be bound (visible via `host_list`).
 
 ## Managed target auth (`auth_type=managed`)
 

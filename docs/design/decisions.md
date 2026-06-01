@@ -475,17 +475,22 @@ scheme:
 - Credential boundaries carry the bastion's NAME (neutral wire reference); the
   management server resolves `jump_host_id` → name so no internal id leaks into
   the standard-SSH layer.
-- Binding an agent to a target transitively authorizes transit through its jump
-  chain; the agent never receives a bastion's credential material, only
-  reachability.
+- Binding an agent to a target transitively authorizes its jump chain. The
+  agentbox authenticates every hop, so an **explicit-credential** bastion's
+  key/password is materialized onto it (0600) like any bound host — only a
+  **managed** target's key stays solely on the bastion.
 **Consequences**:
 - ✅ Standard, portable model — the same inventory works standalone or driven by
   an external management server
 - ✅ Reuses the existing CredentialBroker + security pipeline; no new credential store
-- ⚠️ Transitive authorization: binding a target grants network transit through
-  its bastions (not their secrets)
-- ⚠️ `is_production` is enforced only on the directly-bound entry host; bastions
-  inherit reachability (a test bastion may front a prod target)
+- ⚠️ Transitive authorization materializes onto the agentbox the credentials of
+  every **explicit** bastion in a bound target's chain (managed bastions excepted)
+- ⚠️ `is_production` is enforced only on the directly-bound entry host; a test
+  target whose chain includes a prod bastion materializes that prod bastion's key
+  onto a test agentbox — keep chains within one trust tier
+- ⚠️ The WS-RPC `credential.get` path does not enforce `is_production` matching on
+  the binding (pre-existing; shared with the cluster branch); the transitive jump
+  check mirrors each path's existing policy. Tracked as a separate follow-up.
 
 **Files**: `src/tools/infra/ssh-dial.ts`, `src/tools/infra/ssh-client.ts`, `src/portal/adapter.ts`, `src/portal/host-api.ts`, `src/portal/migrate.ts`; full contract in `docs/design/ssh-jump-host.md`
 
