@@ -41,6 +41,13 @@ export interface HostMeta {
   username: string;
   auth_type: "password" | "key";
   is_production: boolean;
+  /**
+   * Name of the next-hop jump host (bastion), if this host is reached through a
+   * ProxyJump chain. A neutral host-name reference — the management server
+   * resolves any internal id to the host's name before sending. Absent for
+   * directly-reachable hosts. Chains resolve recursively (depth capped at 3).
+   */
+  jump_host?: string;
 }
 
 export interface CredentialFile {
