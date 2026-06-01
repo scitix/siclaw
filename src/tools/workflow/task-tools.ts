@@ -68,6 +68,7 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
     }),
     async execute(_id, raw) {
       const p = raw as { subject: string; description: string; activeForm?: string; owner?: string };
+      if (!p.subject?.trim()) return err("task_create requires a non-empty subject.");
       const t = getOrCreateLedger(taskListId).create(p);
       emitUpsert(emit, taskListId, t);
       return ok(`Created task #${t.id}: ${t.subject}`);

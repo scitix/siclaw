@@ -17,6 +17,13 @@ describe("task tools", () => {
     expect(text(r)).toContain("list nodes");
   });
 
+  it("task_create rejects an empty/whitespace subject", async () => {
+    const t = createTaskCreateTool(TLID);
+    const r = await t.execute("c1", { subject: "   ", description: "x" });
+    expect((r as any).details?.error).toBe(true);
+    expect(text(r)).toContain("non-empty subject");
+  });
+
   it("task_update marks status and is reflected by task_get", async () => {
     await createTaskCreateTool(TLID).execute("c1", { subject: "a", description: "" });
     await createTaskUpdateTool(TLID).execute("u1", { id: "1", status: "completed" });

@@ -302,6 +302,11 @@ export class AgentBoxSessionManager {
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
       if (request.runInBackground) return this.startBackgroundSubagent(request);
+      // Already aborted before we even queue (e.g. the whole turn was cancelled): don't
+      // acquire a slot or spin up a throwaway child session — short-circuit cleanly.
+      if (signal?.aborted) {
+        return { status: "partial", summary: "Sub-agent cancelled before starting.", childSessionId: "", toolCalls: 0, durationMs: 0 };
+      }
       // Cap concurrent foreground children: a wide fan-out queues past the limit
       // instead of spinning up one child agent + LLM stream per target at once.
       const lim = this.subagentLimiter;
@@ -447,12 +452,23 @@ export class AgentBoxSessionManager {
     return path.join(this.getSessionDir(taskListId), ".plan-ledger.json");
   }
 
-  /** Best-effort: write the current ledger snapshot to the PV session dir. */
+  /**
+   * Best-effort: write the current ledger snapshot to the PV session dir. Writes to a
+   * unique temp file then atomically renames over the target, so a wide fan-out's
+   * interleaved snapshot writes can never leave a half-written / truncated file for a
+   * concurrent reader (rehydrate-on-restart) — last writer wins cleanly.
+   */
   private persistLedgerSnapshot(taskListId: string): void {
     const tasks = getOrCreateLedger(taskListId).snapshot();
+    const file = this.ledgerFile(taskListId);
+    const tmp = `${file}.${randomUUID()}.tmp`;
     void fs.promises
-      .writeFile(this.ledgerFile(taskListId), JSON.stringify(tasks), "utf8")
-      .catch((err) => console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err));
+      .writeFile(tmp, JSON.stringify(tasks), "utf8")
+      .then(() => fs.promises.rename(tmp, file))
+      .catch((err) => {
+        console.warn(`[agentbox-session] plan-ledger snapshot failed for ${taskListId}:`, err);
+        void fs.promises.unlink(tmp).catch(() => {});
+      });
   }
 
   /** Restore the ledger from the PV snapshot — only when the in-memory copy is
@@ -589,7 +605,11 @@ export class AgentBoxSessionManager {
     const delegationId = request.spawnId;
     const redactionConfig = buildRedactionConfigForModelConfig(this.delegationModelConfig);
     const lineage = { parentSessionId: request.parentSessionId, parentAgentId: agentId, delegationId, targetAgentId: agentId };
-    let persistTrace = Boolean(agentId && request.userId && request.parentSessionId);
+    // canPersist = is the trace persistable at all (config present). Constant — never
+    // flipped. persistTrace is the per-write latch that disables further *non-terminal*
+    // writes after the first failure; the terminal event must NOT ride this latch.
+    const canPersist = Boolean(agentId && request.userId && request.parentSessionId);
+    let persistTrace = canPersist;
     let persistQueue: Promise<void> = Promise.resolve();
     const enqueuePersist = (op: () => Promise<void>) => {
       if (!persistTrace) return;
@@ -746,26 +766,34 @@ export class AgentBoxSessionManager {
     const bundle = buildDelegateSummaryBundle(finalText);
     const durationMs = Date.now() - startedAt;
 
-    // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
-    enqueuePersist(async () => {
-      await this.persistAppendDelegationEvent({
-        parentSessionId: request.parentSessionId,
-        parentAgentId: agentId,
-        userId: request.userId,
-        delegationId,
-        childSessionId,
-        targetAgentId: agentId,
-        status,
-        capsule: bundle.capsule,
-        fullSummary: bundle.fullSummary,
-        summaryTruncated: bundle.truncated,
-        scope: request.prompt,
-        toolCalls,
-        durationMs,
-        interruptedTool,
-      });
-    });
+    // Drain prior (best-effort) trace writes, then emit the terminal event.
     await persistQueue;
+    // Terminal event ALWAYS — including failure/timeout (design §13 hard requirement).
+    // Routed OFF the persistTrace latch: a transient failure on an earlier trace write
+    // must not drop this, or the child is left stuck "running" in the UI forever. It
+    // still respects whether persistence is configured at all (canPersist).
+    if (canPersist) {
+      try {
+        await this.persistAppendDelegationEvent({
+          parentSessionId: request.parentSessionId,
+          parentAgentId: agentId,
+          userId: request.userId,
+          delegationId,
+          childSessionId,
+          targetAgentId: agentId,
+          status,
+          capsule: bundle.capsule,
+          fullSummary: bundle.fullSummary,
+          summaryTruncated: bundle.truncated,
+          scope: request.prompt,
+          toolCalls,
+          durationMs,
+          interruptedTool,
+        });
+      } catch (err) {
+        console.warn(`[agentbox-session] terminal delegation event persist failed for ${childSessionId}:`, err);
+      }
+    }
 
     return {
       status,
