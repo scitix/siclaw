@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE, SUBAGENT_ALWAYS_DENIED_TOOLS,
+  getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE,
 } from "./subagent-registry.js";
 
 describe("subagent-registry", () => {
@@ -26,7 +26,7 @@ describe("subagent-registry", () => {
     for (const t of types) expect(t.whenToUse.length).toBeGreaterThan(0);
   });
 
-  it("always denies spawn_subagent (no recursion)", () => {
-    expect(SUBAGENT_ALWAYS_DENIED_TOOLS).toContain("spawn_subagent");
-  });
+  // Recursion prevention is structural (a child is created without the spawn
+  // executor) and is asserted in spawn-subagent.test.ts via the `available` guard,
+  // not by a deny-list constant here.
 });

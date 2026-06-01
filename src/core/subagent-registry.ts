@@ -1,10 +1,12 @@
 /**
  * Declarative sub-agent type registry (design §6). A sub-agent type selects the
- * child's system-prompt flavour, tool policy, and model. The parent model picks a
- * type via `spawn_subagent({ subagent_type })`; `whenToUse` is surfaced to it.
+ * child's system-prompt flavour and model. The parent model picks a type via
+ * `spawn_subagent({ subagent_type })`; `whenToUse` is surfaced to it.
  *
- * Recursion is always forbidden: the executor denies `spawn_subagent` to every
- * child regardless of type (see SUBAGENT_ALWAYS_DENIED_TOOLS).
+ * Recursion is always forbidden, enforced structurally: a child session is created
+ * WITHOUT the spawn_subagent executor (see AgentBoxSessionManager.runSpawnedSubagent),
+ * so the spawn_subagent tool's `available` guard hides it from every child — no
+ * sub-agent can spawn another. This holds regardless of subagent type.
  */
 
 export type SubagentModel = "sonnet" | "opus" | "haiku" | "inherit";
@@ -16,18 +18,9 @@ export interface SubagentType {
   whenToUse: string;
   /** Appended to the base SRE system prompt when building the child. */
   systemPromptAddendum: string;
-  /** When set, only these tool names are exposed to the child (plus the always-denied list is removed). */
-  tools?: string[];
-  /** Extra tools denied to the child (on top of the always-denied recursion guard). */
-  disallowedTools?: string[];
-  /** Read-only hint — UI/diagnostic; the executor still applies tools/disallowedTools. */
-  readOnly?: boolean;
   /** Model override; "inherit" uses the parent's model. */
   model?: SubagentModel;
 }
-
-/** Tools no sub-agent may ever call, regardless of type. Prevents recursion. */
-export const SUBAGENT_ALWAYS_DENIED_TOOLS = ["spawn_subagent"] as const;
 
 /**
  * Master switch for `spawn_subagent`'s background mode (and the `job_stop` tool).
