@@ -17,11 +17,21 @@ export const LABEL_COMPONENT = "siclaw.io/component";
 export const LABEL_USER_ID = "siclaw.io/user-id";
 export const LABEL_TARGET_NODE = "siclaw.io/target-node";
 export const LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
+/** Per-Job unique id, so we can find a Job's pod by label across K8s versions. */
+export const LABEL_DEBUG_ID = "siclaw.io/debug-id";
 
 // ── Label value constants ────────────────────────────────────────────
 
 export const COMPONENT_DEBUG_POD = "debug-pod";
 export const MANAGED_BY_SICLAW = "siclaw";
+
+/**
+ * Seconds after a debug Job finishes (Complete or Failed — e.g. it hit
+ * activeDeadlineSeconds, or its owner was deleted) before the cluster's own
+ * TTL-after-finished controller deletes the Job and its pod. This is what makes
+ * orphaned debug pods self-clean — no external GC, on every cluster natively.
+ */
+export const DEBUG_JOB_FINISHED_TTL_SECONDS = 60;
 
 // ── Resource limit constants ────────────────────────────────────────
 // No requests — let the scheduler place the pod freely.
@@ -52,6 +62,47 @@ export function buildDebugPodLabels(
     [LABEL_USER_ID]: sanitizeLabelValue(userId),
     [LABEL_TARGET_NODE]: sanitizeLabelValue(nodeName),
     [LABEL_MANAGED_BY]: MANAGED_BY_SICLAW,
+  };
+}
+
+/**
+ * Build the debug Job manifest. A Job (not a bare Pod) so the cluster's own
+ * TTL-after-finished controller self-cleans it: activeDeadlineSeconds bounds the
+ * run; when the Job finishes (deadline, or owner deletion), ttlSecondsAfterFinished
+ * makes the control plane delete the Job and its pod — no external GC, every cluster.
+ */
+export function buildDebugJobManifest(
+  jobName: string,
+  labels: Record<string, string>,
+  image: string,
+  activeDeadlineSeconds: number,
+  nodeName: string,
+): Record<string, unknown> {
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name: jobName, labels },
+    spec: {
+      backoffLimit: 0,
+      activeDeadlineSeconds,
+      ttlSecondsAfterFinished: DEBUG_JOB_FINISHED_TTL_SECONDS,
+      template: {
+        metadata: { labels },
+        spec: {
+          nodeName,
+          hostPID: true,
+          hostNetwork: true,
+          restartPolicy: "Never",
+          containers: [{
+            name: "debug",
+            image,
+            securityContext: { privileged: true },
+            command: ["sleep", "infinity"],
+            resources: { limits: DEBUG_POD_RESOURCE_LIMITS },
+          }],
+        },
+      },
+    },
   };
 }
 
@@ -126,29 +177,27 @@ const CLEANUP_RETRY_INTERVAL_MS = 2_000;
 // ── Cleanup helpers ─────────────────────────────────────────────────
 
 /**
- * Delete a debug pod with retry. On each failure, logs structured error data.
- * After exhausting retries, logs a final warning but does NOT throw —
- * activeDeadlineSeconds is the safety net.
+ * Delete a debug Job with retry; its pod is cascade-deleted via ownerReference.
+ * On each failure, logs structured error data. After exhausting retries, logs a
+ * final warning but does NOT throw — the Job's activeDeadlineSeconds +
+ * ttlSecondsAfterFinished are the safety net (the cluster cleans it up regardless).
  *
  * Note: does not support AbortSignal. Worst-case retry loop is 6s (3 × 2s).
  * Callers on shutdown paths (evictAll) use Promise.allSettled; awaits may be
- * truncated by process exit, which is acceptable since activeDeadlineSeconds
- * guarantees eventual pod termination.
+ * truncated by process exit, which is acceptable since the Job self-cleans.
  */
-export async function deleteDebugPod(
-  podName: string,
+export async function deleteDebugJob(
+  jobName: string,
   env: ExecEnv,
   opts: {
     namespace: string;
     nodeName: string;
     force?: boolean;
-    gracePeriod?: number;
   },
 ): Promise<boolean> {
   const deleteArgs = [
-    "delete", "pod", podName,
+    "delete", "job", jobName,
     ...(opts.force ? ["--force", "--grace-period=0"] : []),
-    ...(opts.gracePeriod !== undefined && !opts.force ? [`--grace-period=${opts.gracePeriod}`] : []),
   ];
 
   for (let attempt = 1; attempt <= CLEANUP_MAX_RETRIES; attempt++) {
@@ -157,11 +206,11 @@ export async function deleteDebugPod(
       return true;
     } catch (err: any) {
       const errMsg = err.stderr?.trim() || err.message || String(err);
-      // Pod already gone — treat as success
+      // Job already gone — treat as success
       if (errMsg.includes("not found")) return true;
 
       console.error("[debug-pod] cleanup failed", {
-        podName,
+        jobName,
         nodeName: opts.nodeName,
         namespace: opts.namespace,
         attempt,
@@ -175,17 +224,53 @@ export async function deleteDebugPod(
     }
   }
 
-  console.warn("[debug-pod] cleanup exhausted retries, relying on activeDeadlineSeconds", {
-    podName,
+  console.warn("[debug-pod] cleanup exhausted retries, relying on Job ttlSecondsAfterFinished", {
+    jobName,
     nodeName: opts.nodeName,
     namespace: opts.namespace,
   });
   return false;
 }
 
+/**
+ * Resolve the pod created by a debug Job, by our unique debug-id label. The Job
+ * controller creates the pod asynchronously, so poll briefly until it appears
+ * (a Pending pod counts — waitForPodDone then handles Running / fast-fail).
+ * Throws on timeout / abort.
+ */
+async function resolveJobPodName(
+  debugId: string,
+  env: ExecEnv,
+  namespace: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let interval = 250;
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw new Error("Aborted");
+    try {
+      const { stdout } = await kubectlExec(
+        ["get", "pods", "-l", `${LABEL_DEBUG_ID}=${debugId}`, "-o", "jsonpath={.items[0].metadata.name}"],
+        env, 5_000, undefined, namespace,
+      );
+      const name = stdout.trim();
+      if (name) return name;
+    } catch {
+      // pod not created yet / transient kubectl error — keep polling
+    }
+    await new Promise((r) => setTimeout(r, interval));
+    interval = Math.min(interval * 1.5, 2_000);
+  }
+  throw new Error(`Debug Job pod (id ${debugId}) did not appear within ${Math.round(timeoutMs / 1000)}s`);
+}
+
 // ── Pod cache types ─────────────────────────────────────────────────
 
 export interface CachedPod {
+  /** The Job that owns the debug pod — deleted on eviction (cascades to the pod). */
+  jobName: string;
+  /** The Job's pod, used for kubectl exec. */
   podName: string;
   namespace: string;
   nodeName: string;
@@ -277,6 +362,7 @@ export class DebugPodCache {
     userId: string,
     clusterKey: string,
     nodeName: string,
+    jobName: string,
     podName: string,
     namespace: string,
     env: ExecEnv,
@@ -287,6 +373,7 @@ export class DebugPodCache {
     if (existing) clearTimeout(existing.idleTimer);
 
     const entry: CachedPod = {
+      jobName,
       podName,
       namespace,
       nodeName,
@@ -337,14 +424,14 @@ export class DebugPodCache {
   }
 
   /**
-   * Evict a cache entry by key: delete the pod, remove from cache.
-   * Called by the idle timer. Errors are logged but not thrown.
+   * Evict a cache entry by key: delete the Job (cascades to the pod), remove
+   * from cache. Called by the idle timer. Errors are logged but not thrown.
    *
-   * Note: the cache entry is removed BEFORE deleteDebugPod completes.
+   * Note: the cache entry is removed BEFORE deleteDebugJob completes.
    * During the deletion window (up to 6s), a concurrent getOrCreate may
-   * create a second pod on the same node. This is harmless — the old pod
-   * is being deleted and has activeDeadlineSeconds as a hard safety net.
-   * Moving pods.delete after deleteDebugPod would risk returning a stale
+   * create a second Job on the same node. This is harmless — the old Job
+   * self-cleans via ttlSecondsAfterFinished as a hard safety net.
+   * Moving pods.delete after deleteDebugJob would risk returning a stale
    * (being-deleted) entry to concurrent get() callers, which is worse.
    */
   private async evict(key: string): Promise<void> {
@@ -354,13 +441,14 @@ export class DebugPodCache {
     this.pods.delete(key);
 
     console.info("[debug-pod] idle eviction", {
+      jobName: entry.jobName,
       podName: entry.podName,
       nodeName: entry.nodeName,
       namespace: entry.namespace,
       userId: entry.userId,
     });
 
-    await deleteDebugPod(entry.podName, entry.env, {
+    await deleteDebugJob(entry.jobName, entry.env, {
       namespace: entry.namespace,
       nodeName: entry.nodeName,
     });
@@ -432,57 +520,47 @@ export async function runInDebugPod(
       clusterKey,
       spec.nodeName,
       async () => {
-        const podId = randomBytes(4).toString("hex");
-        const podName = `node-debug-${podId}`;
+        const debugId = randomBytes(4).toString("hex");
+        const jobName = `node-debug-${debugId}`;
+        const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
 
-        const labels = buildDebugPodLabels(spec.userId, spec.nodeName);
-        const activeDeadlineSeconds = config.debugPodTTL;
-
-        const overrides = JSON.stringify({
-          metadata: { labels },
-          spec: {
-            activeDeadlineSeconds,
-            nodeName: spec.nodeName,
-            hostPID: true,
-            hostNetwork: true,
-            containers: [{
-              name: podName,
-              image,
-              securityContext: { privileged: true },
-              command: ["sleep", "infinity"],
-              resources: {
-                limits: DEBUG_POD_RESOURCE_LIMITS,
-              },
-            }],
-            restartPolicy: "Never",
-          },
-        });
+        // A Job (not a bare Pod) so the cluster self-cleans it: when the pod hits
+        // activeDeadlineSeconds (or its owner is deleted), the Job finishes and
+        // ttlSecondsAfterFinished deletes it — no external GC, on every cluster.
+        const manifest = JSON.stringify(
+          buildDebugJobManifest(jobName, labels, image, config.debugPodTTL, spec.nodeName),
+        );
 
         try {
           await ensureDebugNamespace(debugNamespace, env);
 
           await spawnAsync(
             "kubectl",
-            [
-              ...env.kubeconfigArgs,
-              "-n", debugNamespace,
-              "run", podName,
-              "--restart=Never",
-              `--image=${image}`,
-              `--overrides=${overrides}`,
-            ],
+            [...env.kubeconfigArgs, "-n", debugNamespace, "create", "-f", "-"],
             30_000,
             env.childEnv,
             opts.signal,
+            manifest,
           );
 
+          // The Job controller creates the pod asynchronously — resolve its name by
+          // our unique label (works across K8s versions, not relying on job-name).
+          const podName = await resolveJobPodName(
+            debugId, env, debugNamespace, config.debugPodStartupTimeout * 1000, opts.signal,
+          );
+
+          // Pod startup gets its OWN bounded budget (config.debugPodStartupTimeout),
+          // not the command's timeoutMs — so a pod stuck pulling/scheduling fails fast
+          // within ~a minute instead of holding the tool call for the full command
+          // timeout. detectFatalPodStartupFailure also short-circuits known fatal
+          // reasons (ImagePullBackOff / Unschedulable / config errors) even sooner.
           const phase = await waitForPodDone(
-            podName, opts.timeoutMs, env.childEnv, opts.signal,
+            podName, config.debugPodStartupTimeout * 1000, env.childEnv, opts.signal,
             env.kubeconfigPath ?? undefined, debugNamespace, "Running",
           );
 
           if (phase !== "Running") {
-            await deleteDebugPod(podName, env, {
+            await deleteDebugJob(jobName, env, {
               namespace: debugNamespace,
               nodeName: spec.nodeName,
               force: true,
@@ -492,10 +570,10 @@ export async function runInDebugPod(
           }
 
           // Store in cache — idle timer starts now
-          debugPodCache.set(spec.userId, clusterKey, spec.nodeName, podName, debugNamespace, env, idleTimeoutMs);
+          debugPodCache.set(spec.userId, clusterKey, spec.nodeName, jobName, podName, debugNamespace, env, idleTimeoutMs);
         } catch (err) {
-          // Creation failed — best-effort cleanup
-          await deleteDebugPod(podName, env, {
+          // Creation failed — best-effort cleanup (the Job self-cleans regardless)
+          await deleteDebugJob(jobName, env, {
             namespace: debugNamespace,
             nodeName: spec.nodeName,
             force: true,
@@ -561,7 +639,7 @@ export async function runInDebugPod(
 
     // Check if pod is still alive — if gone or in terminal phase, evict stale cache entry.
     // Trigger on: (a) non-numeric exit code (kubectl killed), or
-    //             (b) numeric exit code with "not found" in stderr (GC deleted the pod).
+    //             (b) numeric exit code with "not found" in stderr (the Job/pod was deleted).
     const maybeStale = exitCode === null || (exitCode !== 0 && stderr.includes("not found"));
     if (maybeStale) {
       let podPhase = "";
@@ -576,7 +654,7 @@ export async function runInDebugPod(
         podPhase = phaseResult.stdout.trim();
       } catch {
         // Probe failed (network error, pod gone) — don't evict on transient failure,
-        // let GC and idle timer handle cleanup instead.
+        // let the idle timer / Job ttlSecondsAfterFinished handle cleanup instead.
         podPhase = "Unknown";
       }
       if (podPhase === "Succeeded" || podPhase === "Failed" || podPhase === "") {
@@ -591,184 +669,3 @@ export async function runInDebugPod(
 
   return { stdout, stderr, exitCode, ...(timedOut ? { timedOut: true } : {}) };
 }
-
-// ── Garbage Collection ──────────────────────────────────────────────
-
-const GC_INTERVAL_MS = 60_000;
-const GC_PROBE_TIMEOUT_MS = 5_000;
-const GC_LIST_TIMEOUT_MS = 15_000;
-
-/**
- * Background garbage collector for orphaned debug pods.
- *
- * Wired in agentbox-main.ts and cli-main.ts only. Local mode
- * (Gateway + LocalSpawner) does not start GC — activeDeadlineSeconds
- * is the sole cleanup mechanism in that configuration.
- *
- * Runs a sweep every 60 seconds. Targets pods matching:
- *   siclaw.io/component=debug-pod
- * and deletes:
- *   (1) Pods in Succeeded or Failed phase (terminal — delete immediately)
- *   (2) Running/Unknown pods whose creationTimestamp age > config.debugPodTTL seconds
- *
- * GC does NOT consult DebugPodCache — it operates purely on kubectl label queries.
- * This means GC may delete a pod that is still in the cache. When this happens,
- * the next kubectl exec against that pod will fail; the stale-pod detection in
- * runInDebugPod evicts the cache entry, and the following call creates a fresh pod.
- * One request fails before auto-recovery — an acceptable trade-off to keep GC
- * decoupled from in-process cache state.
- * activeDeadlineSeconds is the ultimate safety net; GC is best-effort acceleration.
- *
- * Process lifecycle:
- *   - start(): verifies cluster access, then schedules sweep immediately + every 60s
- *   - stop(): clears interval; does NOT attempt a final sweep (process is exiting)
- *   - Timer uses .unref() so it does not prevent process exit
- */
-export class DebugPodGC {
-  private intervalHandle: ReturnType<typeof setInterval> | null = null;
-  private credentialsDir: string | undefined;
-
-  /**
-   * Start the GC loop.
-   *
-   * Accepts credentialsDir instead of a fixed ExecEnv — kubeconfig is resolved
-   * dynamically on each sweep because credentials may not exist at startup
-   * (gateway pushes them when a session is created).
-   *
-   * The startup probe uses `kubectl version --client` which doesn't need
-   * cluster access, only verifies kubectl binary is available.
-   */
-  async start(credentialsDir?: string): Promise<void> {
-    if (this.intervalHandle !== null) return;
-    this.credentialsDir = credentialsDir;
-
-    // Verify kubectl binary is available (--client doesn't need cluster access)
-    const probeEnv = prepareExecEnv();
-    try {
-      await kubectlExec(["version", "--client"], probeEnv, GC_PROBE_TIMEOUT_MS);
-    } catch {
-      return;
-    }
-
-    // Run first sweep immediately to catch orphans from a previous crash
-    void this.sweep().catch((err) => {
-      console.warn("[debug-pod-gc] initial sweep error", { error: String(err) });
-    });
-
-    this.intervalHandle = setInterval(() => {
-      void this.sweep().catch((err) => {
-        console.warn("[debug-pod-gc] sweep error", { error: String(err) });
-      });
-    }, GC_INTERVAL_MS);
-
-    if (
-      this.intervalHandle &&
-      typeof this.intervalHandle === "object" &&
-      "unref" in this.intervalHandle
-    ) {
-      (this.intervalHandle as NodeJS.Timeout).unref();
-    }
-  }
-
-  /** Stop the GC loop. Clears the interval; any in-progress sweep runs to completion. */
-  stop(): void {
-    if (this.intervalHandle !== null) {
-      clearInterval(this.intervalHandle);
-      this.intervalHandle = null;
-    }
-  }
-
-  /**
-   * Perform a single GC sweep.
-   *
-   * Resolves kubeconfig dynamically on each call — credentials may arrive
-   * after agentbox startup (gateway pushes them on session creation).
-   * If kubeconfig is not yet available, the sweep silently skips.
-   */
-  async sweep(): Promise<void> {
-    const env = prepareExecEnv(
-      this.credentialsDir ? { credentialsDir: this.credentialsDir } : undefined,
-    );
-    // No kubeconfig available yet — credentials not pushed, skip silently
-    if (!env.kubeconfigPath) return;
-    const config = loadConfig();
-    const { debugNamespace, debugPodTTL } = config;
-
-    // Use component + managed-by labels — each agentbox serves a single user,
-    // and userId label may not match config (e.g., "unknown" vs "default").
-    const labelSelector = `${LABEL_COMPONENT}=${COMPONENT_DEBUG_POD},${LABEL_MANAGED_BY}=${MANAGED_BY_SICLAW}`;
-
-    let listOutput: string;
-    try {
-      const result = await kubectlExec(
-        ["get", "pods", "-l", labelSelector, "-o", "json"],
-        env,
-        GC_LIST_TIMEOUT_MS,
-        undefined,
-        debugNamespace,
-      );
-      listOutput = result.stdout;
-    } catch (err: any) {
-      const msg: string = err.stderr?.trim() || err.message || String(err);
-      if (msg.includes("not found") || msg.includes("No resources found")) return;
-      console.warn("[debug-pod-gc] list failed", { error: msg });
-      return;
-    }
-
-    let pods: any[];
-    try {
-      pods = JSON.parse(listOutput).items ?? [];
-    } catch {
-      console.warn("[debug-pod-gc] failed to parse pod list JSON");
-      return;
-    }
-
-    const nowMs = Date.now();
-    const hardTtlMs = debugPodTTL * 1000;
-
-    const toDelete = pods.filter((pod: any) => {
-      const phase: string = pod.status?.phase ?? "";
-      if (phase === "Succeeded" || phase === "Failed") return true;
-      const createdAt = pod.metadata?.creationTimestamp;
-      if (!createdAt) return false;
-      const ageMs = nowMs - new Date(createdAt).getTime();
-      return ageMs > hardTtlMs;
-    });
-
-    if (toDelete.length === 0) return;
-
-    console.info("[debug-pod-gc] sweep deleting pods", {
-      count: toDelete.length,
-      namespace: debugNamespace,
-    });
-
-    await Promise.allSettled(
-      toDelete.map(async (pod: any) => {
-        const podName: string = pod.metadata?.name ?? "";
-        const nodeName: string = pod.spec?.nodeName ?? "unknown";
-        if (!podName) return;
-
-        const ok = await deleteDebugPod(podName, env, {
-          namespace: debugNamespace,
-          nodeName,
-        });
-        if (!ok) {
-          console.warn("[debug-pod-gc] delete failed, will retry next cycle", {
-            podName,
-            nodeName,
-            namespace: debugNamespace,
-          });
-        } else {
-          console.info("[debug-pod-gc] deleted orphaned pod", {
-            podName,
-            nodeName,
-            namespace: debugNamespace,
-          });
-        }
-      }),
-    );
-  }
-}
-
-/** Singleton GC instance — shared across all callers in the same process. */
-export const debugPodGC = new DebugPodGC();

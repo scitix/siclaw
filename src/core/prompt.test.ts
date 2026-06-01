@@ -13,14 +13,14 @@ afterEach(() => {
 
 describe("buildSreSystemPrompt memory flag", () => {
   it("keeps bundled memory instructions when memory is enabled", () => {
-    delete process.env.SICLAW_MEMORY_ENABLED;
+    process.env.SICLAW_MEMORY_ENABLED = "true";
 
     const prompt = buildSreSystemPrompt("web");
 
     expect(prompt).toContain("memory_search");
     expect(prompt).toContain("memory_get");
     expect(prompt).toContain("remember context from previous sessions");
-    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).toContain("# Environment & Configuration");
     expect(prompt).not.toContain("{{memoryIntro}}");
     expect(prompt).not.toContain("{{memorySection}}");
   });
@@ -33,8 +33,17 @@ describe("buildSreSystemPrompt memory flag", () => {
     expect(prompt).not.toContain("memory_search");
     expect(prompt).not.toContain("memory_get");
     expect(prompt).not.toContain("remember context from previous sessions");
-    expect(prompt).toContain("## Environment & Configuration");
+    expect(prompt).toContain("# Environment & Configuration");
     expect(prompt).not.toContain("{{memoryIntro}}");
     expect(prompt).not.toContain("{{memorySection}}");
+  });
+
+  it("defaults to memory disabled when the env is unset (opt-in only)", () => {
+    delete process.env.SICLAW_MEMORY_ENABLED;
+
+    const prompt = buildSreSystemPrompt("web");
+
+    expect(prompt).not.toContain("memory_search");
+    expect(prompt).not.toContain("remember context from previous sessions");
   });
 });

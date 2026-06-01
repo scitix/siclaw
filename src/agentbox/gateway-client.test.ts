@@ -206,42 +206,6 @@ describe("GatewayClient — agent task CRUD", () => {
   });
 });
 
-describe("GatewayClient — searchKnowledge", () => {
-  it("encodes query, topK, minScore into the query string", async () => {
-    const srv = await startServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ chunks: [], message: "" }));
-    });
-    try {
-      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
-      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
-      fs.rmSync(certPath, { recursive: true, force: true });
-
-      await client.searchKnowledge("pod crashloop", 8, 0.5);
-      expect(srv.requests[0].url).toBe("/api/internal/knowledge-search?query=pod%20crashloop&topK=8&minScore=0.5");
-    } finally {
-      await srv.close();
-    }
-  });
-
-  it("defaults topK=5 and minScore=0.35 when omitted", async () => {
-    const srv = await startServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ chunks: [] }));
-    });
-    try {
-      const certPath = fs.mkdtempSync(path.join(os.tmpdir(), "gwc-"));
-      const client = new GatewayClient({ gatewayUrl: `http://127.0.0.1:${srv.port}`, certPath });
-      fs.rmSync(certPath, { recursive: true, force: true });
-
-      await client.searchKnowledge("q");
-      expect(srv.requests[0].url).toBe("/api/internal/knowledge-search?query=q&topK=5&minScore=0.35");
-    } finally {
-      await srv.close();
-    }
-  });
-});
-
 describe("GatewayClient — toClientLike adapter", () => {
   it("exposes a request(path, method, body) function", async () => {
     const srv = await startServer((req, res) => {

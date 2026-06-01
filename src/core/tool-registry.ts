@@ -27,104 +27,97 @@ export type ResolvedToolDefinition = ToolDefinition & {
   requiresUserApproval?: boolean;
 };
 
-export interface DelegateToAgentRequest {
-  /** Target agent id. "self" means spawn a same-agent sub-session. */
-  agentId: string;
-  /** Specific task for the delegated agent. */
-  scope: string;
-  /** Optional compact context selected by the caller model. */
-  contextSummary?: string;
-  /** Parent chat/session metadata for lineage and UI grouping. */
+// ── spawn_subagent (design §6) — the sub-agent contract. ──
+
+/** "launched" is the immediate return for a background spawn; it is never a terminal/persisted status. */
+export type SpawnSubagentStatus = "done" | "partial" | "failed" | "timed_out" | "launched";
+
+export interface SpawnSubagentRequest {
+  /** Short UI label for the spawned task. */
+  description: string;
+  /** The bounded task briefing — the child's only context besides its system prompt. */
+  prompt: string;
+  /** Resolved sub-agent type id (see subagent-registry). */
+  subagentType: string;
+  /** When true, run detached and notify the parent on completion (do not block). */
+  runInBackground: boolean;
+  /** Parent lineage + shared ledger. */
   parentSessionId: string;
   parentAgentId: string | null;
   userId: string;
-  /** Stable id tying the parent tool call and delegated child sessions together. */
-  delegationId?: string;
-  /** 1-based task index inside a batch delegation. */
-  taskIndex?: number;
-  /** Total delegated tasks in the batch. */
-  totalTasks?: number;
+  taskListId: string;
+  /** Stable id tying the parent tool call to the child session (lineage/observability). */
+  spawnId: string;
 }
 
-export type DelegateToAgentStatus = "done" | "partial" | "failed" | "timed_out";
+/**
+ * Discriminated by `status`: a background launch carries only a `jobId` (no summary
+ * yet), while a finished/foreground run carries the report fields. Removes the old
+ * `summary: "launched"` sentinel and makes the illegal "done + jobId" state
+ * unrepresentable.
+ */
+export type SpawnSubagentResult =
+  | {
+      /** Background job launched (gated off today); usable with job_stop. */
+      status: "launched";
+      jobId: string;
+      childSessionId: string;
+    }
+  | SpawnSubagentReport;
 
-export interface DelegateToAgentToolTraceEntry {
-  toolName: string;
-  toolInput?: string | null;
-  outcome: "success" | "error" | "blocked";
-  durationMs: number | null;
-  contentPreview?: string;
-  startedAt?: string;
-  endedAt?: string;
-}
-
-export interface DelegateToAgentResult {
-  /** Execution status for UI recovery and parent-agent interpretation. */
-  status?: DelegateToAgentStatus;
-  /** Budgeted capsule returned to the parent agent as model-visible tool content. */
+export interface SpawnSubagentReport {
+  status: Exclude<SpawnSubagentStatus, "launched">;
+  /** Budgeted capsule returned to the parent as model-visible tool content. */
   summary: string;
-  /** Full sub-agent final report for UI/debug persistence; not sent in model-visible tool content. */
+  /** Full child report for UI/debug persistence; not model-visible. */
   fullSummary?: string;
-  summaryTruncated?: boolean;
-  sessionId: string;
+  /** The child's own persisted session id, for UI drill-in. */
+  childSessionId: string;
   toolCalls: number;
   durationMs: number;
-  /** Lightweight UI trace. Full redacted output is persisted in the child execution session. */
-  toolTrace?: DelegateToAgentToolTraceEntry[];
-  /** Audit/UI-only source for partial delegated results. Not intended for parent model context. */
   partialSource?: "steered" | "runtime_fallback";
-  /** Audit/UI-only tool name that was still active when a partial fallback was produced. */
   interruptedTool?: string;
+  /** The sub-agent's execution steps (reasoning + tool calls), so the UI can show a collapsed log after completion. */
+  steps?: SubagentStep[];
 }
 
-export type DelegateToAgentExecutor = (
-  request: DelegateToAgentRequest,
-) => Promise<DelegateToAgentResult>;
-
-export interface DelegateToAgentsTaskRequest {
-  index: number;
-  agentId: string;
-  scope: string;
-  contextSummary?: string;
+/** One step of a sub-agent's run — its reasoning text or a tool call — for a main-agent-like live view. */
+export interface SubagentStep {
+  kind: "assistant" | "tool";
+  /** assistant: the reasoning/answer text for this step. */
+  text?: string;
+  /** tool: name + input + result preview + outcome. */
+  toolName?: string;
+  toolInput?: string;
+  content?: string;
+  outcome?: "success" | "error";
+  durationMs?: number | null;
 }
 
-export interface DelegateToAgentsRequest {
-  delegationId: string;
-  parentSessionId: string;
-  parentAgentId: string | null;
-  userId: string;
-  tasks: DelegateToAgentsTaskRequest[];
+/** Live progress pushed as a foreground sub-agent works, so the UI streams its execution in real time. */
+export interface SpawnSubagentProgress {
+  /** "queued" = waiting for a concurrency slot (not yet running); "running" = actively executing. */
+  status: "queued" | "running";
+  toolCalls: number;
+  /** Ordered steps so far (assistant reasoning + tool calls), rendered live like the main agent. */
+  steps: SubagentStep[];
+  /** Latest activity line, e.g. the tool currently running. */
+  activity?: string;
 }
 
-export interface DelegateToAgentsTaskStartResult {
-  index: number;
-  status: "running";
-  agent_id: string;
-  scope: string;
-  summary: string;
-  tool_calls: 0;
-  duration_ms: 0;
+export type SpawnSubagentExecutor = (
+  request: SpawnSubagentRequest,
+  onProgress?: (progress: SpawnSubagentProgress) => void,
+  signal?: AbortSignal,
+) => Promise<SpawnSubagentResult>;
+
+export interface SubagentJobStopResult {
+  stopped: boolean;
+  message: string;
 }
 
-export interface DelegateToAgentsStartResult {
-  status: "running";
-  delegation_id: string;
-  /**
-   * False while the batch is still running. The model must wait for the
-   * delegation.batch_complete notification before treating delegated evidence as
-   * available.
-   */
-  results_available: false;
-  next_event: "delegation.batch_complete";
-  parent_instruction: string;
-  tasks: DelegateToAgentsTaskStartResult[];
-  total_tool_calls: 0;
-  duration_ms: 0;
-}
-
-export type DelegateToAgentsExecutor = (
-  request: DelegateToAgentsRequest,
-) => Promise<DelegateToAgentsStartResult>;
+/** Cancels a running background sub-agent job (design §7: job_stop). */
+export type SubagentJobStopExecutor = (jobId: string) => Promise<SubagentJobStopResult>;
 
 /**
  * Callback a tool can invoke to push a custom event into the parent session's
@@ -141,23 +134,27 @@ export interface ToolRefs {
   /** Agent ID — used for metrics labeling. Null when running outside an agent context (TUI/CLI). */
   agentId: string | null;
   sessionIdRef: { current: string };
+  /** Shared task-ledger id. A session and the sub-agents it spawns share one taskListId. */
+  taskListId: string;
+  /**
+   * True when this session is a spawned sub-agent (child). The plan/task tools are
+   * hidden from sub-agents — the plan is owned by the parent; a child that mutated the
+   * shared ledger would have no SSE emitter, so its changes wouldn't reach the UI.
+   */
+  isSubagent?: boolean;
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
-  knowledgeIndexer?: MemoryIndexer;
   memoryIndexer?: MemoryIndexer;
   memoryDir?: string;
   /** See SessionEventEmitter. Undefined when running without a session SSE bus. */
   sessionEventEmitter?: SessionEventEmitter;
   /**
-   * Optional delegation executor. When absent, delegate_to_agent stays out of
-   * the resolved tool list, so the model never sees a non-working tool.
+   * Optional spawn_subagent executor (design §6). When absent, spawn_subagent
+   * stays out of the resolved tool list so the model never sees a non-working tool.
    */
-  delegateToAgentExecutor?: DelegateToAgentExecutor;
-  /**
-   * Optional batch delegation executor. The model sees one batch tool; the
-   * runtime handles background execution and parent-session notification.
-   */
-  delegateToAgentsExecutor?: DelegateToAgentsExecutor;
+  spawnSubagentExecutor?: SpawnSubagentExecutor;
+  /** Cancels a running background sub-agent job (design §7). Enables the job_stop tool. */
+  subagentJobStopExecutor?: SubagentJobStopExecutor;
 }
 
 /** Declarative registration for a single tool. */
@@ -167,7 +164,7 @@ export interface ToolEntry {
 
   /**
    * Factory function — receives shared refs, returns a ToolDefinition.
-   * If your tool accesses optional refs (memoryIndexer, memoryDir, knowledgeIndexer),
+   * If your tool accesses optional refs (memoryIndexer, memoryDir),
    * you MUST provide an `available` guard that checks them. The registry calls
    * `available` before `create` — the guard is the safety net for `!` assertions.
    */
@@ -199,7 +196,28 @@ export interface ToolEntry {
    * Omit = always available.
    */
   available?: (refs: ToolRefs) => boolean;
+
+  /**
+   * Operating modes that expose this tool. Omit = available in every mode (the
+   * common case). Otherwise the tool is shown only when the session's active mode
+   * is in this list:
+   * - `["normal"]` — hidden in Deep Investigation (e.g. the plan/task tools, whose
+   *   structure conflicts with DP's hypothesis-checkpoint flow).
+   * - `["dp"]` — only inside Deep Investigation (a DP-exclusive tool).
+   * - `["normal", "dp"]` — both (same as omitting).
+   * This is a general mode axis (orthogonal to SessionMode): DP is the first mode;
+   * future modes are added to `AgentMode` and tagged here. The session is rebuilt
+   * when the active mode changes, so this is honoured even mid-session.
+   */
+  availableModes?: AgentMode[];
 }
+
+/**
+ * The agent's active operating mode within a session — a general, extensible axis
+ * orthogonal to SessionMode. `"normal"` is the default; `"dp"` is Deep Investigation.
+ * Add new modes here (and resolve them where the active mode is computed).
+ */
+export type AgentMode = "normal" | "dp";
 
 export class ToolRegistry {
   private entries: ToolEntry[] = [];
@@ -218,13 +236,16 @@ export class ToolRegistry {
     mode: SessionMode;
     refs: ToolRefs;
     allowedTools?: string[] | null;
+    /** Active operating mode (normal/dp/…). Filters tools by `availableModes`. */
+    activeMode?: AgentMode;
   }): ResolvedToolDefinition[] {
-    const { mode, refs, allowedTools } = opts;
+    const { mode, refs, allowedTools, activeMode = "normal" } = opts;
 
-    // 1. mode filter + available check (create not called yet)
+    // 1. session-mode + operating-mode + available check (create not called yet)
     const applicable = this.entries.filter(
       (e) =>
         (!e.modes || e.modes.includes(mode)) &&
+        (!e.availableModes || e.availableModes.includes(activeMode)) &&
         (!e.available || e.available(refs)),
     );
 

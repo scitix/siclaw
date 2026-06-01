@@ -21,7 +21,7 @@ export function createClusterListTool(kubeconfigRef: KubeconfigRef): ToolDefinit
     },
     renderResult: renderTextResult,
     description: `List clusters bound to the current agent.
-Returns cluster names, descriptions, api_server, and kubeconfig contexts.
+Returns cluster names, descriptions, api_server, and kube-context names (\`contexts\`/\`current_context\`).
 Does NOT test connectivity — use the \`cluster_probe\` tool for that.
 Use this before running any kubectl command to discover available clusters.`,
     parameters: Type.Object({}),
@@ -62,7 +62,7 @@ Use this before running any kubectl command to discover available clusters.`,
       if (entries.length === 0) {
         hint = "\n\nNo clusters are bound to this agent. Ask the user to bind clusters in the Portal (Agent detail page).";
       } else if (entries.length > 1) {
-        hint = `\n\nIMPORTANT: ${entries.length} clusters available. Ask the user which one to use and pass --kubeconfig=<name> on every kubectl invocation. Do NOT pick one yourself.`;
+        hint = `\n\nIMPORTANT: ${entries.length} clusters available. Ask the user which one to use, then set the \`cluster\` parameter (the cluster's name) on every kubectl/script tool call. Do NOT pick one yourself.`;
       }
 
       return {

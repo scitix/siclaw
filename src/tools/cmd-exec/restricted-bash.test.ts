@@ -1392,6 +1392,25 @@ describe("validateKubectlInPipeline — kubectl exec rejected", () => {
   });
 });
 
+describe("validateKubectlInPipeline — inline --kubeconfig rejected (use the cluster param)", () => {
+  it("rejects --kubeconfig=<name> and points to the cluster parameter", () => {
+    const err = validateKubectlInPipeline(["kubectl --kubeconfig=prod get pods"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("--kubeconfig");
+    expect(err).toContain("cluster");
+  });
+
+  it("rejects --kubeconfig with a space-separated value", () => {
+    const err = validateKubectlInPipeline(["kubectl --kubeconfig prod get nodes -o wide"]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("cluster");
+  });
+
+  it("does not reject ordinary kubectl without --kubeconfig", () => {
+    expect(validateKubectlInPipeline(["kubectl get pods -n default -o wide"])).toBeNull();
+  });
+});
+
 // ── Sensitive resource pipeline protection ──────────────────────────
 
 describe("validateKubectlInPipeline — sensitive resource (no pre-execution blocking)", () => {

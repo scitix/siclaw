@@ -20,10 +20,8 @@ import type { MutableDpStateRef } from "../types.js";
  * event, DP_CONFIRM / DP_ADJUST / DP_SKIP / DP_REINVESTIGATE markers) were
  * removed in the Apr 2026 refactor — see
  * docs/design/2026-04-24-dp-mode-refactor-design.md. The current DP baseline
- * is single-agent plus optional same-agent
- * `delegate_to_agent(agent_id="self")` sub-investigation. Cross-agent expert
- * collaboration and permission gates are intentionally separate follow-up
- * phases.
+ * is single-agent plus optional `spawn_subagent` fan-out for independent
+ * parallel checks (design: 2026-05-29-subagents-background-task-ledger.md).
  */
 
 const DP_ACTIVATION_PROMPT = `You are now in Deep Investigation mode. Approach the user's question with the rigor of a senior SRE running an incident post-mortem.
@@ -34,19 +32,17 @@ Run this loop until you have a justified answer:
 2. The user describes symptoms; you design the investigation. If the request is underspecified, do not ask the user to name root-cause categories or sub-agent scopes before collecting cheap baseline evidence.
 3. Form hypotheses only when evidence makes them useful. Prefer 2-5 concrete hypotheses with evidence, confidence, and the next validation step. If there is not enough evidence yet, continue investigating instead of asking the user to choose.
 4. Work autonomously by default. Do not ask the user to choose A/B/C after every message. Do not narrate DP mechanics unless it helps the investigation.
-5. Use same-agent delegation when it reduces hallucination or latency. You may call delegate_to_agent with agent_id="self" for one focused check. When the user explicitly asks for multiple sub-agents, or when you identify 2-3 independent checks that should run in parallel, prefer delegate_to_agents with 1-3 tasks in a single tool call. Each delegated scope must be narrow and evidence-oriented, with only the context_summary needed for that sub-task. Do not call one sub-agent, wait for it, then decide whether to start the next unless the tasks truly depend on each other. Do not target another agent unless the runtime explicitly exposes that capability.
-6. Treat a delegate_to_agents result with status="running" as a launch acknowledgement only. It does not contain delegated findings. Do not report delegated results, do not produce a final delegated synthesis, and do not attribute parent-collected evidence to sub-agents until you receive a [Delegation Batch Complete] / delegation.batch_complete notification. While waiting, you may collect clearly labeled parent-side baseline evidence or tell the user the delegated checks are still running.
-7. After delegated evidence is actually available, synthesize it in the parent answer. Update the hypotheses, confidence, and next step from the delegated evidence instead of leaving the user to inspect sub-agent cards.
-8. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, credible competing hypotheses that would benefit from user steering, or the runtime asks you to pause after sustained tool use.
-9. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
+5. Validate independent leads in parallel — fan out by default. Once you have 2 or more independent hypotheses, targets, or checks to validate, emit one spawn_subagent per lead in a single turn so they run concurrently — each with a narrow, evidence-oriented scope and only the context it needs — then synthesize their reports into your hypotheses, confidence, and next step. Do not validate the leads one-by-one yourself, and do not spawn one sub-agent, wait for it, then decide on the next unless the leads truly depend on each other. Only skip fan-out for a single small direct check, or a light check across just a couple of targets, which you run inline yourself. Do not leave the user to inspect sub-agent cards — the synthesis is your job.
+6. Only create a Hypothesis Checkpoint when there is a meaningful breakthrough, a fork in the investigation, credible competing hypotheses that would benefit from user steering, or the runtime asks you to pause after sustained tool use.
+7. At a Hypothesis Checkpoint, write the hypotheses in plain markdown. For each hypothesis include: evidence, confidence, and the next validation step. Do not render any visible choice list in the markdown — no A/B/C list and no visible Proceed/Refine/Summarize list. The UI will render those controls from the hidden hints. Append these hidden UI hints exactly once at the end of that checkpoint message and then stop:
    <!-- hypothesis-checkpoint -->
    <!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->
-10. When the user replies:
+8. When the user replies:
    - "Proceed" / "A" — proceed with validating the strongest current hypothesis
    - "Refine" / "B <text>" — revise or add hypotheses based on what they wrote
    - "Summarize" / "C" — wrap up with your current best answer
    - anything else — interpret naturally
-11. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
+9. Document evidence as you collect it. Structure your final answer with clear sections: Findings, Root Cause, Recommendation, Caveats.
 
 Stay in this mindset across turns until the user exits with [DP_EXIT].`;
 
@@ -58,10 +54,7 @@ Stay in this mindset across turns until the user exits with [DP_EXIT].`;
  * meaningful to the LLM.
  */
 const CHIP_MARKER_ALLOWLIST = new Set(["Dig deeper", "Proceed", "Refine", "Summarize", "Adjust", "Skip"]);
-const DELEGATION_BATCH_COMPLETE_MARKER = "[Delegation Batch Complete]";
 const DP_TOOL_CALLS_BEFORE_CHECKPOINT = 20;
-const DELEGATION_SYNTHESIS_BLOCK_REASON =
-  "Delegated investigation results are ready. Before calling more tools, synthesize the delegated evidence for the user in a visible assistant message. Include findings, updated hypotheses, confidence, and the next step.";
 const INVESTIGATION_CHECKPOINT_BLOCK_REASON =
   "Pause tool use now and write a visible Hypothesis Checkpoint before continuing. Include observed evidence, 2-5 current hypotheses, confidence, uncertainty, and the next validation step for each hypothesis. Append the hidden checkpoint UI hints exactly once: <!-- hypothesis-checkpoint --> and <!-- suggested-replies: A|Proceed, B|Refine, C|Summarize -->. Stop after this checkpoint; do not call another tool in this turn.";
 
@@ -79,30 +72,6 @@ function extractTextContent(message: any): string {
     .filter((part: any) => part?.type === "text" && typeof part.text === "string")
     .map((part: any) => part.text)
     .join("");
-}
-
-function isDelegationBatchCompleteNotification(text: string): boolean {
-  return (
-    text.startsWith(`${DELEGATION_BATCH_COMPLETE_MARKER}\n`) &&
-    text.includes("\nDelegation ID: ") &&
-    text.includes("\nEvidence capsules:") &&
-    text.includes("\nSynthesize these capsules into the current investigation.")
-  );
-}
-
-function hasPendingDelegationSynthesis(messages: any[]): boolean {
-  let pending = false;
-  for (const message of messages) {
-    const text = extractTextContent(message);
-    if (message?.role === "user") {
-      pending = isDelegationBatchCompleteNotification(text);
-      continue;
-    }
-    if (pending && message?.role === "assistant" && text.trim()) {
-      pending = false;
-    }
-  }
-  return pending;
 }
 
 function countToolCallsSinceVisibleAssistant(messages: any[]): number {
@@ -124,7 +93,6 @@ export default function deepInvestigationExtension(
   dpStateRef?: MutableDpStateRef,
 ): void {
   let dpActive = false;
-  let delegationSynthesisPending = false;
   let toolCallsSinceVisibleAssistant = 0;
 
   function setActive(next: boolean): void {
@@ -248,7 +216,6 @@ export default function deepInvestigationExtension(
 
   api.on("session_start", async (_event, ctx) => {
     setActive(false);
-    delegationSynthesisPending = false;
     toolCallsSinceVisibleAssistant = 0;
 
     if (api.getFlag("dp") === true) {
@@ -275,29 +242,21 @@ export default function deepInvestigationExtension(
 
   const DP_FILTER_TYPES = new Set(["dp-mode"]);
   api.on("context", async (event) => {
-    delegationSynthesisPending = dpActive && hasPendingDelegationSynthesis(event.messages);
     toolCallsSinceVisibleAssistant = dpActive ? countToolCallsSinceVisibleAssistant(event.messages) : 0;
     return {
       messages: event.messages.filter((m: any) => !DP_FILTER_TYPES.has(m.customType)),
     };
   });
 
-  // --- delegation synthesis barrier ---
+  // --- hypothesis checkpoint barrier ---
   //
-  // This is intentionally one-shot and history-derived, not a DP state
-  // machine. When async delegated evidence arrives, the next model turn must
-  // first produce visible synthesis before spending more tools. Once an
-  // assistant text message exists after the delegation event, the context hook
-  // above clears the barrier automatically.
+  // History-derived, not a DP state machine. After sustained tool use without a
+  // visible assistant message, pause and require a Hypothesis Checkpoint before
+  // spending more tools. The context hook above resets the counter whenever an
+  // assistant text message appears.
 
   api.on("tool_call", async () => {
     if (!dpActive) return {};
-    if (delegationSynthesisPending) {
-      return {
-        block: true,
-        reason: DELEGATION_SYNTHESIS_BLOCK_REASON,
-      };
-    }
     if (toolCallsSinceVisibleAssistant >= DP_TOOL_CALLS_BEFORE_CHECKPOINT) {
       return {
         block: true,

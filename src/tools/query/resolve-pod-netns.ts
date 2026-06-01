@@ -18,7 +18,7 @@ interface ResolvePodNetnsParams {
   pod: string;
   namespace?: string;
   container?: string;
-  kubeconfig?: string;
+  cluster?: string;
   image?: string;
 }
 
@@ -49,19 +49,20 @@ Parameters:
 - pod: Target pod name
 - namespace: Pod namespace (default: "default")
 - container: Container name (for multi-container pods)
-- kubeconfig: Credential name of the target cluster`,
+- cluster: Cluster name (from cluster_list)
+- image: Debug container image (default: SICLAW_DEBUG_IMAGE)`,
     parameters: Type.Object({
       pod: Type.String({ description: "Target pod name" }),
       namespace: Type.Optional(Type.String({ description: 'Namespace (default: "default")' })),
       container: Type.Optional(Type.String({ description: "Container name (for multi-container pods)" })),
-      kubeconfig: Type.Optional(Type.String({ description: "Credential name of the target cluster (from cluster_list)." })),
+      cluster: Type.Optional(Type.String({ description: "Cluster name (from cluster_list)." })),
       image: Type.Optional(Type.String({ description: "Debug container image (default: SICLAW_DEBUG_IMAGE)" })),
     }),
     async execute(_toolCallId, rawParams, signal) {
       const params = rawParams as ResolvePodNetnsParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "resolve_pod_netns");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "resolve_pod_netns");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -69,7 +70,7 @@ Parameters:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -101,8 +102,8 @@ Parameters:
       // Network namespace is a pod-level concept (shared by all containers in the pod),
       // so we use crictl pods + crictl inspectp (sandbox), not crictl inspect (container).
       // The runtime already creates /var/run/netns/<name> — ip netns exec works directly.
-      const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
+      const clusterKey = params.cluster || "default";
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
 
       const innerScript = [
         // Find sandbox ID by pod name and namespace

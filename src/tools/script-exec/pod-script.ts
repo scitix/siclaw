@@ -19,7 +19,7 @@ interface PodScriptParams {
   skill?: string;
   script: string;
   args?: string;
-  kubeconfig?: string;
+  cluster?: string;
   timeout_seconds?: number;
 }
 
@@ -46,7 +46,7 @@ No base64 or tar is required in the target container.
 
 Use this for running diagnostic or operational scripts inside a running pod.
 
-Scripts must come from a skill's scripts/ directory or from user-uploaded scripts.
+Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
 Parameters:
 - pod: Target pod name
@@ -55,6 +55,7 @@ Parameters:
 - skill: Skill name. If omitted, looks in user scripts
 - script: Script filename
 - args: Optional arguments to pass to the script
+- cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
@@ -75,13 +76,13 @@ Examples:
           description: "Skill name (omit to use user scripts)",
         }),
       ),
-      script: Type.String({ description: "Script filename" }),
+      script: Type.String({ description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md. Use it verbatim — do not guess or modify the name." }),
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -94,7 +95,7 @@ Examples:
       const params = rawParams as PodScriptParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "pod_script");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_script");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -102,7 +103,7 @@ Examples:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -171,7 +172,7 @@ Examples:
         const stdout = err.stdout?.trim() ?? "";
         const stderr = err.stderr?.trim() ?? err.message;
         return {
-          content: [{ type: "text", text: postExecSecurity(`Exit code: ${err.code ?? "unknown"}\n${stdout}`, null, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${err.code ?? "unknown"}]`, null, { stderr: stderr || undefined }) }],
           details: { exitCode: err.code ?? null, error: true },
         };
       }

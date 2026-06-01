@@ -205,7 +205,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     if (signal?.aborted) break;
 
     const evt = event as SseEvent;
-    const eventType = evt.type as string;
+    // Always a string: tool-pushed extra events (e.g. task_event, which carries
+    // `kind` not `type`) have no `type`. A bare `eventType.includes(...)` on
+    // undefined would throw and kill the whole SSE stream (STREAM_INTERRUPTED).
+    const eventType = (evt.type as string | undefined) ?? "";
     eventCount++;
 
     // Log lifecycle events

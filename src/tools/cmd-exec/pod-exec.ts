@@ -23,7 +23,7 @@ interface PodExecParams {
   namespace?: string;
   container?: string;
   command: string;
-  kubeconfig?: string;
+  cluster?: string;
   timeout_seconds?: number;
 }
 
@@ -31,7 +31,7 @@ export function createPodExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition
   return {
     name: "pod_exec",
     label: "Pod Exec",
-    description: `Execute a diagnostic command inside a running Kubernetes pod via kubectl exec.
+    description: `Execute a single diagnostic command inside a running Kubernetes pod via kubectl exec. For multi-step scripts, use pod_script instead.
 
 Runs a single whitelisted command directly inside the target pod's container.
 The command runs in the pod's own environment — it uses whatever tools are available in the container image.
@@ -77,9 +77,9 @@ Examples:
         description:
           'Diagnostic command to run in the pod (e.g. "ip addr show", "ps aux")',
       }),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
       timeout_seconds: Type.Optional(
@@ -105,7 +105,7 @@ Examples:
       const params = rawParams as PodExecParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "pod_exec");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "pod_exec");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -113,7 +113,7 @@ Examples:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -184,7 +184,7 @@ Examples:
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";
         return {
-          content: [{ type: "text", text: postExecSecurity(`Exit code: ${exitCode}\n${stdout}`, pre.action, { stderr: stderr || undefined }) }],
+          content: [{ type: "text", text: postExecSecurity(`${stdout || "(no output)"}\n[exit code: ${exitCode}]`, pre.action, { stderr: stderr || undefined }) }],
           details: { exitCode, error: true },
         };
       }

@@ -1,10 +1,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildKnowledgeOverview } from "../memory/overview-generator.js";
+import { randomUUID } from "node:crypto";
+import { buildKnowledgeOverview, buildKnowledgeWikiCatalog } from "../memory/overview-generator.js";
 import { readFile as fsReadFile, writeFile as fsWriteFile, access as fsAccess, mkdir as fsMkdir } from "node:fs/promises";
 import {
-  createAgentSession,
+  createAgentSessionServices,
+  createAgentSessionFromServices,
+  getAgentDir,
   DefaultResourceLoader,
   SessionManager,
   AuthStorage,
@@ -16,12 +19,14 @@ import {
   createFindTool,
   createLsTool,
   type AgentSession,
+  type AgentSessionServices,
+  type LoadExtensionsResult,
   type ToolDefinition,
   type ExtensionAPI,
 } from "@mariozechner/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
-import { ToolRegistry } from "./tool-registry.js";
+import { ToolRegistry, type AgentMode } from "./tool-registry.js";
 import { allToolEntries } from "../tools/all-entries.js";
 import { buildSreSystemPrompt } from "./prompt.js";
 import contextPruningExtension from "./extensions/context-pruning.js";
@@ -43,6 +48,10 @@ export interface CreateSiclawSessionOpts {
   sessionManager?: SessionManager;
   kubeconfigRef?: KubeconfigRef;
   mode?: SessionMode;  // replaces excludeTools / extraTools
+  /** Active operating mode (normal/dp/…) — filters tools by their `availableModes`. */
+  activeMode?: AgentMode;
+  /** True when building a spawned sub-agent (child) — hides the plan/task tools. */
+  isSubagent?: boolean;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for agent customization */
@@ -59,8 +68,6 @@ export interface CreateSiclawSessionOpts {
   userId?: string;
   /** Agent ID — used for metrics labeling (tool_call / skill_call events). Null if no agent context (TUI/CLI). */
   agentId?: string | null;
-  /** Pre-initialized knowledge base indexer (Gateway level) — for knowledge_search tool */
-  knowledgeIndexer?: MemoryIndexer;
   /**
    * Absolute path to a directory that a local Portal snapshot has materialized
    * skills into. CLI mode only: when set, the agent session loads builtin
@@ -96,30 +103,25 @@ export interface CreateSiclawSessionOpts {
   /**
    * Optional callback injected by agentbox. When present, tools may call it to
    * push custom events into the parent session's SSE stream (used by
-   * `delegate_to_agent` / `delegate_to_agents` to forward child-agent events
-   * so the frontend can render them in a nested block).
+   * `spawn_subagent` to forward child-agent events so the frontend can render
+   * them in a nested block).
    */
   sessionEventEmitter?: import("./tool-registry.js").SessionEventEmitter;
-  /**
-   * Optional runtime bridge for `delegate_to_agent`. When absent, the tool is
-   * hidden from the model by the registry availability guard.
-   */
-  delegateToAgentExecutor?: import("./tool-registry.js").DelegateToAgentExecutor;
-  /**
-   * Optional runtime bridge for notify-driven batch same-agent delegation.
-   */
-  delegateToAgentsExecutor?: import("./tool-registry.js").DelegateToAgentsExecutor;
-  /**
-   * Expose same-agent delegation tools to the model for this session. Keep this
-   * false in normal chat so Deep Investigation internals do not leak through
-   * the callable tool schema.
-   */
-  enableDelegationTools?: boolean;
+  /** Shared task-ledger id; sub-agents pass the parent's id to share its ledger. Default: fresh uuid. */
+  taskListId?: string;
+  /** Runtime bridge that spawns a sub-agent (design §6). Injected by the agentbox. */
+  spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
+  /** Runtime bridge that cancels a background sub-agent job (design §7). Injected by the agentbox. */
+  subagentJobStopExecutor?: import("./tool-registry.js").SubagentJobStopExecutor;
 }
 
 export interface SiclawSessionResult {
   brain: BrainSession;
   session: AgentSession;  // backward compat — only set for pi-agent brain
+  /** cwd-bound runtime services (pi 0.73) — needed to build an AgentSessionRuntime for the TUI */
+  services: AgentSessionServices;
+  /** Loaded extensions result — required when wrapping the session in an AgentSessionRuntime */
+  extensionsResult: LoadExtensionsResult;
   modelFallbackMessage?: string;
   customTools: ToolDefinition[];
   kubeconfigRef: KubeconfigRef;
@@ -174,6 +176,7 @@ function truncateWithBudget(content: string, maxChars: number): string {
  */
 function buildAppendSystemPrompt(
   memoryDir: string | null,
+  knowledgeDir?: string,
 ): string[] {
   const parts: string[] = [];
 
@@ -236,6 +239,13 @@ When the user does provide identifying info, IMMEDIATELY update \`${memoryDir}/P
     parts.push(overview);
   }
 
+  // Knowledge wiki catalog (.siclaw/knowledge/index.md) injected directly so the
+  // agent sees available pages without an eager Read and pulls pages on demand.
+  const wikiCatalog = buildKnowledgeWikiCatalog(knowledgeDir ?? path.resolve(process.cwd(), config_.paths.knowledgeDir));
+  if (wikiCatalog) {
+    parts.push(wikiCatalog);
+  }
+
   return parts;
 }
 
@@ -294,7 +304,7 @@ export async function createSiclawSession(
     fs.writeFileSync(configPath, JSON.stringify({ providers: config.providers }, null, 2) + "\n");
   }
   const modelsJson = fs.existsSync(configPath) ? configPath : undefined;
-  const modelRegistry = new ModelRegistry(authStorage, modelsJson);
+  const modelRegistry = ModelRegistry.create(authStorage, modelsJson);
 
   const kubeconfigRef: KubeconfigRef = opts?.kubeconfigRef ?? {};
   const userId = opts?.userId ?? "unknown";
@@ -366,19 +376,23 @@ export async function createSiclawSession(
 
   const allowedTools = opts?.allowedTools ?? config.allowedTools;
 
+  // Shared task-ledger id; sub-agents pass the parent's id to share its ledger.
+  const taskListId = opts?.taskListId ?? randomUUID();
+
   const customTools = registry.resolve({
     mode,
     refs: {
-      kubeconfigRef, userId, agentId, sessionIdRef,
+      kubeconfigRef, userId, agentId, sessionIdRef, taskListId,
+      isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
-      knowledgeIndexer: opts?.knowledgeIndexer,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
-      delegateToAgentExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentExecutor : undefined,
-      delegateToAgentsExecutor: opts?.enableDelegationTools ? opts?.delegateToAgentsExecutor : undefined,
+      spawnSubagentExecutor: opts?.spawnSubagentExecutor,
+      subagentJobStopExecutor: opts?.subagentJobStopExecutor,
     },
     allowedTools,
+    activeMode: opts?.activeMode ?? "normal",
   });
 
   // Log agent tool filter result (diagnostic — original behavior from L365-367)
@@ -565,45 +579,56 @@ export async function createSiclawSession(
       ]
     : [];
 
-  loader = new DefaultResourceLoader({
+  // pi 0.73 split session creation into services + session. agentDir is the
+  // global config root pi uses for personal skills/extensions (~/.pi/agent);
+  // it was an implicit default in the old DefaultResourceLoader and must now
+  // be supplied explicitly. createAgentSessionServices builds + reloads the
+  // resource loader from resourceLoaderOptions, so no separate reload here.
+  const agentDir = getAgentDir();
+  const services = await createAgentSessionServices({
     cwd,
-    systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
-    appendSystemPromptOverride: () => {
-      const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null);
-      if (agentSystemPromptAppend) {
-        parts.push("\n\n" + agentSystemPromptAppend);
-      }
-      return parts;
+    agentDir,
+    authStorage,
+    modelRegistry,
+    resourceLoaderOptions: {
+      systemPromptOverride: () => buildSreSystemPrompt(mode, opts?.systemPromptTemplate),
+      appendSystemPromptOverride: () => {
+        const parts = buildAppendSystemPrompt(memoryEnabled ? memoryDir : null, knowledgeDir);
+        if (agentSystemPromptAppend) {
+          parts.push("\n\n" + agentSystemPromptAppend);
+        }
+        return parts;
+      },
+      // Extension registration order: compactionSafeguard handles session_before_compact.
+      extensionFactories: [
+        contextPruningExtension,
+        compactionSafeguardExtension,
+        ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
+        (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
+        (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
+        ...cliOnlyFactories,
+      ],
+      // In Portal-unified mode, filter out skills that didn't come from either
+      // the Portal-materialized dir or the repo's platform dir. Without this
+      // filter, pi-coding-agent's DefaultResourceLoader also picks up whatever
+      // the user has at `~/.pi/agent/skills/` (e.g. personal lark-cli tools) —
+      // fine for standalone use, but violates "Portal is the source of truth"
+      // when we've just fetched a scoped snapshot.
+      skillsOverride: opts?.portalSkillsDir
+        ? (base) => ({
+            skills: base.skills.filter((s) => {
+              if (!s.filePath) return false;
+              if (s.filePath.startsWith(opts.portalSkillsDir!)) return true;
+              if (fs.existsSync(platformPath) && s.filePath.startsWith(platformPath)) return true;
+              return false;
+            }),
+            diagnostics: base.diagnostics,
+          })
+        : undefined,
+      additionalSkillPaths: skillsDirs,
     },
-    // Extension registration order: compactionSafeguard handles session_before_compact.
-    extensionFactories: [
-      contextPruningExtension,
-      compactionSafeguardExtension,
-      ...(memoryEnabled ? [(api: ExtensionAPI) => memoryFlushExtension(api, memoryIndexerRef.current)] : []),
-      (api) => deepInvestigationExtension(api, memoryRef, mutableDpStateRef),
-      (api) => setupExtension(api, credentialsDir, { portalUrl: opts?.portalUrl ?? null }),
-      ...cliOnlyFactories,
-    ],
-    // In Portal-unified mode, filter out skills that didn't come from either
-    // the Portal-materialized dir or the repo's platform dir. Without this
-    // filter, pi-coding-agent's DefaultResourceLoader also picks up whatever
-    // the user has at `~/.pi/agent/skills/` (e.g. personal lark-cli tools) —
-    // fine for standalone use, but violates "Portal is the source of truth"
-    // when we've just fetched a scoped snapshot.
-    skillsOverride: opts?.portalSkillsDir
-      ? (base) => ({
-          skills: base.skills.filter((s) => {
-            if (!s.filePath) return false;
-            if (s.filePath.startsWith(opts.portalSkillsDir!)) return true;
-            if (fs.existsSync(platformPath) && s.filePath.startsWith(platformPath)) return true;
-            return false;
-          }),
-          diagnostics: base.diagnostics,
-        })
-      : undefined,
-    additionalSkillPaths: skillsDirs,
   });
-  await loader.reload();
+  loader = services.resourceLoader as DefaultResourceLoader;
 
   // Log discovered skills for diagnostics
   const { skills: loadedSkills, diagnostics: skillDiagnostics } = loader.getSkills();
@@ -627,15 +652,16 @@ export async function createSiclawSession(
       )
     : undefined;
 
-  const { session, modelFallbackMessage } = await createAgentSession({
-    tools: restrictedFileTools,
-    customTools,
-    resourceLoader: loader,
+  // restrictedFileTools are registered via customTools (pushed above); suppress
+  // pi's default built-in read/bash/edit/write so only siclaw's path-restricted
+  // tools are exposed (security: no unrestricted bash/file access).
+  const { session, extensionsResult, modelFallbackMessage } = await createAgentSessionFromServices({
+    services,
     sessionManager,
-    authStorage,
-    modelRegistry,
     model: configuredModel,
     thinkingLevel: "high",
+    noTools: "builtin",
+    customTools,
   });
 
   // Trigger session_start for extension state restoration.
@@ -653,5 +679,5 @@ export async function createSiclawSession(
   installGuardPipeline(guardRegistry, { agent: session.agent, sessionManager });
 
   const brain: BrainSession = new PiAgentBrain(session);
-  return { brain, session, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
+  return { brain, session, services, extensionsResult, modelFallbackMessage, customTools, kubeconfigRef, skillsDirs, mode, mcpManager, memoryIndexer, sessionIdRef, dpStateRef };
 }

@@ -15,6 +15,7 @@ import {
   resolveSkillScript,
   listSkillScripts,
   listAllSkillsWithScripts,
+  skillMdHint,
 } from "../infra/script-resolver.js";
 import { emitDiagnostic } from "../../shared/diagnostic-events.js";
 
@@ -22,7 +23,7 @@ interface RunSkillParams {
   skill: string;
   script: string;
   args?: string;
-  kubeconfig?: string;
+  cluster?: string;
   timeout_seconds?: number;
 }
 
@@ -53,7 +54,7 @@ Parameters:
 - skill: Skill name (e.g. "find-node", "roce-perftest-pod")
 - script: Script filename (e.g. "find-node.sh", "run-perftest.py")
 - args: Optional command-line arguments
-- kubeconfig: Credential name of the target cluster (use cluster_list to discover). Omit to use the default kubeconfig.
+- cluster: Cluster name (use cluster_list to discover). Omit for non-Kubernetes work or to use the default cluster when only one is available.
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
@@ -69,16 +70,16 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         description: "Skill name (e.g. 'find-node', 'roce-perftest-pod')",
       }),
       script: Type.String({
-        description: "Script filename within the skill (e.g. 'find-node.sh', 'run-perftest.py')",
+        description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md (e.g. 'find-node.sh', 'run-perftest.py'). Use it verbatim — do not guess or modify the name.",
       }),
       args: Type.Optional(
         Type.String({
           description: "Command-line arguments to pass to the script",
         })
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         })
       ),
       timeout_seconds: Type.Optional(
@@ -112,7 +113,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         const available = listSkillScripts(skill);
         let hint: string;
         if (available.length > 0) {
-          hint = `Available scripts for "${skill}": ${available.join(", ")}`;
+          hint = `Available scripts for "${skill}": ${available.join(", ")}${skillMdHint(skill)}`;
         } else {
           // List all skills that DO have scripts to help the LLM
           const allSkillsWithScripts = listAllSkillsWithScripts();
@@ -128,7 +129,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       }
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "local_script");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "local_script");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -137,7 +138,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       }
 
       // Resolve kubeconfig — requires explicit selection when multiple clusters exist
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],

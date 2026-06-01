@@ -56,6 +56,24 @@ describe("consumeAgentSse — empty stream", () => {
   });
 });
 
+describe("consumeAgentSse — type-less extra events", () => {
+  it("does not throw on a tool-pushed event with no `type` (e.g. task_event has `kind`), and keeps processing the stream", async () => {
+    // Regression: a bare `eventType.includes("error")` on undefined used to throw
+    // and kill the whole SSE stream (STREAM_INTERRUPTED) whenever a task_event
+    // (which carries `kind`, not `type`) was streamed.
+    const events = [
+      { type: "message_start" },
+      { kind: "task_event", taskListId: "tl", action: "upsert", task: { id: "1", subject: "x", status: "pending" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+    ];
+    const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u" });
+    expect(result.eventCount).toBe(4);
+    expect(result.resultText).toBe("ok");
+    expect(result.errorMessage).toBe("");
+  });
+});
+
 describe("consumeAgentSse — assistant message flow", () => {
   it("accumulates text deltas across message_update events and returns the concatenated result", async () => {
     const events = [

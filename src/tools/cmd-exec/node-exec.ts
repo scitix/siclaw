@@ -26,7 +26,7 @@ interface NodeExecParams {
   node: string;
   command: string;
   netns?: string;
-  kubeconfig?: string;
+  cluster?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -35,7 +35,7 @@ export function createNodeExecTool(kubeconfigRef?: KubeconfigRef, userId?: strin
   return {
     name: "node_exec",
     label: "Node Exec",
-    description: `Execute diagnostic commands directly on a Kubernetes node.
+    description: `Execute a single diagnostic command directly on a Kubernetes node. For multi-step scripts (pipes, loops, functions), use node_script instead.
 Creates a privileged debug pod with nsenter to run the command in the host's full namespaces (mount, UTS, IPC, network, PID).
 The pod is automatically cleaned up after execution (--rm).
 
@@ -99,9 +99,9 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
           description: 'Network namespace name (from resolve_pod_netns). When set, command runs inside that netns via "ip netns exec".',
         }),
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         })
       ),
       image: Type.Optional(
@@ -131,7 +131,7 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       const params = rawParams as NodeExecParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "node_exec");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_exec");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -139,7 +139,7 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -190,8 +190,8 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
         };
       }
 
-      const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
+      const clusterKey = params.cluster || "default";
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
       const commands = extractCommands(params.command);
       const needsShell = commands.length > 1;
@@ -228,9 +228,13 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       const filteredStderr = filterPodNoise(execResult.stderr);
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
+      const out = execResult.stdout.trim();
+      // Show the output as a shell would, with the exit code as a trailing annotation
+      // (not a prefix that replaces the body), so a non-zero exit with no output —
+      // e.g. `grep` with no match — reads as an empty result, not a failure.
       const stdout = isError
-        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
-        : execResult.stdout.trim();
+        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
+        : out;
       return {
         content: [{ type: "text", text: postExecSecurity(stdout, pre.action, { stderr: filteredStderr || undefined }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },

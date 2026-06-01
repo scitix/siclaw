@@ -14,7 +14,7 @@ import { AgentBoxSessionManager } from "./agentbox/session.js";
 import { loadConfig, reloadConfig, getConfigPath } from "./core/config.js";
 import { GatewayClient } from "./agentbox/gateway-client.js";
 import { syncAllResources } from "./agentbox/resource-sync.js";
-import { debugPodGC, debugPodCache } from "./tools/infra/debug-pod.js";
+import { debugPodCache } from "./tools/infra/debug-pod.js";
 
 // Side-effect: register metrics subscriber. Also imported in http-server.ts,
 // but ESM guarantees single module evaluation — the subscriber registers only once.
@@ -55,13 +55,7 @@ async function main() {
     }
   }
 
-  // Start background GC for orphaned debug pods (best-effort; silently skips if no cluster)
-  {
-    const credentialsDir = path.resolve(process.cwd(), config.paths.credentialsDir);
-    void debugPodGC.start(credentialsDir).catch((err) => {
-      console.warn("[agentbox] DebugPodGC start failed:", err);
-    });
-  }
+  // Orphaned debug pods self-clean via their Job's ttlSecondsAfterFinished — no GC needed.
 
   const skillsDir = path.resolve(process.cwd(), config.paths.skillsDir);
   const userDataDir = path.resolve(process.cwd(), config.paths.userDataDir);
@@ -142,7 +136,6 @@ async function main() {
   // the final state before the pod terminates.
   const shutdown = async () => {
     console.log("[agentbox] Shutting down...");
-    debugPodGC.stop();
     await debugPodCache.evictAll();
     await sessionManager.closeAll();
     server.close();

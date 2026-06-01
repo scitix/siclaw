@@ -25,7 +25,7 @@ interface NodeScriptParams {
   script: string;
   args?: string;
   netns?: string;
-  kubeconfig?: string;
+  cluster?: string;
   image?: string;
   timeout_seconds?: number;
 }
@@ -51,13 +51,15 @@ The script runs in the host's full namespaces (mount, UTS, IPC, network, PID) �
 Use this for complex node-level diagnostics that need scripts (pipes, loops, functions), not just single commands.
 For single commands, use node_exec instead.
 
-Scripts must come from a skill's scripts/ directory or from user-uploaded scripts.
+Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
 Parameters:
 - node: Target Kubernetes node name
 - skill: Skill name (e.g. "node-logs"). If omitted, looks in user scripts
 - script: Script filename (e.g. "get-node-logs.sh")
 - args: Optional arguments to pass to the script
+- netns: Optional network namespace id to enter a pod's netns on the node (from resolve_pod_netns)
+- cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - image: Debug container image (default: SICLAW_DEBUG_IMAGE)
 - timeout_seconds: Timeout (default: 180, max: 300)
 
@@ -72,7 +74,7 @@ Examples:
           description: "Skill name (omit to use user scripts)",
         }),
       ),
-      script: Type.String({ description: "Script filename" }),
+      script: Type.String({ description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md. Use it verbatim — do not guess or modify the name." }),
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
@@ -81,9 +83,9 @@ Examples:
           description: 'Network namespace name (from resolve_pod_netns). When set, script runs inside that netns via "ip netns exec".',
         }),
       ),
-      kubeconfig: Type.Optional(
+      cluster: Type.Optional(
         Type.String({
-          description: "Credential name of the target cluster (from cluster_list). If omitted, uses the default kubeconfig.",
+          description: "Cluster name (from cluster_list). If omitted, uses the default cluster when only one is available.",
         }),
       ),
       image: Type.Optional(
@@ -101,7 +103,7 @@ Examples:
       const params = rawParams as NodeScriptParams;
 
       try {
-        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.kubeconfig, "node_script");
+        await ensureClusterForTool(kubeconfigRef?.credentialBroker, params.cluster, "node_script");
       } catch (err) {
         return {
           content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -109,7 +111,7 @@ Examples:
         };
       }
 
-      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig);
+      const kubeResult = resolveRequiredKubeconfig({ broker: kubeconfigRef?.credentialBroker }, params.cluster);
       if ("error" in kubeResult) {
         return {
           content: [{ type: "text", text: `Error: ${kubeResult.error}` }],
@@ -150,8 +152,8 @@ Examples:
         };
       }
 
-      const clusterKey = params.kubeconfig || "default";
-      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.kubeconfig) || loadConfig().debugImage;
+      const clusterKey = params.cluster || "default";
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const args = params.args?.trim() || "";
       // Security: shell-escape each argument to prevent injection via args parameter
@@ -194,9 +196,10 @@ Examples:
       const filteredStderr = filterPodNoise(execResult.stderr);
       const isError = execResult.exitCode !== 0 &&
         !(execResult.exitCode === null && execResult.stdout.trim());
+      const out = execResult.stdout.trim();
       const stdout = isError
-        ? `Exit code: ${execResult.exitCode ?? "unknown"}\n${execResult.stdout.trim()}`
-        : execResult.stdout.trim();
+        ? `${out || "(no output)"}\n[exit code: ${execResult.exitCode ?? "unknown"}]`
+        : out;
       return {
         content: [{ type: "text", text: postExecSecurity(stdout, null, { stderr: filteredStderr || undefined }) }],
         details: { exitCode: execResult.exitCode ?? 0, ...(isError && { error: true }) },

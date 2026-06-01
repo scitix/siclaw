@@ -351,8 +351,8 @@ export class CredentialBroker {
 
   /**
    * Ensure a cluster has been acquired at least once (path available).
-   * Triggers acquireCluster if missing or expired. Used by the central
-   * ensureKubeconfigsForCommand helper before a synchronous resolve.
+   * Triggers acquireCluster if missing or expired. Used by the
+   * ensureClusterForTool helper before a synchronous resolve.
    */
   async ensureCluster(clusterName: string, purpose = "ensure"): Promise<ClusterLocalInfo> {
     const existing = this.clusters.get(clusterName);

@@ -92,33 +92,54 @@ describe("checkPodRunning", () => {
 });
 
 describe("waitForPodDone", () => {
+  // waitForPodDone reads `kubectl get pod -o json`; build a minimal pod status.
+  const podJson = (phase: string, status: Record<string, unknown> = {}) =>
+    ({ stdout: JSON.stringify({ status: { phase, ...status } }) });
+
   it("returns when Running target phase is reached", async () => {
-    mockExecFile.mockResolvedValueOnce({ stdout: "Running" });
+    mockExecFile.mockResolvedValueOnce(podJson("Running"));
     const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "Running");
     expect(phase).toBe("Running");
   });
 
   it("returns terminal phase when target is 'terminal'", async () => {
-    mockExecFile.mockResolvedValueOnce({ stdout: "Succeeded" });
+    mockExecFile.mockResolvedValueOnce(podJson("Succeeded"));
     const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "terminal");
     expect(phase).toBe("Succeeded");
   });
 
   it("considers Running-target with terminal phase as done (fail fast)", async () => {
-    mockExecFile.mockResolvedValueOnce({ stdout: "Failed" });
+    mockExecFile.mockResolvedValueOnce(podJson("Failed"));
     const phase = await waitForPodDone("p", 5_000, undefined, undefined, undefined, "ns", "Running");
     expect(phase).toBe("Failed");
   });
 
+  it("fails fast on an unpullable image instead of waiting out the timeout", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      containerStatuses: [{ state: { waiting: { reason: "ImagePullBackOff", message: "Back-off pulling image \"x\"" } } }],
+    }));
+    // Large timeout: if it didn't fail fast, this would hang ~10s and time out instead.
+    await expect(waitForPodDone("p", 10_000, undefined, undefined, undefined, "ns", "Running"))
+      .rejects.toThrow(/cannot start: ImagePullBackOff/);
+  }, 3000);
+
+  it("fails fast when the pod is unschedulable", async () => {
+    mockExecFile.mockResolvedValue(podJson("Pending", {
+      conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: "0/3 nodes available" }],
+    }));
+    await expect(waitForPodDone("p", 10_000, undefined, undefined, undefined, "ns", "Running"))
+      .rejects.toThrow(/cannot start: Unschedulable/);
+  }, 3000);
+
   it("throws on timeout", async () => {
-    // Resolve with non-terminal phase forever; we expect the function to give up.
-    mockExecFile.mockResolvedValue({ stdout: "Pending" });
+    // Resolve with a plain Pending (still starting, no fatal reason) forever.
+    mockExecFile.mockResolvedValue(podJson("Pending"));
     await expect(waitForPodDone("p", 10, undefined, undefined, undefined, "ns", "terminal"))
       .rejects.toThrow(/Timed out/);
   }, 5000);
 
   it("respects abort signal", async () => {
-    mockExecFile.mockResolvedValue({ stdout: "Pending" });
+    mockExecFile.mockResolvedValue(podJson("Pending"));
     const controller = new AbortController();
     const promise = waitForPodDone("p", 5_000, undefined, controller.signal, undefined, "ns", "terminal");
     controller.abort();

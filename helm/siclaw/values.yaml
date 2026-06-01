@@ -61,6 +61,11 @@ runtime:
     # Disabled by default for Sicore-integrated production deployments. Enabling
     # this re-exposes memory_search/memory_get and session memory auto-save.
     enabled: false
+  # Max sub-agent child sessions a single AgentBox runs concurrently. A wide
+  # spawn_subagent fan-out queues past this instead of starting one child agent +
+  # one LLM stream per target at once (avoids provider 429s / pod pressure).
+  # Forwarded to each AgentBox pod as SICLAW_SUBAGENT_CONCURRENCY. Default 5.
+  subagentConcurrency: 5
   env: {}
 
 # -- Portal (standalone web UI, replaces Upstream)
