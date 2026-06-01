@@ -118,6 +118,9 @@ async function resolveHostDialChain(db: Db, startId: string): Promise<DialHop[]>
 }
 
 interface HostFormBody {
+  /** Set when re-testing an existing host being edited: blank credential fields
+   *  fall back to its stored secret (the form omits unchanged passwords/keys). */
+  id?: string;
   ip?: string;
   port?: number;
   username?: string;
@@ -128,21 +131,29 @@ interface HostFormBody {
   jump_host_id?: string | null;
 }
 
-/** Build the target DialHop from submitted (unsaved) form data. */
-function hopFromForm(b: HostFormBody): DialHop {
+/**
+ * Build the target DialHop from submitted (unsaved) form data. When `stored` is
+ * given (re-testing an edited host), a blank credential field falls back to the
+ * stored secret — the edit form omits unchanged passwords/keys, so "leave blank
+ * to keep the saved value" tests the same credential it would save.
+ */
+function hopFromForm(b: HostFormBody, stored?: ChainHostRow): DialHop {
   const host = b.ip ?? "";
   const port = b.port ?? 22;
   const username = b.username || "root";
   const authType = b.auth_type || "password";
+  const passphrase = b.passphrase || stored?.passphrase || undefined;
   if (authType === "managed") {
-    return { host, port, username, auth: { managed: true, ...(b.passphrase ? { passphrase: b.passphrase } : {}) } };
+    return { host, port, username, auth: { managed: true, ...(passphrase ? { passphrase } : {}) } };
   }
   if (authType === "key") {
-    if (!b.private_key) throw new Error('auth_type="key" requires a private_key to test');
-    return { host, port, username, auth: { privateKey: b.private_key, ...(b.passphrase ? { passphrase: b.passphrase } : {}) } };
+    const privateKey = b.private_key || stored?.private_key;
+    if (!privateKey) throw new Error('auth_type="key" requires a private_key to test');
+    return { host, port, username, auth: { privateKey, ...(passphrase ? { passphrase } : {}) } };
   }
-  if (!b.password) throw new Error('auth_type="password" requires a password to test');
-  return { host, port, username, auth: { password: b.password } };
+  const password = b.password || stored?.password;
+  if (!password) throw new Error('auth_type="password" requires a password to test');
+  return { host, port, username, auth: { password } };
 }
 
 /** Dial a resolved hop chain and run `echo ok`; never throws. */
@@ -389,10 +400,21 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
     }
 
     const db = getDb();
+    // On edit (id present), load the stored host so blank credential fields can
+    // fall back to its saved secret instead of failing with "requires a password".
+    let stored: ChainHostRow | undefined;
+    if (body.id) {
+      const [rows] = (await db.query(
+        "SELECT id, ip, port, username, auth_type, password, private_key, passphrase, jump_host_id FROM hosts WHERE id = ?",
+        [body.id],
+      )) as any;
+      stored = rows[0];
+    }
+
     let hops: DialHop[];
     try {
       const jumpChain = body.jump_host_id ? await resolveHostDialChain(db, body.jump_host_id) : [];
-      hops = [...jumpChain, hopFromForm(body)];
+      hops = [...jumpChain, hopFromForm(body, stored)];
     } catch (err) {
       sendJson(res, 200, { ok: false, message: err instanceof Error ? err.message : String(err) });
       return;

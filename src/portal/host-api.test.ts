@@ -311,6 +311,41 @@ describe("registerHostRoutes", () => {
       expect(body.ok).toBe(false);
       expect(body.message).toMatch(/managed.*requires a jump host/i);
     });
+
+    it("falls back to the stored secret when editing with a blank credential", async () => {
+      // The edit form omits the unchanged password and sends the host id, so the
+      // server resolves the blank credential from the saved host instead of failing.
+      query.mockResolvedValueOnce([[{
+        id: "host-1", ip: "10.0.0.5", port: 22, username: "root",
+        auth_type: "password", password: "stored-pw",
+        private_key: null, passphrase: null, jump_host_id: null,
+      }], []]);
+      dialSshChainMock.mockResolvedValueOnce({ client: {}, teardown: vi.fn() });
+      runCommandMock.mockResolvedValueOnce({ stdout: "ok\n", stderr: "", exitCode: 0 });
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { id: "host-1", ip: "10.0.0.5", port: 22, username: "root", auth_type: "password" },
+      }));
+
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      // the target hop was dialed with the STORED password, not a blank one
+      const hops = dialSshChainMock.mock.calls.at(-1)![0];
+      expect(hops.at(-1).auth).toEqual({ password: "stored-pw" });
+    });
+
+    it("still requires a credential for brand-new form data (no id)", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.6", auth_type: "password" }, // no id, no password
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.message).toMatch(/requires a password/i);
+    });
   });
 
   describe("validateJumpChain", () => {
