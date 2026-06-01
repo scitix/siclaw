@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { createSpawnSubagentTool } from "./spawn-subagent.js";
+import { createSpawnSubagentTool, registration } from "./spawn-subagent.js";
 import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 import type { ToolRefs, SpawnSubagentRequest, SpawnSubagentResult } from "../../core/tool-registry.js";
 
@@ -19,6 +19,14 @@ function makeRefs(executor: ToolRefs["spawnSubagentExecutor"]): ToolRefs {
 const text = (r: any) => (r.content[0] as any).text as string;
 
 describe("spawn_subagent tool", () => {
+  // Recursion guard: a child session is created WITHOUT a spawnSubagentExecutor, so
+  // the registration's `available` guard hides spawn_subagent from it — a sub-agent
+  // cannot spawn another. (This is the real enforcement, not a deny-list constant.)
+  it("is unavailable without an executor (no recursion — children get no spawn_subagent)", () => {
+    expect(registration.available?.(makeRefs(undefined))).toBe(false);
+    expect(registration.available?.(makeRefs(vi.fn() as any))).toBe(true);
+  });
+
   it("maps params to a SpawnSubagentRequest and returns the child summary", async () => {
     let captured: SpawnSubagentRequest | undefined;
     const executor = vi.fn(async (req: SpawnSubagentRequest): Promise<SpawnSubagentResult> => {
