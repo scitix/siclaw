@@ -136,6 +136,12 @@ export interface ToolRefs {
   sessionIdRef: { current: string };
   /** Shared task-ledger id. A session and the sub-agents it spawns share one taskListId. */
   taskListId: string;
+  /**
+   * True when this session is a spawned sub-agent (child). The plan/task tools are
+   * hidden from sub-agents — the plan is owned by the parent; a child that mutated the
+   * shared ledger would have no SSE emitter, so its changes wouldn't reach the UI.
+   */
+  isSubagent?: boolean;
   memoryRef: MemoryRef;
   dpStateRef: DpStateRef;
   memoryIndexer?: MemoryIndexer;

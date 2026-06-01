@@ -559,8 +559,11 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
-      // Share the parent's task ledger so the child can own/complete tasks.
+      // Share the parent's task ledger (read-only in practice): the child sees the
+      // plan for context, but the plan/task tools are hidden from sub-agents so a
+      // child can't mutate it (its changes would have no SSE emitter → invisible UI).
       taskListId: request.taskListId,
+      isSubagent: true,
       // The agent-type's prompt flavour for this child.
       systemPromptAppend: type.systemPromptAddendum,
       // Deliberately omit spawnSubagentExecutor + delegate executors → the child
