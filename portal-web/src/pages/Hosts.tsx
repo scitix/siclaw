@@ -299,18 +299,18 @@ export function Hosts() {
                     {editForm.auth_type === "password" && (
                       <div>
                         <label className="block text-sm font-medium mb-1">Password</label>
-                        <input type="password" placeholder="Leave empty to keep current" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                        <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                       </div>
                     )}
                     {editForm.auth_type === "key" && (
                       <>
                         <div>
                           <label className="block text-sm font-medium mb-1">Private Key</label>
-                          <textarea placeholder="Leave empty to keep current" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                          <textarea placeholder="Leave blank to keep current — type only to overwrite" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
                         </div>
                         <div>
                           <label className="block text-sm font-medium mb-1">Key Passphrase</label>
-                          <input type="password" placeholder="Leave empty to keep current" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                          <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                         </div>
                       </>
                     )}
@@ -319,7 +319,7 @@ export function Hosts() {
                         <p className="text-xs text-muted-foreground">Authenticates with a private key found on the selected jump host (<span className="font-mono">~/.ssh/id_*</span>). No credential is stored for this host — <span className="font-medium">a Jump Host is required</span>.</p>
                         <div>
                           <label className="block text-sm font-medium mb-1">Key Passphrase</label>
-                          <input type="password" placeholder="Leave empty to keep current" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                          <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                         </div>
                       </div>
                     )}
