@@ -113,6 +113,60 @@ describe("CredentialBroker — host pipeline", () => {
     expect([0o640, 0o600]).toContain(stat.mode & 0o777);
   });
 
+  it("acquireHost copies metadata.jump_host into HostMeta (and omits when absent)", async () => {
+    transport.hostPayloads.set("with-jump", {
+      credential: {
+        name: "with-jump",
+        type: "ssh",
+        files: [{ name: "with-jump.key", content: "K", mode: 0o600 }],
+        metadata: { ip: "10.0.0.5", port: 22, username: "root", auth_type: "key", is_production: true, jump_host: "bastion" },
+        ttl_seconds: 300,
+      },
+    });
+    transport.hostPayloads.set("no-jump", {
+      credential: {
+        name: "no-jump",
+        type: "ssh",
+        files: [{ name: "no-jump.key", content: "K", mode: 0o600 }],
+        metadata: { ip: "10.0.0.6", port: 22, username: "root", auth_type: "key", is_production: true },
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireHost("with-jump", "test");
+    await broker.acquireHost("no-jump", "test");
+    expect(broker.getHostLocalInfo("with-jump")?.meta.jump_host).toBe("bastion");
+    expect(broker.getHostLocalInfo("no-jump")?.meta.jump_host).toBeUndefined();
+  });
+
+  it("acquireHost accepts a managed host (no files) with jump_host", async () => {
+    transport.hostPayloads.set("managed-t", {
+      credential: {
+        name: "managed-t",
+        type: "ssh",
+        files: [],
+        metadata: { ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", is_production: false, jump_host: "bastion" },
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireHost("managed-t", "test");
+    const info = broker.getHostLocalInfo("managed-t");
+    expect(info?.meta.auth_type).toBe("managed");
+    expect(info?.meta.jump_host).toBe("bastion");
+  });
+
+  it("rejects a managed host with no jump_host", async () => {
+    transport.hostPayloads.set("bad-managed", {
+      credential: {
+        name: "bad-managed",
+        type: "ssh",
+        files: [],
+        metadata: { ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", is_production: false },
+        ttl_seconds: 300,
+      },
+    });
+    await expect(broker.acquireHost("bad-managed", "test")).rejects.toThrow(/managed.*no metadata\.jump_host/);
+  });
+
   it("acquireHost (password) writes <name>.password", async () => {
     transport.hostPayloads.set("node-b", {
       credential: {

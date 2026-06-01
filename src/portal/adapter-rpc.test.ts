@@ -516,6 +516,35 @@ describe("credential.get", () => {
     ]);
   });
 
+  it("returns a managed credential: auth_type=managed + jump_host, no key/password file", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", password: null, private_key: null, passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
+      [{ "1": 1 }],         // binding ok
+      [{ name: "bastion" }], // resolveJumpHostName
+    );
+    const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
+    expect(result.credential.type).toBe("ssh");
+    expect(result.credential.metadata.auth_type).toBe("managed");
+    expect(result.credential.metadata.jump_host).toBe("bastion");
+    expect(result.credential.files).toEqual([]);
+  });
+
+  it("authorizes a jump host transitively when the agent is bound to a host that uses it", async () => {
+    mockQuery(
+      // 1) resolve the requested bastion host
+      [{ id: "bastion-uuid", name: "bastion", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "K", passphrase: null, is_production: 1, description: null, jump_host_id: null }],
+      // 2) direct binding: agent is NOT bound to the bastion
+      [],
+      // 3) isJumpOfBoundHost: the agent's bound host points its jump_host_id at the bastion
+      [{ jump_host_id: "bastion-uuid" }],
+    );
+    const result = await getHandler("credential.get")(
+      { source: "host", source_id: "bastion" }, "agent-1",
+    );
+    expect(result.credential.type).toBe("ssh");
+    expect(result.credential.files[0].name).toBe("host.key");
+  });
+
   it("throws when agent not bound to cluster", async () => {
     mockQuery(
       [{ id: "cluster-uuid-1", name: "prod-cluster", kubeconfig: "yaml" }],
@@ -529,7 +558,8 @@ describe("credential.get", () => {
   it("throws when agent not bound to host", async () => {
     mockQuery(
       [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "pk" }],
-      [],  // binding check returns empty
+      [],  // direct binding check returns empty
+      [],  // transitive jump check: agent has no bound hosts → not a jump of any
     );
     await expect(
       getHandler("credential.get")({ source: "host", source_id: "web-1" }, "agent-1"),

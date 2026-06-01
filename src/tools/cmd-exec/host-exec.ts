@@ -44,7 +44,9 @@ input redirection, $() and backticks are blocked.
 
 The host parameter must be a host name returned by host_list — IPs and arbitrary
 strings are rejected. SSH credentials are looked up via the broker; you cannot
-supply a key path.
+supply a key path. Hosts behind a bastion (host_list shows a "jump_host") are
+reached automatically through the configured ProxyJump chain — just target the
+final host by name.
 
 Examples:
 - host: "jump-1", command: "uptime"

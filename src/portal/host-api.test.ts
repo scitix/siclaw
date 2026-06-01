@@ -5,10 +5,21 @@ vi.mock("../gateway/db.js", () => ({
   getDb: vi.fn(),
 }));
 
+// ssh-dial is broker-free but talks to real sockets; stub it so the /test route
+// is exercised without a live host.
+const { dialSshChainMock, runCommandMock } = vi.hoisted(() => ({
+  dialSshChainMock: vi.fn(),
+  runCommandMock: vi.fn(),
+}));
+vi.mock("../tools/infra/ssh-dial.js", () => ({
+  dialSshChain: dialSshChainMock,
+  runCommand: runCommandMock,
+}));
+
 import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
-import { registerHostRoutes } from "./host-api.js";
+import { registerHostRoutes, validateJumpChain } from "./host-api.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-host-secret";
@@ -120,11 +131,40 @@ describe("registerHostRoutes", () => {
       }));
 
       const insertArgs = query.mock.calls[0][1];
-      // id, name, ip, port, username, auth_type, password, private_key, description, is_production
+      // id, name, ip, port, username, auth_type, password, private_key, passphrase, description, is_production, jump_host_id
       expect(insertArgs[3]).toBe(22);
       expect(insertArgs[4]).toBe("root");
       expect(insertArgs[5]).toBe("password");
-      expect(insertArgs[9]).toBe(1);
+      expect(insertArgs[10]).toBe(1);
+      expect(insertArgs[11]).toBeNull(); // jump_host_id defaults to null
+    });
+
+    it("rejects auth_type=managed without a jump_host_id (400)", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts",
+        method: "POST",
+        body: { name: "m", ip: "10.0.0.9", auth_type: "managed" },
+      }));
+      expect(status).toBe(400);
+      expect(body.error).toMatch(/managed.*requires a jump_host_id/i);
+    });
+
+    it("creates a managed host with a jump host (no secrets stored)", async () => {
+      query
+        .mockResolvedValueOnce([[{ jump_host_id: null }], []]) // validateJumpChain: bastion exists, no further jump
+        .mockResolvedValueOnce([undefined, []])                // INSERT
+        .mockResolvedValueOnce([[{ id: "h-m", name: "m" }], []]); // SELECT back
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts",
+        method: "POST",
+        body: { name: "m", ip: "10.0.0.9", auth_type: "managed", jump_host_id: "bastion-id" },
+      }));
+      expect(status).toBe(201);
+      const insertArgs = query.mock.calls[1][1]; // calls[0] = validateJumpChain SELECT
+      expect(insertArgs[5]).toBe("managed");      // auth_type
+      expect(insertArgs[6]).toBeNull();           // password
+      expect(insertArgs[7]).toBeNull();           // private_key
+      expect(insertArgs[11]).toBe("bastion-id");  // jump_host_id
     });
 
     it("never returns password or private_key in response", async () => {
@@ -212,11 +252,136 @@ describe("registerHostRoutes", () => {
       expect(status).toBe(404);
     });
 
-    it("returns stub ok when host present", async () => {
-      query.mockResolvedValueOnce([[{ id: "h1" }], []]);
+    it("dials the chain and returns ok when echo succeeds", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "h1" }], []]) // existence check
+        .mockResolvedValueOnce([[{ id: "h1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "pw", private_key: null, passphrase: null, jump_host_id: null }], []]); // chain resolve
+      const teardown = vi.fn();
+      dialSshChainMock.mockResolvedValueOnce({ client: {}, teardown });
+      runCommandMock.mockResolvedValueOnce({ stdout: "ok\n", stderr: "", exitCode: 0 });
+
       const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1/test", method: "POST", body: {} }));
       expect(status).toBe(200);
       expect(body.ok).toBe(true);
+      expect(teardown).toHaveBeenCalled();
+    });
+
+    it("returns ok:false when the dial fails (no throw)", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "h1" }], []])
+        .mockResolvedValueOnce([[{ id: "h1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "pw", private_key: null, passphrase: null, jump_host_id: null }], []]);
+      dialSshChainMock.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+      const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1/test", method: "POST", body: {} }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.message).toContain("ECONNREFUSED");
+    });
+  });
+
+  describe("POST /api/v1/hosts/test-connection (unsaved form data)", () => {
+    it("tests a direct host from submitted form data", async () => {
+      dialSshChainMock.mockResolvedValueOnce({ client: {}, teardown: vi.fn() });
+      runCommandMock.mockResolvedValueOnce({ stdout: "ok\n", stderr: "", exitCode: 0 });
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "pw" },
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+    });
+
+    it("returns 400 without ip", async () => {
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { auth_type: "password", password: "pw" },
+      }));
+      expect(status).toBe(400);
+    });
+
+    it("rejects a managed test with no jump host", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.9", auth_type: "managed" },
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.message).toMatch(/managed.*requires a jump host/i);
+    });
+
+    it("falls back to the stored secret when editing with a blank credential", async () => {
+      // The edit form omits the unchanged password and sends the host id, so the
+      // server resolves the blank credential from the saved host instead of failing.
+      query.mockResolvedValueOnce([[{
+        id: "host-1", ip: "10.0.0.5", port: 22, username: "root",
+        auth_type: "password", password: "stored-pw",
+        private_key: null, passphrase: null, jump_host_id: null,
+      }], []]);
+      dialSshChainMock.mockResolvedValueOnce({ client: {}, teardown: vi.fn() });
+      runCommandMock.mockResolvedValueOnce({ stdout: "ok\n", stderr: "", exitCode: 0 });
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { id: "host-1", ip: "10.0.0.5", port: 22, username: "root", auth_type: "password" },
+      }));
+
+      expect(status).toBe(200);
+      expect(body.ok).toBe(true);
+      // the target hop was dialed with the STORED password, not a blank one
+      const hops = dialSshChainMock.mock.calls.at(-1)![0];
+      expect(hops.at(-1).auth).toEqual({ password: "stored-pw" });
+    });
+
+    it("still requires a credential for brand-new form data (no id)", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts/test-connection",
+        method: "POST",
+        body: { ip: "10.0.0.6", auth_type: "password" }, // no id, no password
+      }));
+      expect(status).toBe(200);
+      expect(body.ok).toBe(false);
+      expect(body.message).toMatch(/requires a password/i);
+    });
+  });
+
+  describe("validateJumpChain", () => {
+    // Minimal fake db: each host id maps to its jump_host_id (or absent = not found).
+    const chainDb = (map: Record<string, string | null>): any => ({
+      query: vi.fn(async (_sql: string, args: any[]) => {
+        const id = args[0];
+        return id in map ? [[{ jump_host_id: map[id] }], []] : [[], []];
+      }),
+    });
+
+    it("is a no-op when jumpHostId is empty", async () => {
+      await expect(validateJumpChain(chainDb({}), "a", null)).resolves.toBeUndefined();
+    });
+
+    it("rejects a self-reference", async () => {
+      await expect(validateJumpChain(chainDb({ a: null }), "a", "a")).rejects.toThrow(/its own jump host/);
+    });
+
+    it("rejects a dangling reference", async () => {
+      await expect(validateJumpChain(chainDb({}), "a", "ghost")).rejects.toThrow(/not found/);
+    });
+
+    it("rejects a cycle", async () => {
+      // a → b → a
+      await expect(validateJumpChain(chainDb({ b: "a", a: "b" }), "a", "b")).rejects.toThrow(/cycle/);
+    });
+
+    it("rejects a chain deeper than 3", async () => {
+      await expect(
+        validateJumpChain(chainDb({ b: "c", c: "d", d: "e", e: null }), "a", "b"),
+      ).rejects.toThrow(/exceeds max depth/);
+    });
+
+    it("accepts a valid short chain", async () => {
+      await expect(validateJumpChain(chainDb({ b: "c", c: null }), "a", "b")).resolves.toBeUndefined();
     });
   });
 });
