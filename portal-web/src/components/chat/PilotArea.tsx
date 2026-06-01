@@ -128,7 +128,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-proceed",
     label: "Proceed",
     fullPrompt:
-      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again. If there are two or more independent hypotheses, validation paths, objects, or evidence sources to check, prefer a single delegate_to_agents call with 1-3 narrow self sub-agent tasks instead of sequentially checking everything yourself. Treat delegate_to_agents status=\"running\" as launch-only and wait for delegated results before synthesizing. If there is only one small direct validation, run it yourself. Report evidence after the validation step.",
+      "Proceed with the current leading hypothesis or most promising lead. Do not ask for confirmation again. If there are two or more independent hypotheses, validation paths, objects, or evidence sources to check, fan out: emit one spawn_subagent per check in the same turn so they run concurrently, each with a narrow, evidence-oriented scope and only the context it needs — do not check them one-by-one yourself. When the sub-agent reports come back, synthesize them into your hypotheses, confidence, and next step. If there is only one small direct validation, run it yourself. Report evidence after the validation step.",
     placeholder: "Add optional direction for this step",
   },
   B: {
@@ -136,7 +136,7 @@ const DP_CHECKPOINT_PREFIX_CHIPS: Record<string, PrefixActionChip> = {
     id: "dp-checkpoint-refine",
     label: "Refine",
     fullPrompt:
-      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed. If the refined direction names multiple independent hypotheses, validation paths, objects, or evidence sources, prefer a single delegate_to_agents call with 1-3 narrow self sub-agent tasks instead of sequentially checking everything yourself. Treat delegate_to_agents status=\"running\" as launch-only and wait for delegated results before synthesizing.",
+      "Refine or add hypotheses based on my additional direction below. Preserve useful evidence, update confidence, and explain what changed. If the refined direction names multiple independent hypotheses, validation paths, objects, or evidence sources, fan out: emit one spawn_subagent per check in the same turn so they run concurrently instead of checking them one-by-one yourself. Synthesize the sub-agent reports when they return.",
     placeholder: "Describe what to adjust or add",
   },
   C: {
