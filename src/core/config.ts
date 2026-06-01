@@ -59,6 +59,8 @@ export interface SiclawConfig {
   debugPodTTL: number;
   /** Idle timeout before cached debug pods are evicted, in seconds. */
   debugPodIdleTimeout: number;
+  /** Max time a debug pod may take to reach Running before the tool fails fast, in seconds. */
+  debugPodStartupTimeout: number;
   allowedTools: string[] | null;
   mcpServers: Record<string, unknown>;
   metrics?: { port?: number; token?: string; includeUserId?: boolean };
@@ -104,6 +106,7 @@ const DEFAULTS: SiclawConfig = {
   debugNamespace: "default",
   debugPodTTL: 600,
   debugPodIdleTimeout: 60,
+  debugPodStartupTimeout: 60,
   allowedTools: null,
   mcpServers: {},
   debug: false,
@@ -245,6 +248,11 @@ export function loadConfig(): SiclawConfig {
   if (process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT) {
     const v = parseInt(process.env.SICLAW_DEBUG_POD_IDLE_TIMEOUT, 10);
     if (!isNaN(v)) cached.debugPodIdleTimeout = v;
+  }
+  // Max seconds to wait for a debug pod to reach Running before failing fast.
+  if (process.env.SICLAW_DEBUG_POD_STARTUP_TIMEOUT) {
+    const v = parseInt(process.env.SICLAW_DEBUG_POD_STARTUP_TIMEOUT, 10);
+    if (!isNaN(v) && v > 0) cached.debugPodStartupTimeout = v;
   }
 
   return cached;
