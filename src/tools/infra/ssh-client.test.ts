@@ -56,6 +56,10 @@ const { MockClient, mockState, mockStreams } = vi.hoisted(() => {
 
   class MockClient extends TinyEmitter {
     end = () => {};
+    forwardOut(_sip: string, _sport: number, _dip: string, _dport: number, cb: (err: Error | null, stream?: any) => void): void {
+      // Hand back a dummy duplex; the next hop's connect ignores `sock`.
+      cb(null, new TinyEmitter() as any);
+    }
     exec(_cmd: string, cb: (err: Error | null, stream?: MockStream) => void): void {
       if (state.execShouldError) { cb(new Error("Exec failed")); return; }
       const stream = streams.shift() ?? new MockStream();
@@ -150,6 +154,21 @@ function makeBrokerStub(info?: HostLocalInfo): CredentialBroker {
   } as unknown as CredentialBroker;
 }
 
+// Multi-host broker stub keyed by name — for jump-chain recursion tests.
+function makeMultiBrokerStub(infos: Record<string, HostLocalInfo>): CredentialBroker {
+  return {
+    ensureHost: vi.fn(async (name: string) => infos[name] ?? (null as any)),
+    getHostLocalInfo: vi.fn((name: string) => infos[name]),
+  } as unknown as CredentialBroker;
+}
+
+function keyInfo(name: string, ip: string, jumpHost?: string, extraFiles: string[] = []): HostLocalInfo {
+  return {
+    meta: { name, ip, port: 22, username: "root", auth_type: "key", is_production: false, ...(jumpHost ? { jump_host: jumpHost } : {}) },
+    filePaths: [`/tmp/${name}.${name}.key`, ...extraFiles],
+  } as HostLocalInfo;
+}
+
 describe("acquireSshTarget", () => {
   it("throws when broker is undefined", async () => {
     await expect(acquireSshTarget(undefined, "host-1", "test"))
@@ -206,6 +225,49 @@ describe("acquireSshTarget", () => {
       username: "root",
       auth: { type: "password", passwordPath: "/tmp/host-2.host-2.password" },
     });
+  });
+
+  it("wires a passphrasePath when a .passphrase file is materialized", async () => {
+    const broker = makeBrokerStub({
+      meta: { name: "host-1", ip: "10.0.0.1", port: 22, username: "ops", auth_type: "key", is_production: true },
+      filePaths: ["/tmp/host-1.host-1.key", "/tmp/host-1.host-1.passphrase"],
+    });
+    const target = await acquireSshTarget(broker, "host-1", "test");
+    expect(target.auth).toEqual({
+      type: "key",
+      privateKeyPath: "/tmp/host-1.host-1.key",
+      passphrasePath: "/tmp/host-1.host-1.passphrase",
+    });
+  });
+
+  it("recursively resolves a jump chain into nested target.jumpHost", async () => {
+    const broker = makeMultiBrokerStub({
+      target: keyInfo("target", "10.0.0.9", "bastion"),
+      bastion: keyInfo("bastion", "10.0.0.1"),
+    });
+    const t = await acquireSshTarget(broker, "target", "test");
+    expect(t.host).toBe("10.0.0.9");
+    expect(t.jumpHost?.host).toBe("10.0.0.1");
+    expect(t.jumpHost?.jumpHost).toBeUndefined();
+  });
+
+  it("throws on a jump-host cycle", async () => {
+    const broker = makeMultiBrokerStub({
+      a: keyInfo("a", "10.0.0.1", "b"),
+      b: keyInfo("b", "10.0.0.2", "a"),
+    });
+    await expect(acquireSshTarget(broker, "a", "test")).rejects.toThrow(/cycle/);
+  });
+
+  it("throws when the jump chain exceeds max depth", async () => {
+    const broker = makeMultiBrokerStub({
+      a: keyInfo("a", "10.0.0.1", "b"),
+      b: keyInfo("b", "10.0.0.2", "c"),
+      c: keyInfo("c", "10.0.0.3", "d"),
+      d: keyInfo("d", "10.0.0.4", "e"),
+      e: keyInfo("e", "10.0.0.5"),
+    });
+    await expect(acquireSshTarget(broker, "a", "test")).rejects.toThrow(/max depth/);
   });
 });
 
@@ -273,6 +335,19 @@ describe("sshExec — happy paths", () => {
     stream.emit("close", 0);
     await promise;
     expect(stream.stdin.end).not.toHaveBeenCalled();
+  });
+
+  it("runs through a jump host (forwardOut + sock chain)", async () => {
+    const stream = nextStream();
+    const bastion = makeKeyTarget("bastion", 22);
+    const target = { ...makeKeyTarget("target", 22), jumpHost: bastion };
+    const promise = sshExec(target, "uptime", { timeoutMs: 5000 });
+    await waitForWiring(stream);
+    stream.emit("data", Buffer.from("up 1 day\n"));
+    stream.emit("close", 0);
+    const result = await promise;
+    expect(result.stdout).toBe("up 1 day\n");
+    expect(result.exitCode).toBe(0);
   });
 
   it("truncates output above 10 MB", async () => {
