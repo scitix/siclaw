@@ -23,7 +23,7 @@ export function createHostListTool(kubeconfigRef: KubeconfigRef): ToolDefinition
     },
     renderResult: renderTextResult,
     description: `List SSH-reachable hosts bound to the current agent.
-Returns host names, IPs, ports, usernames, auth_type ("password" or "key"), and is_production.
+Returns host names, IPs, ports, usernames, auth_type ("password" or "key"), is_production, and jump_host (the bastion name when the host is reached via ProxyJump — host_exec/host_script tunnel through it automatically).
 Does NOT return password or private_key — those are materialized to disk only when an SSH-using tool actually runs.
 Use this to discover hosts that the agent can reach via SSH (for node-level diagnostics outside the K8s API).`,
     parameters: Type.Object({}),
@@ -59,6 +59,9 @@ Use this to discover hosts that the agent can reach via SSH (for node-level diag
         auth_type: meta.auth_type,
         is_production: meta.is_production,
         ...(meta.description ? { description: meta.description } : {}),
+        // Surfaced so the model knows a host is reached through a bastion; the
+        // jump chain is dialed automatically by host_exec / host_script.
+        ...(meta.jump_host ? { jump_host: meta.jump_host } : {}),
       }));
 
       let hint = "";
