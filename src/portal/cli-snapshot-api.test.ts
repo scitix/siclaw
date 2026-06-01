@@ -373,6 +373,35 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(key.privateKey).toContain("BEGIN OPENSSH");
   });
 
+  it("pulls a bound host's jump host into the snapshot transitively and sets jumpHost", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO agents (id, name, status, is_production, created_by) VALUES (?, ?, ?, ?, ?)",
+      ["jag", "jump-agent", "active", 1, "u"],
+    );
+    await db.query(
+      "INSERT INTO hosts (id, name, ip, port, username, auth_type, password) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["bas", "bastion", "10.0.0.1", 22, "root", "password", "pw1"],
+    );
+    await db.query(
+      "INSERT INTO hosts (id, name, ip, port, username, auth_type, password, jump_host_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ["tgt", "target", "10.0.0.9", 22, "root", "password", "pw2", "bas"],
+    );
+    // Bind ONLY the target to the agent; the bastion must come along transitively.
+    await db.query("INSERT INTO agent_hosts (agent_id, host_id) VALUES (?, ?)", ["jag", "tgt"]);
+
+    const { body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot?agent=jump-agent", headers: authedHeaders() }),
+    );
+    const names = body.credentials.hosts.map((h: any) => h.name).sort();
+    expect(names).toEqual(["bastion", "target"]);
+    const target = body.credentials.hosts.find((h: any) => h.name === "target");
+    expect(target.jumpHost).toBe("bastion");
+    const bastion = body.credentials.hosts.find((h: any) => h.name === "bastion");
+    expect(bastion.jumpHost).toBeNull();
+  });
+
   // ── Agent binding ────────────────────────────────────────────────
 
   it("populates availableAgents even when the request is unscoped", async () => {

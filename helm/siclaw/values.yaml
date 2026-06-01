@@ -18,7 +18,7 @@ database:
 
 # -- Agent Runtime
 # NOTE: Runtime is a singleton — exactly one replica per Helm release.
-# Phone-home WS registration on the upstream (Portal or SiCore) is keyed by
+# Phone-home WS registration on the upstream (Portal or an external management server) is keyed by
 # runtime identity and a second connection with the same identity evicts the
 # first, so multiple replicas of the same release would continuously fight.
 # Scale horizontally by deploying multiple releases with distinct identities.
@@ -58,7 +58,7 @@ runtime:
       cpu: "2"
       memory: "2Gi"
   memory:
-    # Disabled by default for Sicore-integrated production deployments. Enabling
+    # Disabled by default for integrated production deployments. Enabling
     # this re-exposes memory_search/memory_get and session memory auto-save.
     enabled: false
   # Max sub-agent child sessions a single AgentBox runs concurrently. A wide
@@ -143,10 +143,10 @@ ocr:
     # ingressFrom:
     #   - namespaceSelector:
     #       matchLabels:
-    #         kubernetes.io/metadata.name: sicore
+    #         kubernetes.io/metadata.name: management-server
     #     podSelector:
     #       matchLabels:
-    #         app.kubernetes.io/name: sicore-apiserver
+    #         app.kubernetes.io/name: management-apiserver
     ingressFrom: []
 
 # -- AgentBox (spawned at runtime by K8s spawner)

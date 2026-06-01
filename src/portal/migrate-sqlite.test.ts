@@ -85,6 +85,7 @@ describe("runPortalMigrations on SQLite :memory:", () => {
       "idx_kpe_repo",
       "idx_skills_overlay",
       "idx_skills_org_name",
+      "idx_hosts_jump",
     ];
 
     await runPortalMigrations();
@@ -168,6 +169,15 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(cols).toContain("is_builtin");
     expect(cols).toContain("overlay_of");
     expect(cols).toContain("updated_at");
+  });
+
+  it("hosts.jump_host_id and hosts.passphrase columns exist after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(hosts)");
+    const cols = rows.map((r) => r.name);
+    expect(cols).toContain("jump_host_id");
+    expect(cols).toContain("passphrase");
   });
 
   it("chat_messages has no updated_at column (since chat_messages isn't in the ON UPDATE list)", async () => {

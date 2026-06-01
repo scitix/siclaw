@@ -1,6 +1,6 @@
-# Error Envelope (siclaw + sicore)
+# Error Envelope (siclaw + management server)
 
-> **Goal**: Whenever something fails along the chat flow (browser ↔ sicore-web ↔ sicore-apiserver ↔ siclaw-runtime ↔ agentbox ↔ model/tool), the user sees a clear in-line error bubble — not a silent stop. We do **not** exhaustively classify every failure; we ensure errors are never swallowed, and we tag the few we know how to handle specifically.
+> **Goal**: Whenever something fails along the chat flow (browser ↔ management web ↔ management API server ↔ siclaw-runtime ↔ agentbox ↔ model/tool), the user sees a clear in-line error bubble — not a silent stop. We do **not** exhaustively classify every failure; we ensure errors are never swallowed, and we tag the few we know how to handle specifically.
 
 ---
 
@@ -12,7 +12,7 @@ One canonical shape, shared by REST bodies and SSE error frames.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `code` | string | ✅ | Identifier. Reuse sicore `ErrCode*` values where possible (`INTERNAL_ERROR`, `CONNECTION_FAILED`, `CONNECTION_TIMEOUT`, `TOO_MANY_REQUESTS`, etc.). Default to `INTERNAL_ERROR` when nothing better is known. |
+| `code` | string | ✅ | Identifier. Reuse the management server's `ErrCode*` values where possible (`INTERNAL_ERROR`, `CONNECTION_FAILED`, `CONNECTION_TIMEOUT`, `TOO_MANY_REQUESTS`, etc.). Default to `INTERNAL_ERROR` when nothing better is known. |
 | `message` | string | ✅ | One-line, user-facing. English fine for v1; i18n later. |
 | `retriable` | bool | ✅ | Whether the UI should show a retry button. Default to `true` when wrapping unknown errors (be optimistic). |
 | `retryAfterMs` | number | ❌ | Hint for rate-limit/overload backoff. UI uses for retry button countdown. |
@@ -23,9 +23,9 @@ One canonical shape, shared by REST bodies and SSE error frames.
 
 | Channel | Body shape |
 |---|---|
-| **REST 4xx/5xx** | `{ "error": ErrorDetail }` (matches sicore's existing `ErrorResponse`) |
+| **REST 4xx/5xx** | `{ "error": ErrorDetail }` (matches the management server's existing `ErrorResponse`) |
 | **SSE error event** | `event: error\ndata: <ErrorDetail>\n\n` (data is `ErrorDetail` directly — the event name discriminates, no extra wrapping) |
-| **WS RPC error** (sicore↔runtime) | `{ ok: false, error: ErrorDetail }` — replaces today's `{OK, Error: string}` shape gradually (see §5 migration) |
+| **WS RPC error** (management server↔runtime) | `{ ok: false, error: ErrorDetail }` — replaces today's `{OK, Error: string}` shape gradually (see §5 migration) |
 
 ---
 
@@ -35,10 +35,10 @@ Hard rule: **start small, add only when we actually emit one in code**. No specu
 
 ### Generic / fallback
 - `INTERNAL_ERROR` — anything we couldn't classify. Always default.
-- `BAD_REQUEST` — caller sent garbage (matches sicore `ErrCodeBadRequest`).
+- `BAD_REQUEST` — caller sent garbage (matches the management server's `ErrCodeBadRequest`).
 
 ### Connectivity & infra
-- `CONNECTION_FAILED` — sicore can't reach siclaw runtime ("no Runtime connected for agent X"). Maps to existing `ErrCodeConnectionFailed`.
+- `CONNECTION_FAILED` — the management server can't reach the siclaw runtime ("no Runtime connected for agent X"). Maps to existing `ErrCodeConnectionFailed`.
 - `CONNECTION_TIMEOUT` — WS RPC timed out. Maps to existing `ErrCodeConnectionTimeout`.
 - `STREAM_INTERRUPTED` — SSE / WS connection broke mid-stream.
 
@@ -75,7 +75,7 @@ That's it.
 
 ## 4. Front-end rendering
 
-Two frontends — `siclaw/portal-web` and `sicore/web` — both implement the same rules.
+Two frontends — `siclaw/portal-web` and the management server's web UI — both implement the same rules.
 
 ### `<ErrorBubble>` component
 - Inline red-toned bubble in the chat message stream (same column as agent messages, not a toast)
@@ -119,7 +119,7 @@ The frontend handles both old and new shapes during migration. After all backend
 
 ## 5. Migration & scope
 
-We are **not** rewriting all 402 catch blocks in siclaw or all 15+ `gin.H{"error": ...}` in sicore. Scope for v1:
+We are **not** rewriting all 402 catch blocks in siclaw or all 15+ `gin.H{"error": ...}` in the management server. Scope for v1:
 
 ### Required (chat-flow user-visible)
 
@@ -132,7 +132,7 @@ We are **not** rewriting all 402 catch blocks in siclaw or all 15+ `gin.H{"error
 - `portal-web/src/hooks/usePilotChat.ts` — SSE error + fetch error handling
 - `portal-web/src/components/chat/PilotArea.tsx` (or message renderer) — render error type
 
-**sicore** (Go + React):
+**Management server** (Go + React):
 - `pkg/model/response.go` — extend `ErrorDetail` with `Retriable`, `RetryAfterMs`, `RequestId`; new `RespondErrorEnvelope()` and `WriteSSEError()` helpers
 - `internal/siclaw/proxy/handler.go` — replace `gin.H{"error": ...}` with envelope helpers; map `"no Runtime connected"` → `CONNECTION_FAILED`, RPC timeout → `CONNECTION_TIMEOUT`
 - `web/components/siclaw/chat/error-bubble.tsx` (new)
@@ -141,7 +141,7 @@ We are **not** rewriting all 402 catch blocks in siclaw or all 15+ `gin.H{"error
 
 ### Not in scope (v1)
 - 400 other siclaw catches that are not on the user-visible chat path
-- Other sicore handlers (host, cluster, credential, etc.) — they use proper `RespondError` already; the gap was siclaw proxy bypassing it
+- Other management-server handlers (host, cluster, credential, etc.) — they use proper `RespondError` already; the gap was siclaw proxy bypassing it
 - Auto-classification of every model/tool error subtype — handled per-call as we encounter need
 
 ### Future (v2+, when actual UX gaps surface)
@@ -157,7 +157,7 @@ We are **not** rewriting all 402 catch blocks in siclaw or all 15+ `gin.H{"error
 | Property | Pass? | Why |
 |---|---|---|
 | Single source of truth for shape | ✅ | One `ErrorDetail`, two transports |
-| Wire-compatible with existing sicore `ErrorResponse` | ✅ | `{error: ErrorDetail}` matches; only adds optional fields |
+| Wire-compatible with the management server's existing `ErrorResponse` | ✅ | `{error: ErrorDetail}` matches; only adds optional fields |
 | Frontend renders without per-code branching | ✅ | One bubble + `retriable` flag drives all UX; code only used for optional friendlier copy via i18n later |
 | New code added without UI change | ✅ | Default render uses `message` directly |
 | Backward-compatible during migration | ✅ | `parseErrorDetail()` handles both `{error: string}` and `{error: ErrorDetail}` |

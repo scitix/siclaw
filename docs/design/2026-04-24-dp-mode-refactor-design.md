@@ -529,7 +529,7 @@ Delegation tools are hidden in ordinary chat: `delegate_to_agent` and `delegate_
 ## 8. Migration Plan
 
 ### Pre-work
-- Verify current DP persistence PR (the three commits on `feat/portal-port-from-sicore`) is merged to main.
+- Verify current DP persistence PR (the three commits on the DP-persistence port branch) is merged to main.
 - Snapshot user preferences / settings that might reference DP features (there aren't many; main one is the `[Deep Investigation]` prefix).
 
 ### Step 1 — Land ActionChip unification (no behavior change)

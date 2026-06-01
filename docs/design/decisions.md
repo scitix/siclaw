@@ -450,3 +450,56 @@ Key design choices:
 - ⚠️ Complex validators (12 commands) still need per-command escape hatches
 
 **Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
+
+---
+
+## ADR-013: Multi-Level SSH Jump Hosts via Self-Referencing `jump_host_id`
+
+**Status**: Active (2026-06, feat/ssh-jump-host)
+
+**Context**:
+`host_exec` / `host_script` could only reach directly-routable hosts. Production
+bare-metal / storage / GPU nodes typically sit behind a bastion. ADR-011 left
+non-kubeconfig credential governance for later ("Revisit when: SSH/API need
+environment-aware governance") — this is the first step.
+
+**Decision**:
+Model bastions with standard OpenSSH ProxyJump semantics, not a platform-specific
+scheme:
+- `hosts.jump_host_id` is a self-reference naming the next hop; each bastion is
+  its own managed host row with its own credentials (≡ ssh_config `ProxyJump
+  <named-host>`). Chains cap at depth 3.
+- The execution layer (`ssh-dial.ts`, broker-free) dials hop-by-hop via ssh2
+  `forwardOut` + `sock`; every hop does its own end-to-end handshake, so bastions
+  relay only ciphertext.
+- Credential boundaries carry the bastion's NAME (neutral wire reference); the
+  management server resolves `jump_host_id` → name so no internal id leaks into
+  the standard-SSH layer.
+- Binding an agent to a target transitively authorizes its jump chain. The
+  agentbox authenticates every hop, so an **explicit-credential** bastion's
+  key/password is materialized onto it (0600) like any bound host — only a
+  **managed** target's key stays solely on the bastion.
+**Consequences**:
+- ✅ Standard, portable model — the same inventory works standalone or driven by
+  an external management server
+- ✅ Reuses the existing CredentialBroker + security pipeline; no new credential store
+- ⚠️ Transitive authorization materializes onto the agentbox the credentials of
+  every **explicit** bastion in a bound target's chain (managed bastions excepted)
+- ⚠️ `is_production` is enforced only on the directly-bound entry host; a test
+  target whose chain includes a prod bastion materializes that prod bastion's key
+  onto a test agentbox — keep chains within one trust tier
+- ⚠️ The WS-RPC `credential.get` path does not enforce `is_production` matching on
+  the binding (pre-existing; shared with the cluster branch); the transitive jump
+  check mirrors each path's existing policy. Tracked as a separate follow-up.
+
+**Files**: `src/tools/infra/ssh-dial.ts`, `src/tools/infra/ssh-client.ts`, `src/portal/adapter.ts`, `src/portal/host-api.ts`, `src/portal/migrate.ts`; full contract in `docs/design/ssh-jump-host.md`
+
+**Update (2026-06, feat/ssh-managed-jump): managed auth now supported.**
+The original decision excluded "managed" target auth (last-hop key read off the
+bastion) as a community anti-pattern. Reversed by product decision to support a credential-on-bastion form. siclaw now supports
+`auth_type="managed"`: the target stores no credential; `ssh-dial` reads the first
+readable `~/.ssh/id_*` off the bastion at dial time and uses it for the final hop
+(target username + optional passphrase from the host record). Constraints: a managed
+host **requires a jump host**; the key is **not** broker-materialized (it lives on
+the bastion and transits agentbox memory) — an explicit, documented tradeoff vs.
+explicit per-hop credentials. Mechanism: read the first readable `~/.ssh/id_*` off the bastion for the final hop.

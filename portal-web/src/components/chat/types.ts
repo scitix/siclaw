@@ -30,7 +30,7 @@ export interface MessageTiming {
 }
 
 /** Wire-compatible with siclaw's ErrorDetail (src/lib/error-envelope.ts) and
- *  sicore's pkg/model ErrorDetail. See docs/design/error-envelope.md. */
+ *  the management server's ErrorDetail. See docs/design/error-envelope.md. */
 export interface ErrorDetail {
   code: string
   message: string

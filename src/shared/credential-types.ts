@@ -39,8 +39,20 @@ export interface HostMeta {
   ip: string;
   port: number;
   username: string;
-  auth_type: "password" | "key";
+  /**
+   * "managed" = the target stores no credential of its own; the last hop
+   * authenticates with a private key discovered on the jump host (bastion).
+   * Requires jump_host. See ADR-013.
+   */
+  auth_type: "password" | "key" | "managed";
   is_production: boolean;
+  /**
+   * Name of the next-hop jump host (bastion), if this host is reached through a
+   * ProxyJump chain. A neutral host-name reference — the management server
+   * resolves any internal id to the host's name before sending. Absent for
+   * directly-reachable hosts. Chains resolve recursively (depth capped at 3).
+   */
+  jump_host?: string;
 }
 
 export interface CredentialFile {

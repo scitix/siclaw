@@ -108,10 +108,10 @@ attachments for chat-history replay. Model caches, when enabled, store only
 PaddleOCR/PaddleX model artifacts.
 
 The OCR service is safe to reuse from another API gateway as long as that system
-uses the same `/parse` contract. For example, Sicore can call a shared OCR
+uses the same `/parse` contract. For example, another service can call a shared OCR
 service from its siclaw proxy layer, or point to an externally managed service
 with the same request/response shape, then forward only text evidence to
-Siclaw. Sicore-specific proxy code should live in Sicore, not in this Siclaw
+Siclaw. Caller-specific proxy code should live in the caller, not in this Siclaw
 standalone OCR change.
 
 ## Deployment
@@ -123,7 +123,7 @@ The Helm chart supports three deployment profiles:
   `helm/siclaw/values-no-ocr.yaml`.
 - OCR-only addon: OCR Deployment + Service only, using
   `helm/siclaw/values-ocr-only.yaml`. This is intended for external callers
-  such as Sicore's Siclaw proxy.
+  such as a caller's Siclaw proxy.
 
 The chart creates the OCR Deployment and Service whenever:
 

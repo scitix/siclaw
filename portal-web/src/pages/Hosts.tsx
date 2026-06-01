@@ -1,24 +1,68 @@
 import { useState, useEffect } from "react"
-import { Plus, Monitor, Trash2, Loader2, Settings } from "lucide-react"
+import { Plus, Monitor, Trash2, Loader2, Settings, Zap } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
 
 interface Host {
-  id: string; name: string; ip: string; port: number; username: string; auth_type: string; description: string; is_production: boolean; created_at: string
+  id: string; name: string; ip: string; port: number; username: string; auth_type: string; description: string; is_production: boolean; jump_host_id?: string | null; created_at: string
 }
+
+const emptyForm = { name: "", ip: "", port: "22", username: "root", auth_type: "password", password: "", private_key: "", passphrase: "", description: "", is_production: true, jump_host_id: "" }
 
 export function Hosts() {
   const [hosts, setHosts] = useState<Host[]>([])
   const [loading, setLoading] = useState(true)
   const [showCreate, setShowCreate] = useState(false)
-  const [form, setForm] = useState({ name: "", ip: "", port: "22", username: "root", auth_type: "password", password: "", private_key: "", description: "", is_production: true })
+  const [form, setForm] = useState({ ...emptyForm })
   const [creating, setCreating] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [editForm, setEditForm] = useState({ name: "", ip: "", port: "22", username: "root", auth_type: "password", password: "", private_key: "", description: "", is_production: true })
+  const [editForm, setEditForm] = useState({ ...emptyForm })
   const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [testingHostId, setTestingHostId] = useState<string | null>(null)
   const toast = useToast()
   const confirmDialog = useConfirm()
+
+  // Test connectivity of an already-saved host (dials its full jump chain).
+  const handleTestHost = async (id: string) => {
+    setTestingHostId(id)
+    try {
+      const r = await api<{ ok: boolean; message: string }>(`/hosts/${id}/test`, { method: "POST", body: {} })
+      if (r.ok) toast.success(r.message || "SSH connection OK")
+      else toast.error(r.message || "Connection failed")
+    } catch (err: any) {
+      toast.error(err.message)
+    } finally {
+      setTestingHostId(null)
+    }
+  }
+
+  // Test a connection using the (possibly unsaved) form values, so the operator
+  // can validate what they typed before saving. The jump chain is resolved
+  // server-side from saved hosts; the target hop uses these inline credentials.
+  const handleTestConnection = async (f: typeof emptyForm, id?: string) => {
+    setTesting(true)
+    try {
+      const body: Record<string, unknown> = {
+        ip: f.ip, port: parseInt(f.port), username: f.username,
+        auth_type: f.auth_type, jump_host_id: f.jump_host_id || null,
+      }
+      // Editing: send the host id so the server falls back blank credential
+      // fields to the stored secret (the form omits unchanged passwords/keys).
+      if (id) body.id = id
+      if (f.auth_type === "password" && f.password) body.password = f.password
+      if (f.auth_type === "key" && f.private_key) body.private_key = f.private_key
+      if ((f.auth_type === "key" || f.auth_type === "managed") && f.passphrase) body.passphrase = f.passphrase
+      const r = await api<{ ok: boolean; message: string }>("/hosts/test-connection", { method: "POST", body })
+      if (r.ok) toast.success(r.message || "SSH connection OK")
+      else toast.error(r.message || "Connection failed")
+    } catch (err: any) {
+      toast.error(err.message)
+    } finally {
+      setTesting(false)
+    }
+  }
 
   useEffect(() => {
     api<{ data: Host[] }>("/hosts").then((r) => setHosts(Array.isArray(r.data) ? r.data : Array.isArray(r) ? r as any : [])).catch(() => setHosts([])).finally(() => setLoading(false))
@@ -27,10 +71,18 @@ export function Hosts() {
   const handleCreate = async () => {
     setCreating(true)
     try {
-      const h = await api<Host>("/hosts", { method: "POST", body: { ...form, port: parseInt(form.port) } })
+      const body: Record<string, unknown> = {
+        name: form.name, ip: form.ip, port: parseInt(form.port), username: form.username,
+        auth_type: form.auth_type, description: form.description, is_production: form.is_production,
+        jump_host_id: form.jump_host_id || null,
+      }
+      if (form.auth_type === "password" && form.password) body.password = form.password
+      if (form.auth_type === "key" && form.private_key) body.private_key = form.private_key
+      if ((form.auth_type === "key" || form.auth_type === "managed") && form.passphrase) body.passphrase = form.passphrase
+      const h = await api<Host>("/hosts", { method: "POST", body })
       setHosts((prev) => [...prev, h])
       setShowCreate(false)
-      setForm({ name: "", ip: "", port: "22", username: "root", auth_type: "password", password: "", private_key: "", description: "", is_production: true })
+      setForm({ ...emptyForm })
       toast.success("Host created")
     } catch (err: any) {
       toast.error(err.message)
@@ -47,7 +99,7 @@ export function Hosts() {
 
   const startEditHost = (h: Host) => {
     setEditingId(h.id)
-    setEditForm({ name: h.name, ip: h.ip, port: String(h.port), username: h.username, auth_type: h.auth_type || "password", password: "", private_key: "", description: h.description || "", is_production: h.is_production })
+    setEditForm({ name: h.name, ip: h.ip, port: String(h.port), username: h.username, auth_type: h.auth_type || "password", password: "", private_key: "", passphrase: "", description: h.description || "", is_production: h.is_production, jump_host_id: h.jump_host_id || "" })
   }
 
   const handleSaveEdit = async () => {
@@ -62,9 +114,11 @@ export function Hosts() {
         auth_type: editForm.auth_type,
         description: editForm.description,
         is_production: editForm.is_production,
+        jump_host_id: editForm.jump_host_id || null,
       }
       if (editForm.auth_type === "password" && editForm.password) body.password = editForm.password
       if (editForm.auth_type === "key" && editForm.private_key) body.private_key = editForm.private_key
+      if ((editForm.auth_type === "key" || editForm.auth_type === "managed") && editForm.passphrase) body.passphrase = editForm.passphrase
       const updated = await api<Host>(`/hosts/${editingId}`, { method: "PUT", body })
       setHosts((prev) => prev.map((h) => h.id === editingId ? updated : h))
       setEditingId(null)
@@ -119,19 +173,45 @@ export function Hosts() {
               <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
                 <input type="radio" name="auth" checked={form.auth_type === "key"} onChange={() => setForm({ ...form, auth_type: "key" })} /> SSH Key
               </label>
+              <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                <input type="radio" name="auth" checked={form.auth_type === "managed"} onChange={() => setForm({ ...form, auth_type: "managed" })} /> Managed (key on jump host)
+              </label>
             </div>
           </div>
-          {form.auth_type === "password" ? (
+          {form.auth_type === "password" && (
             <div>
               <label className="block text-sm font-medium mb-1">Password</label>
               <input type="password" placeholder="SSH password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
             </div>
-          ) : (
-            <div>
-              <label className="block text-sm font-medium mb-1">Private Key</label>
-              <textarea placeholder="Paste SSH private key (PEM format)" value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+          )}
+          {form.auth_type === "key" && (
+            <>
+              <div>
+                <label className="block text-sm font-medium mb-1">Private Key</label>
+                <textarea placeholder="Paste SSH private key (PEM format)" value={form.private_key} onChange={(e) => setForm({ ...form, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Key Passphrase</label>
+                <input type="password" placeholder="Optional — only if the key is encrypted" value={form.passphrase} onChange={(e) => setForm({ ...form, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+              </div>
+            </>
+          )}
+          {form.auth_type === "managed" && (
+            <div className="rounded-md border border-border bg-secondary/20 p-3 space-y-2">
+              <p className="text-xs text-muted-foreground">Authenticates with a private key found on the selected jump host (<span className="font-mono">~/.ssh/id_*</span>). No credential is stored for this host — <span className="font-medium">a Jump Host is required</span>.</p>
+              <div>
+                <label className="block text-sm font-medium mb-1">Key Passphrase</label>
+                <input type="password" placeholder="Optional — only if the jump host's key is encrypted" value={form.passphrase} onChange={(e) => setForm({ ...form, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+              </div>
             </div>
           )}
+          <div>
+            <label className="block text-sm font-medium mb-1">Jump Host <span className="text-muted-foreground font-normal">{form.auth_type === "managed" ? "(required — bastion holding the key)" : "(ProxyJump bastion, optional)"}</span></label>
+            <select value={form.jump_host_id} onChange={(e) => setForm({ ...form, jump_host_id: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background">
+              <option value="">None (direct connection)</option>
+              {hosts.map((j) => <option key={j.id} value={j.id}>{j.name} ({j.ip})</option>)}
+            </select>
+          </div>
           <div>
             <label className="block text-sm font-medium mb-1">Description</label>
             <input placeholder="Optional description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
@@ -146,7 +226,8 @@ export function Hosts() {
             </div>
           </div>
           <div className="flex gap-2">
-            <button onClick={handleCreate} disabled={creating || !form.name || !form.ip} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "Creating..." : "Create"}</button>
+            <button onClick={handleCreate} disabled={creating || !form.name || !form.ip || (form.auth_type === "managed" && !form.jump_host_id)} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{creating ? "Creating..." : "Create"}</button>
+            <button onClick={() => handleTestConnection(form)} disabled={testing || !form.ip || (form.auth_type === "managed" && !form.jump_host_id)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-50">{testing ? "Testing..." : "Test Connection"}</button>
             <button onClick={() => setShowCreate(false)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
           </div>
         </div>
@@ -170,9 +251,12 @@ export function Hosts() {
                         {h.is_production ? "PROD" : "DEV"}
                       </span>
                     </div>
-                    <p className="text-xs text-muted-foreground">{h.username}@{h.ip}:{h.port} · {h.auth_type}{h.description ? ` · ${h.description}` : ""}</p>
+                    <p className="text-xs text-muted-foreground">{h.username}@{h.ip}:{h.port} · {h.auth_type}{h.jump_host_id ? ` · via ${hosts.find((j) => j.id === h.jump_host_id)?.name ?? "jump"}` : ""}{h.description ? ` · ${h.description}` : ""}</p>
                   </div>
                   <div className="flex items-center gap-1">
+                    <button onClick={(e) => { e.stopPropagation(); handleTestHost(h.id) }} disabled={testingHostId === h.id} title="Test connection" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground disabled:opacity-50">
+                      {testingHostId === h.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+                    </button>
                     <button onClick={(e) => { e.stopPropagation(); startEditHost(h) }} title="Settings" className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground">
                       <Settings className="h-4 w-4" />
                     </button>
@@ -210,19 +294,45 @@ export function Hosts() {
                         <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
                           <input type="radio" name="edit-auth" checked={editForm.auth_type === "key"} onChange={() => setEditForm({ ...editForm, auth_type: "key" })} /> SSH Key
                         </label>
+                        <label className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                          <input type="radio" name="edit-auth" checked={editForm.auth_type === "managed"} onChange={() => setEditForm({ ...editForm, auth_type: "managed" })} /> Managed (key on jump host)
+                        </label>
                       </div>
                     </div>
-                    {editForm.auth_type === "password" ? (
+                    {editForm.auth_type === "password" && (
                       <div>
                         <label className="block text-sm font-medium mb-1">Password</label>
-                        <input type="password" placeholder="Leave empty to keep current" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
-                      </div>
-                    ) : (
-                      <div>
-                        <label className="block text-sm font-medium mb-1">Private Key</label>
-                        <textarea placeholder="Leave empty to keep current" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                        <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.password} onChange={(e) => setEditForm({ ...editForm, password: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
                       </div>
                     )}
+                    {editForm.auth_type === "key" && (
+                      <>
+                        <div>
+                          <label className="block text-sm font-medium mb-1">Private Key</label>
+                          <textarea placeholder="Leave blank to keep current — type only to overwrite" value={editForm.private_key} onChange={(e) => setEditForm({ ...editForm, private_key: e.target.value })} rows={4} className="w-full px-3 py-2 text-xs font-mono rounded-md border border-border bg-background resize-none" />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium mb-1">Key Passphrase</label>
+                          <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                        </div>
+                      </>
+                    )}
+                    {editForm.auth_type === "managed" && (
+                      <div className="rounded-md border border-border bg-secondary/20 p-3 space-y-2">
+                        <p className="text-xs text-muted-foreground">Authenticates with a private key found on the selected jump host (<span className="font-mono">~/.ssh/id_*</span>). No credential is stored for this host — <span className="font-medium">a Jump Host is required</span>.</p>
+                        <div>
+                          <label className="block text-sm font-medium mb-1">Key Passphrase</label>
+                          <input type="password" placeholder="Leave blank to keep current — type only to overwrite" value={editForm.passphrase} onChange={(e) => setEditForm({ ...editForm, passphrase: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
+                        </div>
+                      </div>
+                    )}
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Jump Host <span className="text-muted-foreground font-normal">{editForm.auth_type === "managed" ? "(required — bastion holding the key)" : "(ProxyJump bastion, optional)"}</span></label>
+                      <select value={editForm.jump_host_id} onChange={(e) => setEditForm({ ...editForm, jump_host_id: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background">
+                        <option value="">None (direct connection)</option>
+                        {hosts.filter((j) => j.id !== h.id).map((j) => <option key={j.id} value={j.id}>{j.name} ({j.ip})</option>)}
+                      </select>
+                    </div>
                     <div>
                       <label className="block text-sm font-medium mb-1">Description</label>
                       <input value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="w-full h-8 px-3 text-sm rounded-md border border-border bg-background" />
@@ -237,7 +347,8 @@ export function Hosts() {
                       </div>
                     </div>
                     <div className="flex gap-2">
-                      <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.ip} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
+                      <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.ip || (editForm.auth_type === "managed" && !editForm.jump_host_id)} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
+                      <button onClick={() => handleTestConnection(editForm, editingId ?? undefined)} disabled={testing || !editForm.ip || (editForm.auth_type === "managed" && !editForm.jump_host_id)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-50">{testing ? "Testing..." : "Test Connection"}</button>
                       <button onClick={() => setEditingId(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
                     </div>
                   </div>

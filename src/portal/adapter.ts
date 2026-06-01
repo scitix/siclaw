@@ -7,7 +7,7 @@
 
 import crypto from "node:crypto";
 import http from "node:http";
-import { getDb } from "../gateway/db.js";
+import { getDb, type Db } from "../gateway/db.js";
 import { buildUpsert, safeParseJson, toSqlTimestamp } from "../gateway/dialect-helpers.js";
 import { createTaskNotification } from "./notification-api.js";
 import {
@@ -26,6 +26,119 @@ function requireInternalAuth(req: http.IncomingMessage, internalSecret: string):
 function jsonParam(value: unknown): string | null {
   if (value === null || value === undefined || value === "") return null;
   return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+// ── SSH jump-host (ProxyJump) helpers ───────────────────────────────
+// Shared by the HTTP routes (registerAdapterRoutes) and the WS-RPC handlers
+// (buildAdapterRpcHandlers) so the two transports can't drift.
+
+/** Matches ssh-client MAX_JUMP_DEPTH (target + up to 3 bastions). */
+const ADAPTER_MAX_JUMP_DEPTH = 3;
+
+interface HostCredentialRow {
+  id: string;
+  name: string;
+  ip: string;
+  port: number;
+  username: string;
+  auth_type: string;
+  password: string | null;
+  private_key: string | null;
+  passphrase: string | null;
+  is_production: number | boolean;
+  description: string | null;
+  jump_host_id: string | null;
+}
+
+/** Resolve a jump_host_id to the bastion's host NAME (neutral wire reference). */
+async function resolveJumpHostName(db: Db, jumpHostId: string | null | undefined): Promise<string | null> {
+  if (!jumpHostId) return null;
+  const [rows] = (await db.query("SELECT name FROM hosts WHERE id = ?", [jumpHostId])) as any;
+  return rows.length > 0 ? (rows[0].name as string) : null;
+}
+
+/**
+ * Build the `credential` payload for an SSH host row: key/password file(s), an
+ * optional passphrase file (kept under the same 0600 materialization as the
+ * key), and metadata carrying the jump-host NAME resolved from jump_host_id.
+ * Throws if the required key/password material is empty.
+ */
+async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
+  const files: { name: string; content: string; mode?: number }[] = [];
+  const jumpName = await resolveJumpHostName(db, host.jump_host_id);
+  if (host.auth_type === "managed") {
+    // Managed: no stored key/password — the key is sourced from the bastion at
+    // dial time. Requires a jump host. Optionally ship a passphrase for an
+    // encrypted bastion key.
+    if (!jumpName) {
+      throw new Error(`Host "${host.name}" has auth_type="managed" but no jump host configured`);
+    }
+    if (host.passphrase) {
+      files.push({ name: "host.passphrase", content: host.passphrase, mode: 0o600 });
+    }
+  } else if (host.auth_type === "key") {
+    if (!host.private_key) {
+      throw new Error(`Host "${host.name}" has auth_type="key" but private_key is empty`);
+    }
+    files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
+    if (host.passphrase) {
+      files.push({ name: "host.passphrase", content: host.passphrase, mode: 0o600 });
+    }
+  } else if (host.auth_type === "password") {
+    if (!host.password) {
+      throw new Error(`Host "${host.name}" has auth_type="password" but password is empty`);
+    }
+    files.push({ name: "host.password", content: host.password });
+  } else {
+    throw new Error(`Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}`);
+  }
+  return {
+    name: host.name,
+    type: "ssh" as const,
+    files,
+    metadata: {
+      ip: host.ip,
+      port: host.port,
+      username: host.username,
+      auth_type: host.auth_type,
+      is_production: !!host.is_production,
+      ...(host.description ? { description: host.description } : {}),
+      ...(jumpName ? { jump_host: jumpName } : {}),
+    },
+    ttl_seconds: 300,
+  };
+}
+
+/**
+ * Transitive jump authorization. A host is authorized for an agent if it is the
+ * jump host (within ADAPTER_MAX_JUMP_DEPTH hops) of some host the agent is
+ * directly bound to. Binding a target thus grants transit through its bastion
+ * chain — the agent never receives a bastion's credential material, only
+ * reachability. `prodMatch` mirrors the entry-point binding's is_production
+ * constraint (the HTTP credential.get path enforces it; the WS path does not).
+ */
+async function isJumpOfBoundHost(db: Db, agentId: string, hostId: string, prodMatch: boolean): Promise<boolean> {
+  const sql = prodMatch
+    ? `SELECT h.jump_host_id FROM agent_hosts ah
+       JOIN hosts h ON ah.host_id = h.id
+       JOIN agents a ON ah.agent_id = a.id
+       WHERE ah.agent_id = ? AND a.is_production = h.is_production`
+    : `SELECT h.jump_host_id FROM agent_hosts ah
+       JOIN hosts h ON ah.host_id = h.id
+       WHERE ah.agent_id = ?`;
+  const [bound] = (await db.query(sql, [agentId])) as any;
+  for (const b of bound) {
+    let cur: string | null = (b.jump_host_id as string | null) ?? null;
+    const seen = new Set<string>();
+    for (let d = 0; cur && d < ADAPTER_MAX_JUMP_DEPTH; d++) {
+      if (cur === hostId) return true;
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      const [rows] = (await db.query("SELECT jump_host_id FROM hosts WHERE id = ?", [cur])) as any;
+      cur = rows.length > 0 ? ((rows[0].jump_host_id as string | null) ?? null) : null;
+    }
+  }
+  return false;
 }
 
 export function registerAdapterRoutes(router: RestRouter, internalSecret: string): void {
@@ -211,16 +324,18 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     if (body.source === "host") {
       // source_id is the host's NAME — see cluster branch above for rationale.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, is_production, description FROM hosts WHERE name = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
         [body.source_id],
       ) as any;
       if (rows.length === 0) {
         sendJson(res, 404, { error: "Host not found" });
         return;
       }
+      const host = rows[0] as HostCredentialRow;
 
       // Check agent binding if agent header present. Also require matching
-      // is_production so cross-env access via stale bindings is blocked.
+      // is_production so cross-env access via stale bindings is blocked. A host
+      // reached only as a jump in a bound host's chain is authorized transitively.
       if (agentId) {
         const [binding] = await db.query(
           `SELECT 1 FROM agent_hosts ah
@@ -228,50 +343,20 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
            JOIN hosts h ON ah.host_id = h.id
            WHERE ah.agent_id = ? AND ah.host_id = ?
              AND a.is_production = h.is_production`,
-          [agentId, rows[0].id],
+          [agentId, host.id],
         ) as any;
-        if (binding.length === 0) {
+        if (binding.length === 0 && !(await isJumpOfBoundHost(db, agentId, host.id, true))) {
           sendJson(res, 403, { error: "Agent not bound to this host" });
           return;
         }
       }
 
-      const host = rows[0];
-      const files: { name: string; content: string; mode?: number }[] = [];
-
-      if (host.auth_type === "key") {
-        if (!host.private_key) {
-          sendJson(res, 400, { error: `Host "${host.name}" has auth_type="key" but private_key is empty` });
-          return;
-        }
-        files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
-      } else if (host.auth_type === "password") {
-        if (!host.password) {
-          sendJson(res, 400, { error: `Host "${host.name}" has auth_type="password" but password is empty` });
-          return;
-        }
-        files.push({ name: "host.password", content: host.password });
-      } else {
-        sendJson(res, 400, { error: `Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}` });
-        return;
+      try {
+        const credential = await buildHostSshCredential(db, host);
+        sendJson(res, 200, { credential });
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
       }
-
-      sendJson(res, 200, {
-        credential: {
-          name: host.name,
-          type: "ssh",
-          files,
-          metadata: {
-            ip: host.ip,
-            port: host.port,
-            username: host.username,
-            auth_type: host.auth_type,
-            is_production: !!host.is_production,
-            ...(host.description ? { description: host.description } : {}),
-          },
-          ttl_seconds: 300,
-        },
-      });
       return;
     }
 
@@ -293,10 +378,11 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     if (body.kind === "host" || body.kind === "hosts") {
       const [rows] = await db.query(
-        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description
+        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
          FROM agent_hosts ah
          JOIN hosts h ON ah.host_id = h.id
          JOIN agents a ON ah.agent_id = a.id
+         LEFT JOIN hosts hj ON h.jump_host_id = hj.id
          WHERE ah.agent_id = ? AND a.is_production = h.is_production`,
         [agentId],
       ) as any;
@@ -305,6 +391,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
           name: r.name, ip: r.ip, port: r.port, username: r.username,
           auth_type: r.auth_type, is_production: !!r.is_production,
           ...(r.description ? { description: r.description } : {}),
+          ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
         })),
       });
       return;
@@ -1691,8 +1778,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const db = getDb();
     if (params.kind === "host" || params.kind === "hosts") {
       const [rows] = await db.query(
-        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description
-         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id WHERE ah.agent_id = ?`,
+        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
+         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id
+         LEFT JOIN hosts hj ON h.jump_host_id = hj.id
+         WHERE ah.agent_id = ?`,
         [agentId],
       ) as any;
       return {
@@ -1700,6 +1789,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           name: r.name, ip: r.ip, port: r.port, username: r.username,
           auth_type: r.auth_type, is_production: !!r.is_production,
           ...(r.description ? { description: r.description } : {}),
+          ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
         })),
       };
     }
@@ -1764,49 +1854,24 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     if (params.source === "host") {
       // source_id is the host's NAME — see cluster branch above.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, is_production, description FROM hosts WHERE name = ?",
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
         [params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Host not found");
-      const host = rows[0];
+      const host = rows[0] as HostCredentialRow;
 
       if (agentId) {
         const [binding] = await db.query(
           "SELECT 1 FROM agent_hosts WHERE agent_id = ? AND host_id = ?",
           [agentId, host.id],
         ) as any;
-        if (binding.length === 0) throw new Error("Agent not bound to this host");
-      }
-      const files: { name: string; content: string; mode?: number }[] = [];
-      if (host.auth_type === "key") {
-        if (!host.private_key) {
-          throw new Error(`Host "${host.name}" has auth_type="key" but private_key is empty`);
+        // A host reached only as a jump in a bound host's chain is authorized
+        // transitively.
+        if (binding.length === 0 && !(await isJumpOfBoundHost(db, agentId, host.id, false))) {
+          throw new Error("Agent not bound to this host");
         }
-        files.push({ name: "host.key", content: host.private_key, mode: 0o600 });
-      } else if (host.auth_type === "password") {
-        if (!host.password) {
-          throw new Error(`Host "${host.name}" has auth_type="password" but password is empty`);
-        }
-        files.push({ name: "host.password", content: host.password });
-      } else {
-        throw new Error(`Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}`);
       }
-      return {
-        credential: {
-          name: host.name,
-          type: "ssh",
-          files,
-          metadata: {
-            ip: host.ip,
-            port: host.port,
-            username: host.username,
-            auth_type: host.auth_type,
-            is_production: !!host.is_production,
-            ...(host.description ? { description: host.description } : {}),
-          },
-          ttl_seconds: 300,
-        },
-      };
+      return { credential: await buildHostSshCredential(db, host) };
     }
 
     throw new Error(`Unknown source type: ${params.source}`);
@@ -1857,9 +1922,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     const sqlParams: unknown[] = [];
 
     if (effectiveAgentId) {
-      sql = `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.description
+      sql = `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.description, hj.name AS jump_host
              FROM agent_hosts ah
              JOIN hosts h ON ah.host_id = h.id
+             LEFT JOIN hosts hj ON h.jump_host_id = hj.id
              WHERE ah.agent_id = ?`;
       sqlParams.push(effectiveAgentId);
       if (params.query) {
@@ -1867,9 +1933,9 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         sqlParams.push(`%${params.query}%`, `%${params.query}%`, `%${params.query}%`);
       }
     } else {
-      sql = "SELECT id, name, ip, port, username, auth_type, description FROM hosts";
+      sql = "SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.description, hj.name AS jump_host FROM hosts h LEFT JOIN hosts hj ON h.jump_host_id = hj.id";
       if (params.query) {
-        sql += " WHERE name LIKE ? OR ip LIKE ? OR description LIKE ?";
+        sql += " WHERE h.name LIKE ? OR h.ip LIKE ? OR h.description LIKE ?";
         sqlParams.push(`%${params.query}%`, `%${params.query}%`, `%${params.query}%`);
       }
     }
