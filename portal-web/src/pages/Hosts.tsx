@@ -41,13 +41,16 @@ export function Hosts() {
   // Test a connection using the (possibly unsaved) form values, so the operator
   // can validate what they typed before saving. The jump chain is resolved
   // server-side from saved hosts; the target hop uses these inline credentials.
-  const handleTestConnection = async (f: typeof emptyForm) => {
+  const handleTestConnection = async (f: typeof emptyForm, id?: string) => {
     setTesting(true)
     try {
       const body: Record<string, unknown> = {
         ip: f.ip, port: parseInt(f.port), username: f.username,
         auth_type: f.auth_type, jump_host_id: f.jump_host_id || null,
       }
+      // Editing: send the host id so the server falls back blank credential
+      // fields to the stored secret (the form omits unchanged passwords/keys).
+      if (id) body.id = id
       if (f.auth_type === "password" && f.password) body.password = f.password
       if (f.auth_type === "key" && f.private_key) body.private_key = f.private_key
       if ((f.auth_type === "key" || f.auth_type === "managed") && f.passphrase) body.passphrase = f.passphrase
@@ -345,7 +348,7 @@ export function Hosts() {
                     </div>
                     <div className="flex gap-2">
                       <button onClick={handleSaveEdit} disabled={saving || !editForm.name || !editForm.ip || (editForm.auth_type === "managed" && !editForm.jump_host_id)} className="h-8 px-4 text-sm rounded-md bg-primary text-primary-foreground disabled:opacity-50">{saving ? "Saving..." : "Save"}</button>
-                      <button onClick={() => handleTestConnection(editForm)} disabled={testing || !editForm.ip || (editForm.auth_type === "managed" && !editForm.jump_host_id)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-50">{testing ? "Testing..." : "Test Connection"}</button>
+                      <button onClick={() => handleTestConnection(editForm, editingId ?? undefined)} disabled={testing || !editForm.ip || (editForm.auth_type === "managed" && !editForm.jump_host_id)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-50">{testing ? "Testing..." : "Test Connection"}</button>
                       <button onClick={() => setEditingId(null)} className="h-8 px-4 text-sm rounded-md border border-border text-muted-foreground hover:text-foreground">Cancel</button>
                     </div>
                   </div>
