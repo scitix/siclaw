@@ -139,6 +139,34 @@ describe("registerHostRoutes", () => {
       expect(insertArgs[11]).toBeNull(); // jump_host_id defaults to null
     });
 
+    it("rejects auth_type=managed without a jump_host_id (400)", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts",
+        method: "POST",
+        body: { name: "m", ip: "10.0.0.9", auth_type: "managed" },
+      }));
+      expect(status).toBe(400);
+      expect(body.error).toMatch(/managed.*requires a jump_host_id/i);
+    });
+
+    it("creates a managed host with a jump host (no secrets stored)", async () => {
+      query
+        .mockResolvedValueOnce([[{ jump_host_id: null }], []]) // validateJumpChain: bastion exists, no further jump
+        .mockResolvedValueOnce([undefined, []])                // INSERT
+        .mockResolvedValueOnce([[{ id: "h-m", name: "m" }], []]); // SELECT back
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/hosts",
+        method: "POST",
+        body: { name: "m", ip: "10.0.0.9", auth_type: "managed", jump_host_id: "bastion-id" },
+      }));
+      expect(status).toBe(201);
+      const insertArgs = query.mock.calls[1][1]; // calls[0] = validateJumpChain SELECT
+      expect(insertArgs[5]).toBe("managed");      // auth_type
+      expect(insertArgs[6]).toBeNull();           // password
+      expect(insertArgs[7]).toBeNull();           // private_key
+      expect(insertArgs[11]).toBe("bastion-id");  // jump_host_id
+    });
+
     it("never returns password or private_key in response", async () => {
       query
         .mockResolvedValueOnce([undefined, []])

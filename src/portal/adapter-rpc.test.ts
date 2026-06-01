@@ -516,6 +516,19 @@ describe("credential.get", () => {
     ]);
   });
 
+  it("returns a managed credential: auth_type=managed + jump_host, no key/password file", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", password: null, private_key: null, passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
+      [{ "1": 1 }],         // binding ok
+      [{ name: "bastion" }], // resolveJumpHostName
+    );
+    const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
+    expect(result.credential.type).toBe("ssh");
+    expect(result.credential.metadata.auth_type).toBe("managed");
+    expect(result.credential.metadata.jump_host).toBe("bastion");
+    expect(result.credential.files).toEqual([]);
+  });
+
   it("authorizes a jump host transitively when the agent is bound to a host that uses it", async () => {
     mockQuery(
       // 1) resolve the requested bastion host

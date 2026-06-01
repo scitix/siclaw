@@ -478,13 +478,20 @@ export class CredentialBroker {
    */
   async ensureHost(hostName: string, purpose = "ensure"): Promise<HostLocalInfo> {
     const existing = this.hosts.get(hostName);
+    // Managed hosts have no key/password file (the key is sourced from the
+    // bastion at dial time), so file existence isn't a freshness/materialization
+    // requirement for them — TTL alone governs.
+    const existingManaged = existing?.meta?.auth_type === "managed";
     const fresh = existing?.expiresAt !== undefined
       && existing.expiresAt > Date.now()
-      && (existing.filePaths?.every((fp) => fs.existsSync(fp)) ?? false);
+      && (existingManaged || (existing.filePaths?.every((fp) => fs.existsSync(fp)) ?? false));
     if (existing && fresh) return existing;
     await this.acquireHost(hostName, purpose);
     const refreshed = this.hosts.get(hostName);
-    if (!refreshed?.filePaths || refreshed.filePaths.length === 0) {
+    if (!refreshed) {
+      throw new Error(`Broker.ensureHost(${hostName}) completed but host not in registry`);
+    }
+    if (refreshed.meta?.auth_type !== "managed" && (!refreshed.filePaths || refreshed.filePaths.length === 0)) {
       throw new Error(`Broker.ensureHost(${hostName}) completed but no files materialized`);
     }
     return refreshed;
@@ -590,8 +597,13 @@ function inferHostMetaFromResponse(response: CredentialResponse, fallbackName: s
   if (typeof username !== "string" || username.length === 0) {
     throw new Error(`Host "${name}" credential payload missing required metadata.username`);
   }
-  if (authType !== "password" && authType !== "key") {
-    throw new Error(`Host "${name}" credential payload metadata.auth_type must be "password" or "key", got ${JSON.stringify(authType)}`);
+  if (authType !== "password" && authType !== "key" && authType !== "managed") {
+    throw new Error(`Host "${name}" credential payload metadata.auth_type must be "password", "key", or "managed", got ${JSON.stringify(authType)}`);
+  }
+  // Managed hosts carry no key/password file (the key is sourced from the
+  // bastion at dial time); they require a jump_host instead.
+  if (authType === "managed" && (typeof metadata.jump_host !== "string" || metadata.jump_host.length === 0)) {
+    throw new Error(`Host "${name}" has auth_type="managed" but no metadata.jump_host`);
   }
   if (typeof isProduction !== "boolean") {
     throw new Error(`Host "${name}" credential payload missing required metadata.is_production`);

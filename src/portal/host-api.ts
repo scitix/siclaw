@@ -64,6 +64,10 @@ interface ChainHostRow {
 }
 
 function hopFromDbRow(h: ChainHostRow): DialHop {
+  if (h.auth_type === "managed") {
+    // No stored key — ssh-dial sources it from the preceding hop (the bastion).
+    return { host: h.ip, port: h.port, username: h.username, auth: { managed: true, ...(h.passphrase ? { passphrase: h.passphrase } : {}) } };
+  }
   if (h.auth_type === "key") {
     if (!h.private_key) {
       throw new Error(`Host ${h.ip} has auth_type="key" but private_key is empty`);
@@ -153,6 +157,11 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
     const id = crypto.randomUUID();
     const db = getDb();
 
+    if (body.auth_type === "managed" && !body.jump_host_id) {
+      sendJson(res, 400, { error: 'auth_type="managed" requires a jump_host_id (the bastion that holds the key)' });
+      return;
+    }
+
     try {
       await validateJumpChain(db, id, body.jump_host_id);
     } catch (err) {
@@ -206,6 +215,14 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
 
     const body = await parseBody<Record<string, unknown>>(req);
     const db = getDb();
+
+    // When switching a host to managed, it must end up with a jump host. Reject
+    // the obvious "managed + clear jump" case; the runtime layers fail closed on
+    // any managed-without-jump that slips through.
+    if (body.auth_type === "managed" && "jump_host_id" in body && !body.jump_host_id) {
+      sendJson(res, 400, { error: 'auth_type="managed" requires a jump_host_id (the bastion that holds the key)' });
+      return;
+    }
 
     if ("jump_host_id" in body) {
       try {

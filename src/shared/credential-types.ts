@@ -39,7 +39,12 @@ export interface HostMeta {
   ip: string;
   port: number;
   username: string;
-  auth_type: "password" | "key";
+  /**
+   * "managed" = the target stores no credential of its own; the last hop
+   * authenticates with a private key discovered on the jump host (bastion).
+   * Requires jump_host. See ADR-013.
+   */
+  auth_type: "password" | "key" | "managed";
   is_production: boolean;
   /**
    * Name of the next-hop jump host (bastion), if this host is reached through a

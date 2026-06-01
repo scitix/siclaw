@@ -169,6 +169,13 @@ function keyInfo(name: string, ip: string, jumpHost?: string, extraFiles: string
   } as HostLocalInfo;
 }
 
+function managedInfo(name: string, ip: string, jumpHost?: string, filePaths: string[] = []): HostLocalInfo {
+  return {
+    meta: { name, ip, port: 22, username: "ops", auth_type: "managed", is_production: false, ...(jumpHost ? { jump_host: jumpHost } : {}) },
+    filePaths,
+  } as HostLocalInfo;
+}
+
 describe("acquireSshTarget", () => {
   it("throws when broker is undefined", async () => {
     await expect(acquireSshTarget(undefined, "host-1", "test"))
@@ -268,6 +275,30 @@ describe("acquireSshTarget", () => {
       e: keyInfo("e", "10.0.0.5"),
     });
     await expect(acquireSshTarget(broker, "a", "test")).rejects.toThrow(/max depth/);
+  });
+
+  it("builds a managed target (no files) with its bastion, skipping the no-files check", async () => {
+    const broker = makeMultiBrokerStub({
+      target: managedInfo("target", "10.0.0.9", "bastion"),  // zero files
+      bastion: keyInfo("bastion", "10.0.0.1"),
+    });
+    const t = await acquireSshTarget(broker, "target", "test");
+    expect(t.auth).toEqual({ type: "managed" });
+    expect(t.jumpHost?.host).toBe("10.0.0.1");
+  });
+
+  it("wires a passphrasePath for a managed target when a .passphrase file is shipped", async () => {
+    const broker = makeMultiBrokerStub({
+      target: managedInfo("target", "10.0.0.9", "bastion", ["/tmp/target.host.passphrase"]),
+      bastion: keyInfo("bastion", "10.0.0.1"),
+    });
+    const t = await acquireSshTarget(broker, "target", "test");
+    expect(t.auth).toEqual({ type: "managed", passphrasePath: "/tmp/target.host.passphrase" });
+  });
+
+  it("throws when a managed host has no jump host", async () => {
+    const broker = makeMultiBrokerStub({ target: managedInfo("target", "10.0.0.9") });
+    await expect(acquireSshTarget(broker, "target", "test")).rejects.toThrow(/requires a jump host/);
   });
 });
 

@@ -41,7 +41,10 @@ export interface SshTarget {
   username: string;
   auth:
     | { type: "key"; privateKeyPath: string; passphrasePath?: string }
-    | { type: "password"; passwordPath: string };
+    | { type: "password"; passwordPath: string }
+    // "managed": no stored credential; the key is discovered on jumpHost at
+    // dial time. Requires jumpHost to be set.
+    | { type: "managed"; passphrasePath?: string };
   /** Next hop toward this target (the bastion), when reached via ProxyJump. */
   jumpHost?: SshTarget;
 }
@@ -89,23 +92,35 @@ async function acquireSshTargetInner(
   if (!info) {
     throw new Error(`Host "${hostName}" not loaded into broker registry after ensureHost`);
   }
-  if (!info.filePaths || info.filePaths.length === 0) {
-    throw new Error(`Host "${hostName}" has no materialized credential file`);
-  }
 
   const meta = info.meta;
-  const wantedSuffix = meta.auth_type === "key" ? ".key" : ".password";
-  const credPath = info.filePaths.find((p) => p.endsWith(wantedSuffix));
-  if (!credPath) {
-    throw new Error(`Host "${hostName}" credential file with suffix ${wantedSuffix} not found`);
-  }
+  const filePaths = info.filePaths ?? [];
 
   let auth: SshTarget["auth"];
-  if (meta.auth_type === "key") {
-    const passphrasePath = info.filePaths.find((p) => p.endsWith(".passphrase"));
-    auth = { type: "key", privateKeyPath: credPath, ...(passphrasePath ? { passphrasePath } : {}) };
+  if (meta.auth_type === "managed") {
+    // Managed hosts store no key/password of their own — the key is sourced
+    // from the bastion at dial time, so they require a jump host and may have
+    // zero materialized files (or just a .passphrase for the bastion key).
+    if (!meta.jump_host) {
+      throw new Error(`Managed host "${hostName}" requires a jump host`);
+    }
+    const passphrasePath = filePaths.find((p) => p.endsWith(".passphrase"));
+    auth = { type: "managed", ...(passphrasePath ? { passphrasePath } : {}) };
   } else {
-    auth = { type: "password", passwordPath: credPath };
+    if (filePaths.length === 0) {
+      throw new Error(`Host "${hostName}" has no materialized credential file`);
+    }
+    const wantedSuffix = meta.auth_type === "key" ? ".key" : ".password";
+    const credPath = filePaths.find((p) => p.endsWith(wantedSuffix));
+    if (!credPath) {
+      throw new Error(`Host "${hostName}" credential file with suffix ${wantedSuffix} not found`);
+    }
+    if (meta.auth_type === "key") {
+      const passphrasePath = filePaths.find((p) => p.endsWith(".passphrase"));
+      auth = { type: "key", privateKeyPath: credPath, ...(passphrasePath ? { passphrasePath } : {}) };
+    } else {
+      auth = { type: "password", passwordPath: credPath };
+    }
   }
 
   const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth };
@@ -166,6 +181,16 @@ async function targetToHops(target: SshTarget): Promise<DialHop[]> {
 }
 
 async function hopFromTarget(t: SshTarget): Promise<DialHop> {
+  if (t.auth.type === "managed") {
+    let passphrase: string | undefined;
+    if (t.auth.passphrasePath) {
+      const buf = await fsp.readFile(t.auth.passphrasePath);
+      passphrase = buf.toString("utf8").replace(/\s+$/u, "");
+      buf.fill(0);
+    }
+    // No key/password read here — ssh-dial sources the key from the bastion.
+    return { host: t.host, port: t.port, username: t.username, auth: { managed: true, ...(passphrase ? { passphrase } : {}) } };
+  }
   if (t.auth.type === "key") {
     const privateKey = await fsp.readFile(t.auth.privateKeyPath);
     let passphrase: string | undefined;

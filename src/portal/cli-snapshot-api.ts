@@ -474,7 +474,10 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       hosts: hostRows
         .filter((h) =>
           (h.auth_type === "password" && typeof h.password === "string" && h.password.length > 0) ||
-          (h.auth_type === "key" && typeof h.private_key === "string" && h.private_key.length > 0),
+          (h.auth_type === "key" && typeof h.private_key === "string" && h.private_key.length > 0) ||
+          // Managed hosts carry no key/password of their own; they're usable as
+          // long as they have a jump host to source the key from.
+          (h.auth_type === "managed" && typeof h.jump_host_name === "string" && h.jump_host_name.length > 0),
         )
         .map((h) => ({
           name: h.name,
@@ -484,7 +487,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           authType: h.auth_type,
           password: h.auth_type === "password" ? h.password : null,
           privateKey: h.auth_type === "key" ? h.private_key : null,
-          passphrase: h.auth_type === "key" ? h.passphrase : null,
+          passphrase: (h.auth_type === "key" || h.auth_type === "managed") ? h.passphrase : null,
           description: h.description,
           jumpHost: h.jump_host_name,
         })),

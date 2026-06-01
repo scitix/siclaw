@@ -65,7 +65,18 @@ async function resolveJumpHostName(db: Db, jumpHostId: string | null | undefined
  */
 async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
   const files: { name: string; content: string; mode?: number }[] = [];
-  if (host.auth_type === "key") {
+  const jumpName = await resolveJumpHostName(db, host.jump_host_id);
+  if (host.auth_type === "managed") {
+    // Managed: no stored key/password — the key is sourced from the bastion at
+    // dial time. Requires a jump host. Optionally ship a passphrase for an
+    // encrypted bastion key.
+    if (!jumpName) {
+      throw new Error(`Host "${host.name}" has auth_type="managed" but no jump host configured`);
+    }
+    if (host.passphrase) {
+      files.push({ name: "host.passphrase", content: host.passphrase, mode: 0o600 });
+    }
+  } else if (host.auth_type === "key") {
     if (!host.private_key) {
       throw new Error(`Host "${host.name}" has auth_type="key" but private_key is empty`);
     }
@@ -81,7 +92,6 @@ async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
   } else {
     throw new Error(`Host "${host.name}" has unknown auth_type=${JSON.stringify(host.auth_type)}`);
   }
-  const jumpName = await resolveJumpHostName(db, host.jump_host_id);
   return {
     name: host.name,
     type: "ssh" as const,

@@ -55,11 +55,28 @@ reachability through the bastion. The `is_production` constraint applies to the
 directly-bound entry host only; bastions inherit reachability (so a test bastion
 may legitimately front a prod target).
 
+## Managed target auth (`auth_type=managed`)
+
+Supported (see ADR-013). A managed host stores **no credential of its own**; the
+final hop authenticates with a private key discovered on the bastion
+(`~/.ssh/id_{ed25519,rsa,ecdsa,dsa}`, first readable), the target username comes
+from the host record, and an optional `passphrase` decrypts an encrypted bastion
+key. Contract:
+
+- A managed host **requires a jump host** (the bastion to source the key from) —
+  enforced on write (`host-api`), at the boundary (`adapter` emits no key/password
+  file, only `auth_type:"managed"` + `jump_host`), at acquire (`acquireSshTarget`),
+  and at dial (`dialSshChain` rejects a managed first hop).
+- `ssh-dial` sources the key by running a `cat` of the candidate paths over the
+  already-connected bastion session, then dials the target through the tunnel with
+  it (`MANAGED_KEY_FETCH_CMD`).
+- **Security tradeoff (deliberate):** the key lives on the bastion and is read into
+  agentbox memory at dial time — it is **not** broker-materialized/0600/agent-scoped.
+  This is the cost of the convenience (one credential on the bastion fronting many
+  targets). Use explicit per-hop credentials when you want full broker governance.
+
 ## Out of scope (intentional)
 
-- **Managed target auth** (reading the last-hop key *from* the bastion): a
-  community anti-pattern (keys on the bastion) and a sicore product convention.
-  Not implemented here; lives in sicore's internal integration if needed.
 - Identity-layer access (SSM/EICE/Teleport-style short-lived certs): future.
 - The legacy `.ssh_config` (`ssh`-via-restricted-bash) path does not consume
   ProxyJump or passphrases yet; only `host_exec`/`host_script` and the Portal

@@ -31,7 +31,11 @@ import { Client, type ConnectConfig } from "ssh2";
 
 export type DialHopAuth =
   | { privateKey: Buffer | string; passphrase?: string }
-  | { password: string };
+  | { password: string }
+  // "managed": this hop has no credential of its own; its private key is
+  // discovered on the PREVIOUS hop (the bastion) at dial time. Only valid for a
+  // hop that has a preceding hop. See ADR-013.
+  | { managed: true; passphrase?: string };
 
 export interface DialHop {
   host: string;
@@ -87,9 +91,55 @@ export function makeHostVerifier(host: string, port: number): (key: Buffer, cb: 
   };
 }
 
+// ── Managed-target key discovery (mirrors sicore managed_jump.go) ───
+
+/**
+ * Shell one-liner run on the bastion to emit the first readable standard SSH
+ * private key. Mirrors sicore's candidate list. Exits 3 if none is readable.
+ */
+const MANAGED_KEY_FETCH_CMD =
+  'for k in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ecdsa" "$HOME/.ssh/id_dsa"; ' +
+  'do [ -r "$k" ] && { cat "$k"; exit 0; }; done; exit 3';
+
+/**
+ * Fetch a managed target's private key by reading it off the already-connected
+ * bastion client. The key bytes transit the agentbox memory (this is the
+ * inherent "managed" tradeoff — see ADR-013).
+ */
+function fetchManagedKeyFromJump(jump: Client, timeoutMs: number): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("timed out fetching managed key from jump host"));
+    }, timeoutMs);
+    jump.exec(MANAGED_KEY_FETCH_CMD, (err, stream) => {
+      if (err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      stream.on("data", (c: Buffer) => chunks.push(c));
+      stream.stderr.on("data", () => { /* discard */ });
+      stream.on("close", (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const key = Buffer.concat(chunks);
+        if (code === 0 && key.length > 0) resolve(key);
+        else reject(new Error("no readable SSH private key found on jump host (~/.ssh/id_{ed25519,rsa,ecdsa,dsa})"));
+      });
+    });
+  });
+}
+
 // ── Internal: ssh2 ConnectConfig for one hop ────────────────────────
 
-function buildHopConfig(hop: DialHop, timeoutMs: number, sock?: Duplex): ConnectConfig {
+function buildHopConfig(hop: DialHop, timeoutMs: number, sock?: Duplex, managedKey?: Buffer): ConnectConfig {
   const config: ConnectConfig = {
     host: hop.host,
     port: hop.port,
@@ -100,7 +150,13 @@ function buildHopConfig(hop: DialHop, timeoutMs: number, sock?: Duplex): Connect
     hostVerifier: makeHostVerifier(hop.host, hop.port),
   };
   if (sock) config.sock = sock;
-  if ("privateKey" in hop.auth) {
+  if ("managed" in hop.auth) {
+    if (!managedKey) {
+      throw new Error(`managed hop ${hop.host}:${hop.port} has no key fetched from the jump host`);
+    }
+    config.privateKey = managedKey;
+    if (hop.auth.passphrase) config.passphrase = hop.auth.passphrase;
+  } else if ("privateKey" in hop.auth) {
     config.privateKey = hop.auth.privateKey;
     if (hop.auth.passphrase) config.passphrase = hop.auth.passphrase;
   } else {
@@ -129,6 +185,9 @@ export interface DialedChain {
 export function dialSshChain(hops: DialHop[], opts: { timeoutMs: number; signal?: AbortSignal }): Promise<DialedChain> {
   if (hops.length === 0) {
     return Promise.reject(new Error("dialSshChain: empty hop chain"));
+  }
+  if ("managed" in hops[0].auth) {
+    return Promise.reject(new Error("managed target requires a jump host (no bastion to source the key from)"));
   }
 
   const clients: Client[] = [];
@@ -169,7 +228,7 @@ export function dialSshChain(hops: DialHop[], opts: { timeoutMs: number; signal?
       opts.timeoutMs,
     );
 
-    const connectHop = (index: number, sock?: Duplex) => {
+    const connectHop = (index: number, sock?: Duplex, managedKey?: Buffer) => {
       const hop = hops[index];
       const client = new Client();
       clients.push(client);
@@ -188,13 +247,22 @@ export function dialSshChain(hops: DialHop[], opts: { timeoutMs: number; signal?
             fail(new Error(`forwardOut from ${hop.host} to ${next.host}:${next.port} failed: ${err.message}`));
             return;
           }
-          connectHop(index + 1, stream as unknown as Duplex);
+          const dialNext = (mk?: Buffer) => connectHop(index + 1, stream as unknown as Duplex, mk);
+          if ("managed" in next.auth) {
+            // Source the managed target's key from THIS hop (the bastion) before
+            // dialing it through the freshly-opened tunnel.
+            fetchManagedKeyFromJump(client, opts.timeoutMs)
+              .then(dialNext)
+              .catch((e) => fail(new Error(`managed key fetch from ${hop.host} failed: ${e instanceof Error ? e.message : String(e)}`)));
+          } else {
+            dialNext();
+          }
         });
       });
 
       let config: ConnectConfig;
       try {
-        config = buildHopConfig(hop, opts.timeoutMs, sock);
+        config = buildHopConfig(hop, opts.timeoutMs, sock, managedKey);
       } catch (err) {
         fail(err instanceof Error ? err : new Error(String(err)));
         return;

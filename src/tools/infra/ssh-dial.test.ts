@@ -34,6 +34,8 @@ const { MockClient, mockState } = vi.hoisted(() => {
     endOrder: [] as string[],
     forwardFail: false,
     connectFailLabel: "" as string,
+    managedKey: "MANAGED-KEY-FROM-BASTION",
+    managedFetchExit: 0,
   };
 
   class MockStream extends TinyEmitter {
@@ -44,17 +46,27 @@ const { MockClient, mockState } = vi.hoisted(() => {
   class MockClient extends TinyEmitter {
     label = "";
     sock: any = undefined;
+    privateKey: any = undefined;
     end = () => { state.endOrder.push(this.label); };
     forwardOut(_sip: string, _sport: number, _dip: string, _dport: number, cb: (err: Error | null, stream?: any) => void): void {
       if (state.forwardFail) { cb(new Error("forward denied")); return; }
       cb(null, new TinyEmitter() as any);
     }
-    exec(_cmd: string, cb: (err: Error | null, stream?: MockStream) => void): void {
-      cb(null, new MockStream());
+    exec(cmd: string, cb: (err: Error | null, stream?: MockStream) => void): void {
+      const stream = new MockStream();
+      cb(null, stream);
+      // Auto-respond to the managed key-fetch one-liner.
+      if (cmd.includes("$HOME/.ssh")) {
+        setImmediate(() => {
+          if (state.managedFetchExit === 0) stream.emit("data", Buffer.from(state.managedKey));
+          stream.emit("close", state.managedFetchExit);
+        });
+      }
     }
     connect(config: any): void {
       this.label = `${config.host}:${config.port}`;
       this.sock = config.sock;
+      this.privateKey = config.privateKey;
       state.instances.push(this);
       setImmediate(() => {
         if (state.connectFailLabel && this.label === state.connectFailLabel) {
@@ -78,10 +90,16 @@ beforeEach(() => {
   mockState.endOrder = [];
   mockState.forwardFail = false;
   mockState.connectFailLabel = "";
+  mockState.managedKey = "MANAGED-KEY-FROM-BASTION";
+  mockState.managedFetchExit = 0;
 });
 
 function hop(host: string, port = 22): DialHop {
   return { host, port, username: "root", auth: { privateKey: "KEY" } };
+}
+
+function managedHop(host: string, port = 22): DialHop {
+  return { host, port, username: "root", auth: { managed: true } };
 }
 
 describe("dialSshChain", () => {
@@ -125,6 +143,32 @@ describe("dialSshChain", () => {
 
   it("rejects empty chains", async () => {
     await expect(dialSshChain([], { timeoutMs: 5000 })).rejects.toThrow(/empty hop chain/);
+  });
+});
+
+describe("dialSshChain — managed target", () => {
+  it("fetches the key off the bastion and dials the target with it", async () => {
+    const { client, teardown } = await dialSshChain(
+      [hop("10.0.0.1"), managedHop("10.0.0.9")],
+      { timeoutMs: 5000 },
+    );
+    expect(client.label).toBe("10.0.0.9:22");
+    // The target hop was connected with the key fetched from the bastion.
+    const target = mockState.instances.find((c) => c.label === "10.0.0.9:22");
+    expect(target.privateKey).toBeInstanceOf(Buffer);
+    expect(target.privateKey.toString()).toBe("MANAGED-KEY-FROM-BASTION");
+    teardown();
+  });
+
+  it("rejects a managed target with no jump host", async () => {
+    await expect(dialSshChain([managedHop("10.0.0.9")], { timeoutMs: 5000 }))
+      .rejects.toThrow(/managed target requires a jump host/);
+  });
+
+  it("rejects with an actionable error when no readable key is on the bastion", async () => {
+    mockState.managedFetchExit = 3;
+    await expect(dialSshChain([hop("10.0.0.1"), managedHop("10.0.0.9")], { timeoutMs: 5000 }))
+      .rejects.toThrow(/managed key fetch from 10\.0\.0\.1 failed: no readable SSH private key/);
   });
 });
 

@@ -478,9 +478,6 @@ scheme:
 - Binding an agent to a target transitively authorizes transit through its jump
   chain; the agent never receives a bastion's credential material, only
   reachability.
-- "Managed" auth (reading the last-hop key off the bastion) is intentionally NOT
-  implemented — a community anti-pattern (keys on the bastion).
-
 **Consequences**:
 - ✅ Standard, portable model — the same inventory works standalone or driven by
   an external management server
@@ -491,3 +488,14 @@ scheme:
   inherit reachability (a test bastion may front a prod target)
 
 **Files**: `src/tools/infra/ssh-dial.ts`, `src/tools/infra/ssh-client.ts`, `src/portal/adapter.ts`, `src/portal/host-api.ts`, `src/portal/migrate.ts`; full contract in `docs/design/ssh-jump-host.md`
+
+**Update (2026-06, feat/ssh-managed-jump): managed auth now supported.**
+The original decision excluded "managed" target auth (last-hop key read off the
+bastion) as a community anti-pattern. Reversed by product decision to align with
+sicore, which supports it as a first-class form. siclaw now supports
+`auth_type="managed"`: the target stores no credential; `ssh-dial` reads the first
+readable `~/.ssh/id_*` off the bastion at dial time and uses it for the final hop
+(target username + optional passphrase from the host record). Constraints: a managed
+host **requires a jump host**; the key is **not** broker-materialized (it lives on
+the bastion and transits agentbox memory) — an explicit, documented tradeoff vs.
+explicit per-hop credentials. Mechanism mirrors sicore `internal/connector/managed_jump.go`.
