@@ -450,3 +450,44 @@ Key design choices:
 - ⚠️ Complex validators (12 commands) still need per-command escape hatches
 
 **Files**: `src/tools/infra/command-sets.ts`, `src/tools/infra/command-validator.ts`
+
+---
+
+## ADR-013: Multi-Level SSH Jump Hosts via Self-Referencing `jump_host_id`
+
+**Status**: Active (2026-06, feat/ssh-jump-host)
+
+**Context**:
+`host_exec` / `host_script` could only reach directly-routable hosts. Production
+bare-metal / storage / GPU nodes typically sit behind a bastion. ADR-011 left
+non-kubeconfig credential governance for later ("Revisit when: SSH/API need
+environment-aware governance") — this is the first step.
+
+**Decision**:
+Model bastions with standard OpenSSH ProxyJump semantics, not a platform-specific
+scheme:
+- `hosts.jump_host_id` is a self-reference naming the next hop; each bastion is
+  its own managed host row with its own credentials (≡ ssh_config `ProxyJump
+  <named-host>`). Chains cap at depth 3.
+- The execution layer (`ssh-dial.ts`, broker-free) dials hop-by-hop via ssh2
+  `forwardOut` + `sock`; every hop does its own end-to-end handshake, so bastions
+  relay only ciphertext.
+- Credential boundaries carry the bastion's NAME (neutral wire reference); the
+  management server resolves `jump_host_id` → name so no internal id leaks into
+  the standard-SSH layer.
+- Binding an agent to a target transitively authorizes transit through its jump
+  chain; the agent never receives a bastion's credential material, only
+  reachability.
+- "Managed" auth (reading the last-hop key off the bastion) is intentionally NOT
+  implemented — a community anti-pattern (keys on the bastion).
+
+**Consequences**:
+- ✅ Standard, portable model — the same inventory works standalone or driven by
+  an external management server
+- ✅ Reuses the existing CredentialBroker + security pipeline; no new credential store
+- ⚠️ Transitive authorization: binding a target grants network transit through
+  its bastions (not their secrets)
+- ⚠️ `is_production` is enforced only on the directly-bound entry host; bastions
+  inherit reachability (a test bastion may front a prod target)
+
+**Files**: `src/tools/infra/ssh-dial.ts`, `src/tools/infra/ssh-client.ts`, `src/portal/adapter.ts`, `src/portal/host-api.ts`, `src/portal/migrate.ts`; full contract in `docs/design/ssh-jump-host.md`
