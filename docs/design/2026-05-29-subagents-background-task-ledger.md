@@ -99,9 +99,11 @@ finishes, task `#3` is marked `completed`. Neither structure embeds the other.
 - **Id allocation:** numeric, monotonic per `taskListId`, serialized by the persistence layer (DB
   transaction in gateway modes; a local lock in TUI) — concurrency-safe when parent and sub-agents write
   the same list.
-- **Scope & sharing:** one `taskListId` per session. The parent **and the sub-agents it spawns share the
-  same ledger** (sub-agents run in-process in the same AgentBox). This is what lets a sub-agent own and
-  complete a task.
+- **Scope & ownership:** one `taskListId` per session, and the **plan is parent-owned**. Sub-agents have
+  no `task_*` tools (hidden via the `isSubagent` ref) — they neither read nor write the ledger, so a
+  child can never mutate the plan in a way the UI wouldn't see. The parent marks a task `completed` as
+  each child reports its findings back. (A task's `owner` may name the sub-agent doing the work; that's
+  metadata the parent sets — the child does not touch the ledger.)
 - **Persistence — durable home is the Portal DB, not the AgentBox (see §14):** the ledger is persisted
   through the **same durable channel as chat + delegation events** (mirrored to the Portal DB in gateway
   modes via `task_*` persistence events; a local session store in TUI). It is **not** a standalone
@@ -226,7 +228,8 @@ The parent orchestrates; sub-agents execute; the ledger records.
    ordering using the returned ids (e.g. `correlate` blocked by `nodes`, `pods`, `net`).
 2. For each ready (unblocked) task, `spawn_subagent` — emit them **in one turn** to run in parallel
    (or `run_in_background` for independent long work).
-3. As each child returns, mark its task `completed` (the child or the parent); dependents unblock.
+3. As each child returns its findings, **the parent** marks that task `completed` (sub-agents have no
+   `task_*` tools); dependents unblock.
 4. Dispatch the next wave. `task_list` is the live, parallel-capable plan.
 
 This delivers parallel + ordered plans **without L4** — the parent is the sole orchestrator; sub-agents

@@ -491,14 +491,9 @@ export class AgentBoxSessionManager {
         this.ledgerHideTimers.delete(taskListId);
         const ledger = getOrCreateLedger(taskListId);
         if (!ledger.allCompleted()) return; // a new task arrived; abort the clear
-        // Don't clear while a sub-agent shares this ledger and is still running:
-        // its task completions are invisible to allCompleted() (children have no
-        // sessionEventEmitter), so clearing now would wipe the parent's live plan
-        // out from under the in-flight child. Re-arm and retry once they finish.
-        if (this.subagentLimiter.activeCount > 0) {
-          this.scheduleLedgerAutoClear(taskListId, emit);
-          return;
-        }
+        // Only the parent touches the ledger (sub-agents have no task tools — see
+        // isSubagent gating), so allCompleted() reflects the whole plan and clearing
+        // here can't wipe anything out from under a child. No in-flight-child guard.
         ledger.clear();
         emit({ kind: "task_event", taskListId, action: "reset" });
       }, LEDGER_AUTOCLEAR_MS);
@@ -559,10 +554,10 @@ export class AgentBoxSessionManager {
       memoryIndexer: this._sharedMemoryIndexer ?? undefined,
       userId: this.userId,
       agentId,
-      // Share the parent's task ledger (read-only in practice): the child sees the
-      // plan for context, but the plan/task tools are hidden from sub-agents so a
-      // child can't mutate it (its changes would have no SSE emitter → invisible UI).
-      taskListId: request.taskListId,
+      // The plan is parent-owned: sub-agents have no task tools (isSubagent hides
+      // them), so the child neither reads nor writes the ledger — the parent marks
+      // tasks complete as children report back. The parent's taskListId is therefore
+      // intentionally NOT shared with the child (nothing there would consume it).
       isSubagent: true,
       // The agent-type's prompt flavour for this child.
       systemPromptAppend: type.systemPromptAddendum,
