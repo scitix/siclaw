@@ -22,7 +22,6 @@ interface SpawnSubagentParams {
   description: string;
   prompt: string;
   subagent_type?: string;
-  model?: string;
   run_in_background?: boolean;
 }
 
@@ -75,7 +74,6 @@ export function createSpawnSubagentTool(
       subagent_type: Type.Optional(Type.String({
         description: `Which sub-agent type to use. Default: ${DEFAULT_SUBAGENT_TYPE}.`,
       })),
-      model: Type.Optional(Type.String({ description: "Optional model override for this sub-agent." })),
       // run_in_background is gated OFF (RUN_IN_BACKGROUND_ENABLED) until background jobs notify the
       // parent model on completion — until then it's foreground-only (see subagent-registry).
       ...(RUN_IN_BACKGROUND_ENABLED
@@ -124,7 +122,6 @@ export function createSpawnSubagentTool(
         description,
         prompt,
         subagentType: type.agentType,
-        model: p.model?.trim() || undefined,
         runInBackground: RUN_IN_BACKGROUND_ENABLED && p.run_in_background === true,
         parentSessionId: refs.sessionIdRef.current,
         parentAgentId: refs.agentId,
