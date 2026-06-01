@@ -11,17 +11,16 @@
 import type { DelegationAppendMessagePayload } from "./delegation-persistence.js";
 import type { LedgerTask } from "../core/task-ledger.js";
 
-export interface TaskEvent {
-  kind: "task_event";
-  taskListId: string;
-  /** "reset" clears the whole plan (emitted ~5s after every task completes —
-   *  CC V2 parity, see resetTaskList). */
-  action: "upsert" | "delete" | "reset";
-  /** Full snapshot for upsert (the UI/agentbox replaces the task by id). */
-  task?: LedgerTask;
-  /** Target id for delete. */
-  taskId?: string;
-}
+/**
+ * Discriminated by `action` so illegal states are unrepresentable: only an upsert
+ * carries `task`, only a delete carries `taskId`, a reset carries neither. "reset"
+ * clears the whole plan (emitted ~5s after every task completes — CC V2 parity,
+ * see resetTaskList).
+ */
+export type TaskEvent =
+  | { kind: "task_event"; taskListId: string; action: "upsert"; task: LedgerTask }
+  | { kind: "task_event"; taskListId: string; action: "delete"; taskId: string }
+  | { kind: "task_event"; taskListId: string; action: "reset" };
 
 /** Type guard for events flowing through the generic session event emitter. */
 export function isTaskEvent(event: Record<string, unknown>): event is TaskEvent & Record<string, unknown> {

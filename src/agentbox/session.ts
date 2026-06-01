@@ -386,10 +386,7 @@ export class AgentBoxSessionManager {
 
     return {
       status: "launched",
-      summary: "launched",
       childSessionId,
-      toolCalls: 0,
-      durationMs: 0,
       jobId,
     };
   }

@@ -30,6 +30,15 @@ describe("TaskLedger — snapshot / hydrate (durability)", () => {
     expect(l.allCompleted()).toBe(true);
   });
 
+  it("addBlockedBy ignores a self-reference (a task can't block itself) and dedupes", () => {
+    const l = new TaskLedger();
+    l.create({ subject: "a", description: "" }); // #1
+    // Self-block + duplicate: "1" is dropped (self), "2" added once even if repeated.
+    l.create({ subject: "b", description: "" }); // #2
+    l.update("2", { addBlockedBy: ["2", "1", "1"] });
+    expect(l.get("2")?.blockedBy).toEqual(["1"]); // no "2" (self), "1" once
+  });
+
   it("clear() empties tasks but keeps the id sequence (next id continues, no reuse)", () => {
     const l = new TaskLedger();
     l.create({ subject: "a", description: "" });    // #1

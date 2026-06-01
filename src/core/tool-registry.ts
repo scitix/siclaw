@@ -50,8 +50,23 @@ export interface SpawnSubagentRequest {
   spawnId: string;
 }
 
-export interface SpawnSubagentResult {
-  status: SpawnSubagentStatus;
+/**
+ * Discriminated by `status`: a background launch carries only a `jobId` (no summary
+ * yet), while a finished/foreground run carries the report fields. Removes the old
+ * `summary: "launched"` sentinel and makes the illegal "done + jobId" state
+ * unrepresentable.
+ */
+export type SpawnSubagentResult =
+  | {
+      /** Background job launched (gated off today); usable with job_stop. */
+      status: "launched";
+      jobId: string;
+      childSessionId: string;
+    }
+  | SpawnSubagentReport;
+
+export interface SpawnSubagentReport {
+  status: Exclude<SpawnSubagentStatus, "launched">;
   /** Budgeted capsule returned to the parent as model-visible tool content. */
   summary: string;
   /** Full child report for UI/debug persistence; not model-visible. */
@@ -62,8 +77,6 @@ export interface SpawnSubagentResult {
   durationMs: number;
   partialSource?: "steered" | "runtime_fallback";
   interruptedTool?: string;
-  /** Set when status === "launched": the background job id, usable with job_stop. */
-  jobId?: string;
   /** The sub-agent's execution steps (reasoning + tool calls), so the UI can show a collapsed log after completion. */
   steps?: SubagentStep[];
 }
