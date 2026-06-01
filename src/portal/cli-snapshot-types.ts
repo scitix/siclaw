@@ -32,7 +32,15 @@ export interface CliSnapshotHostCredential {
   authType: string;
   password: string | null;
   privateKey: string | null;
+  /** Private-key passphrase (key auth only). */
+  passphrase: string | null;
   description: string | null;
+  /**
+   * Name of the next-hop bastion (ProxyJump), or null for direct hosts. The
+   * named host appears as its own entry in the credentials list so its material
+   * is available for the chain.
+   */
+  jumpHost: string | null;
 }
 
 export interface CliSnapshotCredentials {
