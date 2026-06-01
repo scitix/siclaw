@@ -1,7 +1,22 @@
 import { describe, it, expect } from "vitest";
 import {
   getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE,
+  getSubagentMaxRuntimeMs, DEFAULT_SUBAGENT_MAX_RUNTIME_MS,
 } from "./subagent-registry.js";
+
+describe("getSubagentMaxRuntimeMs", () => {
+  it("defaults to 10 minutes when the env is unset or blank", () => {
+    expect(getSubagentMaxRuntimeMs({})).toBe(DEFAULT_SUBAGENT_MAX_RUNTIME_MS);
+    expect(getSubagentMaxRuntimeMs({ SICLAW_SUBAGENT_MAX_RUNTIME: "  " })).toBe(DEFAULT_SUBAGENT_MAX_RUNTIME_MS);
+  });
+  it("reads SICLAW_SUBAGENT_MAX_RUNTIME as seconds → ms", () => {
+    expect(getSubagentMaxRuntimeMs({ SICLAW_SUBAGENT_MAX_RUNTIME: "300" })).toBe(300_000);
+  });
+  it("falls back to the default on invalid / non-positive values", () => {
+    expect(getSubagentMaxRuntimeMs({ SICLAW_SUBAGENT_MAX_RUNTIME: "0" })).toBe(DEFAULT_SUBAGENT_MAX_RUNTIME_MS);
+    expect(getSubagentMaxRuntimeMs({ SICLAW_SUBAGENT_MAX_RUNTIME: "abc" })).toBe(DEFAULT_SUBAGENT_MAX_RUNTIME_MS);
+  });
+});
 
 describe("subagent-registry", () => {
   it("has a general-purpose default type", () => {

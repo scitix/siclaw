@@ -52,6 +52,24 @@ export function getSubagentConcurrency(env: NodeJS.ProcessEnv = process.env): nu
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_SUBAGENT_CONCURRENCY;
 }
 
+/** Default wall-clock backstop for a sub-agent's whole run, in ms (10 minutes). */
+export const DEFAULT_SUBAGENT_MAX_RUNTIME_MS = 10 * 60_000;
+
+/**
+ * Wall-clock backstop for one foreground sub-agent's entire run, from
+ * `SICLAW_SUBAGENT_MAX_RUNTIME` (in SECONDS; default 600 = 10 min). The parent tool
+ * call blocks on the child, so this bounds the worst-case wait; on expiry the child
+ * brain is aborted and the result is reported as `timed_out`. It is a backstop, not
+ * the expected runtime — most bounded tasks finish far sooner. Invalid / non-positive
+ * values fall back to the default.
+ */
+export function getSubagentMaxRuntimeMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SICLAW_SUBAGENT_MAX_RUNTIME;
+  if (raw == null || raw.trim() === "") return DEFAULT_SUBAGENT_MAX_RUNTIME_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) * 1000 : DEFAULT_SUBAGENT_MAX_RUNTIME_MS;
+}
+
 export const DEFAULT_SUBAGENT_TYPE = "general-purpose";
 
 const GENERAL_PURPOSE: SubagentType = {

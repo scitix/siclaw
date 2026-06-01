@@ -28,7 +28,7 @@ import type {
   SubagentJobStopResult,
   AgentMode,
 } from "../core/tool-registry.js";
-import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency } from "../core/subagent-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs } from "../core/subagent-registry.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
@@ -133,7 +133,7 @@ export interface PersistedDpStateSnapshot {
 const SESSION_RELEASE_TTL_MS = 30_000;
 /** Delay before auto-clearing a fully-completed plan (CC V2 parity: HIDE_DELAY_MS). */
 const LEDGER_AUTOCLEAR_MS = 5_000;
-const DELEGATED_AGENT_MAX_RUNTIME_MS = 10 * 60_000;
+const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
 const DELEGATED_AGENT_ABORT_TIMEOUT_MS = 2_000;
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
