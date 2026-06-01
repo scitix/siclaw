@@ -2,10 +2,22 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { resetLedgers } from "../../core/task-ledger.js";
 import {
   createTaskCreateTool, createTaskUpdateTool, createTaskListTool, createTaskGetTool,
+  taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
 } from "./task-tools.js";
 
 const TLID = "sess-test";
 const text = (r: any) => (r.content[0] as any).text as string;
+
+describe("task tools — sub-agent gating", () => {
+  it("hides every task tool from a spawned sub-agent (plan is parent-owned)", () => {
+    const regs = [taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration];
+    for (const reg of regs) {
+      expect(reg.available?.({ isSubagent: true } as any)).toBe(false);
+      expect(reg.available?.({ isSubagent: false } as any)).toBe(true);
+      expect(reg.available?.({} as any)).toBe(true); // default (top-level) = available
+    }
+  });
+});
 
 describe("task tools", () => {
   beforeEach(() => resetLedgers());

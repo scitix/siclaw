@@ -4,7 +4,7 @@
  * reports ready vs blocked; it never gates tool use.
  */
 
-import type { ToolEntry, SessionEventEmitter } from "../../core/tool-registry.js";
+import type { ToolEntry, SessionEventEmitter, ToolRefs } from "../../core/tool-registry.js";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
@@ -189,29 +189,37 @@ export function createTaskGetTool(taskListId: string): ToolDefinition {
   };
 }
 
-// The plan/task ledger is hidden in Deep Investigation mode — DP structures work
-// via hypothesis checkpoints, and a parallel plan conflicts with that (availableModes).
+// The plan/task ledger is hidden:
+// - in Deep Investigation mode — DP structures work via hypothesis checkpoints, and a
+//   parallel plan conflicts with that (availableModes: ["normal"]);
+// - in spawned sub-agents — the plan is owned by the parent; a child has no SSE emitter
+//   so its task mutations would never reach the UI (available: !isSubagent).
+const plannerOnly = (refs: ToolRefs) => !refs.isSubagent;
 export const taskCreateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskCreateTool(refs.taskListId, refs.sessionEventEmitter),
   platform: true,
   availableModes: ["normal"],
+  available: plannerOnly,
 };
 export const taskUpdateRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskUpdateTool(refs.taskListId, refs.sessionEventEmitter),
   platform: true,
   availableModes: ["normal"],
+  available: plannerOnly,
 };
 export const taskListRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskListTool(refs.taskListId),
   platform: true,
   availableModes: ["normal"],
+  available: plannerOnly,
 };
 export const taskGetRegistration: ToolEntry = {
   category: "workflow",
   create: (refs) => createTaskGetTool(refs.taskListId),
   platform: true,
   availableModes: ["normal"],
+  available: plannerOnly,
 };

@@ -50,6 +50,8 @@ export interface CreateSiclawSessionOpts {
   mode?: SessionMode;  // replaces excludeTools / extraTools
   /** Active operating mode (normal/dp/…) — filters tools by their `availableModes`. */
   activeMode?: AgentMode;
+  /** True when building a spawned sub-agent (child) — hides the plan/task tools. */
+  isSubagent?: boolean;
   /** Agent tool allow-list: null = all tools, string[] = only these tools */
   allowedTools?: string[] | null;
   /** Extra system prompt content appended for agent customization */
@@ -381,6 +383,7 @@ export async function createSiclawSession(
     mode,
     refs: {
       kubeconfigRef, userId, agentId, sessionIdRef, taskListId,
+      isSubagent: opts?.isSubagent ?? false,
       memoryRef, dpStateRef,
       memoryIndexer: memoryEnabled ? memoryIndexer : undefined,
       memoryDir: memoryEnabled ? memoryDir : undefined,
