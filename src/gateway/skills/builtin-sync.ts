@@ -12,15 +12,22 @@
  *   - Existing, user has edited     SKIP
  *     (current hash != v1 hash):
  *
- * "Hash" is SHA-256 of (specs + JSON-sorted scripts), providing a stable
- * content fingerprint independent of insertion order.
+ * "Hash" is SHA-256 of the normalized skill package file list, providing a
+ * stable content fingerprint independent of insertion order.
  */
 
-import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getDb } from "../db.js";
+import {
+  computeSkillFilesHash,
+  parseFrontmatter,
+  parseSkillDirectory,
+  safeParseSkillFiles,
+  type SkillPackageFile,
+  type SkillScriptEntry,
+} from "../../shared/skill-package.js";
 
 /**
  * Resolve skills/core/ relative to the installed package, not process.cwd().
@@ -31,17 +38,13 @@ import { getDb } from "../db.js";
  */
 export const SKILLS_CORE_DIR = fileURLToPath(new URL("../../../skills/core", import.meta.url));
 
-interface ScriptEntry {
-  name: string;
-  content: string;
-}
-
 interface BuiltinSkillData {
   dirName: string;
   name: string;
   description: string;
   specs: string;
-  scripts: ScriptEntry[];
+  scripts: SkillScriptEntry[];
+  files: SkillPackageFile[];
   labels: string[];
 }
 
@@ -56,84 +59,18 @@ export interface ParsedSkill {
   labels: string[];
   specs: string;
   scripts: Array<{ name: string; content: string }>;
+  files: SkillPackageFile[];
 }
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Parse a skill's YAML frontmatter and return its `name` and `description`.
- * Handles inline values and block scalars (`>-`, `>`, `|`, `|-`) — built-in
- * skills rely on `description: >-` for multi-line text.
- */
-export function parseFrontmatter(md: string): { name: string; description: string } {
-  const match = md.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return { name: "", description: "" };
-
-  const block = match[1];
-
-  // name: single-line value
-  const nameMatch = block.match(/^name:\s*(.+)$/m);
-  const name = nameMatch ? nameMatch[1].trim() : "";
-
-  // description: may be a YAML block scalar (>-, >, |) or inline
-  let description = "";
-  const lines = block.split("\n");
-  const descIdx = lines.findIndex(l => l.match(/^description:\s/));
-  if (descIdx >= 0) {
-    const firstLine = lines[descIdx].replace(/^description:\s*/, "").trim();
-    if (firstLine === ">-" || firstLine === ">" || firstLine === "|" || firstLine === "|-") {
-      // Block scalar: collect indented continuation lines
-      const contLines: string[] = [];
-      for (let i = descIdx + 1; i < lines.length; i++) {
-        if (lines[i].match(/^\s+/)) {
-          contLines.push(lines[i].trim());
-        } else {
-          break;
-        }
-      }
-      description = contLines.join(" ");
-    } else {
-      // Inline scalar
-      description = firstLine;
-    }
-  }
-
-  return { name, description };
-}
-
 function readSkillDir(dirName: string, dirPath: string, labelsMap: Record<string, string[]>): BuiltinSkillData | null {
-  const skillMdPath = join(dirPath, "SKILL.md");
-  if (!existsSync(skillMdPath)) return null;
-
-  const specs = readFileSync(skillMdPath, "utf8");
-  const { name, description } = parseFrontmatter(specs);
-  if (!name) return null;
-
-  // Collect scripts (sorted by name for deterministic hashing)
-  const scripts: ScriptEntry[] = [];
-  const scriptsDir = join(dirPath, "scripts");
-  if (existsSync(scriptsDir)) {
-    const files = readdirSync(scriptsDir).filter((f) => f.endsWith(".sh") || f.endsWith(".py")).sort();
-    for (const file of files) {
-      const content = readFileSync(join(scriptsDir, file), "utf8");
-      scripts.push({ name: file, content });
-    }
-  }
-
-  const labels = labelsMap[dirName] ?? [];
-
-  return { dirName, name, description, specs, scripts, labels };
+  return parseSkillDirectory(dirName, dirPath, labelsMap);
 }
 
-function computeHash(specs: string, scripts: ScriptEntry[]): string {
-  const h = createHash("sha256");
-  h.update(specs);
-  // Scripts are already sorted by name; stringify produces a stable string
-  h.update(JSON.stringify(scripts));
-  return h.digest("hex");
-}
+export { parseFrontmatter };
 
 // ---------------------------------------------------------------------------
 // Public API — parsing
@@ -205,15 +142,16 @@ export async function syncBuiltinSkills(
   let skipped = 0;
 
   for (const skill of entries) {
-    const hash = computeHash(skill.specs, skill.scripts);
+    const hash = computeSkillFilesHash(skill.files);
     // specs is MEDIUMTEXT — store raw string, not JSON-encoded
     const specsRaw = skill.specs;
     const scriptsJson = JSON.stringify(skill.scripts);
+    const filesJson = JSON.stringify(skill.files);
     const labelsJson = JSON.stringify(skill.labels);
 
     // Look up existing skill row
     const [rows] = await db.query<any[]>(
-      `SELECT id, version, specs, scripts FROM skills WHERE org_id = ? AND name = ? LIMIT 1`,
+      `SELECT id, version, specs, scripts, files FROM skills WHERE org_id = ? AND name = ? LIMIT 1`,
       [orgId, skill.name],
     );
 
@@ -223,15 +161,15 @@ export async function syncBuiltinSkills(
       const versionId = crypto.randomUUID();
 
       await db.query(
-        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
-         VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, 'system')`,
-        [skillId, orgId, skill.name, skill.description, labelsJson, specsRaw, scriptsJson],
+        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, files, created_by)
+         VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, ?, 'system')`,
+        [skillId, orgId, skill.name, skill.description, labelsJson, specsRaw, scriptsJson, filesJson],
       );
 
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
-         VALUES (?, ?, 1, ?, ?, 'Initial builtin import', 'system', 1)`,
-        [versionId, skillId, specsRaw, scriptsJson],
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, commit_message, author_id, is_approved)
+         VALUES (?, ?, 1, ?, ?, ?, 'Initial builtin import', 'system', 1)`,
+        [versionId, skillId, specsRaw, scriptsJson, filesJson],
       );
 
       inserted++;
@@ -239,12 +177,12 @@ export async function syncBuiltinSkills(
     }
 
     // ── Existing skill ────────────────────────────────────
-    const existing = rows[0] as { id: string; version: number; specs: any; scripts: any };
+    const existing = rows[0] as { id: string; version: number; specs: any; scripts: any; files: any };
     // specs is MEDIUMTEXT — should be a raw string, but may be double-encoded from old bug
     let existingSpecs: string = typeof existing.specs === "string" ? existing.specs : String(existing.specs || "");
     if (existingSpecs.startsWith('"')) { try { existingSpecs = JSON.parse(existingSpecs); } catch { /* keep */ } }
     // scripts is JSON column — MySQL driver may return string or parsed object
-    let existingScripts: ScriptEntry[];
+    let existingScripts: SkillScriptEntry[];
     if (Array.isArray(existing.scripts)) {
       existingScripts = existing.scripts;
     } else if (typeof existing.scripts === "string") {
@@ -252,7 +190,7 @@ export async function syncBuiltinSkills(
     } else {
       existingScripts = [];
     }
-    const currentHash = computeHash(existingSpecs, existingScripts);
+    const currentHash = computeSkillFilesHash(safeParseSkillFiles(existing.files, existingSpecs, existingScripts));
 
     if (currentHash === hash) {
       // Content identical — nothing to do
@@ -262,19 +200,19 @@ export async function syncBuiltinSkills(
 
     // Check v1 hash to detect user edits
     const [v1Rows] = await db.query<any[]>(
-      `SELECT specs, scripts FROM skill_versions WHERE skill_id = ? AND version = 1 LIMIT 1`,
+      `SELECT specs, scripts, files FROM skill_versions WHERE skill_id = ? AND version = 1 LIMIT 1`,
       [existing.id],
     );
 
     if (v1Rows.length > 0) {
-      const v1 = v1Rows[0] as { specs: any; scripts: any };
+      const v1 = v1Rows[0] as { specs: any; scripts: any; files: any };
       let v1Specs: string = typeof v1.specs === "string" ? v1.specs : String(v1.specs || "");
       if (v1Specs.startsWith('"')) { try { v1Specs = JSON.parse(v1Specs); } catch { /* keep */ } }
-      let v1Scripts: ScriptEntry[];
+      let v1Scripts: SkillScriptEntry[];
       if (Array.isArray(v1.scripts)) { v1Scripts = v1.scripts; }
       else if (typeof v1.scripts === "string") { try { v1Scripts = JSON.parse(v1.scripts); } catch { v1Scripts = []; } }
       else { v1Scripts = []; }
-      const v1Hash = computeHash(v1Specs, v1Scripts);
+      const v1Hash = computeSkillFilesHash(safeParseSkillFiles(v1.files, v1Specs, v1Scripts));
 
       if (v1Hash !== currentHash) {
         // User has edited since v1 — leave their version alone
@@ -289,15 +227,15 @@ export async function syncBuiltinSkills(
     const versionId = crypto.randomUUID();
 
     await db.query(
-      `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP
+      `UPDATE skills SET description = ?, labels = ?, version = ?, specs = ?, scripts = ?, files = ?, status = 'installed', updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
-      [skill.description, labelsJson, newVersion, specsRaw, scriptsJson, existing.id],
+      [skill.description, labelsJson, newVersion, specsRaw, scriptsJson, filesJson, existing.id],
     );
 
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved)
-       VALUES (?, ?, ?, ?, ?, 'Builtin update from image', 'system', 1)`,
-      [versionId, existing.id, newVersion, specsRaw, scriptsJson],
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, commit_message, author_id, is_approved)
+       VALUES (?, ?, ?, ?, ?, ?, 'Builtin update from image', 'system', 1)`,
+      [versionId, existing.id, newVersion, specsRaw, scriptsJson, filesJson],
     );
 
     updated++;

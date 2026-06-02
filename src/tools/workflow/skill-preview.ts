@@ -4,6 +4,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveUnderDir } from "../../shared/path-utils.js";
+import { collectSkillDirectoryFiles, parseSingleSkillPackage } from "../../shared/skill-package.js";
 
 const DRAFTS_BASE = path.resolve(process.cwd(), ".siclaw/user-data/skill-drafts");
 
@@ -99,45 +100,26 @@ description: >-
             details: { error: true },
           };
         }
-        const specs = fs.readFileSync(specPath, "utf-8").replace(/\r\n/g, "\n");
-
-        // Parse name and description from YAML frontmatter
-        let name = path.basename(safeDir);
-        let description = "";
+        let parsed;
+        try {
+          parsed = parseSingleSkillPackage(collectSkillDirectoryFiles(safeDir));
+        } catch (err: unknown) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) }],
+            details: { error: true },
+          };
+        }
         let type = "Custom";
-        const fmMatch = specs.match(/^---\n([\s\S]*?)\n---/);
+        const fmMatch = parsed.specs.match(/^---\n([\s\S]*?)\n---/);
         if (fmMatch) {
           const fm = fmMatch[1];
-          const nameMatch = fm.match(/^name:\s*(.+)$/m);
-          if (nameMatch) name = nameMatch[1].trim();
-          // Multiline: "description: >-\n  line1\n  line2" or inline: "description: one line"
-          const descMulti = fm.match(/^description:\s*>-?\s*\n((?:[ \t]+.+\n?)+)/m);
-          if (descMulti) {
-            description = descMulti[1].trim().replace(/\n\s*/g, " ");
-          } else {
-            const descInline = fm.match(/^description:\s*(?!>)(.+)$/m);
-            if (descInline) description = descInline[1].trim().replace(/^["']|["']$/g, "");
-          }
           const typeMatch = fm.match(/^type:\s*(.+)$/m);
           if (typeMatch) type = typeMatch[1].trim();
         }
 
-        // Read scripts (skip symlinks to prevent exfiltration)
-        const scripts: Array<{ name: string; content: string }> = [];
-        const scriptsDir = path.join(safeDir, "scripts");
-        if (fs.existsSync(scriptsDir) && fs.statSync(scriptsDir).isDirectory()) {
-          for (const f of fs.readdirSync(scriptsDir).sort()) {
-            const fp = path.join(scriptsDir, f);
-            const stat = fs.lstatSync(fp);
-            if (stat.isFile() && !stat.isSymbolicLink()) {
-              scripts.push({ name: f, content: fs.readFileSync(fp, "utf-8") });
-            }
-          }
-        }
-
         const result = {
-          skill: { name, description, type, specs, scripts },
-          summary: `Skill preview for '${name}'. Click View to inspect and copy.`,
+          skill: { ...parsed, type },
+          summary: `Skill preview for '${parsed.name}'. Click View to inspect and copy.`,
         };
 
         return {

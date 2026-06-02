@@ -20,6 +20,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { CliSnapshotSkill } from "../portal/cli-snapshot-api.js";
+import { decodeSkillFileContent, normalizeSkillFiles } from "../shared/skill-package.js";
 
 /**
  * Reject names that would land outside `rootDir` when joined with it.
@@ -79,9 +80,30 @@ export function materializePortalSkills(
     }
     const skillDir = path.join(outDir, skill.name);
     fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs, "utf-8");
+    if (Array.isArray(skill.files) && skill.files.length > 0) {
+      try {
+        for (const file of normalizeSkillFiles(skill.files)) {
+          const filePath = path.resolve(skillDir, file.path);
+          const rel = path.relative(skillDir, filePath);
+          if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+            throw new Error(`unsafe file path: ${file.path}`);
+          }
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, file.encoding === "base64" ? Buffer.from(file.content, "base64") : decodeSkillFileContent(file));
+          if (file.executable || /^scripts\/[^/]+\.(sh|py)$/.test(file.path)) {
+            try { fs.chmodSync(filePath, 0o755); } catch { /* non-POSIX */ }
+          }
+        }
+      } catch {
+        fs.rmSync(skillDir, { recursive: true, force: true });
+        skipped.push(skill.name || "(empty)");
+        continue;
+      }
+    } else {
+      fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs, "utf-8");
+    }
 
-    if (Array.isArray(skill.scripts) && skill.scripts.length > 0) {
+    if (!Array.isArray(skill.files) && Array.isArray(skill.scripts) && skill.scripts.length > 0) {
       const scriptsDir = path.join(skillDir, "scripts");
       fs.mkdirSync(scriptsDir, { recursive: true });
       for (const script of skill.scripts) {

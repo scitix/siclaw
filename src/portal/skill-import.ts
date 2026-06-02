@@ -17,6 +17,7 @@ import AdmZip from "adm-zip";
 import * as tar from "tar";
 import { getDb } from "../gateway/db.js";
 import { parseSkillsDir, type ParsedSkill } from "../gateway/skills/builtin-sync.js";
+import { computeSkillFilesHash, parseSingleSkillPackage, collectSkillDirectoryFiles, parseSkillDirectory, safeParseSkillFiles } from "../shared/skill-package.js";
 
 export type { ParsedSkill };
 
@@ -47,6 +48,10 @@ export interface ImportResult extends ImportDiff {
  *   - "upsert" — leave them untouched (additive upload; used by admin pack upload)
  */
 export type ImportMode = "sync" | "upsert";
+
+function packageFilesFor(skill: ParsedSkill) {
+  return safeParseSkillFiles((skill as any).files, skill.specs, skill.scripts);
+}
 
 // ---------------------------------------------------------------------------
 // 1. Parse a skill pack archive into structured skill objects
@@ -137,9 +142,15 @@ export async function parseSkillPack(archiveBuffer: Buffer): Promise<ParsedSkill
     // the archive likely has a wrapper directory — descend into it.
     const entries = fs.readdirSync(extractDir, { withFileTypes: true });
     const dirs = entries.filter(e => e.isDirectory());
+    if (entries.some(e => e.name === "SKILL.md")) {
+      return [parseSingleSkillPackage(collectSkillDirectoryFiles(extractDir))];
+    }
     let skillsRoot = extractDir;
     if (dirs.length === 1 && !entries.some(e => e.name === "meta.json")) {
-      skillsRoot = path.join(extractDir, dirs[0].name);
+      const singleDir = path.join(extractDir, dirs[0].name);
+      const singleSkill = parseSkillDirectory(dirs[0].name, singleDir);
+      if (singleSkill) return [singleSkill];
+      skillsRoot = singleDir;
     }
 
     return parseSkillsDir(skillsRoot);
@@ -164,10 +175,10 @@ export async function computeImportDiff(
 
   // Current builtin skills
   const [builtinRows] = await db.query(
-    "SELECT id, name, description, specs, scripts FROM skills WHERE org_id = ? AND is_builtin = 1",
+    "SELECT id, name, description, specs, scripts, files FROM skills WHERE org_id = ? AND is_builtin = 1",
     [orgId],
   ) as any;
-  const builtinMap = new Map<string, { id: string; description: string; specs: string; scripts: string }>();
+  const builtinMap = new Map<string, { id: string; description: string; specs: string; scripts: string; files?: string | null }>();
   for (const row of builtinRows) {
     builtinMap.set(row.name, row);
   }
@@ -183,11 +194,13 @@ export async function computeImportDiff(
     if (!existing) {
       added.push(entry);
     } else {
-      // Normalize scripts — DB may store as JSON string or parsed object
       const existingScripts = typeof existing.scripts === "string"
-        ? existing.scripts : JSON.stringify(existing.scripts);
-      const incomingScripts = JSON.stringify(skill.scripts);
-      if (existing.specs !== skill.specs || existingScripts !== incomingScripts) {
+        ? existing.scripts : JSON.stringify(existing.scripts ?? []);
+      let parsedExistingScripts: Array<{ name: string; content: string }> = [];
+      try { parsedExistingScripts = JSON.parse(existingScripts || "[]"); } catch { parsedExistingScripts = []; }
+      const existingHash = computeSkillFilesHash(safeParseSkillFiles(existing.files, existing.specs, parsedExistingScripts));
+      const incomingHash = computeSkillFilesHash(packageFilesFor(skill));
+      if (existingHash !== incomingHash) {
         updated.push(entry);
       } else {
         unchanged.push(entry);
@@ -265,15 +278,16 @@ export async function executeImport(
     for (const entry of diff.added) {
       const skill = incoming.find(s => s.name === entry.name)!;
       const id = crypto.randomUUID();
+      const filesJson = JSON.stringify(packageFilesFor(skill));
       await conn.query(
-        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by, is_builtin)
-         VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, 'system', 1)`,
-        [id, orgId, skill.name, skill.description, JSON.stringify(skill.labels), skill.specs, JSON.stringify(skill.scripts)],
+        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, files, created_by, is_builtin)
+         VALUES (?, ?, ?, ?, ?, 'system', 'installed', 1, ?, ?, ?, 'system', 1)`,
+        [id, orgId, skill.name, skill.description, JSON.stringify(skill.labels), skill.specs, JSON.stringify(skill.scripts), filesJson],
       );
       await conn.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved, commit_message)
-         VALUES (?, ?, 1, ?, ?, 'system', 1, ?)`,
-        [crypto.randomUUID(), id, skill.specs, JSON.stringify(skill.scripts), comment || "Builtin import"],
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, author_id, is_approved, commit_message)
+         VALUES (?, ?, 1, ?, ?, ?, 'system', 1, ?)`,
+        [crypto.randomUUID(), id, skill.specs, JSON.stringify(skill.scripts), filesJson, comment || "Builtin import"],
       );
     }
 
@@ -281,6 +295,7 @@ export async function executeImport(
     for (const entry of diff.updated) {
       const skill = incoming.find(s => s.name === entry.name)!;
       const existingId = builtinByName.get(entry.name)!;
+      const filesJson = JSON.stringify(packageFilesFor(skill));
       // Get next version number
       const [vRows] = await conn.query(
         "SELECT MAX(version) AS v FROM skill_versions WHERE skill_id = ?",
@@ -289,15 +304,15 @@ export async function executeImport(
       const nextVersion = (vRows[0]?.v ?? 0) + 1;
       // Update skills row
       await conn.query(
-        `UPDATE skills SET description = ?, labels = ?, specs = ?, scripts = ?, version = ?, updated_at = CURRENT_TIMESTAMP
+        `UPDATE skills SET description = ?, labels = ?, specs = ?, scripts = ?, files = ?, version = ?, updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [skill.description, JSON.stringify(skill.labels), skill.specs, JSON.stringify(skill.scripts), nextVersion, existingId],
+        [skill.description, JSON.stringify(skill.labels), skill.specs, JSON.stringify(skill.scripts), filesJson, nextVersion, existingId],
       );
       // Create approved version row
       await conn.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved, commit_message)
-         VALUES (?, ?, ?, ?, ?, 'system', 1, ?)`,
-        [crypto.randomUUID(), existingId, nextVersion, skill.specs, JSON.stringify(skill.scripts), comment || "Builtin update"],
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, author_id, is_approved, commit_message)
+         VALUES (?, ?, ?, ?, ?, ?, 'system', 1, ?)`,
+        [crypto.randomUUID(), existingId, nextVersion, skill.specs, JSON.stringify(skill.scripts), filesJson, comment || "Builtin update"],
       );
     }
 

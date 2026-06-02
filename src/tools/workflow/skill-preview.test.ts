@@ -133,7 +133,7 @@ description: "A skill that does X"
     expect(parsed.skill.description).toBe("A skill that does X");
   });
 
-  it("falls back to directory name when frontmatter has no name", async () => {
+  it("returns error when frontmatter has no name", async () => {
     const dir = writeSkill(`---
 description: Some skill
 ---
@@ -141,17 +141,16 @@ description: Some skill
 `);
     const result = await exec({ dir });
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.skill.name).toBe(path.basename(testSkillDir));
+    expect(parsed.error).toMatch(/name field/);
+    expect(result.details.error).toBe(true);
   });
 
-  it("handles SKILL.md without frontmatter", async () => {
+  it("returns error for SKILL.md without frontmatter", async () => {
     const dir = writeSkill("# Just a title\n\nSome content");
     const result = await exec({ dir });
     const parsed = JSON.parse(result.content[0].text);
-    expect(parsed.skill.name).toBe(path.basename(testSkillDir));
-    expect(parsed.skill.description).toBe("");
-    expect(parsed.skill.type).toBe("Custom");
-    expect(parsed.skill.specs).toBe("# Just a title\n\nSome content");
+    expect(parsed.error).toMatch(/name field/);
+    expect(result.details.error).toBe(true);
   });
 
   // --- Scripts ---

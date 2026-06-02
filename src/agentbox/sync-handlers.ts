@@ -25,6 +25,7 @@ import type {
 } from "../shared/gateway-sync.js";
 import { GATEWAY_SYNC_DESCRIPTORS } from "../shared/gateway-sync.js";
 import { resolveUnderDir } from "../shared/path-utils.js";
+import { decodeSkillFileContent, normalizeSkillFiles, type SkillPackageFile } from "../shared/skill-package.js";
 
 // ── MCP handler ───────────────────────────────────────────────────────
 
@@ -81,10 +82,26 @@ export const mcpHandler: AgentBoxSyncHandler<McpPayload> = {
 /** Write a single skill (specs + scripts) into the resolved directory */
 function writeSkillToDir(
   resolvedDir: string,
-  skill: { dirName: string; specs: string; scripts: Array<{ name: string; content: string }> | null | undefined },
+  skill: {
+    dirName: string;
+    specs: string;
+    scripts: Array<{ name: string; content: string }> | null | undefined;
+    files?: SkillPackageFile[] | null;
+  },
 ): void {
   const skillDir = resolveUnderDir(resolvedDir, skill.dirName);
   fs.mkdirSync(skillDir, { recursive: true });
+  if (Array.isArray(skill.files) && skill.files.length > 0) {
+    for (const file of normalizeSkillFiles(skill.files)) {
+      const filePath = resolveUnderDir(skillDir, file.path);
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, file.encoding === "base64" ? Buffer.from(file.content, "base64") : decodeSkillFileContent(file));
+      if (file.executable || /^scripts\/[^/]+\.(sh|py)$/.test(file.path)) {
+        try { fs.chmodSync(filePath, 0o755); } catch { /* non-POSIX */ }
+      }
+    }
+    return;
+  }
   if (skill.specs) {
     fs.writeFileSync(path.join(skillDir, "SKILL.md"), skill.specs);
   }
@@ -114,6 +131,7 @@ interface SkillBundlePayload {
     scope: "builtin" | "global";
     specs: string;
     scripts: Array<{ name: string; content: string }>;
+    files?: SkillPackageFile[] | null;
     skillSpaceId?: string;
   }>;
 }
@@ -184,8 +202,18 @@ export const skillsHandler: AgentBoxSyncHandler<SkillBundlePayload> = {
     for (const skill of sortedSkills) {
       if (!skill?.dirName) continue;
       if (seen.has(skill.dirName)) continue;
-      seen.add(skill.dirName);
-      writeSkillToDir(resolvedDir, skill);
+      try {
+        writeSkillToDir(resolvedDir, skill);
+        seen.add(skill.dirName);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[sync-handlers.skills] Failed to materialize skill ${skill.dirName}: ${msg}`);
+        try {
+          fs.rmSync(resolveUnderDir(resolvedDir, skill.dirName), { recursive: true, force: true });
+        } catch {
+          // If dirName itself was unsafe, there is no in-bounds path to clean up.
+        }
+      }
     }
 
     return seen.size;

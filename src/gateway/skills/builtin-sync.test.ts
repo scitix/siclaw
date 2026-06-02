@@ -63,10 +63,10 @@ describe("parseSkillsDir", () => {
 
   // ── 3. basic frontmatter ────────────────────────────────────────────
   it("parses name from basic frontmatter", () => {
-    writeSkill("my-skill", "---\nname: foo\n---\nBody text");
+    writeSkill("foo", "---\nname: foo\n---\nBody text");
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.name).toBe("foo");
-    expect(skill.dirName).toBe("my-skill");
+    expect(skill.dirName).toBe("foo");
   });
 
   // ── 4. block scalar description (>-) ────────────────────────────────
@@ -80,21 +80,21 @@ describe("parseSkillsDir", () => {
       "---",
       "Body",
     ].join("\n");
-    writeSkill("block", specs);
+    writeSkill("blocker", specs);
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.description).toBe("line1 line2");
   });
 
   // ── 5. inline description ──────────────────────────────────────────
   it("parses inline description", () => {
-    writeSkill("inline", "---\nname: inl\ndescription: simple desc\n---\n");
+    writeSkill("inl", "---\nname: inl\ndescription: simple desc\n---\n");
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.description).toBe("simple desc");
   });
 
   // ── 6. skill without description ───────────────────────────────────
   it("returns empty description when not present in frontmatter", () => {
-    writeSkill("no-desc", "---\nname: nd\n---\n");
+    writeSkill("nd", "---\nname: nd\n---\n");
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.description).toBe("");
   });
@@ -116,7 +116,7 @@ describe("parseSkillsDir", () => {
 
   // ── 8. skill without scripts dir ──────────────────────────────────
   it("returns empty scripts array when scripts/ does not exist", () => {
-    writeSkill("no-scripts", "---\nname: ns\n---\n");
+    writeSkill("ns", "---\nname: ns\n---\n");
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.scripts).toEqual([]);
   });
@@ -148,10 +148,9 @@ describe("parseSkillsDir", () => {
   });
 
   // ── 12. SKILL.md without name ──────────────────────────────────────
-  it("skips skills whose SKILL.md lacks a name field", () => {
+  it("rejects skills whose SKILL.md lacks a name field", () => {
     writeSkill("nameless", "---\ndescription: something\n---\n");
-    const result = parseSkillsDir(tmpDir);
-    expect(result).toEqual([]);
+    expect(() => parseSkillsDir(tmpDir)).toThrow(/name field/);
   });
 
   // ── 13. multiple skills ───────────────────────────────────────────
@@ -178,7 +177,7 @@ describe("parseSkillsDir", () => {
   // ── additional edge cases ─────────────────────────────────────────
 
   it("ignores non-.sh/.py files in scripts/", () => {
-    writeSkill("filtered-scripts", "---\nname: fs\n---\n", {
+    writeSkill("fs", "---\nname: fs\n---\n", {
       "run.sh": "echo hi",
       "helper.py": "pass",
       "readme.md": "# doc",
@@ -189,10 +188,9 @@ describe("parseSkillsDir", () => {
     expect(skill.scripts.map((s) => s.name)).toEqual(["helper.py", "run.sh"]);
   });
 
-  it("handles SKILL.md with no frontmatter block — skips it", () => {
+  it("rejects SKILL.md with no frontmatter block", () => {
     writeSkill("no-front", "Just some markdown without frontmatter");
-    const result = parseSkillsDir(tmpDir);
-    expect(result).toEqual([]);
+    expect(() => parseSkillsDir(tmpDir)).toThrow(/name field/);
   });
 
   it("handles meta.json with invalid JSON gracefully", () => {
@@ -213,16 +211,44 @@ describe("parseSkillsDir", () => {
       "  literal line2",
       "---",
     ].join("\n");
-    writeSkill("literal", specs);
+    writeSkill("lit", specs);
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.description).toBe("literal line1 literal line2");
   });
 
   it("includes the full raw specs content (frontmatter + body)", () => {
     const specs = "---\nname: full\n---\n# Body\nSome content here";
-    writeSkill("full-specs", specs);
+    writeSkill("full", specs);
     const [skill] = parseSkillsDir(tmpDir);
     expect(skill.specs).toBe(specs);
+  });
+
+  it("preserves non-script package files in files[]", () => {
+    writeSkill("packaged", "---\nname: packaged\n---\n", { "run.sh": "echo ok" });
+    fs.mkdirSync(path.join(tmpDir, "packaged", "references"));
+    fs.writeFileSync(path.join(tmpDir, "packaged", "references", "runbook.md"), "# Runbook\n");
+    fs.mkdirSync(path.join(tmpDir, "packaged", "examples"));
+    fs.writeFileSync(path.join(tmpDir, "packaged", "examples", "input.json"), "{}");
+
+    const [skill] = parseSkillsDir(tmpDir);
+    expect(skill.files.map(f => f.path).sort()).toEqual([
+      "SKILL.md",
+      "examples/input.json",
+      "references/runbook.md",
+      "scripts/run.sh",
+    ]);
+  });
+
+  it("rejects lowercase skill.md", () => {
+    const dir = path.join(tmpDir, "lowercase");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "skill.md"), "---\nname: lowercase\n---\n");
+    expect(() => parseSkillsDir(tmpDir)).toThrow(/uppercase SKILL\.md/);
+  });
+
+  it("rejects directory/name mismatch", () => {
+    writeSkill("folder-name", "---\nname: frontmatter-name\n---\n");
+    expect(() => parseSkillsDir(tmpDir)).toThrow(/does not match/);
   });
 
   // ── platform skill isolation ──────────────────────────────────────────

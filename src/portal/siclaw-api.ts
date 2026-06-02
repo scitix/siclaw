@@ -40,6 +40,16 @@ import { parseFrontmatter } from "../gateway/skills/builtin-sync.js";
 import { validateSchedule } from "../cron/cron-limits.js";
 import { validateKnowledgePackage } from "../shared/knowledge-package.js";
 import {
+  decodeSkillFileContent,
+  normalizeSkillFiles,
+  parseSingleSkillPackage,
+  safeParseSkillFiles,
+  scriptsFromSkillFiles,
+  skillFilesFromLegacy,
+  type SkillPackageFile,
+  type SkillScriptEntry,
+} from "../shared/skill-package.js";
+import {
   normalizeChatSessionPreview,
   normalizeChatSessionTitle,
   truncateChatSessionTitle,
@@ -309,10 +319,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       db.query(listSql, [...params, pageSize, offset]),
     ]) as [any, any];
 
-    for (const row of listRows as any[]) {
-      if (row.labels !== undefined) row.labels = safeParseJson(row.labels, []);
-      if (row.scripts !== undefined) row.scripts = safeParseJson(row.scripts, []);
-    }
+    for (const row of listRows as any[]) hydrateSkillRow(row);
 
     sendJson(res, 200, {
       data: listRows,
@@ -349,6 +356,172 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     return { valid: true, name: nameMatch[1].trim(), description };
   }
 
+  function decodeSpecs(raw: string | null | undefined): string | null {
+    if (!raw) return null;
+    if (raw.startsWith('"')) { try { return JSON.parse(raw); } catch {} }
+    return raw;
+  }
+
+  function parseScripts(raw: unknown): SkillScriptEntry[] {
+    if (Array.isArray(raw)) return raw as SkillScriptEntry[];
+    if (typeof raw === "string") return safeParseJson<SkillScriptEntry[]>(raw, []);
+    return [];
+  }
+
+  function parseFiles(raw: unknown, specs?: string | null, scripts?: SkillScriptEntry[] | null): SkillPackageFile[] {
+    return safeParseSkillFiles(raw, specs, scripts);
+  }
+
+  function mergeLegacyPackageFiles(
+    baseFiles: SkillPackageFile[],
+    specs: string,
+    scripts: SkillScriptEntry[],
+    opts: { replaceSpecs: boolean; replaceScripts: boolean },
+  ): SkillPackageFile[] {
+    if (baseFiles.length === 0) return skillFilesFromLegacy(specs, scripts);
+    const kept = baseFiles.filter((file) => {
+      if (opts.replaceSpecs && file.path === "SKILL.md") return false;
+      if (opts.replaceScripts && /^scripts\/[^/]+\.(sh|py)$/.test(file.path)) return false;
+      return true;
+    });
+    const replacements = skillFilesFromLegacy(
+      opts.replaceSpecs ? specs : null,
+      opts.replaceScripts ? scripts : [],
+    );
+    return normalizeSkillFiles([...kept, ...replacements]);
+  }
+
+  function hydrateSkillRow(row: any): any {
+    if (!row) return row;
+    row.labels = safeParseJson(row.labels, []);
+    row.scripts = parseScripts(row.scripts);
+    row.files = parseFiles(row.files, decodeSpecs(row.specs) ?? "", row.scripts);
+    return row;
+  }
+
+  function buildSkillPackageFromBody(
+    body: Record<string, unknown>,
+    fallback?: { name?: string; description?: string | null; labels?: unknown; specs?: unknown; scripts?: unknown; files?: unknown },
+  ): {
+    name: string;
+    description: string;
+    labels: string[];
+    specs: string;
+    scripts: SkillScriptEntry[];
+    files: SkillPackageFile[];
+    labelsJson: string;
+    scriptsJson: string;
+    filesJson: string;
+  } {
+    const labels = Array.isArray(body.labels)
+      ? body.labels.map(String)
+      : safeParseJson<string[]>(fallback?.labels as any, []);
+
+    if (Array.isArray(body.files)) {
+      const parsed = parseSingleSkillPackage(body.files, { labels });
+      const explicitName = typeof body.name === "string" ? body.name.trim() : "";
+      if (explicitName && explicitName !== parsed.name) {
+        throw new Error(`name "${explicitName}" does not match SKILL.md name "${parsed.name}"`);
+      }
+      const explicitDescription = typeof body.description === "string" ? body.description.trim() : "";
+      const description = explicitDescription || parsed.description || "";
+      return {
+        name: parsed.name,
+        description,
+        labels,
+        specs: parsed.specs,
+        scripts: parsed.scripts,
+        files: parsed.files,
+        labelsJson: JSON.stringify(labels),
+        scriptsJson: JSON.stringify(parsed.scripts),
+        filesJson: JSON.stringify(parsed.files),
+      };
+    }
+
+    const fallbackSpecs = decodeSpecs(fallback?.specs as any) ?? "";
+    const specs = typeof body.specs === "string" ? body.specs : fallbackSpecs;
+    const specsCheck = validateSpecs(specs);
+    if (!specsCheck.valid) throw new Error(specsCheck.error);
+    const bodyHasSpecs = typeof body.specs === "string";
+    const bodyHasScripts = Array.isArray(body.scripts);
+    const fallbackScripts = parseScripts(fallback?.scripts);
+    const scripts = bodyHasScripts ? body.scripts as SkillScriptEntry[] : fallbackScripts;
+    const fallbackFiles = parseFiles(fallback?.files, fallbackSpecs, fallbackScripts);
+    const files = !bodyHasSpecs && !bodyHasScripts && fallbackFiles.length > 0
+      ? fallbackFiles
+      : mergeLegacyPackageFiles(fallbackFiles, specs, scripts, {
+        replaceSpecs: bodyHasSpecs,
+        replaceScripts: bodyHasScripts,
+      });
+    const derivedScripts = !bodyHasScripts && files.length > 0 ? scriptsFromSkillFiles(files) : scripts;
+    const explicitName = typeof body.name === "string" ? body.name.trim() : "";
+    const explicitDescription = typeof body.description === "string" ? body.description.trim() : "";
+    return {
+      name: explicitName || specsCheck.name || fallback?.name || "untitled",
+      description: explicitDescription || specsCheck.description || String(fallback?.description ?? ""),
+      labels,
+      specs,
+      scripts: derivedScripts,
+      files,
+      labelsJson: JSON.stringify(labels),
+      scriptsJson: JSON.stringify(derivedScripts),
+      filesJson: JSON.stringify(files),
+    };
+  }
+
+  function buildFilesDiff(
+    oldFiles: SkillPackageFile[] | null,
+    newFiles: SkillPackageFile[] | null,
+  ): Record<string, { old: string | null; new: string | null; encoding?: string }> {
+    const diff: Record<string, { old: string | null; new: string | null; encoding?: string }> = {};
+    const oldMap = new Map((oldFiles ?? []).map((file) => [file.path, file]));
+    const newMap = new Map((newFiles ?? []).map((file) => [file.path, file]));
+    for (const filePath of [...new Set([...oldMap.keys(), ...newMap.keys()])].sort()) {
+      const oldFile = oldMap.get(filePath);
+      const newFile = newMap.get(filePath);
+      if (oldFile?.sha256 === newFile?.sha256 && oldFile?.encoding === newFile?.encoding) continue;
+      const encoding = newFile?.encoding ?? oldFile?.encoding;
+      diff[filePath] = encoding === "base64"
+        ? { old: null, new: null, encoding }
+        : {
+          old: oldFile ? decodeSkillFileContent(oldFile) : null,
+          new: newFile ? decodeSkillFileContent(newFile) : null,
+          encoding,
+        };
+    }
+    return diff;
+  }
+
+  function evaluateInstructionFilesStatic(files: SkillPackageFile[]) {
+    const findings: ReturnType<typeof evaluateScriptsStatic> = [];
+    const patterns = [
+      { category: "prompt_injection", severity: "medium" as const, pattern: /ignore (all )?(previous|prior) instructions/i, label: "Instruction override" },
+      { category: "prompt_injection", severity: "medium" as const, pattern: /system prompt/i, label: "System prompt reference" },
+      { category: "data_exfiltration", severity: "high" as const, pattern: /(secret|token|credential).*(send|upload|exfiltrate|post)/i, label: "Credential exfiltration instruction" },
+    ];
+    for (const file of files) {
+      if (file.path !== "SKILL.md" && !file.path.startsWith("references/")) continue;
+      if (file.encoding !== "utf8") continue;
+      const lines = decodeSkillFileContent(file).split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        for (const p of patterns) {
+          const match = lines[i].match(p.pattern);
+          if (match) {
+            findings.push({
+              category: p.category,
+              severity: p.severity,
+              pattern: p.label,
+              match: match[0],
+              scriptName: file.path,
+              line: i + 1,
+            });
+          }
+        }
+      }
+    }
+    return findings;
+  }
+
   // Create skill
   router.post(`${P}/skills`, async (req, res) => {
     const auth = requireAuth(req, config.jwtSecret);
@@ -357,52 +530,44 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (await guardAccess(res, config, auth, "write")) return;
     const body = await parseBody<Record<string, unknown>>(req);
 
-    // Validate specs format
-    const specsCheck = validateSpecs(body.specs as string);
-    if (!specsCheck.valid) {
-      sendJson(res, 400, { error: specsCheck.error });
+    let pkg: ReturnType<typeof buildSkillPackageFromBody>;
+    try {
+      pkg = buildSkillPackageFromBody(body);
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message });
       return;
     }
 
     const id = crypto.randomUUID();
     const version = 1;
-
     const db = getDb();
 
-    // Use name/description from frontmatter if not explicitly provided
-    const skillName = (body.name as string)?.trim() || specsCheck.name || "untitled";
-    const skillDescription = (body.description as string)?.trim() || specsCheck.description || "";
-
     await db.query(
-      `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, files, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        id, auth.orgId, skillName, skillDescription || null,
-        JSON.stringify(body.labels || []),
+        id, auth.orgId, pkg.name, pkg.description || null,
+        pkg.labelsJson,
         auth.userId, "draft", version,
-        body.specs || "", JSON.stringify(body.scripts || []),
+        pkg.specs, pkg.scriptsJson, pkg.filesJson,
         auth.userId,
       ],
     );
 
     // Insert initial version
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, labels)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, commit_message, author_id, labels)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         crypto.randomUUID(), id, version,
-        body.specs || "", JSON.stringify(body.scripts || []),
+        pkg.specs, pkg.scriptsJson, pkg.filesJson,
         body.commit_message || "Initial version", auth.userId,
-        JSON.stringify(body.labels || []),
+        pkg.labelsJson,
       ],
     );
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [id]) as any;
-    const created = rows[0];
-    if (created) {
-      created.labels = safeParseJson(created.labels, []);
-      created.scripts = safeParseJson(created.scripts, []);
-    }
+    const created = hydrateSkillRow(rows[0]);
     sendJson(res, 201, created);
   });
 
@@ -577,6 +742,38 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
   // Skills CRUD (continues — parameterized resource routes)
   // ================================================================
 
+  // Preview a single skill package from archive bytes or JSON { files }.
+  router.post(`${P}/skills/package/preview`, async (req, res) => {
+    const auth = requireAuth(req, config.jwtSecret);
+    if (!auth) { sendJson(res, 401, { error: "Unauthorized" }); return; }
+
+    if (await guardAccess(res, config, auth, "write")) return;
+
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const raw = Buffer.concat(chunks);
+    const contentType = req.headers["content-type"] || "";
+
+    try {
+      let parsed;
+      if (contentType.includes("application/json")) {
+        const body = JSON.parse(raw.toString("utf8"));
+        parsed = parseSingleSkillPackage(body.files ?? [], { labels: Array.isArray(body.labels) ? body.labels : [] });
+      } else {
+        const { parseSkillPack } = await import("./skill-import.js");
+        const skills = await parseSkillPack(raw);
+        if (skills.length !== 1) {
+          sendJson(res, 400, { error: "Single-skill package upload must contain exactly one skill directory" });
+          return;
+        }
+        parsed = skills[0];
+      }
+      sendJson(res, 200, { skill: parsed });
+    } catch (err: any) {
+      sendJson(res, 400, { error: err.message || "Failed to parse skill package" });
+    }
+  });
+
   // Get skill
   router.get(`${P}/skills/:id`, async (req, res, params) => {
     const auth = requireAuth(req, config.jwtSecret);
@@ -592,9 +789,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       sendJson(res, 404, { error: "Skill not found" });
       return;
     }
-    const row = rows[0];
-    row.labels = safeParseJson(row.labels, []);
-    row.scripts = safeParseJson(row.scripts, []);
+    const row = hydrateSkillRow(rows[0]);
     sendJson(res, 200, row);
   });
 
@@ -626,29 +821,28 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         return;
       }
       // Create overlay — full copy with user's edits applied
+      let pkg: ReturnType<typeof buildSkillPackageFromBody>;
+      try {
+        pkg = buildSkillPackageFromBody(body, targetSkill);
+      } catch (err: any) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
       const overlayId = crypto.randomUUID();
-      const newSpecs = (body.specs as string) ?? targetSkill.specs;
-      const newScripts = body.scripts ? JSON.stringify(body.scripts) : targetSkill.scripts;
-      const newLabels = body.labels ? JSON.stringify(body.labels) : targetSkill.labels;
-      const newDesc = (body.description as string) ?? targetSkill.description;
 
       await db.query(
-        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, created_by, is_builtin, overlay_of)
-         VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, 0, ?)`,
-        [overlayId, auth.orgId, targetSkill.name, newDesc, newLabels, auth.userId, newSpecs, newScripts, auth.userId, params.id],
+        `INSERT INTO skills (id, org_id, name, description, labels, author_id, status, version, specs, scripts, files, created_by, is_builtin, overlay_of)
+         VALUES (?, ?, ?, ?, ?, ?, 'draft', 1, ?, ?, ?, ?, 0, ?)`,
+        [overlayId, auth.orgId, pkg.name, pkg.description, pkg.labelsJson, auth.userId, pkg.specs, pkg.scriptsJson, pkg.filesJson, auth.userId, params.id],
       );
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, author_id, is_approved, labels)
-         VALUES (?, ?, 1, ?, ?, ?, 0, ?)`,
-        [crypto.randomUUID(), overlayId, newSpecs, newScripts, auth.userId, newLabels],
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, author_id, is_approved, labels)
+         VALUES (?, ?, 1, ?, ?, ?, ?, 0, ?)`,
+        [crypto.randomUUID(), overlayId, pkg.specs, pkg.scriptsJson, pkg.filesJson, auth.userId, pkg.labelsJson],
       );
 
       const [created] = await db.query("SELECT * FROM skills WHERE id = ?", [overlayId]) as any;
-      const overlay = created[0];
-      if (overlay) {
-        overlay.labels = safeParseJson(overlay.labels, []);
-        overlay.scripts = safeParseJson(overlay.scripts, []);
-      }
+      const overlay = hydrateSkillRow(created[0]);
       sendJson(res, 201, overlay);
       return;
     }
@@ -664,69 +858,79 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (skill.status === "installed") {
       // Bump version, create version record, reset to draft
       const newVersion = (skill.version || 0) + 1;
-      // specs is MEDIUMTEXT (raw string), scripts is JSON
-      const newSpecs = body.specs ?? skill.specs ?? "";
-      const newScripts = body.scripts ? JSON.stringify(body.scripts) : (typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts || []));
-      const oldSpecs = skill.specs ?? "";
-      const oldScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts || []);
+      let pkg: ReturnType<typeof buildSkillPackageFromBody>;
+      try {
+        pkg = buildSkillPackageFromBody(body, skill);
+      } catch (err: any) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      const oldSpecs = decodeSpecs(skill.specs) ?? "";
+      const oldScripts = parseScripts(skill.scripts);
+      const oldFiles = parseFiles(skill.files, oldSpecs, oldScripts);
 
       // Create version record with diff between old and new
-      const newLabels = body.labels ? JSON.stringify(body.labels) : targetSkill.labels;
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved, labels)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, diff, commit_message, author_id, is_approved, labels)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
         [
           crypto.randomUUID(), params.id, newVersion,
-          newSpecs, newScripts,
+          pkg.specs, pkg.scriptsJson, pkg.filesJson,
           JSON.stringify({
-            specs_diff: { old: oldSpecs, new: newSpecs },
-            scripts_diff: { old: oldScripts, new: newScripts },
+            specs_diff: { old: oldSpecs, new: pkg.specs },
+            scripts_diff: { old: JSON.stringify(oldScripts), new: pkg.scriptsJson },
+            files_diff: buildFilesDiff(oldFiles, pkg.files),
           }),
           body.commit_message || `Version ${newVersion}`,
           auth.userId,
-          newLabels,
+          pkg.labelsJson,
         ],
       );
 
       await db.query(
         `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
          labels = COALESCE(?, labels), status = 'draft',
-         version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts),
+         version = ?, specs = COALESCE(?, specs), scripts = COALESCE(?, scripts), files = COALESCE(?, files),
          updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [
-          body.name ?? null, body.description ?? null,
-          body.labels ? JSON.stringify(body.labels) : null,
+          pkg.name, pkg.description,
+          pkg.labelsJson,
           newVersion,
-          body.specs ?? null,
-          body.scripts ? JSON.stringify(body.scripts) : null,
+          pkg.specs,
+          pkg.scriptsJson,
+          pkg.filesJson,
           params.id,
         ],
       );
     } else {
       // Draft: in-place update, no version bump
+      let pkg: ReturnType<typeof buildSkillPackageFromBody>;
+      try {
+        pkg = buildSkillPackageFromBody(body, skill);
+      } catch (err: any) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
       await db.query(
         `UPDATE skills SET name = COALESCE(?, name), description = COALESCE(?, description),
          labels = COALESCE(?, labels),
-         specs = COALESCE(?, specs), scripts = COALESCE(?, scripts),
+         specs = COALESCE(?, specs), scripts = COALESCE(?, scripts), files = COALESCE(?, files),
          updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
         [
-          body.name ?? null, body.description ?? null,
-          body.labels ? JSON.stringify(body.labels) : null,
-          body.specs ?? null,
-          body.scripts ? JSON.stringify(body.scripts) : null,
+          pkg.name, pkg.description,
+          pkg.labelsJson,
+          pkg.specs,
+          pkg.scriptsJson,
+          pkg.filesJson,
           params.id,
         ],
       );
     }
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
-    const updated = rows[0];
-    if (updated) {
-      updated.labels = safeParseJson(updated.labels, []);
-      updated.scripts = safeParseJson(updated.scripts, []);
-    }
+    const updated = hydrateSkillRow(rows[0]);
     sendJson(res, 200, updated);
 
     // Draft update: notify dev agents to reload skills
@@ -792,7 +996,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       [params.id],
     ) as any;
     for (const row of rows as any[]) {
-      if (row.scripts !== undefined) row.scripts = safeParseJson(row.scripts, []);
+      const scripts = parseScripts(row.scripts);
+      if (row.scripts !== undefined) row.scripts = scripts;
+      row.files = parseFiles(row.files, decodeSpecs(row.specs) ?? "", scripts);
       if (row.labels !== undefined) row.labels = safeParseJson(row.labels, []);
       if (row.diff !== undefined) row.diff = safeParseJson(row.diff, null);
     }
@@ -825,7 +1031,9 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
       return;
     }
     const versionRow = rows[0];
-    versionRow.scripts = safeParseJson(versionRow.scripts, []);
+    const versionScripts = parseScripts(versionRow.scripts);
+    versionRow.scripts = versionScripts;
+    versionRow.files = parseFiles(versionRow.files, decodeSpecs(versionRow.specs) ?? "", versionScripts);
     versionRow.labels = safeParseJson(versionRow.labels, []);
     versionRow.diff = safeParseJson(versionRow.diff, null);
     sendJson(res, 200, versionRow);
@@ -866,21 +1074,22 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
 
     // Find last approved version for diff baseline
     const [baselineRows] = await db.query(
-      "SELECT specs, scripts FROM skill_versions WHERE skill_id = ? AND is_approved = 1 ORDER BY version DESC LIMIT 1",
+      "SELECT specs, scripts, files FROM skill_versions WHERE skill_id = ? AND is_approved = 1 ORDER BY version DESC LIMIT 1",
       [params.id],
     ) as any;
     const baseline = baselineRows.length > 0 ? baselineRows[0] : null;
 
-    // Decode specs — may be double-encoded from earlier bug
-    function decodeSpecs(raw: string | null): string | null {
-      if (!raw) return null;
-      if (raw.startsWith('"')) { try { return JSON.parse(raw); } catch {} }
-      return raw;
-    }
+    const baselineSpecs = decodeSpecs(baseline?.specs) || null;
+    const baselineScripts = parseScripts(baseline?.scripts);
+    const baselineFiles = baseline ? parseFiles(baseline.files, baselineSpecs, baselineScripts) : null;
+    const currentSpecs = decodeSpecs(skill.specs) || "";
+    const currentScripts = parseScripts(skill.scripts);
+    const currentFiles = parseFiles(skill.files, currentSpecs, currentScripts);
 
     const diff = JSON.stringify({
-      specs_diff: { old: decodeSpecs(baseline?.specs) || null, new: decodeSpecs(skill.specs) },
-      scripts_diff: { old: baseline?.scripts || null, new: skill.scripts },
+      specs_diff: { old: baselineSpecs, new: currentSpecs },
+      scripts_diff: { old: baseline ? JSON.stringify(baselineScripts) : null, new: JSON.stringify(currentScripts) },
+      files_diff: buildFilesDiff(baselineFiles, currentFiles),
       ...(body.comment ? { comment: body.comment } : {}),
     });
 
@@ -900,12 +1109,15 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     sendJson(res, 200, { review_id: reviewId, status: "pending_review" });
 
     // Security assessment runs entirely in background — reviewer sees results when they open the review
-    const scriptsArr: { name: string; content: string }[] = safeParseJson(skill.scripts, []);
+    const scriptsArr = scriptsFromSkillFiles(currentFiles);
 
     (async () => {
       try {
         // Phase 1: static
-        const staticFindings = evaluateScriptsStatic(scriptsArr);
+        const staticFindings = [
+          ...evaluateScriptsStatic(scriptsArr),
+          ...evaluateInstructionFilesStatic(currentFiles),
+        ];
         const staticAssessment = buildAssessment(staticFindings);
 
         // Phase 2: AI (may take 10-30s)
@@ -921,6 +1133,7 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
         // Fallback: at least store static assessment
         try {
           const staticFindings = evaluateScriptsStatic(scriptsArr);
+          staticFindings.push(...evaluateInstructionFilesStatic(currentFiles));
           await db.query(
             "UPDATE skill_reviews SET security_assessment = ? WHERE id = ?",
             [JSON.stringify(buildAssessment(staticFindings)), reviewId],
@@ -1005,14 +1218,18 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     ) as any;
 
     if (versionRows.length === 0) {
+      const approvedScripts = parseScripts(skill.scripts);
+      const approvedSpecs = typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs);
+      const approvedFiles = JSON.stringify(parseFiles(skill.files, decodeSpecs(approvedSpecs) ?? "", approvedScripts));
       // Create one with current skill content, is_approved=1
       await db.query(
-        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, commit_message, author_id, is_approved, labels)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+        `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, commit_message, author_id, is_approved, labels)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
         [
           crypto.randomUUID(), params.id, skill.version,
-          typeof skill.specs === "string" ? skill.specs : JSON.stringify(skill.specs),
-          typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts),
+          approvedSpecs,
+          JSON.stringify(approvedScripts),
+          approvedFiles,
           `Approved version ${skill.version}`,
           skill.author_id,
           typeof skill.labels === "string" ? skill.labels : JSON.stringify(skill.labels || []),
@@ -1186,18 +1403,24 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     const currentScripts = typeof skill.scripts === "string" ? skill.scripts : JSON.stringify(skill.scripts);
     const targetSpecs = typeof target.specs === "string" ? target.specs : JSON.stringify(target.specs);
     const targetScripts = typeof target.scripts === "string" ? target.scripts : JSON.stringify(target.scripts);
+    const currentScriptsArr = parseScripts(currentScripts);
+    const targetScriptsArr = parseScripts(targetScripts);
+    const currentFiles = parseFiles(skill.files, decodeSpecs(currentSpecs) ?? "", currentScriptsArr);
+    const targetFiles = parseFiles(target.files, decodeSpecs(targetSpecs) ?? "", targetScriptsArr);
+    const targetFilesJson = JSON.stringify(targetFiles);
 
     // Create new version record with target's content and diff vs current
     const targetLabels = target.labels ?? skill.labels;
     await db.query(
-      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, diff, commit_message, author_id, is_approved, labels)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+      `INSERT INTO skill_versions (id, skill_id, version, specs, scripts, files, diff, commit_message, author_id, is_approved, labels)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
       [
         crypto.randomUUID(), params.id, newVersion,
-        targetSpecs, targetScripts,
+        targetSpecs, targetScripts, targetFilesJson,
         JSON.stringify({
           specs_diff: { old: currentSpecs, new: targetSpecs },
           scripts_diff: { old: currentScripts, new: targetScripts },
+          files_diff: buildFilesDiff(currentFiles, targetFiles),
         }),
         `Rollback to version ${body.version}`,
         auth.userId,
@@ -1217,17 +1440,14 @@ export function registerSiclawRoutes(router: RestRouter, config: SiclawConfig, c
     if (rollbackName) { setClauses.push("name = ?"); setValues.push(rollbackName); }
     if (rollbackDesc) { setClauses.push("description = ?"); setValues.push(rollbackDesc); }
     if (rollbackLabels) { setClauses.push("labels = ?"); setValues.push(typeof rollbackLabels === "string" ? rollbackLabels : JSON.stringify(rollbackLabels)); }
+    setClauses.push("files = ?"); setValues.push(targetFilesJson);
     setClauses.push("updated_at = CURRENT_TIMESTAMP");
     setValues.push(params.id);
     await db.query(`UPDATE skills SET ${setClauses.join(", ")} WHERE id = ?`, setValues);
 
     const [rows] = await db.query("SELECT * FROM skills WHERE id = ?", [params.id]) as any;
     const row = rows[0];
-    if (row) {
-      row.labels = safeParseJson(row.labels, []);
-      row.scripts = safeParseJson(row.scripts, []);
-    }
-    sendJson(res, 200, row);
+    sendJson(res, 200, hydrateSkillRow(row));
   });
 
   // ================================================================

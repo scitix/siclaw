@@ -254,6 +254,36 @@ describe("siclaw-api skills", () => {
       const skillInsertArgs = query.mock.calls[0][1];
       expect(skillInsertArgs).toContain(JSON.stringify(["demo"]));
     });
+
+    it("creates a skill from files[] and derives specs/scripts", async () => {
+      const files = [
+        { path: "SKILL.md", content: "---\nname: package-skill\ndescription: packaged\n---\nbody", encoding: "utf8", size: 55, sha256: "a" },
+        { path: "scripts/run.sh", content: "echo ok", encoding: "utf8", size: 7, sha256: "b", executable: true },
+        { path: "references/runbook.md", content: "# runbook", encoding: "utf8", size: 9, sha256: "c" },
+      ];
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "s-new", name: "package-skill", status: "draft", labels: "[]", scripts: JSON.stringify([{ name: "run.sh", content: "echo ok" }]), files: JSON.stringify(files) }], []]);
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills",
+        method: "POST",
+        body: { files },
+      }));
+
+      expect(status).toBe(201);
+      expect(body.name).toBe("package-skill");
+      const insertArgs = query.mock.calls[0][1];
+      expect(insertArgs).toContain("package-skill");
+      expect(insertArgs).toContain(JSON.stringify([{ name: "run.sh", content: "echo ok" }]));
+      const filesArg = insertArgs.find((arg: unknown) => typeof arg === "string" && arg.includes("references/runbook.md"));
+      expect(JSON.parse(filesArg)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "SKILL.md" }),
+        expect.objectContaining({ path: "scripts/run.sh" }),
+        expect.objectContaining({ path: "references/runbook.md" }),
+      ]));
+    });
   });
 
   // ── GET /skills/:id ──────────────────────────────────────
@@ -306,6 +336,107 @@ describe("siclaw-api skills", () => {
 
       expect(status).toBe(201);
       expect(body.overlay_of).toBe("s-builtin");
+    });
+
+    it("preserves package extras when legacy scripts are updated", async () => {
+      const specs = "---\nname: package-skill\ndescription: packaged\n---\nbody";
+      const existingFiles = [
+        { path: "SKILL.md", content: specs, encoding: "utf8", size: 55, sha256: "a" },
+        { path: "scripts/old.sh", content: "echo old", encoding: "utf8", size: 8, sha256: "b", executable: true },
+        { path: "references/runbook.md", content: "# runbook", encoding: "utf8", size: 9, sha256: "c" },
+      ];
+      query
+        .mockResolvedValueOnce([[{
+          id: "s1",
+          name: "package-skill",
+          description: "packaged",
+          labels: "[]",
+          status: "draft",
+          is_builtin: 0,
+          specs,
+          scripts: JSON.stringify([{ name: "old.sh", content: "echo old" }]),
+          files: JSON.stringify(existingFiles),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockImplementationOnce(async () => {
+          const updateArgs = query.mock.calls[1][1];
+          return [[{
+            id: "s1",
+            name: "package-skill",
+            labels: "[]",
+            status: "draft",
+            specs,
+            scripts: updateArgs[4],
+            files: updateArgs[5],
+          }], []];
+        });
+
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills/s1",
+        method: "PUT",
+        body: { scripts: [{ name: "new.sh", content: "echo new" }] },
+      }));
+
+      expect(status).toBe(200);
+      expect(body.files).toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "SKILL.md" }),
+        expect.objectContaining({ path: "scripts/new.sh" }),
+        expect.objectContaining({ path: "references/runbook.md" }),
+      ]));
+      expect(body.files).not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ path: "scripts/old.sh" }),
+      ]));
+    });
+
+    it("stores binary package diffs without UTF-8 decoded payloads", async () => {
+      const specs = "---\nname: package-skill\ndescription: packaged\n---\nbody";
+      const oldFiles = [
+        { path: "SKILL.md", content: specs, encoding: "utf8" },
+        { path: "assets/blob.bin", content: Buffer.from([1, 2, 3]).toString("base64"), encoding: "base64" },
+      ];
+      const newFiles = [
+        { path: "SKILL.md", content: specs, encoding: "utf8" },
+        { path: "assets/blob.bin", content: Buffer.from([4, 5, 6]).toString("base64"), encoding: "base64" },
+      ];
+      query
+        .mockResolvedValueOnce([[{
+          id: "s1",
+          name: "package-skill",
+          description: "packaged",
+          labels: "[]",
+          status: "installed",
+          version: 1,
+          is_builtin: 0,
+          specs,
+          scripts: "[]",
+          files: JSON.stringify(oldFiles),
+        }], []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{
+          id: "s1",
+          name: "package-skill",
+          labels: "[]",
+          status: "draft",
+          specs,
+          scripts: "[]",
+          files: JSON.stringify(newFiles),
+        }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/siclaw/skills/s1",
+        method: "PUT",
+        body: { files: newFiles },
+      }));
+
+      expect(status).toBe(200);
+      const versionInsertArgs = query.mock.calls[1][1];
+      const diff = JSON.parse(versionInsertArgs[6]);
+      expect(diff.files_diff["assets/blob.bin"]).toEqual({
+        old: null,
+        new: null,
+        encoding: "base64",
+      });
     });
 
     it("returns 409 when builtin already has an overlay", async () => {

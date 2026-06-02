@@ -45,6 +45,28 @@ describe("materializePortalSkills", () => {
     expect(mode & 0o100).toBe(0o100);  // owner-executable at minimum
   });
 
+  it("writes complete skill package files when files[] is present", () => {
+    const out = path.join(tmpRoot, "skills");
+    materializePortalSkills(
+      [{
+        name: "packaged",
+        description: "desc",
+        labels: [],
+        specs: "# fallback",
+        scripts: [],
+        files: [
+          { path: "SKILL.md", content: "# packaged", encoding: "utf8", size: 10, sha256: "x" },
+          { path: "references/runbook.md", content: "# runbook", encoding: "utf8", size: 9, sha256: "y" },
+          { path: "scripts/run.sh", content: "echo ok", encoding: "utf8", size: 7, sha256: "z", executable: true },
+        ],
+      }],
+      out,
+    );
+    expect(fs.readFileSync(path.join(out, "packaged", "SKILL.md"), "utf-8")).toBe("# packaged");
+    expect(fs.readFileSync(path.join(out, "packaged", "references", "runbook.md"), "utf-8")).toBe("# runbook");
+    expect(fs.readFileSync(path.join(out, "packaged", "scripts", "run.sh"), "utf-8")).toBe("echo ok");
+  });
+
   it("skips skills with directory-traversal names", () => {
     const out = path.join(tmpRoot, "skills");
     const result = materializePortalSkills(
