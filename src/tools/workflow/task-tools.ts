@@ -86,10 +86,12 @@ export function createTaskUpdateTool(taskListId: string, emit?: SessionEventEmit
       "Update a task in the plan: set status (pending/in_progress/completed), subject/description/" +
       "activeForm/owner, add a dependency (addBlockedBy), or delete it (status=deleted). " +
       "An unknown id returns an error.\n" +
-      "Status workflow pending -> in_progress -> completed: mark a task in_progress right before you start " +
-      "it, keeping only ONE task in_progress at a time, and completed as soon as it is FULLY done so " +
-      "dependents unblock — do not batch completions. Only mark completed when truly finished; if you hit " +
-      "errors, blockers, partial work, or failing checks, keep it in_progress.\n" +
+      "Status workflow pending -> in_progress -> completed: mark a task in_progress when work on it actually " +
+      "starts, and completed as soon as it is FULLY done so dependents unblock — do not batch completions. " +
+      "Keep your OWN inline work to one task in_progress at a time (you do one thing yourself at a time); but " +
+      "when you fan out sub-agents in parallel, mark EACH of their tasks in_progress — several can be " +
+      "in_progress at once when sub-agents are running them. Only mark completed when truly finished; if you " +
+      "hit errors, blockers, partial work, or failing checks, keep it in_progress.\n" +
       "Keep the plan a living mirror of the work: when the investigation reveals a new thread or root-cause " +
       "lead (e.g. you set out to check RDMA but the evidence points at the GPU driver), task_create a NEW " +
       "task for it — do NOT repurpose or re-label an existing task to cram in the new finding. The plan " +
