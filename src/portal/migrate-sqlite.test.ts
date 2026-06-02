@@ -171,6 +171,16 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(cols).toContain("updated_at");
   });
 
+  it("skills and skill_versions files columns exist after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [skillRows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(skills)");
+    const [versionRows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(skill_versions)");
+
+    expect(skillRows.map((r) => r.name)).toContain("files");
+    expect(versionRows.map((r) => r.name)).toContain("files");
+  });
+
   it("hosts.jump_host_id and hosts.passphrase columns exist after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

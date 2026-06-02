@@ -40,6 +40,7 @@ import type {
   CliSnapshotActiveAgent,
   CliSnapshotSkill,
 } from "./cli-snapshot-types.js";
+import { safeParseSkillFiles } from "../shared/skill-package.js";
 
 export type {
   CliSnapshotKnowledgeRepo,
@@ -117,6 +118,7 @@ interface SkillRow {
   labels: string | null;
   specs: string | null;
   scripts: string | null;
+  files: string | null;
 }
 
 interface KnowledgeRow {
@@ -304,7 +306,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // both paths — an overlay always wins over the base builtin.
     const [skills] = activeAgentId
       ? await db.query<SkillRow[]>(
-          `SELECT s.name, s.description, s.labels, s.specs, s.scripts
+          `SELECT s.name, s.description, s.labels, s.specs, s.scripts, s.files
            FROM skills s
            JOIN agent_skills ask ON ask.skill_id = s.id
            WHERE s.org_id = ? AND ask.agent_id = ?
@@ -316,7 +318,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           ["default", activeAgentId, "default"],
         )
       : await db.query<SkillRow[]>(
-          `SELECT s.name, s.description, s.labels, s.specs, s.scripts
+          `SELECT s.name, s.description, s.labels, s.specs, s.scripts, s.files
            FROM skills s
            WHERE s.org_id = ?
              AND (s.is_builtin = 0 OR s.id NOT IN (
@@ -443,6 +445,11 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
         labels: safeJson<string[]>(s.labels ?? "", []),
         specs: s.specs!,
         scripts: safeJson<Array<{ name: string; content: string }>>(s.scripts ?? "", []),
+        files: safeParseSkillFiles(
+          s.files,
+          s.specs ?? "",
+          safeJson<Array<{ name: string; content: string }>>(s.scripts ?? "", []),
+        ),
       }));
 
     const knowledgeOut: CliSnapshotKnowledgeRepo[] = knowledge.map((k) => {

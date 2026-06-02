@@ -108,6 +108,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     version INT NOT NULL DEFAULT 1,
     specs MEDIUMTEXT,
     scripts TEXT,
+    files MEDIUMTEXT,
     created_by CHAR(36) NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -119,6 +120,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     version INT NOT NULL,
     specs MEDIUMTEXT,
     scripts TEXT,
+    files MEDIUMTEXT,
     diff TEXT,
     commit_message VARCHAR(500),
     author_id CHAR(36) NOT NULL,
@@ -499,12 +501,14 @@ export async function runPortalMigrations(): Promise<void> {
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");
   await safeAlterTable(db, "skills", "overlay_of", "CHAR(36) DEFAULT NULL");
+  await safeAlterTable(db, "skills", "files", "MEDIUMTEXT DEFAULT NULL");
   // Hosts: self-referencing jump host chain (ProxyJump) + private-key passphrase.
   // No FK on jump_host_id — mirrors chat_sessions.parent_session_id; integrity is
   // enforced in app code (validateJumpChain) and acquire-time tolerates dangling refs.
   await safeAlterTable(db, "hosts", "jump_host_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "hosts", "passphrase", "VARCHAR(500) DEFAULT NULL");
   await safeAlterTable(db, "skill_versions", "labels", "TEXT DEFAULT NULL");
+  await safeAlterTable(db, "skill_versions", "files", "MEDIUMTEXT DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "parent_agent_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "chat_sessions", "delegation_id", "CHAR(36) DEFAULT NULL");

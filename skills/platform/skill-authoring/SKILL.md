@@ -2,13 +2,36 @@
 name: skill-authoring
 description: >-
   Guide for writing and improving Siclaw skills. Read this when creating or
-  modifying a skill. Covers SKILL.md format, script execution modes, and
-  best practices.
+  modifying a skill. Covers skill directory layout, SKILL.md format, script
+  execution modes, and best practices.
 ---
 
 # Skill Authoring Guide
 
 Read this guide before creating a new skill or improving an existing one.
+
+## Directory Layout
+
+A skill is a directory package, not a single file. The smallest valid skill is:
+
+```text
+<skill-name>/
+└── SKILL.md
+```
+
+Optional package files can live beside `SKILL.md`:
+
+```text
+<skill-name>/
+├── SKILL.md
+├── scripts/        # executable .sh/.py helpers
+├── references/     # markdown docs the agent can read
+├── examples/       # example inputs/outputs
+└── assets/         # small images or other package assets
+```
+
+The directory name must match the `name` field in `SKILL.md`. Use uppercase
+`SKILL.md`; lowercase `skill.md` is not canonical.
 
 ## SKILL.md Format
 

@@ -253,6 +253,62 @@ describe("skillsHandler", () => {
     expect(fs.readFileSync(path.join(scriptsDir, "analyze.py"), "utf8")).toBe("print('ok')");
   });
 
+  it("materializes complete skill package files when files[] is present", async () => {
+    const payload = {
+      version: new Date().toISOString(),
+      skills: [
+        {
+          dirName: "packaged",
+          scope: "global" as const,
+          specs: "---\nname: packaged\n---\n",
+          scripts: [],
+          files: [
+            { path: "SKILL.md", content: "---\nname: packaged\n---\n", encoding: "utf8" as const, size: 23, sha256: "a" },
+            { path: "references/runbook.md", content: "# runbook", encoding: "utf8" as const, size: 9, sha256: "b" },
+            { path: "scripts/run.sh", content: "echo ok", encoding: "utf8" as const, size: 7, sha256: "c", executable: true },
+          ],
+        },
+      ],
+    };
+
+    await skillsHandler.materialize(payload);
+
+    expect(fs.readFileSync(path.join(resolvedDir(), "packaged", "references", "runbook.md"), "utf8")).toBe("# runbook");
+    expect(fs.readFileSync(path.join(resolvedDir(), "packaged", "scripts", "run.sh"), "utf8")).toBe("echo ok");
+  });
+
+  it("skips one invalid skill package instead of aborting the whole bundle", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const payload = {
+        version: "v1",
+        skills: [
+          {
+            dirName: "../bad",
+            scope: "global" as const,
+            specs: "---\nname: bad\n---\n",
+            scripts: [],
+            files: [{ path: "SKILL.md", content: "---\nname: bad\n---\n", encoding: "utf8" as const, size: 18, sha256: "bad" }],
+          },
+          {
+            dirName: "good",
+            scope: "global" as const,
+            specs: "---\nname: good\n---\n",
+            scripts: [],
+          },
+        ],
+      };
+
+      const count = await skillsHandler.materialize(payload);
+
+      expect(count).toBe(1);
+      expect(readResolved("good")).toBe("---\nname: good\n---\n");
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to materialize skill ../bad"));
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   // ── 3. global overrides builtin ──────────────────────────────────
   it("global scope takes priority over builtin with the same dirName", async () => {
     const payload = {

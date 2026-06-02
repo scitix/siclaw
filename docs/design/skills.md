@@ -8,7 +8,7 @@
 4. **Per-user toggles**: skill enable/disable and skill space enable/disable are per-user, keyed by `skillId` (not `skillName`).
 5. **Submit and Contribute are independent**: two separate approval flows, each with its own staging tag, review handler, and withdraw operation.
 6. **No cross-origin name collisions**: skills with the same name but different `originId` are rejected at all entry points (create, fork, rename, move, contribute). Only fork from the same source is allowed to create a same-name copy.
-7. **Content hash for change detection**: SHA-256 of specs + sorted scripts determines whether content has changed. Used by `canSubmit`, `canContribute`, `hasUnpublishedChanges`, and builtin sync.
+7. **Content hash for change detection**: SHA-256 of the normalized skill package files determines whether content has changed. Used by `canSubmit`, `canContribute`, `hasUnpublishedChanges`, and builtin sync.
 8. **Skill preview in conversation**: the `skill_preview` tool reads skill draft files from disk and renders a side panel with copy buttons. Agent writes files first via file I/O tools, then calls `skill_preview` with the directory path. Does not persist to DB.
 
 ### The Security-Flexibility Trade-off
@@ -53,10 +53,17 @@ snapshots.
 ```
 {skillName}/
 ├── SKILL.md              # Specification (YAML frontmatter + Markdown body)
-└── scripts/
-    ├── main-script.sh    # One or more executable scripts
-    └── helper.py
+├── scripts/              # Optional executable scripts; direct .sh/.py files remain executable
+│   ├── main-script.sh
+│   └── helper.py
+├── references/           # Optional markdown/source material for the agent to read
+├── examples/             # Optional examples, fixtures, expected outputs
+└── assets/               # Optional small binary/text assets
 ```
+
+A single skill is always a directory package. The smallest valid skill is
+`{skillName}/SKILL.md`; a bundle is a collection of skill directories, not a
+skill itself. The directory name and `SKILL.md` frontmatter `name` must match.
 
 ### SKILL.md Frontmatter
 
@@ -247,7 +254,7 @@ skill.contribute -> contributionStatus: pending -> staging-contribution snapshot
 
 Before publish, submit, or contribute, the UI shows a GitHub-style diff dialog:
 
-- **File diffs**: collapsible sections per file (SKILL.md, scripts/*), 3 lines context, hidden unchanged regions
+- **File diffs**: collapsible sections per package file (`SKILL.md`, `scripts/*`, `references/*`, assets), with text diffs where possible and binary file summaries otherwise
 - **Metadata diff**: type and labels shown as colored tag pills (+green, -red, unchanged gray)
 - **Commit message**: optional text input, stored on skill record for version history
 - **Origin fallback**: for first-time operations on forked skills, diffs against the fork source
@@ -256,7 +263,7 @@ Before publish, submit, or contribute, the UI shows a GitHub-style diff dialog:
 
 Each publish/approve creates a version record with:
 - `tag: "published"` for dev versions, `tag: "approved"` for prod versions
-- Inline specs + scriptsJson + metadata snapshot
+- Full package `files` plus compatibility `specs` / `scriptsJson` and metadata snapshot
 - commitMessage from the user
 
 The UI provides a version history drawer with tag filter (Dev / Prod) and rollback button.
@@ -362,7 +369,7 @@ Personal skills use `published` as a diff baseline (set during fork). Dev bundle
 
 ## Content Hash
 
-SHA-256 of `specs + sorted scripts` (scripts sorted by name for order-independence). Stored in `skill_contents.content_hash`, auto-computed on every save.
+SHA-256 of normalized skill package files, including `SKILL.md`, scripts, references, examples, and assets. Legacy `specs + scripts` payloads are first converted into the same package-file representation. Stored in `skill_contents.content_hash`, auto-computed on every save.
 
 Used by:
 - `hasUnpublishedSkillChanges`: working hash vs published/approved hash
@@ -406,7 +413,7 @@ Gateway (buildSkillBundle)
   -> dedup by dirName (first wins), logs warning on collision
   -> skips per-user disabled skills and disabled skill spaces
   -> generates dirName slug from name at runtime
-  -> builds SkillBundlePayload { skills: [{ dirName, scope, specs, scripts }] }
+  -> builds SkillBundlePayload { skills: [{ dirName, scope, specs, scripts, files }] }
 
 AgentBox (materialize)
   -> builds resolved/ directory with priority-based merging (first dirName wins):
@@ -448,8 +455,8 @@ Gateway startup executes `syncBuiltinSkills()`:
 
 ```
 Scans skills/core/ + skills/extension/
-  -> parses SKILL.md + scripts + meta.json labels for each skill
-  -> computes content hash (SHA-256)
+  -> parses the full skill directory package + meta.json labels for each skill
+  -> computes content hash (SHA-256 of normalized files)
   -> compares with DB:
     - new -> INSERT (id = "builtin:<dirName>"), creates base version record
     - content hash changed -> UPDATE, creates version record
@@ -528,9 +535,9 @@ See `docs/design/invariants.md` §1.4 for the enclosing Portal-as-SoT contract.
 
 | Table | Purpose |
 |-------|---------|
-| `skills` | Skill metadata: name, scope, dirName, authorId, skillSpaceId, originId, forkedFromId, contentHash, labelsJson, publishedVersion, approvedVersion, stagingVersion, reviewStatus, contributionStatus, commitMessage, globalSourceSkillId, globalPinnedVersion |
-| `skill_contents` | File content (specs + scriptsJson + contentHash) by tag (working / staging / staging-contribution / published / approved). Unique index on (skillId, tag). CHECK constraint enforces valid tags. |
-| `skill_versions` | Version history: version number, specs, scriptsJson, tag (published/approved), commitMessage, authorId |
+| `skills` | Skill metadata and working content: name, scope, dirName, authorId, skillSpaceId, originId, forkedFromId, files, compatibility specs/scriptsJson, contentHash, labelsJson, publishedVersion, approvedVersion, stagingVersion, reviewStatus, contributionStatus, commitMessage, globalSourceSkillId, globalPinnedVersion |
+| `skill_contents` | Historical content-tag model for working / staging / staging-contribution / published / approved snapshots where present. New package content should use normalized files and derive compatibility specs/scriptsJson. |
+| `skill_versions` | Version history: version number, files, compatibility specs/scriptsJson, tag (published/approved), commitMessage, authorId |
 | `skill_reviews` | AI + admin review records: reviewerType (ai/admin), riskLevel, summary, findings[], decision (approve/reject/info) |
 | `skill_votes` | User upvotes/downvotes on global skills |
 | `skill_spaces` | Skill space metadata: name, description, ownerId |

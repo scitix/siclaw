@@ -17,6 +17,7 @@ import {
 } from "../gateway/rest-router.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
+import { safeParseSkillFiles } from "../shared/skill-package.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -139,6 +140,23 @@ async function isJumpOfBoundHost(db: Db, agentId: string, hostId: string, prodMa
     }
   }
   return false;
+}
+
+function parseSkillScripts(raw: unknown): Array<{ name: string; content: string }> {
+  if (Array.isArray(raw)) return raw as Array<{ name: string; content: string }>;
+  if (typeof raw === "string") return safeParseJson<Array<{ name: string; content: string }>>(raw, []);
+  return [];
+}
+
+function skillBundleEntry(row: any) {
+  const scripts = parseSkillScripts(row.scripts);
+  return {
+    dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
+    scope: "global",
+    specs: row.specs || "",
+    scripts,
+    files: safeParseSkillFiles(row.files, row.specs || "", scripts),
+  };
 }
 
 export function registerAdapterRoutes(router: RestRouter, internalSecret: string): void {
@@ -814,7 +832,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
            COALESCE(o.name, s.name) AS name,
            COALESCE(o.labels, s.labels) AS labels,
            COALESCE(ov.specs, sv.specs) AS specs,
-           COALESCE(ov.scripts, sv.scripts) AS scripts
+           COALESCE(ov.scripts, sv.scripts) AS scripts,
+           COALESCE(ov.files, sv.files, o.files, s.files) AS files
          FROM skills s
          LEFT JOIN skills o ON o.overlay_of = s.id
          LEFT JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
@@ -833,7 +852,8 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
            COALESCE(o.name, s.name) AS name,
            COALESCE(o.labels, s.labels) AS labels,
            COALESCE(o.specs, s.specs) AS specs,
-           COALESCE(o.scripts, s.scripts) AS scripts
+           COALESCE(o.scripts, s.scripts) AS scripts,
+           COALESCE(o.files, s.files) AS files
          FROM skills s
          LEFT JOIN skills o ON o.overlay_of = s.id
          WHERE s.id IN (${placeholders})`,
@@ -843,12 +863,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     const skills = rows
       .filter((row: any) => row.specs != null)
-      .map((row: any) => ({
-        dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
-        scope: "global",
-        specs: row.specs || "",
-        scripts: safeParseJson(row.scripts, []),
-      }));
+      .map(skillBundleEntry);
     sendJson(res, 200, { version: new Date().toISOString(), skills });
   });
 
@@ -1643,7 +1658,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     if (isProduction) {
       const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts
+        `SELECT s.id, s.name, s.labels, sv.specs, sv.scripts, COALESCE(sv.files, s.files) AS files
          FROM skills s
          JOIN skill_versions sv ON sv.skill_id = s.id AND sv.is_approved = 1
          WHERE s.id IN (${placeholders})
@@ -1657,17 +1672,12 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     } else {
       const placeholders = skillIds.map(() => "?").join(",");
       const [result] = await db.query(
-        `SELECT id, name, labels, specs, scripts FROM skills WHERE id IN (${placeholders})`,
+        `SELECT id, name, labels, specs, scripts, files FROM skills WHERE id IN (${placeholders})`,
         skillIds,
       ) as any;
       rows = result;
     }
-    const skills = rows.map((row: any) => ({
-      dirName: row.name.replace(/[^a-zA-Z0-9_-]/g, "_"),
-      scope: "global",
-      specs: row.specs || "",
-      scripts: safeParseJson(row.scripts, []),
-    }));
+    const skills = rows.map(skillBundleEntry);
     return { version: new Date().toISOString(), skills };
   });
 

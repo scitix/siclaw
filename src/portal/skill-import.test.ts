@@ -418,17 +418,12 @@ describe("parseSkillPack", () => {
     expect(buf[0]).toBe(0x1f);
     expect(buf[1]).toBe(0x8b);
 
-    let extractedFiles: string[] = [];
-    (parseSkillsDir as any).mockImplementation((dir: string) => {
-      extractedFiles = fs.readdirSync(dir);
-      return [];
-    });
+    const skills = await parseSkillPack(buf);
 
-    await parseSkillPack(buf);
-
-    // Single wrapper subdir (no meta.json at root) → parseSkillPack descends
-    // into it, so the dir we observed lists SKILL.md directly.
-    expect(extractedFiles).toContain("SKILL.md");
+    expect(skills).toHaveLength(1);
+    expect(skills[0].name).toBe("my-skill");
+    expect(skills[0].files.map(f => f.path)).toContain("SKILL.md");
+    expect(parseSkillsDir).not.toHaveBeenCalled();
   });
 
   it("rejects buffers that are neither zip nor tar", async () => {

@@ -6,6 +6,8 @@
  * the types without pulling Portal runtime code into its tsconfig graph.
  */
 
+import type { SkillPackageFile } from "../shared/skill-package.js";
+
 export interface CliSnapshotKnowledgeRepo {
   name: string;
   version: number;
@@ -76,4 +78,6 @@ export interface CliSnapshotSkill {
   specs: string;
   /** Companion scripts (shell / python) referenced by SKILL.md. */
   scripts: Array<{ name: string; content: string }>;
+  /** Complete skill directory package, rooted at the skill directory. */
+  files?: SkillPackageFile[];
 }
