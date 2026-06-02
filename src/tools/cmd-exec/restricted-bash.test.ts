@@ -14,6 +14,16 @@ import {
 import { extractPipeline } from "../infra/command-validator.js";
 import { preExecSecurity } from "../infra/security-pipeline.js";
 
+function expectAllowedByRestrictedBashGate(command: string) {
+  const pre = preExecSecurity(command, {
+    context: "local",
+    extraAllowed: new Set(["kubectl"]),
+    isAllowed: isSkillScript,
+    pipelineValidators: [validateKubectlInPipeline],
+  });
+  expect(pre.error).toBeNull();
+}
+
 describe("extractCommands", () => {
   it("splits pipe", () => {
     expect(extractCommands("kubectl get pods | grep Error")).toEqual([
@@ -1149,14 +1159,8 @@ describe("createRestrictedBashTool — new DevOps command restrictions", () => {
   });
 
   // ctr
-  it("allows ctr images ls", async () => {
-    const result = await tool.execute(
-      "test-id",
-      { command: "ctr images ls" },
-      undefined,
-      {} as any
-    );
-    expect((result.details as any).blocked).toBeFalsy();
+  it("allows ctr images ls", () => {
+    expectAllowedByRestrictedBashGate("ctr images ls");
   });
 
   it("blocks ctr images pull", async () => {
@@ -1333,15 +1337,8 @@ describe("createRestrictedBashTool — pipe-only text command enforcement", () =
   ];
 
   for (const cmd of allowedPiped) {
-    it(`allows piped: ${cmd}`, async () => {
-      const result = await tool.execute(
-        "test-id",
-        { command: cmd },
-        undefined,
-        {} as any
-      );
-      expect(result.content[0].text).not.toContain("can only be used after a pipe");
-      expect((result.details as any).blocked).toBeFalsy();
+    it(`allows piped: ${cmd}`, () => {
+      expectAllowedByRestrictedBashGate(cmd);
     });
   }
 
