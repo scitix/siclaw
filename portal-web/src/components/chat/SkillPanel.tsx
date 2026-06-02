@@ -9,6 +9,7 @@ interface SkillData {
   type: string
   specs: string
   scripts: Array<{ name: string; content: string }>
+  files?: Array<{ path: string; content: string; encoding?: "utf8" | "base64"; size?: number }>
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -44,16 +45,19 @@ function CopyButton({ text }: { text: string }) {
 function getFileIcon(name: string) {
   if (name === "SKILL.md") return <FileText className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
   if (name.endsWith(".py")) return <FileCode className="w-3.5 h-3.5 text-blue-500 shrink-0" />
-  return <Terminal className="w-3.5 h-3.5 text-green-500 shrink-0" />
+  if (name.endsWith(".sh")) return <Terminal className="w-3.5 h-3.5 text-green-500 shrink-0" />
+  return <FileText className="w-3.5 h-3.5 text-slate-500 shrink-0" />
 }
 
 function FileEntry({
   name,
   content,
+  meta,
   defaultExpanded,
 }: {
   name: string
   content: string
+  meta?: string
   defaultExpanded?: boolean
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded ?? false)
@@ -73,6 +77,7 @@ function FileEntry({
         />
         {getFileIcon(name)}
         <span className="text-xs font-mono text-foreground truncate">{name}</span>
+        {meta && <span className="text-[10px] text-muted-foreground shrink-0">{meta}</span>}
         <span className="ml-auto shrink-0">
           <CopyButton text={content} />
         </span>
@@ -86,6 +91,16 @@ function FileEntry({
       )}
     </div>
   )
+}
+
+function decodeSkillPanelFile(file: NonNullable<SkillData["files"]>[number]): { content: string; meta?: string } {
+  if (file.encoding === "base64") {
+    return {
+      content: `[binary file${file.size ? `, ${file.size} bytes` : ""}]`,
+      meta: "binary",
+    }
+  }
+  return { content: file.content, meta: file.size ? `${file.size}B` : undefined }
 }
 
 export interface SkillPanelProps {
@@ -116,12 +131,21 @@ export function SkillPanel({ message, onClose }: SkillPanelProps) {
     )
   }
 
-  // Flat file list: SKILL.md first, then scripts
-  const files: Array<{ name: string; content: string }> = []
-  if (skill.specs) files.push({ name: "SKILL.md", content: skill.specs })
-  for (const s of skill.scripts ?? []) {
-    if (s.content) files.push({ name: s.name, content: s.content })
-  }
+  const files: Array<{ name: string; content: string; meta?: string }> = Array.isArray(skill.files) && skill.files.length > 0
+    ? skill.files
+      .map(file => {
+        const decoded = decodeSkillPanelFile(file)
+        return { name: file.path, content: decoded.content, meta: decoded.meta }
+      })
+      .sort((a, b) => {
+        if (a.name === "SKILL.md") return -1
+        if (b.name === "SKILL.md") return 1
+        return a.name.localeCompare(b.name)
+      })
+    : [
+      ...(skill.specs ? [{ name: "SKILL.md", content: skill.specs }] : []),
+      ...(skill.scripts ?? []).filter(s => s.content).map(s => ({ name: `scripts/${s.name}`, content: s.content })),
+    ]
 
   return (
     <div className="w-[480px] border-l border-border bg-card flex flex-col shrink-0 h-full">
@@ -149,7 +173,7 @@ export function SkillPanel({ message, onClose }: SkillPanelProps) {
       {/* File list */}
       <div className="overflow-y-auto flex-1">
         {files.map((f, i) => (
-          <FileEntry key={f.name} name={f.name} content={f.content} defaultExpanded={i === 0} />
+          <FileEntry key={f.name} name={f.name} content={f.content} meta={f.meta} defaultExpanded={i === 0} />
         ))}
       </div>
     </div>

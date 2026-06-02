@@ -4,7 +4,7 @@ import { Plus, Zap, Trash2, Loader2, Search, ClipboardCheck, ShieldCheck, Tag, C
 import { api } from "../api"
 import { useToast } from "../components/toast"
 import { useConfirm } from "../components/confirm-dialog"
-import { SkillDiffView } from "../components/SimpleDiff"
+import { PackageDiffView } from "../components/SimpleDiff"
 
 // ── Types ───────────────────────────────────────────────────────
 
@@ -515,7 +515,7 @@ function ReviewApprovalCard({ review: r, onDecision }: { review: PendingReview; 
       {expanded && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/50" onClick={() => setExpanded(false)} />
-          <div className="relative w-full max-w-3xl bg-card rounded-xl shadow-xl border border-border overflow-hidden flex flex-col max-h-[85vh]">
+          <div className="relative w-full max-w-[92vw] h-[88vh] bg-card rounded-xl shadow-xl border border-border overflow-hidden flex flex-col">
             {/* Modal header */}
             <div className="px-6 py-4 border-b border-border flex items-center justify-between shrink-0">
               <div>
@@ -600,7 +600,7 @@ function ReviewApprovalCard({ review: r, onDecision }: { review: PendingReview; 
                   {reviewDetail?.diff && (
                     <div className="space-y-2">
                       <span className="text-[12px] font-medium text-muted-foreground">Changes</span>
-                      <SkillDiffView diff={reviewDetail.diff} />
+                      <PackageDiffView diff={reviewDetail.diff} className="h-[54vh]" />
                     </div>
                   )}
                 </>
