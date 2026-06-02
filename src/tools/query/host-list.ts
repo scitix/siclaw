@@ -22,12 +22,23 @@ export function createHostListTool(kubeconfigRef: KubeconfigRef): ToolDefinition
       return new Text(theme.fg("toolTitle", theme.bold("host_list")), 0, 0);
     },
     renderResult: renderTextResult,
-    description: `List SSH-reachable hosts bound to the current agent.
-Returns host names, IPs, ports, usernames, auth_type ("password" or "key"), is_production, and jump_host (the bastion name when the host is reached via ProxyJump — host_exec/host_script tunnel through it automatically).
+    description: `List SSH-reachable hosts bound to the current agent (server-side search; results are capped).
+Returns id, name, IP, port, username, auth_type ("password"/"key"/"managed"), is_production, and jump_host (the bastion name when the host is reached via ProxyJump — host_exec/host_script tunnel through it automatically).
 Does NOT return password or private_key — those are materialized to disk only when an SSH-using tool actually runs.
-Use this to discover hosts that the agent can reach via SSH (for node-level diagnostics outside the K8s API).`,
-    parameters: Type.Object({}),
-    async execute(_toolCallId, _rawParams) {
+Pass "query" to filter by name / IP / description (an IP-looking query matches the IP exactly); omit it to browse all bound hosts (still capped).
+The response includes "total" (full match count) and "next_cursor": if total exceeds what's shown, narrow the query or page with cursor.`,
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({
+        description: "Filter by name / IP / description (server-side; an IP-looking value matches the IP exactly). Omit to browse all bound hosts.",
+      })),
+      limit: Type.Optional(Type.Number({
+        description: "Max results per page (default 20, max 100).",
+      })),
+      cursor: Type.Optional(Type.String({
+        description: "Opaque pagination cursor from a previous response's next_cursor.",
+      })),
+    }),
+    async execute(_toolCallId, rawParams) {
       const broker = kubeconfigRef.credentialBroker;
       if (!broker) {
         return {
@@ -36,22 +47,24 @@ Use this to discover hosts that the agent can reach via SSH (for node-level diag
         };
       }
 
-      // Lazy fill: pay one transport round-trip only on first access.
-      // Subsequent calls serve the cached Map synchronously; the Map is
-      // kept fresh by notify-driven refresh (POST /api/reload-host).
-      if (!broker.isHostsReady()) {
-        try {
-          await broker.refreshHosts();
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          return {
-            content: [{ type: "text", text: JSON.stringify({ error: `Failed to list hosts: ${message}` }) }],
-            details: {},
-          };
-        }
+      const params = (rawParams ?? {}) as { query?: string; limit?: number; cursor?: string };
+      const query = typeof params.query === "string" ? params.query.trim() : "";
+
+      // Always go through the server-side search (a blank query = browse). This
+      // keeps results capped and never loads the full host list into the broker.
+      let result;
+      try {
+        result = await broker.queryHosts(query, { limit: params.limit, cursor: params.cursor });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `Failed to list hosts: ${message}` }) }],
+          details: {},
+        };
       }
 
-      const entries = broker.getHostsLocal().map((meta) => ({
+      const entries = result.hosts.map((meta) => ({
+        ...(meta.id ? { id: meta.id } : {}),
         name: meta.name,
         ip: meta.ip,
         port: meta.port,
@@ -66,11 +79,15 @@ Use this to discover hosts that the agent can reach via SSH (for node-level diag
 
       let hint = "";
       if (entries.length === 0) {
-        hint = "\n\nNo hosts are bound to this agent. Ask the user to bind hosts in the Portal (Agent detail page).";
+        hint = query
+          ? `\n\nNo hosts match "${query}".`
+          : "\n\nNo hosts are bound to this agent. Ask the user to bind hosts in the Portal (Agent detail page).";
+      } else if (result.next_cursor) {
+        hint = `\n\nShowing ${entries.length} of ${result.total}. Narrow the query, or pass cursor="${result.next_cursor}" for the next page.`;
       }
 
       return {
-        content: [{ type: "text", text: JSON.stringify({ hosts: entries }, null, 2) + hint }],
+        content: [{ type: "text", text: JSON.stringify({ hosts: entries, total: result.total, next_cursor: result.next_cursor }, null, 2) + hint }],
         details: {},
       };
     },

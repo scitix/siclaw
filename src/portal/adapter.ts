@@ -1787,21 +1787,64 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     if (!agentId) throw new Error("agentId required");
     const db = getDb();
     if (params.kind === "host" || params.kind === "hosts") {
+      const fromHost = "FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id LEFT JOIN hosts hj ON h.jump_host_id = hj.id";
+      // No `query` field → full snapshot (the broker's reconcileFullList depends
+      // on this). A `query` (even "") → server-side filtered + paginated browse.
+      if (typeof params.query !== "string") {
+        const [rows] = await db.query(
+          `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
+           ${fromHost} WHERE ah.agent_id = ?`,
+          [agentId],
+        ) as any;
+        return {
+          hosts: rows.map((r: any) => ({
+            name: r.name, ip: r.ip, port: r.port, username: r.username,
+            auth_type: r.auth_type, is_production: !!r.is_production,
+            ...(r.description ? { description: r.description } : {}),
+            ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
+          })),
+        };
+      }
+
+      // Filtered + paginated host_list (metadata only; never secrets). limit
+      // default 20 / max 100; offset from an opaque numeric cursor. Both are
+      // clamped integers → safe to inline (avoids a bound-param-in-LIMIT quirk).
+      const q = (params.query as string).trim();
+      const rawLimit = Number(params.limit);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : 20;
+      const rawOffset = Number(params.cursor);
+      const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+      // IP smart-match: an IPv4-looking query matches h.ip exactly (so "10.0.0.5"
+      // doesn't substring-hit "10.0.0.51"); else substring over name/ip/description.
+      const isIpv4 = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(q);
+      const conds = ["ah.agent_id = ?"];
+      const whereParams: unknown[] = [agentId];
+      if (q) {
+        if (isIpv4) {
+          conds.push("h.ip = ?");
+          whereParams.push(q);
+        } else {
+          conds.push("(h.name LIKE ? OR h.ip LIKE ? OR h.description LIKE ?)");
+          whereParams.push(`%${q}%`, `%${q}%`, `%${q}%`);
+        }
+      }
+      const where = ` WHERE ${conds.join(" AND ")}`;
+      const [countRows] = await db.query(`SELECT COUNT(*) AS n ${fromHost}${where}`, whereParams) as any;
+      const total = Number((countRows as any[])?.[0]?.n ?? 0);
       const [rows] = await db.query(
-        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
-         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id
-         LEFT JOIN hosts hj ON h.jump_host_id = hj.id
-         WHERE ah.agent_id = ?`,
-        [agentId],
+        `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
+         ${fromHost}${where} ORDER BY h.name LIMIT ${limit} OFFSET ${offset}`,
+        whereParams,
       ) as any;
-      return {
-        hosts: rows.map((r: any) => ({
-          name: r.name, ip: r.ip, port: r.port, username: r.username,
-          auth_type: r.auth_type, is_production: !!r.is_production,
-          ...(r.description ? { description: r.description } : {}),
-          ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
-        })),
-      };
+      const hosts = (rows as any[]).map((r) => ({
+        id: r.id,
+        name: r.name, ip: r.ip, port: r.port, username: r.username,
+        auth_type: r.auth_type, is_production: !!r.is_production,
+        ...(r.description ? { description: r.description } : {}),
+        ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
+      }));
+      const next_cursor = offset + hosts.length < total ? String(offset + limit) : null;
+      return { hosts, total, next_cursor };
     }
     // Default: clusters
     const [rows] = await db.query(

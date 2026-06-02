@@ -34,6 +34,9 @@ export interface ClusterMeta {
 }
 
 export interface HostMeta {
+  /** Stable host id. Populated by host search as a selection handle; absent on
+   *  the dial path (credential.get) where the broker keys by name. */
+  id?: string;
   name: string;
   description?: string;
   ip: string;
@@ -59,6 +62,18 @@ export interface CredentialFile {
   name: string;
   content: string;
   mode?: number;
+}
+
+/**
+ * A page of `host_list` results (when a query / pagination is supplied).
+ * Metadata only — never secrets. `total` is the full match count (for "narrow
+ * your query" hints); `next_cursor` is an opaque pagination cursor, null when
+ * exhausted.
+ */
+export interface HostListResult {
+  hosts: HostMeta[];
+  total: number;
+  next_cursor: string | null;
 }
 
 export interface CredentialPayload {

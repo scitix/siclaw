@@ -428,6 +428,55 @@ describe("credential.list", () => {
       getHandler("credential.list")({}, ""),
     ).rejects.toThrow("agentId required");
   });
+
+  // ── host query path (host_list with a query) ──
+  it("host query: filters, paginates, returns id + total + next_cursor", async () => {
+    const q = mockQuery(
+      [{ n: 137 }], // COUNT(*)
+      [{ id: "h1", name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: 1, description: "x", jump_host_name: "bastion" }],
+    );
+    const result = await getHandler("credential.list")({ kind: "host", query: "gpu", limit: 1 }, "agent-1");
+    expect(result.hosts).toEqual([
+      { id: "h1", name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: true, description: "x", jump_host: "bastion" },
+    ]);
+    expect(result.total).toBe(137);
+    expect(result.next_cursor).toBe("1"); // offset 0 + limit 1 < 137
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).toContain("LIMIT 1 OFFSET 0");
+    expect(selectSql).toContain("LIKE");
+  });
+
+  it("host query: limit defaults to 20 and caps at 100", async () => {
+    const q1 = mockQuery([{ n: 0 }], []);
+    await getHandler("credential.list")({ kind: "host", query: "x" }, "a1");
+    expect(q1.mock.calls[1][0]).toContain("LIMIT 20 OFFSET 0");
+    const q2 = mockQuery([{ n: 0 }], []);
+    await getHandler("credential.list")({ kind: "host", query: "x", limit: 9999 }, "a1");
+    expect(q2.mock.calls[1][0]).toContain("LIMIT 100");
+  });
+
+  it("host query: an IPv4 query matches ip exactly (no LIKE)", async () => {
+    const q = mockQuery([{ n: 1 }], [{ id: "h1", name: "n", ip: "10.0.0.5", port: 22, username: "root", auth_type: "key", is_production: 1, description: null, jump_host_name: null }]);
+    await getHandler("credential.list")({ kind: "host", query: "10.0.0.5" }, "a1");
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).toContain("h.ip = ?");
+    expect(selectSql).not.toContain("LIKE");
+    expect(q.mock.calls[1][1]).toEqual(["a1", "10.0.0.5"]); // agentId + exact ip
+  });
+
+  it("host query: an empty query browses (paginated, no filter)", async () => {
+    const q = mockQuery([{ n: 2 }], [
+      { id: "h1", name: "a", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", is_production: 1, description: null, jump_host_name: null },
+      { id: "h2", name: "b", ip: "10.0.0.2", port: 22, username: "root", auth_type: "key", is_production: 0, description: null, jump_host_name: null },
+    ]);
+    const result = await getHandler("credential.list")({ kind: "host", query: "" }, "a1");
+    expect(result.hosts).toHaveLength(2);
+    expect(result.total).toBe(2);
+    expect(result.next_cursor).toBeNull(); // 0 + 2 == total
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).not.toContain("LIKE");
+    expect(selectSql).toContain("WHERE ah.agent_id = ?");
+  });
 });
 
 describe("credential.get", () => {
@@ -690,6 +739,7 @@ describe("credential.hostSearch", () => {
     expect(query.mock.calls[0][0]).toContain("FROM hosts");
     expect(query.mock.calls[0][0]).not.toContain("agent_hosts");
   });
+
 });
 
 // ================================================================

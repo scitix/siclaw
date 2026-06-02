@@ -53,6 +53,7 @@ class FakeService {
   getHostCredential = vi.fn();
   listClusters = vi.fn();
   listHosts = vi.fn();
+  queryHosts = vi.fn();
 }
 
 let service: FakeService;
@@ -176,6 +177,28 @@ describe("handleCredentialList", () => {
     await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).hosts).toHaveLength(1);
+  });
+
+  it("routes a host list WITH a query to queryHosts (filtered path), not listHosts", async () => {
+    service.queryHosts.mockResolvedValue({ hosts: [{ name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: true }], total: 1, next_cursor: null });
+    const req = new FakeReq(JSON.stringify({ kind: "host", query: "gpu", limit: 10 }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(res.statusCode).toBe(200);
+    const parsed = JSON.parse(res.body);
+    expect(parsed.hosts).toHaveLength(1);
+    expect(parsed.total).toBe(1);
+    expect(service.queryHosts).toHaveBeenCalledWith(expect.objectContaining({ agentId: "a1" }), "gpu", expect.objectContaining({ limit: 10 }));
+    expect(service.listHosts).not.toHaveBeenCalled();
+  });
+
+  it("routes a host list WITHOUT a query to the full listHosts path", async () => {
+    service.listHosts.mockResolvedValue([]);
+    const req = new FakeReq(JSON.stringify({ kind: "host" }));
+    const res = new FakeRes();
+    await handleCredentialList(asHttpReq(req), asHttpRes(res), goodIdentity, service as unknown as CredentialService);
+    expect(service.listHosts).toHaveBeenCalled();
+    expect(service.queryHosts).not.toHaveBeenCalled();
   });
 
   it("400 when kind is unsupported", async () => {

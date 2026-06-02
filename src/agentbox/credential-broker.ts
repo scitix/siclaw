@@ -34,9 +34,10 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  HostListResult,
 } from "./credential-transport.js";
 
-export type { ClusterMeta, HostMeta, CredentialPayload };
+export type { ClusterMeta, HostMeta, CredentialPayload, HostListResult };
 
 export interface CredentialFile {
   name: string;
@@ -431,6 +432,16 @@ export class CredentialBroker {
   /** Synchronous read of the host metadata Map. Empty if never refreshed. */
   getHostsLocal(): HostMeta[] {
     return this.hosts.list().map((info) => info.meta);
+  }
+
+  /**
+   * Filtered + paginated host_list (name/ip/description). Bypasses the registry
+   * entirely — does NOT reconcile or cache — so it can't violate the full-snapshot
+   * contract of refreshHosts/reconcileFullList. Used by the host_list tool
+   * (metadata only, no credentials).
+   */
+  async queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult> {
+    return this.transport.queryHosts(query, opts);
   }
 
   /** true once refreshHosts() has succeeded at least once. */
