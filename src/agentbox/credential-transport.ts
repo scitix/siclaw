@@ -12,13 +12,21 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  HostListResult,
 } from "../shared/credential-types.js";
 
-export type { ClusterMeta, HostMeta, CredentialPayload };
+export type { ClusterMeta, HostMeta, CredentialPayload, HostListResult };
 
 export interface CredentialTransport {
   listClusters(): Promise<ClusterMeta[]>;
   listHosts(): Promise<HostMeta[]>;
+  /**
+   * Filtered + paginated host_list (name/ip/description), agent-scoped. Distinct
+   * from listHosts: returns a FILTERED subset, so the broker must NOT feed it to
+   * reconcileFullList (which requires a full snapshot). Hits the same
+   * `credential-list` RPC as listHosts, with a `query`.
+   */
+  queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult>;
   getClusterCredential(name: string, purpose: string): Promise<CredentialPayload>;
   getHostCredential(name: string, purpose: string): Promise<CredentialPayload>;
 }
@@ -56,6 +64,27 @@ export class HttpTransport implements CredentialTransport {
       throw new Error("Gateway returned malformed credential-list (host) response");
     }
     return res.hosts;
+  }
+
+  async queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult> {
+    const res = await this.client.request(
+      "/api/internal/credential-list",
+      "POST",
+      {
+        kind: "host",
+        query,
+        ...(opts?.limit != null ? { limit: opts.limit } : {}),
+        ...(opts?.cursor != null ? { cursor: opts.cursor } : {}),
+      },
+    ) as Partial<HostListResult>;
+    if (!Array.isArray(res.hosts)) {
+      throw new Error("Gateway returned malformed credential-list (host search) response");
+    }
+    return {
+      hosts: res.hosts,
+      total: typeof res.total === "number" ? res.total : res.hosts.length,
+      next_cursor: res.next_cursor ?? null,
+    };
   }
 
   async getClusterCredential(name: string, purpose: string): Promise<CredentialPayload> {

@@ -8,6 +8,7 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  HostListResult,
 } from "./credential-transport.js";
 
 /**
@@ -36,6 +37,12 @@ class FakeTransport implements CredentialTransport {
     const p = this.hostPayloads.get(name);
     if (!p) throw new Error(`no host payload for ${name}`);
     return Promise.resolve(p);
+  }
+  queryResult: HostListResult = { hosts: [], total: 0, next_cursor: null };
+  queryHostsCalls: Array<{ query: string; opts?: { limit?: number; cursor?: string } }> = [];
+  queryHosts(query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult> {
+    this.queryHostsCalls.push({ query, opts });
+    return Promise.resolve(this.queryResult);
   }
 }
 
@@ -420,5 +427,20 @@ describe("CredentialBroker — sync read + refresh API", () => {
     await broker.refreshHosts();
     await broker.refreshHosts();
     expect(transport.listHostsCalls - baseline).toBe(2);
+  });
+
+  it("queryHosts passes through to the transport without touching the registry (no reconcile)", async () => {
+    transport.queryResult = {
+      hosts: [{ name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: true }],
+      total: 1,
+      next_cursor: null,
+    };
+    const result = await broker.queryHosts("gpu", { limit: 10 });
+    expect(result.hosts).toHaveLength(1);
+    expect(result.hosts[0].name).toBe("gpu-1");
+    expect(result.total).toBe(1);
+    expect(transport.queryHostsCalls).toEqual([{ query: "gpu", opts: { limit: 10 } }]);
+    // No reconcile / no caching — the registry stays empty (full-snapshot contract intact).
+    expect(broker.listHostsLocalInfo()).toHaveLength(0);
   });
 });
