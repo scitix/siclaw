@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react"
+import { useState, useEffect, useCallback, useRef, useMemo } from "react"
 import { Plus, Trash2, Loader2, MessageSquare, Search, Pencil, Check, X, History, Info } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
@@ -8,7 +8,7 @@ import { PilotArea } from "./chat/PilotArea"
 import { SkillPanel } from "./chat/SkillPanel"
 import { SchedulePanel } from "./chat/SchedulePanel"
 import { PlanPanel } from "./plan/PlanPanel"
-import { hasPlan } from "./plan/foldPlan"
+import { foldPlan } from "./plan/foldPlan"
 import { SubagentTranscript } from "./plan/SubagentTranscript"
 import { JobsBar } from "./plan/JobsBar"
 import type { ChatAttachment, PilotMessage } from "./chat/types"
@@ -158,6 +158,26 @@ export function AgentChat({ agentId }: AgentChatProps) {
 
   // Pilot-style chat hook
   const pilot = usePilotChat({ agentId, sessionId: activeSessionId })
+
+  // Plan panel visibility. The backend auto-clears a fully-completed plan ~5s
+  // after completion and emits a `reset` task_event — but that reset fires after
+  // the turn's SSE stream has already closed, so the live client only picks it up
+  // on reload (hence "only disappears on refresh"). Mirror the 5s auto-hide on the
+  // client so the panel goes away live; the persisted reset keeps it hidden after
+  // a refresh, and a new (incomplete) plan reveals it again.
+  const plan = useMemo(() => foldPlan(pilot.messages), [pilot.messages])
+  const planExists = plan.length > 0
+  const planDone = planExists && plan.every((t) => t.group === "completed")
+  const [planAutoHidden, setPlanAutoHidden] = useState(false)
+  useEffect(() => {
+    if (!planDone) {
+      setPlanAutoHidden(false) // no plan, or a fresh/incomplete one → keep it visible
+      return
+    }
+    const timer = window.setTimeout(() => setPlanAutoHidden(true), 5000)
+    return () => window.clearTimeout(timer)
+  }, [planDone])
+  const planActive = planExists && !planAutoHidden
 
   // Fetch sessions
   useEffect(() => {
@@ -313,7 +333,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
           <History className="h-4 w-4" />
         </button>
         <div className="ml-auto flex items-center gap-1">
-          {activeSessionId && hasPlan(pilot.messages) && (
+          {activeSessionId && planActive && (
             <button
               onClick={() => setShowPlan((v) => !v)}
               className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary transition-colors"
@@ -363,7 +383,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
                 onOpenSubagent={(childSessionId, status, label) => setSubagentDrill({ childSessionId, status, label })}
               />
               {/* Plan: a floating overlay panel, toggled from the top bar's plan button. */}
-              {showPlan && hasPlan(pilot.messages) && (
+              {showPlan && planActive && (
                 <PlanPanel messages={pilot.messages} onClose={() => setShowPlan(false)} />
               )}
             </div>
