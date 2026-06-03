@@ -202,6 +202,39 @@ describe("CredentialBroker — host pipeline", () => {
     expect(fs.readFileSync(path.join(dir, "hosts", "target.hop1.host.password"), "utf-8")).toBe("NEAR_PW");
   });
 
+  it("invalidateHostCredentials drops the cache + hop files, forcing ensureHost to re-acquire", async () => {
+    transport.hostPayloads.set("target", {
+      credential: {
+        name: "target", type: "ssh",
+        files: [{ name: "host.key", content: "K", mode: 0o600 }],
+        metadata: { ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false, jump_host: "b" },
+        jump_chain: [{ name: "b", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "BK", mode: 0o600 }] }],
+        ttl_seconds: 300,
+      },
+    });
+
+    // First ensure materializes; a second ensure within TTL serves the cache.
+    await broker.ensureHost("target", "first");
+    await broker.ensureHost("target", "second");
+    expect(transport.getHostCalls).toEqual(["target"]); // cached — no re-fetch
+
+    const own = path.join(dir, "hosts", "target.host.key");
+    const hop = path.join(dir, "hosts", "target.hop0.host.key");
+    expect(fs.existsSync(own)).toBe(true);
+    expect(fs.existsSync(hop)).toBe(true);
+
+    // Config-change reload: invalidate clears files + expiry, keeps metadata.
+    broker.invalidateHostCredentials();
+    expect(fs.existsSync(own)).toBe(false);
+    expect(fs.existsSync(hop)).toBe(false);
+    expect(broker.getHostsLocal().map((m) => m.name)).toContain("target");
+
+    // Next ensure must walk the transport again (picks up the edited config).
+    await broker.ensureHost("target", "after-reload");
+    expect(transport.getHostCalls).toEqual(["target", "target"]);
+    expect(fs.existsSync(own)).toBe(true);
+  });
+
   it("dispose unlinks jump_chain hop files as well as the target's own", async () => {
     transport.hostPayloads.set("t2", {
       credential: {

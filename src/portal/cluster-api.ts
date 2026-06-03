@@ -152,8 +152,17 @@ export function registerClusterRoutes(router: RestRouter, jwtSecret: string, con
       return;
     }
 
+    // Capture bound agents BEFORE delete — the FK cascade removes agent_clusters
+    // rows, so querying them afterwards would return nothing.
+    const [boundRows] = await db.query("SELECT agent_id FROM agent_clusters WHERE cluster_id = ?", [params.id]) as any;
+
     await db.query("DELETE FROM clusters WHERE id = ?", [params.id]);
     sendJson(res, 200, { deleted: true });
+
+    // Notify formerly-bound agents so they drop the now-deleted cluster from
+    // their cached list/credentials (mirror of the PUT notify).
+    const agentIds = ((boundRows ?? []) as { agent_id: string }[]).map((r) => r.agent_id);
+    if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["cluster"] });
   });
 
   // POST /api/v1/clusters/:id/test — test connection (stub)

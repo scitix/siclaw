@@ -217,11 +217,22 @@ describe("registerClusterRoutes", () => {
     it("deletes when present", async () => {
       query
         .mockResolvedValueOnce([[{ id: "c1" }], []])   // existence
+        .mockResolvedValueOnce([[], []])               // agent_clusters (no bound agents)
         .mockResolvedValueOnce([undefined, []]);        // delete
 
       const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/clusters/c1", method: "DELETE" }));
       expect(status).toBe(200);
       expect(body).toEqual({ deleted: true });
+    });
+
+    it("notifies formerly-bound agents on delete", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "c1" }], []])        // existence
+        .mockResolvedValueOnce([[{ agent_id: "a1" }], []])  // agent_clusters (captured pre-delete)
+        .mockResolvedValueOnce([undefined, []]);            // delete
+      await runRoute(router, fakeReq({ url: "/api/v1/clusters/c1", method: "DELETE" }));
+      await new Promise(r => setImmediate(r));
+      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1"], "agent.reload", { resources: ["cluster"] });
     });
   });
 

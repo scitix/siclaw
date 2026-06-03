@@ -400,8 +400,18 @@ export function registerHostRoutes(router: RestRouter, jwtSecret: string, connec
       return;
     }
 
+    // Capture bound agents BEFORE delete — the FK cascade removes agent_hosts
+    // rows, so querying them afterwards would return nothing.
+    const [boundRows] = await db.query("SELECT agent_id FROM agent_hosts WHERE host_id = ?", [params.id]) as any;
+
     await db.query("DELETE FROM hosts WHERE id = ?", [params.id]);
     sendJson(res, 200, { deleted: true });
+
+    // Notify formerly-bound agents so they drop the now-deleted host from their
+    // cached list/credentials (mirror of the PUT notify; the host vanishing from
+    // the snapshot makes reconcileFullList unlink it on the next refresh).
+    const agentIds = ((boundRows ?? []) as { agent_id: string }[]).map((r) => r.agent_id);
+    if (agentIds.length > 0) connectionMap.notifyMany(agentIds, "agent.reload", { resources: ["host"] });
   });
 
   // POST /api/v1/hosts/:id/test — test SSH connection (dials the full ProxyJump

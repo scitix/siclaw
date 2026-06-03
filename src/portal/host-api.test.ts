@@ -237,11 +237,22 @@ describe("registerHostRoutes", () => {
 
     it("deletes when present", async () => {
       query
-        .mockResolvedValueOnce([[{ id: "h1" }], []])
-        .mockResolvedValueOnce([undefined, []]);
+        .mockResolvedValueOnce([[{ id: "h1" }], []])  // existence check
+        .mockResolvedValueOnce([[], []])              // agent_hosts (no bound agents)
+        .mockResolvedValueOnce([undefined, []]);      // delete
       const { status, body } = await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1", method: "DELETE" }));
       expect(status).toBe(200);
       expect(body).toEqual({ deleted: true });
+    });
+
+    it("notifies formerly-bound agents on delete", async () => {
+      query
+        .mockResolvedValueOnce([[{ id: "h1" }], []])        // existence check
+        .mockResolvedValueOnce([[{ agent_id: "a1" }], []])  // agent_hosts (captured pre-delete)
+        .mockResolvedValueOnce([undefined, []]);            // delete
+      await runRoute(router, fakeReq({ url: "/api/v1/hosts/h1", method: "DELETE" }));
+      await new Promise(r => setImmediate(r));
+      expect(connMap.notifyMany).toHaveBeenCalledWith(["a1"], "agent.reload", { resources: ["host"] });
     });
   });
 

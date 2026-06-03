@@ -260,6 +260,27 @@ class ResourceRegistry<TMeta extends { name: string }> {
     }
   }
 
+  /**
+   * Force-invalidate the materialized credential of EVERY entry, regardless of
+   * TTL: unlink files (incl. jump_chain hops) and clear path/filePaths/
+   * jumpChain/expiresAt, keeping metadata. The next ensure*() re-acquires from
+   * source. Used on a config/credential-change reload so an edited host/cluster
+   * cannot keep serving its stale (pre-edit) credential within its TTL window.
+   * Same shape as evictExpired() minus the expiry guard.
+   */
+  invalidateAll(): void {
+    for (const [key, entry] of this.map) {
+      this.unlinkEntry(entry);
+      this.map.set(key, {
+        meta: entry.meta,
+        path: undefined,
+        filePaths: undefined,
+        jumpChain: undefined,
+        expiresAt: undefined,
+      });
+    }
+  }
+
   dispose(): void {
     for (const entry of this.map.values()) {
       this.unlinkEntry(entry);
@@ -492,6 +513,23 @@ export class CredentialBroker {
   /** true once refreshHosts() has succeeded at least once. */
   isHostsReady(): boolean {
     return this.hostsInitialized;
+  }
+
+  /**
+   * Drop every host's materialized credential (files + jump_chain + expiry),
+   * keeping metadata. Forces the next ensureHost() to re-acquire via
+   * credential.get. Call this on a host config/credential-change reload —
+   * refreshHosts() alone only reconciles metadata and PRESERVES the materialized
+   * credential for still-bound hosts, so an edited host would otherwise keep
+   * dialing its stale (pre-edit) ip/auth/jump_chain until the TTL lapses.
+   */
+  invalidateHostCredentials(): void {
+    this.hosts.invalidateAll();
+  }
+
+  /** Cluster analogue of invalidateHostCredentials — drop cached kubeconfigs. */
+  invalidateClusterCredentials(): void {
+    this.clusters.invalidateAll();
   }
 
   /**
