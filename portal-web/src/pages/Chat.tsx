@@ -16,6 +16,7 @@ export function Chat() {
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedAgentId, setSelectedAgentId] = useState<string>(searchParams.get("agent") || "")
+  const [agentPreview, setAgentPreview] = useState<{ agentId: string; left: number; top: number } | null>(null)
   const [agentSelectorCollapsed, setAgentSelectorCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(AGENT_SELECTOR_COLLAPSED_KEY) === "true"
@@ -59,12 +60,26 @@ export function Chat() {
   const handleSelectAgent = (agentId: string) => {
     setSelectedAgentId(agentId)
     setAgentSelectorCollapsed(true)
+    setAgentPreview(null)
     if (location.pathname.startsWith("/chat")) {
       setSearchParams({ agent: agentId })
     }
   }
 
+  const handleShowAgentPreview = (agentId: string, element: HTMLElement) => {
+    if (!agentSelectorCollapsed) return
+    const rect = element.getBoundingClientRect()
+    const previewWidth = 224
+    const previewHeight = 64
+    setAgentPreview({
+      agentId,
+      left: Math.max(8, Math.min(rect.right + 10, window.innerWidth - previewWidth - 8)),
+      top: Math.max(8, Math.min(rect.top, window.innerHeight - previewHeight - 8)),
+    })
+  }
+
   const agentStatusClass = (status: string) => (status === "active" ? "bg-green-500" : "bg-gray-500")
+  const previewAgent = agentPreview ? agents.find((a) => a.id === agentPreview.agentId) : undefined
 
   if (loading) {
     return (
@@ -107,6 +122,10 @@ export function Chat() {
               key={a.id}
               type="button"
               onClick={() => handleSelectAgent(a.id)}
+              onFocus={(e) => handleShowAgentPreview(a.id, e.currentTarget)}
+              onMouseEnter={(e) => handleShowAgentPreview(a.id, e.currentTarget)}
+              onBlur={() => setAgentPreview(null)}
+              onMouseLeave={() => setAgentPreview(null)}
               className={`relative mx-auto flex h-10 w-10 items-center justify-center rounded-lg transition-colors ${
                 selectedAgentId === a.id
                   ? "bg-secondary text-foreground"
@@ -123,42 +142,70 @@ export function Chat() {
       </aside>
 
       {!agentSelectorCollapsed && (
-        <div className="absolute left-0 top-0 bottom-0 z-40 w-[220px] border-r border-border bg-background/95 shadow-xl shadow-black/10">
-          <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
-            <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
-              Select Agent
-            </span>
-            <button
-              type="button"
-              onClick={() => setAgentSelectorCollapsed(true)}
-              className="h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors"
-              aria-label="Collapse agent selector"
-              title="Collapse agent selector"
-            >
-              <PanelLeftClose className="h-4 w-4" />
-            </button>
-          </div>
-          <div className="h-[calc(100%-45px)] overflow-y-auto overflow-x-hidden py-1">
-            {agents.map((a) => (
+        <>
+          <div
+            className="absolute left-[220px] right-0 top-0 bottom-0 z-30"
+            onClick={() => setAgentSelectorCollapsed(true)}
+            aria-hidden="true"
+          />
+          <div className="absolute left-0 top-0 bottom-0 z-40 w-[220px] border-r border-border bg-background/95 shadow-xl shadow-black/10">
+            <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
+                Select Agent
+              </span>
               <button
-                key={a.id}
                 type="button"
-                onClick={() => handleSelectAgent(a.id)}
-                className={`flex items-center gap-2 w-full px-3 py-2 text-left transition-colors ${
-                  selectedAgentId === a.id
-                    ? "bg-secondary text-foreground"
-                    : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
-                }`}
-                title={`${a.name}${a.model_id ? ` · ${a.model_id}` : ""}`}
+                onClick={() => setAgentSelectorCollapsed(true)}
+                className="h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors"
+                aria-label="Collapse agent selector"
+                title="Collapse agent selector"
               >
-                <Bot className="h-3.5 w-3.5 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-[12px] font-mono truncate">{a.name}</p>
-                  <p className="text-[10px] text-muted-foreground truncate">{a.model_id || "No model"}</p>
-                </div>
-                <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${agentStatusClass(a.status)}`} />
+                <PanelLeftClose className="h-4 w-4" />
               </button>
-            ))}
+            </div>
+            <div className="h-[calc(100%-45px)] overflow-y-auto overflow-x-hidden py-1">
+              {agents.map((a) => (
+                <button
+                  key={a.id}
+                  type="button"
+                  onClick={() => handleSelectAgent(a.id)}
+                  className={`flex items-center gap-2 w-full px-3 py-2 text-left transition-colors ${
+                    selectedAgentId === a.id
+                      ? "bg-secondary text-foreground"
+                      : "text-muted-foreground hover:bg-secondary/50 hover:text-foreground"
+                  }`}
+                  title={`${a.name}${a.model_id ? ` · ${a.model_id}` : ""}`}
+                >
+                  <Bot className="h-3.5 w-3.5 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[12px] font-mono truncate">{a.name}</p>
+                    <p className="text-[10px] text-muted-foreground truncate">{a.model_id || "No model"}</p>
+                  </div>
+                  <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${agentStatusClass(a.status)}`} />
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+
+      {agentSelectorCollapsed && agentPreview && previewAgent && (
+        <div
+          className="fixed z-50 w-56 rounded-md border border-border bg-background/95 p-2 shadow-lg shadow-black/10 pointer-events-none"
+          style={{ left: agentPreview.left, top: agentPreview.top }}
+          aria-hidden="true"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-secondary text-foreground">
+              <Bot className="h-3.5 w-3.5" />
+              <span className={`absolute right-1 top-1 h-1.5 w-1.5 rounded-full ${agentStatusClass(previewAgent.status)}`} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[12px] font-medium text-foreground">{previewAgent.name}</p>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                {previewAgent.model_id || "No model"}
+              </p>
+            </div>
           </div>
         </div>
       )}
