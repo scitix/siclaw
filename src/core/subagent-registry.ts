@@ -36,7 +36,7 @@ export interface SubagentType {
 export const RUN_IN_BACKGROUND_ENABLED = false;
 
 /** Default cap on sub-agent child sessions running concurrently in one AgentBox. */
-export const DEFAULT_SUBAGENT_CONCURRENCY = 5;
+export const DEFAULT_SUBAGENT_CONCURRENCY = 2;
 
 /**
  * Max sub-agent child sessions allowed to run at once within a single AgentBox,

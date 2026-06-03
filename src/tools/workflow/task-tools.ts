@@ -42,7 +42,12 @@ export function createTaskCreateTool(taskListId: string, emit?: SessionEventEmit
       "soon as you see it is multi-step, BEFORE diving into tool calls. Don't wait until you're deep in.\n\n" +
       "## When NOT to use\n" +
       "- A single, straightforward, or purely informational request — just answer it, no ceremony.\n" +
-      "- Fewer than 3 trivial steps.\n\n" +
+      "- Fewer than 3 trivial steps.\n" +
+      "- NEVER open a one-task plan whose single task just restates the request (e.g. a lone " +
+      "\"investigate why X is slow\"). A single-item plan tracks nothing and is pure ceremony — it is " +
+      "always wrong. Either you can name 3+ real steps up front (then create those), or you cannot yet — " +
+      "in which case skip the plan and start working, narrating as you go; create the plan later if it " +
+      "turns out to be genuinely multi-step.\n\n" +
       "## What belongs in the ledger\n" +
       "Create tasks ONLY for steps you will carry out yourself — read-only diagnosis and verification. Do " +
       "NOT add remediation, physical hardware work, or anything that needs the user or another team (you " +
