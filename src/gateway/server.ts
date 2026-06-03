@@ -291,6 +291,16 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     const text = params.text as string;
     if (!agentId || !sessionId || !text) throw new Error("agentId, sessionId, text required");
 
+    // Persist the steer as a user message BEFORE injecting it, mirroring
+    // chat.send (L198). Without this the steer only rides the running prompt's
+    // SSE stream and is rendered optimistically by the frontend, but never lands
+    // in chat_messages — so it vanishes on the next history reload. metadata.kind
+    // = "steer" lets the frontend render it as a steer bubble, not a plain user
+    // message. No ensureChatSession: a steer always targets an already-running
+    // session, so the row exists and we must not clobber its title/preview.
+    await appendMessage({ sessionId, role: "user", content: text, metadata: { kind: "steer" } });
+    await incrementMessageCount(sessionId);
+
     const handle = await agentBoxManager.getOrCreate(agentId);
     const client = new AgentBoxClient(handle.endpoint, 10000, agentBoxTlsOptions);
     await client.steerSession(sessionId, text);
