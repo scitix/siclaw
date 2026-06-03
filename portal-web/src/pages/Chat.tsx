@@ -5,6 +5,7 @@ import { api } from "../api"
 import { AgentChat } from "../components/AgentChat"
 
 const AGENT_SELECTOR_COLLAPSED_KEY = "siclaw.agentSelector.collapsed"
+const AGENT_SELECTOR_OVERLAY_WIDTH = 220
 
 interface Agent {
   id: string; name: string; status: string; model_id: string; is_production: boolean
@@ -57,10 +58,41 @@ export function Chat() {
     }
   }, [agentSelectorCollapsed])
 
-  const handleSelectAgent = (agentId: string) => {
-    setSelectedAgentId(agentId)
+  useEffect(() => {
+    if (agentSelectorCollapsed) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAgentSelectorCollapsed(true)
+        setAgentPreview(null)
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [agentSelectorCollapsed])
+
+  useEffect(() => {
+    if (!agentPreview) return
+
+    const hideAgentPreview = () => setAgentPreview(null)
+
+    window.addEventListener("resize", hideAgentPreview)
+    document.addEventListener("scroll", hideAgentPreview, true)
+    return () => {
+      window.removeEventListener("resize", hideAgentPreview)
+      document.removeEventListener("scroll", hideAgentPreview, true)
+    }
+  }, [agentPreview])
+
+  const collapseAgentSelector = () => {
     setAgentSelectorCollapsed(true)
     setAgentPreview(null)
+  }
+
+  const handleSelectAgent = (agentId: string) => {
+    setSelectedAgentId(agentId)
+    collapseAgentSelector()
     if (location.pathname.startsWith("/chat")) {
       setSearchParams({ agent: agentId })
     }
@@ -108,7 +140,10 @@ export function Chat() {
         <div className="h-12 border-b border-border flex items-center justify-center">
           <button
             type="button"
-            onClick={() => setAgentSelectorCollapsed(false)}
+            onClick={() => {
+              setAgentSelectorCollapsed(false)
+              setAgentPreview(null)
+            }}
             className="h-8 w-8 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors"
             aria-label="Expand agent selector"
             title="Expand agent selector"
@@ -144,18 +179,22 @@ export function Chat() {
       {!agentSelectorCollapsed && (
         <>
           <div
-            className="absolute left-[220px] right-0 top-0 bottom-0 z-30"
-            onClick={() => setAgentSelectorCollapsed(true)}
+            className="absolute right-0 top-0 bottom-0 z-30"
+            style={{ left: AGENT_SELECTOR_OVERLAY_WIDTH }}
+            onClick={collapseAgentSelector}
             aria-hidden="true"
           />
-          <div className="absolute left-0 top-0 bottom-0 z-40 w-[220px] border-r border-border bg-background/95 shadow-xl shadow-black/10">
-            <div className="px-3 py-2 border-b border-border flex items-center justify-between gap-2">
+          <div
+            className="absolute left-0 top-0 bottom-0 z-40 flex flex-col border-r border-border bg-background/95 shadow-xl shadow-black/10"
+            style={{ width: AGENT_SELECTOR_OVERLAY_WIDTH }}
+          >
+            <div className="shrink-0 px-3 py-2 border-b border-border flex items-center justify-between gap-2">
               <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/60">
                 Select Agent
               </span>
               <button
                 type="button"
-                onClick={() => setAgentSelectorCollapsed(true)}
+                onClick={collapseAgentSelector}
                 className="h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/70 transition-colors"
                 aria-label="Collapse agent selector"
                 title="Collapse agent selector"
@@ -163,7 +202,7 @@ export function Chat() {
                 <PanelLeftClose className="h-4 w-4" />
               </button>
             </div>
-            <div className="h-[calc(100%-45px)] overflow-y-auto overflow-x-hidden py-1">
+            <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden py-1">
               {agents.map((a) => (
                 <button
                   key={a.id}
