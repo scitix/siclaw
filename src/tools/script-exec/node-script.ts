@@ -46,6 +46,8 @@ export function createNodeScriptTool(kubeconfigRef?: KubeconfigRef, userId?: str
     renderResult: renderTextResult,
     description: `Execute a skill or user script on a Kubernetes node via a privileged debug pod with nsenter.
 
+PREFER host_script when the node is reachable via SSH (check host_list by the node's IP or name): SSH runs the script with NO debug pod. Use node_script when the node is NOT a bound SSH host, or when the script needs pod-namespace access (e.g. a pod's netns) that only the debug pod provides.
+
 The script runs in the host's full namespaces (mount, UTS, IPC, network, PID) — it has access to the host's tools, filesystem, devices, /proc, /sys, and /dev.
 
 Use this for complex node-level diagnostics that need scripts (pipes, loops, functions), not just single commands.

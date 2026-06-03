@@ -30,17 +30,24 @@ export function createHostExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinitio
   return {
     name: "host_exec",
     label: "Host Exec",
-    description: `Execute a single diagnostic command on a non-Kubernetes host via SSH.
+    description: `Execute a single diagnostic command on a host via SSH — bare-metal nodes, jump
+hosts, storage nodes, AND Kubernetes nodes registered as SSH hosts (they appear
+in host_list).
 
-Use this (not the bash tool, which cannot ssh) for hosts NOT managed by
-Kubernetes — bare-metal nodes, jump hosts, storage nodes — where kubectl can't
-reach. Only host_exec / host_script carry a valid SSH credential. The host must
-be bound to this agent in the Portal (visible via host_list).
+PREFER this over node_exec for node-level diagnostics whenever the target is
+SSH-reachable: SSH runs the command directly with NO privileged debug pod on the
+node — cleaner and lighter. The allowed-command whitelist is identical to
+node_exec's (network, RDMA, GPU, hardware, kernel, process, file read-only, text
+processing, logs/services, container, firewall read-only, general), so you lose
+no capability. node_exec is the fallback for nodes not bound as SSH hosts, and
+for pod-namespace (netns) work.
 
-Allowed commands match node_exec's whitelist (network, RDMA, GPU, hardware,
-kernel, process, file read-only, text processing, logs/services, container,
-firewall read-only, general). Pipes (|), && and ; supported. Output redirection,
-input redirection, $() and backticks are blocked.
+ON CONNECTION FAILURE — SSH can't connect / auth fails / timeout / jump host
+unreachable / the host isn't bound (NOT a non-zero command exit) — if the target
+is a Kubernetes node, retry the same command with node_exec (debug pod, no SSH).
+
+Pipes (|), && and ; supported. Output redirection, input redirection, $() and
+backticks are blocked.
 
 The host parameter must be a host name returned by host_list — IPs and arbitrary
 strings are rejected. SSH credentials are looked up via the broker; you cannot
@@ -108,8 +115,9 @@ Examples:
       try {
         target = await acquireSshTarget(kubeconfigRef?.credentialBroker, params.host, "host_exec");
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
@@ -120,8 +128,9 @@ Examples:
       try {
         result = await sshExec(target, params.command, { timeoutMs: timeout, signal });
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
           details: { error: true, reason: "ssh_exec_failed", host: params.host },
         };
       }

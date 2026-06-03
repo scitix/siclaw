@@ -35,6 +35,14 @@ import {
 /** Caps a target + up to 3 bastions. */
 const MAX_JUMP_DEPTH = 3;
 
+/**
+ * SSH connect/handshake fail-fast deadline (sicore parity: connector default 10s).
+ * Deliberately separate from the per-command timeout — an unreachable host fails
+ * in ~10s so the caller can fall back (e.g. to node_exec) instead of waiting out
+ * the full 30–120s command timeout.
+ */
+const SSH_CONNECT_TIMEOUT_MS = 10_000;
+
 // ── Types ───────────────────────────────────────────────────────────
 
 export interface SshTarget {
@@ -199,8 +207,10 @@ export async function sshExec(
   options: SshExecOptions,
 ): Promise<SshExecResult> {
   const hops = await targetToHops(target);
+  // Connect with the short fail-fast deadline; the command itself then runs under
+  // the caller's (longer) options.timeoutMs via runCommand below.
   const { client, teardown } = await dialSshChain(hops, {
-    timeoutMs: options.timeoutMs,
+    timeoutMs: SSH_CONNECT_TIMEOUT_MS,
     signal: options.signal,
   });
   try {

@@ -44,13 +44,14 @@ export function createHostScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinit
       );
     },
     renderResult: renderTextResult,
-    description: `Execute a skill or user script on a non-Kubernetes host via SSH.
+    description: `Execute a skill or user script on a host via SSH — incl. Kubernetes nodes registered as SSH hosts (they appear in host_list).
+
+PREFER this over node_script for node-level diagnostics whenever the target is SSH-reachable: SSH runs the script with NO privileged debug pod (cleaner, lighter). node_script is the fallback for nodes not bound as SSH hosts, and for pod-namespace (netns) work. On connection failure (can't connect / auth / timeout / host not bound — not a non-zero script exit) and the target is a Kubernetes node, retry with node_script.
 
 The script is piped via stdin into the remote shell — no file transfer needed.
 Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
-Use this for complex non-K8s host diagnostics that need scripts (pipes, loops,
-functions), not just single commands. For single commands, use host_exec.
+For complex host diagnostics that need scripts (pipes, loops, functions), not just single commands. For single commands, use host_exec.
 
 Parameters:
 - host: Host name (from host_list). Must be bound to this agent.
@@ -107,8 +108,9 @@ Examples:
       try {
         target = await acquireSshTarget(kubeconfigRef?.credentialBroker, params.host, "host_script");
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a script error). If "${params.host}" is a Kubernetes node, retry this script with node_script (debug pod, no SSH).` }],
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
@@ -126,8 +128,9 @@ Examples:
           stdin: resolved.content,
         });
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a script error). If "${params.host}" is a Kubernetes node, retry this script with node_script (debug pod, no SSH).` }],
           details: { error: true, reason: "ssh_exec_failed", host: params.host },
         };
       }

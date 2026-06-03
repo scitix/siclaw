@@ -403,6 +403,19 @@ describe("sshExec — happy paths", () => {
     expect(result.signal).toBeUndefined();
   });
 
+  it("connects with the 10s fail-fast timeout + keepalive, independent of the command timeout", async () => {
+    const stream = nextStream();
+    const target = makeKeyTarget("h-ff", 22);
+    const promise = sshExec(target, "sleep 1", { timeoutMs: 90_000 }); // long command timeout
+    await waitForWiring(stream);
+    // Dial used the short fail-fast connect deadline (10s), NOT the 90s command timeout.
+    expect(mockState.lastConnectConfig.readyTimeout).toBe(10_000);
+    expect(mockState.lastConnectConfig.keepaliveInterval).toBe(30_000);
+    expect(mockState.lastConnectConfig.keepaliveCountMax).toBe(3);
+    stream.emit("close", 0);
+    await promise;
+  });
+
   it("captures non-zero exit code", async () => {
     const stream = nextStream();
     const target = makeKeyTarget("h2", 22);
