@@ -551,6 +551,25 @@ describe("credential.get", () => {
     ]);
   });
 
+  it("resolves a host by id (the handle host_list returns), not just by name", async () => {
+    // host_list exposes HostMeta.id as a selection handle; a model may pass that
+    // id to host_exec → credential.get(source_id=<id>). The lookup must accept it.
+    const query = mockQuery(
+      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----", is_production: 1, description: "db node" }],
+      [{ "1": 1 }],  // binding check
+    );
+
+    const result = await getHandler("credential.get")(
+      { source: "host", source_id: "host-uuid-1" }, "agent-1",
+    );
+    expect(result.credential.type).toBe("ssh");
+    // Lookup accepts name OR id, and passes both bind params as source_id.
+    expect(query.mock.calls[0][0]).toMatch(/WHERE name = \? OR id = \?/);
+    expect(query.mock.calls[0][1]).toEqual(["host-uuid-1", "host-uuid-1"]);
+    // Binding check uses the RESOLVED host.id regardless of the handle passed in.
+    expect(query.mock.calls[1][1]).toEqual(["agent-1", "host-uuid-1"]);
+  });
+
   it("returns password file for host credential with password auth", async () => {
     mockQuery(
       [{ id: "host-uuid-2", name: "web-2", ip: "10.0.0.2", port: 22, username: "admin", auth_type: "password", password: "secret123", private_key: null }],
