@@ -345,10 +345,12 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
 
     if (body.source === "host") {
-      // source_id is the host's NAME — see cluster branch above for rationale.
+      // source_id is the host's NAME or id. host_list exposes `id` as a stable
+      // selection handle, so accept either; the binding checks below run against
+      // the resolved host.id, so authorization is identical regardless.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
-        [body.source_id],
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ? OR id = ?",
+        [body.source_id, body.source_id],
       ) as any;
       if (rows.length === 0) {
         sendJson(res, 404, { error: "Host not found" });
@@ -1910,10 +1912,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
 
     if (params.source === "host") {
-      // source_id is the host's NAME — see cluster branch above.
+      // source_id is the host's NAME or id (host_list exposes id as a selection
+      // handle); accept either — binding checks below use the resolved host.id.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
-        [params.source_id],
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ? OR id = ?",
+        [params.source_id, params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Host not found");
       const host = rows[0] as HostCredentialRow;
