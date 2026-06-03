@@ -49,20 +49,21 @@ is a Kubernetes node, retry the same command with node_exec (debug pod, no SSH).
 Pipes (|), && and ; supported. Output redirection, input redirection, $() and
 backticks are blocked.
 
-The host parameter must be a host name returned by host_list — IPs and arbitrary
-strings are rejected. SSH credentials are looked up via the broker; you cannot
-supply a key path. Hosts behind a bastion (host_list shows a "jump_host") are
-reached automatically through the configured ProxyJump chain — just target the
-final host by name.
+The host parameter is the host's \`id\` from host_list — prefer the id, since host
+names can be duplicated (a duplicate name fails at execution); a unique name also
+works. IPs and arbitrary strings are rejected. SSH credentials are looked up via
+the broker; you cannot supply a key path. Hosts behind a bastion (host_list shows
+a "jump_host") are reached automatically through the configured ProxyJump chain —
+just target the final host by its host_list id.
 
-Examples:
-- host: "jump-1", command: "uptime"
-- host: "bare-metal-3", command: "nvidia-smi"
-- host: "storage-1", command: "df -h"
-- host: "node-a", command: "journalctl -u kubelet -n 100 | grep error"`,
+Examples (pass the id from host_list; names shown here for readability):
+- host: "<jump-1 id>", command: "uptime"
+- host: "<bare-metal-3 id>", command: "nvidia-smi"
+- host: "<storage-1 id>", command: "df -h"
+- host: "<node-a id>", command: "journalctl -u kubelet -n 100 | grep error"`,
     parameters: Type.Object({
       host: Type.String({
-        description: "Host name (from host_list). Must be bound to this agent.",
+        description: "Host id from host_list (preferred — names can be duplicated, so the id is the unambiguous handle; a unique name also works). Must be bound to this agent.",
       }),
       command: Type.String({
         description: 'Diagnostic command to run on the host (e.g. "uptime", "ip addr show")',

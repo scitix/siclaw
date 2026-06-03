@@ -54,18 +54,18 @@ Scripts must come from a skill's scripts/ directory or from user-uploaded script
 For complex host diagnostics that need scripts (pipes, loops, functions), not just single commands. For single commands, use host_exec.
 
 Parameters:
-- host: Host name (from host_list). Must be bound to this agent.
+- host: Host id from host_list (preferred — names can be duplicated, so the id is the unambiguous handle; a unique name also works). Must be bound to this agent.
 - skill: Skill name. If omitted, looks in user scripts.
 - script: Script filename (e.g. "collect-system-logs.sh").
 - args: Optional arguments to pass to the script.
 - timeout_seconds: Timeout (default: 180, max: 300)
 
-Examples:
-- host: "bare-metal-3", skill: "node-logs", script: "collect-system-logs.sh", args: "--lines 200"
-- host: "jump-1", script: "my-check.sh"`,
+Examples (pass the id from host_list; names shown here for readability):
+- host: "<bare-metal-3 id>", skill: "node-logs", script: "collect-system-logs.sh", args: "--lines 200"
+- host: "<jump-1 id>", script: "my-check.sh"`,
     parameters: Type.Object({
       host: Type.String({
-        description: "Host name (from host_list). Must be bound to this agent.",
+        description: "Host id from host_list (preferred — names can be duplicated, so the id is the unambiguous handle; a unique name also works). Must be bound to this agent.",
       }),
       skill: Type.Optional(
         Type.String({
