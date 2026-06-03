@@ -158,6 +158,11 @@ function buildHopConfig(hop: DialHop, timeoutMs: number, sock?: Duplex, managedK
     port: hop.port,
     username: hop.username,
     readyTimeout: timeoutMs,
+    // Liveness after connect (sicore parity: 30s × 3) — detects a dead /
+    // black-holed connection mid-command instead of hanging until the command
+    // timeout fires.
+    keepaliveInterval: 30_000,
+    keepaliveCountMax: 3,
     // host/port are still used for the verifier cache key even when `sock` is
     // set (ssh2 then ignores them for transport but we keep them meaningful).
     hostVerifier: makeHostVerifier(hop.host, hop.port),

@@ -428,6 +428,55 @@ describe("credential.list", () => {
       getHandler("credential.list")({}, ""),
     ).rejects.toThrow("agentId required");
   });
+
+  // ── host query path (host_list with a query) ──
+  it("host query: filters, paginates, returns id + total + next_cursor", async () => {
+    const q = mockQuery(
+      [{ n: 137 }], // COUNT(*)
+      [{ id: "h1", name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: 1, description: "x", jump_host_name: "bastion" }],
+    );
+    const result = await getHandler("credential.list")({ kind: "host", query: "gpu", limit: 1 }, "agent-1");
+    expect(result.hosts).toEqual([
+      { id: "h1", name: "gpu-1", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: true, description: "x", jump_host: "bastion" },
+    ]);
+    expect(result.total).toBe(137);
+    expect(result.next_cursor).toBe("1"); // offset 0 + limit 1 < 137
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).toContain("LIMIT 1 OFFSET 0");
+    expect(selectSql).toContain("LIKE");
+  });
+
+  it("host query: limit defaults to 20 and caps at 100", async () => {
+    const q1 = mockQuery([{ n: 0 }], []);
+    await getHandler("credential.list")({ kind: "host", query: "x" }, "a1");
+    expect(q1.mock.calls[1][0]).toContain("LIMIT 20 OFFSET 0");
+    const q2 = mockQuery([{ n: 0 }], []);
+    await getHandler("credential.list")({ kind: "host", query: "x", limit: 9999 }, "a1");
+    expect(q2.mock.calls[1][0]).toContain("LIMIT 100");
+  });
+
+  it("host query: an IPv4 query matches ip exactly (no LIKE)", async () => {
+    const q = mockQuery([{ n: 1 }], [{ id: "h1", name: "n", ip: "10.0.0.5", port: 22, username: "root", auth_type: "key", is_production: 1, description: null, jump_host_name: null }]);
+    await getHandler("credential.list")({ kind: "host", query: "10.0.0.5" }, "a1");
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).toContain("h.ip = ?");
+    expect(selectSql).not.toContain("LIKE");
+    expect(q.mock.calls[1][1]).toEqual(["a1", "10.0.0.5"]); // agentId + exact ip
+  });
+
+  it("host query: an empty query browses (paginated, no filter)", async () => {
+    const q = mockQuery([{ n: 2 }], [
+      { id: "h1", name: "a", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", is_production: 1, description: null, jump_host_name: null },
+      { id: "h2", name: "b", ip: "10.0.0.2", port: 22, username: "root", auth_type: "key", is_production: 0, description: null, jump_host_name: null },
+    ]);
+    const result = await getHandler("credential.list")({ kind: "host", query: "" }, "a1");
+    expect(result.hosts).toHaveLength(2);
+    expect(result.total).toBe(2);
+    expect(result.next_cursor).toBeNull(); // 0 + 2 == total
+    const selectSql = q.mock.calls[1][0];
+    expect(selectSql).not.toContain("LIKE");
+    expect(selectSql).toContain("WHERE ah.agent_id = ?");
+  });
 });
 
 describe("credential.get", () => {
@@ -502,6 +551,25 @@ describe("credential.get", () => {
     ]);
   });
 
+  it("resolves a host by id (the handle host_list returns), not just by name", async () => {
+    // host_list exposes HostMeta.id as a selection handle; a model may pass that
+    // id to host_exec → credential.get(source_id=<id>). The lookup must accept it.
+    const query = mockQuery(
+      [{ id: "host-uuid-1", name: "web-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "-----BEGIN RSA-----", is_production: 1, description: "db node" }],
+      [{ "1": 1 }],  // binding check
+    );
+
+    const result = await getHandler("credential.get")(
+      { source: "host", source_id: "host-uuid-1" }, "agent-1",
+    );
+    expect(result.credential.type).toBe("ssh");
+    // Lookup accepts name OR id, and passes both bind params as source_id.
+    expect(query.mock.calls[0][0]).toMatch(/WHERE name = \? OR id = \?/);
+    expect(query.mock.calls[0][1]).toEqual(["host-uuid-1", "host-uuid-1"]);
+    // Binding check uses the RESOLVED host.id regardless of the handle passed in.
+    expect(query.mock.calls[1][1]).toEqual(["agent-1", "host-uuid-1"]);
+  });
+
   it("returns password file for host credential with password auth", async () => {
     mockQuery(
       [{ id: "host-uuid-2", name: "web-2", ip: "10.0.0.2", port: 22, username: "admin", auth_type: "password", password: "secret123", private_key: null }],
@@ -516,17 +584,50 @@ describe("credential.get", () => {
     ]);
   });
 
-  it("returns a managed credential: auth_type=managed + jump_host, no key/password file", async () => {
+  it("returns a managed credential: auth_type=managed + jump_host + jump_chain, no key/password file", async () => {
     mockQuery(
       [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", password: null, private_key: null, passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
       [{ "1": 1 }],         // binding ok
-      [{ name: "bastion" }], // resolveJumpHostName
+      // walkJumpChainRows(b1): the sole bastion, chain ends (jump_host_id null)
+      [{ id: "b1", name: "bastion", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "BKEY", passphrase: null, jump_host_id: null }],
     );
     const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
     expect(result.credential.type).toBe("ssh");
     expect(result.credential.metadata.auth_type).toBe("managed");
     expect(result.credential.metadata.jump_host).toBe("bastion");
     expect(result.credential.files).toEqual([]);
+    // Server-pre-resolved chain [outermost … nearest], target excluded, files materializable.
+    expect(result.credential.jump_chain).toEqual([
+      { name: "bastion", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "BKEY", mode: 0o600 }] },
+    ]);
+  });
+
+  it("emits a 2-hop jump_chain ordered [outermost … nearest] + dual-emits metadata.jump_host", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", password: null, private_key: "TK", passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
+      [{ "1": 1 }], // binding ok
+      // walkJumpChainRows(b1): nearest bastion b1 → its jump b2
+      [{ id: "b1", name: "near", ip: "10.0.0.2", port: 22, username: "root", auth_type: "key", password: null, private_key: "B1K", passphrase: null, jump_host_id: "b2" }],
+      [{ id: "b2", name: "outer", ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "B2PW", private_key: null, passphrase: null, jump_host_id: null }],
+    );
+    const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
+    expect(result.credential.files).toEqual([{ name: "host.key", content: "TK", mode: 0o600 }]);
+    expect(result.credential.metadata.jump_host).toBe("near"); // nearest bastion name, for legacy fallback
+    expect(result.credential.jump_chain).toEqual([
+      { name: "outer", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "password" }, files: [{ name: "host.password", content: "B2PW" }] },
+      { name: "near", metadata: { ip: "10.0.0.2", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "B1K", mode: 0o600 }] },
+    ]);
+  });
+
+  it("fails closed when an explicit host's jump_host_id is dangling (no silent direct-connect)", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", password: null, private_key: "TK", passphrase: null, is_production: 1, description: null, jump_host_id: "missing" }],
+      [{ "1": 1 }], // binding ok
+      [],           // walkJumpChainRows("missing") → row not found
+    );
+    await expect(
+      getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1"),
+    ).rejects.toThrow(/not found in jump chain/);
   });
 
   it("authorizes a jump host transitively when the agent is bound to a host that uses it", async () => {
@@ -690,6 +791,7 @@ describe("credential.hostSearch", () => {
     expect(query.mock.calls[0][0]).toContain("FROM hosts");
     expect(query.mock.calls[0][0]).not.toContain("agent_hosts");
   });
+
 });
 
 // ================================================================

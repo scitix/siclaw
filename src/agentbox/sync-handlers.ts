@@ -380,8 +380,10 @@ import type { CredentialBroker } from "./credential-broker.js";
  * Does NOT use GatewaySyncClientLike: the CredentialBroker carries its own
  * HttpTransport. The framework's generic HTTP client is the wrong tool here.
  *
- * Consequence: fetch() drives the entire refresh; materialize() is a
- * no-op that just returns the count for the framework log line.
+ * fetch() reconciles metadata; materialize() then invalidates the cached
+ * kubeconfigs so a config/credential change actually takes effect — reconcile
+ * alone PRESERVES the materialized credential for still-bound clusters, which
+ * would otherwise serve the stale (pre-edit) kubeconfig until its TTL lapses.
  */
 export function createClusterHandler(broker: CredentialBroker): AgentBoxSyncHandler<number> {
   return {
@@ -391,12 +393,13 @@ export function createClusterHandler(broker: CredentialBroker): AgentBoxSyncHand
       return metas.length;
     },
     async materialize(count: number): Promise<number> {
+      broker.invalidateClusterCredentials();
       return count;
     },
   };
 }
 
-/** host handler — mirror of cluster handler. */
+/** host handler — mirror of cluster handler (incl. credential invalidation). */
 export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler<number> {
   return {
     type: "host",
@@ -405,6 +408,7 @@ export function createHostHandler(broker: CredentialBroker): AgentBoxSyncHandler
       return metas.length;
     },
     async materialize(count: number): Promise<number> {
+      broker.invalidateHostCredentials();
       return count;
     },
   };

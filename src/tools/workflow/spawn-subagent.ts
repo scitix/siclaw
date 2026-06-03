@@ -35,10 +35,12 @@ function errorResult(message: string) {
 function buildDescription(): string {
   const lines = listSubagentTypes().map((t) => `- ${t.agentType}: ${t.whenToUse}`);
   return (
-    "Launch an isolated sub-agent to handle ONE bounded task and get its findings back. Use it to " +
-    "parallelize independent work — emit several spawn_subagent calls in a single turn — or to keep a " +
-    "large investigation's raw output out of your own context. Do NOT use it for a single quick lookup " +
-    "you can do yourself in one tool call, and never redo work a sub-agent is already doing.\n\n" +
+    "Launch an isolated sub-agent to handle ONE bounded job and get its findings back. Use it to " +
+    "run independent work in parallel — emit several spawn_subagent calls in a single turn — or to keep a " +
+    "large investigation's raw output out of your own context. Do NOT use it for a lone lookup you'd do " +
+    "in one tool call — but the same lookup needed across several targets at once IS a fan-out (the main " +
+    "agent runs one thing at a time, so concurrency goes to sub-agents). Never redo work a sub-agent is " +
+    "already doing.\n\n" +
     "Writing the prompt: the sub-agent starts fresh and sees ONLY your prompt — brief it like a smart " +
     "colleague who just walked in. State the goal and why it matters, what you already know or have ruled " +
     "out, the exact target/scope, and what evidence to report back. For a lookup, hand over the exact " +

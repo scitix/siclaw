@@ -12,6 +12,7 @@ import type {
   ClusterMeta,
   HostMeta,
   CredentialPayload,
+  HostListResult,
 } from "../shared/credential-types.js";
 import { sessionRegistry, type SessionRegistry } from "./session-registry.js";
 
@@ -73,6 +74,29 @@ export class CredentialService {
       throw new Error("Adapter credential-list returned malformed host list response");
     }
     return data.hosts;
+  }
+
+  /** Filtered + paginated host_list (name/ip/description), agent-scoped. Hits the
+   *  same `credential.list` RPC as listHosts, with a `query` — returns a FILTERED
+   *  subset, not a full snapshot. */
+  async queryHosts(identity: Identity, query: string, opts?: { limit?: number; cursor?: string }): Promise<HostListResult> {
+    const data = await this.frontendClient.request(
+      "credential.list",
+      await this.rpcParams(identity, {
+        kind: "host",
+        query,
+        ...(opts?.limit != null ? { limit: opts.limit } : {}),
+        ...(opts?.cursor != null ? { cursor: opts.cursor } : {}),
+      }),
+    ) as Partial<HostListResult>;
+    if (!Array.isArray(data.hosts)) {
+      throw new Error("Adapter credential-list returned malformed host search response");
+    }
+    return {
+      hosts: data.hosts,
+      total: typeof data.total === "number" ? data.total : data.hosts.length,
+      next_cursor: data.next_cursor ?? null,
+    };
   }
 
   async getClusterCredential(identity: Identity, clusterName: string, purpose: string): Promise<CredentialPayload> {

@@ -36,6 +36,9 @@ export function createNodeExecTool(kubeconfigRef?: KubeconfigRef, userId?: strin
     name: "node_exec",
     label: "Node Exec",
     description: `Execute a single diagnostic command directly on a Kubernetes node. For multi-step scripts (pipes, loops, functions), use node_script instead.
+
+PREFER host_exec when the node is reachable via SSH: check host_list (match by the node's IP or name) — if the node is a bound SSH host, use host_exec, which runs over SSH with NO debug pod (lighter, leaves the node untouched). Use node_exec when the node is NOT in host_list (it works on any cluster node without SSH credentials — its role as the fallback), or when you need pod-namespace access (e.g. a pod's netns) that only the debug pod provides.
+
 Creates a privileged debug pod with nsenter to run the command in the host's full namespaces (mount, UTS, IPC, network, PID).
 The pod is automatically cleaned up after execution (--rm).
 

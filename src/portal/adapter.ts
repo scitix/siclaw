@@ -18,6 +18,7 @@ import {
 import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
+import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -51,27 +52,30 @@ interface HostCredentialRow {
   jump_host_id: string | null;
 }
 
-/** Resolve a jump_host_id to the bastion's host NAME (neutral wire reference). */
-async function resolveJumpHostName(db: Db, jumpHostId: string | null | undefined): Promise<string | null> {
-  if (!jumpHostId) return null;
-  const [rows] = (await db.query("SELECT name FROM hosts WHERE id = ?", [jumpHostId])) as any;
-  return rows.length > 0 ? (rows[0].name as string) : null;
-}
-
 /**
  * Build the `credential` payload for an SSH host row: key/password file(s), an
- * optional passphrase file (kept under the same 0600 materialization as the
- * key), and metadata carrying the jump-host NAME resolved from jump_host_id.
- * Throws if the required key/password material is empty.
+ * optional passphrase file (0600), metadata, and the server-pre-resolved
+ * `jump_chain` (ordered [outermost … nearest]). The nearest bastion's NAME is
+ * ALSO emitted as `metadata.jump_host` for backward compat — not-yet-migrated
+ * Runtimes fall back to name-recursion. Fail-closed: a dangling / cyclic /
+ * over-deep jump, a managed bastion, or a credential-less bastion throws (no
+ * silent direct-connect). See docs/design/ssh-jump-host.md §3 / §6.4 / §6.5.
  */
 async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
   const files: { name: string; content: string; mode?: number }[] = [];
-  const jumpName = await resolveJumpHostName(db, host.jump_host_id);
+  // Server-pre-resolve the whole bastion chain by jump_host_id. walkJumpChainRows
+  // throws on dangling/cycle/over-depth; chainHopFromRow throws on a managed or
+  // credential-less bastion (invariants ②③④) — any broken jump fails closed.
+  const chainRows = host.jump_host_id ? await walkJumpChainRows(db, host.jump_host_id) : [];
+  const jumpChain = chainRows.map(chainHopFromRow);
+  // chainRows = [outermost … nearest]; the nearest bastion is the host's direct jump.
+  const jumpName = chainRows.length > 0 ? chainRows[chainRows.length - 1].name : null;
+
   if (host.auth_type === "managed") {
     // Managed: no stored key/password — the key is sourced from the bastion at
-    // dial time. Requires a jump host. Optionally ship a passphrase for an
-    // encrypted bastion key.
-    if (!jumpName) {
+    // dial time, so a jump chain is mandatory. Optionally ship a passphrase for
+    // an encrypted bastion key.
+    if (jumpChain.length === 0) {
       throw new Error(`Host "${host.name}" has auth_type="managed" but no jump host configured`);
     }
     if (host.passphrase) {
@@ -106,6 +110,7 @@ async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
       ...(host.description ? { description: host.description } : {}),
       ...(jumpName ? { jump_host: jumpName } : {}),
     },
+    ...(jumpChain.length > 0 ? { jump_chain: jumpChain } : {}),
     ttl_seconds: 300,
   };
 }
@@ -340,10 +345,12 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
 
     if (body.source === "host") {
-      // source_id is the host's NAME — see cluster branch above for rationale.
+      // source_id is the host's NAME or id. host_list exposes `id` as a stable
+      // selection handle, so accept either; the binding checks below run against
+      // the resolved host.id, so authorization is identical regardless.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
-        [body.source_id],
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ? OR id = ?",
+        [body.source_id, body.source_id],
       ) as any;
       if (rows.length === 0) {
         sendJson(res, 404, { error: "Host not found" });
@@ -1787,21 +1794,64 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     if (!agentId) throw new Error("agentId required");
     const db = getDb();
     if (params.kind === "host" || params.kind === "hosts") {
+      const fromHost = "FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id LEFT JOIN hosts hj ON h.jump_host_id = hj.id";
+      // No `query` field → full snapshot (the broker's reconcileFullList depends
+      // on this). A `query` (even "") → server-side filtered + paginated browse.
+      if (typeof params.query !== "string") {
+        const [rows] = await db.query(
+          `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
+           ${fromHost} WHERE ah.agent_id = ?`,
+          [agentId],
+        ) as any;
+        return {
+          hosts: rows.map((r: any) => ({
+            name: r.name, ip: r.ip, port: r.port, username: r.username,
+            auth_type: r.auth_type, is_production: !!r.is_production,
+            ...(r.description ? { description: r.description } : {}),
+            ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
+          })),
+        };
+      }
+
+      // Filtered + paginated host_list (metadata only; never secrets). limit
+      // default 20 / max 100; offset from an opaque numeric cursor. Both are
+      // clamped integers → safe to inline (avoids a bound-param-in-LIMIT quirk).
+      const q = (params.query as string).trim();
+      const rawLimit = Number(params.limit);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 100) : 20;
+      const rawOffset = Number(params.cursor);
+      const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+      // IP smart-match: an IPv4-looking query matches h.ip exactly (so "10.0.0.5"
+      // doesn't substring-hit "10.0.0.51"); else substring over name/ip/description.
+      const isIpv4 = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(q);
+      const conds = ["ah.agent_id = ?"];
+      const whereParams: unknown[] = [agentId];
+      if (q) {
+        if (isIpv4) {
+          conds.push("h.ip = ?");
+          whereParams.push(q);
+        } else {
+          conds.push("(h.name LIKE ? OR h.ip LIKE ? OR h.description LIKE ?)");
+          whereParams.push(`%${q}%`, `%${q}%`, `%${q}%`);
+        }
+      }
+      const where = ` WHERE ${conds.join(" AND ")}`;
+      const [countRows] = await db.query(`SELECT COUNT(*) AS n ${fromHost}${where}`, whereParams) as any;
+      const total = Number((countRows as any[])?.[0]?.n ?? 0);
       const [rows] = await db.query(
-        `SELECT h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
-         FROM agent_hosts ah JOIN hosts h ON ah.host_id = h.id
-         LEFT JOIN hosts hj ON h.jump_host_id = hj.id
-         WHERE ah.agent_id = ?`,
-        [agentId],
+        `SELECT h.id, h.name, h.ip, h.port, h.username, h.auth_type, h.is_production, h.description, hj.name AS jump_host_name
+         ${fromHost}${where} ORDER BY h.name LIMIT ${limit} OFFSET ${offset}`,
+        whereParams,
       ) as any;
-      return {
-        hosts: rows.map((r: any) => ({
-          name: r.name, ip: r.ip, port: r.port, username: r.username,
-          auth_type: r.auth_type, is_production: !!r.is_production,
-          ...(r.description ? { description: r.description } : {}),
-          ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
-        })),
-      };
+      const hosts = (rows as any[]).map((r) => ({
+        id: r.id,
+        name: r.name, ip: r.ip, port: r.port, username: r.username,
+        auth_type: r.auth_type, is_production: !!r.is_production,
+        ...(r.description ? { description: r.description } : {}),
+        ...(r.jump_host_name ? { jump_host: r.jump_host_name } : {}),
+      }));
+      const next_cursor = offset + hosts.length < total ? String(offset + limit) : null;
+      return { hosts, total, next_cursor };
     }
     // Default: clusters
     const [rows] = await db.query(
@@ -1862,10 +1912,11 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
     }
 
     if (params.source === "host") {
-      // source_id is the host's NAME — see cluster branch above.
+      // source_id is the host's NAME or id (host_list exposes id as a selection
+      // handle); accept either — binding checks below use the resolved host.id.
       const [rows] = await db.query(
-        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ?",
-        [params.source_id],
+        "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, is_production, description, jump_host_id FROM hosts WHERE name = ? OR id = ?",
+        [params.source_id, params.source_id],
       ) as any;
       if (rows.length === 0) throw new Error("Host not found");
       const host = rows[0] as HostCredentialRow;

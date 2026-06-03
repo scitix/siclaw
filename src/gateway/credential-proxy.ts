@@ -25,6 +25,10 @@ interface CredentialRequestBody {
 interface CredentialListBody {
   kind?: string;
   session_id?: string;
+  /** Host search (kind="host"): server-side filter + pagination. Absent = full list. */
+  query?: string;
+  limit?: number;
+  cursor?: string;
 }
 
 // Keep identity fields to a safe charset before they land in SQL params or
@@ -144,8 +148,16 @@ export async function handleCredentialList(
       const clusters = await service.listClusters(id);
       sendJson(res, 200, { clusters });
     } else {
-      const hosts = await service.listHosts(id);
-      sendJson(res, 200, { hosts });
+      // A `query` (even "") routes to the filtered/paginated search (no full
+      // snapshot); its absence keeps the full-list path the broker's reconcile
+      // depends on.
+      if (typeof body.query === "string") {
+        const result = await service.queryHosts(id, body.query, { limit: body.limit, cursor: body.cursor });
+        sendJson(res, 200, result);
+      } else {
+        const hosts = await service.listHosts(id);
+        sendJson(res, 200, { hosts });
+      }
     }
   } catch (err) {
     if (err instanceof SessionOwnershipError) {

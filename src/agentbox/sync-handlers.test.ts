@@ -87,9 +87,11 @@ describe("createClusterHandler", () => {
     expect(broker.getClustersLocal().map((m) => m.name).sort()).toEqual(["c1", "c2"]);
   });
 
-  it("materialize is a passthrough that returns the count verbatim", async () => {
+  it("materialize invalidates cached cluster credentials and returns the count", async () => {
+    const spy = vi.spyOn(broker, "invalidateClusterCredentials");
     const handler = createClusterHandler(broker);
     await expect(handler.materialize(42)).resolves.toBe(42);
+    expect(spy).toHaveBeenCalledOnce();
   });
 
   it("handler type is 'cluster'", () => {
@@ -107,6 +109,13 @@ describe("createHostHandler", () => {
     expect(count).toBe(1);
     expect(transport.listHostsCalls).toBe(1);
     expect(broker.isHostsReady()).toBe(true);
+  });
+
+  it("materialize invalidates cached host credentials and returns the count", async () => {
+    const spy = vi.spyOn(broker, "invalidateHostCredentials");
+    const handler = createHostHandler(broker);
+    await expect(handler.materialize(7)).resolves.toBe(7);
+    expect(spy).toHaveBeenCalledOnce();
   });
 
   it("handler type is 'host'", () => {

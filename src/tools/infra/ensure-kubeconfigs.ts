@@ -7,7 +7,7 @@
  * parameter; `ensureHostForTool` does the equivalent for host credentials.
  */
 
-import type { CredentialBroker } from "../../agentbox/credential-broker.js";
+import type { CredentialBroker, HostLocalInfo } from "../../agentbox/credential-broker.js";
 
 /**
  * Prefetch for tools that take a single `cluster` parameter (pod-exec,
@@ -38,16 +38,22 @@ export async function ensureClusterForTool(
 
 /**
  * Ensure a host's credential file is materialized on disk before host_exec /
- * host_script tries to read it. Throws when the broker is missing, or when
- * the broker can't fetch the host (not bound, gateway error, etc).
+ * host_script tries to read it, and RETURN the resolved registry entry. Throws
+ * when the broker is missing, or when the broker can't fetch the host (not
+ * bound, gateway error, etc).
+ *
+ * Returning the entry is load-bearing: `ensureHost` maps the handle (a host
+ * NAME or an id) to its `credential.name`-keyed registry entry. Callers must
+ * use THIS entry rather than re-looking-up by the original handle, which would
+ * miss when the handle is a host id even though ensureHost succeeded.
  */
 export async function ensureHostForTool(
   broker: CredentialBroker | undefined,
   hostName: string,
   purpose: string,
-): Promise<void> {
+): Promise<HostLocalInfo> {
   if (!broker) {
     throw new Error("Credential broker required for host_exec / host_script");
   }
-  await broker.ensureHost(hostName, purpose);
+  return broker.ensureHost(hostName, purpose);
 }
