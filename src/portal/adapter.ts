@@ -18,6 +18,7 @@ import {
 import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
+import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -51,27 +52,30 @@ interface HostCredentialRow {
   jump_host_id: string | null;
 }
 
-/** Resolve a jump_host_id to the bastion's host NAME (neutral wire reference). */
-async function resolveJumpHostName(db: Db, jumpHostId: string | null | undefined): Promise<string | null> {
-  if (!jumpHostId) return null;
-  const [rows] = (await db.query("SELECT name FROM hosts WHERE id = ?", [jumpHostId])) as any;
-  return rows.length > 0 ? (rows[0].name as string) : null;
-}
-
 /**
  * Build the `credential` payload for an SSH host row: key/password file(s), an
- * optional passphrase file (kept under the same 0600 materialization as the
- * key), and metadata carrying the jump-host NAME resolved from jump_host_id.
- * Throws if the required key/password material is empty.
+ * optional passphrase file (0600), metadata, and the server-pre-resolved
+ * `jump_chain` (ordered [outermost … nearest]). The nearest bastion's NAME is
+ * ALSO emitted as `metadata.jump_host` for backward compat — not-yet-migrated
+ * Runtimes fall back to name-recursion. Fail-closed: a dangling / cyclic /
+ * over-deep jump, a managed bastion, or a credential-less bastion throws (no
+ * silent direct-connect). See docs/design/ssh-jump-host.md §3 / §6.4 / §6.5.
  */
 async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
   const files: { name: string; content: string; mode?: number }[] = [];
-  const jumpName = await resolveJumpHostName(db, host.jump_host_id);
+  // Server-pre-resolve the whole bastion chain by jump_host_id. walkJumpChainRows
+  // throws on dangling/cycle/over-depth; chainHopFromRow throws on a managed or
+  // credential-less bastion (invariants ②③④) — any broken jump fails closed.
+  const chainRows = host.jump_host_id ? await walkJumpChainRows(db, host.jump_host_id) : [];
+  const jumpChain = chainRows.map(chainHopFromRow);
+  // chainRows = [outermost … nearest]; the nearest bastion is the host's direct jump.
+  const jumpName = chainRows.length > 0 ? chainRows[chainRows.length - 1].name : null;
+
   if (host.auth_type === "managed") {
     // Managed: no stored key/password — the key is sourced from the bastion at
-    // dial time. Requires a jump host. Optionally ship a passphrase for an
-    // encrypted bastion key.
-    if (!jumpName) {
+    // dial time, so a jump chain is mandatory. Optionally ship a passphrase for
+    // an encrypted bastion key.
+    if (jumpChain.length === 0) {
       throw new Error(`Host "${host.name}" has auth_type="managed" but no jump host configured`);
     }
     if (host.passphrase) {
@@ -106,6 +110,7 @@ async function buildHostSshCredential(db: Db, host: HostCredentialRow) {
       ...(host.description ? { description: host.description } : {}),
       ...(jumpName ? { jump_host: jumpName } : {}),
     },
+    ...(jumpChain.length > 0 ? { jump_chain: jumpChain } : {}),
     ttl_seconds: 300,
   };
 }

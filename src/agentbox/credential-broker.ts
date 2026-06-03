@@ -35,6 +35,7 @@ import type {
   HostMeta,
   CredentialPayload,
 } from "./credential-transport.js";
+import type { ChainHop, ChainHopMeta } from "../shared/credential-types.js";
 
 export type { ClusterMeta, HostMeta, CredentialPayload };
 
@@ -50,8 +51,17 @@ export interface LocalInfo<TMeta extends { name: string }> {
   meta: TMeta;
   /** Main file path, set by the caller (cluster computes from filePaths). */
   path?: string;
-  /** All materialized file paths tied to this credential; unlinked on evict. */
+  /** The credential's OWN materialized file paths (target host only — NOT the
+   * bastion hop files, which live in jumpChain). Unlinked on evict. */
   filePaths?: string[];
+  /**
+   * Materialized bastion chain (host only), ordered [outermost … nearest].
+   * Each hop's files are materialized under isolated paths kept OUT of
+   * filePaths (so target file-suffix lookups never match a hop file); tracked
+   * for eviction alongside filePaths. The Runtime builds the SshTarget.jumpHost
+   * chain from this — no per-hop credential.get recursion.
+   */
+  jumpChain?: Array<{ meta: ChainHopMeta; filePaths: string[] }>;
   /** When the cached credential expires; undefined if metadata-only. */
   expiresAt?: number;
 }
@@ -109,17 +119,18 @@ class ResourceRegistry<TMeta extends { name: string }> {
     // Drop anything not in the snapshot, unlinking materialized files.
     for (const [name, entry] of this.map) {
       if (keep.has(name)) continue;
-      this.unlinkFiles(entry.filePaths);
+      this.unlinkEntry(entry);
       this.map.delete(name);
     }
 
-    // Upsert, preserving prior path/expiry for existing entries.
+    // Upsert, preserving prior path/expiry/chain for existing entries.
     for (const meta of metas) {
       const existing = this.map.get(meta.name);
       this.map.set(meta.name, {
         meta,
         path: existing?.path,
         filePaths: existing?.filePaths,
+        jumpChain: existing?.jumpChain,
         expiresAt: existing?.expiresAt,
       });
     }
@@ -133,6 +144,7 @@ class ResourceRegistry<TMeta extends { name: string }> {
       meta,
       path: existing?.path,
       filePaths: existing?.filePaths,
+      jumpChain: existing?.jumpChain,
       expiresAt: existing?.expiresAt,
     });
   }
@@ -142,7 +154,7 @@ class ResourceRegistry<TMeta extends { name: string }> {
    * Returns the list of written file paths. Does NOT compute a "main" path;
    * callers decide which file is primary (cluster picks `.kubeconfig`).
    */
-  setMaterialized(name: string, meta: TMeta, files: CredentialFile[], ttlMs: number): string[] {
+  setMaterialized(name: string, meta: TMeta, files: CredentialFile[], ttlMs: number, chain?: ChainHop[]): string[] {
     // Sanitize the credential name before it becomes part of a file path.
     // path.basename alone is not enough — ".." or slashes inside would still
     // land in <dir>/<..>.xxx. Strip anything that isn't a safe name char.
@@ -152,6 +164,38 @@ class ResourceRegistry<TMeta extends { name: string }> {
       return [];
     }
 
+    const paths = this.writeFiles(safeName, files);
+
+    // Materialize each bastion hop under an isolated per-hop prefix
+    // (<name>.hop<i>.<file>) so identically-named files (host.key/…) don't
+    // collide with the target's or each other. Kept OUT of filePaths so the
+    // target's file-suffix lookups in ssh-client never match a hop file;
+    // tracked for eviction via unlinkEntry. See jump-chain design §6.3.
+    let jumpChain: Array<{ meta: ChainHopMeta; filePaths: string[] }> | undefined;
+    if (chain && chain.length > 0) {
+      jumpChain = chain.map((hop, i) => ({
+        meta: hop.metadata,
+        filePaths: this.writeFiles(`${safeName}.hop${i}`, hop.files),
+      }));
+    }
+
+    const existing = this.map.get(name);
+    this.map.set(name, {
+      meta,
+      path: existing?.path, // caller may overwrite via setMainPath
+      filePaths: paths,
+      jumpChain,
+      expiresAt: Date.now() + ttlMs,
+    });
+    return paths;
+  }
+
+  /**
+   * Atomically write `files` under `<subdir>/<prefix>.<file>` with the
+   * registry's mode / shared-group policy. Returns the written paths. Shared by
+   * the target credential and each materialized jump_chain hop.
+   */
+  private writeFiles(prefix: string, files: CredentialFile[]): string[] {
     const sharedGid = this.opts.sharedGroup
       ? resolveGroupGid(this.opts.sharedGroup)
       : null;
@@ -160,7 +204,7 @@ class ResourceRegistry<TMeta extends { name: string }> {
 
     for (const file of files) {
       const safeFile = path.basename(file.name);
-      const filePath = path.join(this.subdirAbs, `${safeName}.${safeFile}`);
+      const filePath = path.join(this.subdirAbs, `${prefix}.${safeFile}`);
       // Defense-in-depth: ensure the resolved path is still under subdirAbs.
       const rel = path.relative(this.subdirAbs, filePath);
       if (rel.startsWith("..") || path.isAbsolute(rel)) {
@@ -182,14 +226,6 @@ class ResourceRegistry<TMeta extends { name: string }> {
       fs.renameSync(tmpPath, filePath);
       paths.push(filePath);
     }
-
-    const existing = this.map.get(name);
-    this.map.set(name, {
-      meta,
-      path: existing?.path, // caller may overwrite via setMainPath
-      filePaths: paths,
-      expiresAt: Date.now() + ttlMs,
-    });
     return paths;
   }
 
@@ -212,11 +248,12 @@ class ResourceRegistry<TMeta extends { name: string }> {
     const now = Date.now();
     for (const [key, entry] of this.map) {
       if (!entry.expiresAt || entry.expiresAt > now) continue;
-      this.unlinkFiles(entry.filePaths);
+      this.unlinkEntry(entry);
       this.map.set(key, {
         meta: entry.meta,
         path: undefined,
         filePaths: undefined,
+        jumpChain: undefined,
         expiresAt: undefined,
       });
     }
@@ -224,9 +261,17 @@ class ResourceRegistry<TMeta extends { name: string }> {
 
   dispose(): void {
     for (const entry of this.map.values()) {
-      this.unlinkFiles(entry.filePaths);
+      this.unlinkEntry(entry);
     }
     this.map.clear();
+  }
+
+  /** Unlink a credential's own files AND its materialized jump_chain hop files. */
+  private unlinkEntry(entry: LocalInfo<TMeta>): void {
+    this.unlinkFiles(entry.filePaths);
+    if (entry.jumpChain) {
+      for (const hop of entry.jumpChain) this.unlinkFiles(hop.filePaths);
+    }
   }
 
   private unlinkFiles(filePaths: string[] | undefined): void {
@@ -462,12 +507,16 @@ export class CredentialBroker {
     const cached = this.hosts.get(sourceId);
     const meta = mergeHostMeta(cached?.meta, response, sourceId);
     const ttlMs = (response.credential.ttl_seconds ?? 300) * 1000;
-    const filePaths = this.hosts.setMaterialized(response.credential.name, meta, response.credential.files, ttlMs);
+    const filePaths = this.hosts.setMaterialized(
+      response.credential.name, meta, response.credential.files, ttlMs,
+      response.credential.jump_chain,
+    );
     // Host has no "main path" concept (no sync consumer). filePaths are enough.
 
+    const hopCount = response.credential.jump_chain?.length ?? 0;
     console.log(
       `[credential-broker] acquired host "${response.credential.name}" ` +
-      `(ttl=${ttlMs / 1000}s, files=${filePaths.length})`,
+      `(ttl=${ttlMs / 1000}s, files=${filePaths.length}, jump_hops=${hopCount})`,
     );
     return response;
   }
@@ -486,8 +535,11 @@ export class CredentialBroker {
       && existing.expiresAt > Date.now()
       && (existingManaged || (existing.filePaths?.every((fp) => fs.existsSync(fp)) ?? false));
     if (existing && fresh) return existing;
-    await this.acquireHost(hostName, purpose);
-    const refreshed = this.hosts.get(hostName);
+    const response = await this.acquireHost(hostName, purpose);
+    // Registry is keyed by credential.name. When the caller's handle isn't the
+    // name (e.g. a host id), get(hostName) misses — fall back to the just-
+    // acquired response's name before failing. See jump-chain design §6.2.
+    const refreshed = this.hosts.get(hostName) ?? this.hosts.get(response.credential.name);
     if (!refreshed) {
       throw new Error(`Broker.ensureHost(${hostName}) completed but host not in registry`);
     }
@@ -601,9 +653,15 @@ function inferHostMetaFromResponse(response: CredentialResponse, fallbackName: s
     throw new Error(`Host "${name}" credential payload metadata.auth_type must be "password", "key", or "managed", got ${JSON.stringify(authType)}`);
   }
   // Managed hosts carry no key/password file (the key is sourced from the
-  // bastion at dial time); they require a jump_host instead.
-  if (authType === "managed" && (typeof metadata.jump_host !== "string" || metadata.jump_host.length === 0)) {
-    throw new Error(`Host "${name}" has auth_type="managed" but no metadata.jump_host`);
+  // bastion at dial time); they require a jump — satisfied by EITHER the
+  // server-pre-resolved jump_chain (new protocol) OR metadata.jump_host (legacy
+  // name-recursion). See jump-chain design §6.6.
+  if (authType === "managed") {
+    const hasChain = Array.isArray(response.credential.jump_chain) && response.credential.jump_chain.length > 0;
+    const hasJumpName = typeof metadata.jump_host === "string" && metadata.jump_host.length > 0;
+    if (!hasChain && !hasJumpName) {
+      throw new Error(`Host "${name}" has auth_type="managed" but no jump_chain or metadata.jump_host`);
+    }
   }
   if (typeof isProduction !== "boolean") {
     throw new Error(`Host "${name}" credential payload missing required metadata.is_production`);

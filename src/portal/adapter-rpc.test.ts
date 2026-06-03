@@ -516,17 +516,50 @@ describe("credential.get", () => {
     ]);
   });
 
-  it("returns a managed credential: auth_type=managed + jump_host, no key/password file", async () => {
+  it("returns a managed credential: auth_type=managed + jump_host + jump_chain, no key/password file", async () => {
     mockQuery(
       [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", password: null, private_key: null, passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
       [{ "1": 1 }],         // binding ok
-      [{ name: "bastion" }], // resolveJumpHostName
+      // walkJumpChainRows(b1): the sole bastion, chain ends (jump_host_id null)
+      [{ id: "b1", name: "bastion", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", password: null, private_key: "BKEY", passphrase: null, jump_host_id: null }],
     );
     const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
     expect(result.credential.type).toBe("ssh");
     expect(result.credential.metadata.auth_type).toBe("managed");
     expect(result.credential.metadata.jump_host).toBe("bastion");
     expect(result.credential.files).toEqual([]);
+    // Server-pre-resolved chain [outermost … nearest], target excluded, files materializable.
+    expect(result.credential.jump_chain).toEqual([
+      { name: "bastion", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "BKEY", mode: 0o600 }] },
+    ]);
+  });
+
+  it("emits a 2-hop jump_chain ordered [outermost … nearest] + dual-emits metadata.jump_host", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", password: null, private_key: "TK", passphrase: null, is_production: 1, description: null, jump_host_id: "b1" }],
+      [{ "1": 1 }], // binding ok
+      // walkJumpChainRows(b1): nearest bastion b1 → its jump b2
+      [{ id: "b1", name: "near", ip: "10.0.0.2", port: 22, username: "root", auth_type: "key", password: null, private_key: "B1K", passphrase: null, jump_host_id: "b2" }],
+      [{ id: "b2", name: "outer", ip: "10.0.0.1", port: 22, username: "root", auth_type: "password", password: "B2PW", private_key: null, passphrase: null, jump_host_id: null }],
+    );
+    const result = await getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1");
+    expect(result.credential.files).toEqual([{ name: "host.key", content: "TK", mode: 0o600 }]);
+    expect(result.credential.metadata.jump_host).toBe("near"); // nearest bastion name, for legacy fallback
+    expect(result.credential.jump_chain).toEqual([
+      { name: "outer", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "password" }, files: [{ name: "host.password", content: "B2PW" }] },
+      { name: "near", metadata: { ip: "10.0.0.2", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "B1K", mode: 0o600 }] },
+    ]);
+  });
+
+  it("fails closed when an explicit host's jump_host_id is dangling (no silent direct-connect)", async () => {
+    mockQuery(
+      [{ id: "t1", name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", password: null, private_key: "TK", passphrase: null, is_production: 1, description: null, jump_host_id: "missing" }],
+      [{ "1": 1 }], // binding ok
+      [],           // walkJumpChainRows("missing") → row not found
+    );
+    await expect(
+      getHandler("credential.get")({ source: "host", source_id: "target" }, "agent-1"),
+    ).rejects.toThrow(/not found in jump chain/);
   });
 
   it("authorizes a jump host transitively when the agent is bound to a host that uses it", async () => {

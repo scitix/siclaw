@@ -188,6 +188,26 @@ describe("acquireSshTarget", () => {
       .rejects.toThrow(/not loaded into broker registry/);
   });
 
+  it("resolves an id-handle via ensureHost's return, never re-looking-up by the handle", async () => {
+    // The registry is keyed by credential.name, so getHostLocalInfo(<id>) MISSES.
+    // ensureHost maps the id to the name-keyed entry (its §6.2 fallback) and returns
+    // it; acquireSshTarget must consume that return, not re-look-up by the id —
+    // otherwise the multi-tenant "ensureHost ok but not in registry" failure returns.
+    const info = {
+      meta: { name: "real-name", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false },
+      filePaths: ["/tmp/real-name.real-name.key"],
+    } as HostLocalInfo;
+    const broker = {
+      ensureHost: vi.fn(async () => info),       // id → resolved entry
+      getHostLocalInfo: vi.fn(() => undefined),  // id-handle would miss the name-keyed registry
+    } as unknown as CredentialBroker;
+    const t = await acquireSshTarget(broker, "host-id-123", "test");
+    expect(t.host).toBe("10.0.0.9");
+    expect(t.auth).toEqual({ type: "key", privateKeyPath: "/tmp/real-name.real-name.key" });
+    // The fix: we never re-look-up by the original handle.
+    expect((broker.getHostLocalInfo as any).mock.calls.length).toBe(0);
+  });
+
   it("throws when host has no materialized files", async () => {
     const broker = makeBrokerStub({
       meta: { name: "host-1", ip: "10.0.0.1", port: 22, username: "root", auth_type: "key", is_production: false },
@@ -299,6 +319,62 @@ describe("acquireSshTarget", () => {
   it("throws when a managed host has no jump host", async () => {
     const broker = makeMultiBrokerStub({ target: managedInfo("target", "10.0.0.9") });
     await expect(acquireSshTarget(broker, "target", "test")).rejects.toThrow(/requires a jump host/);
+  });
+
+  // ── jump_chain (server-pre-resolved) ────────────────────────────────
+
+  it("consumes a server-pre-resolved jumpChain into nested jumpHost, no recursion", async () => {
+    const info = {
+      meta: { name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false },
+      filePaths: ["/tmp/target.target.key"],
+      jumpChain: [
+        // [outermost … nearest]
+        { meta: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, filePaths: ["/tmp/target.hop0.host.key"] },
+        { meta: { ip: "10.0.0.2", port: 2222, username: "ops", auth_type: "password" }, filePaths: ["/tmp/target.hop1.host.password"] },
+      ],
+    } as HostLocalInfo;
+    const broker = makeBrokerStub(info);
+    const t = await acquireSshTarget(broker, "target", "test");
+    // target → nearest (hop1) → outermost (hop0) → undefined
+    expect(t.host).toBe("10.0.0.9");
+    expect(t.jumpHost?.host).toBe("10.0.0.2");
+    expect(t.jumpHost?.auth).toEqual({ type: "password", passwordPath: "/tmp/target.hop1.host.password" });
+    expect(t.jumpHost?.jumpHost?.host).toBe("10.0.0.1");
+    expect(t.jumpHost?.jumpHost?.auth).toEqual({ type: "key", privateKeyPath: "/tmp/target.hop0.host.key" });
+    expect(t.jumpHost?.jumpHost?.jumpHost).toBeUndefined();
+    // No per-hop recursion: ensureHost (the credential fetch) is called exactly
+    // once (the target); the chain hops are consumed from its return, not re-fetched.
+    expect((broker.ensureHost as any).mock.calls.length).toBe(1);
+  });
+
+  it("prefers jumpChain over a (stale) meta.jump_host — never recurses on the name", async () => {
+    const info = {
+      meta: { name: "target", ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false, jump_host: "stale-bastion" },
+      filePaths: ["/tmp/target.target.key"],
+      jumpChain: [
+        { meta: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, filePaths: ["/tmp/target.hop0.host.key"] },
+      ],
+    } as HostLocalInfo;
+    // Single-host stub: if it recursed on "stale-bastion" it would throw "not loaded".
+    const broker = makeBrokerStub(info);
+    const t = await acquireSshTarget(broker, "target", "test");
+    expect(t.jumpHost?.host).toBe("10.0.0.1");
+    expect(t.jumpHost?.jumpHost).toBeUndefined();
+  });
+
+  it("builds a managed target from a jumpChain alone (no meta.jump_host)", async () => {
+    const info = {
+      meta: { name: "target", ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", is_production: false },
+      filePaths: [],
+      jumpChain: [
+        { meta: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, filePaths: ["/tmp/target.hop0.host.key"] },
+      ],
+    } as HostLocalInfo;
+    const broker = makeBrokerStub(info);
+    const t = await acquireSshTarget(broker, "target", "test");
+    expect(t.auth).toEqual({ type: "managed" });
+    expect(t.jumpHost?.host).toBe("10.0.0.1");
+    expect(t.jumpHost?.auth).toEqual({ type: "key", privateKeyPath: "/tmp/target.hop0.host.key" });
   });
 });
 

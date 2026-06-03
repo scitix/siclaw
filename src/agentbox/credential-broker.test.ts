@@ -164,7 +164,79 @@ describe("CredentialBroker — host pipeline", () => {
         ttl_seconds: 300,
       },
     });
-    await expect(broker.acquireHost("bad-managed", "test")).rejects.toThrow(/managed.*no metadata\.jump_host/);
+    await expect(broker.acquireHost("bad-managed", "test")).rejects.toThrow(/managed.*no jump_chain or metadata\.jump_host/);
+  });
+
+  it("acquireHost materializes a jump_chain under isolated per-hop paths + records jumpChain (kept out of filePaths)", async () => {
+    transport.hostPayloads.set("target", {
+      credential: {
+        name: "target",
+        type: "ssh",
+        files: [{ name: "host.key", content: "TARGET_KEY", mode: 0o600 }],
+        metadata: { ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false, jump_host: "nearest" },
+        jump_chain: [
+          { name: "outer", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "OUTER_KEY", mode: 0o600 }] },
+          { name: "nearest", metadata: { ip: "10.0.0.2", port: 22, username: "ops", auth_type: "password" }, files: [{ name: "host.password", content: "NEAR_PW" }] },
+        ],
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireHost("target", "test");
+    const info = broker.getHostLocalInfo("target")!;
+    // The target's OWN files only — hop files must NOT leak into filePaths (so
+    // ssh-client's suffix lookup can't match a hop file).
+    expect(info.filePaths).toEqual([path.join(dir, "hosts", "target.host.key")]);
+    // Structured chain [outermost … nearest] with isolated per-hop paths.
+    expect(info.jumpChain).toEqual([
+      { meta: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, filePaths: [path.join(dir, "hosts", "target.hop0.host.key")] },
+      { meta: { ip: "10.0.0.2", port: 22, username: "ops", auth_type: "password" }, filePaths: [path.join(dir, "hosts", "target.hop1.host.password")] },
+    ]);
+    expect(fs.readFileSync(path.join(dir, "hosts", "target.hop0.host.key"), "utf-8")).toBe("OUTER_KEY");
+    expect(fs.readFileSync(path.join(dir, "hosts", "target.hop1.host.password"), "utf-8")).toBe("NEAR_PW");
+  });
+
+  it("dispose unlinks jump_chain hop files as well as the target's own", async () => {
+    transport.hostPayloads.set("t2", {
+      credential: {
+        name: "t2", type: "ssh",
+        files: [{ name: "host.key", content: "K", mode: 0o600 }],
+        metadata: { ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false, jump_host: "b" },
+        jump_chain: [{ name: "b", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "BK", mode: 0o600 }] }],
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireHost("t2", "test");
+    const hop = path.join(dir, "hosts", "t2.hop0.host.key");
+    expect(fs.existsSync(hop)).toBe(true);
+    broker.dispose();
+    expect(fs.existsSync(hop)).toBe(false);
+  });
+
+  it("acquireHost accepts a managed target carried by jump_chain (no metadata.jump_host)", async () => {
+    transport.hostPayloads.set("m1", {
+      credential: {
+        name: "m1", type: "ssh", files: [],
+        metadata: { ip: "10.0.0.9", port: 22, username: "ops", auth_type: "managed", is_production: false }, // no jump_host
+        jump_chain: [{ name: "b", metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" }, files: [{ name: "host.key", content: "BK", mode: 0o600 }] }],
+        ttl_seconds: 300,
+      },
+    });
+    await broker.acquireHost("m1", "test");
+    expect(broker.getHostLocalInfo("m1")?.meta.auth_type).toBe("managed");
+    expect(broker.getHostLocalInfo("m1")?.jumpChain?.length).toBe(1);
+  });
+
+  it("ensureHost falls back to credential.name when the request handle differs (e.g. an id)", async () => {
+    transport.hostPayloads.set("host-id-123", {
+      credential: {
+        name: "real-name", type: "ssh",
+        files: [{ name: "host.key", content: "K", mode: 0o600 }],
+        metadata: { ip: "10.0.0.9", port: 22, username: "root", auth_type: "key", is_production: false },
+        ttl_seconds: 300,
+      },
+    });
+    const info = await broker.ensureHost("host-id-123", "test");
+    expect(info.meta.name).toBe("real-name");
   });
 
   it("acquireHost (password) writes <name>.password", async () => {

@@ -3,9 +3,10 @@
  *
  * Two responsibilities:
  *   1. acquireSshTarget: drive the CredentialBroker to materialize a host's
- *      credential file(s), then assemble an SshTarget — recursively following
- *      `meta.jump_host` to build a ProxyJump chain (depth capped at 3, with a
- *      cycle guard).
+ *      credential file(s), then assemble an SshTarget. When the broker entry
+ *      carries a server-pre-resolved `jumpChain`, nest it directly (no
+ *      recursion); otherwise fall back to recursively following the legacy
+ *      `meta.jump_host` name (depth capped at 3, with a cycle guard).
  *   2. sshExec: resolve the target (+ its jump chain) to inline hops and run a
  *      single command on the final host via ssh-dial's dialSshChain + runCommand.
  *
@@ -21,6 +22,7 @@
 
 import { promises as fsp } from "node:fs";
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";
+import type { ChainHopMeta } from "../../shared/credential-types.js";
 import { ensureHostForTool } from "./ensure-kubeconfigs.js";
 import {
   dialSshChain,
@@ -57,8 +59,9 @@ export type SshExecOptions = SshRunOptions;
 
 /**
  * Drive the broker to ensure host credentials are on disk, then assemble an
- * SshTarget. If the host's metadata names a `jump_host`, recurse to acquire the
- * bastion and attach it as `target.jumpHost` (depth ≤ 3, cycle-guarded). Throws
+ * SshTarget. If the broker entry carries a pre-resolved `jumpChain`, attach it
+ * as the `target.jumpHost` nest directly; else, if the metadata names a legacy
+ * `jump_host`, recurse to acquire the bastion (depth ≤ 3, cycle-guarded). Throws
  * with an actionable message if a host is not bound or not materialized.
  */
 export async function acquireSshTarget(
@@ -86,22 +89,29 @@ async function acquireSshTargetInner(
     throw new Error(`Jump-host chain for "${hostName}" exceeds max depth ${MAX_JUMP_DEPTH}`);
   }
 
-  await ensureHostForTool(broker, hostName, purpose);
-
-  const info = broker.getHostLocalInfo(hostName);
+  // ensureHost resolves the handle (a host name OR an id) to its registry entry
+  // and returns it directly. Don't re-look-up by the original handle — the
+  // registry is keyed by credential.name, so a host-id handle would miss here
+  // even though ensureHost succeeded (its id→name fallback lives inside ensureHost).
+  const info = await ensureHostForTool(broker, hostName, purpose);
   if (!info) {
     throw new Error(`Host "${hostName}" not loaded into broker registry after ensureHost`);
   }
 
   const meta = info.meta;
   const filePaths = info.filePaths ?? [];
+  // New protocol: the server may pre-resolve the whole bastion chain. When
+  // present we consume it directly (no per-hop credential.get recursion);
+  // otherwise we fall back to recursing on meta.jump_host (legacy).
+  const chain = info.jumpChain;
 
   let auth: SshTarget["auth"];
   if (meta.auth_type === "managed") {
     // Managed hosts store no key/password of their own — the key is sourced
-    // from the bastion at dial time, so they require a jump host and may have
-    // zero materialized files (or just a .passphrase for the bastion key).
-    if (!meta.jump_host) {
+    // from the bastion at dial time, so they require a jump (via jump_chain or
+    // the legacy jump_host) and may have zero materialized files (or just a
+    // .passphrase for the bastion key).
+    if (!(chain && chain.length > 0) && !meta.jump_host) {
       throw new Error(`Managed host "${hostName}" requires a jump host`);
     }
     const passphrasePath = filePaths.find((p) => p.endsWith(".passphrase"));
@@ -125,13 +135,54 @@ async function acquireSshTargetInner(
 
   const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth };
 
-  if (meta.jump_host) {
+  if (chain && chain.length > 0) {
+    // Server pre-resolved the chain [outermost … nearest]. Nest it onto the
+    // target: target.jumpHost = nearest bastion, whose .jumpHost chains outward
+    // to the outermost (directly-reachable) bastion. No recursion, no per-hop
+    // credential.get. See docs/design/ssh-jump-host.md §6.1.
+    let jh: SshTarget | undefined;
+    for (const hop of chain) {
+      const t = chainHopToTarget(hop, hostName);
+      t.jumpHost = jh;
+      jh = t;
+    }
+    target.jumpHost = jh;
+  } else if (meta.jump_host) {
+    // Legacy fallback: recurse by bastion NAME (depth- and cycle-guarded).
     const nextVisited = new Set(visited);
     nextVisited.add(hostName);
     target.jumpHost = await acquireSshTargetInner(broker, meta.jump_host, purpose, nextVisited, depth + 1);
   }
 
   return target;
+}
+
+/**
+ * Build an SshTarget for one materialized jump_chain hop. A bastion is always
+ * explicit (key/password) — never managed (jump-chain invariant ③) — and reads
+ * its OWN materialized files by suffix (kept isolated from the target's files).
+ */
+function chainHopToTarget(
+  hop: { meta: ChainHopMeta; filePaths: string[] },
+  targetName: string,
+): SshTarget {
+  const fps = hop.filePaths ?? [];
+  let auth: SshTarget["auth"];
+  if (hop.meta.auth_type === "key") {
+    const privateKeyPath = fps.find((p) => p.endsWith(".key"));
+    if (!privateKeyPath) {
+      throw new Error(`Jump hop ${hop.meta.ip} for "${targetName}" has no materialized key file`);
+    }
+    const passphrasePath = fps.find((p) => p.endsWith(".passphrase"));
+    auth = { type: "key", privateKeyPath, ...(passphrasePath ? { passphrasePath } : {}) };
+  } else {
+    const passwordPath = fps.find((p) => p.endsWith(".password"));
+    if (!passwordPath) {
+      throw new Error(`Jump hop ${hop.meta.ip} for "${targetName}" has no materialized password file`);
+    }
+    auth = { type: "password", passwordPath };
+  }
+  return { host: hop.meta.ip, port: hop.meta.port, username: hop.meta.username, auth };
 }
 
 // ── sshExec ─────────────────────────────────────────────────────────

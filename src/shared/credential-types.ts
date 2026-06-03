@@ -61,12 +61,39 @@ export interface CredentialFile {
   mode?: number;
 }
 
+/**
+ * One bastion hop on a server-pre-resolved jump chain. A bastion is always
+ * "explicit" (key/password) — never "managed" — so auth_type excludes it.
+ * See docs/design/ssh-jump-host.md §3.2 / §4 invariant ③.
+ */
+export interface ChainHopMeta {
+  ip: string;
+  port: number;
+  username: string;
+  auth_type: "password" | "key";
+}
+
+export interface ChainHop {
+  /** Bastion name — diagnostics only; the chain is resolved server-side by id. */
+  name?: string;
+  metadata: ChainHopMeta;
+  /** This hop's own host.key / host.password / host.passphrase. */
+  files: CredentialFile[];
+}
+
 export interface CredentialPayload {
   credential: {
     name: string;
     type: "kubeconfig" | "ssh";
     files: CredentialFile[];
     metadata?: Record<string, unknown>;
+    /**
+     * Server-pre-resolved bastion chain, ordered [outermost … nearest-to-target].
+     * Dial order is `jump_chain ++ [target]`. Absent/empty = direct connect.
+     * The Runtime consumes this directly (no per-hop credential.get recursion).
+     * See docs/design/ssh-jump-host.md §3.
+     */
+    jump_chain?: ChainHop[];
     ttl_seconds?: number;
   };
   audit_id?: string;

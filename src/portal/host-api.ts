@@ -15,6 +15,7 @@ import {
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 import { dialSshChain, runCommand, type DialHop } from "../tools/infra/ssh-dial.js";
+import type { ChainHop, CredentialFile } from "../shared/credential-types.js";
 
 /** Column list that excludes sensitive fields (password / private_key / passphrase). */
 const SAFE_COLUMNS = "id, name, ip, port, username, auth_type, description, is_production, jump_host_id, created_at, updated_at";
@@ -53,6 +54,7 @@ export async function validateJumpChain(db: Db, hostId: string, jumpHostId: stri
 
 interface ChainHostRow {
   id: string;
+  name: string;
   ip: string;
   port: number;
   username: string;
@@ -61,6 +63,42 @@ interface ChainHostRow {
   private_key: string | null;
   passphrase: string | null;
   jump_host_id: string | null;
+}
+
+/**
+ * Walk a host's jump_host_id chain by FK, returning rows ordered
+ * [outermost bastion, …, startId]. Throws on over-depth, cycle, or dangling
+ * reference. Shared by the dial path (`resolveHostDialChain`) and the adapter's
+ * jump_chain emission (`chainHopFromRow`). Exported for reuse + tests.
+ */
+export async function walkJumpChainRows(db: Db, startId: string): Promise<ChainHostRow[]> {
+  const fromStart: ChainHostRow[] = [];
+  const seen = new Set<string>();
+  let cur: string | null = startId;
+  for (let d = 0; cur; d++) {
+    // `>=`, not `>`: d counts bastions starting at 0, so MAX_JUMP_DEPTH=3 admits
+    // d=0,1,2 (three bastions) and rejects the fourth — matching validateJumpChain's
+    // write-time cap. `>` would emit a 4-bastion chain that the write path forbids
+    // (e.g. from legacy rows, a migration, or a direct DB write), breaking fail-closed.
+    if (d >= MAX_JUMP_DEPTH) {
+      throw new Error(`Jump-host chain exceeds max depth ${MAX_JUMP_DEPTH}`);
+    }
+    if (seen.has(cur)) {
+      throw new Error("Jump-host chain forms a cycle");
+    }
+    seen.add(cur);
+    const [rows] = (await db.query(
+      "SELECT id, name, ip, port, username, auth_type, password, private_key, passphrase, jump_host_id FROM hosts WHERE id = ?",
+      [cur],
+    )) as any;
+    if (rows.length === 0) {
+      throw new Error(`Host ${cur} not found in jump chain`);
+    }
+    const h = rows[0] as ChainHostRow;
+    fromStart.push(h);
+    cur = h.jump_host_id ?? null;
+  }
+  return fromStart.reverse();
 }
 
 function hopFromDbRow(h: ChainHostRow): DialHop {
@@ -86,35 +124,45 @@ function hopFromDbRow(h: ChainHostRow): DialHop {
 }
 
 /**
+ * Project a bastion row into a credential `ChainHop` (metadata + materializable
+ * files). Enforces jump-chain invariants ③ (a bastion is never "managed") and
+ * ④ (a bastion must carry its own credential). Exported for the adapter's
+ * jump_chain emission. See docs/design/ssh-jump-host.md §3.2 / §4.
+ */
+export function chainHopFromRow(h: ChainHostRow): ChainHop {
+  if (h.auth_type === "managed") {
+    throw new Error(`Jump host "${h.name}" is auth_type="managed" — a bastion cannot be managed`);
+  }
+  const files: CredentialFile[] = [];
+  if (h.auth_type === "key") {
+    if (!h.private_key) {
+      throw new Error(`Jump host "${h.name}" has auth_type="key" but no credential configured`);
+    }
+    files.push({ name: "host.key", content: h.private_key, mode: 0o600 });
+    if (h.passphrase) files.push({ name: "host.passphrase", content: h.passphrase, mode: 0o600 });
+  } else if (h.auth_type === "password") {
+    if (!h.password) {
+      throw new Error(`Jump host "${h.name}" has auth_type="password" but no credential configured`);
+    }
+    files.push({ name: "host.password", content: h.password });
+  } else {
+    throw new Error(`Jump host "${h.name}" has unknown auth_type=${JSON.stringify(h.auth_type)}`);
+  }
+  return {
+    name: h.name,
+    metadata: { ip: h.ip, port: h.port, username: h.username, auth_type: h.auth_type as "password" | "key" },
+    files,
+  };
+}
+
+/**
  * Resolve a host's full ProxyJump chain (reading plaintext secrets straight
  * from the DB — Portal has no broker) into the ordered hop list dialSshChain
  * expects: [outermost bastion, …, final target]. Throws on cycle, over-depth,
  * dangling reference, or empty credential material.
  */
 async function resolveHostDialChain(db: Db, startId: string): Promise<DialHop[]> {
-  const targetFirst: DialHop[] = [];
-  const seen = new Set<string>();
-  let cur: string | null = startId;
-  for (let d = 0; cur; d++) {
-    if (d > MAX_JUMP_DEPTH) {
-      throw new Error(`Jump-host chain exceeds max depth ${MAX_JUMP_DEPTH}`);
-    }
-    if (seen.has(cur)) {
-      throw new Error("Jump-host chain forms a cycle");
-    }
-    seen.add(cur);
-    const [rows] = (await db.query(
-      "SELECT id, ip, port, username, auth_type, password, private_key, passphrase, jump_host_id FROM hosts WHERE id = ?",
-      [cur],
-    )) as any;
-    if (rows.length === 0) {
-      throw new Error(`Host ${cur} not found in jump chain`);
-    }
-    const h = rows[0] as ChainHostRow;
-    targetFirst.push(hopFromDbRow(h));
-    cur = h.jump_host_id ?? null;
-  }
-  return targetFirst.reverse();
+  return (await walkJumpChainRows(db, startId)).map(hopFromDbRow);
 }
 
 interface HostFormBody {

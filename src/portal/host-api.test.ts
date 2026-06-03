@@ -19,7 +19,7 @@ vi.mock("../tools/infra/ssh-dial.js", () => ({
 import { getDb } from "../gateway/db.js";
 import { createRestRouter } from "../gateway/rest-router.js";
 import { signToken } from "./auth.js";
-import { registerHostRoutes, validateJumpChain } from "./host-api.js";
+import { registerHostRoutes, validateJumpChain, walkJumpChainRows, chainHopFromRow } from "./host-api.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
 const JWT_SECRET = "test-host-secret";
@@ -383,5 +383,75 @@ describe("registerHostRoutes", () => {
     it("accepts a valid short chain", async () => {
       await expect(validateJumpChain(chainDb({ b: "c", c: null }), "a", "b")).resolves.toBeUndefined();
     });
+  });
+});
+
+describe("walkJumpChainRows (resolve-time depth cap — P2)", () => {
+  // Fake db returning full host rows; each id maps to its jump_host_id.
+  const rowDb = (chain: Record<string, string | null>): any => ({
+    query: vi.fn(async (_sql: string, args: any[]) => {
+      const id = args[0] as string;
+      if (!(id in chain)) return [[], []];
+      return [[{
+        id, name: id, ip: "10.0.0.1", port: 22, username: "root",
+        auth_type: "key", password: null, private_key: "PK", passphrase: null,
+        jump_host_id: chain[id],
+      }], []];
+    }),
+  });
+
+  it("rejects a 4-bastion chain — matching validateJumpChain's write-time cap", async () => {
+    // b1 → b2 → b3 → b4: four bastions. The off-by-one (`d > MAX`) used to emit this;
+    // the fix (`d >= MAX`) fails it closed before the fourth, like the writer rejects it.
+    await expect(walkJumpChainRows(rowDb({ b1: "b2", b2: "b3", b3: "b4" }), "b1"))
+      .rejects.toThrow(/exceeds max depth/);
+  });
+
+  it("accepts a 3-bastion chain, ordered [outermost … nearest]", async () => {
+    const rows = await walkJumpChainRows(rowDb({ b1: "b2", b2: "b3", b3: null }), "b1");
+    expect(rows.map((r) => r.id)).toEqual(["b3", "b2", "b1"]); // startId b1 (nearest) ends up last
+  });
+
+  it("fails closed on a cycle and on a dangling reference", async () => {
+    await expect(walkJumpChainRows(rowDb({ b1: "b2", b2: "b1" }), "b1")).rejects.toThrow(/cycle/);
+    await expect(walkJumpChainRows(rowDb({}), "ghost")).rejects.toThrow(/not found in jump chain/);
+  });
+});
+
+describe("chainHopFromRow (bastion → credential ChainHop)", () => {
+  const base = { id: "b1", name: "bastion", ip: "10.0.0.1", port: 22, username: "root", jump_host_id: null } as any;
+
+  it("projects a key bastion into metadata + host.key file", () => {
+    const hop = chainHopFromRow({ ...base, auth_type: "key", private_key: "PK", password: null, passphrase: null });
+    expect(hop).toEqual({
+      name: "bastion",
+      metadata: { ip: "10.0.0.1", port: 22, username: "root", auth_type: "key" },
+      files: [{ name: "host.key", content: "PK", mode: 0o600 }],
+    });
+  });
+
+  it("includes host.passphrase for an encrypted key bastion", () => {
+    const hop = chainHopFromRow({ ...base, auth_type: "key", private_key: "PK", password: null, passphrase: "PP" });
+    expect(hop.files).toEqual([
+      { name: "host.key", content: "PK", mode: 0o600 },
+      { name: "host.passphrase", content: "PP", mode: 0o600 },
+    ]);
+  });
+
+  it("projects a password bastion into a host.password file", () => {
+    const hop = chainHopFromRow({ ...base, auth_type: "password", private_key: null, password: "PW", passphrase: null });
+    expect(hop.files).toEqual([{ name: "host.password", content: "PW" }]);
+  });
+
+  it("invariant ③: a managed bastion fails closed", () => {
+    expect(() => chainHopFromRow({ ...base, auth_type: "managed", private_key: null, password: null, passphrase: null }))
+      .toThrow(/bastion cannot be managed/);
+  });
+
+  it("invariant ④: a credential-less bastion fails closed", () => {
+    expect(() => chainHopFromRow({ ...base, auth_type: "key", private_key: null, password: null, passphrase: null }))
+      .toThrow(/no credential configured/);
+    expect(() => chainHopFromRow({ ...base, auth_type: "password", private_key: null, password: null, passphrase: null }))
+      .toThrow(/no credential configured/);
   });
 });
