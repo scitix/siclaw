@@ -72,9 +72,14 @@ Concrete tool invocations with realistic parameters.
 | Tool | Runs where | When to use |
 |------|-----------|-------------|
 | `local_script` | AgentBox (local) | kubectl commands from outside the cluster — **most common** |
-| `node_script` | K8s node (host) | Needs host tools, /proc, /sys, devices, nsenter |
+| `host_script` | A host via SSH | Host-level tools on a node reachable via SSH. **Preferred over `node_script`** — runs over SSH with no debug pod (lighter, leaves the node untouched) |
+| `node_script` | K8s node (host) | Host tools, /proc, /sys, devices, nsenter. The **fallback** when the node is not an SSH host, or whenever a pod's `netns` is needed |
 | `pod_script` | Inside a pod | Diagnostics inside a running container |
 | `node_script` + `netns` | Node + pod's network ns | Host tools + pod's network view (call `resolve_pod_netns` first) |
+
+**Host vs node for host-level skills.** `host_script` and `node_script` take the **same** `skill`/`script`/`args` — only the target differs (`host="<id>"` vs `node="<name>"`). For a host-level skill, write the `## Tool` line as `host_script` (preferred) / `node_script` (fallback) and keep the Examples in one form — the agent picks the right tool at runtime based on `host_list`. Do **not** duplicate every example across both tools.
+
+**Exception — pod's netns cannot degrade to host.** A skill that enters a pod's network namespace uses `node_script` + `netns` (a privileged debug pod with `nsenter`). `host_script` has no `netns` path, so these skills **must** stay on `node_script` — never offer a `host_script` form for them.
 
 ## Best Practices
 
@@ -90,6 +95,7 @@ Concrete tool invocations with realistic parameters.
 
 - **Too much raw output** — dump kubectl describe without filtering. Grep for relevant lines
 - **Missing Tool section** — without it, the agent doesn't know which execution tool to use
-- **Wrong execution mode** — using `local_script` for host-level tools (use `node_script`)
+- **Wrong execution mode** — using `local_script` for host-level tools (use `host_script`/`node_script`)
+- **Forcing `node_script` for host-level skills** — prefer `host_script` (SSH, no debug pod); fall back to `node_script`. Exception: pod-`netns` skills must stay on `node_script`
 - **Hardcoded values** — node names, namespaces should be parameters
 - **No severity guidance** — e.g., CRC errors: 0 = normal, 1-100 = minor, >1000 = critical

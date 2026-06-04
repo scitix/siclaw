@@ -3,16 +3,18 @@ name: node-ping-gateway
 description: >-
   Ping a node's gateway for a given network interface.
   Auto-detects gateway IP from the routing table, then pings it.
-  Execute via node_script tool.
+  Run via host_script (preferred) or node_script.
 ---
 
 # Node Ping Gateway
 
 ## Tool
 
-Use the `node_script` tool to run this skill:
+Prefer `host_script` when the node is a bound SSH host (check `host_list`) — it runs over
+SSH with no debug pod. Fall back to `node_script` otherwise. Both take the same `skill`/`script`/`args`.
 
 ```
+host_script: host="<host>", skill="node-ping-gateway", script="ping-node-gateway.sh", args="<args>"
 node_script: node="<node>", skill="node-ping-gateway", script="ping-node-gateway.sh", args="<args>"
 ```
 

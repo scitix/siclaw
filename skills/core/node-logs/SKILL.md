@@ -4,16 +4,18 @@ description: >-
   Retrieve logs from a Kubernetes node.
   Supports journalctl (systemd units) and file-based logs.
   Use when you need to inspect node-level logs (containerd, kubelet, etc.).
-  Execute via node_script tool.
+  Run via host_script (preferred) or node_script.
 ---
 
 # Node Logs
 
 ## Tool
 
-Use the `node_script` tool to run this skill:
+Prefer `host_script` when the node is a bound SSH host (check `host_list`) — it runs over
+SSH with no debug pod. Fall back to `node_script` otherwise. Both take the same `skill`/`script`/`args`.
 
 ```
+host_script: host="<host>", skill="node-logs", script="get-node-logs.sh", args="<args>"
 node_script: node="<node>", skill="node-logs", script="get-node-logs.sh", args="<args>"
 ```
 

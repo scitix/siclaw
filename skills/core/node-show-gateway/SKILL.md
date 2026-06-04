@@ -2,16 +2,18 @@
 name: node-show-gateway
 description: >-
   Show the gateway for a network interface on a Kubernetes node.
-  Runs `ip -j route` on the host via node_script tool.
+  Runs `ip -j route` on the host. Run via host_script (preferred) or node_script.
 ---
 
 # Node Show Gateway
 
 ## Tool
 
-Use the `node_script` tool to run this skill:
+Prefer `host_script` when the node is a bound SSH host (check `host_list`) — it runs over
+SSH with no debug pod. Fall back to `node_script` otherwise. Both take the same `skill`/`script`/`args`.
 
 ```
+host_script: host="<host>", skill="node-show-gateway", script="show-node-gateway.sh", args="<args>"
 node_script: node="<node>", skill="node-show-gateway", script="show-node-gateway.sh", args="<args>"
 ```
 
