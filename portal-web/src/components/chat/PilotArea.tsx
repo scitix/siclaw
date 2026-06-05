@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect, Fragment } from "react"
+import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
 import type { KeyboardEvent } from "react"
 import { formatToolInput } from "../../hooks/usePilotChat"
 import {
@@ -20,13 +20,25 @@ import {
   ArrowRight,
   PencilLine,
   FileText,
+  ListChecks,
+  Square,
+  X,
+  Download,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
-import { tryParseChartSpec } from "./ChartRenderer"
-import { validateMermaidSource } from "./MermaidRenderer"
-import { svgToPngDataUrl } from "./svg-export"
-import { useCopyFeedback } from "./clipboard"
+import { useCopyFeedback, copyTextToClipboard } from "./clipboard"
+import { copyElementsAsRichText, buildCopyHtml } from "./rich-copy"
+import { downloadBlob } from "./svg-export"
+import { serializeMessagesToText, serializeMessagesToMarkdown, stripVisualizationFences, stripImageData } from "./transcript"
+import {
+  EMPTY_SELECTION,
+  selectVisible,
+  toggleMessage,
+  selectAll as selectAllMessages,
+  selectedIds as computeSelectedIds,
+  type SelectionState,
+} from "./selection-model"
 import { InputArea } from "./InputArea"
 import { ImageAttachmentPreview } from "./ImageAttachmentPreview"
 import { SkillCard } from "./SkillCard"
@@ -34,6 +46,33 @@ import { ScheduleCard } from "./ScheduleCard"
 import { ErrorBubble } from "./ErrorBubble"
 import { stripAttachmentOcrEvidence } from "./user-message-text"
 import type { ChatAttachment, PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
+
+// Wrap copy-ready message HTML in a minimal self-contained document for the
+// Markdown-export's companion .html file. Charts are inline PNG <img>, which
+// browsers always render (unlike data: images in many Markdown viewers).
+function wrapChatHtml(inner: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Siclaw chat export</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; color: #1a1a1a; }
+  img { max-width: 100%; height: auto; }
+  pre { background: #f4f4f5; padding: .75rem 1rem; border-radius: 8px; overflow-x: auto; }
+  code { background: #f0f0f1; padding: .1rem .3rem; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; margin: .5rem 0; }
+  th, td { border: 1px solid #ddd; padding: .4rem .7rem; }
+  blockquote { border-left: 3px solid #ddd; margin: .5rem 0; padding-left: 1rem; color: #555; }
+  hr { border: none; border-top: 1px solid #e5e5e5; margin: 1.5rem 0; }
+</style>
+</head>
+<body>${inner}</body>
+</html>
+`
+}
 
 /**
  * Format a millisecond duration into a compact human-readable string.
@@ -71,7 +110,7 @@ function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
   const total = combinedModelMs(timing)
   if (total == null) return null
   return (
-    <span className="text-xs text-muted-foreground/70 tabular-nums select-text cursor-text">
+    <span data-copy-ignore className="text-xs text-muted-foreground/70 tabular-nums select-text cursor-text">
       thinking {formatTimingMs(total)}
     </span>
   )
@@ -293,6 +332,9 @@ export function PilotArea({
       .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
   }, [messages, isLoading, dpActive])
   const renderMessages = useMemo(() => withDelegationStatusNotices(messages), [messages])
+  // The exact list rendered as rows, in order. Scroll-selection indexes into
+  // this same list, so a row's data-msg-idx always maps back to the right message.
+  const selectableMessages = useMemo(() => renderMessages.filter((m) => !m.hidden), [renderMessages])
   const latestEditableUserMessageId = useMemo(() => {
     for (let i = renderMessages.length - 1; i >= 0; i--) {
       const message = renderMessages[i]
@@ -326,8 +368,114 @@ export function PilotArea({
     setEditingDraft("")
   }, [editingDraft, isLoading, wrappedSendMessage])
 
+  // --- Scroll-to-select copy ---
+  // Click a message to anchor, scroll to paint a contiguous band over the
+  // messages you pass, fine-tune with checkboxes, then copy the lot (images and
+  // all). See selection-model.ts for the pure state rules.
+  const [selectMode, setSelectMode] = useState(false)
+  const [selection, setSelection] = useState<SelectionState>(EMPTY_SELECTION)
+  const selectModeRef = useRef(false)
+  const [selectionCopied, , flashSelectionCopied] = useCopyFeedback()
+  useEffect(() => {
+    selectModeRef.current = selectMode
+  }, [selectMode])
+  // Drop any in-progress selection when the session changes.
+  useEffect(() => {
+    setSelectMode(false)
+    setSelection(EMPTY_SELECTION)
+  }, [sessionKey])
+
+  const enterSelectMode = useCallback(() => {
+    setSelection(EMPTY_SELECTION)
+    setSelectMode(true)
+  }, [])
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false)
+    setSelection(EMPTY_SELECTION)
+  }, [])
+  const handleToggleMessage = useCallback((id: string) => {
+    setSelection((s) => toggleMessage(s, id))
+  }, [])
+
+  // Scroll-to-select via IntersectionObserver: while in select mode, every
+  // message row that enters the viewport is auto-checked (accumulating, either
+  // scroll direction). The observer fires only on actual visibility changes —
+  // no per-scroll-event layout scans of the whole list — and its initial
+  // callback covers whatever is already on screen when select mode turns on.
+  useEffect(() => {
+    if (!selectMode) return
+    const container = scrollContainerRef.current
+    if (!container) return
+    const visible = new Set<string>()
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).getAttribute("data-msg-id")
+          if (!id) continue
+          if (entry.isIntersecting) visible.add(id)
+          else visible.delete(id)
+        }
+        setSelection((s) => selectVisible(s, [...visible]))
+      },
+      { root: container, threshold: 0 },
+    )
+    container.querySelectorAll<HTMLElement>("[data-msg-id]").forEach((row) => io.observe(row))
+    return () => io.disconnect()
+    // Re-observe when the rendered list changes so new rows are tracked too.
+  }, [selectMode, selectableMessages])
+
+  const selectedIdSet = useMemo(() => computeSelectedIds(selection), [selection])
+  const selectedCount = selectedIdSet.size
+
+  const copySelection = useCallback(async () => {
+    if (selectedIdSet.size === 0) return
+    const selected = selectableMessages.filter((m) => selectedIdSet.has(m.id))
+    const plain = serializeMessagesToText(selected)
+    const container = scrollContainerRef.current
+    let ok = false
+    if (container) {
+      const els = Array.from(container.querySelectorAll<HTMLElement>("[data-msg-id]")).filter((el) => {
+        const id = el.getAttribute("data-msg-id")
+        return id != null && selectedIdSet.has(id)
+      })
+      ok = await copyElementsAsRichText(els, plain)
+    }
+    if (!ok) ok = await copyTextToClipboard(plain)
+    if (ok) flashSelectionCopied()
+  }, [selectedIdSet, selectableMessages, flashSelectionCopied])
+
+  const downloadSelection = useCallback(async () => {
+    if (selectedIdSet.size === 0) return
+    const selected = selectableMessages.filter((m) => selectedIdSet.has(m.id))
+    const base = `siclaw-chat-${selected.length}-messages`
+
+    // 1) Markdown — content verbatim, charts kept as ```chart spec blocks
+    //    (compact chart data; the HTML carries the rendered colour image).
+    const md = serializeMessagesToMarkdown(selected)
+    downloadBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), `${base}.md`)
+
+    // 2) Self-contained HTML — buildCopyHtml rasterizes charts/Mermaid to <img>,
+    //    which browsers always render, so double-clicking the .html shows them.
+    const container = scrollContainerRef.current
+    if (container) {
+      const rowById = new Map(
+        Array.from(container.querySelectorAll<HTMLElement>("[data-msg-id]")).map(
+          (r) => [r.getAttribute("data-msg-id"), r] as const,
+        ),
+      )
+      const els = selected.map((m) => rowById.get(m.id)).filter((r): r is HTMLElement => !!r)
+      const { html } = await buildCopyHtml(els)
+      downloadBlob(new Blob([wrapChatHtml(html)], { type: "text/html;charset=utf-8" }), `${base}.html`)
+    }
+  }, [selectedIdSet, selectableMessages])
+
   // Auto-scroll logic
   useEffect(() => {
+    // While selecting, the user is scrolling on purpose — never yank them.
+    if (selectModeRef.current) {
+      prevMsgCountRef.current = messages.length
+      return
+    }
     if (needsScrollOnLoadRef.current && messages.length > 0) {
       needsScrollOnLoadRef.current = false
       userScrolledAwayRef.current = false
@@ -349,7 +497,8 @@ export function PilotArea({
     prevMsgCountRef.current = messages.length
   }, [messages, scrollToBottom])
 
-  // Detect user scrolling away
+  // Detect user scrolling away (scroll-to-select is handled by the
+  // IntersectionObserver above, not here).
   const handleScroll = useCallback(() => {
     const container = scrollContainerRef.current
     if (!container) return
@@ -364,7 +513,68 @@ export function PilotArea({
     <div className="flex-1 flex flex-col h-full bg-card relative">
       {visibleForCopy.length > 0 && (
         <div className="absolute top-2 left-3 z-10">
-          <CopySessionButton messages={visibleForCopy} containerRef={scrollContainerRef} />
+          <button
+            type="button"
+            onClick={selectMode ? exitSelectMode : enterSelectMode}
+            title={selectMode ? "Exit selection" : "Select messages to copy"}
+            className={cn(
+              "p-1.5 rounded-md transition-colors",
+              selectMode
+                ? "bg-blue-500/15 text-blue-400"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary/50",
+            )}
+          >
+            <ListChecks className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+      {selectMode && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full border border-border bg-card/95 px-3 py-1.5 shadow-md shadow-black/10 backdrop-blur">
+          <span className="text-xs font-medium text-foreground whitespace-nowrap">
+            {selectedCount > 0 ? `${selectedCount} selected` : "Scroll to select on-screen messages"}
+          </span>
+          <div className="h-3.5 w-px bg-border" />
+          <button
+            type="button"
+            onClick={() => setSelection(selectAllMessages(selectableMessages.map((m) => m.id)))}
+            className="px-2 py-0.5 rounded-md border border-border bg-secondary/40 text-xs font-medium text-foreground hover:bg-secondary transition-colors"
+          >
+            All
+          </button>
+          <button
+            type="button"
+            onClick={() => setSelection(EMPTY_SELECTION)}
+            disabled={selectedCount === 0}
+            className="px-2 py-0.5 rounded-md border border-border bg-secondary/40 text-xs font-medium text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:hover:bg-secondary/40"
+          >
+            Clear
+          </button>
+          <button
+            type="button"
+            onClick={downloadSelection}
+            disabled={selectedCount === 0}
+            title="Download selected as Markdown + HTML"
+            className="flex items-center rounded-md border border-border bg-secondary/40 p-1 text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:hover:bg-secondary/40"
+          >
+            <Download className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={copySelection}
+            disabled={selectedCount === 0}
+            className="flex items-center gap-1 rounded-full bg-blue-600 px-3 py-1 text-xs font-medium text-white hover:bg-blue-700 transition-colors disabled:opacity-40 disabled:hover:bg-blue-600"
+          >
+            {selectionCopied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+            {selectionCopied ? "Copied" : "Copy"}
+          </button>
+          <button
+            type="button"
+            onClick={exitSelectMode}
+            title="Exit selection"
+            className="p-0.5 rounded text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto px-4 lg:px-8 py-8" onScroll={handleScroll}>
@@ -402,54 +612,85 @@ export function PilotArea({
                 </div>
               )}
 
-              {renderMessages
-                .filter((m) => !m.hidden)
-                .map((msg) => {
+              {selectableMessages.map((msg) => {
                 const childSessionId = msg.metadata?.kind === "delegation_event"
                   ? (msg.metadata as Record<string, unknown>).child_session_id
                   : undefined
                 const subStatus = (msg.metadata as Record<string, unknown> | undefined)?.status
+                const selected = selectMode && selectedIdSet.has(msg.id)
                 return (
-                <Fragment key={msg.id}>
-                  <MessageItem
-                    message={msg}
-                    sendMessage={wrappedSendMessage}
-                    showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
-                    dpActive={dpActive}
-                    canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
-                    editingContent={editingMessageId === msg.id ? editingDraft : null}
-                    onStartEditMessage={startEditingMessage}
-                    onEditMessageChange={setEditingDraft}
-                    onCancelEditMessage={cancelEditingMessage}
-                    onSubmitEditMessage={submitEditedMessage}
-                    onChipClick={(chip, meta) => {
-                      if (meta.isDpCheckpoint) {
-                        const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
-                        if (prefixChip) {
-                          setActivePrefix(prefixChip)
-                          setChipDraft(null)
-                          return
-                        }
-                      }
-                      setChipSeq((s) => s + 1)
-                      setChipDraft(chip.insertText + " ")
-                    }}
-                    onOpenSkillPanel={onOpenSkillPanel}
-                    onOpenSchedulePanel={onOpenSchedulePanel}
-                    agentId={agentId}
-                  />
-                  {typeof childSessionId === "string" && onOpenSubagent && (
-                    <div className="pl-12 -mt-1 mb-2">
-                      <button
-                        type="button"
-                        onClick={() => onOpenSubagent(childSessionId as string, typeof subStatus === "string" ? subStatus : undefined, "Sub-agent")}
-                        className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
-                      >
-                        View sub-agent transcript →
-                      </button>
-                    </div>
+                <div
+                  key={msg.id}
+                  data-msg-id={msg.id}
+                  data-msg-role={msg.role}
+                  onClick={selectMode ? () => handleToggleMessage(msg.id) : undefined}
+                  className={cn(
+                    "relative rounded-xl transition-colors",
+                    // No row-level highlight — the checkbox alone signals selection.
+                    selectMode && "cursor-pointer px-2 -mx-2 py-1 hover:bg-secondary/30",
                   )}
-                </Fragment>
+                >
+                  {selectMode && (
+                    <button
+                      type="button"
+                      data-copy-ignore
+                      title={selected ? "Deselect" : "Select"}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleToggleMessage(msg.id)
+                      }}
+                      className="absolute left-1.5 top-1.5 z-10 text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {selected ? (
+                        <span className="flex h-3.5 w-3.5 items-center justify-center rounded-[4px] bg-blue-500 text-white">
+                          <Check className="h-2.5 w-2.5" strokeWidth={3} />
+                        </span>
+                      ) : (
+                        <Square className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                  <div className={cn(selectMode && "pl-8 pointer-events-none select-none")}>
+                    <MessageItem
+                      message={msg}
+                      sendMessage={wrappedSendMessage}
+                      showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                      dpActive={dpActive}
+                      canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                      editingContent={editingMessageId === msg.id ? editingDraft : null}
+                      onStartEditMessage={startEditingMessage}
+                      onEditMessageChange={setEditingDraft}
+                      onCancelEditMessage={cancelEditingMessage}
+                      onSubmitEditMessage={submitEditedMessage}
+                      onChipClick={(chip, meta) => {
+                        if (meta.isDpCheckpoint) {
+                          const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
+                          if (prefixChip) {
+                            setActivePrefix(prefixChip)
+                            setChipDraft(null)
+                            return
+                          }
+                        }
+                        setChipSeq((s) => s + 1)
+                        setChipDraft(chip.insertText + " ")
+                      }}
+                      onOpenSkillPanel={onOpenSkillPanel}
+                      onOpenSchedulePanel={onOpenSchedulePanel}
+                      agentId={agentId}
+                    />
+                    {typeof childSessionId === "string" && onOpenSubagent && (
+                      <div className="pl-12 -mt-1 mb-2">
+                        <button
+                          type="button"
+                          onClick={() => onOpenSubagent(childSessionId as string, typeof subStatus === "string" ? subStatus : undefined, "Sub-agent")}
+                          className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+                        >
+                          View sub-agent transcript →
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
                 )
                 })}
 
@@ -1190,6 +1431,7 @@ function MessageItem({
     <div className={cn("flex gap-4 group", isUser ? "flex-row-reverse" : "flex-row")}>
       {/* Avatar */}
       <div
+        data-copy-ignore
         className={cn(
           "w-8 h-8 rounded-full flex items-center justify-center shrink-0 shadow-sm shadow-black/10 border",
           isUser ? "bg-blue-600 border-blue-600 text-white" : "bg-card border-border text-blue-400",
@@ -1244,11 +1486,16 @@ function MessageItem({
         )}
 
         {isUser && message.attachments && message.attachments.length > 0 && (
-          <ImageAttachmentPreview
-            attachments={message.attachments}
-            className="mb-2 max-w-[560px] justify-end"
-            tileClassName="h-32 w-56"
-          />
+          // data-copy-ignore: pasted/uploaded attachments are transient OCR
+          // inputs, so the scroll-select copy/export skips them (the copy helper
+          // strips [data-copy-ignore]).
+          <div data-copy-ignore>
+            <ImageAttachmentPreview
+              attachments={message.attachments}
+              className="mb-2 max-w-[560px] justify-end"
+              tileClassName="h-32 w-56"
+            />
+          </div>
         )}
 
         {isUser && editingContent != null && canRenderEditor ? (
@@ -1305,150 +1552,6 @@ function DelegationStatusNotice({ content }: { content: string }) {
   )
 }
 
-function serializeSessionToText(messages: PilotMessage[]): string {
-  const lines: string[] = []
-  for (const m of messages) {
-    if (m.hidden) continue
-    if (m.metadata?.kind === "delegation_status_notice") continue
-    if (m.role === "user") {
-      lines.push(`You:\n${m.content.trim()}`)
-    } else if (m.role === "assistant") {
-      const body = stripVisualizationFences(m.content ?? "")
-      if (body) lines.push(`Assistant:\n${body}`)
-    } else if (m.role === "tool") {
-      const name = m.toolName ?? "tool"
-      const input = m.toolInput ? `\n$ ${m.toolInput}` : ""
-      const out = (m.content ?? "").trim()
-      lines.push(`[${name}]${input}${out ? `\n${out}` : ""}`)
-    } else if (m.role === "error") {
-      lines.push(`Error: ${(m.content ?? "").trim()}`)
-    }
-  }
-  return lines.join("\n\n")
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-}
-
-// Build a text/html rendition of the whole session with each visual fenced
-// block swapped for its rasterised PNG. The PNGs are passed in DOM order; an
-// assistant message's fences are mapped to them left-to-right, skipping fences
-// whose source failed validation.
-//
-// KNOWN LIMITATION — this PNG↔fence mapping is best-effort, not exact. It
-// assumes `tryParseChartSpec` / `validateMermaidSource` succeeding here implies
-// the fence rendered a real `.chart-host svg` / `.mermaid-host svg` in the DOM.
-// That can drift if a fence parsed but the visual did not actually mount (e.g.
-// it was still in the streaming/loading state, or future render-gating changes),
-// in which case later images attach to the wrong message. Acceptable for a
-// copy-to-clipboard convenience; if it ever needs to be exact, walk per-message
-// DOM nodes instead of re-parsing text.
-function serializeSessionToHtml(messages: PilotMessage[], visualUrls: string[]): string {
-  const fenceRe = /```(chart|mermaid)\s*([\s\S]*?)```/g
-  let visualIdx = 0
-  const parts: string[] = []
-  for (const m of messages) {
-    if (m.hidden) continue
-    if (m.metadata?.kind === "delegation_status_notice") continue
-    if (m.role === "user") {
-      parts.push(`<p><strong>You:</strong></p><p>${escapeHtml(m.content.trim()).replace(/\n/g, "<br/>")}</p>`)
-    } else if (m.role === "assistant") {
-      const body = (m.content ?? "").trim()
-      if (!body) continue
-      let html = "<p><strong>Assistant:</strong></p>"
-      let last = 0
-      let match: RegExpExecArray | null
-      fenceRe.lastIndex = 0
-      while ((match = fenceRe.exec(body)) !== null) {
-        const before = body.slice(last, match.index).trim()
-        if (before) html += `<p>${escapeHtml(before).replace(/\n/g, "<br/>")}</p>`
-        const lang = match[1]
-        const raw = match[2].trim()
-        const parsed = lang === "chart" ? Boolean(tryParseChartSpec(raw)) : validateMermaidSource(raw).ok
-        if (parsed && visualIdx < visualUrls.length) {
-          html += `<p><img src="${visualUrls[visualIdx++]}" alt="${lang}" style="max-width:100%;height:auto"/></p>`
-        } else if (lang === "mermaid") {
-          html += "<p>[diagram]</p>"
-        } else {
-          html += `<p>[${lang}]</p>`
-        }
-        last = match.index + match[0].length
-      }
-      const tail = body.slice(last).trim()
-      if (tail) html += `<p>${escapeHtml(tail).replace(/\n/g, "<br/>")}</p>`
-      parts.push(html)
-    } else if (m.role === "tool") {
-      const name = m.toolName ?? "tool"
-      const out = (m.content ?? "").trim()
-      parts.push(
-        `<p><strong>[${escapeHtml(name)}]</strong></p>` +
-          (out ? `<pre>${escapeHtml(out)}</pre>` : ""),
-      )
-    } else if (m.role === "error") {
-      parts.push(`<p><strong>Error:</strong> ${escapeHtml((m.content ?? "").trim())}</p>`)
-    }
-  }
-  return `<div>${parts.join("")}</div>`
-}
-
-async function copySessionWithCharts(
-  container: HTMLElement,
-  messages: PilotMessage[],
-): Promise<boolean> {
-  const svgs = Array.from(container.querySelectorAll<SVGSVGElement>(
-    '.chart-host svg[role="img"], .mermaid-host svg[role="img"]',
-  ))
-  if (svgs.length === 0) return false
-  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
-  try {
-    const visualUrls = await Promise.all(svgs.map((svg) => svgToPngDataUrl(svg)))
-    const html = serializeSessionToHtml(messages, visualUrls)
-    const plain = serializeSessionToText(messages)
-    await navigator.clipboard.write([
-      new ClipboardItem({
-        "text/html": new Blob([html], { type: "text/html" }),
-        "text/plain": new Blob([plain], { type: "text/plain" }),
-      }),
-    ])
-    return true
-  } catch (err) {
-    console.warn("[copy] rich session copy failed, falling back to text:", err)
-    return false
-  }
-}
-
-function CopySessionButton({
-  messages,
-  containerRef,
-}: {
-  messages: PilotMessage[]
-  containerRef: React.RefObject<HTMLDivElement | null>
-}) {
-  const [copied, copy, flashCopied] = useCopyFeedback()
-  const handleCopy = async () => {
-    const container = containerRef.current
-    if (container && (await copySessionWithCharts(container, messages))) {
-      flashCopied()
-      return
-    }
-    void copy(serializeSessionToText(messages))
-  }
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      title="Copy entire session"
-      className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-secondary/50 transition-colors"
-    >
-      {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
-    </button>
-  )
-}
-
 function CopyIconButton({
   text,
   title,
@@ -1478,55 +1581,6 @@ function CopyIconButton({
   )
 }
 
-// Plain-text fallback for the clipboard: a ```chart fenced JSON block is noise
-// when pasted as text, so swap it for a readable placeholder.
-function stripVisualizationFences(markdown: string): string {
-  return markdown
-    .replace(/```chart\s*[\s\S]*?```/g, "[chart]")
-    .replace(/```mermaid\s*[\s\S]*?```/g, "[diagram]")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim()
-}
-
-// Copy a rendered message bubble as rich text/html with visualisations rasterised to
-// inline PNGs, plus a text/plain fallback. Returns false when there are no
-// visualisations or the browser can't do a rich clipboard write, so the caller can
-// fall back to a plain markdown copy. Without this, "copy answer" yielded the
-// raw chart JSON spec or Mermaid source instead of the picture the user sees.
-async function copyBubbleWithCharts(bubble: HTMLElement, content: string): Promise<boolean> {
-  const visuals = Array.from(bubble.querySelectorAll<SVGSVGElement>(
-    '.chart-host svg[role="img"], .mermaid-host svg[role="img"]',
-  ))
-  if (visuals.length === 0) return false
-  if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return false
-  try {
-    const dataUrls = await Promise.all(visuals.map((svg) => svgToPngDataUrl(svg)))
-    const clone = bubble.cloneNode(true) as HTMLElement
-    const cloneHosts = Array.from(clone.querySelectorAll<HTMLElement>(".chart-host, .mermaid-host"))
-    cloneHosts.forEach((host, i) => {
-      const img = document.createElement("img")
-      img.src = dataUrls[i] ?? ""
-      img.style.maxWidth = "100%"
-      img.style.height = "auto"
-      host.replaceWith(img)
-    })
-    // Drop any leftover interactive controls (chart toolbars etc.).
-    clone.querySelectorAll("button").forEach((b) => b.remove())
-    const html = `<div>${clone.innerHTML}</div>`
-    const plain = stripVisualizationFences(content)
-    await navigator.clipboard.write([
-      new ClipboardItem({
-        "text/html": new Blob([html], { type: "text/html" }),
-        "text/plain": new Blob([plain], { type: "text/plain" }),
-      }),
-    ])
-    return true
-  } catch (err) {
-    console.warn("[copy] rich chart copy failed, falling back to text:", err)
-    return false
-  }
-}
-
 function CopyableMessage({
   isUser,
   content,
@@ -1543,7 +1597,8 @@ function CopyableMessage({
 
   const handleCopy = async () => {
     const bubble = bubbleRef.current
-    if (bubble && (await copyBubbleWithCharts(bubble, content))) {
+    const plain = stripImageData(stripVisualizationFences(content))
+    if (bubble && (await copyElementsAsRichText([bubble], plain))) {
       flashCopied()
       return
     }
