@@ -68,7 +68,7 @@ Parameters:
 Examples:
 - node: "node-1", skill: "node-logs", script: "get-node-logs.sh", args: "--lines 100"
 - node: "node-1", script: "my-check.sh"
-- node: "node-1", netns: "abc123", skill: "pod-ping-gateway", script: "ping.sh", args: "--interface net1"`,
+- node: "node-1", netns: "abc123", skill: "gateway-diagnostics", script: "ping-gateway.sh", args: "--interface net1"`,
     parameters: Type.Object({
       node: Type.String({ description: "Kubernetes node name" }),
       skill: Type.Optional(

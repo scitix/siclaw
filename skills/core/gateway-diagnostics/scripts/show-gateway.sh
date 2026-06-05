@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Show gateway for a network interface in a pod's network namespace.
-# Runs via node_script with netns param (ip netns exec into pod's netns).
-# Network namespace = pod's; host tools available.
+# Show the gateway(s) for a network interface from the routing table (ip -j route).
+# Identical logic for a node or a pod — the network namespace is selected by
+# the node_script `netns=` param (or host namespace when omitted), not here.
 
 DEVICE=""
 JSON_OUTPUT=false
@@ -21,8 +21,18 @@ done
 if [[ -n "$DEVICE" ]]; then
   if ! ip -j link show dev "$DEVICE" >/dev/null 2>&1; then
     echo "Error: interface '$DEVICE' not found" >&2
-    echo "Available interfaces:" >&2
-    ip -o link show 2>/dev/null | awk -F': ' '{print "  " $2}' >&2
+    # List only physical/bond interfaces — on a Kubernetes node the full list
+    # is hundreds of cali*/veth/vlan entries, which is noise, not a hint.
+    AVAIL=$(ip -o link show 2>/dev/null \
+      | awk -F': ' '{print $2}' \
+      | sed 's/@.*//' \
+      | grep -vE '^(lo|cali|veth|cni|docker|kube-ipvs0|tunl|flannel|dummy|nodelocaldns|br-|virbr)' \
+      | grep -vE '\.[0-9]+$' \
+      | sort -u | head -50)
+    if [[ -n "$AVAIL" ]]; then
+      echo "Available physical interfaces (virtual/vlan omitted):" >&2
+      echo "$AVAIL" | sed 's/^/  /' >&2
+    fi
     exit 1
   fi
   ROUTE_JSON=$(ip -j route show dev "$DEVICE" 2>/dev/null)
