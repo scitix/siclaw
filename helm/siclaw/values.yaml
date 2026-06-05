@@ -1,6 +1,6 @@
 # -- Container images
 image:
-  registry: ""          # e.g. "siclaw" -> siclaw/siclaw-runtime:latest
+  registry: "siclaw"    # e.g. "siclaw" -> siclaw/siclaw-runtime:latest
   pullPolicy: Always
   tag: "latest"
 
