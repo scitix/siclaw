@@ -84,3 +84,63 @@ describe("Markdown Mermaid fences", () => {
     expect(countMermaidEdges("flowchart TD\n  A --> B\n  B --- C\n  C ==> D")).toBe(3)
   })
 })
+
+describe("Markdown intra-word underscores", () => {
+  const R = (s: string) => renderToStaticMarkup(<Markdown>{s}</Markdown>)
+
+  it("renders plain intra-word underscores literally (no italic)", () => {
+    const html = R("mlx5_0 and mlx5_1")
+    expect(html).toContain("mlx5_0 and mlx5_1")
+    expect(html).not.toContain("<em>")
+  })
+
+  it("strips a model-escaped intra-word underscore", () => {
+    expect(R("mlx5\\_0")).toContain("mlx5_0")
+    expect(R("mlx5\\_0")).not.toContain("mlx5\\_0")
+  })
+
+  it("strips a DOUBLE-escaped intra-word underscore (the visible-backslash bug)", () => {
+    const html = R("**跨网卡 061 mlx5\\\\_0 → 062 mlx5\\\\_1 成功**")
+    expect(html).toContain("mlx5_0")
+    expect(html).toContain("mlx5_1")
+    expect(html).not.toContain("\\_")
+  })
+
+  it("preserves intentional _emphasis_ at word boundaries", () => {
+    expect(R("this is _italic_ text")).toContain("<em>")
+  })
+
+  it("leaves underscores inside inline code untouched", () => {
+    expect(R("`mlx5\\_0`")).toContain("mlx5\\_0")
+  })
+})
+
+describe("Markdown CJK-flanked underscores", () => {
+  const R = (s: string) => renderToStaticMarkup(<Markdown>{s}</Markdown>)
+  it("strips a double-escaped underscore flanked by CJK", () => {
+    const html = R("主\\\\_网卡 和 接\\\\_口")
+    expect(html).toContain("主_网卡")
+    expect(html).toContain("接_口")
+    expect(html).not.toContain("\\_")
+  })
+  it("strips a single-escaped underscore flanked by CJK", () => {
+    expect(R("网卡\\_接口")).toContain("网卡_接口")
+    expect(R("网卡\\_接口")).not.toContain("\\_")
+  })
+})
+
+describe("Markdown CJK full-width-space markers", () => {
+  const R = (s: string) => renderToStaticMarkup(<Markdown>{s}</Markdown>)
+  it("renders a heading written with a full-width space after the #'s", () => {
+    const html = R("##　RoCE连通性测试结果")
+    expect(html).toContain("<h2")
+    expect(html).toContain("RoCE连通性测试结果")
+    expect(html).not.toContain("##")
+  })
+  it("renders a list item written with a full-width space after the marker", () => {
+    expect(R("-　第一项")).toContain("<li")
+  })
+  it("leaves a normal (ascii-space) heading untouched", () => {
+    expect(R("## 正常标题")).toContain("<h2")
+  })
+})

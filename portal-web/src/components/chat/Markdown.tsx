@@ -64,16 +64,27 @@ function remarkDemoteIndentedCode() {
 }
 
 /**
- * Escape underscores between word characters to prevent markdown from
- * interpreting them as emphasis markers (e.g. roll_dice.py → italic).
- * Preserves fenced code blocks and inline code.
+ * CommonMark fixes for Chinese-authored markdown, applied outside fenced/inline code:
+ *
+ * 1. Intra-word underscores: CommonMark never treats an underscore flanked by word
+ *    characters as emphasis (`mlx5_0` renders literally), so backslash(es) the model — or
+ *    a transport double-encode — placed before such an underscore are unnecessary AND
+ *    harmful (a doubled `\\_` renders the backslash literally, `mlx5\_0`). Collapse them.
+ *    Flank on \p{L}\p{N} so CJK neighbours count too. Intentional `_emphasis_` at word
+ *    boundaries is untouched (the lookbehind requires a word char).
+ *
+ * 2. Heading / list markers followed by a FULL-WIDTH space (U+3000, common in Chinese):
+ *    CommonMark requires an ASCII space after `#`/`-`/`*`/`1.`, so `##　标题` is NOT a
+ *    heading and renders the literal `##`. Convert that one full-width space to ASCII.
  */
-function escapeIntraWordUnderscores(text: string): string {
+function normalizeCjkMarkdown(text: string): string {
   const segments = text.split(/(```[\s\S]*?```|`[^`]+`)/g)
   return segments
     .map((segment, i) => {
       if (i % 2 === 1) return segment // code — leave untouched
-      return segment.replace(/(?<=\w)_(?=\w)/g, "\\_")
+      return segment
+        .replace(/^(\s{0,3}(?:#{1,6}|[-*+]|\d{1,9}[.)]))　/gm, "$1 ")
+        .replace(/(?<=[\p{L}\p{N}])\\+_(?=[\p{L}\p{N}])/gu, "_")
     })
     .join("")
 }
@@ -363,7 +374,7 @@ export function Markdown({ children, isStreaming = false }: MarkdownProps) {
         urlTransform={permissiveUrlTransform}
         components={MARKDOWN_COMPONENTS}
       >
-        {escapeIntraWordUnderscores(children)}
+        {normalizeCjkMarkdown(children)}
       </ReactMarkdown>
     </ChartStreamingContext.Provider>
   )
