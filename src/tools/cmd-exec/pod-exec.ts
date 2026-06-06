@@ -1,4 +1,4 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -7,8 +7,11 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { loadConfig } from "../../core/config.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validatePodName, prepareExecEnv } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
@@ -25,9 +28,11 @@ interface PodExecParams {
   command: string;
   cluster?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
-export function createPodExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createPodExecTool(kubeconfigRef?: KubeconfigRef, bg?: BackgroundExecWiring): ToolDefinition {
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "pod_exec",
     label: "Pod Exec",
@@ -84,9 +89,23 @@ Examples:
       ),
       timeout_seconds: Type.Optional(
         Type.Number({
-          description: "Timeout in seconds (default: 30, max: 120)",
+          description: "Timeout in seconds (default: 30, max: 120; ignored when run_in_background)",
         }),
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the command inside the pod in the background instead of waiting. Returns immediately " +
+                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read the " +
+                  "file or call any tool, and do NOT sleep/wait. You are notified when it completes; ONLY THEN " +
+                  "read the output_file. Note: if stopped early, the in-pod process may keep running until the " +
+                  "pod ends. Output needing structural (JSON) redaction cannot run in background.",
+              })
+            ),
+          }
+        : {}),
     }),
     renderCall(args: any, theme: any) {
       const pod = args?.pod || "...";
@@ -101,7 +120,7 @@ Examples:
       );
     },
     renderResult: renderTextResult,
-    async execute(_toolCallId, rawParams) {
+    async execute(toolCallId, rawParams) {
       const params = rawParams as PodExecParams;
 
       try {
@@ -168,6 +187,40 @@ Examples:
       }
       kubectlArgs.push("--", ...execArgs);
 
+      // ── Background mode ──────────────────────────────────────────────
+      // No debug pod / no pin — the target pod is user-managed. Wrap the in-pod command in
+      // `timeout <ttl>` so a long/runaway background process (tail -f, a loop) self-terminates
+      // instead of running until the pod dies: job_stop here only reaps the LOCAL kubectl, not
+      // the pod-internal process. Requires `timeout` in the target pod (coreutils/busybox) —
+      // without it the launch errors visibly (acceptable; far better than an unbounded leak).
+      if (backgroundEnabled && params.run_in_background === true) {
+        if (pre.action && !pre.action.lineSafe) {
+          return backgroundNotLineSafeError();
+        }
+        const cfg = loadConfig();
+        const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
+        const bgKubectlArgs = [...env.kubeconfigArgs, "exec", pod, "-n", namespace];
+        if (params.container?.trim()) bgKubectlArgs.push("-c", params.container.trim());
+        bgKubectlArgs.push("--", "timeout", String(ttl), ...execArgs);
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            file: "kubectl",
+            args: bgKubectlArgs,
+            env: env.childEnv as Record<string, string>,
+            action: pre.action,
+            hasSensitiveKubectl: pre.hasSensitiveKubectl,
+            description: `pod ${namespace}/${pod}: ${params.command.length > 60 ? params.command.slice(0, 57) + "…" : params.command}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: process.env.NODE_ENV === "production",
+            jobType: "pod",
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running in the pod in the background.");
+        } catch (err) {
+          console.warn(`[pod-exec] background launch declined, running foreground:`, err);
+        }
+      }
+
       try {
         const { stdout, stderr } = await execFileAsync(
           "kubectl",
@@ -194,5 +247,9 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  create: (refs) => createPodExecTool(refs.kubeconfigRef),
+  create: (refs) =>
+    createPodExecTool(refs.kubeconfigRef, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

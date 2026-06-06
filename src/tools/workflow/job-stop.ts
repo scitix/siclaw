@@ -1,8 +1,8 @@
 /**
- * job_stop — cancel a running background sub-agent job (design §7).
+ * job_stop — cancel a running background job (sub-agent OR bash) (design §7).
  *
- * The job id comes from a prior spawn_subagent({ run_in_background: true }) result.
- * Hidden until the runtime injects the stop executor.
+ * The job id comes from a prior spawn_subagent({ run_in_background: true }) launch or a
+ * bash({ run_in_background: true }) launch. Hidden until the runtime injects the stop executor.
  */
 
 import { Type } from "@sinclair/typebox";
@@ -10,20 +10,20 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs } from "../../core/tool-registry.js";
-import { RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
+import { BACKGROUND_BASH_ENABLED, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";
 
 export function createJobStopTool(
   refs: ToolRefs,
-  executor = refs.subagentJobStopExecutor,
+  executor = refs.jobStopExecutor,
 ): ToolDefinition {
   return {
     name: "job_stop",
     label: "Stop Job",
     renderCall: (_a, theme) => new Text(theme.fg("toolTitle", theme.bold("job_stop")), 0, 0),
     renderResult: renderTextResult,
-    description: "Cancel a running background sub-agent by its job_id (from a spawn_subagent launch).",
+    description: "Cancel a running background job (sub-agent or bash command) by its job_id, returned when it was launched with run_in_background.",
     parameters: Type.Object({
-      job_id: Type.String({ description: "The job_id returned by a background spawn_subagent." }),
+      job_id: Type.String({ description: "The job_id returned by a background spawn_subagent or background bash launch." }),
     }),
     async execute(_toolCallId, rawParams) {
       if (!executor) {
@@ -47,7 +47,8 @@ export const registration: ToolEntry = {
   create: (refs) => createJobStopTool(refs),
   modes: ["web", "channel", "cli"],
   platform: true,
-  // Gated OFF with background jobs (RUN_IN_BACKGROUND_ENABLED) — no job_id can exist
-  // when run_in_background is hidden, so the tool stays unregistered until that lands.
-  available: (refs) => RUN_IN_BACKGROUND_ENABLED && Boolean(refs.subagentJobStopExecutor),
+  // Available once either background mode is on AND the runtime injected a stop executor
+  // (so a job_id can actually exist). Hidden otherwise.
+  available: (refs) =>
+    (RUN_IN_BACKGROUND_ENABLED || BACKGROUND_BASH_ENABLED) && Boolean(refs.jobStopExecutor),
 };

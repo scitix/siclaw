@@ -177,6 +177,7 @@ The most complex tool. Handles full shell pipelines with:
 - Production mode: `sudo -E -u sandbox` user isolation
 - Skill script detection bypass (`isSkillScript`)
 - 3-layer output sanitization (see §6.2)
+- Optional `run_in_background` (see §9) — exposed only when a `backgroundBashExecutor` is injected
 
 **kubectl access**: There is no dedicated kubectl tool — all kubectl commands go
 through `restricted_bash` with pipeline validation. `validateKubectlInPipeline()`
@@ -473,3 +474,89 @@ complexity, `run` + error handling) differ enough that a forced template would
 add abstraction without reducing real complexity. The security-critical steps
 are already unified via the `security-pipeline.ts` facade. Revisit only if more
 than 2 new cmd-exec tools are added.
+
+---
+
+## 9. Background Jobs (`run_in_background`)
+
+Two background modes share one core, modeled on Claude Code's `run_in_background`:
+**background bash** (a detached shell command) and **background sub-agent**
+(`spawn_subagent run_in_background`). They are peers — background bash does NOT spawn a
+sub-agent. Master switches: `BACKGROUND_BASH_ENABLED` and `RUN_IN_BACKGROUND_ENABLED`
+(`src/core/subagent-registry.ts`).
+
+### 9.1 Shared pieces
+
+- **`JobRegistry`** (`src/core/job-registry.ts`) — one per runtime; `JobRecord{type:"subagent"|"bash"}`.
+  `claimNotification(jobId)` is the atomic dedup latch (a completion notice is sent EXACTLY
+  once, even when process-exit and `job_stop` race).
+- **`buildTaskNotificationText`** (`src/core/task-notification.ts`) — the `<task_notification>`
+  XML (task_id / output_file / status / summary) injected back into the parent model.
+- **`spawnBackgroundBash`** (`src/core/background-bash-runner.ts`) — runtime-agnostic: spawns
+  detached, streams sanitized output to disk (`SanitizingLineBuffer`, §6b sanitization.md),
+  registers the job, fires `notify` once on exit.
+- **`job_stop`** — generalized to cancel either job type (bash → process-group SIGKILL).
+
+### 9.2 The completion-notification injector
+
+Tools have no live brain handle, so background work is launched via injected executors
+(`ToolRefs.backgroundBashExecutor`, `spawnSubagentExecutor`) and notified back through the
+runtime:
+
+- **Gateway/agentbox** (`AgentBoxSessionManager.notifyParent`): parent run in-flight
+  (`!_promptDone`) → `brain.followUp(text)`; parent idle → `runSyntheticPrompt`, which
+  acquires the SAME `_promptDone`/`_promptInflight` mutex `/prompt` uses (synchronously,
+  no await gap) and calls `brain.prompt(text)`. This closes the TOCTOU vs. an incoming
+  HTTP `/prompt` (it either started first → we degrade to `followUp`, or hits the 409 guard).
+  `_backgroundWorkCount` keeps the session alive until jobs finish.
+- **TUI** (`TuiBackgroundHost`, `src/core/tui-background-host.ts`): idle → `sendCustomMessage(triggerTurn:true)`
+  (pi routes a not-streaming triggerTurn through `agent.prompt`, waking a turn — `followUp`
+  alone does NOT wake an idle agent); streaming → `sendCustomMessage(deliverAs:"followUp")`.
+  TUI wires background **bash + node_exec + pod_exec** (shared `spawnBackgroundBash` executor); only background **sub-agents** are unavailable (no agentbox child-session machinery). Delivery is per-host, not session-scoped — a job finishing after `/new` notifies the current session (the prior one is gone; surfacing beats dropping).
+
+**Live delivery of an idle synthetic turn to the WebUI.** A synthetic turn runs *after* the
+`/send` SSE stream closed, so it has no live gateway consumer. Two contracts make it visible:
+(1) the synthetic turn's messages are persisted (`persistSyntheticMessage`, tagged
+`metadata.kind="task_notification"` for the leading injected prompt so the frontend hides that
+raw bubble — the model's human reply stays); (2) once the persists settle, `runSyntheticPrompt`
+emits a `delegation.emit_chat_event` of type **`background_turn_done`** on the session's
+`chat.event` channel. The frontend keeps a persistent per-session SSE open
+(`GET /api/v1/siclaw/agents/:id/chat/sessions/:sessionId/events`, `src/portal/chat-gateway.ts`,
+query-token auth, NEVER closes on `prompt_done`) and on `background_turn_done` silently refetches
+history from the DB. The body is loaded from DB, not rendered from the live event stream —
+`emit_chat_event` deliberately skips `message_update` text deltas (to avoid an HTTP-per-token
+storm), and the frontend builds assistant text only from those deltas, so a refetch is the only
+faithful render. `background_turn_done` is a dedicated signal (not `prompt_done`) so it never
+collides with a normal `/send`.
+
+### 9.3 Reading output
+
+Background bash output streams to `<userDataDir>/agent/tasks/<jobId>.output` (within the
+`read` tool's allow-list). The launch returns `{task_id, output_file}`; the model uses the
+built-in `read` tool (offset/limit) to inspect progress and is notified on completion — it
+must NOT poll. Output is sanitized on write (§6b sanitization.md).
+
+### 9.4 Background on remote tools (node_exec / pod_exec)
+
+`run_in_background` also works on `node_exec` and `pod_exec` (gated identically on the
+injected executor). This is how long node-side work — e.g. RDMA perftest打流, server on
+node A + client on node B — runs without a dedicated skill.
+
+The mechanism reuses the same runner in **argv mode**: the agentbox spawns the
+`kubectl exec <pod> -- …` (node_exec: into a debug pod, `nsenter` into the host;
+pod_exec: into the target pod) as a detached child and streams its output to the same
+on-disk file the model reads. Differences from bash background:
+
+- **node_exec** runs in the host namespace via a debug pod. The pod is **pinned**
+  (`acquireDebugPod`/`releaseDebugPod` refcount in `debug-pod.ts`) for the job's lifetime
+  so the idle-timer can't evict it mid-run; the pin is released by the job's `onComplete`.
+  The node command is wrapped in **`timeout <ttl>`** so the host-namespace process
+  self-terminates even if the local `kubectl exec` child is killed (kubectl exec does not
+  reliably propagate kill to a host-ns process) — **the debug image must provide
+  `timeout`**. Hard ceiling: the debug pod's `activeDeadlineSeconds` (`debugPodTTL`, ~600s)
+  — longer runs need a shorter perftest duration or a raised `debugPodTTL`.
+- **pod_exec** has no debug pod / no pin; the process is bounded by the target pod's
+  lifecycle. If stopped early, the in-pod process may keep running until the pod ends.
+
+The per-session concurrency cap (`getBackgroundBashConcurrency`) counts ALL background
+exec jobs (bash + node + pod) together; over the cap, the tool falls back to foreground.

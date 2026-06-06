@@ -218,10 +218,39 @@ before data enters the LLM context window.
 
 ---
 
+## 6b. Background bash: sanitize-on-write (streaming)
+
+Foreground `bash` sanitizes its captured output once via `postExecSecurity` before
+returning it to the model. **Background bash** (`run_in_background`) cannot do that — its
+output streams to a disk file that the model reads with the built-in `read` tool, so the
+bytes must already be sanitized *on the way to disk*.
+
+Contract (`SanitizingLineBuffer` in `src/tools/cmd-exec/disk-output.ts`):
+
+- Output is sanitized **per complete line** using the SAME `pre.action` resolved for the
+  foreground path, in the same order as `postExecSecurity` (`applySanitizer(action)` →
+  `redactSensitiveContent` when `hasSensitiveKubectl`). A residual buffer holds the
+  trailing partial line until its newline arrives; it is flushed on process exit.
+- Only **line-safe** sanitizers may stream. `OutputAction.lineSafe` marks sanitizers that
+  operate as `split("\n")→map→join` (the env/file/kubectl-non-JSON redactors). Structural
+  sanitizers (`sanitizeJSON`, crictl inspect) are `lineSafe: false` — applying them per
+  line would corrupt the document and could leak. restricted-bash **rejects** background
+  mode for a command whose resolved action is not line-safe (use `-o wide/name/jsonpath`
+  or run foreground); `SanitizingLineBuffer` also throws if one slips through (fail closed).
+- Truncation (`processToolOutput`) is NOT applied on write — it is a read-time concern; the
+  `read` tool's offset/limit and the 5GB disk cap bound ingestion.
+
+**Invariant: the model never reads unsanitized background output.** The output file is
+created and written only by the node main process (the `sandbox` child never holds the fd),
+under `<userDataDir>/agent/tasks/`, opened `O_NOFOLLOW` to defeat symlink redirection.
+
+---
+
 ## 7. Key Files
 
 ```
-src/tools/infra/output-sanitizer.ts      OUTPUT_RULES, analyzeOutput(), applySanitizer()
+src/tools/infra/output-sanitizer.ts      OUTPUT_RULES, analyzeOutput(), applySanitizer(), OutputAction.lineSafe
+src/tools/cmd-exec/disk-output.ts        DiskTaskOutput + SanitizingLineBuffer (background bash sanitize-on-write)
 src/tools/infra/kubectl-sanitize.ts      sanitizeJSON(), detectSensitiveResource(), redaction patterns
 src/tools/shell/restricted-bash.ts       Pipeline fallback (Layer 3), isSkillScript()
 src/tools/infra/output-sanitizer.test.ts Test coverage for sanitization rules

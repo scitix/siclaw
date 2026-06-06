@@ -153,6 +153,10 @@ export class PiAgentBrain implements BrainSession {
     return this.session.steer(text);
   }
 
+  followUp(text: string): Promise<void> {
+    return this.session.followUp(text);
+  }
+
   clearQueue(): { steering: string[]; followUp: string[] } {
     return this.session.clearQueue();
   }

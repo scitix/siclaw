@@ -111,8 +111,10 @@ export interface CreateSiclawSessionOpts {
   taskListId?: string;
   /** Runtime bridge that spawns a sub-agent (design §6). Injected by the agentbox. */
   spawnSubagentExecutor?: import("./tool-registry.js").SpawnSubagentExecutor;
-  /** Runtime bridge that cancels a background sub-agent job (design §7). Injected by the agentbox. */
-  subagentJobStopExecutor?: import("./tool-registry.js").SubagentJobStopExecutor;
+  /** Runtime bridge that cancels a background job — sub-agent or bash (design §7). */
+  jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;
+  /** Runtime bridge that launches a background bash command. Injected by agentbox / TUI host. */
+  backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
 }
 
 export interface SiclawSessionResult {
@@ -389,7 +391,8 @@ export async function createSiclawSession(
       memoryDir: memoryEnabled ? memoryDir : undefined,
       sessionEventEmitter: opts?.sessionEventEmitter,
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
-      subagentJobStopExecutor: opts?.subagentJobStopExecutor,
+      jobStopExecutor: opts?.jobStopExecutor,
+      backgroundExecExecutor: opts?.backgroundExecExecutor,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",

@@ -10,10 +10,12 @@ import http from "node:http";
 import {
   sendJson,
   parseBody,
+  parseQuery,
   RequestBodyTooLargeError,
   requireAuth,
   type RestRouter,
 } from "../gateway/rest-router.js";
+import { verifyJwt } from "../gateway/jwt.js";
 import type { ResolvedModelBinding } from "../gateway/agent-model-binding.js";
 import { getDb } from "../gateway/db.js";
 import {
@@ -355,6 +357,20 @@ async function authenticateApiKey(req: http.IncomingMessage): Promise<ApiKeyAuth
 }
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
 
+/**
+ * Open an SSE response: the event-stream headers + disable Nagle so each frame is its own
+ * TCP segment (small text_delta frames are exactly what Nagle's 40ms coalescing hurts).
+ */
+function writeSseHead(res: import("node:http").ServerResponse): void {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.socket?.setNoDelay(true);
+}
+
 /** Send an SSE event to the response stream. No-op if the stream is already closed. */
 function sseWrite(res: import("node:http").ServerResponse, event: string, data: unknown): void {
   if (res.writableEnded || res.destroyed) return;
@@ -411,16 +427,7 @@ export function registerChatRoutes(
     }
 
     // Set up SSE response
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no",
-    });
-    // Disable Nagle algorithm so each SSE frame is sent as its own TCP segment
-    // rather than waiting up to 40 ms for coalescing. Small text_delta frames
-    // are exactly the case Nagle hurts most.
-    res.socket?.setNoDelay(true);
+    writeSseHead(res);
 
     // Subscribe to chat events for this agent, filter by sessionId
     let unsubscribe: (() => void) | null = null;
@@ -487,6 +494,79 @@ export function registerChatRoutes(
 
     // Initial response — send session info
     sseWrite(res, "session", { sessionId: (result.payload as Record<string, unknown>)?.sessionId ?? sessionId });
+  });
+
+  // GET /api/v1/siclaw/agents/:id/chat/sessions/:sessionId/events — persistent SSE.
+  //
+  // Unlike /send (which subscribes to chat.event only for the duration of one prompt and
+  // closes on prompt_done), this stream stays open for the lifetime of the viewed session,
+  // so the frontend can receive server-pushed turns that land while the user is idle — e.g.
+  // a background job's completion turn, generated after the /send stream already closed.
+  //
+  // EventSource cannot set the Authorization header, so the JWT is passed as a ?token=
+  // query param (same pattern as /ws/notifications). The frontend keys on the
+  // `background_turn_done` event to silently refetch history; other chat.event types are
+  // ignored client-side (the synthetic turn's body is loaded from DB, not rendered live —
+  // message_update text deltas are intentionally not emitted on this channel).
+  router.get("/api/v1/siclaw/agents/:id/chat/sessions/:sessionId/events", async (req, res, params) => {
+    const token = parseQuery(req.url ?? "").token;
+    const payload = token ? verifyJwt(token, jwtSecret) : null;
+    if (!payload?.sub) { sendJson(res, 401, { error: "Authentication required" }); return; }
+
+    const agentId = params.id;
+    const sessionId = params.sessionId;
+
+    // Authorization: this is a read channel for the session's chat.event stream, so the
+    // caller MUST own it — mirror the user_id scoping every chat-session endpoint in
+    // siclaw-api.ts enforces. If the session row exists but belongs to another user, reject
+    // (cross-tenant leak). A not-yet-persisted (brand-new) session has no row: allow it
+    // (nothing flows until the owner's own agent produces events) so the frontend's
+    // EventSource doesn't 404-storm before the first message lands.
+    try {
+      const [rows] = await getDb().query(
+        "SELECT user_id FROM chat_sessions WHERE id = ? AND agent_id = ? AND deleted_at IS NULL",
+        [sessionId, agentId],
+      ) as any;
+      if (rows.length > 0 && rows[0].user_id !== payload.sub) {
+        sendJson(res, 403, { error: "Forbidden" });
+        return;
+      }
+    } catch {
+      sendJson(res, 500, { error: "Failed to authorize session" });
+      return;
+    }
+
+    writeSseHead(res);
+
+    let unsubscribe: (() => void) | null = null;
+    let keepalive: ReturnType<typeof setInterval> | null = null;
+    function cleanup(): void {
+      if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+      if (keepalive) { clearInterval(keepalive); keepalive = null; }
+    }
+    // Tear down on ANY connection-end signal. A half-open socket (proxy/NAT drop without a
+    // clean 'close') would otherwise keep the subscription + interval alive, and EventSource
+    // reconnects open fresh ones — an unbounded subscriber/timer leak. res 'close'/'error'
+    // cover the cases req 'close' misses.
+    req.on("close", cleanup);
+    res.on("close", cleanup);
+    res.on("error", cleanup);
+
+    unsubscribe = connectionMap.subscribe(agentId, "chat.event", (data: unknown) => {
+      const envelope = data as { sessionId?: string; event?: Record<string, unknown> } | undefined;
+      if (!envelope?.event) return;
+      if (envelope.sessionId && envelope.sessionId !== sessionId) return;
+      sseWrite(res, "chat.event", envelope.event);
+    });
+
+    // Open the stream (fires the client's onopen) + a heartbeat so proxies don't reap the
+    // idle connection. EventSource auto-reconnects on drop, but a dropped window could miss
+    // a trigger — the heartbeat keeps it alive. unref so it never holds the process open.
+    res.write(": connected\n\n");
+    keepalive = setInterval(() => {
+      try { res.write(": keepalive\n\n"); } catch { cleanup(); }
+    }, 25_000);
+    keepalive.unref?.();
   });
 
   // POST /api/v1/siclaw/agents/:id/chat/steer — inject steer message

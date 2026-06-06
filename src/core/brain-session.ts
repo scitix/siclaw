@@ -58,6 +58,13 @@ export interface BrainSession {
   /** Interrupt mid-run and inject a user message. */
   steer(text: string): Promise<void>;
 
+  /**
+   * Queue a message delivered only after the agent finishes its current run (no
+   * pending tool calls or steering). Used to inject a background-job completion
+   * notification into an in-flight parent turn without interrupting it.
+   */
+  followUp(text: string): Promise<void>;
+
   /** Clear queued steer/followUp messages. */
   clearQueue(): { steering: string[]; followUp: string[] };
 

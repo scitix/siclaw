@@ -8,6 +8,7 @@ import {
   type CreateAgentSessionRuntimeFactory,
 } from "@mariozechner/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
+import { TuiBackgroundHost } from "./core/tui-background-host.js";
 import { isMemoryEnabled, loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
 import { needsSetup } from "./cli-setup.js";
 import { runFirstRunSetup } from "./cli-first-run.js";
@@ -188,6 +189,20 @@ const credentialsDir = portalCredentialsDir ?? path.resolve(process.cwd(), confi
 // Create session via shared factory. Opts are factored out so the runtime's
 // session-replacement factory (/new, /resume, /fork) can recreate an
 // equivalent siclaw session against a different SessionManager.
+// Background-job host for the TUI: owns the job registry and delivers completion
+// notifications back into the current session. Constructed before the session so its
+// executors can be injected; sessionRef is filled in once the session exists (and on
+// every session swap via createRuntime).
+const tuiBackgroundHost = new TuiBackgroundHost();
+// Background bash children are detached process-group leaders, so terminal SIGINT does
+// not reach them — sweep them on shutdown so they don't orphan in the host.
+{
+  const sweepJobs = () => tuiBackgroundHost.shutdown();
+  process.on("exit", sweepJobs);
+  process.on("SIGINT", sweepJobs);
+  process.on("SIGTERM", sweepJobs);
+}
+
 const buildSiclawOpts = (sm: SessionManager) => ({
   sessionManager: sm,
   mode: "cli" as const,
@@ -201,15 +216,21 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   portalActiveAgent: portalSnapshot?.activeAgent ?? null,
   portalAvailableAgents: portalSnapshot?.availableAgents ?? [],
   portalUrl: portalSnapshot?.portalUrl,
+  // TUI background bash + job_stop. (No spawnSubagentExecutor → background sub-agents
+  // stay TUI-unavailable; that needs the agentbox child-session machinery.)
+  backgroundExecExecutor: tuiBackgroundHost.createBackgroundExecExecutor(),
+  jobStopExecutor: tuiBackgroundHost.createJobStopExecutor(),
 });
 
 const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
   await createSiclawSession(buildSiclawOpts(sessionManager));
+tuiBackgroundHost.setSession(session);
 
 // pi 0.73 drives the TUI through an AgentSessionRuntime rather than a bare
 // AgentSession. The factory recreates a full siclaw session on session switch.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager: sm }) => {
   const recreated = await createSiclawSession(buildSiclawOpts(sm));
+  tuiBackgroundHost.setSession(recreated.session);
   return {
     session: recreated.session,
     services: recreated.services,

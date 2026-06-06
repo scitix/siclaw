@@ -22,7 +22,17 @@ import {
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type OutputAction = { type: "sanitize"; sanitize: (output: string) => string };
+/**
+ * `lineSafe` marks sanitizers that operate per complete line (split("\n") → map → join),
+ * so they can be applied incrementally to streamed output (background bash) without a
+ * cross-line leak. Structural sanitizers (JSON) need the whole document and are NOT
+ * line-safe — background bash rejects commands resolving to such an action.
+ */
+export type OutputAction = {
+  type: "sanitize";
+  sanitize: (output: string) => string;
+  lineSafe: boolean;
+};
 
 /** Rule function: analyze user command args, return action or null */
 export type OutputRuleFn = (args: string[]) => OutputAction | null;
@@ -80,7 +90,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (sub === "describe") {
     const resource = detectSensitiveResource(args);
     if (resource && resource !== "secret") {
-      return { type: "sanitize", sanitize: redactSensitiveContent };
+      return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
     }
     return null;
   }
@@ -95,7 +105,7 @@ OUTPUT_RULES["kubectl"] = (args) => {
 
   // -o json → structural sanitization (precise)
   if (fmt === "json") {
-    return { type: "sanitize", sanitize: makeKubectlJsonSanitizer(resource) };
+    return { type: "sanitize", sanitize: makeKubectlJsonSanitizer(resource), lineSafe: false };
   }
 
   // table / wide / name → safe, no sanitization needed
@@ -103,12 +113,20 @@ OUTPUT_RULES["kubectl"] = (args) => {
   if (!fmt || safeFormats.has(fmt)) return null;
 
   // All other formats (yaml, jsonpath, go-template, custom-columns) → line-level sanitization
-  return { type: "sanitize", sanitize: redactSensitiveContent };
+  return { type: "sanitize", sanitize: redactSensitiveContent, lineSafe: true };
 };
 
 // ── File-reading command rules ──────────────────────────────────────
 
 const REDACTED = "**REDACTED**";
+
+/**
+ * Advisory footer appended (once) by the line-based redactors when anything was
+ * redacted. Exported so streaming sanitization (background bash) can strip the
+ * per-batch duplicates — the inline **REDACTED** markers carry the actual security
+ * property; the footer is cosmetic.
+ */
+export const REDACTION_NOTICE = "\n\n⚠️ Sensitive values have been redacted for security.";
 
 /**
  * Redact sensitive content from file-reading command output.
@@ -154,13 +172,14 @@ export function redactSensitiveContent(output: string): string {
   });
 
   const sanitized = result.join("\n");
-  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
 }
 
 /** Rule for file-reading commands: always sanitize output */
 const fileReadingRule: OutputRuleFn = (_args) => ({
   type: "sanitize",
   sanitize: redactSensitiveContent,
+  lineSafe: true,
 });
 
 for (const cmd of [
@@ -202,17 +221,19 @@ function redactEnvOutput(output: string): string {
   });
 
   const sanitized = result.join("\n");
-  return redacted ? sanitized + "\n\n⚠️ Sensitive values have been redacted for security." : sanitized;
+  return redacted ? sanitized + REDACTION_NOTICE : sanitized;
 }
 
 OUTPUT_RULES["env"] = (_args) => ({
   type: "sanitize",
   sanitize: redactEnvOutput,
+  lineSafe: true,
 });
 
 OUTPUT_RULES["printenv"] = (_args) => ({
   type: "sanitize",
   sanitize: redactEnvOutput,
+  lineSafe: true,
 });
 
 // ── crictl inspect rules ────────────────────────────────────────────
@@ -268,7 +289,7 @@ function sanitizeCrictlInspect(output: string): string {
 OUTPUT_RULES["crictl"] = (args) => {
   const sub = args.find((a) => !a.startsWith("-"));
   if (sub === "inspect" || sub === "inspecti" || sub === "inspectp") {
-    return { type: "sanitize", sanitize: sanitizeCrictlInspect };
+    return { type: "sanitize", sanitize: sanitizeCrictlInspect, lineSafe: false };
   }
   return null;
 };

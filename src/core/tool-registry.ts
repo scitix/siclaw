@@ -111,13 +111,76 @@ export type SpawnSubagentExecutor = (
   signal?: AbortSignal,
 ) => Promise<SpawnSubagentResult>;
 
-export interface SubagentJobStopResult {
+export interface JobStopResult {
   stopped: boolean;
   message: string;
 }
 
-/** Cancels a running background sub-agent job (design §7: job_stop). */
-export type SubagentJobStopExecutor = (jobId: string) => Promise<SubagentJobStopResult>;
+/** Cancels a running background job — sub-agent OR bash (design §7: job_stop). */
+export type JobStopExecutor = (jobId: string) => Promise<JobStopResult>;
+
+// ── background exec (run_in_background on bash / node_exec / pod_exec) ──────
+
+/**
+ * A background-exec launch request. The calling tool assembles the FULLY-WRAPPED
+ * command and the sanitized env, plus the sanitizer resolved by preExecSecurity — the
+ * executor only spawns + streams + notifies, keeping all command/security construction
+ * in the tool.
+ *
+ * Two spawn modes (exactly one set):
+ *  - `command` (shell mode): run via `bash -c` — used by the local `bash` tool, whose
+ *    command may include `sudo -E -u sandbox …` wrapping.
+ *  - `file` + `args` (argv mode, no shell): used by node_exec/pod_exec to spawn
+ *    `kubectl exec … -- nsenter … <cmd>` without re-tokenizing/quoting the nested command.
+ */
+export interface BackgroundExecRequest {
+  /** Shell-mode command (bash). Mutually exclusive with file/args. */
+  command?: string;
+  /** argv-mode binary (node/pod). Mutually exclusive with command. */
+  file?: string;
+  args?: string[];
+  cwd?: string;
+  env: Record<string, string>;
+  /** Sanitizer from preExecSecurity. MUST be line-safe (caller rejects otherwise) or null. */
+  action: import("../tools/infra/output-sanitizer.js").OutputAction | null;
+  hasSensitiveKubectl: boolean;
+  description: string;
+  parentSessionId: string;
+  /** Tool-call id, reused as the jobId (matches spawn_subagent's spawnId convention). */
+  jobId: string;
+  /** True in K8s prod where the command is sudo-wrapped (bash shell mode only). */
+  isProd: boolean;
+  /** Job kind for the registry + concurrency accounting. Defaults to "bash". */
+  jobType?: "bash" | "node" | "pod";
+  /** Called exactly once when the job settles (completed/failed/killed), before notify.
+   *  node_exec uses it to unpin (release) the debug pod it acquired for the job. */
+  onComplete?: () => void;
+  /** Called by job_stop's abort BEFORE the local child is killed. node_exec uses it to
+   *  promptly kill the REMOTE process group (the local kubectl-exec kill does not reach a
+   *  host-namespace process). Best-effort, fire-and-forget. */
+  onAbort?: () => void;
+}
+
+export interface BackgroundExecResult {
+  jobId: string;
+  outputFile: string;
+}
+
+/**
+ * Launches a background exec job. Returns immediately (the process keeps running);
+ * completion is delivered to the parent model via the runtime's notify path. When
+ * absent, the `run_in_background` param is hidden from the model.
+ */
+export type BackgroundExecExecutor = (req: BackgroundExecRequest) => BackgroundExecResult;
+
+/**
+ * Wiring injected into a cmd-exec tool factory (bash / node_exec / pod_exec) to enable
+ * run_in_background: the executor + a ref to the live session id. Shared by all three tools.
+ */
+export interface BackgroundExecWiring {
+  executor?: BackgroundExecExecutor;
+  sessionIdRef?: { current: string };
+}
 
 /**
  * Callback a tool can invoke to push a custom event into the parent session's
@@ -153,8 +216,14 @@ export interface ToolRefs {
    * stays out of the resolved tool list so the model never sees a non-working tool.
    */
   spawnSubagentExecutor?: SpawnSubagentExecutor;
-  /** Cancels a running background sub-agent job (design §7). Enables the job_stop tool. */
-  subagentJobStopExecutor?: SubagentJobStopExecutor;
+  /** Cancels a running background job (sub-agent or bash). Enables the job_stop tool. */
+  jobStopExecutor?: JobStopExecutor;
+  /**
+   * Launches a background exec job (run_in_background on bash / node_exec / pod_exec).
+   * When absent, the `run_in_background` param is not exposed on those tools. Injected by
+   * the agentbox session manager and the TUI background host.
+   */
+  backgroundExecExecutor?: BackgroundExecExecutor;
 }
 
 /** Declarative registration for a single tool. */
