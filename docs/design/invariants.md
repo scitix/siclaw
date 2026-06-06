@@ -396,6 +396,18 @@ Test runner:    vitest
 
 ---
 
+## 10b. Background Jobs
+
+Two background modes (bash command, sub-agent) share one core; see tools.md §9, sanitization.md §6b.
+
+- **Notify exactly once**: `JobRegistry.claimNotification(jobId)` is the single-fire latch. The process-exit handler and `job_stop` race to send a completion `<task_notification>`; exactly one wins. No double-notify, no dropped notify.
+- **No concurrent parent prompts**: the idle-notification path (`runSyntheticPrompt`) acquires the SAME `_promptDone`/`_promptInflight` mutex an HTTP `/prompt` uses, set synchronously before any await. An interleaving `/prompt` either started first (synthetic path degrades to `followUp`) or hits the 409 busy guard — two concurrent `brain.prompt()` is unrepresentable.
+- **Model never reads unsanitized background output**: background bash output is sanitized per complete line on write (line-safe `OutputAction`s only); structural (JSON) sanitizers are rejected for background mode. The output file is created and written solely by the node main process under `userDataDir`, `O_NOFOLLOW`.
+- **Session stays alive while work runs**: `_backgroundWorkCount` defers agentbox session release until all background jobs of that session finish.
+- **TUI scope**: the TUI wires background **bash + node_exec + pod_exec** (one shared `spawnBackgroundBash` executor handles both the shell and kubectl-exec argv forms); only background **sub-agents** are unavailable, as they require the agentbox child-session machinery.
+
+---
+
 ## 11. mTLS Scope
 
 **Invariant**: mTLS is used **only between Gateway and AgentBox in K8s mode**. It is not used in LocalSpawner mode (same-machine, in-process) or TUI mode (no network).

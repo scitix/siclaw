@@ -2,11 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import { createJobStopTool } from "./job-stop.js";
 import type { ToolRefs } from "../../core/tool-registry.js";
 
-function makeRefs(executor: ToolRefs["subagentJobStopExecutor"]): ToolRefs {
+function makeRefs(executor: ToolRefs["jobStopExecutor"]): ToolRefs {
   return {
     kubeconfigRef: {} as any, userId: "u", agentId: "a", sessionIdRef: { current: "s" },
     taskListId: "tl", memoryRef: {} as any, dpStateRef: {} as any,
-    subagentJobStopExecutor: executor,
+    jobStopExecutor: executor,
   };
 }
 const text = (r: any) => (r.content[0] as any).text as string;

@@ -1,9 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# Ping a pod's gateway for a given network interface.
-# Runs via node_script with netns param (ip netns exec into pod's netns).
-# Network namespace = pod's; host tools available.
+# Find and ping the gateway for a given network interface.
+# Auto-detects the gateway IP from the routing table, then pings it.
+# Identical logic for a node or a pod — the network namespace is selected by
+# the node_script `netns=` param (or host namespace when omitted), not here.
 
 IFACE=""
 SRC_MODE=""

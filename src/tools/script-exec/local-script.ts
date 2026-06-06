@@ -51,14 +51,14 @@ export function createLocalScriptTool(
 Skills have helper scripts under their scripts/ directory. Use this tool to run them instead of calling bash directly.
 
 Parameters:
-- skill: Skill name (e.g. "find-node", "roce-perftest-pod")
-- script: Script filename (e.g. "find-node.sh", "run-perftest.py")
+- skill: Skill name (e.g. "volcano-queue-diagnose", "roce-perftest-pod")
+- script: Script filename (e.g. "diagnose-queue.sh", "run-perftest.py")
 - args: Optional command-line arguments
 - cluster: Cluster name (use cluster_list to discover). Omit for non-Kubernetes work or to use the default cluster when only one is available.
 - timeout_seconds: Timeout (default: 180, max: 300)
 
 Examples:
-- skill: "find-node", script: "find-node.sh", args: "A100"
+- skill: "volcano-queue-diagnose", script: "diagnose-queue.sh"
 - skill: "roce-perftest-pod", script: "run-perftest.py", args: "--server-pod srv --client-pod cli --server-ns ns --client-ns ns"
 - skill: "roce-check-node-config", script: "check-node-config.py", args: "--node node1 --mode sriov-switchdev"
 
@@ -67,10 +67,10 @@ Do NOT use the bash tool to run skill scripts locally. Always use this tool inst
 Read the skill's SKILL.md first to understand required parameters and usage.`,
     parameters: Type.Object({
       skill: Type.String({
-        description: "Skill name (e.g. 'find-node', 'roce-perftest-pod')",
+        description: "Skill name (e.g. 'volcano-queue-diagnose', 'roce-perftest-pod')",
       }),
       script: Type.String({
-        description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md (e.g. 'find-node.sh', 'run-perftest.py'). Use it verbatim — do not guess or modify the name.",
+        description: "Exact script filename from the skill's scripts/ directory, as listed in its SKILL.md (e.g. 'diagnose-queue.sh', 'run-perftest.py'). Use it verbatim — do not guess or modify the name.",
       }),
       args: Type.Optional(
         Type.String({

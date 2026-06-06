@@ -308,7 +308,7 @@ Loaded from `skills/core/meta.json` during startup sync:
 ```json
 {
   "labels": {
-    "find-node": ["kubernetes", "general", "diagnostic"],
+    "node-logs": ["kubernetes", "general", "diagnostic"],
     "dns-debug": ["kubernetes", "network", "diagnostic"]
   }
 }

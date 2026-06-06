@@ -33,7 +33,31 @@ export interface SubagentType {
  * Flip to `true` only after implementing that notification — then the param, the
  * job_stop tool, and the prompt guidance all return automatically.
  */
-export const RUN_IN_BACKGROUND_ENABLED = false;
+export const RUN_IN_BACKGROUND_ENABLED = true;
+
+/**
+ * Master switch for background bash (`run_in_background` on the `bash` tool) and its
+ * share of the `job_stop` tool. Independent of {@link RUN_IN_BACKGROUND_ENABLED} so the
+ * two modes can be rolled back separately even though they ship together. When OFF, the
+ * `run_in_background` param is not exposed on the bash tool.
+ */
+export const BACKGROUND_BASH_ENABLED = true;
+
+/** Default cap on background bash commands running concurrently in one AgentBox. */
+export const DEFAULT_BACKGROUND_BASH_CONCURRENCY = 4;
+
+/**
+ * Max background bash commands allowed to run at once within a single AgentBox, from
+ * `SICLAW_BACKGROUND_BASH_CONCURRENCY` (default {@link DEFAULT_BACKGROUND_BASH_CONCURRENCY}).
+ * Bounds detached processes per pod; past the cap, restricted-bash falls back to a
+ * foreground run with a note. Invalid / non-positive values fall back to the default.
+ */
+export function getBackgroundBashConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.SICLAW_BACKGROUND_BASH_CONCURRENCY;
+  if (raw == null || raw.trim() === "") return DEFAULT_BACKGROUND_BASH_CONCURRENCY;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_BACKGROUND_BASH_CONCURRENCY;
+}
 
 /** Default cap on sub-agent child sessions running concurrently in one AgentBox. */
 export const DEFAULT_SUBAGENT_CONCURRENCY = 2;

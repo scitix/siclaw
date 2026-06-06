@@ -40,7 +40,7 @@ export function createResolvePodNetnsTool(kubeconfigRef?: KubeconfigRef, userId?
 
 Returns the node name and netns name so you can use them with node_exec or node_script:
   node_exec(node=<node>, netns=<netns>, command="ip addr show")
-  node_script(node=<node>, netns=<netns>, skill="pod-ping-gateway", script="ping.sh")
+  node_script(node=<node>, netns=<netns>, skill="gateway-diagnostics", script="ping-gateway.sh")
 
 This is a prerequisite for running host tools in a pod's network namespace.
 The result can be reused for multiple commands on the same pod.

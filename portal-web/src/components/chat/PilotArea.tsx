@@ -2150,6 +2150,25 @@ function AgentWorkBatchRow({ task }: { task: AgentWorkBatchTask }) {
 function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const isOpen = message.isStreaming || expanded
+  // node_exec / pod_exec / bash launched with run_in_background return immediately and
+  // notify on completion. The job's completion is folded back onto this box as bgStatus
+  // (see annotateExecJobCompletions), so the box shows its lifecycle: running → done/failed.
+  const isBackground = (message.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true
+  const bgStatus = isBackground ? ((message.metadata as Record<string, unknown> | undefined)?.bgStatus as string | undefined) : undefined
+  const bgExitCode = (message.metadata as Record<string, unknown> | undefined)?.bgExitCode
+  const bgRunning = isBackground && !bgStatus
+  const bgFailed = bgStatus === "failed"
+  const bgStopped = bgStatus === "stopped" || bgStatus === "killed"
+  const bgDone = isBackground && !!bgStatus && !bgFailed && !bgStopped
+  const bgExitLabel = typeof bgExitCode === "number" ? ` (exit ${bgExitCode})` : ""
+  // The expanded body re-prints toolInput only when the single-line header can't
+  // already show it in full: multi-line input (a heredoc / multi-statement command)
+  // or a very long one-liner the header truncates. For short single-line inputs
+  // (a `read`/`grep`/`glob` path), the header already shows the whole thing, so the
+  // body echo is pure duplication — skip it. The header copy button grabs full text
+  // either way.
+  const showInputBody =
+    !!message.toolInput && (message.toolInput.includes("\n") || message.toolInput.length > 100)
 
   return (
     <div className={nested ? "min-w-0" : "pl-12 min-w-0"}>
@@ -2177,6 +2196,15 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
           />
           <Terminal className="w-4 h-4 text-muted-foreground shrink-0" />
           <span className="font-mono text-xs font-semibold text-foreground shrink-0">{message.toolName}</span>
+          {isBackground && (
+            <span
+              className="shrink-0 inline-flex text-muted-foreground/70"
+              title="后台执行:立即返回,完成后自动通知"
+              aria-label="后台执行"
+            >
+              <Clock className="w-3.5 h-3.5" />
+            </span>
+          )}
           {message.toolInput && (
             <span
               className="font-mono text-xs text-muted-foreground truncate min-w-0 select-text cursor-text"
@@ -2210,31 +2238,50 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
                 className=""
               />
             )}
-            {message.toolStatus === "running" && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
-            {message.toolStatus === "success" && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
-            {message.toolStatus === "error" && <XCircle className="w-3.5 h-3.5 text-red-500" />}
-            {message.toolStatus === "aborted" && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+            {isBackground ? (
+              // Background launch: show the JOB's lifecycle (folded from its completion),
+              // not the launch call's own status (which is always "success" at launch).
+              <>
+                {bgRunning && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
+                {bgDone && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
+                {bgFailed && <XCircle className="w-3.5 h-3.5 text-red-500" />}
+                {bgStopped && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+              </>
+            ) : (
+              <>
+                {message.toolStatus === "running" && <Loader2 className="w-3 h-3 animate-spin text-blue-400" />}
+                {message.toolStatus === "success" && <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />}
+                {message.toolStatus === "error" && <XCircle className="w-3.5 h-3.5 text-red-500" />}
+                {message.toolStatus === "aborted" && <Ban className="w-3.5 h-3.5 text-amber-500" />}
+              </>
+            )}
           </div>
         </div>
         {isOpen && (
           <div className="overflow-x-auto bg-secondary/30 max-h-80 overflow-y-auto">
-            {message.toolInput && (
+            {showInputBody && (
               <div className="relative group/input px-4 pt-3 pb-2 border-b border-border/50">
+                {/* No copy button here — the header already copies the command. */}
                 <pre className="text-xs font-mono leading-relaxed text-foreground whitespace-pre-wrap break-all pr-8">
                   {message.toolInput}
                 </pre>
-                <CopyIconButton
-                  text={message.toolInput}
-                  title="Copy command"
-                  className="absolute top-2 right-2"
-                />
               </div>
             )}
             <div className="relative group/output p-4">
               <pre className="text-xs font-mono leading-relaxed text-muted-foreground whitespace-pre-wrap pr-8">
-                {message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running...")}
+                {isBackground
+                  ? (bgRunning
+                      ? "在后台运行中…(完成后此处更新)"
+                      : bgFailed
+                        ? `后台任务失败${bgExitLabel}`
+                        : bgStopped
+                          ? "后台任务已停止"
+                          : `后台任务完成${bgExitLabel}`)
+                  : (message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running..."))}
               </pre>
-              {message.content && (
+              {/* Output copy only for a real captured output — a background box's body is a
+                  status line, not output (the real output is read via the read tool). */}
+              {!isBackground && message.content && (
                 <CopyIconButton
                   text={message.content}
                   title="Copy output"

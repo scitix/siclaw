@@ -1,4 +1,5 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { Type } from "@sinclair/typebox";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
@@ -24,6 +25,7 @@ import {
   validateShellOperators as _validateShellOperators,
 } from "../infra/command-validator.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 
 const execAsync = promisify(exec);
 
@@ -235,9 +237,16 @@ interface RestrictedBashParams {
   command: string;
   cluster?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
-export function createRestrictedBashTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createRestrictedBashTool(
+  kubeconfigRef?: KubeconfigRef,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  // run_in_background is exposed to the model only when the master switch is on AND a
+  // runtime executor was injected — otherwise the param stays out of the schema.
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "bash",
     label: "Bash",
@@ -270,7 +279,9 @@ Examples:
 - With pipe: "kubectl get pods -n default | grep -i error"
 - Logs: "kubectl logs my-pod --tail=500 | grep ERROR"
 - JSON query: "kubectl get pod my-pod -o json | jq '.status.conditions'"
-- Skill scripts: "python3 skills/core/roce-perftest-pod/scripts/run-perftest.py --server-pod pod-a --client-pod pod-b --server-ns ns --client-ns ns"
+- Skill scripts: "python3 skills/core/<skill>/scripts/run.py --flag value"
+
+For long node-side work (e.g. RDMA perftest打流: a server on node A, a client on node B), do NOT hand-roll shell '&' here — use node_exec with run_in_background (it runs the command on the node, streams output to a file, and notifies you on completion).
 
 Prefer kubectl built-in filtering (-l, --field-selector, -o jsonpath, -o custom-columns) over piping to grep when possible.
 Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
@@ -290,8 +301,24 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
           description: "Timeout in seconds (default: 60, max: 300)",
         })
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the command in the background instead of waiting. Returns immediately with a " +
+                  "task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT call " +
+                  "read (or any other tool) to check on it, and do NOT sleep or wait. You will be " +
+                  "automatically notified when it completes; ONLY THEN read the output_file. Polling " +
+                  "the file before the notification just wastes turns (it will not be there yet). Use " +
+                  "for long-running work (perftest, follow logs, big collections). Output that needs " +
+                  "structural (JSON) redaction cannot run in the background — use -o wide/name or run foreground.",
+              })
+            ),
+          }
+        : {}),
     }),
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as RestrictedBashParams;
       const command = params.command.trim();
 
@@ -356,33 +383,64 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
       const timeout = Math.min(params.timeout_seconds ?? defaultTimeout, 300) * 1000;
 
+      // Sanitized env + KUBECONFIG injection — identical for foreground and background.
+      const isProd = process.env.NODE_ENV === "production";
+      const env: Record<string, string> = {
+        ...sanitizeEnv(process.env as Record<string, string>),
+        SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
+        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+        // KUBECONFIG from the resolved `cluster` param (see above): the cluster's
+        // kubeconfig when set, else /dev/null. Inline --kubeconfig is rejected by
+        // validation, so the `cluster` param is the only way to select a cluster.
+        KUBECONFIG: selectedKubeconfigPath,
+      };
+
+      // In production (K8s pods), run child processes as the sandbox user.
+      // sudo's SUID elevates to root, then drops to sandbox; -E preserves our
+      // sanitized env (allowed by SETENV in sudoers).
+      let execCommand = command;
+      if (isProd) {
+        const escaped = command.replace(/'/g, "'\\''");
+        execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
+      }
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Hand the fully-wrapped command to the runtime executor and return immediately.
+      // The model reads progress via `read` on output_file and is notified on completion.
+      if (backgroundEnabled && params.run_in_background === true) {
+        // Structural (JSON) sanitizers are not line-safe and cannot be streamed
+        // per line without risking a leak — reject background mode for them.
+        if (pre.action && !pre.action.lineSafe) {
+          return backgroundNotLineSafeError();
+        }
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            command: execCommand,
+            env,
+            cwd: process.cwd(),
+            action: pre.action,
+            hasSensitiveKubectl: pre.hasSensitiveKubectl,
+            description: command.length > 80 ? command.slice(0, 77) + "…" : command,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running in the background.");
+        } catch (err) {
+          // Concurrency cap (or executor failure) → fall through to a foreground run
+          // so the command still executes, with a note for the model.
+          console.warn(`[restricted-bash] background launch declined, running foreground:`, err);
+        }
+      }
+
       try {
         const execOpts = {
           timeout,
           maxBuffer: 1024 * 1024 * 10,
           shell: "/bin/bash",
           detached: true, // make child a process group leader for clean group kill
-          env: {
-            ...sanitizeEnv(process.env as Record<string, string>),
-            SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
-            ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            // KUBECONFIG from the resolved `cluster` param (see above): the cluster's
-            // kubeconfig when set, else /dev/null. Inline --kubeconfig is rejected by
-            // validation, so the `cluster` param is the only way to select a cluster.
-            KUBECONFIG: selectedKubeconfigPath,
-          },
+          env,
         };
-
-        const finalCommand = command;
-
-        // In production (K8s pods), run child processes as sandbox user.
-        // sudo's SUID elevates to root, then drops to sandbox.
-        // -E preserves our sanitized env (allowed by SETENV in sudoers).
-        let execCommand = finalCommand;
-        if (process.env.NODE_ENV === "production") {
-          const escaped = finalCommand.replace(/'/g, "'\\''");
-          execCommand = `sudo -E -u sandbox -- bash -c '${escaped}'`;
-        }
 
         const child = exec(execCommand, execOpts as any);
 
@@ -424,5 +482,9 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  create: (refs) => createRestrictedBashTool(refs.kubeconfigRef),
+  create: (refs) =>
+    createRestrictedBashTool(refs.kubeconfigRef, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

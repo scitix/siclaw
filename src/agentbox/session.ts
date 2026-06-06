@@ -24,11 +24,14 @@ import type {
   SpawnSubagentRequest,
   SpawnSubagentResult,
   SpawnSubagentStatus,
-  SubagentJobStopExecutor,
-  SubagentJobStopResult,
+  JobStopExecutor,
+  BackgroundExecExecutor,
   AgentMode,
 } from "../core/tool-registry.js";
-import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs } from "../core/subagent-registry.js";
+import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency } from "../core/subagent-registry.js";
+import { JobRegistry, type JobStatus } from "../core/job-registry.js";
+import { buildNotificationBatch, type TaskNotification } from "../core/task-notification.js";
+import { spawnBackgroundBash } from "../core/background-bash-runner.js";
 import { ConcurrencyLimiter } from "../core/concurrency-limiter.js";
 import { buildDelegateSummaryBundle } from "./delegation-summary.js";
 import type { KubeconfigRef, SessionMode, DpStateRef } from "../core/types.js";
@@ -123,6 +126,14 @@ export interface ManagedSession {
   _extraEventSubs: Set<(event: Record<string, unknown>) => void>;
   /** Buffer of extra events fired before an SSE client connects (replayed on connect, like _eventBuffer for brain events). */
   _extraEventBuffer: Record<string, unknown>[];
+  /**
+   * Completion notifications claimed but not yet delivered, plus a short coalescing timer.
+   * A burst of background jobs finishing close together (e.g. an RDMA server + client) is
+   * delivered as ONE synthetic turn instead of N — so the model reacts once rather than
+   * re-summarizing per completion. See notifyParent / flushPendingNotifications.
+   */
+  _pendingNotifications: TaskNotification[];
+  _coalesceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface PersistedDpStateSnapshot {
@@ -131,6 +142,15 @@ export interface PersistedDpStateSnapshot {
 
 /** Delay before releasing an idle session (seconds). Gives frontend time to query context/model. */
 const SESSION_RELEASE_TTL_MS = 30_000;
+/**
+ * Window for coalescing background-job completion notifications when the parent is idle.
+ * A burst finishing within this window becomes ONE synthetic turn. Short enough to be
+ * imperceptible for background work, well under SESSION_RELEASE_TTL_MS so the synthetic
+ * turn (which clears the release timer) always wins the race.
+ */
+const NOTIFICATION_COALESCE_MS = 600;
+/** One-time guard for the "synthetic turn can't persist" diagnostic (see runSyntheticPrompt). */
+let warnedNoPersist = false;
 /** Delay before auto-clearing a fully-completed plan (CC V2 parity: HIDE_DELAY_MS). */
 const LEDGER_AUTOCLEAR_MS = 5_000;
 const DELEGATED_AGENT_MAX_RUNTIME_MS = getSubagentMaxRuntimeMs();
@@ -289,15 +309,11 @@ export class AgentBoxSessionManager {
    */
   private subagentLimiter = new ConcurrencyLimiter(getSubagentConcurrency());
 
-  /** In-flight + recent background sub-agent jobs, keyed by jobId (= spawn tool call id). */
-  private subagentJobs = new Map<string, {
-    jobId: string;
-    childSessionId: string;
-    status: "running" | "stopped" | SpawnSubagentStatus;
-    description: string;
-    abort?: () => void;
-    startedAt: number;
-  }>();
+  /**
+   * Unified background-job registry (sub-agents + bash), keyed by jobId.
+   * Replaces the old inline subagentJobs map; shared by notifyParent / job_stop.
+   */
+  private jobs = new JobRegistry();
 
   private createSpawnSubagentExecutor(): SpawnSubagentExecutor {
     return async (request, onProgress, signal) => {
@@ -334,25 +350,83 @@ export class AgentBoxSessionManager {
     };
   }
 
-  private createSubagentJobStopExecutor(): SubagentJobStopExecutor {
-    return async (jobId) => this.stopSubagentJob(jobId);
+  private createJobStopExecutor(): JobStopExecutor {
+    // Shared stop logic lives on JobRegistry (same as the TUI path).
+    return async (jobId) => this.jobs.stopJob(jobId);
+  }
+
+  /**
+   * Background exec executor (run_in_background on bash / node_exec / pod_exec). Injected
+   * into ToolRefs; the calling tool hands over the already-assembled command. Throws when
+   * the per-session concurrency cap is reached so the tool falls back to foreground.
+   */
+  private createBackgroundExecExecutor(): BackgroundExecExecutor {
+    return (req) => {
+      const cap = getBackgroundBashConcurrency();
+      // Cap counts ALL background exec jobs (bash/node/pod), not sub-agents.
+      const running = this.jobs
+        .list(req.parentSessionId)
+        .filter((j) => j.type !== "subagent" && j.status === "running").length;
+      if (running >= cap) {
+        throw new Error(
+          `Background exec concurrency cap reached (${running}/${cap}); run this command in the foreground.`,
+        );
+      }
+
+      const parent = this.sessions.get(req.parentSessionId);
+      if (parent) {
+        parent._backgroundWorkCount++;
+        if (parent._releaseTimer) {
+          clearTimeout(parent._releaseTimer);
+          parent._releaseTimer = null;
+        }
+      }
+
+      // Pair the increment with the decrement: if spawnBackgroundBash throws
+      // synchronously (e.g. SanitizingLineBuffer fail-closed, spawn EACCES) the job's
+      // close/error handlers never wire onSettled, so undo the increment here — otherwise
+      // _backgroundWorkCount leaks and the session can never be released.
+      try {
+        return spawnBackgroundBash(
+          req,
+          this.jobs,
+          (jobId, n) => void this.notifyParent(req.parentSessionId, jobId, n),
+          () => this.releaseBackgroundWork(req.parentSessionId),
+        );
+      } catch (err) {
+        this.releaseBackgroundWork(req.parentSessionId);
+        throw err;
+      }
+    };
+  }
+
+  /** Decrement a parent's background-work count and re-arm release once idle. */
+  private releaseBackgroundWork(parentSessionId: string): void {
+    const current = this.sessions.get(parentSessionId);
+    if (!current) return;
+    current._backgroundWorkCount = Math.max(0, current._backgroundWorkCount - 1);
+    if (current._backgroundWorkCount === 0 && current._promptDone) {
+      this.scheduleRelease(current.id);
+    }
   }
 
   /**
    * Launch a sub-agent detached (design §7). Returns immediately with status
-   * "launched"; the child's terminal event (persisted to the parent session by
-   * runSpawnedSubagent) is the completion notification. Background work blocks
-   * session release until it finishes.
+   * "launched"; on completion notifyParent injects a <task_notification> into the
+   * parent model. Background work blocks session release until it finishes.
    */
   private startBackgroundSubagent(request: SpawnSubagentRequest): SpawnSubagentResult {
     const childSessionId = randomUUID();
     const jobId = request.spawnId;
-    this.subagentJobs.set(jobId, {
+    this.jobs.register({
       jobId,
+      type: "subagent",
+      parentSessionId: request.parentSessionId,
       childSessionId,
       status: "running",
       description: request.description,
       startedAt: Date.now(),
+      notified: false,
     });
 
     const parent = this.sessions.get(request.parentSessionId);
@@ -366,23 +440,41 @@ export class AgentBoxSessionManager {
 
     void this.runSpawnedSubagent(request, { childSessionId, jobId })
       .then((res) => {
-        const job = this.subagentJobs.get(jobId);
-        if (job && job.status === "running") job.status = res.status;
+        const job = this.jobs.get(jobId);
+        const status: JobStatus =
+          job?.status === "stopped"
+            ? "stopped"
+            : res.status === "launched"
+              ? "running"
+              : res.status; // SpawnSubagentStatus terminal ⊂ JobStatus
+        this.jobs.setStatus(jobId, status);
+        const summary =
+          job?.status === "stopped"
+            ? `Sub-agent "${request.description}" was stopped`
+            : res.status === "launched"
+              ? `Sub-agent "${request.description}" finished`
+              : `Sub-agent "${request.description}" ${res.status}: ${res.summary}`;
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status,
+          summary,
+        });
       })
       .catch((err) => {
         console.warn(`[agentbox-session] background sub-agent ${jobId} failed:`, err);
-        const job = this.subagentJobs.get(jobId);
-        if (job && job.status === "running") job.status = "failed";
+        // Honor a user job_stop: a rejection AFTER stop is a "stopped" outcome, not a
+        // spurious "failed" notification (mirrors the .then path).
+        const stopped = this.jobs.get(jobId)?.status === "stopped";
+        this.jobs.setStatus(jobId, stopped ? "stopped" : "failed");
+        void this.notifyParent(request.parentSessionId, jobId, {
+          taskId: jobId,
+          status: stopped ? "stopped" : "failed",
+          summary: stopped
+            ? `Sub-agent "${request.description}" was stopped`
+            : `Sub-agent "${request.description}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
       })
-      .finally(() => {
-        const current = this.sessions.get(request.parentSessionId);
-        if (current) {
-          current._backgroundWorkCount = Math.max(0, current._backgroundWorkCount - 1);
-          if (current._backgroundWorkCount === 0 && current._promptDone) {
-            this.scheduleRelease(current.id);
-          }
-        }
-      });
+      .finally(() => this.releaseBackgroundWork(request.parentSessionId));
 
     return {
       status: "launched",
@@ -391,19 +483,245 @@ export class AgentBoxSessionManager {
     };
   }
 
-  private async stopSubagentJob(jobId: string): Promise<SubagentJobStopResult> {
-    const job = this.subagentJobs.get(jobId);
-    if (!job) return { stopped: false, message: `No background job "${jobId}".` };
-    if (job.status !== "running") return { stopped: false, message: `Job "${jobId}" is not running (${job.status}).` };
-    if (!job.abort) return { stopped: false, message: `Job "${jobId}" is starting up; try again shortly.` };
-    job.abort();
-    job.status = "stopped";
-    return { stopped: true, message: `Stopping background sub-agent "${jobId}".` };
+  /**
+   * Inject a completed background job's <task_notification> into the parent model.
+   *  - claimNotification dedups (job_stop vs process-exit race → exactly one notice).
+   *  - Parent run in-flight → flush now via followUp (rides the current turn).
+   *  - Parent idle → buffer + a short coalescing window, so a burst of completions becomes
+   *    ONE synthetic turn (the model reacts once instead of re-summarizing per job).
+   */
+  private async notifyParent(
+    sessionId: string,
+    jobId: string,
+    n: TaskNotification,
+  ): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return; // session released — nothing to notify (rare; release is deferred while work pending)
+    if (!this.jobs.claimNotification(jobId)) return;
+
+    // Surface the completion in the launching tool's OWN box, not as a chat bubble: persist a
+    // hidden exec_job_event (correlated to the launch by jobId) and fire a refetch so the box
+    // flips running → done/failed live and on reload. Exec jobs only (sub-agents have their
+    // own Jobs-bar fold). Independent of the model turn below.
+    const job = this.jobs.get(jobId);
+    if (job && job.type !== "subagent") {
+      void this.persistExecJobEvent(sessionId, jobId, n.status, job.exitCode);
+    }
+
+    // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
+    // via the synthetic-turn path (never followUp): the completion itself already shows in the
+    // tool box (exec_job_done above), and a followUp's acknowledgement rides the running turn
+    // where it can't be suppressed. The synthetic path drops pure acks (no tool call).
+    managed._pendingNotifications.push(n);
+    if (!managed._coalesceTimer) {
+      managed._coalesceTimer = setTimeout(() => {
+        void this.flushPendingNotifications(sessionId);
+      }, NOTIFICATION_COALESCE_MS);
+      managed._coalesceTimer.unref?.();
+    }
+  }
+
+  /**
+   * Deliver all buffered completion notifications as a single message. In-flight → followUp
+   * (rides the turn); idle → one synthetic turn. Re-fetches the session because the
+   * coalescing window may outlive it (released) — a no-op then. followUp rejection falls
+   * back to a synthetic turn so a notice is never lost (the latch is already spent).
+   */
+  private async flushPendingNotifications(sessionId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId);
+    if (!managed) return;
+    if (managed._coalesceTimer) {
+      clearTimeout(managed._coalesceTimer);
+      managed._coalesceTimer = null;
+    }
+    if (!managed._promptDone) {
+      // A turn is running — wait for it to finish, then deliver as a synthetic turn (where a
+      // pure-ack reaction is suppressed). Re-arm rather than followUp: a followUp's ack rides
+      // the running turn and can't be suppressed. The box already updated live, so the user
+      // isn't waiting on this; only the model's optional reaction is deferred.
+      managed._coalesceTimer = setTimeout(() => {
+        void this.flushPendingNotifications(sessionId);
+      }, NOTIFICATION_COALESCE_MS);
+      managed._coalesceTimer.unref?.();
+      return;
+    }
+    const batch = managed._pendingNotifications.splice(0);
+    if (batch.length === 0) return;
+    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
+  }
+
+  /**
+   * Run a notification as a synthetic parent turn when the parent is idle. Serialized
+   * via _syntheticPromptQueue; acquires the SAME _promptDone/_promptInflight mutex that
+   * HTTP /prompt uses, SYNCHRONOUSLY before any await — so an interleaving /prompt either
+   * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
+   * the TOCTOU documented at the _promptInflight declaration.
+   */
+  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
+    const run = (managed._syntheticPromptQueue ?? Promise.resolve())
+      .catch(() => {})
+      .then(async () => {
+        // Re-check under the queue: an HTTP /prompt may have started since notifyParent
+        // decided "idle". If so, degrade to followUp (delivered to that running turn).
+        if (!managed._promptDone || managed._promptInflight) {
+          await managed.brain.followUp(text);
+          return;
+        }
+        // Acquire the mutex synchronously (no await between check and set).
+        managed._promptDone = false;
+        managed._aborted = false;
+        // Cancel any pending release timer (mirrors getOrCreate): a background job's
+        // onSettled may have armed scheduleRelease just before this turn started — left
+        // running, release() would tear the session down mid-synthetic-turn (it has no
+        // in-flight guard). Both run in this same tick, so clearing here always wins.
+        if (managed._releaseTimer) {
+          clearTimeout(managed._releaseTimer);
+          managed._releaseTimer = null;
+        }
+        let release!: () => void;
+        managed._promptInflight = new Promise<void>((r) => { release = r; });
+        // Buffer events so a reconnecting SSE client can replay the synthetic turn.
+        // The /send SSE consumer is already gone (turn 1 closed it), so the synthetic
+        // turn has NO gateway consumer — persist + live-emit its completed messages
+        // ourselves (via the delegation channel) so the notification + the model's
+        // reaction appear in chat history (refresh) and live in a connected session.
+        managed._eventBuffer = [];
+        if (managed._bufferUnsub) managed._bufferUnsub();
+        const sid = managed.id;
+        // delegation.append_message / emit_chat_event auth is agent+session based and does
+        // NOT need userId (the agentbox often has SICLAW_AGENT_ID but no USER_ID env), so
+        // gate only on gatewayClient + agentId.
+        const canPersist = Boolean(this.gatewayClient && this.agentId);
+        // P3.7: if we can't persist, the synthetic turn runs but neither persists nor fires
+        // the live `background_turn_done` trigger, so the user never sees the background
+        // job's completion (it's effectively lost). That only happens when gatewayClient /
+        // agentId aren't wired — a deployment misconfig. Surface it once so it's diagnosable
+        // instead of a silent disappearance.
+        if (!canPersist && !warnedNoPersist) {
+          warnedNoPersist = true;
+          console.warn(
+            "[agentbox-session] background-job completion turns cannot be persisted/delivered " +
+            `(gatewayClient=${Boolean(this.gatewayClient)}, agentId=${Boolean(this.agentId)}). ` +
+            "Set SICLAW_AGENT_ID and wire the gateway client so completions survive a refresh.",
+          );
+        }
+        // Buffer the turn's messages and whether it did any real work (a tool call). We
+        // persist at turn end, conditionally — a reaction with NO tool call is a pure
+        // acknowledgement and is dropped (no bubble); see the finally block.
+        const turnMessages: any[] = [];
+        let turnHadTool = false;
+        const brainUnsub = managed.brain.subscribe((event: any) => {
+          if (!managed._promptDone) managed._eventBuffer.push(event);
+          if (event?.type === "tool_execution_start") turnHadTool = true;
+          if (event?.type === "message_end" && event.message) {
+            if (event.message.role === "toolResult") turnHadTool = true;
+            turnMessages.push(event.message);
+          }
+        });
+        managed._bufferUnsub = () => brainUnsub();
+        try {
+          await managed.brain.prompt(text);
+        } catch (err) {
+          console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
+        } finally {
+          managed._promptDone = true;
+          if (managed._bufferUnsub) { managed._bufferUnsub(); managed._bufferUnsub = null; }
+          for (const cb of managed._promptDoneCallbacks) { try { cb(); } catch { /* ignore */ } }
+          managed._promptDoneCallbacks.clear();
+          managed._promptInflight = null;
+          release();
+          if (managed._backgroundWorkCount === 0) this.scheduleRelease(managed.id);
+          // Show the model's reaction ONLY if it actually DID something (made a tool call).
+          // A reaction with no tool call is a pure acknowledgement ("nothing new") — drop it
+          // so it doesn't add a noise bubble; the completion is already surfaced in the
+          // launching tool's own box (exec_job_event). A data-bearing summary necessarily
+          // reads the output first (a tool call), so this never hides real information.
+          // When kept, persist the whole turn then fire a refetch so the frontend shows it.
+          if (canPersist && turnHadTool) {
+            void Promise.allSettled(
+              turnMessages.map((m) => this.persistSyntheticMessage(sid, m).catch(() => {})),
+            ).then(() =>
+              this.persistDelegationEvent({
+                type: "delegation.emit_chat_event",
+                sessionId: sid,
+                event: { type: "background_turn_done", sessionId: sid },
+              }).catch(() => {}),
+            );
+          }
+        }
+      });
+    managed._syntheticPromptQueue = run.finally(() => {
+      if (managed._syntheticPromptQueue === run) managed._syntheticPromptQueue = null;
+    });
+    return run;
   }
 
   private async persistDelegationEvent(event: DelegationPersistenceEvent): Promise<DelegationPersistenceResponse> {
     if (!this.gatewayClient) return { ok: false };
     return this.gatewayClient.sendDelegationPersistenceEvent(event);
+  }
+
+  /**
+   * Persist a hidden completion marker for a background exec job, then fire a refetch so the
+   * frontend folds it into the launching tool's box (running → done/failed). Correlated to
+   * the launch by jobId (=== the launch result's backgroundTaskId). No-op when persistence
+   * isn't wired (gatewayClient/agentId absent).
+   */
+  private async persistExecJobEvent(
+    sessionId: string,
+    jobId: string,
+    status: JobStatus,
+    exitCode: number | undefined,
+  ): Promise<void> {
+    if (!(this.gatewayClient && this.agentId)) return;
+    try {
+      await this.persistAppendMessage({
+        sessionId,
+        parentSessionId: sessionId,
+        fromAgentId: this.agentId,
+        targetAgentId: this.agentId,
+        role: "user",
+        content: "",
+        metadata: { kind: "exec_job_event", job_id: jobId, status, exit_code: exitCode ?? null },
+        outcome: status === "failed" ? "error" : null,
+      });
+      // Live, TARGETED box update (not a refetch): the frontend flips the launching tool's
+      // box in place — works even while a turn is streaming (so it's immediate, not delayed
+      // until the in-flight turn ends), and never clobbers the live stream.
+      await this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId,
+        event: { type: "exec_job_done", job_id: jobId, status, exit_code: exitCode ?? null },
+      });
+    } catch { /* best-effort UI update */ }
+  }
+
+  /**
+   * Persist one completed message of a synthetic notification turn to the PARENT session
+   * (sessionId === parentSessionId so the delegation auth passes for our own agent).
+   * Reuses the delegation append channel since the gateway's per-/send SSE consumer is
+   * not attached to this turn. The leading <task_notification> user message is tagged
+   * metadata.kind so the UI can fold it like other system notices.
+   */
+  private async persistSyntheticMessage(sessionId: string, message: any): Promise<void> {
+    const role: "user" | "assistant" | "tool" =
+      message.role === "toolResult" ? "tool" : message.role === "assistant" ? "assistant" : "user";
+    const content = Array.isArray(message.content)
+      ? message.content.filter((c: any) => c?.type === "text").map((c: any) => c.text ?? "").join("")
+      : typeof message.content === "string" ? message.content : "";
+    if (role === "assistant" && !content.trim()) return; // skip empty (pure tool-call) assistant frames
+    const isNotification = role === "user" && content.trimStart().startsWith("<task_notification>");
+    await this.persistAppendMessage({
+      sessionId,
+      parentSessionId: sessionId,
+      fromAgentId: this.agentId,
+      targetAgentId: this.agentId,
+      role,
+      content,
+      toolName: message.toolName ?? null,
+      metadata: isNotification ? { kind: "task_notification" } : null,
+      outcome: message.isError ? "error" : null,
+    });
   }
 
   private async persistEnsureChatSession(
@@ -588,7 +906,7 @@ export class AgentBoxSessionManager {
     }
     // Wire job cancellation (job_stop) into this run once the child exists.
     if (opts?.jobId) {
-      const job = this.subagentJobs.get(opts.jobId);
+      const job = this.jobs.get(opts.jobId);
       if (job) {
         job.childSessionId = childSessionId;
         job.abort = () => requestStop(`job_stop ${childSessionId}`);
@@ -941,7 +1259,8 @@ export class AgentBoxSessionManager {
       // spawn_subagent is available in normal chat (top-level sessions only — child
       // sessions above omit this executor, so sub-agents cannot recurse).
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
-      subagentJobStopExecutor: this.createSubagentJobStopExecutor(),
+      jobStopExecutor: this.createJobStopExecutor(),
+      backgroundExecExecutor: this.createBackgroundExecExecutor(),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session
@@ -984,6 +1303,8 @@ export class AgentBoxSessionManager {
       _promptInflight: null,
       _extraEventSubs: extraEventSubs,
       _extraEventBuffer: extraEventBuffer,
+      _pendingNotifications: [],
+      _coalesceTimer: null,
     };
 
     this.sessions.set(id, managed);
@@ -1250,6 +1571,7 @@ export class AgentBoxSessionManager {
     // Guard: only delete if the map still holds the same instance — a new
     // getOrCreate() may have replaced it while release() was running async.
     if (this.sessions.get(sessionId) === managed) {
+      if (managed._coalesceTimer) { clearTimeout(managed._coalesceTimer); managed._coalesceTimer = null; }
       this.sessions.delete(sessionId);
       emitDiagnostic({ type: "session_released", sessionId });
       console.log(`[agentbox-session] Session released: ${sessionId} (${this.sessions.size} remaining)`);

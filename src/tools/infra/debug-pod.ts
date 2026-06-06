@@ -277,6 +277,14 @@ export interface CachedPod {
   userId: string;
   env: ExecEnv;
   idleTimer: ReturnType<typeof setTimeout>;
+  /** Idle timeout used to (re)arm the timer — stored so evict/release can re-arm. */
+  idleTimeoutMs: number;
+  /**
+   * Number of in-flight holders that must not have the pod evicted (e.g. a background
+   * node_exec job streaming a long `kubectl exec`). While > 0 the idle timer is disarmed;
+   * evict() refuses to delete and re-arms instead. acquire()/release() manage it.
+   */
+  refCount: number;
 }
 
 // ── Pod reuse cache (with creation-only lock) ───────────────────────
@@ -380,11 +388,55 @@ export class DebugPodCache {
       userId,
       env,
       idleTimer: setTimeout(() => this.evict(k), idleTimeoutMs),
+      idleTimeoutMs,
+      refCount: 0,
     };
     if (entry.idleTimer && typeof entry.idleTimer === "object" && "unref" in entry.idleTimer) {
       entry.idleTimer.unref();
     }
     this.pods.set(k, entry);
+  }
+
+  /**
+   * Pin a cached pod so the idle timer cannot evict it while a long-running holder
+   * (e.g. a background node_exec job) is using it. Disarms the idle timer. Returns the
+   * pinned pod's NAME (null if no entry), so the caller releases that exact pod — pinning
+   * and releasing the same instance even if the cache entry is later replaced. Pair every
+   * acquire() with a release().
+   */
+  acquire(userId: string, clusterKey: string, nodeName: string): string | null {
+    const entry = this.pods.get(this.key(userId, clusterKey, nodeName));
+    if (!entry) return null;
+    entry.refCount++;
+    clearTimeout(entry.idleTimer);
+    return entry.podName;
+  }
+
+  /**
+   * Release a pin. When the count reaches 0, re-arm the idle timer so the pod is
+   * eventually reclaimed. Idempotent-safe (won't go below 0).
+   *
+   * `expectedPodName` guards against decrementing the WRONG pod: if the pinned pod
+   * died (deadline) and a fresh pod replaced it under the same cache key, a late
+   * release from the old job must NOT steal a ref from the replacement (which could
+   * drop its count to 0 and let evict() delete a pod another job is still using).
+   * When the current entry is a different pod, the release is a no-op.
+   */
+  release(userId: string, clusterKey: string, nodeName: string, expectedPodName?: string): void {
+    const entry = this.pods.get(this.key(userId, clusterKey, nodeName));
+    if (!entry) return;
+    if (expectedPodName !== undefined && entry.podName !== expectedPodName) return;
+    if (entry.refCount > 0) entry.refCount--;
+    if (entry.refCount === 0) this.armIdle(entry, this.key(userId, clusterKey, nodeName));
+  }
+
+  /** (Re)arm the idle eviction timer for an entry. */
+  private armIdle(entry: CachedPod, key: string): void {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = setTimeout(() => this.evict(key), entry.idleTimeoutMs);
+    if (entry.idleTimer && typeof entry.idleTimer === "object" && "unref" in entry.idleTimer) {
+      entry.idleTimer.unref();
+    }
   }
 
   /**
@@ -437,6 +489,12 @@ export class DebugPodCache {
   private async evict(key: string): Promise<void> {
     const entry = this.pods.get(key);
     if (!entry) return;
+    // Pinned by an in-flight holder (e.g. a background job streaming a long exec) —
+    // do not delete; re-arm so we retry after the next idle window.
+    if (entry.refCount > 0) {
+      this.armIdle(entry, key);
+      return;
+    }
     clearTimeout(entry.idleTimer);
     this.pods.delete(key);
 
@@ -501,102 +559,134 @@ export interface DebugPodSpec {
  *   - Idle pods are auto-deleted by DebugPodCache after the configured timeout.
  *   - activeDeadlineSeconds (config.debugPodTTL) is the hard safety net.
  */
-export async function runInDebugPod(
+/**
+ * Phase 0 only: ensure a reusable debug pod exists & is Running on the node, returning
+ * its CachedPod. Extracted from runInDebugPod so background node_exec can ensure+pin a
+ * pod and then build its own (detached, streamed) `kubectl exec`. Throws on failure
+ * (creation error carries .stdout/.stderr/.code; "didn't start" is a plain Error).
+ */
+export async function ensureDebugPodReady(
   spec: DebugPodSpec,
   env: ExecEnv,
-  opts: { timeoutMs: number; signal?: AbortSignal },
-): Promise<ExecResult> {
+  opts: { signal?: AbortSignal },
+): Promise<CachedPod> {
   const config = loadConfig();
   const image = spec.image || config.debugImage;
   const clusterKey = spec.clusterKey || "default";
   const debugNamespace = config.debugNamespace;
   const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
 
-  // ── Phase 0: Get or create a reusable pod ─────────────────────────
-  let cachedPod: CachedPod | undefined;
-  try {
-    const result = await debugPodCache.getOrCreate(
-      spec.userId,
-      clusterKey,
-      spec.nodeName,
-      async () => {
-        const debugId = randomBytes(4).toString("hex");
-        const jobName = `node-debug-${debugId}`;
-        const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
+  const result = await debugPodCache.getOrCreate(
+    spec.userId,
+    clusterKey,
+    spec.nodeName,
+    async () => {
+      const debugId = randomBytes(4).toString("hex");
+      const jobName = `node-debug-${debugId}`;
+      const labels = { ...buildDebugPodLabels(spec.userId, spec.nodeName), [LABEL_DEBUG_ID]: debugId };
 
-        // A Job (not a bare Pod) so the cluster self-cleans it: when the pod hits
-        // activeDeadlineSeconds (or its owner is deleted), the Job finishes and
-        // ttlSecondsAfterFinished deletes it — no external GC, on every cluster.
-        const manifest = JSON.stringify(
-          buildDebugJobManifest(jobName, labels, image, config.debugPodTTL, spec.nodeName),
+      // A Job (not a bare Pod) so the cluster self-cleans it: when the pod hits
+      // activeDeadlineSeconds (or its owner is deleted), the Job finishes and
+      // ttlSecondsAfterFinished deletes it — no external GC, on every cluster.
+      const manifest = JSON.stringify(
+        buildDebugJobManifest(jobName, labels, image, config.debugPodTTL, spec.nodeName),
+      );
+
+      try {
+        await ensureDebugNamespace(debugNamespace, env);
+
+        await spawnAsync(
+          "kubectl",
+          [...env.kubeconfigArgs, "-n", debugNamespace, "create", "-f", "-"],
+          30_000,
+          env.childEnv,
+          opts.signal,
+          manifest,
         );
 
-        try {
-          await ensureDebugNamespace(debugNamespace, env);
+        // The Job controller creates the pod asynchronously — resolve its name by
+        // our unique label (works across K8s versions, not relying on job-name).
+        const podName = await resolveJobPodName(
+          debugId, env, debugNamespace, config.debugPodStartupTimeout * 1000, opts.signal,
+        );
 
-          await spawnAsync(
-            "kubectl",
-            [...env.kubeconfigArgs, "-n", debugNamespace, "create", "-f", "-"],
-            30_000,
-            env.childEnv,
-            opts.signal,
-            manifest,
-          );
+        // Pod startup gets its OWN bounded budget (config.debugPodStartupTimeout),
+        // not the command's timeoutMs — so a pod stuck pulling/scheduling fails fast
+        // within ~a minute instead of holding the tool call for the full command
+        // timeout. detectFatalPodStartupFailure also short-circuits known fatal
+        // reasons (ImagePullBackOff / Unschedulable / config errors) even sooner.
+        const phase = await waitForPodDone(
+          podName, config.debugPodStartupTimeout * 1000, env.childEnv, opts.signal,
+          env.kubeconfigPath ?? undefined, debugNamespace, "Running",
+        );
 
-          // The Job controller creates the pod asynchronously — resolve its name by
-          // our unique label (works across K8s versions, not relying on job-name).
-          const podName = await resolveJobPodName(
-            debugId, env, debugNamespace, config.debugPodStartupTimeout * 1000, opts.signal,
-          );
-
-          // Pod startup gets its OWN bounded budget (config.debugPodStartupTimeout),
-          // not the command's timeoutMs — so a pod stuck pulling/scheduling fails fast
-          // within ~a minute instead of holding the tool call for the full command
-          // timeout. detectFatalPodStartupFailure also short-circuits known fatal
-          // reasons (ImagePullBackOff / Unschedulable / config errors) even sooner.
-          const phase = await waitForPodDone(
-            podName, config.debugPodStartupTimeout * 1000, env.childEnv, opts.signal,
-            env.kubeconfigPath ?? undefined, debugNamespace, "Running",
-          );
-
-          if (phase !== "Running") {
-            await deleteDebugJob(jobName, env, {
-              namespace: debugNamespace,
-              nodeName: spec.nodeName,
-              force: true,
-            });
-            // Don't call set() — pod failed to start
-            return;
-          }
-
-          // Store in cache — idle timer starts now
-          debugPodCache.set(spec.userId, clusterKey, spec.nodeName, jobName, podName, debugNamespace, env, idleTimeoutMs);
-        } catch (err) {
-          // Creation failed — best-effort cleanup (the Job self-cleans regardless)
+        if (phase !== "Running") {
           await deleteDebugJob(jobName, env, {
             namespace: debugNamespace,
             nodeName: spec.nodeName,
             force: true,
-          }).catch(() => {});
-          throw err; // re-throw so getOrCreate reports failure; waiters will retry
+          });
+          // Don't call set() — pod failed to start
+          return;
         }
-      },
-    );
-    cachedPod = result.pod;
+
+        // Store in cache — idle timer starts now
+        debugPodCache.set(spec.userId, clusterKey, spec.nodeName, jobName, podName, debugNamespace, env, idleTimeoutMs);
+      } catch (err) {
+        // Creation failed — best-effort cleanup (the Job self-cleans regardless)
+        await deleteDebugJob(jobName, env, {
+          namespace: debugNamespace,
+          nodeName: spec.nodeName,
+          force: true,
+        }).catch(() => {});
+        throw err; // re-throw so getOrCreate reports failure; waiters will retry
+      }
+    },
+  );
+
+  if (!result.pod) {
+    throw new Error(`Debug pod failed to start on node "${spec.nodeName}".`);
+  }
+  return result.pod;
+}
+
+/**
+ * Pin a node's debug pod (prevent idle eviction) while a background job uses it. Returns the
+ * pinned pod's NAME (null if no entry); pass it to {@link releaseDebugPod} so pin and release
+ * always target the same pod instance.
+ */
+export function acquireDebugPod(spec: DebugPodSpec): string | null {
+  return debugPodCache.acquire(spec.userId, spec.clusterKey || "default", spec.nodeName);
+}
+
+/**
+ * Release a pin acquired via {@link acquireDebugPod}. Pass the pod name that was pinned
+ * (e.g. the `podName` from {@link ensureDebugPodReady}) so a stale release can't decrement
+ * a replacement pod that took over the same cache key.
+ */
+export function releaseDebugPod(spec: DebugPodSpec, expectedPodName?: string): void {
+  debugPodCache.release(spec.userId, spec.clusterKey || "default", spec.nodeName, expectedPodName);
+}
+
+export async function runInDebugPod(
+  spec: DebugPodSpec,
+  env: ExecEnv,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<ExecResult> {
+  const config = loadConfig();
+  const clusterKey = spec.clusterKey || "default";
+  const debugNamespace = config.debugNamespace;
+  const idleTimeoutMs = config.debugPodIdleTimeout * 1000;
+
+  // ── Phase 0: Get or create a reusable pod ─────────────────────────
+  let cachedPod: CachedPod;
+  try {
+    cachedPod = await ensureDebugPodReady(spec, env, { signal: opts.signal });
   } catch (err: any) {
     return {
       stdout: err.stdout?.trim() ?? "",
       stderr: err.stderr?.trim() ?? err.message ?? String(err),
       exitCode: typeof err.code === "number" ? err.code : null,
-    };
-  }
-
-  // Creation failed (pod didn't reach Running) or waiter got no cached pod
-  if (!cachedPod) {
-    return {
-      stdout: "",
-      stderr: `Debug pod failed to start on node "${spec.nodeName}".`,
-      exitCode: null,
     };
   }
 

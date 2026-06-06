@@ -304,12 +304,37 @@ function extractTiming(metadata: Record<string, unknown> | undefined, durationMs
   return Object.keys(t).length > 0 ? t : undefined
 }
 
+const PAGE_SIZE = 20
+
+/**
+ * Fetch page 1 (the most recent PAGE_SIZE messages) of a session and map to PilotMessages.
+ * Shared by the initial load and the recovered-run / async-delegation / background-turn
+ * pollers, which each previously inlined the identical fetch + envelope-unwrap + map.
+ */
+async function fetchSessionPage1(
+  agentId: string,
+  sessionId: string,
+): Promise<{ items: ChatMessage[]; pilotMsgs: PilotMessage[] }> {
+  const res = await api<{ data: ChatMessage[] }>(
+    `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
+  )
+  const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+  return { items, pilotMsgs: annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))) }
+}
+
 function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
   const isDelegationEvent = metadata?.kind === "delegation_event"
   // task_event rows are folded into the Plan panel (foldPlan); never show them as chat bubbles.
   const isTaskEvent = metadata?.kind === "task_event"
+  // The <task_notification> user message is the internal prompt injected to wake the model
+  // when a background job finishes — plumbing, not user-facing. The model's human reply to it
+  // ("✅ 后台任务已完成…") stays; this raw XML bubble is hidden. (Tagged in src/agentbox/session.ts.)
+  const isTaskNotification = metadata?.kind === "task_notification"
+  // A background exec job's completion marker — folded into the launching tool's box
+  // (annotateExecJobCompletions), never shown as its own row.
+  const isExecJobEvent = metadata?.kind === "exec_job_event"
   const staleRunning = isStaleRunningTool(m)
   const toolIsDelegation = isDelegationTool(m.tool_name)
   const toolStatus = toolStatusFromMessage(m)
@@ -338,7 +363,7 @@ function toPilotMessage(m: ChatMessage): PilotMessage {
     toolDetails: m.role === "tool" ? (recoveredMetadata ?? undefined) : undefined,
     metadata: recoveredMetadata,
     timing,
-    hidden: m.hidden || isDelegationEvent || isTaskEvent || isTaskTool(m.tool_name),
+    hidden: m.hidden || isDelegationEvent || isTaskEvent || isTaskNotification || isExecJobEvent || isTaskTool(m.tool_name),
     fromAgentId: m.from_agent_id ?? null,
     parentSessionId: m.parent_session_id ?? null,
     delegationId: m.delegation_id ?? null,
@@ -463,6 +488,34 @@ function annotateDelegationSynthesis(messages: PilotMessage[]): PilotMessage[] {
   return next ?? messages
 }
 
+/**
+ * Fold a background exec job's completion (hidden exec_job_event row) into the launching
+ * tool's box: attach bgStatus / bgExitCode so the box renders running → done/failed.
+ * Correlated by jobId (the launch tool message's metadata.backgroundTaskId === the
+ * completion's job_id). Refresh-safe — it's all chat history.
+ */
+function annotateExecJobCompletions(messages: PilotMessage[]): PilotMessage[] {
+  const done = new Map<string, { status: string; exitCode: number | null }>()
+  for (const m of messages) {
+    const meta = m.metadata as Record<string, unknown> | undefined
+    if (meta?.kind === "exec_job_event" && typeof meta.job_id === "string") {
+      done.set(meta.job_id, {
+        status: typeof meta.status === "string" ? meta.status : "completed",
+        exitCode: typeof meta.exit_code === "number" ? meta.exit_code : null,
+      })
+    }
+  }
+  if (done.size === 0) return messages
+  return messages.map((m) => {
+    const jobId = (m.metadata as Record<string, unknown> | undefined)?.backgroundTaskId
+    if (m.role === "tool" && typeof jobId === "string" && done.has(jobId)) {
+      const c = done.get(jobId)!
+      return { ...m, metadata: { ...(m.metadata ?? {}), bgStatus: c.status, bgExitCode: c.exitCode } }
+    }
+    return m
+  })
+}
+
 function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
   return messages.some((message) => message.metadata?.ui_state === "synthesizing")
 }
@@ -505,8 +558,6 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const resetDpState = useCallback(() => {
     setDpActive(false)
   }, [])
-
-  const PAGE_SIZE = 20
 
   // Load message history when session changes
   useEffect(() => {
@@ -560,12 +611,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     async function loadHistory() {
       try {
         pageRef.current = 1
-        const res = await api<{ data: ChatMessage[] }>(
-          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
-        )
-        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
+        const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         const hasRunning = hasRunningPersistedMessages(pilotMsgs)
         const recoveredActive = hasRunning || hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
@@ -625,12 +672,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
     async function refreshRecoveredRun() {
       try {
-        const res = await api<{ data: ChatMessage[] }>(
-          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
-        )
+        const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         const hasRunning = hasRunningPersistedMessages(pilotMsgs)
         const latest = pilotMsgs[pilotMsgs.length - 1]
 
@@ -678,12 +721,8 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
 
     async function refreshAsyncDelegation() {
       try {
-        const res = await api<{ data: ChatMessage[] }>(
-          `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
-        )
+        const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-        const pilotMsgs = annotateDelegationSynthesis(items.map(toPilotMessage))
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
         setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
@@ -711,6 +750,78 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       if (timer) clearTimeout(timer)
     }
   }, [agentId, sessionId, hasActiveAsyncDelegation])
+
+  // Persistent per-session SSE: receives server-pushed turns that land while the user is
+  // idle — e.g. a background job's completion turn, generated AFTER the /send stream closed.
+  // We do NOT render events live off this channel (the synthetic turn's body isn't streamed
+  // here — message_update text deltas are intentionally not emitted). Instead, a
+  // `background_turn_done` signal triggers a silent history refetch, so the completed turn
+  // appears without a manual reload. EventSource can't set headers → JWT via ?token=.
+  useEffect(() => {
+    if (!sessionId) return
+    const token = localStorage.getItem("token")
+    if (!token) return
+
+    let closed = false
+    let refetchTimer: ReturnType<typeof setTimeout> | null = null
+
+    async function refetchHistory() {
+      // Only safe to wholesale-replace with page 1 when page 1 is all that's loaded.
+      // If the user has paged back (loaded older history), replacing would discard that
+      // scrollback — skip the live refresh; the completed turn still appears on their next
+      // message or on reload.
+      if (pageRef.current !== 1) return
+      try {
+        const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
+        if (closed) return
+        setMessages(pilotMsgs)
+        setHasMore(items.length >= PAGE_SIZE)
+      } catch (err) {
+        console.warn("[usePilotChat] background-turn refetch failed:", err)
+      }
+    }
+
+    // Debounced refetch that DEFERS while a live /send is streaming (don't clobber the
+    // active stream); re-checks at fire time and reschedules if still streaming.
+    function scheduleRefetch() {
+      if (refetchTimer) clearTimeout(refetchTimer)
+      refetchTimer = setTimeout(() => {
+        if (closed) return
+        if (streamingRef.current) { scheduleRefetch(); return }
+        void refetchHistory()
+      }, 400)
+    }
+
+    const url = `/api/v1/siclaw/agents/${agentId}/chat/sessions/${sessionId}/events?token=${encodeURIComponent(token)}`
+    const es = new EventSource(url)
+    es.addEventListener("chat.event", (ev: MessageEvent) => {
+      try {
+        const evt = JSON.parse(ev.data) as Record<string, unknown>
+        if (evt?.type === "background_turn_done") {
+          scheduleRefetch()
+        } else if (evt?.type === "exec_job_done" && typeof evt.job_id === "string") {
+          // Flip the launching tool's box in place (running → done/failed) live, no refetch.
+          const jobId = evt.job_id
+          const status = typeof evt.status === "string" ? evt.status : "completed"
+          const exitCode = typeof evt.exit_code === "number" ? evt.exit_code : null
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.role === "tool" && (m.metadata as Record<string, unknown> | undefined)?.backgroundTaskId === jobId
+                ? { ...m, metadata: { ...(m.metadata ?? {}), bgStatus: status, bgExitCode: exitCode } }
+                : m,
+            ),
+          )
+        }
+      } catch { /* ignore malformed frame */ }
+    })
+    // EventSource auto-reconnects on transient errors; nothing to do here.
+
+    return () => {
+      closed = true
+      if (refetchTimer) clearTimeout(refetchTimer)
+      es.close()
+    }
+  }, [agentId, sessionId])
 
   // Process a chat.event from the SSE stream
   const handleChatEvent = useCallback(
@@ -864,10 +975,16 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           // column written at the same moment).
           const durationMs = typeof evt.durationMs === "number" ? evt.durationMs : undefined
 
+          const endToolCallId = evt.toolCallId as string | undefined
           setMessages((prev) => {
+            // Correlate the result to its OWN tool box: prefer the DB id, then the toolCallId
+            // (so parallel/sequential tool calls never cross-attach), and only then fall back
+            // to the last still-running tool box.
             const index = dbMessageId
               ? prev.findIndex((m) => m.id === dbMessageId && m.role === "tool")
-              : -1
+              : endToolCallId
+                ? prev.findIndex((m) => m.role === "tool" && m.toolCallId === endToolCallId && Boolean(m.isStreaming))
+                : -1
             const fallbackIndex = index >= 0
               ? index
               : findLastMessageIndex(prev, (m) => m.role === "tool" && Boolean(m.isStreaming))
@@ -890,6 +1007,24 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             }
             return prev
           })
+          break
+        }
+
+        // --- Background exec job finished: flip the launching tool's box in place ---
+        // (running → done/failed) without a refetch, so it updates immediately even while a
+        // turn is streaming. Correlated by jobId === the launch's backgroundTaskId.
+        case "exec_job_done": {
+          const jobId = evt.job_id as string | undefined
+          if (!jobId) break
+          const status = typeof evt.status === "string" ? evt.status : "completed"
+          const exitCode = typeof evt.exit_code === "number" ? evt.exit_code : null
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.role === "tool" && (m.metadata as Record<string, unknown> | undefined)?.backgroundTaskId === jobId
+                ? { ...m, metadata: { ...(m.metadata ?? {}), bgStatus: status, bgExitCode: exitCode } }
+                : m,
+            ),
+          )
           break
         }
 

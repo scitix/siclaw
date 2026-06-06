@@ -11,7 +11,7 @@ describe("COMMANDS registry", () => {
     // text processing (sed removed)
     "grep", "sort", "uniq", "wc", "head", "tail", "jq", "yq",
     // network
-    "ip", "ping", "curl", "ss", "dig",
+    "ip", "ping", "curl", "ss", "dig", "tcpdump",
     // RDMA
     "ibstat", "rdma", "ibswitches", "ibroute",
     // perftest
@@ -46,6 +46,10 @@ describe("COMMANDS registry", () => {
     "iptables", "ip6tables", "tee", "lsof", "lsns",
     "sar", "blkid", "timedatectl", "hostnamectl",
     "zcat", "zgrep", "bzcat", "xzcat", "strings",
+    // read-only diagnostics added for RDMA/GPU/storage/host triage
+    "mst", "mlxlink", "perfquery", "ibqueryerrors", "saquery", "ibping",
+    "dcgmi", "smartctl", "nvme", "sensors", "getconf",
+    "pidstat", "pstree", "numastat", "ipcs", "nstat", "tree", "hexdump", "od", "tac", "nl",
   ];
   for (const cmd of newCommands) {
     it(`contains "${cmd}"`, () => {
@@ -1423,5 +1427,164 @@ describe("validateCommandRestrictions", () => {
     it("allows grep without -r in local context", () => {
       expect(validateCommandRestrictions("grep pattern", local)).toBeNull();
     });
+  });
+});
+
+describe("tcpdump restrictions (read-only live capture)", () => {
+  it("allows interface + filter + on-screen format flags", () => {
+    expect(validateCommandRestrictions("tcpdump -i eth0 -nn -c 100 port 53")).toBeNull();
+    expect(validateCommandRestrictions("tcpdump -i mlx5_0 -e -vvv -s 96 tcp and port 80")).toBeNull();
+    expect(validateCommandRestrictions("tcpdump -i any -A -l host 10.0.0.1")).toBeNull();
+    expect(validateCommandRestrictions("tcpdump -D")).toBeNull();
+  });
+
+  it("rejects -w (write pcap to file)", () => {
+    const err = validateCommandRestrictions("tcpdump -i eth0 -w /tmp/cap.pcap");
+    expect(err).not.toBeNull();
+    expect(err).toContain("-w");
+  });
+
+  it("rejects -z (post-rotate command execution)", () => {
+    const err = validateCommandRestrictions("tcpdump -i eth0 -G 60 -z reboot");
+    expect(err).not.toBeNull();
+  });
+
+  it("rejects -r (read an arbitrary file)", () => {
+    expect(validateCommandRestrictions("tcpdump -r /etc/shadow")).not.toBeNull();
+  });
+
+  it("rejects -F / -V (read filter/list from file) and -W/-G/-C (rotate+write)", () => {
+    expect(validateCommandRestrictions("tcpdump -i eth0 -F /tmp/filter")).not.toBeNull();
+    expect(validateCommandRestrictions("tcpdump -i eth0 -V /tmp/list")).not.toBeNull();
+    expect(validateCommandRestrictions("tcpdump -i eth0 -G 10 -W 5 -w /tmp/x")).not.toBeNull();
+  });
+});
+
+describe("perftest tuning flags are allowed (no skill needed)", () => {
+  it("accepts device / gid / size / sweep / duration / bidirectional flags", () => {
+    expect(validateCommandRestrictions("ib_write_bw -d mlx5_1 -x 3 -F 22.253.212.1")).toBeNull();
+    expect(validateCommandRestrictions("ib_send_bw -s 65536 -n 1000 --report_gbits")).toBeNull();
+    expect(validateCommandRestrictions("ib_send_bw -a -b 192.168.1.1")).toBeNull();
+    expect(validateCommandRestrictions("ib_write_bw -D 20 -m 4096 -c RC")).toBeNull();
+    expect(validateCommandRestrictions("ib_read_bw -r 256 --tx-depth 128 --inline_size 0")).toBeNull();
+  });
+});
+
+describe("read-only enforcement for added diagnostic commands", () => {
+  // RDMA / RoCE
+  it("allows read-only RDMA diagnostics", () => {
+    expect(validateCommandRestrictions("mst status")).toBeNull();
+    expect(validateCommandRestrictions("mlxlink -d /dev/mst/mt4123_pciconf0 -m -e -c")).toBeNull();
+    expect(validateCommandRestrictions("perfquery -C mlx5_0 -P 1")).toBeNull();
+    // flag VALUES (mlx5_0, 1) must not be miscounted as positionals → a flagged read with
+    // explicit <lid> <port> is allowed (regression: this used to be over-blocked)
+    expect(validateCommandRestrictions("perfquery -C mlx5_0 -P 1 2 1")).toBeNull();
+    expect(validateCommandRestrictions("ibqueryerrors -r")).toBeNull();
+    expect(validateCommandRestrictions("saquery")).toBeNull();
+  });
+  it("rejects RDMA writes: mst start, mlxlink set, counter reset/clear (flag + positional)", () => {
+    expect(validateCommandRestrictions("mst start")).not.toBeNull();
+    expect(validateCommandRestrictions("mlxlink -d mlx5_0 --port_state DN")).not.toBeNull();
+    expect(validateCommandRestrictions("mlxlink -d mlx5_0 --amber_collect /tmp/x")).not.toBeNull();
+    expect(validateCommandRestrictions("perfquery -R")).not.toBeNull();
+    expect(validateCommandRestrictions("perfquery -r")).not.toBeNull();
+    // legacy positional reset form `<lid> <port> <reset_mask>` — 3rd positional blocked
+    expect(validateCommandRestrictions("perfquery 2 1 0xffffffff")).not.toBeNull();
+    expect(validateCommandRestrictions("ibqueryerrors -c")).not.toBeNull();
+    expect(validateCommandRestrictions("ibqueryerrors -k")).not.toBeNull();
+  });
+
+  // GPU
+  it("allows read-only dcgmi subcommands, rejects config/set/diag", () => {
+    expect(validateCommandRestrictions("dcgmi discovery -l")).toBeNull();
+    expect(validateCommandRestrictions("dcgmi health -g 0 -c")).toBeNull();
+    expect(validateCommandRestrictions("dcgmi config --set")).not.toBeNull();
+    expect(validateCommandRestrictions("dcgmi policy --set")).not.toBeNull();
+    expect(validateCommandRestrictions("dcgmi diag -r 3")).not.toBeNull();
+    // setter flags on an otherwise-read subcommand must be rejected (read-only invariant)
+    expect(validateCommandRestrictions("dcgmi health -g 0 -s mpid")).not.toBeNull();
+    expect(validateCommandRestrictions("dcgmi stats --enable")).not.toBeNull();
+  });
+
+  // storage
+  it("allows read-only smartctl/nvme, rejects self-test/set/format", () => {
+    expect(validateCommandRestrictions("smartctl -a /dev/sda")).toBeNull();
+    expect(validateCommandRestrictions("smartctl -H -A /dev/nvme0")).toBeNull();
+    expect(validateCommandRestrictions("smartctl -t short /dev/sda")).not.toBeNull();
+    expect(validateCommandRestrictions("smartctl -s on /dev/sda")).not.toBeNull();
+    expect(validateCommandRestrictions("nvme smart-log /dev/nvme0")).toBeNull();
+    expect(validateCommandRestrictions("nvme list")).toBeNull();
+    expect(validateCommandRestrictions("nvme format /dev/nvme0")).not.toBeNull();
+    expect(validateCommandRestrictions("nvme sanitize /dev/nvme0")).not.toBeNull();
+    expect(validateCommandRestrictions("nvme set-feature /dev/nvme0 -f 1 -v 0")).not.toBeNull();
+  });
+
+  // sensors / topology / tree write paths
+  it("rejects sensors -s (apply config) and -c (read arbitrary file)", () => {
+    expect(validateCommandRestrictions("sensors")).toBeNull();
+    expect(validateCommandRestrictions("sensors -A -u")).toBeNull();
+    expect(validateCommandRestrictions("sensors -s")).not.toBeNull();
+    expect(validateCommandRestrictions("sensors -c /etc/passwd")).not.toBeNull();
+  });
+  it("blocks tree -o (write output to file)", () => {
+    expect(validateCommandRestrictions("tree -L 2 /etc")).toBeNull();
+    expect(validateCommandRestrictions("tree -o /tmp/out.txt /etc")).not.toBeNull();
+  });
+
+  // pure-read commands accept normal usage
+  it("allows the pure read-only additions", () => {
+    expect(validateCommandRestrictions("pidstat 1 1")).toBeNull();
+    expect(validateCommandRestrictions("pstree -p")).toBeNull();
+    expect(validateCommandRestrictions("numastat")).toBeNull();
+    expect(validateCommandRestrictions("ipcs -m")).toBeNull();
+    expect(validateCommandRestrictions("getconf PAGE_SIZE")).toBeNull();
+    expect(validateCommandRestrictions("nstat -az")).toBeNull();
+    expect(validateCommandRestrictions("hexdump -C /proc/cpuinfo")).toBeNull();
+    expect(validateCommandRestrictions("tac /var/log/syslog")).toBeNull();
+  });
+
+  // read-only tightening of already-open commands (write/destructive flags slip-through)
+  it("blocks ss -K/--kill (destroys sockets) but allows reads", () => {
+    expect(validateCommandRestrictions("ss -tnp")).toBeNull();
+    expect(validateCommandRestrictions("ss -s")).toBeNull();
+    expect(validateCommandRestrictions("ss -K dst :22")).not.toBeNull();
+    expect(validateCommandRestrictions("ss --kill state established")).not.toBeNull();
+  });
+  it("blocks dmidecode --dump-bin (write to file) but allows reads", () => {
+    expect(validateCommandRestrictions("dmidecode -t system")).toBeNull();
+    expect(validateCommandRestrictions("dmidecode -u")).toBeNull();
+    expect(validateCommandRestrictions("dmidecode --dump-bin /tmp/x")).not.toBeNull();
+    expect(validateCommandRestrictions("dmidecode --dump-bin=/tmp/x")).not.toBeNull();
+  });
+  it("blocks sar -o (write binary to file) but allows reads", () => {
+    expect(validateCommandRestrictions("sar -u 1 1")).toBeNull();
+    expect(validateCommandRestrictions("sar -f /var/log/sa/sa01")).toBeNull();
+    expect(validateCommandRestrictions("sar -o /tmp/x 1 1")).not.toBeNull();
+  });
+  it("blocks yq -s/--split-exp (writes split files) but allows stdout reads", () => {
+    expect(validateCommandRestrictions("yq -o=json '.' f.yaml")).toBeNull();
+    expect(validateCommandRestrictions("yq -P '.a.b' f.yaml")).toBeNull();
+    expect(validateCommandRestrictions("yq -s '.id' f.yaml")).not.toBeNull();
+    expect(validateCommandRestrictions("yq --split-exp '.id' f.yaml")).not.toBeNull();
+  });
+
+  // DNS troubleshooting additions (getent real resolution path + resolvectl)
+  it("allows getent name-resolution databases but blocks sensitive ones", () => {
+    expect(validateCommandRestrictions("getent hosts example.com")).toBeNull();
+    expect(validateCommandRestrictions("getent ahosts example.com")).toBeNull();
+    expect(validateCommandRestrictions("getent ahostsv4 example.com")).toBeNull();
+    expect(validateCommandRestrictions("getent networks")).toBeNull();
+    expect(validateCommandRestrictions("getent shadow")).not.toBeNull();
+    expect(validateCommandRestrictions("getent passwd root")).not.toBeNull();
+    expect(validateCommandRestrictions("getent group")).not.toBeNull();
+  });
+  it("allows resolvectl read-only subcommands but blocks mutating ones", () => {
+    expect(validateCommandRestrictions("resolvectl")).toBeNull(); // bare = status
+    expect(validateCommandRestrictions("resolvectl status")).toBeNull();
+    expect(validateCommandRestrictions("resolvectl query example.com")).toBeNull();
+    expect(validateCommandRestrictions("resolvectl statistics")).toBeNull();
+    expect(validateCommandRestrictions("resolvectl flush-caches")).not.toBeNull();
+    expect(validateCommandRestrictions("resolvectl dns eth0 1.1.1.1")).not.toBeNull();
+    expect(validateCommandRestrictions("resolvectl revert eth0")).not.toBeNull();
   });
 });

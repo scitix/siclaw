@@ -69,10 +69,10 @@ skill itself. The directory name and `SKILL.md` frontmatter `name` must match.
 
 ```yaml
 ---
-name: find-node
+name: node-logs
 description: >-
-  Fuzzy-match Kubernetes nodes by keyword.
-  Use this instead of listing all nodes to keep context minimal.
+  Retrieve systemd/journald or file-based logs from a Kubernetes node.
+  Use this instead of dumping full logs to keep context minimal.
 ---
 ```
 
@@ -86,7 +86,7 @@ Each tier directory (`skills/core/`, `skills/extension/`) may contain a `meta.js
 ```json
 {
   "labels": {
-    "find-node":      ["kubernetes", "general", "diagnostic"],
+    "node-logs":      ["kubernetes", "general", "diagnostic"],
     "dns-debug":      ["kubernetes", "network", "diagnostic"]
   }
 }

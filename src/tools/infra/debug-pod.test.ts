@@ -180,6 +180,46 @@ describe("DebugPodCache — lock + eviction mechanics", () => {
     expect(cache.get("u1", "c1", "n2")?.podName).toBe("pod-B");
     expect(cache.get("u2", "c1", "n1")?.podName).toBe("pod-C");
   });
+
+  it("acquire pins (refCount up, idle timer cleared); release re-arms at 0", () => {
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
+    const armed = cache.get("u", "c", "n")?.idleTimer;
+    expect(cache.acquire("u", "c", "n")).toBe("pod-1");
+    const e = cache.get("u", "c", "n")!;
+    expect(e.refCount).toBe(1);
+    // acquire disarmed the idle timer (replaced/cleared) so eviction can't fire while pinned
+    cache.acquire("u", "c", "n");
+    expect(cache.get("u", "c", "n")?.refCount).toBe(2);
+    cache.release("u", "c", "n");
+    expect(cache.get("u", "c", "n")?.refCount).toBe(1);
+    cache.release("u", "c", "n");
+    const after = cache.get("u", "c", "n")!;
+    expect(after.refCount).toBe(0);
+    expect(after.idleTimer).not.toBe(armed); // re-armed a fresh timer at refCount 0
+  });
+
+  it("acquire returns false for a missing entry; release is a no-op", () => {
+    expect(cache.acquire("u", "c", "n")).toBeNull();
+    expect(() => cache.release("u", "c", "n")).not.toThrow();
+  });
+
+  it("release never drives refCount below 0", () => {
+    cache.set("u", "c", "n", "job-pod-1", "pod-1", "ns", {} as any, 60_000);
+    cache.release("u", "c", "n");
+    cache.release("u", "c", "n");
+    expect(cache.get("u", "c", "n")?.refCount).toBe(0);
+  });
+
+  it("release with a stale podName does NOT steal a ref from the replacement pod", () => {
+    cache.set("u", "c", "n", "job-1", "pod-1", "ns", {} as any, 60_000);
+    cache.acquire("u", "c", "n");                 // old job pins pod-1
+    cache.set("u", "c", "n", "job-2", "pod-2", "ns", {} as any, 60_000); // pod-1 died, pod-2 replaced it (refCount 0)
+    cache.acquire("u", "c", "n");                 // a new job pins pod-2 → refCount 1
+    cache.release("u", "c", "n", "pod-1");        // stale release for the GONE pod → must be a no-op
+    expect(cache.get("u", "c", "n")?.refCount).toBe(1); // pod-2 still pinned
+    cache.release("u", "c", "n", "pod-2");        // correct release
+    expect(cache.get("u", "c", "n")?.refCount).toBe(0);
+  });
 });
 
 describe("DebugPodCache — getOrCreate failure paths", () => {

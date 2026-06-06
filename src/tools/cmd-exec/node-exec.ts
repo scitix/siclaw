@@ -1,4 +1,6 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
@@ -6,15 +8,17 @@ import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { extractCommands } from "../infra/command-validator.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import {
   validateNodeName,
   prepareExecEnv,
   filterPodNoise,
 } from "../infra/exec-utils.js";
-import { runInDebugPod } from "../infra/debug-pod.js";
+import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
@@ -29,9 +33,17 @@ interface NodeExecParams {
   cluster?: string;
   image?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
-export function createNodeExecTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
+export function createNodeExecTool(
+  kubeconfigRef?: KubeconfigRef,
+  userId?: string,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  // run_in_background is exposed only when the switch is on AND a runtime executor was
+  // injected — otherwise the param stays out of the schema.
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "node_exec",
     label: "Node Exec",
@@ -53,15 +65,15 @@ Use this tool for host-level diagnostics that cannot be done from within a pod, 
 - Checking network connectivity with curl
 
 Allowed commands (ONLY these are permitted — do NOT use \`which\` to check, just run the command directly):
-  network: ip, ifconfig, ping, traceroute, tracepath, ss, netstat, route, arp, ethtool, mtr, bridge, tc, conntrack, nslookup, dig, host, curl
-  RDMA/RoCE: ibstat, ibstatus, ibv_devinfo, ibv_devices, rdma, ibaddr, iblinkinfo, ibportstate, show_gids, ibdev2netdev
+  network: ip, ifconfig, ping, traceroute, tracepath, ss, netstat, route, arp, ethtool, mtr, bridge, tc, conntrack, nslookup, dig, host, curl, tcpdump, nstat
+  RDMA/RoCE: ibstat, ibstatus, ibv_devinfo, ibv_devices, rdma, ibaddr, iblinkinfo, ibportstate, show_gids, ibdev2netdev, saquery, ibping, perfquery (read-only; counter reset rejected), ibqueryerrors (read-only; counter clear rejected), mst (status/version), mlxlink (read-only link/FEC/eye diagnostics)
   perftest: ib_write_bw, ib_write_lat, ib_read_bw, ib_read_lat, ib_send_bw, ib_send_lat, ib_atomic_bw, ib_atomic_lat, raw_ethernet_bw, raw_ethernet_lat, raw_ethernet_burst_lat
-  GPU: nvidia-smi, gpustat, nvtopo
-  hardware: lspci, lsusb, lsblk, lscpu, lsmem, lshw, dmidecode
-  kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo
-  process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc
-  file (read-only): cat, head, tail, ls, stat, file, wc, find, grep, diff, md5sum, sha256sum
-  text processing: sort, uniq, cut, tr, jq, yq, column
+  GPU: nvidia-smi, gpustat, nvtopo, dcgmi (discovery/topo/modules/nvlink/health/stats)
+  hardware: lspci, lsusb, lsblk, lscpu, lsmem, lshw, dmidecode, smartctl (read-only; no self-test/set), nvme (read-only subcommands: list/smart-log/id-ctrl/error-log/…), sensors
+  kernel: uname, hostname, uptime, dmesg, sysctl, lsmod, modinfo, getconf
+  process: ps, pgrep, top, free, vmstat, iostat, mpstat, df, du, mount, findmnt, nproc, pidstat, pstree, numastat, ipcs
+  file (read-only): cat, head, tail, ls, stat, file, wc, find, grep, diff, md5sum, sha256sum, tree, hexdump, od
+  text processing: sort, uniq, cut, tr, jq, yq, column, tac, nl
   logs/services: journalctl, systemctl, timedatectl, hostnamectl
   container: crictl, ctr
   firewall (read-only): iptables, ip6tables
@@ -73,12 +85,20 @@ The following will be rejected: find with -exec/-delete, sysctl with -w, mount w
 curl with -o/-O/-T (file output/upload) and all non-read HTTP methods (POST, PUT, DELETE, PATCH) and data flags (-d/--data), env with command arguments (only listing allowed),
 systemctl with non-read-only subcommands, iptables with non-list operations.
 
+perftest tuning flags are ALLOWED — you do not need a skill to parametrize a run. Common ones: -s/--size (msg size), -n/--iters, -a/--all (sweep all sizes), -D/--duration (run N seconds), -b/--bidirectional, -d/--ib-dev (e.g. mlx5_1), -x/--gid-index (e.g. 3 for RoCEv2), -m/--mtu, -c/--connection, -q/--qp, -F (skip CPU-freq warning), --report_gbits. Just pass them directly.
+
+tcpdump is read-only LIVE capture to stdout (file-writing -w / post-rotate -z / file-read -r are rejected). For a bounded capture use -c <count>; for an open-ended capture start it with run_in_background and end it with job_stop.
+
 Examples:
 - node: "node-1", command: "ip addr show"
 - node: "node-1", command: "ip addr show | grep 10.0.0"
 - node: "node-1", command: "nvidia-smi"
 - node: "node-1", command: "ibstat"
 - node: "node-1", command: "ib_write_bw --help"
+- RDMA perftest across two nodes (server on A in the background, then client on B):
+    1. node: "node-A", command: "ib_write_bw -d mlx5_1 -x 3 -D 20 -F", run_in_background: true   (server; returns immediately)
+    2. node: "node-B", command: "ib_write_bw -d mlx5_1 -x 3 -D 20 -F <node-A-ip>"               (client; blocks ~20s, prints the bandwidth table)
+- node: "node-1", command: "tcpdump -i eth0 -nn -c 50 port 53"   (bounded capture: 50 DNS packets)
 - node: "node-1", command: "dmesg --level=err"
 - node: "node-1", command: "sysctl net.ipv4.ip_forward"
 - node: "node-1", command: "cat /etc/os-release"
@@ -114,9 +134,25 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       ),
       timeout_seconds: Type.Optional(
         Type.Number({
-          description: "Timeout in seconds (default: 30, max: 120)",
+          description: "Timeout in seconds (default: 30, max: 120; ignored when run_in_background — see that param)",
         })
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the command on the node in the background instead of waiting. Returns immediately " +
+                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
+                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
+                  "completes; ONLY THEN read the output_file. Use for long node work like RDMA perftest " +
+                  "(start the server on node A in the background, then the client on node B). The command is " +
+                  "wrapped in `timeout` and capped at the debug-pod lifetime (~600s) — for longer runs lower " +
+                  "the perftest duration. Output needing structural (JSON) redaction cannot run in background.",
+              })
+            ),
+          }
+        : {}),
     }),
     renderCall(args: any, theme: any) {
       const node = args?.node || "...";
@@ -130,7 +166,7 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       );
     },
     renderResult: renderTextResult,
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeExecParams;
 
       try {
@@ -204,14 +240,105 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
       // When netns is specified, wrap with "ip netns exec <name>" to run
       // in the pod's network namespace using host tools.
       const netnsPrefix = netns ? `ip netns exec ${netns} ` : "";
-      let nsenterCmd: string[];
-      if (needsShell || netnsPrefix) {
-        // Shell mode — needed for pipelines or netns wrapping
-        const shellCmd = netnsPrefix + params.command;
-        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh", "-c", shellCmd];
-      } else {
-        const execArgs = cmdArgs;
-        nsenterCmd = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", ...execArgs];
+      const NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"];
+      // tail = the part after `nsenter -- ` (the host-namespace command); reused for the
+      // foreground and (timeout-wrapped) background forms.
+      const tail: string[] =
+        needsShell || netnsPrefix
+          ? ["sh", "-c", netnsPrefix + params.command]
+          : [...cmdArgs];
+      const nsenterCmd: string[] = [...NSENTER, ...tail];
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Ensure+pin the debug pod, then hand a detached `kubectl exec … -- nsenter …` to
+      // the runtime executor. The remote command runs in its OWN process group via
+      // `setsid` and records its PGID to a node-side file, so job_stop can promptly kill
+      // the whole group (kubectl exec does NOT propagate kill to a host-namespace
+      // process). `timeout <ttl>` is the backstop if the job is never stopped. The user
+      // command is interpolated single-quote-escaped into `sh -c` (kubectl exec does NOT
+      // forward local env), already whitelisted by preExecSecurity; see the launchScript below.
+      if (backgroundEnabled && params.run_in_background === true) {
+        if (pre.action && !pre.action.lineSafe) {
+          return backgroundNotLineSafeError();
+        }
+        const cfg = loadConfig();
+        const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
+        const userShell = netnsPrefix + params.command;
+        const safeJob = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_");
+        // Random suffix: two background jobs whose tool-call ids sanitize to the same
+        // string (cross-session reuse → same node, host PID ns), or a stale .pgid left by
+        // a crashed prior run, must NOT share this file — otherwise job_stop could read the
+        // wrong PGID and kill an unrelated process group.
+        const pgidFile = `/tmp/siclaw-bg-${safeJob}-${randomBytes(4).toString("hex")}.pgid`;
+        // The user command is interpolated single-quote-escaped (NOT via env — kubectl exec
+        // does not forward the local process env to the remote command). preExecSecurity
+        // already whitelisted it; the '\'' escaping makes it injection-safe regardless.
+        const userShellEsc = userShell.replace(/'/g, "'\\''");
+        // `setsid -w` (wait): run the command as a NEW session/group leader (its PID == PGID,
+        // recorded to pgidFile) but KEEP the exec attached & streaming until it exits — plain
+        // setsid forks+detaches and returns immediately. `timeout <ttl>` is the leak backstop.
+        const launchScript = `echo $$ > ${pgidFile}; exec timeout ${ttl} sh -c '${userShellEsc}'`;
+        const bgNsenterCmd = [...NSENTER, "setsid", "-w", "sh", "-c", launchScript];
+        const spec = { userId: userId ?? "unknown", nodeName: params.node, command: bgNsenterCmd, image, clusterKey };
+        let cachedPod;
+        try {
+          cachedPod = await ensureDebugPodReady(spec, env, { signal });
+        } catch (err: any) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
+            details: { error: true, reason: "debug_pod_failed" },
+          };
+        }
+        // Pin and capture the EXACT pod name we pinned — release by that name so pin/release
+        // always target the same instance even if the cache entry is later replaced (and so
+        // a stale release can't decrement a replacement pod). Robust regardless of any future
+        // await between ensure and acquire.
+        const pinnedPodName = acquireDebugPod(spec);
+        if (!pinnedPodName) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: true, message: "Debug pod went away before the background job could pin it; try again." }) }],
+            details: { error: true, reason: "debug_pod_gone" },
+          };
+        }
+        // job_stop → kill the remote process GROUP (TERM, then KILL) by the recorded PGID.
+        // Poll briefly for the pgid file: job_stop can race the remote launch (the file is
+        // written by `echo $$` at the very start of launchScript), and reading an empty
+        // pgid would make the kill a silent no-op, leaking the host process until `timeout`.
+        const killScript = `pgid=""; for i in 1 2 3; do pgid=$(cat ${pgidFile} 2>/dev/null); [ -n "$pgid" ] && break; sleep 1; done; if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null; sleep 1; kill -KILL -"$pgid" 2>/dev/null; fi; rm -f ${pgidFile}`;
+        const onAbort = () => {
+          try {
+            const killer = spawn(
+              "kubectl",
+              [...env.kubeconfigArgs, "-n", cachedPod!.namespace, "exec", cachedPod!.podName, "--", ...NSENTER, "sh", "-c", killScript],
+              { env: env.childEnv as Record<string, string>, detached: true },
+            );
+            killer.on("error", () => {});
+            // Don't let the kill-exec linger forever.
+            setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, 15_000).unref();
+            killer.unref();
+          } catch { /* best-effort */ }
+        };
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            file: "kubectl",
+            args: [...env.kubeconfigArgs, "-n", cachedPod.namespace, "exec", cachedPod.podName, "--", ...bgNsenterCmd],
+            env: env.childEnv as Record<string, string>,
+            action: pre.action,
+            hasSensitiveKubectl: pre.hasSensitiveKubectl,
+            description: `node ${params.node}: ${params.command.length > 60 ? params.command.slice(0, 57) + "…" : params.command}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: process.env.NODE_ENV === "production",
+            jobType: "node",
+            onComplete: () => releaseDebugPod(spec, pinnedPodName),
+            onAbort,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the node in the background.");
+        } catch (err) {
+          // Concurrency cap (or executor failure): release the pin, fall through to foreground.
+          releaseDebugPod(spec, pinnedPodName);
+          console.warn(`[node-exec] background launch declined, running foreground:`, err);
+        }
       }
 
       const execResult = await runInDebugPod(
@@ -248,5 +375,9 @@ To run in a pod's network namespace (host tools + pod's network view), first cal
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  create: (refs) => createNodeExecTool(refs.kubeconfigRef, refs.userId),
+  create: (refs) =>
+    createNodeExecTool(refs.kubeconfigRef, refs.userId, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };
