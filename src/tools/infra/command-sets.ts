@@ -88,9 +88,85 @@ const PERFTEST_FLAGS = [
   "-a", "--all", "-b", "--bidirectional",
   "-F", "--CPU-freq", "-c", "--connection",
   "-R", "--rdma_cm", "-q", "--qp",
+  "-r", "--rx-depth", "-t", "--tx-depth", "--inline_size",
   "--run_infinitely", "--report_gbits", "--report_per_port",
   "-l", "--post_list", "--use_cuda", "--use_rocm", "--output_format",
   "-h", "--help", "-V", "--version",
+];
+
+// tcpdump: read-only LIVE packet capture to STDOUT. Default-deny allow-list — every
+// file-writing / code-executing flag is intentionally OMITTED, so it is auto-rejected:
+//   -w (write pcap), -W/-G/-C (rotate + write to files), -z (post-rotate command
+//   EXECUTION), -r/-F/-V (read a pcap/filter/list FILE → arbitrary file read), -Z
+//   (drop privileges to an arbitrary user). Only interface-selection, capture-control,
+//   and on-screen format flags are permitted; the BPF filter expression is positional
+//   and passes through. For a bounded capture use `-c <count>` or run_in_background +
+//   job_stop — an unbounded tcpdump is killed by the per-call timeout / debug-pod TTL.
+const TCPDUMP_FLAGS = [
+  "-i", "--interface", "-c", "--count", "-s", "--snapshot-length",
+  "-n", "-N", "-e", "-q", "-v", "-A", "-x", "-X", "-S", "-t", "-K",
+  "-p", "--no-promiscuous-mode", "-l", "--packet-buffered", "-U",
+  "-Q", "--direction", "--immediate-mode", "-B", "--buffer-size",
+  "-d", "-D", "--list-interfaces", "-L", "--list-data-link-types",
+  "-h", "--help", "--version",
+];
+
+// mlxlink (Mellanox link diagnostics) — read-only flag allow-list. mlxlink can CHANGE
+// port state and WRITE files (--port_state, --amber_collect, --write_to_file, --reset,
+// and the --set_* family); those are OMITTED → auto-rejected. Only link/PHY/FEC/eye/
+// counter *read* flags are permitted. -d takes a device (positional value), passes through.
+const MLXLINK_FLAGS = [
+  "-d", "--device", "-p", "--port", "-c", "--counters",
+  "-e", "--errors_show", "-m", "--module_info",
+  "--show_module", "--show_serdes_tx", "--show_fec", "--show_eye",
+  "--show_counters", "--rx_fec_histogram", "--port_type", "--json",
+  "--use_csv", "-h", "--help",
+];
+
+// smartctl — read-only SMART/health flags only. -t (run self-test) and -s (SET features:
+// SMART enable/disable, security, write-cache) are OMITTED → auto-rejected.
+const SMARTCTL_FLAGS = [
+  "-a", "--all", "-i", "--info", "-H", "--health",
+  "-A", "--attributes", "-x", "--xall", "-c", "--capabilities",
+  "-l", "--log", "-j", "--json", "-d", "--device", "-n", "--nocheck",
+  "-f", "--format", "-q", "--quietmode",
+];
+
+// nvme-cli — read-only subcommands only (information/log queries). Destructive subcommands
+// (format, sanitize, write, write-zeroes, create-ns, delete-ns, fw-download, fw-commit,
+// reset, set-feature, security-send) are NOT listed → auto-rejected.
+const NVME_READ_SUBCMDS = [
+  "list", "list-subsys", "list-ns", "list-ctrl", "id-ctrl", "id-ns", "ns-descs",
+  "smart-log", "error-log", "fw-log", "ana-log", "endurance-log", "self-test-log",
+  "telemetry-log", "get-feature", "get-log", "show-regs", "version", "help",
+];
+
+// perfquery (IB/RoCE port counters) — read-only flag allow-list. Counter-reset flags
+// (-R/--Reset_only, -r/--reset_after_read) are OMITTED → auto-rejected. The legacy
+// positional form `<lid> <port> <reset_mask>` ALSO resets via a 3rd positional, so the
+// rule caps positionals at 2 (lid + port, or two flag values) — a 3rd is rejected.
+const PERFQUERY_FLAGS = [
+  "-x", "--extended", "-X", "--xmtsl", "-D", "--Direct", "-G", "--Guid",
+  "-C", "--Ca", "-P", "--Port", "-a", "--all_ports", "-l", "--loop_ports",
+  "-t", "--timeout", "-h", "--help", "-V", "--version",
+];
+
+// ibqueryerrors — read-only flag allow-list. Counter-clear flags (-c/--clear_errors,
+// -k/--clear_port_counters) and file-reading flags (-t/--threshold-file, --node-name-map)
+// are OMITTED → auto-rejected.
+const IBQUERYERRORS_FLAGS = [
+  "-s", "--suppress", "-S", "--suppress-common", "-D", "--Direct", "-G", "--Guid",
+  "-C", "--Ca", "-P", "--Port", "-r", "--report-port", "-d", "--details",
+  "--counters", "--data", "--switch", "-h", "--help", "-V", "--version",
+];
+
+// tree — read/display flag allow-list. -o (write tree output to a file) is OMITTED →
+// auto-rejected. Positional directory paths are read targets (allowed).
+const TREE_FLAGS = [
+  "-a", "-d", "-l", "-f", "-i", "-L", "-P", "-I", "-p", "-u", "-g", "-s",
+  "-h", "-D", "-F", "-C", "-n", "-Q", "-N", "-r", "-t", "-v", "-x", "-J", "-X", "-H",
+  "--du", "--dirsfirst", "--noreport", "--filelimit", "--charset", "--timefmt",
+  "--inodes", "--device", "--prune", "--help", "--version",
 ];
 
 // ── Generic rule engine ──────────────────────────────────────────
@@ -445,6 +521,64 @@ function validateIbportstate(args: string[]): string | null {
       return JSON.stringify({
         error: `ibportstate "${arg}" is not allowed. Only query operations are permitted.`,
         allowed: [...IBPORTSTATE_SAFE_ACTIONS],
+      }, null, 2);
+    }
+  }
+  return null;
+}
+
+// ─── perfquery ───────────────────────────────────────────────────
+// Custom validator (not declarative) so we have a flag-argument model: the generic rule
+// engine counts a flag's VALUE (e.g. the "mlx5_0" in "-C mlx5_0") as a positional, which
+// both over-blocked legit reads and couldn't see the legacy positional reset form. Here we
+// skip value-flag values, default-deny unknown/reset flags, and cap BARE positionals at 2
+// (<lid> <port>) — a 3rd positional is the reset_mask, which RESETS the counters.
+const PERFQUERY_VALUE_FLAGS = new Set(["-C", "--Ca", "-P", "--Port", "-t", "--timeout"]);
+
+function validatePerfquery(args: string[]): string | null {
+  let positionals = 0;
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-")) {
+      const flag = extractFlag(arg);
+      if (!PERFQUERY_FLAGS.includes(flag)) {
+        return JSON.stringify({
+          error: `perfquery "${arg}" is not allowed (counter-reset and unknown flags are blocked; read-only only).`,
+        }, null, 2);
+      }
+      // Consume the value of a value-taking flag so it isn't miscounted as a positional.
+      if (PERFQUERY_VALUE_FLAGS.has(flag) && !arg.includes("=")) i++;
+      continue;
+    }
+    if (++positionals > 2) {
+      return JSON.stringify({
+        error: `perfquery positional "${arg}" is not allowed: a 3rd positional is a reset_mask that RESETS counters. Only <lid> <port> are permitted.`,
+      }, null, 2);
+    }
+  }
+  return null;
+}
+
+// ─── dcgmi ───────────────────────────────────────────────────────
+// Read-oriented subcommands only, AND (unlike a bare allowedSubcommands, which stops at the
+// verb) reject the setter flags that mutate DCGM state — so "dcgmi health -s" / "dcgmi stats
+// --enable" can't slip through and break the read-only invariant.
+const DCGMI_READ_SUBCMDS = new Set(["discovery", "topo", "modules", "nvlink", "health", "stats"]);
+const DCGMI_SETTER_FLAGS = new Set(["-s", "--set", "-e", "--enable", "--unwatch"]);
+
+function validateDcgmi(args: string[]): string | null {
+  const sub = args.slice(1).find((a) => !a.startsWith("-"));
+  if (sub !== undefined && !DCGMI_READ_SUBCMDS.has(sub)) {
+    return JSON.stringify({
+      error: `dcgmi "${sub}" is not allowed. Only read subcommands are permitted.`,
+      allowed: [...DCGMI_READ_SUBCMDS],
+    }, null, 2);
+  }
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("-") && DCGMI_SETTER_FLAGS.has(extractFlag(arg))) {
+      return JSON.stringify({
+        error: `dcgmi "${arg}" is not allowed (it changes DCGM state; this tool is read-only).`,
       }, null, 2);
     }
   }
@@ -963,12 +1097,16 @@ export const COMMANDS: Record<string, CommandDef> = {
   cut:    { category: "text" },
   tr:     { category: "text" },
   jq:     { category: "text" },
+  tac:    { category: "text" }, // reverse-cat — read-only
+  nl:     { category: "text" }, // number lines — read-only
   yq:     { category: "text", allowedFlags: [
     "-r", "--raw-output", "-e", "--exit-status", "-o", "--output-format",
     "-P", "--prettyprint", "-C", "--colors", "-M", "--no-colors",
     "-N", "--no-doc", "-j", "--tojson", "-p", "--input-format",
     "--xml-attribute-prefix", "--xml-content-name",
-    "-s", "--split-exp", "--unwrapScalar", "--nul-output", "--header-preprocess",
+    "--unwrapScalar", "--nul-output", "--header-preprocess",
+    // NOTE: -s/--split-exp intentionally excluded — mikefarah yq's --split-exp writes each
+    // document to a separate FILE (write capability); output must stay on stdout.
   ] },
   column: { category: "text" },
 
@@ -978,7 +1116,7 @@ export const COMMANDS: Record<string, CommandDef> = {
   ping:       { category: "network" },
   traceroute: { category: "network" },
   tracepath:  { category: "network" },
-  ss:         { category: "network" },
+  ss:         { category: "network", blockedFlags: ["-K", "--kill"] }, // -K/--kill destroys matching sockets → blocked; reads still allowed
   netstat:    { category: "network" },
   route:      { category: "network", allowedFlags: ["-n", "-e", "-v", "-F", "-C", "--numeric", "--extend", "--verbose"], positionals: "block" },
   arp:        { category: "network", allowedFlags: ["-a", "-n", "-e", "-v", "--all", "--numeric", "--verbose"] },
@@ -991,6 +1129,14 @@ export const COMMANDS: Record<string, CommandDef> = {
   tc:         { category: "network", allowedSubcommands: { position: 1, allowed: ["show", "list", "ls"] } },
   conntrack:  { category: "network", validate: validateConntrack },
   curl:       { category: "network", validate: validateCurl },
+  tcpdump:    { category: "network", allowedFlags: TCPDUMP_FLAGS },
+  nstat:      { category: "network", allowedFlags: ["-a", "--ignore", "-z", "--zeros", "-s", "--noupdate", "-j", "--json"] }, // -d (daemon) rejected
+  // getent: nsswitch real resolution path (hosts/networks). Restricted to name-resolution
+  // databases so "getent shadow"/"passwd"/"group" can't leak /etc/shadow or enumerate users.
+  getent:     { category: "network", allowedSubcommands: { position: 0, allowed: ["hosts", "ahosts", "ahostsv4", "ahostsv6", "networks"] } },
+  // resolvectl: systemd-resolved stub resolver. Read-only subcommands only; write subcommands
+  // (flush-caches / dns / domain / revert / reset-*) are rejected. Bare `resolvectl` = status → allowed.
+  resolvectl: { category: "network", allowedSubcommands: { position: 0, allowed: ["query", "status", "statistics", "service"] } },
 
   // ── RDMA / RoCE ──
   ibstat:       { category: "rdma" },
@@ -1005,6 +1151,13 @@ export const COMMANDS: Record<string, CommandDef> = {
   ibroute:      { category: "rdma" },
   show_gids:    { category: "rdma" },
   ibdev2netdev: { category: "rdma" },
+  // ── read-only fabric / link diagnostics (added) ──
+  saquery:      { category: "rdma" }, // subnet-admin queries — read-only, no write path
+  ibping:       { category: "rdma" }, // RDMA ping — read-only
+  perfquery:    { category: "rdma", validate: validatePerfquery }, // flag-aware: blocks reset (flag + 3rd positional), no longer over-blocks flagged reads
+  ibqueryerrors:{ category: "rdma", allowedFlags: IBQUERYERRORS_FLAGS }, // default-deny: clear/threshold-file flags rejected
+  mst:          { category: "rdma", allowedSubcommands: { position: 0, allowed: ["status", "version"] } }, // start/stop load/unload drivers → not allowed
+  mlxlink:      { category: "rdma", allowedFlags: MLXLINK_FLAGS }, // default-deny: only read-only link/PHY/FEC/eye/counter flags
 
   // ── perftest (11 binaries, shared flags) ──
   ib_write_bw:          { category: "perftest", allowedFlags: PERFTEST_FLAGS },
@@ -1023,6 +1176,9 @@ export const COMMANDS: Record<string, CommandDef> = {
   "nvidia-smi": { category: "gpu", validate: validateNvidiaSmi },
   gpustat:      { category: "gpu" },
   nvtopo:       { category: "gpu" },
+  // dcgmi: read subcommands AND setter-flag rejection (validateDcgmi) so health/stats can't
+  // toggle DCGM watches. "config"/"policy"/"set"/"profile"/"group"/"diag" are not allowed.
+  dcgmi:        { category: "gpu", validate: validateDcgmi },
 
   // ── hardware info ──
   lspci:     { category: "hardware" },
@@ -1031,7 +1187,11 @@ export const COMMANDS: Record<string, CommandDef> = {
   lscpu:     { category: "hardware" },
   lsmem:     { category: "hardware" },
   lshw:      { category: "hardware" },
-  dmidecode: { category: "hardware" },
+  dmidecode: { category: "hardware", blockedFlags: ["--dump-bin"] }, // --dump-bin <file> writes SMBIOS binary to an arbitrary file → blocked; -u/--dump (stdout) kept
+  // ── storage / sensor / topology health (added, read-only) ──
+  smartctl:  { category: "hardware", allowedFlags: SMARTCTL_FLAGS }, // default-deny: -t (self-test) / -s (set) rejected
+  nvme:      { category: "hardware", allowedSubcommands: { position: 0, allowed: NVME_READ_SUBCMDS } }, // format/sanitize/write/set-feature/fw-* rejected
+  sensors:   { category: "hardware", allowedFlags: ["-A", "-u", "-f", "-j", "--no-adapter"] }, // -s (apply config) / -c (read arbitrary file) rejected
 
   // ── kernel / system ──
   uname:    { category: "kernel" },
@@ -1049,6 +1209,7 @@ export const COMMANDS: Record<string, CommandDef> = {
   sysctl:   { category: "kernel", validate: validateSysctl },
   lsmod:    { category: "kernel" },
   modinfo:  { category: "kernel" },
+  getconf:  { category: "kernel" }, // prints system configuration values — read-only
 
   // ── process / resource ──
   ps:      { category: "process" },
@@ -1066,6 +1227,11 @@ export const COMMANDS: Record<string, CommandDef> = {
   mount:   { category: "process", validate: validateMount },
   findmnt: { category: "process" },
   nproc:   { category: "process" },
+  // ── added (read-only) ──
+  pidstat:  { category: "process" },
+  pstree:   { category: "process" },
+  numastat: { category: "process" },
+  ipcs:     { category: "process" }, // ipcs reads IPC status; ipcrm (the writer) is a separate, un-whitelisted binary
 
   // ── file inspection (read-only) — category blocked in local context ──
   cat:       { category: "file" },
@@ -1081,6 +1247,7 @@ export const COMMANDS: Record<string, CommandDef> = {
   diff:      { category: "file" },
   md5sum:    { category: "file" },
   sha256sum: { category: "file" },
+  tree:      { category: "file", allowedFlags: TREE_FLAGS }, // default-deny: -o (write output to file) rejected; positional dirs are read targets
 
   // ── system logs & services ──
   journalctl:  { category: "services", allowedFlags: [
@@ -1124,6 +1291,8 @@ export const COMMANDS: Record<string, CommandDef> = {
   lsof:    { category: "inspection" },
   lsns:    { category: "inspection" },
   strings: { category: "inspection" },
+  hexdump: { category: "inspection" }, // reads file/stdin → stdout; no output-file arg
+  od:      { category: "inspection" }, // octal/hex dump → stdout; no output-file arg
 
   // ── compressed file reading — category blocked in local context ──
   zcat:  { category: "compressed" },
@@ -1132,7 +1301,7 @@ export const COMMANDS: Record<string, CommandDef> = {
   xzcat: { category: "compressed" },
 
   // ── system activity ──
-  sar:   { category: "activity" },
+  sar:   { category: "activity", blockedFlags: ["-o"] }, // -o <file> writes sar binary data to a file → blocked; -f (read) unaffected
   blkid: { category: "activity" },
 
   // ── stream utility ──
