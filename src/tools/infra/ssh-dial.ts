@@ -357,12 +357,96 @@ export function runCommand(client: Client, command: string, options: SshRunOptio
           ...(truncated ? { truncated: true } : {}),
         });
       });
+      // A channel 'error' with no listener throws an uncaught exception; the timeout would
+      // eventually settleReject but the process may already have crashed. Reject explicitly.
+      stream.on("error", (e: Error) => settleReject(e));
+      stream.stderr.on("error", () => { /* see main stream 'error' */ });
       stream.on("data", (chunk: Buffer) => append(stdoutChunks, chunk));
       stream.stderr.on("data", (chunk: Buffer) => append(stderrChunks, chunk));
 
       if (options.stdin !== undefined) {
+        // Swallow EPIPE if the remote closes stdin early (async — not catchable around .end()).
+        stream.stdin.on("error", () => { /* EPIPE / broken pipe — ignore */ });
         stream.stdin.end(options.stdin);
       }
+    });
+  });
+}
+
+// ── runCommandStream (background) ────────────────────────────────────
+
+/** Live handle to a streaming remote command, for background execution. */
+export interface SshStreamHandle {
+  /** stdout of the remote command (the ssh2 channel itself). */
+  stdout: import("node:stream").Readable;
+  /** stderr of the remote command. */
+  stderr: import("node:stream").Readable;
+  /** Resolves when the remote channel closes (exitCode null = killed by signal). */
+  done: Promise<{ exitCode: number | null; signal?: string }>;
+  /** Best-effort: close the channel. The caller tears down the client afterwards. */
+  abort: () => void;
+}
+
+/**
+ * Streaming counterpart to {@link runCommand}: does NOT buffer — exposes the raw
+ * stdout/stderr streams so a background launcher can pipe them line-by-line to disk.
+ * Pipes options.stdin (script body) and honours an AbortSignal. There is no overall
+ * timeout here: a background command is bounded by its own `timeout <ttl>` wrapper
+ * (added by the calling tool) and by job_stop's abort. The caller owns client teardown.
+ */
+export function runCommandStream(
+  client: Client,
+  command: string,
+  options: { signal?: AbortSignal; stdin?: string } = {},
+): Promise<SshStreamHandle> {
+  return new Promise<SshStreamHandle>((resolve, reject) => {
+    client.exec(command, (err, stream) => {
+      if (err) return reject(err);
+
+      let closed = false;
+      let resolveDone!: (v: { exitCode: number | null; signal?: string }) => void;
+      const done = new Promise<{ exitCode: number | null; signal?: string }>((res) => {
+        resolveDone = res;
+      });
+      const onAbort = () => { try { stream.close(); } catch { /* already closing */ } };
+      const finish = (v: { exitCode: number | null; signal?: string }) => {
+        if (closed) return;
+        closed = true;
+        options.signal?.removeEventListener("abort", onAbort);
+        resolveDone(v);
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+
+      stream.on("close", (code: number | null, signal?: string) => {
+        finish({ exitCode: code, ...(signal ? { signal } : {}) });
+      });
+      // A channel 'error' (link flap, window/protocol error) MUST be handled: with no
+      // listener Node throws an uncaught exception (can take down the whole agentbox), and
+      // `done` would otherwise never settle — leaving the job hung, the parent session's
+      // background-work count un-decremented, and the ssh chain never torn down (connection
+      // leak). Resolve `done` as a failure so the runner settles and the caller tears down.
+      stream.on("error", () => {
+        try { stream.destroy(); } catch { /* ignore */ }
+        finish({ exitCode: null, signal: "ERROR" });
+      });
+      // stderr shares the channel; swallow its 'error' so it can't throw unhandled (the
+      // failure is already surfaced via the main stream 'error' above).
+      stream.stderr?.on("error", () => { /* see main stream 'error' */ });
+
+      if (options.stdin !== undefined) {
+        // The remote may close stdin early (interpreter exits / channel drops) → EPIPE on
+        // this writable; with no listener that throws unhandled. Swallow it (close/error
+        // drives `done`). try/catch around .end() can't catch this async stream error.
+        stream.stdin.on("error", () => { /* EPIPE / broken pipe — ignore */ });
+        stream.stdin.end(options.stdin);
+      }
+
+      // The signal may already be aborted by the time exec's callback fires (a job_stop
+      // during a slow multi-hop dial). addEventListener won't fire for an already-fired
+      // signal, so close now — otherwise the stop is silently lost and the command runs on.
+      if (options.signal?.aborted) onAbort();
+
+      resolve({ stdout: stream, stderr: stream.stderr, done, abort: onAbort });
     });
   });
 }

@@ -1,5 +1,7 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
+import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
@@ -7,6 +9,8 @@ import { checkNodeReady } from "../infra/k8s-checks.js";
 import { resolveScript } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { loadConfig } from "../../core/config.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import {
   validateNodeName,
@@ -15,7 +19,7 @@ import {
   stdinExecCmd,
 } from "../infra/exec-utils.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
-import { runInDebugPod } from "../infra/debug-pod.js";
+import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
@@ -28,9 +32,15 @@ interface NodeScriptParams {
   cluster?: string;
   image?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
-export function createNodeScriptTool(kubeconfigRef?: KubeconfigRef, userId?: string): ToolDefinition {
+export function createNodeScriptTool(
+  kubeconfigRef?: KubeconfigRef,
+  userId?: string,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "node_script",
     label: "Node Script",
@@ -100,8 +110,22 @@ Examples:
           description: "Timeout in seconds (default: 180, max: 300)",
         }),
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the script on the node in the background instead of waiting. Returns immediately with " +
+                  "a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read the file " +
+                  "or call any tool, and do NOT sleep/wait. You are notified automatically when it completes; " +
+                  "ONLY THEN read the output_file. The script is wrapped in `timeout` and capped at the " +
+                  "debug-pod lifetime (~600s). Use for long-running node skill scripts (orchestration, soak).",
+              }),
+            ),
+          }
+        : {}),
     }),
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as NodeScriptParams;
 
       try {
@@ -177,10 +201,73 @@ Examples:
         ? `ip netns exec ${netns} ${baseCmd}`
         : baseCmd;
 
-      const nsenterCmd = [
-        "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
-        "--", "sh", "-c", innerCmd,
-      ];
+      const NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"];
+      const nsenterCmd = [...NSENTER, "sh", "-c", innerCmd];
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Mirror node_exec's background path (ensure + pin a debug pod, record the remote PGID
+      // so job_stop can kill the host-namespace group, `timeout` as the leak backstop) but
+      // feed the SCRIPT via stdin: `sh -c launchScript` gets launchScript as its -c arg, so
+      // stdin stays free for the inner `sh -s`/`python3 -` reading the piped script body.
+      if (backgroundEnabled && params.run_in_background === true) {
+        const cfg = loadConfig();
+        const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
+        const safeJob = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_");
+        const pgidFile = `/tmp/siclaw-bg-${safeJob}-${randomBytes(4).toString("hex")}.pgid`;
+        const launchScript = `echo $$ > ${pgidFile}; exec timeout ${ttl} ${innerCmd}`;
+        const bgNsenterCmd = [...NSENTER, "setsid", "-w", "sh", "-c", launchScript];
+        const spec = { userId: userId ?? "unknown", nodeName: params.node, command: bgNsenterCmd, image, clusterKey };
+        let cachedPod;
+        try {
+          cachedPod = await ensureDebugPodReady(spec, env, { signal });
+        } catch (err: any) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
+            details: { error: true, reason: "debug_pod_failed" },
+          };
+        }
+        const pinnedPodName = acquireDebugPod(spec);
+        if (!pinnedPodName) {
+          return {
+            content: [{ type: "text", text: JSON.stringify({ error: true, message: "Debug pod went away before the background job could pin it; try again." }) }],
+            details: { error: true, reason: "debug_pod_gone" },
+          };
+        }
+        const killScript = `pgid=""; for i in 1 2 3; do pgid=$(cat ${pgidFile} 2>/dev/null); [ -n "$pgid" ] && break; sleep 1; done; if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null; sleep 1; kill -KILL -"$pgid" 2>/dev/null; fi; rm -f ${pgidFile}`;
+        const onAbort = () => {
+          try {
+            const killer = spawn(
+              "kubectl",
+              [...env.kubeconfigArgs, "-n", cachedPod!.namespace, "exec", cachedPod!.podName, "--", ...NSENTER, "sh", "-c", killScript],
+              { env: env.childEnv as Record<string, string>, detached: true },
+            );
+            killer.on("error", () => {});
+            setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, 15_000).unref();
+            killer.unref();
+          } catch { /* best-effort */ }
+        };
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            file: "kubectl",
+            args: [...env.kubeconfigArgs, "-n", cachedPod.namespace, "exec", "-i", cachedPod.podName, "--", ...bgNsenterCmd],
+            stdin: resolved.content,
+            env: env.childEnv as Record<string, string>,
+            action: null,
+            hasSensitiveKubectl: false,
+            description: `node ${params.node}: ${[params.skill, params.script].filter(Boolean).join("/")}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: process.env.NODE_ENV === "production",
+            jobType: "node",
+            onComplete: () => releaseDebugPod(spec, pinnedPodName),
+            onAbort,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running the script on the node in the background.");
+        } catch (err) {
+          releaseDebugPod(spec, pinnedPodName);
+          console.warn(`[node-script] background launch declined, running foreground:`, err);
+        }
+      }
 
       const execResult = await runInDebugPod(
         { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey, stdinData: resolved.content },
@@ -212,5 +299,9 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  create: (refs) => createNodeScriptTool(refs.kubeconfigRef, refs.userId),
+  create: (refs) =>
+    createNodeScriptTool(refs.kubeconfigRef, refs.userId, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

@@ -161,8 +161,10 @@ Step 8: formatExecOutput()
 
 | Tool | Method | How |
 |------|--------|-----|
-| `node_script` | base64 inject | Encode script → echo + base64 -d inside nsenter. Supports `netns` param for pod network namespace. |
+| `node_script` | stdin pipe | `kubectl exec -i` → `nsenter … sh -c '<reader>'` with the script piped to stdin (`sh -s` / `python3 -`). Supports `netns` param for pod network namespace. |
 | `pod_script` | stdin pipe | `kubectl exec -i` with script piped to stdin |
+| `host_script` | stdin pipe | ssh2 channel with the script piped to the remote `sh -s` / `python3 -` |
+| `local_script` | argv | interpreter + scriptPath (+ args) spawned directly in the AgentBox |
 
 ---
 
@@ -177,7 +179,7 @@ The most complex tool. Handles full shell pipelines with:
 - Production mode: `sudo -E -u sandbox` user isolation
 - Skill script detection bypass (`isSkillScript`)
 - 3-layer output sanitization (see §6.2)
-- Optional `run_in_background` (see §9) — exposed only when a `backgroundBashExecutor` is injected
+- Optional `run_in_background` (see §9) — exposed only when a `backgroundExecExecutor` is injected
 
 **kubectl access**: There is no dedicated kubectl tool — all kubectl commands go
 through `restricted_bash` with pipeline validation. `validateKubectlInPipeline()`
@@ -480,27 +482,33 @@ than 2 new cmd-exec tools are added.
 ## 9. Background Jobs (`run_in_background`)
 
 Two background modes share one core, modeled on Claude Code's `run_in_background`:
-**background bash** (a detached shell command) and **background sub-agent**
-(`spawn_subagent run_in_background`). They are peers — background bash does NOT spawn a
-sub-agent. Master switches: `BACKGROUND_BASH_ENABLED` and `RUN_IN_BACKGROUND_ENABLED`
-(`src/core/subagent-registry.ts`).
+**background exec** (a detached command/stream) and **background sub-agent**
+(`spawn_subagent run_in_background`). They are peers — background exec does NOT spawn a
+sub-agent. Background exec is wired on the whole exec + script family: `bash`, `node_exec`,
+`pod_exec`, `host_exec`, and the `local_script` / `node_script` / `pod_script` / `host_script`
+tools. Master switches: `BACKGROUND_BASH_ENABLED` (the exec + script family) and
+`RUN_IN_BACKGROUND_ENABLED` (sub-agents) (`src/core/subagent-registry.ts`).
 
 ### 9.1 Shared pieces
 
-- **`JobRegistry`** (`src/core/job-registry.ts`) — one per runtime; `JobRecord{type:"subagent"|"bash"}`.
+- **`JobRegistry`** (`src/core/job-registry.ts`) — one per runtime; `JobRecord{type:"subagent"|"bash"|"node"|"pod"|"host"|"local"}`.
   `claimNotification(jobId)` is the atomic dedup latch (a completion notice is sent EXACTLY
   once, even when process-exit and `job_stop` race).
 - **`buildTaskNotificationText`** (`src/core/task-notification.ts`) — the `<task_notification>`
   XML (task_id / output_file / status / summary) injected back into the parent model.
-- **`spawnBackgroundBash`** (`src/core/background-bash-runner.ts`) — runtime-agnostic: spawns
-  detached, streams sanitized output to disk (`SanitizingLineBuffer`, §6b sanitization.md),
-  registers the job, fires `notify` once on exit.
+- **`spawnBackgroundBash`** (`src/core/background-bash-runner.ts`) — runtime-agnostic launcher
+  with **three exec modes** (exactly one per request): `command` (detached shell — bash),
+  `file`+`args` (detached argv, no shell — node/pod/local/scripts; optional `stdin` carries a
+  script body), and `streamFactory` (in-process ssh2 stream — host_exec/host_script: no child
+  process, the factory dials ssh and returns live stdout/stderr + a `done` promise and owns
+  connection teardown). All three stream sanitized output to disk (`SanitizingLineBuffer`,
+  §6b sanitization.md), register the job, and fire `notify` exactly once on settle.
 - **`job_stop`** — generalized to cancel either job type (bash → process-group SIGKILL).
 
 ### 9.2 The completion-notification injector
 
 Tools have no live brain handle, so background work is launched via injected executors
-(`ToolRefs.backgroundBashExecutor`, `spawnSubagentExecutor`) and notified back through the
+(`ToolRefs.backgroundExecExecutor`, `spawnSubagentExecutor`) and notified back through the
 runtime:
 
 - **Gateway/agentbox** (`AgentBoxSessionManager.notifyParent`): parent run in-flight
@@ -536,11 +544,12 @@ Background bash output streams to `<userDataDir>/agent/tasks/<jobId>.output` (wi
 built-in `read` tool (offset/limit) to inspect progress and is notified on completion — it
 must NOT poll. Output is sanitized on write (§6b sanitization.md).
 
-### 9.4 Background on remote tools (node_exec / pod_exec)
+### 9.4 Background on remote & script tools (node_exec / pod_exec / host_exec / scripts)
 
-`run_in_background` also works on `node_exec` and `pod_exec` (gated identically on the
-injected executor). This is how long node-side work — e.g. RDMA perftest打流, server on
-node A + client on node B — runs without a dedicated skill.
+`run_in_background` also works on `node_exec`, `pod_exec`, `host_exec`, and every script tool
+(`local_script` / `node_script` / `pod_script` / `host_script`), gated identically on the
+injected executor. This is how long node-/host-side work — e.g. RDMA perftest打流, server on
+node A + client on node B — runs, whether issued as a one-off command or a skill script.
 
 The mechanism reuses the same runner in **argv mode**: the agentbox spawns the
 `kubectl exec <pod> -- …` (node_exec: into a debug pod, `nsenter` into the host;
@@ -557,6 +566,14 @@ on-disk file the model reads. Differences from bash background:
   — longer runs need a shorter perftest duration or a raised `debugPodTTL`.
 - **pod_exec** has no debug pod / no pin; the process is bounded by the target pod's
   lifecycle. If stopped early, the in-pod process may keep running until the pod ends.
+- **host_exec / host_script** use the **stream mode** (ssh2, no child process). The remote
+  command is wrapped in **`timeout <ttl>`** (host_exec default 600s, cap 3600s; host_script
+  the same) so a dropped channel cannot orphan the remote process — `job_stop` closes the
+  channel and the remote is bounded by `timeout`. The script body (host_script) is piped via
+  the ssh channel's stdin. `sshExecStream` (`src/tools/infra/ssh-client.ts`) owns chain teardown.
+- **node_script / pod_script / local_script** reuse the argv mode with the script piped via
+  `stdin` (no temp files on the target). node_script pins a debug pod and records the remote
+  PGID exactly like node_exec; pod/local mirror pod_exec/bash.
 
 The per-session concurrency cap (`getBackgroundBashConcurrency`) counts ALL background
-exec jobs (bash + node + pod) together; over the cap, the tool falls back to foreground.
+exec jobs (bash + node + pod + host + local) together; over the cap, the tool falls back to foreground.
