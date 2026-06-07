@@ -9,7 +9,8 @@ import { postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
-import { validateNodeName, stdinExecCmd } from "../infra/exec-utils.js";
+import { validateNodeName, validatePodName, stdinExecCmd } from "../infra/exec-utils.js";
+import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
 import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
 
@@ -18,6 +19,9 @@ interface HostScriptParams {
   skill?: string;
   script: string;
   args?: string;
+  pod?: string;
+  namespace?: string;
+  container?: string;
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
@@ -89,6 +93,17 @@ Examples (pass the id from host_list; names shown here for readability):
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
+      pod: Type.Optional(
+        Type.String({
+          description: "Target pod name. When set, the script runs inside THIS POD's network namespace (on this host/node) using host tools — RDMA/RoCE on a pod that lacks the tools. The host must be the K8s node running the pod, and its SSH credential must be root (crictl + `ip netns exec` need CAP_SYS_ADMIN).",
+        }),
+      ),
+      namespace: Type.Optional(
+        Type.String({ description: 'Pod namespace (default: "default"). Only used with `pod`.' }),
+      ),
+      container: Type.Optional(
+        Type.String({ description: "Container name (multi-container pods). Only used with `pod`." }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 180, max: 300; in background: default 600, max 3600)",
@@ -144,7 +159,24 @@ Examples (pass the id from host_list; names shown here for readability):
 
       const args = params.args?.trim() || "";
       const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
-      const remoteCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
+      let remoteCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
+
+      // One-step pod netns: resolve the pod's netns over SSH (crictl on this node; needs root),
+      // then run the interpreter inside it (`ip netns exec <netns> bash -s …`); the script body
+      // still flows in via stdin. Prefix is tool-built; netns name comes from crictl (validated).
+      if (params.pod?.trim()) {
+        const podErr = validatePodName(params.pod.trim());
+        if (podErr) {
+          return { content: [{ type: "text", text: `Error: ${podErr}` }], details: { error: true, reason: "invalid_pod_name" } };
+        }
+        const r = await resolvePodNetnsViaSsh({
+          target, pod: params.pod.trim(), namespace: params.namespace?.trim() || "default", container: params.container, signal,
+        });
+        if ("error" in r) {
+          return { content: [{ type: "text", text: `Error: ${r.error}` }], details: { error: true, reason: "netns_resolve_failed" } };
+        }
+        remoteCmd = `ip netns exec ${r.netns} ${remoteCmd}`;
+      }
 
       // ── Background mode ──────────────────────────────────────────────
       // Pipe the script via stdin to a `setsid`-wrapped, `timeout <ttl>`-bounded remote shell,

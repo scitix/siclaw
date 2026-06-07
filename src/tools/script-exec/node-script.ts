@@ -14,21 +14,26 @@ import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import {
   validateNodeName,
+  validatePodName,
   prepareExecEnv,
   filterPodNoise,
   stdinExecCmd,
 } from "../infra/exec-utils.js";
+import { resolvePodNetnsViaKubectl, validateNetnsName } from "../infra/pod-netns-resolve.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 interface NodeScriptParams {
-  node: string;
+  node?: string;
   skill?: string;
   script: string;
   args?: string;
   netns?: string;
+  pod?: string;
+  namespace?: string;
+  container?: string;
   cluster?: string;
   image?: string;
   timeout_seconds?: number;
@@ -66,11 +71,13 @@ For single commands, use node_exec instead.
 Scripts must come from a skill's scripts/ directory or from user-uploaded scripts. Read the skill's SKILL.md first for the exact script name, arguments, and usage — don't guess the filename.
 
 Parameters:
-- node: Target Kubernetes node name
+- node: Target Kubernetes node name (optional when pod= is given)
+- pod: Target pod — run the script inside THIS pod's network namespace using host tools (one step; node resolved for you)
+- namespace: Pod namespace (default "default"); only with pod
 - skill: Skill name (e.g. "node-logs"). If omitted, looks in user scripts
 - script: Script filename (e.g. "get-node-logs.sh")
 - args: Optional arguments to pass to the script
-- netns: Optional network namespace id to enter a pod's netns on the node (from resolve_pod_netns)
+- netns: Advanced — a pre-resolved netns (from resolve_pod_netns) + node, to reuse one resolution across many runs
 - cluster: Cluster name (from cluster_list); omit to use the default cluster when only one is available
 - image: Debug container image (default: SICLAW_DEBUG_IMAGE)
 - timeout_seconds: Timeout (default: 180, max: 300)
@@ -78,9 +85,9 @@ Parameters:
 Examples:
 - node: "node-1", skill: "node-logs", script: "get-node-logs.sh", args: "--lines 100"
 - node: "node-1", script: "my-check.sh"
-- node: "node-1", netns: "abc123", skill: "gateway-diagnostics", script: "ping-gateway.sh", args: "--interface net1"`,
+- pod: "rdma-a", namespace: "rdma-test", skill: "gateway-diagnostics", script: "ping-gateway.sh", args: "--interface net1"   (one step into the pod's netns)`,
     parameters: Type.Object({
-      node: Type.String({ description: "Kubernetes node name" }),
+      node: Type.Optional(Type.String({ description: "Kubernetes node name. Optional when `pod` is given (the node is resolved from the pod)." })),
       skill: Type.Optional(
         Type.String({
           description: "Skill name (omit to use user scripts)",
@@ -90,9 +97,20 @@ Examples:
       args: Type.Optional(
         Type.String({ description: "Arguments to pass to the script" }),
       ),
+      pod: Type.Optional(
+        Type.String({
+          description: "Target pod name. When set, the script runs inside THIS POD's network namespace using host tools (one step — no resolve_pod_netns needed); the node is resolved automatically.",
+        }),
+      ),
+      namespace: Type.Optional(
+        Type.String({ description: 'Pod namespace (default: "default"). Only used with `pod`.' }),
+      ),
+      container: Type.Optional(
+        Type.String({ description: "Container name (multi-container pods). Only used with `pod`." }),
+      ),
       netns: Type.Optional(
         Type.String({
-          description: 'Network namespace name (from resolve_pod_netns). When set, script runs inside that netns via "ip netns exec".',
+          description: 'Advanced: a pre-resolved network namespace name (from resolve_pod_netns) + `node`. Prefer `pod` for one step; use `netns` to reuse one resolution across many commands.',
         }),
       ),
       cluster: Type.Optional(
@@ -146,24 +164,42 @@ Examples:
       }
       const env = prepareExecEnv(kubeconfigRef, kubeResult.path);
 
-      // Validate node name format
-      const nodeErr = validateNodeName(params.node);
-      if (nodeErr) {
-        return {
-          content: [{ type: "text", text: `Error: ${nodeErr}` }],
-          details: { error: true },
-        };
+      const clusterKey = params.cluster || "default";
+      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
+      const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
+      const args = params.args?.trim() || "";
+      // Security: shell-escape each argument to prevent injection via args parameter
+      const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
+
+      // Resolve the target: effective node + optional pod netns. netns → advanced/reuse (needs
+      // node); pod → one step (resolve {node, netns}); neither → plain node script.
+      let nodeName = params.node?.trim() ?? "";
+      let netns = "";
+      if (params.netns?.trim()) {
+        netns = params.netns.trim();
+        const nsErr = validateNetnsName(netns);
+        if (nsErr) return { content: [{ type: "text", text: `Error: ${nsErr}` }], details: { error: true } };
+        if (!nodeName) return { content: [{ type: "text", text: "Error: netns requires node. Provide node, or use pod= for one-step resolution." }], details: { error: true } };
+      } else if (params.pod?.trim()) {
+        const podErr = validatePodName(params.pod.trim());
+        if (podErr) return { content: [{ type: "text", text: `Error: ${podErr}` }], details: { error: true } };
+        const r = await resolvePodNetnsViaKubectl({
+          pod: params.pod.trim(), namespace: params.namespace?.trim() || "default", container: params.container,
+          env, userId: userId ?? "unknown", clusterKey, image, signal,
+        });
+        if ("error" in r) return { content: [{ type: "text", text: `Error: ${r.error}` }], details: { error: true } };
+        nodeName = r.node;
+        netns = r.netns;
+      } else if (!nodeName) {
+        return { content: [{ type: "text", text: "Error: provide node, or pod (+namespace) to target a pod's network namespace." }], details: { error: true } };
       }
 
-      // Check node exists and is Ready
-      const nodeCheckErr = await checkNodeReady(
-        params.node, env.childEnv, env.kubeconfigPath ?? undefined,
-      );
-      if (nodeCheckErr) {
-        return {
-          content: [{ type: "text", text: `Error: ${nodeCheckErr}` }],
-          details: { error: true },
-        };
+      // Validate node name + readiness (the pod path already verified the node via resolution).
+      if (!params.pod?.trim()) {
+        const nodeErr = validateNodeName(nodeName);
+        if (nodeErr) return { content: [{ type: "text", text: `Error: ${nodeErr}` }], details: { error: true } };
+        const nodeCheckErr = await checkNodeReady(nodeName, env.childEnv, env.kubeconfigPath ?? undefined);
+        if (nodeCheckErr) return { content: [{ type: "text", text: `Error: ${nodeCheckErr}` }], details: { error: true } };
       }
 
       // Resolve script
@@ -174,22 +210,6 @@ Examples:
       if ("error" in resolved) {
         return {
           content: [{ type: "text", text: `Error: ${resolved.error}` }],
-          details: { error: true },
-        };
-      }
-
-      const clusterKey = params.cluster || "default";
-      const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
-      const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
-      const args = params.args?.trim() || "";
-      // Security: shell-escape each argument to prevent injection via args parameter
-      const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
-
-      // Validate netns name if provided (prevent shell injection)
-      const netns = params.netns?.trim();
-      if (netns && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(netns)) {
-        return {
-          content: [{ type: "text", text: `Error: invalid netns name "${netns}". Must be alphanumeric, dashes, underscores (max 64 chars).` }],
           details: { error: true },
         };
       }
@@ -216,7 +236,7 @@ Examples:
         const pgidFile = `/tmp/siclaw-bg-${safeJob}-${randomBytes(4).toString("hex")}.pgid`;
         const launchScript = `echo $$ > ${pgidFile}; exec timeout ${ttl} ${innerCmd}`;
         const bgNsenterCmd = [...NSENTER, "setsid", "-w", "sh", "-c", launchScript];
-        const spec = { userId: userId ?? "unknown", nodeName: params.node, command: bgNsenterCmd, image, clusterKey };
+        const spec = { userId: userId ?? "unknown", nodeName, command: bgNsenterCmd, image, clusterKey };
         let cachedPod;
         try {
           cachedPod = await ensureDebugPodReady(spec, env, { signal });
@@ -254,7 +274,7 @@ Examples:
             env: env.childEnv as Record<string, string>,
             action: null,
             hasSensitiveKubectl: false,
-            description: `node ${params.node}: ${[params.skill, params.script].filter(Boolean).join("/")}`,
+            description: `node ${nodeName}: ${[params.skill, params.script].filter(Boolean).join("/")}`,
             parentSessionId: bg!.sessionIdRef?.current ?? "",
             jobId: toolCallId,
             isProd: process.env.NODE_ENV === "production",
@@ -270,7 +290,7 @@ Examples:
       }
 
       const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: params.node, command: nsenterCmd, image, clusterKey, stdinData: resolved.content },
+        { userId: userId ?? "unknown", nodeName, command: nsenterCmd, image, clusterKey, stdinData: resolved.content },
         env,
         { timeoutMs: timeout, signal },
       );

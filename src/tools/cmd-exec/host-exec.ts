@@ -9,12 +9,16 @@ import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript 
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
-import { validateNodeName } from "../infra/exec-utils.js";
+import { validateNodeName, validatePodName } from "../infra/exec-utils.js";
+import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
 
 interface HostExecParams {
   host: string;
   command: string;
+  pod?: string;
+  namespace?: string;
+  container?: string;
   timeout_seconds?: number;
   run_in_background?: boolean;
 }
@@ -83,6 +87,17 @@ Examples (pass the id from host_list; names shown here for readability):
       command: Type.String({
         description: 'Diagnostic command to run on the host (e.g. "uptime", "ip addr show")',
       }),
+      pod: Type.Optional(
+        Type.String({
+          description: "Target pod name. When set, the command runs inside THIS POD's network namespace (on this host/node) using host tools — for RDMA/RoCE checks on a pod that lacks the tools (show_gids, ib_write_bw…). The host must be the K8s node running the pod, and its SSH credential must be root (crictl + `ip netns exec` need CAP_SYS_ADMIN).",
+        }),
+      ),
+      namespace: Type.Optional(
+        Type.String({ description: 'Pod namespace (default: "default"). Only used with `pod`.' }),
+      ),
+      container: Type.Optional(
+        Type.String({ description: "Container name (multi-container pods). Only used with `pod`." }),
+      ),
       timeout_seconds: Type.Optional(
         Type.Number({
           description: "Timeout in seconds (default: 30, max: 120; in background: default 600, max 3600)",
@@ -154,6 +169,26 @@ Examples (pass the id from host_list; names shown here for readability):
         };
       }
 
+      // One-step pod netns: resolve the pod's netns over SSH (crictl on this node; needs root),
+      // then run the command inside it via `ip netns exec`. The prefix is tool-built — only the
+      // inner command (params.command) went through preExecSecurity above. Whole command runs in
+      // the netns (`ip netns exec <netns> sh -c '<cmd>'`) so a pipeline can't straddle namespaces.
+      let netnsExec = "";
+      if (params.pod?.trim()) {
+        const podErr = validatePodName(params.pod.trim());
+        if (podErr) {
+          return { content: [{ type: "text", text: `Error: ${podErr}` }], details: { blocked: true, reason: "invalid_pod_name" } };
+        }
+        const r = await resolvePodNetnsViaSsh({
+          target, pod: params.pod.trim(), namespace: params.namespace?.trim() || "default", container: params.container, signal,
+        });
+        if ("error" in r) {
+          return { content: [{ type: "text", text: `Error: ${r.error}` }], details: { error: true, reason: "netns_resolve_failed" } };
+        }
+        netnsExec = `ip netns exec ${r.netns} `;
+      }
+      const esc = params.command.replace(/'/g, "'\\''");
+
       // ── Background mode ──────────────────────────────────────────────
       // No child process: hand the executor an ssh2 stream factory. The remote command runs
       // under `setsid` (own process-group leader) wrapped in `timeout <ttl>`, and records its
@@ -166,8 +201,7 @@ Examples (pass the id from host_list; names shown here for readability):
           return backgroundNotLineSafeError();
         }
         const ttl = Math.min(params.timeout_seconds ?? HOST_BG_DEFAULT_TTL, HOST_BG_MAX_TTL);
-        const esc = params.command.replace(/'/g, "'\\''");
-        const userCmd = `timeout ${ttl} sh -c '${esc}'`;
+        const userCmd = `timeout ${ttl} ${netnsExec}sh -c '${esc}'`;
         // Run as a killable session (setsid + recorded session id) so job_stop reaps the whole
         // remote tree incl. timeout's own process group. See bg-session.ts for the rationale.
         const pgidFile = backgroundPgidFile(toolCallId);
@@ -202,7 +236,8 @@ Examples (pass the id from host_list; names shown here for readability):
 
       let result;
       try {
-        result = await sshExec(target, params.command, { timeoutMs: timeout, signal });
+        const fgCmd = netnsExec ? `${netnsExec}sh -c '${esc}'` : params.command;
+        result = await sshExec(target, fgCmd, { timeoutMs: timeout, signal });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {

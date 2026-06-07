@@ -133,10 +133,22 @@ Step 10: formatExecOutput() / processToolOutput() → infra/exec-utils.ts / tool
 | Pipeline support | Yes (pipes, `&&`, `;`) | No (`blockPipeline: true`) |
 | Execution | `runInDebugPod` | `execFileAsync("kubectl")` |
 
-**Pod network namespace diagnostics**: To run host-level tools in a pod's
-network namespace, use `resolve_pod_netns` (in `query/`) to get the netns name,
-then call `node_exec` with the `netns` parameter. This replaces the former
-`pod_nsenter_exec` tool.
+**Pod network namespace diagnostics** (host tools against a pod's network — RDMA/RoCE
+on a pod that lacks `show_gids`/perftest): enter the pod's **net** namespace while keeping
+the host's mount namespace, i.e. `… ip netns exec <netns> <host-tool>`. Two transports,
+one mechanism (`src/tools/infra/pod-netns-resolve.ts` resolves pod → netns):
+
+- **One step (preferred)** — pass `pod` (+ `namespace`) directly; the tool resolves the netns
+  internally and runs the command inside it:
+  - kubectl: `node_exec(pod, namespace, command)` / `node_script(pod, …)` — node is resolved too.
+  - ssh: `host_exec(host=<node>, pod, namespace, command)` / `host_script(…)` — `host` is the node;
+    its SSH credential must be **root** (crictl + `ip netns exec` need CAP_SYS_ADMIN).
+- **Advanced / reuse** — `resolve_pod_netns(pod, namespace)` → `{node, netns}`, then
+  `node_exec(node, netns, command)`; lets one resolution serve many commands.
+
+The netns/nsenter/`ip netns exec` prefix is always **tool-constructed** (never raw model input):
+the inner command goes through the same whitelist; the netns name (from crictl) is regex-validated.
+Assumes the CNI creates `/var/run/netns/<name>`. Replaces the former `pod_nsenter_exec` tool.
 
 ---
 

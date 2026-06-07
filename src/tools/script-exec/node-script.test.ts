@@ -11,10 +11,16 @@ vi.mock("../infra/ensure-kubeconfigs.js", () => ({
   ensureClusterForTool: vi.fn(),
 }));
 
+vi.mock("../infra/pod-netns-resolve.js", async () => {
+  const actual = await vi.importActual<any>("../infra/pod-netns-resolve.js");
+  return { ...actual, resolvePodNetnsViaKubectl: vi.fn(async () => ({ node: "worker-1", netns: "cni-x" })) };
+});
+
 import { createNodeScriptTool } from "./node-script.js";
 import { resolveScript } from "../infra/script-resolver.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { runInDebugPod } from "../infra/debug-pod.js";
+import { resolvePodNetnsViaKubectl } from "../infra/pod-netns-resolve.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
 const tool = createNodeScriptTool(undefined, "user-1");
@@ -23,6 +29,8 @@ beforeEach(() => {
   vi.mocked(resolveScript).mockReset();
   vi.mocked(checkNodeReady).mockReset();
   vi.mocked(runInDebugPod).mockReset();
+  vi.mocked(resolvePodNetnsViaKubectl).mockReset();
+  vi.mocked(resolvePodNetnsViaKubectl).mockResolvedValue({ node: "worker-1", netns: "cni-x" } as any);
   vi.mocked(ensureClusterForTool).mockReset();
 });
 
@@ -154,5 +162,19 @@ describe("node_script tool", () => {
     );
     const opts = vi.mocked(runInDebugPod).mock.calls[0][2];
     expect(opts.timeoutMs).toBe(300_000);
+  });
+
+  it("one-step pod: resolves the pod netns then wraps the script with ip netns exec", async () => {
+    vi.mocked(resolveScript).mockReturnValue({ interpreter: "bash", content: "echo hi", path: "/x", scope: "global" } as any);
+    vi.mocked(runInDebugPod).mockResolvedValue({ stdout: "ok", stderr: "", exitCode: 0 } as any);
+    const res = await tool.execute("id", { pod: "rdma-a", namespace: "rdma-test", skill: "exec-smoke", script: "x.sh" }, undefined, {} as any);
+    expect((res.details as any).error).toBeFalsy();
+    expect(resolvePodNetnsViaKubectl).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resolvePodNetnsViaKubectl).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
+    // node not required + node-ready check skipped on the pod path.
+    expect(checkNodeReady).not.toHaveBeenCalled();
+    const cmd = vi.mocked(runInDebugPod).mock.calls[0][0].command as string[];
+    expect(cmd.join(" ")).toContain("ip netns exec cni-x");
+    expect(vi.mocked(runInDebugPod).mock.calls[0][0].nodeName).toBe("worker-1");
   });
 });
