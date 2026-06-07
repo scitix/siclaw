@@ -52,6 +52,87 @@ export function spawnBackgroundBash(
     }
   };
 
+  // Settle (notify + onSettled) runs EXACTLY once — shared by all three modes. Node can
+  // emit both 'error' and 'close' for a child; ssh can resolve done after an abort. Without
+  // this latch onSettled would double-decrement the parent's background-work count.
+  let settled = false;
+  const settle = async (status: "completed" | "failed" | "killed" | "stopped", code: number | null, summary: string) => {
+    if (settled) return;
+    settled = true;
+    await flushAll();
+    jobs.setStatus(req.jobId, status, code != null ? { exitCode: code } : undefined);
+    // Per-job cleanup (node_exec unpins its debug pod) — before notify so the pod is
+    // released even if notify throws. Independent of onSettled (parent work-count).
+    try { req.onComplete?.(); } catch { /* best-effort */ }
+    notify(req.jobId, { taskId: req.jobId, outputFile, status, summary });
+    onSettled?.();
+  };
+
+  // Map a terminal exit code to (status, summary), honouring a prior job_stop ("stopped").
+  const terminalStatus = (code: number | null) => {
+    const wasStopped = jobs.get(req.jobId)?.status === "stopped";
+    const status = wasStopped ? "stopped" : code === 0 ? "completed" : "failed";
+    const summary =
+      status === "completed"
+        ? `Background command "${req.description}" completed${code != null ? ` (exit ${code})` : ""}`
+        : status === "stopped"
+          ? `Background command "${req.description}" was stopped`
+          : `Background command "${req.description}" failed${code != null ? ` (exit ${code})` : ""}`;
+    return { status, summary } as const;
+  };
+
+  // ── Stream mode (host_exec / host_script via ssh2) ──────────────────
+  // No child process: an in-process factory dials ssh and hands back live streams. The
+  // job is registered immediately (so job_stop can abort the dial-in-flight), then the
+  // streams are wired once the async factory resolves.
+  if (req.streamFactory) {
+    let abortStream = () => {};
+    jobs.register({
+      jobId: req.jobId,
+      type: req.jobType ?? "bash",
+      parentSessionId: req.parentSessionId,
+      description: req.description,
+      status: "running",
+      startedAt: Date.now(),
+      notified: false,
+      outputFile,
+      abort: () => {
+        try { req.onAbort?.(); } catch { /* best-effort */ }
+        try { abortStream(); } catch { /* best-effort */ }
+      },
+    });
+    void (async () => {
+      let handle;
+      try {
+        handle = await req.streamFactory!();
+      } catch (err) {
+        await settle("failed", null, `Background command "${req.description}" failed to start: ${(err as Error).message}`);
+        return;
+      }
+      abortStream = handle.abort;
+      // Dial-race: a job_stop that fired while the stream factory was still dialing ran the
+      // registry abort() when abortStream was still a no-op, so the stop was lost. Now that
+      // the streams are live, honour a prior stop immediately (close the channel + re-run the
+      // remote kill — both idempotent) instead of letting the command run to completion.
+      if (jobs.get(req.jobId)?.status === "stopped") {
+        try { req.onAbort?.(); } catch { /* best-effort */ }
+        try { abortStream(); } catch { /* best-effort */ }
+      }
+      handle.stdout.setEncoding("utf8");
+      handle.stderr.setEncoding("utf8");
+      handle.stdout.on("data", (c: string) => outSink.append(c));
+      handle.stderr.on("data", (c: string) => errSink.append(c));
+      try {
+        const { exitCode } = await handle.done;
+        const { status, summary } = terminalStatus(exitCode);
+        await settle(status, exitCode, summary);
+      } catch (err) {
+        await settle("failed", null, `Background command "${req.description}" failed: ${(err as Error).message}`);
+      }
+    })();
+    return { jobId: req.jobId, outputFile };
+  }
+
   // spawn (not exec) so output streams to disk instead of buffering in memory — a long
   // background command can emit far more than exec's maxBuffer. detached:true makes the
   // child a process-group leader, so kill(-pid) reaps the whole tree (matches the
@@ -68,21 +149,15 @@ export function spawnBackgroundBash(
   child.stdout?.setEncoding("utf8");
   child.stderr?.setEncoding("utf8");
 
-  // Settle (notify + onSettled) runs EXACTLY once. Node can emit both 'error' and 'close'
-  // for one process; without this latch onSettled would double-decrement the parent's
-  // background-work count and release the session while a sibling job still runs.
-  let settled = false;
-  const settle = async (status: "completed" | "failed" | "killed" | "stopped", code: number | null, summary: string) => {
-    if (settled) return;
-    settled = true;
-    await flushAll();
-    jobs.setStatus(req.jobId, status, code != null ? { exitCode: code } : undefined);
-    // Per-job cleanup (e.g. node_exec unpins its debug pod) — before notify so the pod is
-    // released even if notify throws. Independent of onSettled (parent work-count).
-    try { req.onComplete?.(); } catch { /* best-effort */ }
-    notify(req.jobId, { taskId: req.jobId, outputFile, status, summary });
-    onSettled?.();
-  };
+  // Script body (node/pod/local scripts) is piped via stdin — the calling tool builds the
+  // argv (kubectl exec / interpreter) and hands the script here rather than as a temp file.
+  if (req.stdin !== undefined) {
+    // The child may close stdin early (interpreter errors out) → EPIPE on this writable,
+    // emitted asynchronously, which a try/catch around .end() cannot catch. Without an
+    // 'error' listener Node throws unhandled. Swallow it; close/error drives the settle.
+    child.stdin?.on("error", () => { /* EPIPE / broken pipe — ignore */ });
+    try { child.stdin?.end(req.stdin); } catch { /* child may have failed to start */ }
+  }
 
   jobs.register({
     jobId: req.jobId,
@@ -117,14 +192,7 @@ export function spawnBackgroundBash(
     // A "stopped" status was set by job_stop before the SIGKILL that produced this exit.
     // Keep it "stopped" (not "killed") so the terminal status + notification match the
     // sub-agent stop path (job-registry maps a stopped sub-agent to "stopped" too).
-    const wasStopped = jobs.get(req.jobId)?.status === "stopped";
-    const status = wasStopped ? "stopped" : code === 0 ? "completed" : "failed";
-    const summary =
-      status === "completed"
-        ? `Background command "${req.description}" completed${code != null ? ` (exit ${code})` : ""}`
-        : status === "stopped"
-          ? `Background command "${req.description}" was stopped`
-          : `Background command "${req.description}" failed${code != null ? ` (exit ${code})` : ""}`;
+    const { status, summary } = terminalStatus(code);
     void settle(status, code, summary);
   });
 

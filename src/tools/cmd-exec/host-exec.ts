@@ -1,19 +1,28 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
+import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import { validateNodeName } from "../infra/exec-utils.js";
-import { acquireSshTarget, sshExec } from "../infra/ssh-client.js";
+import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
 
 interface HostExecParams {
   host: string;
   command: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
+
+// Background ssh: default leak-guard ttl and cap (s). A dropped channel can't orphan the
+// remote process — `timeout <ttl>` bounds it. Generous vs node/pod (no debug-pod lifetime).
+const HOST_BG_DEFAULT_TTL = 600;
+const HOST_BG_MAX_TTL = 3600;
 
 /**
  * host_exec — run a single shell command on a non-K8s host via SSH.
@@ -26,7 +35,13 @@ interface HostExecParams {
  * the COMMANDS registry has no ssh / scp / sftp / sshpass entries — those are
  * blocked at the local context whitelist (DESIGN risk #1).
  */
-export function createHostExecTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createHostExecTool(
+  kubeconfigRef?: KubeconfigRef,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  // run_in_background is exposed only when the switch is on AND a runtime executor was
+  // injected — otherwise the param stays out of the schema.
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "host_exec",
     label: "Host Exec",
@@ -70,9 +85,25 @@ Examples (pass the id from host_list; names shown here for readability):
       }),
       timeout_seconds: Type.Optional(
         Type.Number({
-          description: "Timeout in seconds (default: 30, max: 120)",
+          description: "Timeout in seconds (default: 30, max: 120; in background: default 600, max 3600)",
         })
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the command on the host in the background instead of waiting. Returns immediately " +
+                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
+                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
+                  "completes; ONLY THEN read the output_file. Use for long host work like RDMA perftest over " +
+                  "SSH (start the server on host A in the background, then the client on host B). The command " +
+                  "is wrapped in `timeout` and capped (~3600s). Output needing structural (JSON) redaction " +
+                  "cannot run in background.",
+              })
+            ),
+          }
+        : {}),
     }),
     renderCall(args: any, theme: any) {
       const host = args?.host || "...";
@@ -86,7 +117,7 @@ Examples (pass the id from host_list; names shown here for readability):
       );
     },
     renderResult: renderTextResult,
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as HostExecParams;
 
       // Validate host name format (reuse node naming rules — RFC 1123)
@@ -121,6 +152,50 @@ Examples (pass the id from host_list; names shown here for readability):
           content: [{ type: "text", text: `Error: ${msg}\n\nCould not reach "${params.host}" over SSH (not bound / no credential — not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
           details: { error: true, reason: "host_acquire_failed" },
         };
+      }
+
+      // ── Background mode ──────────────────────────────────────────────
+      // No child process: hand the executor an ssh2 stream factory. The remote command runs
+      // under `setsid` (own process-group leader) wrapped in `timeout <ttl>`, and records its
+      // PGID to a pidfile so job_stop can kill the WHOLE remote tree over a fresh ssh channel —
+      // closing the streaming channel does NOT reliably SIGHUP a non-PTY remote process, so a
+      // "stopped" perftest would otherwise keep running to ttl. Mirrors node_exec/node_script.
+      // Validation already ran above; only line-safe sanitizers stream per-line.
+      if (backgroundEnabled && params.run_in_background === true) {
+        if (pre.action && !pre.action.lineSafe) {
+          return backgroundNotLineSafeError();
+        }
+        const ttl = Math.min(params.timeout_seconds ?? HOST_BG_DEFAULT_TTL, HOST_BG_MAX_TTL);
+        const esc = params.command.replace(/'/g, "'\\''");
+        const userCmd = `timeout ${ttl} sh -c '${esc}'`;
+        // Run as a killable session (setsid + recorded session id) so job_stop reaps the whole
+        // remote tree incl. timeout's own process group. See bg-session.ts for the rationale.
+        const pgidFile = backgroundPgidFile(toolCallId);
+        const wrapped = wrapBackgroundSession(userCmd, pgidFile);
+        const killScript = backgroundSessionKillScript(pgidFile);
+        // job_stop: kill the remote process group over a FRESH ssh connection (the streaming
+        // channel is being torn down). Best-effort, time-boxed; the runner closes the channel after.
+        const onAbort = () => { void sshExec(target, killScript, { timeoutMs: 20_000 }).catch(() => {}); };
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            // The job outlives this turn, so it is NOT tied to the turn's AbortSignal —
+            // job_stop drives the abort via the JobRegistry → onAbort + handle.abort.
+            streamFactory: () => sshExecStream(target, wrapped, {}),
+            env: {},
+            action: pre.action,
+            hasSensitiveKubectl: pre.hasSensitiveKubectl,
+            description: `host ${params.host}: ${params.command.length > 60 ? params.command.slice(0, 57) + "…" : params.command}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: false,
+            jobType: "host",
+            onAbort,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+        } catch (err) {
+          // Concurrency cap (or executor failure): fall through to a foreground run.
+          console.warn(`[host-exec] background launch declined, running foreground:`, err);
+        }
       }
 
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
@@ -171,5 +246,9 @@ Examples (pass the id from host_list; names shown here for readability):
 
 export const registration: ToolEntry = {
   category: "cmd-exec",
-  create: (refs) => createHostExecTool(refs.kubeconfigRef),
+  create: (refs) =>
+    createHostExecTool(refs.kubeconfigRef, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

@@ -127,18 +127,27 @@ export type JobStopExecutor = (jobId: string) => Promise<JobStopResult>;
  * executor only spawns + streams + notifies, keeping all command/security construction
  * in the tool.
  *
- * Two spawn modes (exactly one set):
+ * Three exec modes (exactly one set):
  *  - `command` (shell mode): run via `bash -c` — used by the local `bash` tool, whose
  *    command may include `sudo -E -u sandbox …` wrapping.
- *  - `file` + `args` (argv mode, no shell): used by node_exec/pod_exec to spawn
- *    `kubectl exec … -- nsenter … <cmd>` without re-tokenizing/quoting the nested command.
+ *  - `file` + `args` (argv mode, no shell): used by node_exec/pod_exec and node/pod/local
+ *    scripts to spawn `kubectl exec … -- nsenter … <cmd>` (or an interpreter) without
+ *    re-tokenizing/quoting the nested command. `stdin` may carry the script body.
+ *  - `streamFactory` (in-process stream mode): used by host_exec/host_script — there is no
+ *    child process; the factory dials ssh2 and returns live stdout/stderr streams + done.
  */
 export interface BackgroundExecRequest {
-  /** Shell-mode command (bash). Mutually exclusive with file/args. */
+  /** Shell-mode command (bash). Mutually exclusive with file/args/streamFactory. */
   command?: string;
-  /** argv-mode binary (node/pod). Mutually exclusive with command. */
+  /** argv-mode binary (node/pod/scripts). Mutually exclusive with command/streamFactory. */
   file?: string;
   args?: string[];
+  /** Script body piped to the child's stdin (argv mode: node/pod/local scripts). */
+  stdin?: string;
+  /** In-process stream source (host_exec/host_script via ssh2). Mutually exclusive with
+   *  command/file. Called once by the runner; the handle's `done` settles the job and the
+   *  factory owns connection teardown. */
+  streamFactory?: () => Promise<BackgroundStreamHandle>;
   cwd?: string;
   env: Record<string, string>;
   /** Sanitizer from preExecSecurity. MUST be line-safe (caller rejects otherwise) or null. */
@@ -151,7 +160,7 @@ export interface BackgroundExecRequest {
   /** True in K8s prod where the command is sudo-wrapped (bash shell mode only). */
   isProd: boolean;
   /** Job kind for the registry + concurrency accounting. Defaults to "bash". */
-  jobType?: "bash" | "node" | "pod";
+  jobType?: "bash" | "node" | "pod" | "host" | "local";
   /** Called exactly once when the job settles (completed/failed/killed), before notify.
    *  node_exec uses it to unpin (release) the debug pod it acquired for the job. */
   onComplete?: () => void;
@@ -164,6 +173,17 @@ export interface BackgroundExecRequest {
 export interface BackgroundExecResult {
   jobId: string;
   outputFile: string;
+}
+
+/** Live stream handle for an in-process background job (e.g. ssh2 channel). Structurally
+ *  matches ssh-dial's SshStreamHandle so sshExecStream's result is assignable. */
+export interface BackgroundStreamHandle {
+  stdout: import("node:stream").Readable;
+  stderr: import("node:stream").Readable;
+  /** Resolves when the remote side closes (exitCode null = killed by signal). */
+  done: Promise<{ exitCode: number | null; signal?: string }>;
+  /** Best-effort: close/abort the stream. */
+  abort: () => void;
 }
 
 /**
