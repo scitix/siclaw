@@ -7,9 +7,13 @@ vi.mock("../infra/ssh-client.js", () => ({
   sshExecStream: vi.fn(async () => ({ stdout: { setEncoding() {}, on() {} }, stderr: { setEncoding() {}, on() {} }, done: new Promise(() => {}), abort() {} })),
   sshExec: vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 })),
 }));
+vi.mock("../infra/pod-netns-resolve.js", () => ({
+  resolvePodNetnsViaSsh: vi.fn(async () => ({ netns: "cni-x" })),
+}));
 
 import { createHostExecTool } from "./host-exec.js";
 import { sshExecStream, sshExec } from "../infra/ssh-client.js";
+import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import type { BackgroundExecExecutor } from "../../core/tool-registry.js";
 
 const fakeExecutor: BackgroundExecExecutor = vi.fn(() => ({ jobId: "j", outputFile: "/o" }));
@@ -19,6 +23,7 @@ beforeEach(() => {
   vi.mocked(sshExecStream).mockClear();
   vi.mocked(sshExec).mockClear();
   vi.mocked(fakeExecutor).mockClear();
+  vi.mocked(resolvePodNetnsViaSsh).mockClear();
 });
 
 describe("host_exec — run_in_background schema gating", () => {
@@ -70,5 +75,35 @@ describe("host_exec — background remote lifecycle", () => {
     expect(killScript).toContain("pkill -KILL -s");
     expect(killScript).toContain("kill -TERM -"); // group-kill fallback
     expect(killScript).toContain(".pgid");
+  });
+});
+
+describe("host_exec — one-step pod netns", () => {
+  it("foreground: resolves the pod netns over SSH and runs the command inside it", async () => {
+    const tool = createHostExecTool(undefined, wiring);
+    await tool.execute("c1", { host: "node-1", pod: "rdma-a", namespace: "rdma-test", command: "show_gids" }, undefined, {} as any);
+    expect(resolvePodNetnsViaSsh).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resolvePodNetnsViaSsh).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
+    // The actual remote command wraps the whole thing in `ip netns exec <netns> sh -c '<cmd>'`.
+    const fgCmd = vi.mocked(sshExec).mock.calls.find((c) => String(c[1]).includes("show_gids"))![1] as string;
+    expect(fgCmd).toBe("ip netns exec cni-x sh -c 'show_gids'");
+  });
+
+  it("background: the launched command runs under ip netns exec + timeout + setsid", async () => {
+    const tool = createHostExecTool(undefined, wiring);
+    const res = await tool.execute("c2", { host: "node-1", pod: "rdma-a", namespace: "rdma-test", command: "ib_write_bw -d mlx5_0", run_in_background: true }, undefined, {} as any);
+    expect((res.details as any).backgroundTaskId).toBe("j");
+    const req = vi.mocked(fakeExecutor).mock.calls[0][0] as any;
+    await req.streamFactory();
+    const wrapped = vi.mocked(sshExecStream).mock.calls[0][1] as string;
+    expect(wrapped).toContain("setsid");
+    expect(wrapped).toMatch(/timeout \d+ ip netns exec cni-x sh -c/);
+  });
+
+  it("rejects an invalid pod name", async () => {
+    const tool = createHostExecTool(undefined, wiring);
+    const res = await tool.execute("c3", { host: "node-1", pod: "BAD POD!", command: "show_gids" }, undefined, {} as any);
+    expect((res.details as any).reason).toBe("invalid_pod_name");
+    expect(resolvePodNetnsViaSsh).not.toHaveBeenCalled();
   });
 });

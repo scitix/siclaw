@@ -18,6 +18,28 @@ export const NODE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9.\-]*$/;
 /** Valid pod name: RFC 1123 subdomain — lowercase alphanumeric, hyphens, dots. */
 export const POD_NAME_RE = /^[a-z0-9][a-z0-9.\-]*$/;
 
+/** Valid namespace / container name: RFC 1123 label — lowercase alphanumeric + hyphens, ≤63, no dots. */
+export const K8S_LABEL_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+
+/** Validate a Kubernetes namespace name (security-critical: it is interpolated into a shell
+ * command in pod-netns-resolve — see buildCrictlNetnsScript). Returns an error message or null. */
+export function validateNamespace(namespace: string): string | null {
+  if (!namespace || !namespace.trim()) return "Namespace must not be empty.";
+  if (namespace.length > 63 || !K8S_LABEL_RE.test(namespace)) {
+    return `Invalid namespace "${namespace}". Namespaces must be an RFC-1123 label (lowercase letters, digits, hyphens; max 63).`;
+  }
+  return null;
+}
+
+/** Validate a container name (RFC-1123 label). Returns an error message or null. */
+export function validateContainerName(container: string): string | null {
+  if (!container || !container.trim()) return "Container name must not be empty.";
+  if (container.length > 63 || !K8S_LABEL_RE.test(container)) {
+    return `Invalid container name "${container}". Container names must be an RFC-1123 label (lowercase letters, digits, hyphens; max 63).`;
+  }
+  return null;
+}
+
 export function validateNodeName(node: string): string | null {
   if (!node || !node.trim()) {
     return "Node name must not be empty.";

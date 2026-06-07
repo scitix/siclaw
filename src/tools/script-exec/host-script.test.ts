@@ -8,10 +8,14 @@ vi.mock("../infra/ssh-client.js", () => ({
 vi.mock("../infra/script-resolver.js", () => ({
   resolveScript: vi.fn(),
 }));
+vi.mock("../infra/pod-netns-resolve.js", () => ({
+  resolvePodNetnsViaSsh: vi.fn(async () => ({ netns: "cni-x" })),
+}));
 
 import { createHostScriptTool } from "./host-script.js";
 import { acquireSshTarget, sshExec } from "../infra/ssh-client.js";
 import { resolveScript } from "../infra/script-resolver.js";
+import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import type { CredentialBroker } from "../../agentbox/credential-broker.js";
 
 const fakeBroker = {} as CredentialBroker;
@@ -21,6 +25,8 @@ beforeEach(() => {
   vi.mocked(acquireSshTarget).mockReset();
   vi.mocked(sshExec).mockReset();
   vi.mocked(resolveScript).mockReset();
+  vi.mocked(resolvePodNetnsViaSsh).mockReset();
+  vi.mocked(resolvePodNetnsViaSsh).mockResolvedValue({ netns: "cni-x" } as any);
 });
 
 const okTarget = {
@@ -91,5 +97,20 @@ describe("host_script", () => {
     const result = await tool.execute("id", { host: "h1", script: "x.sh" }, undefined, {} as any);
     expect((result.details as any).error).toBe(true);
     expect(result.content[0].text).toContain("Exit code: 2");
+  });
+});
+
+describe("host_script — one-step pod netns", () => {
+  it("resolves the pod netns over SSH and runs the script inside it", async () => {
+    vi.mocked(acquireSshTarget).mockResolvedValue(okTarget as any);
+    vi.mocked(resolveScript).mockReturnValue({ interpreter: "bash", content: "echo hi", path: "/x", scope: "global" } as any);
+    vi.mocked(sshExec).mockResolvedValue({ stdout: "ok", stderr: "", exitCode: 0 } as any);
+    const res = await tool.execute("id", { host: "node-1", pod: "rdma-a", namespace: "rdma-test", script: "x.sh" }, undefined, {} as any);
+    expect((res.details as any).error).toBeFalsy();
+    expect(resolvePodNetnsViaSsh).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(resolvePodNetnsViaSsh).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
+    const remoteCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
+    expect(remoteCmd.startsWith("ip netns exec cni-x ")).toBe(true);
+    expect(remoteCmd).toContain("bash -s");
   });
 });

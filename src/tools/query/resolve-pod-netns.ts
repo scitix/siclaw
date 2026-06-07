@@ -7,9 +7,8 @@ import { renderTextResult } from "../infra/tool-render.js";
 import {
   validatePodName,
   prepareExecEnv,
-  resolveContainerNetns,
 } from "../infra/exec-utils.js";
-import { runInDebugPod } from "../infra/debug-pod.js";
+import { resolvePodNetnsViaKubectl } from "../infra/pod-netns-resolve.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 import { loadConfig } from "../../core/config.js";
@@ -89,55 +88,17 @@ Parameters:
         };
       }
 
-      // Step 1: Get pod node via kubectl API (also verifies pod is Running and node is Ready)
-      const netns = await resolveContainerNetns(pod, namespace, params.container, env);
-      if ("error" in netns) {
-        return {
-          content: [{ type: "text", text: `Error: ${netns.error}` }],
-          details: { error: true },
-        };
-      }
-
-      // Step 2: Get netns name via crictl inspectp (pod sandbox level) on the node.
-      // Network namespace is a pod-level concept (shared by all containers in the pod),
-      // so we use crictl pods + crictl inspectp (sandbox), not crictl inspect (container).
-      // The runtime already creates /var/run/netns/<name> — ip netns exec works directly.
+      // Resolve node (kubectl API) + netns (crictl via a privileged debug pod). Shared with the
+      // one-step `pod=` path on node_exec/node_script (see pod-netns-resolve.ts).
       const clusterKey = params.cluster || "default";
       const image = params.image || resolveDebugImage({ broker: kubeconfigRef?.credentialBroker }, params.cluster) || loadConfig().debugImage;
-
-      const innerScript = [
-        // Find sandbox ID by pod name and namespace
-        `SANDBOX_ID=$(crictl pods --name "^${pod}$" --namespace "${namespace}" -q 2>/dev/null | head -1)`,
-        `if [ -z "$SANDBOX_ID" ]; then echo "Error: cannot find sandbox for pod ${pod} in namespace ${namespace}" >&2; exit 1; fi`,
-        // Get netns path from sandbox inspect
-        `NETNS_PATH=$(crictl inspectp "$SANDBOX_ID" 2>/dev/null | jq -r '.info.runtimeSpec.linux.namespaces[] | select(.type=="network") | .path')`,
-        `if [ -z "$NETNS_PATH" ]; then echo "Error: cannot find network namespace for sandbox $SANDBOX_ID" >&2; exit 1; fi`,
-        `basename "$NETNS_PATH"`,
-      ].join("\n");
-
-      const nsenterCmd = [
-        "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
-        "--", "sh", "-c", innerScript,
-      ];
-
-      const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName: netns.nodeName, command: nsenterCmd, image, clusterKey },
-        env,
-        { timeoutMs: 30_000, signal },
-      );
-
-      if (signal?.aborted) {
+      const resolved = await resolvePodNetnsViaKubectl({
+        pod, namespace, container: params.container, env,
+        userId: userId ?? "unknown", clusterKey, image, signal,
+      });
+      if ("error" in resolved) {
         return {
-          content: [{ type: "text", text: "Aborted." }],
-          details: { error: true },
-        };
-      }
-
-      const netnsName = execResult.stdout.trim();
-      if (execResult.exitCode !== 0 || !netnsName) {
-        const errMsg = execResult.stderr.trim() || "Failed to resolve network namespace";
-        return {
-          content: [{ type: "text", text: `Error: ${errMsg}` }],
+          content: [{ type: "text", text: `Error: ${resolved.error}` }],
           details: { error: true },
         };
       }
@@ -145,9 +106,9 @@ Parameters:
       return {
         content: [{
           type: "text",
-          text: `Pod "${pod}" in namespace "${namespace}" is on node "${netns.nodeName}" with network namespace "${netnsName}".\n\nTo run commands in this pod's network namespace using host tools:\n  node_exec: node="${netns.nodeName}", netns="${netnsName}", command="ip addr show"\n  node_script: node="${netns.nodeName}", netns="${netnsName}", skill="...", script="..."`,
+          text: `Pod "${pod}" in namespace "${namespace}" is on node "${resolved.node}" with network namespace "${resolved.netns}".\n\nTip: you can skip this step — node_exec/node_script accept pod= directly (kubectl), and host_exec/host_script accept host=<node> + pod= (SSH). To reuse the netns across many commands:\n  node_exec: node="${resolved.node}", netns="${resolved.netns}", command="ip addr show"\n  node_script: node="${resolved.node}", netns="${resolved.netns}", skill="...", script="..."`,
         }],
-        details: { node: netns.nodeName, netns: netnsName },
+        details: { node: resolved.node, netns: resolved.netns },
       };
     },
   };
