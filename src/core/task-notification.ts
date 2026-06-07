@@ -45,11 +45,14 @@ export function escapeXml(s: string): string {
  * it already gave, and stay terse (or silent) when the result is already covered.
  */
 const NOTIFICATION_INSTRUCTIONS =
-  "This is an automatic background-job result, NOT a new user request. " +
+  "This is an automatic background-job result, NOT a new user request. The job has ALREADY FINISHED and its " +
+  "result is FINAL — the <summary> below (and the output_file, for shell jobs) IS that result. Do NOT re-launch, " +
+  "re-run, or re-dispatch this work, and do NOT spawn another sub-agent or call another tool to redo, verify, " +
+  "wait for, or 'get' a result you have just been handed — simply relay it. " +
   "Read the output_file only if you still need this result. " +
   "If it adds nothing the user doesn't already know — e.g. it matches a result or issue you already reported — " +
   "END YOUR TURN WITH NO MESSAGE AT ALL. Do NOT post 'no new info', 'same as above', or a restated summary; silence is the correct response and avoids a noise bubble. " +
-  "Produce text ONLY when there is genuinely NEW, actionable information, and then keep it to a brief update — never a re-run of a full report. " +
+  "Produce text ONLY when there is genuinely NEW, actionable information (e.g. the answer the user was waiting for), and then keep it to a brief update — never a re-run of a full report. " +
   "If several jobs finish together, fold them into ONE concise update.";
 
 /** One `<task_notification>` block (no instructions — those are appended once per message). */

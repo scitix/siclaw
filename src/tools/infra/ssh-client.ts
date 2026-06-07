@@ -27,9 +27,11 @@ import { ensureHostForTool } from "./ensure-kubeconfigs.js";
 import {
   dialSshChain,
   runCommand,
+  runCommandStream,
   type DialHop,
   type SshRunResult,
   type SshRunOptions,
+  type SshStreamHandle,
 } from "./ssh-dial.js";
 
 /** Caps a target + up to 3 bastions. */
@@ -217,6 +219,38 @@ export async function sshExec(
     return await runCommand(client, command, options);
   } finally {
     teardown();
+  }
+}
+
+// ── sshExecStream (background) ──────────────────────────────────────
+
+/**
+ * Streaming counterpart to {@link sshExec} for background jobs: dials the chain,
+ * starts `command` on the final host, and returns live stdout/stderr streams plus
+ * a `done` promise — WITHOUT buffering. The chain is torn down automatically when
+ * the command finishes or is aborted (so the caller never leaks a connection).
+ * The command itself should be `timeout`-wrapped by the calling tool so a dropped
+ * channel cannot orphan the remote process.
+ */
+export async function sshExecStream(
+  target: SshTarget,
+  command: string,
+  options: { signal?: AbortSignal; stdin?: string } = {},
+): Promise<SshStreamHandle> {
+  const hops = await targetToHops(target);
+  const { client, teardown } = await dialSshChain(hops, {
+    timeoutMs: SSH_CONNECT_TIMEOUT_MS,
+    signal: options.signal,
+  });
+  try {
+    const handle = await runCommandStream(client, command, options);
+    // Tear the chain down once the remote command closes (or is aborted, which
+    // closes the channel → resolves done). finally so a rejected done still cleans up.
+    void handle.done.finally(() => { try { teardown(); } catch { /* already gone */ } });
+    return handle;
+  } catch (err) {
+    teardown();
+    throw err;
   }
 }
 

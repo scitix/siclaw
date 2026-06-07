@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 import { reloadConfig } from "./config.js";
 import { JobRegistry } from "./job-registry.js";
 import { spawnBackgroundBash } from "./background-bash-runner.js";
@@ -136,6 +137,115 @@ describe("spawnBackgroundBash — argv mode (node/pod)", () => {
     // onComplete fires exactly once (settle is latched)
     await new Promise((r) => setTimeout(r, 20));
     expect(onCompleteCalls).toBe(1);
+  });
+});
+
+describe("spawnBackgroundBash — stream mode (host_exec/host_script via ssh2)", () => {
+  it("streams from a factory, sanitizes to disk, settles on done (exit 0)", async () => {
+    const jobs = new JobRegistry();
+    const jobId = `js-${Math.random().toString(36).slice(2)}`;
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let resolveDone!: (v: { exitCode: number | null }) => void;
+    const done = new Promise<{ exitCode: number | null }>((r) => { resolveDone = r; });
+    const settled = new Promise<{ status: string; outputFile: string }>((resolve) => {
+      spawnBackgroundBash(
+        {
+          streamFactory: async () => ({ stdout, stderr, done, abort: () => {} }),
+          env: {},
+          action: redactSecret,
+          hasSensitiveKubectl: false,
+          description: "host h: cmd",
+          parentSessionId: "s1",
+          jobId,
+          isProd: false,
+          jobType: "host",
+        },
+        jobs,
+        (_id, n) => resolve({ status: n.status, outputFile: n.outputFile! }),
+      );
+    });
+    // let the async factory resolve + wire data handlers, then push output and finish
+    await new Promise((r) => setTimeout(r, 20));
+    stdout.write("line1 SECRET\n");
+    stdout.write("line2 ok\n");
+    stdout.end();
+    stderr.end();
+    await new Promise((r) => setTimeout(r, 20));
+    resolveDone({ exitCode: 0 });
+
+    const { status, outputFile } = await settled;
+    expect(status).toBe("completed");
+    expect(jobs.get(jobId)?.type).toBe("host");
+    const content = fs.readFileSync(outputFile, "utf8");
+    expect(content).toContain("line1 **REDACTED**");
+    expect(content).toContain("line2 ok");
+    expect(content).not.toContain("SECRET");
+  });
+
+  it("stream mode: job_stop marks stopped, abort resolves done → status stopped", async () => {
+    const jobs = new JobRegistry();
+    const jobId = `js2-${Math.random().toString(36).slice(2)}`;
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let resolveDone!: (v: { exitCode: number | null }) => void;
+    const done = new Promise<{ exitCode: number | null }>((r) => { resolveDone = r; });
+    let aborted = false;
+    const settled = new Promise<string>((resolve) => {
+      spawnBackgroundBash(
+        {
+          streamFactory: async () => ({
+            stdout, stderr, done,
+            abort: () => { aborted = true; resolveDone({ exitCode: null }); },
+          }),
+          env: {},
+          action: null,
+          hasSensitiveKubectl: false,
+          description: "host h: sleep",
+          parentSessionId: "s1",
+          jobId,
+          isProd: false,
+          jobType: "host",
+        },
+        jobs,
+        (_id, n) => resolve(n.status),
+      );
+    });
+    await new Promise((r) => setTimeout(r, 20)); // factory resolved + job registered
+    jobs.setStatus(jobId, "stopped");
+    jobs.get(jobId)!.abort!();
+    expect(await settled).toBe("stopped");
+    expect(aborted).toBe(true);
+  });
+});
+
+describe("spawnBackgroundBash — stdin (node/pod/local scripts)", () => {
+  it("pipes req.stdin (the script body) to the child", async () => {
+    const jobs = new JobRegistry();
+    const jobId = `jstdin-${Math.random().toString(36).slice(2)}`;
+    const done = new Promise<{ status: string; outputFile: string }>((resolve) => {
+      spawnBackgroundBash(
+        {
+          file: "/bin/cat", // echoes stdin to stdout
+          args: [],
+          stdin: "hello-from-stdin\n",
+          env: process.env as Record<string, string>,
+          action: null,
+          hasSensitiveKubectl: false,
+          description: "local: script",
+          parentSessionId: "s1",
+          jobId,
+          isProd: false,
+          jobType: "local",
+        },
+        jobs,
+        (_id, n) => resolve({ status: n.status, outputFile: n.outputFile! }),
+      );
+    });
+    const { status, outputFile } = await done;
+    expect(status).toBe("completed");
+    expect(jobs.get(jobId)?.type).toBe("local");
+    expect(fs.readFileSync(outputFile, "utf8")).toContain("hello-from-stdin");
   });
 });
 

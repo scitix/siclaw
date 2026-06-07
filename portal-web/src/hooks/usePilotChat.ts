@@ -319,7 +319,7 @@ async function fetchSessionPage1(
     `/siclaw/agents/${agentId}/chat/sessions/${sessionId}/messages?page=1&page_size=${PAGE_SIZE}`,
   )
   const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as unknown as ChatMessage[]) : []
-  return { items, pilotMsgs: annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage))) }
+  return { items, pilotMsgs: annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage)))) }
 }
 
 function toPilotMessage(m: ChatMessage): PilotMessage {
@@ -516,6 +516,66 @@ function annotateExecJobCompletions(messages: PilotMessage[]): PilotMessage[] {
   })
 }
 
+/**
+ * Fold a BACKGROUND spawn_subagent's completion into its launch card. The launch tool row
+ * returns {status:"launched", job_id} immediately; the sub-agent's result lands later as a
+ * hidden delegation_event whose delegation_id === the launch job_id (spawnId). Mark the launch
+ * background (so the card shows the clock indicator + a running state) and, once the completion
+ * is present, attach subBgStatus/subBgSummary so the card folds running → done/failed with the
+ * report. Refresh-safe — it's all chat history. (Sync spawn cards already fold via streaming.)
+ */
+function annotateSubagentCompletions(messages: PilotMessage[]): PilotMessage[] {
+  const done = new Map<string, { status: string; summary?: string }>()
+  for (const m of messages) {
+    if (m.metadata?.kind !== "delegation_event") continue
+    const id = messageDelegationId(m)
+    if (!id) continue
+    const raw = (messageString(m.metadata?.event_type) ?? messageString(m.metadata?.status) ?? "done").toLowerCase()
+    if (/run|start|queue|pend|progress|synthes/.test(raw)) continue // not a terminal event
+    // Preserve timed_out / partial as their own (amber) statuses — collapsing them into "done"
+    // showed a truncated/timed-out background investigation as a clean green success. statusTone
+    // renders both amber, matching the foreground delegation path.
+    const status = /fail|error/.test(raw) ? "failed"
+      : /cancel|abort|stop/.test(raw) ? "cancelled"
+      : /timed?[-_ ]?out/.test(raw) ? "timed_out"
+      : /partial|truncat/.test(raw) ? "partial"
+      : "done"
+    done.set(id, { status, summary: typeof m.content === "string" ? m.content : undefined })
+  }
+  let changed = false
+  const next = messages.map((m) => {
+    if (!isBackgroundSpawnLaunch(m)) return m // foreground spawn already carries its final status
+    const parsed = m.content ? tryParseJson(m.content) : undefined
+    changed = true
+    const jobId = messageString(parsed?.job_id) ?? messageDelegationId(m) ?? m.id
+    const c = jobId ? done.get(jobId) : undefined
+    return {
+      ...m,
+      metadata: {
+        ...(m.metadata ?? {}),
+        subBackground: true,
+        ...(c ? { subBgStatus: c.status, subBgSummary: c.summary } : {}),
+      },
+    }
+  })
+  return changed ? next : messages
+}
+
+/** A spawn_subagent launched in the background — detectable from the launch itself (args /
+ * "launched" result), so it works during the LIVE turn too, not only after annotate runs on a
+ * refetch. */
+function isBackgroundSpawnLaunch(m: PilotMessage): boolean {
+  if (m.role !== "tool" || m.toolName !== "spawn_subagent") return false
+  if ((m.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true) return true
+  const parsed = m.content ? tryParseJson(m.content) : undefined
+  return parsed?.status === "launched"
+}
+
+/** A background spawn_subagent that launched but whose completion hasn't folded in yet. */
+function hasActiveBackgroundSubagent(messages: PilotMessage[]): boolean {
+  return messages.some((m) => isBackgroundSpawnLaunch(m) && !m.metadata?.subBgStatus)
+}
+
 function hasPendingDelegationSynthesis(messages: PilotMessage[]): boolean {
   return messages.some((message) => message.metadata?.ui_state === "synthesizing")
 }
@@ -542,6 +602,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
+  const hasActiveBgSubagent = hasActiveBackgroundSubagent(messages)
 
   // Per-session state cache: preserves ALL state across session switches so each
   // agent's conversation feels independent — like browser tabs.
@@ -751,6 +812,32 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     }
   }, [agentId, sessionId, hasActiveAsyncDelegation])
 
+  // A background spawn_subagent isn't an async-delegation batch, so the poller above doesn't
+  // cover it, and its completion is a pure-ack synthetic turn (no background_turn_done). Poll
+  // history while one is running so its card folds running → done live (annotateSubagentCompletions
+  // does the fold); stop once folded. Never clobbers a live /send stream or paged-back scrollback.
+  useEffect(() => {
+    if (!sessionId || !hasActiveBgSubagent) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    async function poll() {
+      try {
+        const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
+        if (cancelled) return
+        if (pageRef.current === 1 && !streamingRef.current) {
+          setMessages(pilotMsgs)
+          setHasMore(items.length >= PAGE_SIZE)
+        }
+        if (!hasActiveBackgroundSubagent(pilotMsgs)) return // folded → stop polling
+      } catch (err) {
+        console.warn("[usePilotChat] background-subagent refresh failed:", err)
+      }
+      if (!cancelled) timer = setTimeout(poll, 2500)
+    }
+    timer = setTimeout(poll, 1500)
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [agentId, sessionId, hasActiveBgSubagent])
+
   // Persistent per-session SSE: receives server-pushed turns that land while the user is
   // idle — e.g. a background job's completion turn, generated AFTER the /send stream closed.
   // We do NOT render events live off this channel (the synthetic turn's body isn't streamed
@@ -810,6 +897,23 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                 ? { ...m, metadata: { ...(m.metadata ?? {}), bgStatus: status, bgExitCode: exitCode } }
                 : m,
             ),
+          )
+        } else if (evt?.type === "subagent_done" && typeof evt.job_id === "string") {
+          // Fold the background spawn_subagent card in place (running → done/failed/…), regardless
+          // of page/stream state — so a completion the model stays silent about doesn't leave the
+          // card stuck on "Running…". The refetch reconciles the full summary later.
+          const jobId = evt.job_id
+          const raw = (typeof evt.status === "string" ? evt.status : "completed").toLowerCase()
+          const status = raw === "completed" ? "done" : raw === "stopped" ? "cancelled" : raw // failed/timed_out/partial pass through
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (!isBackgroundSpawnLaunch(m) || m.metadata?.subBgStatus) return m
+              const parsedJobId = (m.content ? tryParseJson(m.content) : undefined)?.job_id
+              const launchJobId = (typeof parsedJobId === "string" ? parsedJobId : undefined) ?? messageDelegationId(m) ?? m.id
+              return launchJobId === jobId
+                ? { ...m, metadata: { ...(m.metadata ?? {}), subBackground: true, subBgStatus: status } }
+                : m
+            }),
           )
         }
       } catch { /* ignore malformed frame */ }

@@ -83,7 +83,7 @@ const { MockClient, mockState } = vi.hoisted(() => {
 
 vi.mock("ssh2", () => ({ Client: MockClient }));
 
-import { dialSshChain, runCommand, makeHostVerifier, type DialHop } from "./ssh-dial.js";
+import { dialSshChain, runCommand, runCommandStream, makeHostVerifier, type DialHop } from "./ssh-dial.js";
 
 beforeEach(() => {
   mockState.instances = [];
@@ -195,6 +195,93 @@ describe("runCommand", () => {
     const { client, teardown } = await dialSshChain([hop("10.0.0.9")], { timeoutMs: 5000 });
     (client as any).exec = () => { /* never calls back */ };
     await expect(runCommand(client, "sleep", { timeoutMs: 30 })).rejects.toThrow(/SSH timeout after 30ms/);
+    teardown();
+  });
+});
+
+describe("runCommandStream (background)", () => {
+  it("exposes live streams, pipes stdin, resolves done with exitCode on close", async () => {
+    const { client, teardown } = await dialSshChain([hop("10.0.0.9")], { timeoutMs: 5000 });
+    const handlers: Record<string, (...a: any[]) => void> = {};
+    const stdinEnd = vi.fn();
+    const fakeStream: any = {
+      on(ev: string, fn: (...a: any[]) => void) { handlers[ev] = fn; return fakeStream; },
+      stderr: { on() { return fakeStream.stderr; } },
+      stdin: { end: stdinEnd, on() { /* error listener */ } },
+      close() { /* abort path */ },
+    };
+    (client as any).exec = (_cmd: string, cb: (e: Error | null, s: any) => void) => cb(null, fakeStream);
+
+    const handle = await runCommandStream(client, "echo ok", { stdin: "scriptbody" });
+    expect(stdinEnd).toHaveBeenCalledWith("scriptbody"); // script body piped to remote stdin
+
+    let out = "";
+    handle.stdout.on("data", (c: Buffer) => { out += c.toString(); });
+    handlers["data"](Buffer.from("hello\n"));
+    handlers["close"](0);
+
+    const res = await handle.done;
+    expect(out).toBe("hello\n");
+    expect(res.exitCode).toBe(0);
+    teardown();
+  });
+
+  it("resolves done as a failure on a channel 'error' (no crash, no hang)", async () => {
+    const { client, teardown } = await dialSshChain([hop("10.0.0.9")], { timeoutMs: 5000 });
+    const handlers: Record<string, (...a: any[]) => void> = {};
+    const destroy = vi.fn();
+    const fakeStream: any = {
+      on(ev: string, fn: (...a: any[]) => void) { handlers[ev] = fn; return fakeStream; },
+      stderr: { on() { return fakeStream.stderr; } },
+      stdin: { end() {}, on() {} },
+      close() {}, destroy,
+    };
+    (client as any).exec = (_cmd: string, cb: (e: Error | null, s: any) => void) => cb(null, fakeStream);
+
+    const handle = await runCommandStream(client, "x");
+    // A channel error must NOT throw unhandled, and `done` must settle (so the job ends + teardown runs).
+    expect(() => handlers["error"](new Error("connection reset"))).not.toThrow();
+    const res = await handle.done;
+    expect(res.exitCode).toBeNull();
+    expect(res.signal).toBe("ERROR");
+    expect(destroy).toHaveBeenCalled();
+    teardown();
+  });
+
+  it("swallows an EPIPE on stdin instead of throwing unhandled", async () => {
+    const { client, teardown } = await dialSshChain([hop("10.0.0.9")], { timeoutMs: 5000 });
+    const handlers: Record<string, (...a: any[]) => void> = {};
+    const stdinHandlers: Record<string, (...a: any[]) => void> = {};
+    const fakeStream: any = {
+      on(ev: string, fn: (...a: any[]) => void) { handlers[ev] = fn; return fakeStream; },
+      stderr: { on() { return fakeStream.stderr; } },
+      stdin: { end() {}, on(ev: string, fn: (...a: any[]) => void) { stdinHandlers[ev] = fn; } },
+      close() {},
+    };
+    (client as any).exec = (_cmd: string, cb: (e: Error | null, s: any) => void) => cb(null, fakeStream);
+
+    const handle = await runCommandStream(client, "x", { stdin: "body" });
+    expect(stdinHandlers["error"]).toBeTypeOf("function");
+    expect(() => stdinHandlers["error"](new Error("write EPIPE"))).not.toThrow();
+    handlers["close"](0);
+    expect((await handle.done).exitCode).toBe(0);
+    teardown();
+  });
+
+  it("closes the channel immediately when the signal is already aborted (lost-stop guard)", async () => {
+    const { client, teardown } = await dialSshChain([hop("10.0.0.9")], { timeoutMs: 5000 });
+    const close = vi.fn();
+    const fakeStream: any = {
+      on(_ev: string, _fn: (...a: any[]) => void) { return fakeStream; },
+      stderr: { on() { return fakeStream.stderr; } },
+      stdin: { end() {}, on() {} },
+      close,
+    };
+    (client as any).exec = (_cmd: string, cb: (e: Error | null, s: any) => void) => cb(null, fakeStream);
+    const ac = new AbortController();
+    ac.abort(); // already stopped before exec's callback fires
+    await runCommandStream(client, "x", { signal: ac.signal });
+    expect(close).toHaveBeenCalled();
     teardown();
   });
 });
