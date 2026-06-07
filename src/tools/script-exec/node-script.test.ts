@@ -167,7 +167,7 @@ describe("node_script tool", () => {
   it("one-step pod: resolves the pod netns then wraps the script with ip netns exec", async () => {
     vi.mocked(resolveScript).mockReturnValue({ interpreter: "bash", content: "echo hi", path: "/x", scope: "global" } as any);
     vi.mocked(runInDebugPod).mockResolvedValue({ stdout: "ok", stderr: "", exitCode: 0 } as any);
-    const res = await tool.execute("id", { pod: "rdma-a", namespace: "rdma-test", skill: "exec-smoke", script: "x.sh" }, undefined, {} as any);
+    const res = await tool.execute("id", { pod: "rdma-a", namespace: "rdma-test", skill: "node-logs", script: "x.sh" }, undefined, {} as any);
     expect((res.details as any).error).toBeFalsy();
     expect(resolvePodNetnsViaKubectl).toHaveBeenCalledTimes(1);
     expect(vi.mocked(resolvePodNetnsViaKubectl).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
