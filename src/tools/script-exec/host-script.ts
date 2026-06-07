@@ -1,4 +1,4 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -6,9 +6,12 @@ import type { KubeconfigRef } from "../../core/types.js";
 import { resolveScript } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validateNodeName, stdinExecCmd } from "../infra/exec-utils.js";
-import { acquireSshTarget, sshExec } from "../infra/ssh-client.js";
+import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
+import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
 
 interface HostScriptParams {
   host: string;
@@ -16,7 +19,13 @@ interface HostScriptParams {
   script: string;
   args?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
+
+// Background ssh leak-guard ttl (s): the script is `timeout`-wrapped so a dropped channel
+// can't orphan it. Generous vs the foreground cap; matches host_exec.
+const HOST_BG_DEFAULT_TTL = 600;
+const HOST_BG_MAX_TTL = 3600;
 
 /**
  * host_script — run a skill or user script on a non-K8s host via SSH.
@@ -30,7 +39,11 @@ interface HostScriptParams {
  * as node_script — scripts are trusted assets); but `args` are shell-escaped
  * to prevent injection.
  */
-export function createHostScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createHostScriptTool(
+  kubeconfigRef?: KubeconfigRef,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "host_script",
     label: "Host Script",
@@ -78,11 +91,25 @@ Examples (pass the id from host_list; names shown here for readability):
       ),
       timeout_seconds: Type.Optional(
         Type.Number({
-          description: "Timeout in seconds (default: 180, max: 300)",
+          description: "Timeout in seconds (default: 180, max: 300; in background: default 600, max 3600)",
         }),
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the script on the host in the background instead of waiting. Returns immediately " +
+                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
+                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
+                  "completes; ONLY THEN read the output_file. Use for long-running skill scripts over SSH " +
+                  "(orchestration, soak, perftest). The script is wrapped in `timeout` and capped (~3600s).",
+              }),
+            ),
+          }
+        : {}),
     }),
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as HostScriptParams;
 
       const hostErr = validateNodeName(params.host);
@@ -118,6 +145,40 @@ Examples (pass the id from host_list; names shown here for readability):
       const args = params.args?.trim() || "";
       const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
       const remoteCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Pipe the script via stdin to a `setsid`-wrapped, `timeout <ttl>`-bounded remote shell,
+      // stream output to disk. setsid makes the remote command its own process-group leader and
+      // records its PGID so job_stop can kill the WHOLE remote tree over a fresh ssh channel
+      // (closing the streaming channel does NOT reliably SIGHUP a non-PTY remote process).
+      // Mirrors node_script. Script bodies aren't sanitized (trusted assets) → action null.
+      if (backgroundEnabled && params.run_in_background === true) {
+        const ttl = Math.min(params.timeout_seconds ?? HOST_BG_DEFAULT_TTL, HOST_BG_MAX_TTL);
+        // Run as a killable session so job_stop reaps the whole remote tree (incl. timeout's own
+        // process group); the script body on stdin flows through to `timeout … bash -s`/`python3 -`.
+        const pgidFile = backgroundPgidFile(toolCallId);
+        const wrapped = wrapBackgroundSession(`timeout ${ttl} ${remoteCmd}`, pgidFile);
+        const killScript = backgroundSessionKillScript(pgidFile);
+        const onAbort = () => { void sshExec(target, killScript, { timeoutMs: 20_000 }).catch(() => {}); };
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            streamFactory: () => sshExecStream(target, wrapped, { stdin: resolved.content }),
+            env: {},
+            action: null,
+            hasSensitiveKubectl: false,
+            description: `host ${params.host}: ${[params.skill, params.script].filter(Boolean).join("/")}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: false,
+            jobType: "host",
+            onAbort,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+        } catch (err) {
+          console.warn(`[host-script] background launch declined, running foreground:`, err);
+        }
+      }
+
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
 
       let result;
@@ -168,5 +229,9 @@ Examples (pass the id from host_list; names shown here for readability):
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  create: (refs) => createHostScriptTool(refs.kubeconfigRef),
+  create: (refs) =>
+    createHostScriptTool(refs.kubeconfigRef, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

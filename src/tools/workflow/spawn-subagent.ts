@@ -49,8 +49,11 @@ function buildDescription(): string {
     "concrete targets, paths, and what to check.\n\n" +
     "Sub-agents cannot spawn their own sub-agents (one level deep)." +
     (RUN_IN_BACKGROUND_ENABLED
-      ? " With run_in_background you are notified on completion — do NOT poll the job or fabricate its " +
-        "results; report status until the notification arrives."
+      ? " With run_in_background you get an automatic completion notification carrying the sub-agent's result — " +
+        "after launching, just END YOUR TURN (or do other independent work). Never poll it, never spawn another " +
+        "sub-agent to 'wait for' it, and never fabricate its result; report to the user only when the " +
+        "notification arrives. If you actually need the result before you can continue, use the FOREGROUND form " +
+        "(omit run_in_background) instead — that blocks and returns the result inline."
       : "") +
     "\n\nAvailable subagent_type values:\n" +
     lines.join("\n")
@@ -82,9 +85,10 @@ export function createSpawnSubagentTool(
         ? {
             run_in_background: Type.Optional(Type.Boolean({
               description:
-                "Run the sub-agent in the background instead of waiting. You are notified when it completes — " +
-                "do NOT poll. Use only for genuinely independent work you can proceed without. " +
-                "Returns a job_id you can pass to job_stop to cancel it.",
+                "Run the sub-agent in the background instead of waiting. A completion notification with its result " +
+                "arrives automatically — do NOT poll and do NOT spawn another sub-agent to wait for it. Use ONLY " +
+                "for genuinely independent work you can proceed without; if you need the result before continuing, " +
+                "omit this (foreground) so it returns inline. Returns a job_id you can pass to job_stop to cancel it.",
             })),
           }
         : {}),
@@ -143,8 +147,11 @@ function toToolOutput(result: SpawnSubagentResult) {
       status: "launched" as const,
       job_id: result.jobId,
       message:
-        "Sub-agent launched in the background. You will be notified when it completes — do NOT poll. " +
-        "Continue with other work or respond to the user. Use job_stop with this job_id to cancel it.",
+        "Sub-agent launched in the background. END YOUR TURN NOW unless you have OTHER independent work to do " +
+        "right now — do NOT poll it, do NOT sleep/wait, and do NOT spawn another sub-agent or call any tool whose " +
+        "purpose is to 'wait for', 'check on', or 'get the result of' this job. There is nothing to wait for: a " +
+        "completion notification carrying the result will arrive on its own, and you report to the user THEN. " +
+        "Tell the user in plain language what is running; do NOT show them this job_id (use it only with job_stop to cancel).",
     };
     return {
       content: [{ type: "text" as const, text: JSON.stringify(modelVisible) }],

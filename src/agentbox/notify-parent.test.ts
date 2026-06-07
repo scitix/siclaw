@@ -178,6 +178,106 @@ describe("notifyParent", () => {
     expect(nonExec).toHaveLength(0);
   });
 
+  it("a text-only synthetic turn for a SUB-AGENT (inline result, no output_file) persists the report + fires background_turn_done", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    // Brain that, on prompt(), emits one assistant text message (the inline result report) and no tool call.
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "The sum is 34" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    mgr.jobs.register({ jobId: "sa1", type: "subagent", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false }); // no outputFile
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "sa1", { taskId: "sa1", status: "completed", summary: "result: 34" }); // no output_file → inline result
+    await flushCoalesce();
+    const events = send.mock.calls.map((c) => c[0]);
+    const report = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("34"));
+    expect(report).toBeTruthy(); // the text-only report is persisted (not dropped)
+    const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
+    expect(btd).toHaveLength(1); // refetch trigger fired so the UI shows the report
+  });
+
+  it("a text-only synthetic turn for a BASH job (output_file present) is still dropped (pure ack)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "no new info" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "s1", description: "cmd", status: "completed", startedAt: 0, notified: false, outputFile: "/o" });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" }); // output_file → data in file, text-only ack is noise
+    await flushCoalesce();
+    const events = send.mock.calls.map((c) => c[0]);
+    const ack = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("no new info"));
+    expect(ack).toBeFalsy(); // the pure-ack text is NOT persisted
+    const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
+    expect(btd).toHaveLength(0);
+  });
+
+  it("a MIXED batch (sub-agent + shell job) keeps the strict guard — text-only ack is dropped", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "both done, nothing new" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    mgr.jobs.register({ jobId: "sa1", type: "subagent", parentSessionId: "s1", description: "sub", status: "completed", startedAt: 0, notified: false }); // inline (no outputFile)
+    mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "s1", description: "cmd", status: "completed", startedAt: 0, notified: false, outputFile: "/o" });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    // Both complete within the coalesce window → ONE synthetic turn covering the mixed batch.
+    await mgr.notifyParent("s1", "sa1", { taskId: "sa1", status: "completed", summary: "sub result" });
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
+    await flushCoalesce();
+    const events = send.mock.calls.map((c) => c[0]);
+    // The shell job present in the batch flips off allowTextOnlyPersist, so a text-only reaction
+    // is NOT persisted as a bubble (the sub-agent result still shows via its own card fold).
+    const ack = events.filter((e: any) => e?.type === "delegation.append_message").find((e: any) => (e.message?.content || "").includes("nothing new"));
+    expect(ack).toBeFalsy();
+    const btd = events.filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "background_turn_done");
+    expect(btd).toHaveLength(0);
+  });
+
+  it("emits a live subagent_done fold event when a background sub-agent completes", async () => {
+    const { mgr } = setup(true);
+    mgr.jobs.register({ jobId: "sa9", type: "subagent", parentSessionId: "s1", description: "sub", status: "completed", startedAt: 0, notified: false });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "sa9", { taskId: "sa9", status: "completed", summary: "result: 42" });
+    await flushCoalesce();
+    const fold = send.mock.calls
+      .map((c) => c[0])
+      .filter((e: any) => e?.type === "delegation.emit_chat_event" && e?.event?.type === "subagent_done");
+    expect(fold).toHaveLength(1);
+    expect(fold[0].event.job_id).toBe("sa9");
+    expect(fold[0].event.status).toBe("completed");
+    // Sub-agents are NOT given an exec_job_event (that's for shell/exec jobs).
+    const execEvents = send.mock.calls.map((c) => c[0]).filter((e: any) => e?.message?.metadata?.kind === "exec_job_event");
+    expect(execEvents).toHaveLength(0);
+  });
+
   it("does NOT emit background_turn_done when not persistable (no gatewayClient)", async () => {
     const { mgr, brain } = setup(true);
     // No gatewayClient / agentId → canPersist is false.

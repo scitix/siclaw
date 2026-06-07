@@ -1,4 +1,4 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
@@ -6,6 +6,8 @@ import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { loadConfig } from "../../core/config.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
@@ -25,6 +27,7 @@ interface RunSkillParams {
   args?: string;
   cluster?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
 export function createLocalScriptTool(
@@ -32,7 +35,9 @@ export function createLocalScriptTool(
   sessionIdRef?: { current: string },
   userId?: string,
   agentId?: string | null,
+  bg?: BackgroundExecWiring,
 ): ToolDefinition {
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "local_script",
     label: "Local Script",
@@ -87,8 +92,21 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
           description: "Timeout in seconds (default: 180, max: 300)",
         })
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the script in the background instead of waiting. Returns immediately with a task_id " +
+                  "and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read the file or call " +
+                  "any tool, and do NOT sleep/wait. You are notified automatically when it completes; ONLY " +
+                  "THEN read the output_file. Use for long-running skill scripts (orchestration, soak, perftest).",
+              })
+            ),
+          }
+        : {}),
     }),
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as RunSkillParams;
       const skill = params.skill?.trim();
       const script = params.script?.trim();
@@ -151,6 +169,37 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
       // into a shell command string (prevents shell injection via args parameter)
       const cmdArgs = args ? parseArgs(args) : [];
 
+      const childEnv: Record<string, string> = {
+        ...sanitizeEnv(process.env as Record<string, string>),
+        SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
+        ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
+        KUBECONFIG: kubeResult.path || "/dev/null",
+      };
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Reuse the child-process runner in argv mode: interpreter + [scriptPath, ...args].
+      // Script output isn't sanitized (trusted asset), so action is null (line-safe).
+      // Note: background launches don't emit the skill_call diagnostic (no terminal outcome yet).
+      if (backgroundEnabled && params.run_in_background === true) {
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            file: resolved.interpreter,
+            args: [resolved.path, ...cmdArgs],
+            env: childEnv,
+            action: null,
+            hasSensitiveKubectl: false,
+            description: `${skill}/${script}${args ? " " + args : ""}`,
+            parentSessionId: sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: process.env.NODE_ENV === "production",
+            jobType: "local",
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running the script in the background.");
+        } catch (err) {
+          console.warn(`[local-script] background launch declined, running foreground:`, err);
+        }
+      }
+
       const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
       const startMs = Date.now();
 
@@ -158,12 +207,7 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
         const child = spawn(resolved.interpreter, [resolved.path, ...cmdArgs], {
           detached: true, // make child a process group leader for clean group kill
           stdio: ["ignore", "pipe", "pipe"],
-          env: {
-            ...sanitizeEnv(process.env as Record<string, string>),
-            SICLAW_DEBUG_IMAGE: loadConfig().debugImage,
-            ...(kubeconfigRef?.credentialsDir ? { SICLAW_CREDENTIALS_DIR: kubeconfigRef.credentialsDir } : {}),
-            KUBECONFIG: kubeResult.path || "/dev/null",
-          },
+          env: childEnv,
         });
 
         const onAbort = () => {
@@ -241,5 +285,9 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  create: (refs) => createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef, refs.userId, refs.agentId),
+  create: (refs) =>
+    createLocalScriptTool(refs.kubeconfigRef, refs.sessionIdRef, refs.userId, refs.agentId, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };

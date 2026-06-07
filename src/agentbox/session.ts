@@ -506,6 +506,17 @@ export class AgentBoxSessionManager {
     const job = this.jobs.get(jobId);
     if (job && job.type !== "subagent") {
       void this.persistExecJobEvent(sessionId, jobId, n.status, job.exitCode);
+    } else if (job) {
+      // Background sub-agent: fold its launch card live (running → done/failed/timed_out)
+      // regardless of the model's synthetic-turn reaction. The persisted delegation_event still
+      // drives the refetch fold; this TARGETED live event (mirrors exec_job_done) makes it
+      // immediate and paged-back/streaming-safe — without it, a completion the model correctly
+      // stays silent about leaves the card stuck on "Running…" until a manual refresh.
+      void this.persistDelegationEvent({
+        type: "delegation.emit_chat_event",
+        sessionId,
+        event: { type: "subagent_done", sessionId, job_id: jobId, status: n.status },
+      }).catch(() => {});
     }
 
     // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
@@ -547,7 +558,17 @@ export class AgentBoxSessionManager {
     }
     const batch = managed._pendingNotifications.splice(0);
     if (batch.length === 0) return;
-    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch));
+    // A notification with NO output_file carries its result INLINE in the summary (sub-agents —
+    // see task-notification.ts). For those the model's report is pure text (no read tool call),
+    // so the turnHadTool persist guard below would wrongly drop it — allow a text-only reaction.
+    // Require EVERY notification in the batch to be inline-result (`.every`, not `.some`): a
+    // mixed batch (sub-agent + a shell/exec job whose data lives in output_file) must keep the
+    // STRICT guard, else the shell job's pure-ack ("nothing new") text gets persisted as a noise
+    // bubble — the exact thing turnHadTool suppresses. In that rare mixed case the sub-agent's
+    // result is still visible via its own card fold (annotateSubagentCompletions), so only the
+    // model's optional prose is dropped, never the result itself.
+    const allInlineResult = batch.every((n) => !n.outputFile);
+    await this.runSyntheticPrompt(managed, buildNotificationBatch(batch), allInlineResult);
   }
 
   /**
@@ -557,7 +578,7 @@ export class AgentBoxSessionManager {
    * already started (re-check degrades us to followUp) or hits the 409 guard. This closes
    * the TOCTOU documented at the _promptInflight declaration.
    */
-  private runSyntheticPrompt(managed: ManagedSession, text: string): Promise<void> {
+  private runSyntheticPrompt(managed: ManagedSession, text: string, allowTextOnlyPersist = false): Promise<void> {
     const run = (managed._syntheticPromptQueue ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
@@ -631,13 +652,23 @@ export class AgentBoxSessionManager {
           managed._promptInflight = null;
           release();
           if (managed._backgroundWorkCount === 0) this.scheduleRelease(managed.id);
-          // Show the model's reaction ONLY if it actually DID something (made a tool call).
-          // A reaction with no tool call is a pure acknowledgement ("nothing new") — drop it
-          // so it doesn't add a noise bubble; the completion is already surfaced in the
-          // launching tool's own box (exec_job_event). A data-bearing summary necessarily
-          // reads the output first (a tool call), so this never hides real information.
+          // Decide whether to keep the model's reaction. Normally we keep it ONLY if it made a
+          // tool call: for a bash/exec completion the data lives in output_file, so a data-bearing
+          // report necessarily reads that file first (a tool call), and a text-only reaction is a
+          // pure ack ("nothing new") we drop to avoid a noise bubble (the completion already shows
+          // in the launching tool's own box).
+          // EXCEPTION (allowTextOnlyPersist): a sub-agent's result is delivered INLINE in the
+          // notification summary — the model reports it as pure text with NO tool call. There the
+          // text IS the answer the user is waiting for, so keep a non-empty text-only reaction too.
+          const turnHadText = turnMessages.some((m) => {
+            if (m.role !== "assistant") return false;
+            const c = Array.isArray(m.content)
+              ? m.content.filter((x: any) => x?.type === "text").map((x: any) => x.text ?? "").join("")
+              : typeof m.content === "string" ? m.content : "";
+            return c.trim().length > 0;
+          });
           // When kept, persist the whole turn then fire a refetch so the frontend shows it.
-          if (canPersist && turnHadTool) {
+          if (canPersist && (turnHadTool || (allowTextOnlyPersist && turnHadText))) {
             void Promise.allSettled(
               turnMessages.map((m) => this.persistSyntheticMessage(sid, m).catch(() => {})),
             ).then(() =>

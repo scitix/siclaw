@@ -47,10 +47,10 @@ const { MockClient, mockState, mockStreams } = vi.hoisted(() => {
 
   class MockStream extends TinyEmitter {
     stderr = new TinyEmitter();
-    stdin: { end: ReturnType<typeof makeFn> };
+    stdin: { end: ReturnType<typeof makeFn>; on: () => void };
     constructor() {
       super();
-      this.stdin = { end: makeFn() };
+      this.stdin = { end: makeFn(), on: () => {} };
     }
   }
 
@@ -123,10 +123,10 @@ afterEach(() => {
 function nextStream() {
   const s = new EventEmitter() as EventEmitter & {
     stderr: EventEmitter;
-    stdin: { end: ReturnType<typeof vi.fn> };
+    stdin: { end: ReturnType<typeof vi.fn>; on: () => void };
   };
   s.stderr = new EventEmitter();
-  s.stdin = { end: vi.fn() };
+  s.stdin = { end: vi.fn(), on: () => {} };
   mockStreams.push(s as any);
   return s;
 }

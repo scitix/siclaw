@@ -1250,6 +1250,16 @@ function agentWorkBatchSummary(message: PilotMessage): {
   }
 }
 
+// A spawn_subagent launched in the background — detectable from the launch itself (run_in_background
+// arg or the "launched" result), so the card shows the indicator/running state during the LIVE turn,
+// not only after annotateSubagentCompletions runs on a refetch.
+function isBackgroundSpawn(message: PilotMessage): boolean {
+  if (message.toolName !== "spawn_subagent") return false
+  if ((message.toolArgs as Record<string, unknown> | undefined)?.run_in_background === true) return true
+  const parsed = message.content ? parseJsonRecord(message.content) : null
+  return stringValue(parsed?.status) === "launched"
+}
+
 function agentWorkSummary(message: PilotMessage): {
   target: string
   targetLabel: string
@@ -1292,7 +1302,12 @@ function agentWorkSummary(message: PilotMessage): {
     targetLabel: isSelfDelegation ? "self sub-agent" : (targetName ? `${targetName} · ${rawTarget}` : rawTarget),
     isSelfDelegation,
     scope: stringValue(args.description) ?? stringValue(args.scope) ?? stringValue(args.prompt) ?? stringValue(metadata.scope) ?? message.toolInput,
-    summary: normalizeAgentWorkSummary(stringValue(result.summary) ?? stringValue(message.content)),
+    summary: normalizeAgentWorkSummary(
+      // Background spawn: the folded sub-agent report (subBgSummary), not the launch JSON.
+      stringValue(metadata.subBgSummary) ??
+      stringValue(result.summary) ??
+      (isBackgroundSpawn(message) ? undefined : stringValue(message.content)),
+    ),
     fullSummary: normalizeAgentWorkSummary(
       stringValue(details.full_summary) ??
       stringValue(metadata.full_summary) ??
@@ -1309,6 +1324,10 @@ function agentWorkSummary(message: PilotMessage): {
     duration: compactDuration(durationMs ?? message.metadata?.durationMs as number | undefined),
     toolTrace: toolTraceValue(result.tool_trace ?? result.toolTrace ?? details.tool_trace ?? details.toolTrace),
     status:
+      // Background spawn: folded completion status, else "running" until it folds — never the
+      // launch result's "launched" (which would show as the default "Ready").
+      stringValue(metadata.subBgStatus) ??
+      (isBackgroundSpawn(message) ? "running" : undefined) ??
       stringValue(result.status) ??
       stringValue(metadata.status) ??
       message.toolStatus ??
@@ -1786,7 +1805,12 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
   // "running" at once (one tool_execution_start each), so without this the queued
   // children would falsely show a spinner; the backend flips status to "queued".
   const isQueued = work.status === "queued"
-  const isRunning = !isQueued && (message.toolStatus === "running" || message.isStreaming)
+  // Background spawn_subagent: the launch tool returns immediately (toolStatus "success"), so it
+  // is "running in the background" until its completion folds in (subBgStatus). Treat that as
+  // running so the card shows a spinner + the background marker instead of a bare "Ready".
+  const isBgSubagent = isBackgroundSpawn(message)
+  const bgSubDone = Boolean(message.metadata?.subBgStatus)
+  const isRunning = !isQueued && (message.toolStatus === "running" || message.isStreaming || (isBgSubagent && !bgSubDone))
   const isSpawn = message.toolName === "spawn_subagent"
   // Collapsed by default — the user expands the card when they want to see the
   // execution. (Legacy delegate cards keep auto-opening while streaming.)
@@ -1819,6 +1843,15 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
                   sub-agent
                 </span>
               )}
+              {isBgSubagent && (
+                <span
+                  className="shrink-0 inline-flex text-muted-foreground/70"
+                  title="Runs in the background — returns immediately, notifies on completion"
+                  aria-label="Background execution"
+                >
+                  <Clock className="w-3.5 h-3.5" />
+                </span>
+              )}
               <span className={cn("shrink-0 px-2 py-0.5 rounded-full border text-[11px] font-medium", tone.className)}>
                 {tone.label}
               </span>
@@ -1842,7 +1875,9 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
               // The card is just the sub-agent's execution process; the conclusion is
               // surfaced by the parent in the main conversation, so no report here.
               <div>
-                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">Execution</div>
+                <div className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
+                  {isBgSubagent && bgSubDone ? "Result" : "Execution"}
+                </div>
                 {steps.length > 0 ? (
                   <SubagentSteps steps={steps} />
                 ) : isQueued ? (
@@ -1852,8 +1887,13 @@ function AgentWorkCard({ message }: { message: PilotMessage }) {
                   </div>
                 ) : isRunning ? (
                   <div className="text-xs text-muted-foreground flex items-center gap-2">
-                    <Loader2 className="w-3 h-3 animate-spin" /> Sub-agent working…
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    {isBgSubagent ? "Running in the background… (updates here when done)" : "Sub-agent working…"}
                   </div>
+                ) : isBgSubagent && work.summary ? (
+                  // Background sub-agent has no inline steps (it ran in its own session); show the
+                  // folded result report so the user sees the outcome on the card.
+                  <div className="text-sm text-foreground"><Markdown>{work.summary}</Markdown></div>
                 ) : (
                   <div className="text-xs text-muted-foreground/60">(no execution recorded)</div>
                 )}
@@ -2199,8 +2239,8 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
           {isBackground && (
             <span
               className="shrink-0 inline-flex text-muted-foreground/70"
-              title="后台执行:立即返回,完成后自动通知"
-              aria-label="后台执行"
+              title="Runs in the background — returns immediately, notifies on completion"
+              aria-label="Background execution"
             >
               <Clock className="w-3.5 h-3.5" />
             </span>
@@ -2271,12 +2311,12 @@ function ToolItem({ message, nested }: { message: PilotMessage; nested?: boolean
               <pre className="text-xs font-mono leading-relaxed text-muted-foreground whitespace-pre-wrap pr-8">
                 {isBackground
                   ? (bgRunning
-                      ? "在后台运行中…(完成后此处更新)"
+                      ? "Running in the background… (updates here when done)"
                       : bgFailed
-                        ? `后台任务失败${bgExitLabel}`
+                        ? `Background task failed${bgExitLabel}`
                         : bgStopped
-                          ? "后台任务已停止"
-                          : `后台任务完成${bgExitLabel}`)
+                          ? "Background task stopped"
+                          : `Background task completed${bgExitLabel}`)
                   : (message.content || (message.toolStatus === "aborted" ? "Aborted." : "Running..."))}
               </pre>
               {/* Output copy only for a real captured output — a background box's body is a

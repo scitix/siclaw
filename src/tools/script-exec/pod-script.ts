@@ -1,4 +1,4 @@
-import type { ToolEntry } from "../../core/tool-registry.js";
+import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
@@ -7,10 +7,15 @@ import { resolveScript } from "../infra/script-resolver.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { checkPodRunning } from "../infra/k8s-checks.js";
+import { loadConfig } from "../../core/config.js";
+import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
+import { backgroundLaunchedResult } from "../cmd-exec/background-launch.js";
 import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validatePodName, prepareExecEnv, spawnAsync, stdinExecCmd } from "../infra/exec-utils.js";
 import { resolveRequiredKubeconfig } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
+import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
+import { spawn } from "node:child_process";
 
 interface PodScriptParams {
   pod: string;
@@ -21,9 +26,14 @@ interface PodScriptParams {
   args?: string;
   cluster?: string;
   timeout_seconds?: number;
+  run_in_background?: boolean;
 }
 
-export function createPodScriptTool(kubeconfigRef?: KubeconfigRef): ToolDefinition {
+export function createPodScriptTool(
+  kubeconfigRef?: KubeconfigRef,
+  bg?: BackgroundExecWiring,
+): ToolDefinition {
+  const backgroundEnabled = BACKGROUND_BASH_ENABLED && Boolean(bg?.executor);
   return {
     name: "pod_script",
     label: "Pod Script",
@@ -90,8 +100,22 @@ Examples:
           description: "Timeout in seconds (default: 180, max: 300)",
         }),
       ),
+      ...(backgroundEnabled
+        ? {
+            run_in_background: Type.Optional(
+              Type.Boolean({
+                description:
+                  "Run the script in the pod in the background instead of waiting. Returns immediately with " +
+                  "a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read the file " +
+                  "or call any tool, and do NOT sleep/wait. You are notified automatically when it completes; " +
+                  "ONLY THEN read the output_file. The script is wrapped in `timeout` (requires coreutils/busybox " +
+                  "`timeout` in the pod). Use for long-running in-pod scripts (soak, load).",
+              }),
+            ),
+          }
+        : {}),
     }),
-    async execute(_toolCallId, rawParams, signal) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as PodScriptParams;
 
       try {
@@ -154,13 +178,63 @@ Examples:
         };
       }
 
-      // Build kubectl exec args — pipe script via stdin, no temp files inside pod
-      const kubectlArgs = [...env.kubeconfigArgs, "-n", namespace, "-i", "exec", pod];
+      // Build kubectl exec args — pipe script via stdin, no temp files inside pod.
+      // `-i` is an `exec` flag (not a global one), so it MUST come AFTER the `exec`
+      // subcommand — placing it before makes kubectl stop at `-i`, fail to find a command,
+      // and fall into plugin resolution ("flags cannot be placed before plugin name").
+      const kubectlArgs = [...env.kubeconfigArgs, "-n", namespace, "exec", "-i", pod];
       if (params.container?.trim()) {
         kubectlArgs.push("-c", params.container.trim());
       }
       const execCmd = stdinExecCmd(resolved.interpreter, escapedArgs || undefined);
       kubectlArgs.push("--", "sh", "-c", execCmd);
+
+      // ── Background mode ──────────────────────────────────────────────
+      // Run the in-pod command under `setsid` (own session) wrapped in `timeout <ttl>`, with the
+      // script piped via stdin. job_stop only reaps the LOCAL kubectl, so on abort we kubectl-exec
+      // a session-kill in the pod (mirrors node_script) — closing the exec channel does not
+      // reliably reap the in-pod process tree. Scripts are trusted assets → action null (line-safe).
+      // Requires `timeout`/`setsid` in the pod.
+      if (backgroundEnabled && params.run_in_background === true) {
+        const cfg = loadConfig();
+        const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
+        const pgidFile = backgroundPgidFile(toolCallId);
+        const wrapped = wrapBackgroundSession(`timeout ${ttl} ${execCmd}`, pgidFile);
+        const bgArgs = [...env.kubeconfigArgs, "-n", namespace, "exec", "-i", pod];
+        if (params.container?.trim()) bgArgs.push("-c", params.container.trim());
+        bgArgs.push("--", "sh", "-c", wrapped);
+        const killScript = backgroundSessionKillScript(pgidFile);
+        const killArgs = [...env.kubeconfigArgs, "-n", namespace, "exec", pod];
+        if (params.container?.trim()) killArgs.push("-c", params.container.trim());
+        killArgs.push("--", "sh", "-c", killScript);
+        const onAbort = () => {
+          try {
+            const killer = spawn("kubectl", killArgs, { env: env.childEnv as Record<string, string>, detached: true });
+            killer.on("error", () => {});
+            setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, 15_000).unref();
+            killer.unref();
+          } catch { /* best-effort */ }
+        };
+        try {
+          const { jobId, outputFile } = bg!.executor!({
+            file: "kubectl",
+            args: bgArgs,
+            stdin: resolved.content,
+            env: env.childEnv as Record<string, string>,
+            action: null,
+            hasSensitiveKubectl: false,
+            description: `pod ${namespace}/${pod}: ${[params.skill, params.script].filter(Boolean).join("/")}`,
+            parentSessionId: bg!.sessionIdRef?.current ?? "",
+            jobId: toolCallId,
+            isProd: process.env.NODE_ENV === "production",
+            jobType: "pod",
+            onAbort,
+          });
+          return backgroundLaunchedResult(jobId, outputFile, "Running the script in the pod in the background.");
+        } catch (err) {
+          console.warn(`[pod-script] background launch declined, running foreground:`, err);
+        }
+      }
 
       try {
         const result = await spawnAsync("kubectl", kubectlArgs, timeout, env.childEnv, signal, resolved.content);
@@ -182,5 +256,9 @@ Examples:
 
 export const registration: ToolEntry = {
   category: "script-exec",
-  create: (refs) => createPodScriptTool(refs.kubeconfigRef),
+  create: (refs) =>
+    createPodScriptTool(refs.kubeconfigRef, {
+      executor: refs.backgroundExecExecutor,
+      sessionIdRef: refs.sessionIdRef,
+    }),
 };
