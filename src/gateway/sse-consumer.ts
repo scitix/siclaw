@@ -518,6 +518,59 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
     // when the agentbox closes the SSE stream after prompt() fully resolves.
   }
 
+  // ── Abort finalization ───────────────────────────────────────────────
+  // The loop above breaks on `signal.aborted` (L205) the moment the user hits Stop. At that
+  // point any tool whose tool_execution_start row was persisted but never got a matching
+  // tool_execution_end is left with outcome=null / metadata.status="running" — so it would
+  // spin forever in the UI and a history refetch would re-paint it as running. Finalize those
+  // rows here as "stopped" (mirroring a background job's stopped representation: outcome stays
+  // null, metadata.status="stopped"), and persist any partial assistant text so the words the
+  // model already streamed don't vanish on the next refetch.
+  if (persist && signal?.aborted) {
+    for (const [toolName, ids] of pendingToolMessageIds) {
+      // startTimes/inputs are pushed in lockstep with the message ids on tool_execution_start
+      // and shifted together on tool_execution_end, so the surviving entries stay index-aligned.
+      const startTimes = pendingToolStartTimes.get(toolName) ?? [];
+      const inputs = pendingToolInputs.get(toolName) ?? [];
+      for (let i = 0; i < ids.length; i++) {
+        const stoppedMeta: Record<string, unknown> = { status: "stopped" };
+        if (startTimes[i] != null) stoppedMeta.started_at = new Date(startTimes[i]).toISOString();
+        try {
+          // updateMessage REPLACES columns (it is not a partial patch), so we must re-send
+          // toolName + toolInput or they'd be NULLed — leaving the stopped card with no identity.
+          await updateMessage({
+            messageId: ids[i],
+            sessionId,
+            content: "",
+            toolName,
+            toolInput: inputs[i] ? redactText(inputs[i], redactionConfig) : null,
+            outcome: null,
+            metadata: stoppedMeta,
+          });
+        } catch (err) {
+          console.warn(`[sse-consumer] ${userId}: failed to finalize aborted tool row ${ids[i]}:`, err);
+        }
+      }
+    }
+    if (assistantContent) {
+      const cleaned = stripEmptyResponseMarkers(assistantContent);
+      if (cleaned.length > 0) {
+        try {
+          await appendMessage({
+            sessionId,
+            role: "assistant",
+            content: redactText(cleaned, redactionConfig),
+            metadata: { incomplete: true },
+          });
+          await incrementMessageCount(sessionId);
+        } catch (err) {
+          console.warn(`[sse-consumer] ${userId}: failed to persist partial assistant message on abort:`, err);
+        }
+      }
+      assistantContent = "";
+    }
+  }
+
   // Fallback: if no message_end arrived but we have accumulated text
   if (!resultText && currentMsgText) {
     resultText = currentMsgText;

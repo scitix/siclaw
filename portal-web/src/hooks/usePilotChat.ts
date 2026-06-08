@@ -267,6 +267,11 @@ function isTaskTool(toolName?: string | null): boolean {
 
 function toolStatusFromMessage(m: ChatMessage): PilotMessage["toolStatus"] | undefined {
   if (m.role !== "tool") return undefined;
+  // A tool the user Stopped is finalized with metadata.status="stopped" (outcome stays null —
+  // see sse-consumer abort finalization). Map it to "aborted" so it shows the terminal ⊘ state
+  // even after a history refetch, instead of falling through to "running" (spinner forever).
+  const status = m.metadata?.status;
+  if (status === "stopped" || status === "aborted" || status === "killed") return "aborted";
   if (isStaleRunningTool(m)) return "error";
   if (m.outcome === "error" || m.outcome === "blocked") return "error";
   if (m.outcome === "success") return "success";
@@ -322,7 +327,7 @@ async function fetchSessionPage1(
   return { items, pilotMsgs: annotateSubagentCompletions(annotateExecJobCompletions(annotateDelegationSynthesis(items.map(toPilotMessage)))) }
 }
 
-function toPilotMessage(m: ChatMessage): PilotMessage {
+export function toPilotMessage(m: ChatMessage): PilotMessage {
   const toolArgs = m.tool_input ? tryParseJson(m.tool_input) : undefined
   const metadata = normalizeMetadata(m.metadata)
   const isDelegationEvent = metadata?.kind === "delegation_event"
@@ -599,6 +604,11 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const streamingRef = useRef(false)
   const recoveredStreamingRef = useRef(false)
   const isAbortingRef = useRef(false)
+  // Timestamp until which history refetches stay suppressed AFTER chatAbort resolves. The gateway
+  // finalizes the stopped tool rows asynchronously (decoupled from the abort RPC), so a refetch in
+  // that gap could re-paint them "running" over the optimistic "aborted". Bounded (a few hundred ms)
+  // so a stuck/failed abort can never freeze the message list.
+  const abortGuardUntilRef = useRef(0)
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
@@ -619,6 +629,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   const resetDpState = useCallback(() => {
     setDpActive(false)
   }, [])
+
+  // True while a Stop is in flight or within the brief grace window after it — the single gate the
+  // history-refetch pollers consult before wholesale-replacing messages, so none of them re-paints
+  // an optimistically-aborted tool row as "running" before the gateway has persisted "stopped".
+  const refetchSuppressedByAbort = useCallback(
+    () => isAbortingRef.current || Date.now() < abortGuardUntilRef.current,
+    [],
+  )
 
   // Load message history when session changes
   useEffect(() => {
@@ -738,7 +756,9 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const hasRunning = hasRunningPersistedMessages(pilotMsgs)
         const latest = pilotMsgs[pilotMsgs.length - 1]
 
-        setMessages(pilotMsgs)
+        // While an abort is in flight the gateway is still finalizing the stopped tool rows;
+        // don't let this poll re-paint them as "running" over the optimistic "aborted" state.
+        if (!refetchSuppressedByAbort()) setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
 
         if (hasRunning) {
@@ -785,7 +805,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
         const pendingSynthesis = hasPendingDelegationSynthesis(pilotMsgs)
-        setMessages(pilotMsgs)
+        if (!refetchSuppressedByAbort()) setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
         if (pendingSynthesis) {
           setStreaming(true)
@@ -824,7 +844,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
         if (cancelled) return
-        if (pageRef.current === 1 && !streamingRef.current) {
+        if (pageRef.current === 1 && !streamingRef.current && !refetchSuppressedByAbort()) {
           setMessages(pilotMsgs)
           setHasMore(items.length >= PAGE_SIZE)
         }
@@ -860,7 +880,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       if (pageRef.current !== 1) return
       try {
         const { items, pilotMsgs } = await fetchSessionPage1(agentId, sessionId!)
-        if (closed) return
+        if (closed || refetchSuppressedByAbort()) return
         setMessages(pilotMsgs)
         setHasMore(items.length >= PAGE_SIZE)
       } catch (err) {
@@ -1538,9 +1558,14 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       await chatAbort(agentId, sessionId)
     } catch (err) {
       console.error("[usePilotChat] abort error:", err)
+    } finally {
+      // chatAbort only signals the abort; the gateway persists the "stopped" rows a beat later.
+      // Keep refetches suppressed for a brief bounded window past here so a poll landing in that
+      // gap can't re-paint the optimistic "aborted" tool cards as "running". finally (not the
+      // straight-line path) guarantees the flag clears even if chatAbort throws.
+      isAbortingRef.current = false
+      abortGuardUntilRef.current = Date.now() + 1500
     }
-    // Only allow new input after backend confirms abort
-    isAbortingRef.current = false
     setStreaming(false)
     streamingRef.current = false
     recoveredStreamingRef.current = false

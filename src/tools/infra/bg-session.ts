@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import { shellEscape } from "./command-sets.js";
+import { sshExec, type SshTarget } from "./ssh-client.js";
 
 /**
  * Shared shell-string builders for background jobs that run a command on a REMOTE shell
@@ -37,4 +39,53 @@ export function wrapBackgroundSession(innerCmd: string, pgidFile: string): strin
  */
 export function backgroundSessionKillScript(pgidFile: string): string {
   return `sid=""; for i in 1 2 3; do sid=$(cat ${pgidFile} 2>/dev/null); [ -n "$sid" ] && break; sleep 1; done; if [ -n "$sid" ]; then pkill -TERM -s "$sid" 2>/dev/null || kill -TERM -"$sid" 2>/dev/null; sleep 1; pkill -KILL -s "$sid" 2>/dev/null || kill -KILL -"$sid" 2>/dev/null; fi; rm -f ${pgidFile}`;
+}
+
+/**
+ * Fire {@link backgroundSessionKillScript} on a node's debug pod over a FRESH `kubectl exec`
+ * connection — used to reap a remote session started with {@link wrapBackgroundSession} when the
+ * caller can no longer use the streaming channel (it is being torn down on abort). Detached and
+ * self-killed after `timeoutMs` so a hung reap can never keep the process alive or leak a client.
+ *
+ * `nsenterPrefix` is the host-namespace prefix the command was launched under (e.g.
+ * `["nsenter","-t","1",...,"--"]` for node_exec) so the kill lands in the SAME PID namespace as
+ * the target; pass `[]` to run the kill directly inside the pod. Best-effort: errors are swallowed
+ * (the local-client kill and the remote `timeout` backstop are complementary safety nets).
+ */
+export function killRemoteSessionViaKubectl(opts: {
+  kubeconfigArgs: string[];
+  childEnv: Record<string, string>;
+  namespace: string;
+  podName: string;
+  nsenterPrefix: string[];
+  pgidFile: string;
+  timeoutMs?: number;
+}): void {
+  const { kubeconfigArgs, childEnv, namespace, podName, nsenterPrefix, pgidFile } = opts;
+  const timeoutMs = opts.timeoutMs ?? 15_000;
+  try {
+    const killer = spawn(
+      "kubectl",
+      [...kubeconfigArgs, "-n", namespace, "exec", podName, "--", ...nsenterPrefix, "sh", "-c", backgroundSessionKillScript(pgidFile)],
+      { env: childEnv, detached: true },
+    );
+    killer.on("error", () => {});
+    setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, timeoutMs).unref();
+    killer.unref();
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Fire {@link backgroundSessionKillScript} on a host over a FRESH ssh connection — the foreground
+ * (and background) counterpart of {@link killRemoteSessionViaKubectl} for the SSH transport. The
+ * streaming channel is being torn down on abort and closing it does NOT reliably SIGHUP a non-PTY
+ * remote process, so the reap runs over a new, time-boxed connection. Best-effort; errors swallowed.
+ */
+export function killRemoteSessionViaSsh(opts: {
+  target: SshTarget;
+  pgidFile: string;
+  timeoutMs?: number;
+}): void {
+  const { target, pgidFile } = opts;
+  void sshExec(target, backgroundSessionKillScript(pgidFile), { timeoutMs: opts.timeoutMs ?? 20_000 }).catch(() => {});
 }

@@ -286,4 +286,89 @@ describe("notifyParent", () => {
     expect(brain.prompt).toHaveBeenCalledTimes(1); // synthetic turn still runs
     // (nothing to assert on a send mock — there is no gatewayClient; the guard prevents the call)
   });
+
+  it("persists a COMPLETED tool call in a synthetic turn with outcome 'success' (not null → no stuck 'running' card on refresh)", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    let cb: ((e: any) => void) | undefined;
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => { cb = fn; return () => {}; }),
+      prompt: vi.fn(async () => {
+        cb?.({ type: "tool_execution_start", name: "read" }); // turnHadTool → the turn persists
+        cb?.({ type: "message_end", message: { role: "toolResult", toolName: "read", content: [{ type: "text", text: "PING … 0.264 ms" }] } });
+        cb?.({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "gateway ok" }] } });
+      }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    mgr.sessions.set("s1", managed);
+    mgr.jobs.register({ jobId: "j1", type: "bash", parentSessionId: "s1", description: "ping", status: "completed", startedAt: 0, notified: false, outputFile: "/o" });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "completed", summary: "done" });
+    await flushCoalesce();
+    const toolRow = send.mock.calls
+      .map((c) => c[0])
+      .filter((e: any) => e?.type === "delegation.append_message")
+      .find((e: any) => e.message?.role === "tool");
+    expect(toolRow).toBeTruthy();
+    expect(toolRow.message.outcome).toBe("success"); // terminal → card renders done, NOT a forever-spinner
+  });
+});
+
+describe("stopSessionJobs (the Stop button halts all of a session's background jobs)", () => {
+  it("stops only THIS session's RUNNING jobs (bg exec + bg sub-agents), leaving others alone", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const reg = (jobId: string, parentSessionId: string, status: string, type = "bash") => {
+      const abort = vi.fn();
+      mgr.jobs.register({ jobId, type, parentSessionId, description: jobId, status, startedAt: 0, notified: false, abort });
+      return abort;
+    };
+    const aRun = reg("a", "s1", "running");             // bg exec, this session, running → stop
+    const aSub = reg("sub", "s1", "running", "subagent"); // bg sub-agent, this session, running → stop
+    const aDone = reg("done", "s1", "completed");        // already finished → untouched
+    const other = reg("b", "s2", "running");             // other session → untouched
+
+    const n = mgr.stopSessionJobs("s1");
+
+    expect(n).toBe(2);
+    expect(aRun).toHaveBeenCalledTimes(1);
+    expect(aSub).toHaveBeenCalledTimes(1);
+    expect(aDone).not.toHaveBeenCalled();
+    expect(other).not.toHaveBeenCalled();
+    expect(mgr.jobs.get("a").status).toBe("stopped");
+    expect(mgr.jobs.get("sub").status).toBe("stopped");
+    expect(mgr.jobs.get("b").status).toBe("running"); // other session's job keeps running
+  });
+
+  it("returns 0 when the session has no running jobs", () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    expect(mgr.stopSessionJobs("nope")).toBe(0);
+  });
+
+  it("marks user-stopped jobs suppressNotifyTurn so their completion folds the card but does NOT wake the model", async () => {
+    const { mgr, brain } = setup(true); // idle parent
+    // j1 is registered as running with an abort hook; stopSessionJobs stops it with suppression.
+    mgr.jobs.setStatus("j1", "running");
+    mgr.jobs.setAbort("j1", vi.fn());
+    expect(mgr.stopSessionJobs("s1")).toBe(1);
+    expect(mgr.jobs.get("j1").suppressNotifyTurn).toBe(true);
+
+    // The settle path still calls notifyParent (dedup/card-fold), but the synthetic turn is suppressed.
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", outputFile: "/o", status: "stopped", summary: "stopped" });
+    await flushCoalesce();
+    expect(brain.prompt).not.toHaveBeenCalled();   // model is NOT woken to react to its own cancellation
+    expect(brain.followUp).not.toHaveBeenCalled();
+  });
+
+  it("a NORMAL job_stop (model tool, no suppression) still notifies the parent", async () => {
+    const { mgr, brain } = setup(true);
+    mgr.jobs.setStatus("j1", "running");
+    mgr.jobs.setAbort("j1", vi.fn());
+    mgr.jobs.stopJob("j1"); // model's job_stop — no suppressNotifyTurn
+    expect(mgr.jobs.get("j1").suppressNotifyTurn).toBeFalsy();
+    await mgr.notifyParent("s1", "j1", { taskId: "j1", status: "stopped", summary: "stopped by model" });
+    await flushCoalesce();
+    expect(brain.prompt).toHaveBeenCalledTimes(1); // model-initiated stop still reacts (unchanged)
+  });
 });

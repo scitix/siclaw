@@ -142,6 +142,7 @@ function makeFakeSessionManager() {
     activeCount: () => sessions.size,
     list: () => Array.from(sessions.values()),
     get: (id: string) => sessions.get(id),
+    stopSessionJobs: vi.fn(() => 0),
     getOrCreate: async (id?: string, _mode?: unknown, _systemPromptTemplate?: unknown, activeMode?: unknown) => {
       getOrCreateCalls.push({ id, activeMode });
       const key = id ?? "default";
@@ -339,13 +340,15 @@ describe("http-server — steer / abort / clear-queue", () => {
     expect(s.brain.steer).toHaveBeenCalledWith("stop");
   });
 
-  it("POST /api/sessions/:id/abort calls brain.abort", async () => {
+  it("POST /api/sessions/:id/abort calls brain.abort AND stops the session's background jobs", async () => {
     await getJson(port, "/api/prompt", "POST", { text: "hi", sessionId: "ab1" });
     const s = sm.sessions.get("ab1")!;
     const r = await getJson(port, "/api/sessions/ab1/abort", "POST");
     expect(r.status).toBe(200);
     expect(s.brain.abort).toHaveBeenCalled();
     expect(s._aborted).toBe(true);
+    // Stop also halts the session's detached background jobs (not just the live turn).
+    expect(sm.stopSessionJobs).toHaveBeenCalledWith("ab1");
   });
 
   it("POST /api/sessions/:id/abort returns pending when brain abort hangs", async () => {
@@ -356,7 +359,7 @@ describe("http-server — steer / abort / clear-queue", () => {
     const r = await getJson(port, "/api/sessions/ab-hangs/abort", "POST");
 
     expect(r.status).toBe(200);
-    expect(r.data).toEqual({ ok: true, pending: true });
+    expect(r.data).toEqual({ ok: true, stoppedJobs: 0, pending: true });
     expect(s._aborted).toBe(true);
   });
 
