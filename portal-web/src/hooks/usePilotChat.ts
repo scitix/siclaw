@@ -123,9 +123,26 @@ const DELEGATED_TOOL_NAMES = new Set(["delegate_to_agent", "delegate_to_agents"]
 const ASYNC_DELEGATED_TOOL_NAMES = new Set(["delegate_to_agents"])
 
 /** Format tool args into a readable one-liner for display */
-export function formatToolInput(toolName: string, args?: Record<string, unknown>): string {
+export function formatToolInput(toolName: string, args?: Record<string, unknown>, metadata?: Record<string, unknown>): string {
   if (!args) return ""
   const name = toolName.toLowerCase()
+  // host_exec/host_script: the model passes an opaque host id; the backend resolves the friendly
+  // name into metadata.host_label so the card reads `<name> $ <command>` like node_exec (falls
+  // back to the raw id if the label isn't present, e.g. a pre-resolution live frame).
+  if (name === "host_exec") {
+    const host = (metadata?.host_label as string) || (args.host as string) || ""
+    const cmd = (args.command as string) || ""
+    return host && cmd ? `${host} $ ${cmd}` : host || cmd
+  }
+  if (name === "host_script") {
+    const host = (metadata?.host_label as string) || (args.host as string) || ""
+    const skill = (args.skill as string) || ""
+    const script = (args.script as string) || ""
+    const sArgs = (args.args as string) || ""
+    const scriptPart = [skill, script].filter(Boolean).join("/")
+    const cmdPart = sArgs ? `${scriptPart} ${sArgs}` : scriptPart
+    return host && cmdPart ? `${host} $ ${cmdPart}` : host || cmdPart
+  }
   if (name === "bash" || name === "shell" || name === "command") {
     return (args.command as string) || (args.cmd as string) || ""
   }
@@ -361,7 +378,7 @@ export function toPilotMessage(m: ChatMessage): PilotMessage {
       : m.role === "user" ? stripAttachmentOcrEvidence(m.content) : m.content,
     toolName: m.tool_name,
     toolArgs,
-    toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs) : undefined,
+    toolInput: toolArgs ? formatToolInput(m.tool_name ?? "", toolArgs, metadata ?? undefined) : undefined,
     toolStatus,
     // Persisted tool result details (e.g. sub-agent steps, child_session_id) live in
     // metadata; surface them as toolDetails so cards recover their content on refresh.

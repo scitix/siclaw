@@ -170,6 +170,10 @@ Examples (pass the id from host_list; names shown here for readability):
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
+      // The model often passes an opaque host id; surface the resolved friendly name so the tool
+      // card can render `<name> $ <command>` like node_exec instead of a bare UUID. Persisted via
+      // the result details → tool row metadata (foreground details + background extraDetails).
+      const hostLabel = target.name || params.host;
 
       // One-step pod netns: resolve the pod's netns over SSH (crictl on this node; needs root),
       // then run the command inside it via `ip netns exec`. The prefix is tool-built — only the
@@ -226,7 +230,7 @@ Examples (pass the id from host_list; names shown here for readability):
             jobType: "host",
             onAbort,
           });
-          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.", { host_label: hostLabel });
         } catch (err) {
           // Concurrency cap (or executor failure): fall through to a foreground run.
           console.warn(`[host-exec] background launch declined, running foreground:`, err);
@@ -287,6 +291,7 @@ Examples (pass the id from host_list; names shown here for readability):
         details: {
           exitCode: result.exitCode,
           host: params.host,
+          host_label: hostLabel,
           ...(isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },

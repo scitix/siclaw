@@ -36,6 +36,7 @@ export function backgroundLaunchedResult(
   jobId: string,
   outputFile: string,
   runningWhere: string,
+  extraDetails?: Record<string, unknown>,
 ): BackgroundToolResult {
   return {
     content: [{ type: "text", text: JSON.stringify({
@@ -54,6 +55,8 @@ export function backgroundLaunchedResult(
         "NOTE: task_id and output_file are internal handles for YOUR use only — do NOT show them to the user; just " +
         "tell the user in plain language what is running and that you'll report back when it finishes.",
     }, null, 2) }],
-    details: { backgroundTaskId: jobId, outputFile },
+    // extraDetails (e.g. a resolved host_label) is persisted to the tool row metadata so the
+    // card can render a friendly label even when the model passed an opaque id.
+    details: { backgroundTaskId: jobId, outputFile, ...extraDetails },
   };
 }

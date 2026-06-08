@@ -158,6 +158,8 @@ Examples (pass the id from host_list; names shown here for readability):
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
+      // Resolved friendly name for the card label (model may pass an opaque host id). See host-exec.
+      const hostLabel = target.name || params.host;
 
       const args = params.args?.trim() || "";
       const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
@@ -207,7 +209,7 @@ Examples (pass the id from host_list; names shown here for readability):
             jobType: "host",
             onAbort,
           });
-          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.", { host_label: hostLabel });
         } catch (err) {
           console.warn(`[host-script] background launch declined, running foreground:`, err);
         }
@@ -253,6 +255,7 @@ Examples (pass the id from host_list; names shown here for readability):
         details: {
           exitCode: result.exitCode,
           host: params.host,
+          host_label: hostLabel,
           ...(isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },
