@@ -98,9 +98,10 @@ Read the skill's SKILL.md first to understand required parameters and usage.`,
               Type.Boolean({
                 description:
                   "Run the script in the background instead of waiting. Returns immediately with a task_id " +
-                  "and output_file. After launching, END YOUR TURN by default (do NOT poll, sleep, or read the " +
-                  "output_file until the completion notification). EXCEPTION: when this is the server/listener side " +
-                  "of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then read the output_file when the " +
+                  "and output_file. After launching, END YOUR TURN by default (do NOT poll, sleep, or read its " +
+                  "output until the completion notification — then call task_output(task_id), not the raw output_file). " +
+                  "EXCEPTION: when this is the server/listener side " +
+                  "of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then call task_output(task_id) when the " +
                   "test finishes (waiting for the server's completion first deadlocks: it blocks until the client " +
                   "connects, then times out). Use for long-running skill scripts (orchestration, soak, perftest).",
               })

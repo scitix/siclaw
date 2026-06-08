@@ -119,6 +119,23 @@ export interface JobStopResult {
 /** Cancels a running background job — sub-agent OR bash (design §7: job_stop). */
 export type JobStopExecutor = (jobId: string) => Promise<JobStopResult>;
 
+/** Live status of a background job, from the runtime's JobRegistry (for the task_output tool). */
+export interface TaskOutputSnapshot {
+  /** False when the job id is unknown to this runtime's registry. */
+  found: boolean;
+  status?: import("./job-registry.js").JobStatus;
+  exitCode?: number;
+  outputFile?: string;
+}
+
+/**
+ * Reads a background job's CURRENT status from the runtime's JobRegistry. Injected by the
+ * agentbox session manager and the TUI host (they own the registry). Enables the task_output
+ * tool to return "running / completed / failed / stopped" instead of the model blindly
+ * file-reading the output path (which 404s while the job has produced no output).
+ */
+export type TaskOutputReader = (jobId: string) => TaskOutputSnapshot;
+
 // ── background exec (run_in_background on bash / node_exec / pod_exec) ──────
 
 /**
@@ -244,6 +261,8 @@ export interface ToolRefs {
    * the agentbox session manager and the TUI background host.
    */
   backgroundExecExecutor?: BackgroundExecExecutor;
+  /** Reads a background job's live status from the runtime's JobRegistry. Enables task_output. */
+  taskOutputReader?: TaskOutputReader;
 }
 
 /** Declarative registration for a single tool. */

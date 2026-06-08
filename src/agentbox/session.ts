@@ -26,6 +26,7 @@ import type {
   SpawnSubagentStatus,
   JobStopExecutor,
   BackgroundExecExecutor,
+  TaskOutputReader,
   AgentMode,
 } from "../core/tool-registry.js";
 import { getSubagentType, DEFAULT_SUBAGENT_TYPE, getSubagentConcurrency, getSubagentMaxRuntimeMs, getBackgroundBashConcurrency } from "../core/subagent-registry.js";
@@ -368,6 +369,11 @@ export class AgentBoxSessionManager {
   private createJobStopExecutor(): JobStopExecutor {
     // Shared stop logic lives on JobRegistry (same as the TUI path).
     return async (jobId) => this.jobs.stopJob(jobId);
+  }
+
+  private createTaskOutputReader(): TaskOutputReader {
+    // Snapshot the job's live status so task_output can report running/terminal (same as TUI).
+    return (jobId) => this.jobs.snapshot(jobId);
   }
 
   /**
@@ -1427,6 +1433,7 @@ export class AgentBoxSessionManager {
       spawnSubagentExecutor: this.createSpawnSubagentExecutor(),
       jobStopExecutor: this.createJobStopExecutor(),
       backgroundExecExecutor: this.createBackgroundExecExecutor(),
+      taskOutputReader: this.createTaskOutputReader(),
     });
 
     // Populate sessionIdRef so skill_call events can associate with this session

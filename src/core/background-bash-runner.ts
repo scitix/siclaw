@@ -21,9 +21,15 @@ import {
   DiskTaskOutput,
   getTaskOutputPath,
   SanitizingLineBuffer,
+  sweepStaleTaskOutputs,
 } from "../tools/cmd-exec/disk-output.js";
 
 export type NotifyFn = (jobId: string, n: TaskNotification) => void;
+
+// Throttle the opportunistic stale-output GC: it's a 24h-granularity sweep, so running it on
+// EVERY launch (full readdir + stat per file) is pure waste. At most once per hour per process.
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+let lastSweepAt = 0;
 
 /**
  * Launch `req.command` detached, streaming sanitized output to disk. Registers the
@@ -42,8 +48,31 @@ export function spawnBackgroundBash(
   // One disk file, but a separate line buffer per stream so a partial (newline-less)
   // stdout line is never glued to the next stderr line.
   const disk = new DiskTaskOutput(req.jobId);
-  const outSink = new SanitizingLineBuffer(disk, req.action, req.hasSensitiveKubectl);
-  const errSink = new SanitizingLineBuffer(disk, req.action, req.hasSensitiveKubectl);
+  // Create the file NOW so reading `output_file` before any output exists yields an empty
+  // file (= "running, no output yet"), not ENOENT.
+  void disk.ensureCreated();
+  // Opportunistic GC of stale leftovers (throttled to once/hour). sweepStaleTaskOutputs
+  // self-protects every file with a live writer (process-wide, registry-independent), so a
+  // silent long-running job — including one owned by another session/agent sharing this dir —
+  // is never swept.
+  const now = Date.now();
+  if (now - lastSweepAt > SWEEP_INTERVAL_MS) {
+    lastSweepAt = now;
+    void sweepStaleTaskOutputs();
+  }
+  // SanitizingLineBuffer throws on a non-line-safe action (defense-in-depth) and spawn() below
+  // can throw synchronously. Either way settle() — the one place disk.markFinal() runs — was
+  // never wired, so release the live-writer guard here or the basename leaks in liveTaskOutputs
+  // forever (its file would also never become GC-eligible).
+  let outSink: SanitizingLineBuffer;
+  let errSink: SanitizingLineBuffer;
+  try {
+    outSink = new SanitizingLineBuffer(disk, req.action, req.hasSensitiveKubectl);
+    errSink = new SanitizingLineBuffer(disk, req.action, req.hasSensitiveKubectl);
+  } catch (err) {
+    disk.markFinal();
+    throw err;
+  }
   const flushAll = async () => {
     try {
       await Promise.all([outSink.flush(), errSink.flush()]);
@@ -60,6 +89,7 @@ export function spawnBackgroundBash(
     if (settled) return;
     settled = true;
     await flushAll();
+    disk.markFinal(); // writer done — release it from the stale-output sweep's live-writer guard
     jobs.setStatus(req.jobId, status, code != null ? { exitCode: code } : undefined);
     // Per-job cleanup (node_exec unpins its debug pod) — before notify so the pod is
     // released even if notify throws. Independent of onSettled (parent work-count).
@@ -140,10 +170,16 @@ export function spawnBackgroundBash(
   //  - argv (node/pod): spawn the kubectl-exec binary + args WITHOUT a shell, so the
   //    nested `nsenter … <cmd>` is passed verbatim (no re-tokenizing/quoting).
   //  - shell (bash): run the already-wrapped string (incl. sudo -E -u sandbox in prod).
-  const child =
-    req.file != null
-      ? spawn(req.file, req.args ?? [], { cwd: req.cwd, env: req.env, detached: true })
-      : spawn(req.command!, { cwd: req.cwd, env: req.env, shell: "/bin/bash", detached: true });
+  let child: ReturnType<typeof spawn>;
+  try {
+    child =
+      req.file != null
+        ? spawn(req.file, req.args ?? [], { cwd: req.cwd, env: req.env, detached: true })
+        : spawn(req.command!, { cwd: req.cwd, env: req.env, shell: "/bin/bash", detached: true });
+  } catch (err) {
+    disk.markFinal(); // spawn threw before the exit handlers wired settle() — release the guard
+    throw err;
+  }
   // Decode as UTF-8 via StringDecoder so a multibyte char split across two data chunks
   // is not corrupted into U+FFFD (raw Buffer.toString() per chunk would garble it).
   child.stdout?.setEncoding("utf8");

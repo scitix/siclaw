@@ -115,6 +115,8 @@ export interface CreateSiclawSessionOpts {
   jobStopExecutor?: import("./tool-registry.js").JobStopExecutor;
   /** Runtime bridge that launches a background bash command. Injected by agentbox / TUI host. */
   backgroundExecExecutor?: import("./tool-registry.js").BackgroundExecExecutor;
+  /** Runtime bridge that reads a background job's live status. Injected by agentbox / TUI host. */
+  taskOutputReader?: import("./tool-registry.js").TaskOutputReader;
 }
 
 export interface SiclawSessionResult {
@@ -393,6 +395,7 @@ export async function createSiclawSession(
       spawnSubagentExecutor: opts?.spawnSubagentExecutor,
       jobStopExecutor: opts?.jobStopExecutor,
       backgroundExecExecutor: opts?.backgroundExecExecutor,
+      taskOutputReader: opts?.taskOutputReader,
     },
     allowedTools,
     activeMode: opts?.activeMode ?? "normal",

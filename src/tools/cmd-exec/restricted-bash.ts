@@ -309,7 +309,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
                   "Run the command in the background instead of waiting. Returns immediately with a " +
                   "task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT call " +
                   "read (or any other tool) to check on it, and do NOT sleep or wait. You will be " +
-                  "automatically notified when it completes; ONLY THEN read the output_file. Polling " +
+                  "automatically notified when it completes; ONLY THEN call task_output(task_id). Polling " +
                   "the file before the notification just wastes turns (it will not be there yet). Use " +
                   "for long-running work (perftest, follow logs, big collections). Output that needs " +
                   "structural (JSON) redaction cannot run in the background — use -o wide/name or run foreground.",
@@ -406,7 +406,7 @@ Do NOT use for non-kubectl tasks (file editing, package management, etc.).`,
 
       // ── Background mode ──────────────────────────────────────────────
       // Hand the fully-wrapped command to the runtime executor and return immediately.
-      // The model reads progress via `read` on output_file and is notified on completion.
+      // The model reads progress via task_output(task_id) and is notified on completion.
       if (backgroundEnabled && params.run_in_background === true) {
         // Structural (JSON) sanitizers are not line-safe and cannot be streamed
         // per line without risking a leak — reject background mode for them.
