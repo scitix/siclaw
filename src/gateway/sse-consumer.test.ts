@@ -295,6 +295,47 @@ describe("consumeAgentSse — tool execution", () => {
   });
 });
 
+describe("consumeAgentSse — abort finalization", () => {
+  it("finalizes an in-flight tool row as stopped and persists partial assistant text on abort", async () => {
+    const controller = new AbortController();
+    const client = {
+      async *streamEvents() {
+        yield { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "Let me run that" } };
+        yield { type: "tool_execution_start", toolName: "node_exec", args: { command: "ib_write_bw -D 60" } };
+        controller.abort(); // user clicks Stop while the tool is in flight
+        yield { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "(never processed — loop breaks)" } };
+      },
+    } as unknown as AgentBoxClient;
+
+    await consumeAgentSse({ client, sessionId: "s", userId: "u", persistMessages: true, signal: controller.signal });
+
+    // The running tool row (msg-1) is finalized as stopped — outcome stays null, metadata.status="stopped"
+    // (mirrors a background job's stopped representation) so the UI shows ⊘ instead of a forever-spinner.
+    const stopped = updateCalls.find((u) => u.metadata?.status === "stopped");
+    expect(stopped).toBeDefined();
+    expect(stopped.messageId).toBe("msg-1");
+    expect(stopped.outcome).toBeNull();
+    // updateMessage REPLACES columns, so finalize must re-send toolName/toolInput or the stopped
+    // card would render blank (no tool identity / no command) after a refetch.
+    expect(stopped.toolName).toBe("node_exec");
+    expect(stopped.toolInput).toContain("ib_write_bw -D 60");
+    // The partial assistant text the model already streamed is persisted so it doesn't vanish on refetch.
+    const partial = appendCalls.find((a) => a.role === "assistant");
+    expect(partial).toBeDefined();
+    expect(partial.content).toContain("Let me run that");
+    expect(partial.metadata?.incomplete).toBe(true);
+  });
+
+  it("does NOT finalize tool rows on a normal (non-abort) stream end", async () => {
+    const events = [
+      { type: "tool_execution_start", toolName: "node_exec", args: { command: "x" } },
+      // stream ends without a tool_execution_end, but the turn was NOT aborted
+    ];
+    await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u", persistMessages: true });
+    expect(updateCalls.find((u) => u.metadata?.status === "stopped")).toBeUndefined();
+  });
+});
+
 // ── Timing (TTFT / 💭 / ⚙️ / turn total) ──────────────
 
 describe("consumeAgentSse — timing", () => {

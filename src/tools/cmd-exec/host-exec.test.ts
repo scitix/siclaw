@@ -70,6 +70,56 @@ describe("host_exec", () => {
     expect((result.details as any).error).toBe(true);
   });
 
+  it("foreground: wraps the command as a killable timeout-bounded session and reaps it on abort", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    // First sshExec = the wrapped foreground command; abort mid-flight to trip the reap.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) controller.abort();
+      return { stdout: "", stderr: "", exitCode: null, signal: "SIGKILL" } as any;
+    });
+
+    const result = await tool.execute(
+      "tc1", { host: "h1", command: "ib_write_bw -D 60 -F", timeout_seconds: 90 }, controller.signal, {} as any,
+    );
+
+    // (1) The foreground command ran as a setsid session, `timeout`-bounded at the cap, recording a .pgid.
+    const fgCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
+    expect(fgCmd).toContain("setsid -w sh -c");
+    expect(fgCmd).toContain("timeout 90 ");
+    expect(fgCmd).toMatch(/\.pgid/);
+    expect(fgCmd).toContain("ib_write_bw -D 60 -F");
+    // (2) Abort fired a SECOND sshExec carrying the reap script over a fresh, time-boxed connection.
+    expect(vi.mocked(sshExec).mock.calls.length).toBeGreaterThanOrEqual(2);
+    const killCmd = vi.mocked(sshExec).mock.calls[1][1] as string;
+    expect(killCmd).toContain("pkill -TERM -s");
+    expect(vi.mocked(sshExec).mock.calls[1][2]).toEqual({ timeoutMs: 20_000 });
+    expect((result.details as any).error).toBe(true); // "Aborted."
+  });
+
+  it("foreground: an SSH reject AFTER abort returns a clean 'Aborted.' (not ssh_exec_failed)", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    // Real SSH path: rejects with Error("Aborted") once the signal fires (the reject path the
+    // earlier resolve-mock missed). The catch must recognize signal.aborted, not report a
+    // connection failure.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) { controller.abort(); throw new Error("Aborted"); }
+      return { stdout: "", stderr: "", exitCode: 0 } as any;
+    });
+    const result = await tool.execute(
+      "tc2", { host: "h1", command: "ping -c 100 10.0.0.254" }, controller.signal, {} as any,
+    );
+    expect(result.content[0].text).toBe("Aborted.");
+    expect((result.details as any).reason).not.toBe("ssh_exec_failed");
+  });
+
   it("signal-killed with stdout is NOT treated as error (mirrors node_exec)", async () => {
     vi.mocked(acquireSshTarget).mockResolvedValueOnce({
       host: "10.0.0.1", port: 22, username: "root",

@@ -1,5 +1,18 @@
-import { describe, it, expect } from "vitest";
-import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "./bg-session.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+const spawnMock = vi.fn();
+vi.mock("node:child_process", () => ({ spawn: (...a: unknown[]) => spawnMock(...a) }));
+
+const sshExecMock = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+vi.mock("./ssh-client.js", () => ({ sshExec: (...a: unknown[]) => sshExecMock(...a) }));
+
+const {
+  backgroundPgidFile,
+  wrapBackgroundSession,
+  backgroundSessionKillScript,
+  killRemoteSessionViaKubectl,
+  killRemoteSessionViaSsh,
+} = await import("./bg-session.js");
 
 describe("bg-session", () => {
   it("builds a unique, sanitized pidfile path", () => {
@@ -26,5 +39,77 @@ describe("bg-session", () => {
     expect(kill).toContain("pkill -KILL -s");
     expect(kill).toContain("kill -TERM -");  // group-kill fallback when pkill is absent
     expect(kill).toContain("rm -f /tmp/x.pgid");
+  });
+});
+
+describe("killRemoteSessionViaKubectl", () => {
+  beforeEach(() => { spawnMock.mockReset(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  function fakeChild() {
+    return { on: vi.fn(), unref: vi.fn(), kill: vi.fn() };
+  }
+
+  it("spawns a detached `kubectl exec … nsenter … sh -c <killScript>` over a fresh connection", () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    killRemoteSessionViaKubectl({
+      kubeconfigArgs: ["--kubeconfig", "/k"],
+      childEnv: { KUBECONFIG: "/k" },
+      namespace: "siclaw-debug",
+      podName: "node-debug-abcd",
+      nsenterPrefix: ["nsenter", "-t", "1", "--"],
+      pgidFile: "/tmp/x.pgid",
+    });
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [cmd, args, opts] = spawnMock.mock.calls[0];
+    expect(cmd).toBe("kubectl");
+    expect(args).toEqual([
+      "--kubeconfig", "/k", "-n", "siclaw-debug", "exec", "node-debug-abcd", "--",
+      "nsenter", "-t", "1", "--", "sh", "-c", backgroundSessionKillScript("/tmp/x.pgid"),
+    ]);
+    expect((opts as { detached?: boolean }).detached).toBe(true);
+    expect(child.on).toHaveBeenCalledWith("error", expect.any(Function)); // swallow spawn errors
+    expect(child.unref).toHaveBeenCalled();
+  });
+
+  it("self-kills the reap exec if it lingers past the timeout, then is unreffed", () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    killRemoteSessionViaKubectl({
+      kubeconfigArgs: [], childEnv: {}, namespace: "ns", podName: "p",
+      nsenterPrefix: [], pgidFile: "/tmp/x.pgid", timeoutMs: 5000,
+    });
+    // pod_exec passes an empty nsenter prefix → kill runs directly in the pod.
+    expect(spawnMock.mock.calls[0][1]).toEqual(["-n", "ns", "exec", "p", "--", "sh", "-c", backgroundSessionKillScript("/tmp/x.pgid")]);
+    expect(child.kill).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(5000);
+    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("never throws when spawn itself throws (best-effort)", () => {
+    spawnMock.mockImplementation(() => { throw new Error("ENOENT kubectl"); });
+    expect(() => killRemoteSessionViaKubectl({
+      kubeconfigArgs: [], childEnv: {}, namespace: "ns", podName: "p", nsenterPrefix: [], pgidFile: "/tmp/x.pgid",
+    })).not.toThrow();
+  });
+});
+
+describe("killRemoteSessionViaSsh", () => {
+  beforeEach(() => sshExecMock.mockClear());
+
+  it("reaps the remote session over a fresh ssh connection with a bounded timeout", () => {
+    const target = { host: "h" } as never;
+    killRemoteSessionViaSsh({ target, pgidFile: "/tmp/x.pgid" });
+    expect(sshExecMock).toHaveBeenCalledTimes(1);
+    expect(sshExecMock.mock.calls[0][0]).toBe(target);
+    expect(sshExecMock.mock.calls[0][1]).toBe(backgroundSessionKillScript("/tmp/x.pgid"));
+    expect(sshExecMock.mock.calls[0][2]).toEqual({ timeoutMs: 20_000 });
+  });
+
+  it("swallows a rejected sshExec (best-effort)", async () => {
+    sshExecMock.mockRejectedValueOnce(new Error("connect failed"));
+    expect(() => killRemoteSessionViaSsh({ target: {} as never, pgidFile: "/tmp/x.pgid" })).not.toThrow();
+    await Promise.resolve(); // let the .catch settle without an unhandled rejection
   });
 });

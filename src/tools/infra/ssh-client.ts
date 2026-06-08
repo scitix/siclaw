@@ -51,6 +51,9 @@ export interface SshTarget {
   host: string;
   port: number;
   username: string;
+  /** Friendly host name from the registry (HostMeta.name), for display/labeling. The model may
+   *  pass an opaque host id, so callers use this to show a human name instead of the id. */
+  name?: string;
   auth:
     | { type: "key"; privateKeyPath: string; passphrasePath?: string }
     | { type: "password"; passwordPath: string }
@@ -143,7 +146,7 @@ async function acquireSshTargetInner(
     }
   }
 
-  const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth };
+  const target: SshTarget = { host: meta.ip, port: meta.port, username: meta.username, auth, name: meta.name };
 
   if (chain && chain.length > 0) {
     // Server pre-resolved the chain [outermost … nearest]. Nest it onto the

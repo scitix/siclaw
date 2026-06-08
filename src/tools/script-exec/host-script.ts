@@ -12,7 +12,7 @@ import { parseArgs, shellEscape } from "../infra/command-sets.js";
 import { validateNodeName, validatePodName, stdinExecCmd } from "../infra/exec-utils.js";
 import { resolvePodNetnsViaSsh } from "../infra/pod-netns-resolve.js";
 import { acquireSshTarget, sshExec, sshExecStream } from "../infra/ssh-client.js";
-import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
+import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 
 interface HostScriptParams {
   host: string;
@@ -158,6 +158,8 @@ Examples (pass the id from host_list; names shown here for readability):
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
+      // Resolved friendly name for the card label (model may pass an opaque host id). See host-exec.
+      const hostLabel = target.name || params.host;
 
       const args = params.args?.trim() || "";
       const escapedArgs = args ? parseArgs(args).map(shellEscape).join(" ") : "";
@@ -192,8 +194,7 @@ Examples (pass the id from host_list; names shown here for readability):
         // process group); the script body on stdin flows through to `timeout … bash -s`/`python3 -`.
         const pgidFile = backgroundPgidFile(toolCallId);
         const wrapped = wrapBackgroundSession(`timeout ${ttl} ${remoteCmd}`, pgidFile);
-        const killScript = backgroundSessionKillScript(pgidFile);
-        const onAbort = () => { void sshExec(target, killScript, { timeoutMs: 20_000 }).catch(() => {}); };
+        const onAbort = () => killRemoteSessionViaSsh({ target, pgidFile });
         try {
           const { jobId, outputFile } = bg!.executor!({
             streamFactory: () => sshExecStream(target, wrapped, { stdin: resolved.content }),
@@ -207,27 +208,44 @@ Examples (pass the id from host_list; names shown here for readability):
             jobType: "host",
             onAbort,
           });
-          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.", { host_label: hostLabel });
         } catch (err) {
           console.warn(`[host-script] background launch declined, running foreground:`, err);
         }
       }
 
-      const timeout = Math.min(params.timeout_seconds ?? 180, 300) * 1000;
+      // ── Foreground mode ──────────────────────────────────────────────
+      // Run as a killable, `timeout`-bounded setsid session like the background path, and reap the
+      // remote group over a FRESH ssh connection on abort (closing the streaming channel does not
+      // reliably SIGHUP a non-PTY remote process). The script body still flows through stdin to the
+      // inner interpreter (`echo $$` consumes no stdin). Mirrors host_exec foreground.
+      const cap = Math.min(params.timeout_seconds ?? 180, 300);
+      const timeout = cap * 1000;
+      const fgPgidFile = backgroundPgidFile(toolCallId);
+      const fgWrapped = wrapBackgroundSession(`timeout ${cap} ${remoteCmd}`, fgPgidFile);
+      const onFgAbort = () => killRemoteSessionViaSsh({ target, pgidFile: fgPgidFile });
+      signal?.addEventListener("abort", onFgAbort, { once: true });
 
       let result;
       try {
-        result = await sshExec(target, remoteCmd, {
+        result = await sshExec(target, fgWrapped, {
           timeoutMs: timeout,
           signal,
           stdin: resolved.content,
         });
       } catch (err) {
+        // The SSH path rejects with Error("Aborted") on abort — return a clean stop, not a
+        // spurious connection error (the post-try abort check is unreachable on the reject path).
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a script error). If "${params.host}" is a Kubernetes node, retry this script with node_script (debug pod, no SSH).` }],
           details: { error: true, reason: "ssh_exec_failed", host: params.host },
         };
+      } finally {
+        signal?.removeEventListener("abort", onFgAbort);
       }
 
       if (signal?.aborted) {
@@ -253,6 +271,7 @@ Examples (pass the id from host_list; names shown here for readability):
         details: {
           exitCode: result.exitCode,
           host: params.host,
+          host_label: hostLabel,
           ...(isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },

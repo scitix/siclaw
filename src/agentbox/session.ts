@@ -356,6 +356,24 @@ export class AgentBoxSessionManager {
   }
 
   /**
+   * Stop ALL running background jobs (background exec + background sub-agents) of a session.
+   * Called from the /abort handler so the user's "Stop" button halts everything the session is
+   * running — not just the live turn (foreground tools/sub-agents die with the turn's abort
+   * signal), but also the detached background jobs, which are otherwise decoupled from the turn.
+   * Returns how many were stopped.
+   */
+  stopSessionJobs(sessionId: string): number {
+    let stopped = 0;
+    for (const job of this.jobs.list(sessionId)) {
+      // suppressNotifyTurn: the user's Stop is terminal. The completion still folds each job's card
+      // to "stopped", but we must NOT wake the model with a synthetic turn reacting to the
+      // cancellation — that "comes back to life after Stop" is exactly what the button must avoid.
+      if (job.status === "running" && this.jobs.stopJob(job.jobId, { suppressNotifyTurn: true }).stopped) stopped++;
+    }
+    return stopped;
+  }
+
+  /**
    * Background exec executor (run_in_background on bash / node_exec / pod_exec). Injected
    * into ToolRefs; the calling tool hands over the already-assembled command. Throws when
    * the per-session concurrency cap is reached so the tool falls back to foreground.
@@ -518,6 +536,11 @@ export class AgentBoxSessionManager {
         event: { type: "subagent_done", sessionId, job_id: jobId, status: n.status },
       }).catch(() => {});
     }
+
+    // User Stop is terminal: the card already folded to "stopped" above, but do NOT wake the model
+    // with a synthetic turn reacting to its own cancellation (the "won't stop" behavior). Card
+    // folds, model stays silent.
+    if (job?.suppressNotifyTurn) return;
 
     // Buffer the model-facing notification and arm the coalescing window. We deliver it ONLY
     // via the synthetic-turn path (never followUp): the completion itself already shows in the
@@ -751,7 +774,11 @@ export class AgentBoxSessionManager {
       content,
       toolName: message.toolName ?? null,
       metadata: isNotification ? { kind: "task_notification" } : null,
-      outcome: message.isError ? "error" : null,
+      // A COMPLETED tool row must persist a terminal outcome. Without this a successful tool call
+      // in a synthetic (background-completion) turn was written with outcome=null, which the
+      // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck
+      // on "Thinking…" after refresh. Only tool rows carry an outcome; user/assistant rows stay null.
+      outcome: role === "tool" ? (message.isError ? "error" : "success") : null,
     });
   }
 

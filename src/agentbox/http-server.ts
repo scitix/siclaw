@@ -782,14 +782,19 @@ export function createHttpServer(
     managed._aborted = true;
 
     // Foreground sub-agents are cancelled via the parent brain's abort signal
-    // (threaded into runSpawnedSubagent); background sub-agent jobs are cancelled
-    // explicitly via the job_stop tool and block session release until they settle.
+    // (threaded into runSpawnedSubagent). The user's Stop should also halt the session's
+    // DETACHED background jobs (background exec + background sub-agents), which are decoupled
+    // from the turn — stop them all here so one Stop click halts everything the session runs.
+    const stoppedJobs = sessionManager.stopSessionJobs(sessionId);
+    if (stoppedJobs > 0) {
+      console.log(`[agentbox-http] Stop also halted ${stoppedJobs} background job(s) for session ${sessionId}`);
+    }
     const outcome = await abortBrainForHttp(managed.brain, sessionId);
     if (outcome === "failed") {
-      sendJson(res, 500, { error: "Abort failed" });
+      sendJson(res, 500, { error: "Abort failed", stoppedJobs });
       return;
     }
-    sendJson(res, 200, { ok: true, ...(outcome === "timeout" ? { pending: true } : {}) });
+    sendJson(res, 200, { ok: true, stoppedJobs, ...(outcome === "timeout" ? { pending: true } : {}) });
   });
 
   /**

@@ -236,6 +236,7 @@ describe("acquireSshTarget", () => {
       host: "10.0.0.1",
       port: 2222,
       username: "ops",
+      name: "host-1", // friendly name surfaced for display labeling
       auth: { type: "key", privateKeyPath: "/tmp/host-1.host-1.key" },
     });
   });
@@ -250,6 +251,7 @@ describe("acquireSshTarget", () => {
       host: "10.0.0.2",
       port: 22,
       username: "root",
+      name: "host-2", // friendly name surfaced for display labeling
       auth: { type: "password", passwordPath: "/tmp/host-2.host-2.password" },
     });
   });
