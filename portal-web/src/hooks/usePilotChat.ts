@@ -276,72 +276,6 @@ function modelRouteFromEvent(evt: Record<string, unknown>): ModelRouteMetadata |
   }
 }
 
-function modelRouteSwitchNoticeFromEvent(evt: Record<string, unknown>): { content: string; metadata: Record<string, unknown> } | null {
-  const fromProvider = routeString(evt.fromProvider)
-  const fromModelId = routeString(evt.fromModelId)
-  const toProvider = routeString(evt.toProvider)
-  const toModelId = routeString(evt.toModelId)
-  if (!fromProvider || !fromModelId || !toProvider || !toModelId) return null
-  const failureKind = routeString(evt.failureKind)
-  const reason = failureKind ? ` (${failureKind})` : ""
-  return {
-    content: `Switched to fallback model ${toProvider}/${toModelId} after ${fromProvider}/${fromModelId} failed${reason}.`,
-    metadata: {
-      kind: "model_route_notice",
-      event_type: "model_route.switch",
-      from_candidate_key: routeString(evt.fromCandidateKey),
-      from_provider: fromProvider,
-      from_model_id: fromModelId,
-      to_candidate_key: routeString(evt.toCandidateKey),
-      to_provider: toProvider,
-      to_model_id: toModelId,
-      failure_kind: failureKind,
-      error_message: routeString(evt.errorMessage),
-      cooldown_until: routeNumber(evt.cooldownUntil),
-      attempt: routeNumber(evt.attempt),
-    },
-  }
-}
-
-function modelRouteRecoveryNoticeFromEvent(evt: Record<string, unknown>): { content: string; metadata: Record<string, unknown> } | null {
-  const fromProvider = routeString(evt.recoveredFromProvider)
-  const fromModelId = routeString(evt.recoveredFromModelId)
-  const toProvider = routeString(evt.provider)
-  const toModelId = routeString(evt.modelId)
-  if (!fromProvider || !fromModelId || !toProvider || !toModelId) return null
-  return {
-    content: `Recovered to primary model ${toProvider}/${toModelId}.`,
-    metadata: {
-      kind: "model_route_notice",
-      event_type: "model_route.recovered",
-      from_candidate_key: routeString(evt.recoveredFromCandidateKey),
-      from_provider: fromProvider,
-      from_model_id: fromModelId,
-      to_candidate_key: routeString(evt.candidateKey),
-      to_provider: toProvider,
-      to_model_id: toModelId,
-      attempt: routeNumber(evt.attempt),
-    },
-  }
-}
-
-function appendModelRouteNotice(
-  prev: PilotMessage[],
-  notice: { content: string; metadata: Record<string, unknown> },
-  id?: string,
-): PilotMessage[] {
-  return [
-    ...prev,
-    {
-      id: id ?? `route-${Date.now()}`,
-      role: "assistant",
-      content: notice.content,
-      metadata: notice.metadata,
-      timestamp: timeNow(),
-    },
-  ]
-}
-
 export function parsePortalTimestamp(value: string): number {
   // SQLite CURRENT_TIMESTAMP returns UTC as "YYYY-MM-DD HH:mm:ss" without a
   // timezone. Browsers parse that shape as local time, which makes fresh
@@ -1097,20 +1031,11 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           currentModelRouteRef.current = null
           break
 
-        case "model_route_switch": {
-          const notice = modelRouteSwitchNoticeFromEvent(evt)
-          if (notice) {
-            setMessages((prev) => appendModelRouteNotice(prev, notice, evt.dbMessageId as string | undefined))
-          }
+        case "model_route_switch":
           break
-        }
 
         case "model_route_success": {
           currentModelRouteRef.current = modelRouteFromEvent(evt)
-          const notice = modelRouteRecoveryNoticeFromEvent(evt)
-          if (notice) {
-            setMessages((prev) => appendModelRouteNotice(prev, notice, evt.dbMessageId as string | undefined))
-          }
           break
         }
 
