@@ -125,7 +125,7 @@ mTLS is **K8s mode only**. Do not add mTLS dependencies to local mode code paths
 ## Tech Stack
 
 ```
-Runtime:    Node.js ≥22.12.0  (ESM-only)     Tests:      vitest (npm test)
+Runtime:    Node.js ≥22.19.0  (ESM-only)     Tests:      vitest (npm test)
 Language:   TypeScript 5.9    (strict, .js)   Type check: npx tsc --noEmit
 Frontend:   React + Vite + Tailwind           Agent:      pi-coding-agent
 DB (GW):    mysql2 / node:sqlite (raw SQL)    DB (mem):   node:sqlite + FTS5 + sqlite-vec

@@ -8,7 +8,7 @@
  * Ported from OpenClaw's session-transcript-repair.ts (simplified —
  * no allowedToolNames, no sessions_spawn handling).
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 const TOOL_CALL_NAME_MAX_CHARS = 64;
 const TOOL_CALL_NAME_RE = /^[A-Za-z0-9_-]+$/;

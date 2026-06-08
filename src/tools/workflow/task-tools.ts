@@ -5,9 +5,9 @@
  */
 
 import type { ToolEntry, SessionEventEmitter, ToolRefs } from "../../core/tool-registry.js";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import { getOrCreateLedger, type LedgerTask, type TaskStatus, type TaskView } from "../../core/task-ledger.js";
 import type { TaskEvent } from "../../shared/task-events.js";

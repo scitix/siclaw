@@ -172,7 +172,7 @@ The pipe passes stdout data, not file access permissions.
 Key excerpts from `Dockerfile.agentbox` (see full file for build stage and other details):
 
 ```dockerfile
-FROM node:22-slim
+FROM node:22.19-slim
 
 # System deps including sudo (for agentbox→sandbox user switching)
 RUN apt-get update && apt-get install -y --no-install-recommends \

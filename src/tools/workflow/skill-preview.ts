@@ -1,6 +1,6 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveUnderDir } from "../../shared/path-utils.js";

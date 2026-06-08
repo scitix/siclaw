@@ -9,7 +9,7 @@
  * Ported from OpenClaw's src/agents/pi-embedded-runner/tool-result-context-guard.ts
  * with inlined char estimation (no separate module).
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ContextGuard } from "./guard-pipeline.js";
 
 // ── Constants ────────────────────────────────────────────────────────────

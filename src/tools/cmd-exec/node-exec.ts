@@ -1,7 +1,7 @@
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";

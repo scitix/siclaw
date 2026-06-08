@@ -6,7 +6,7 @@ import path from "node:path";
 /**
  * Tests for AgentBoxSessionManager.
  *
- * The module imports from @mariozechner/pi-coding-agent (SessionManager) and
+ * The module imports from @earendil-works/pi-coding-agent (SessionManager) and
  * from the core agent-factory (createSiclawSession). Both are replaced with
  * lightweight fakes so the tests focus on the manager's own state machine:
  * getOrCreate caching, release/close lifecycle, scheduleRelease timer
@@ -15,7 +15,7 @@ import path from "node:path";
 
 // ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
 
-vi.mock("@mariozechner/pi-coding-agent", () => {
+vi.mock("@earendil-works/pi-coding-agent", () => {
   const g = globalThis as any;
   g.__frameworkEntriesState = g.__frameworkEntriesState ?? { entries: [] };
   class FakeFrameworkSessionManager {
