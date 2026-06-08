@@ -79,7 +79,8 @@ Examples (pass the id from host_list; names shown here for readability):
 - host: "<jump-1 id>", command: "uptime"
 - host: "<bare-metal-3 id>", command: "nvidia-smi"
 - host: "<storage-1 id>", command: "df -h"
-- host: "<node-a id>", command: "journalctl -u kubelet -n 100 | grep error"`,
+- host: "<node-a id>", command: "journalctl -u kubelet -n 100 | grep error"
+- host: "<node-a id>", command: "tcpdump -i eth0 -nn", run_in_background: true   (open-ended capture; returns immediately — stop it later with job_stop, then read the output_file)`,
     parameters: Type.Object({
       host: Type.String({
         description: "Host id from host_list (preferred — names can be duplicated, so the id is the unambiguous handle; a unique name also works). Must be bound to this agent.",
@@ -109,12 +110,13 @@ Examples (pass the id from host_list; names shown here for readability):
               Type.Boolean({
                 description:
                   "Run the command on the host in the background instead of waiting. Returns immediately " +
-                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
-                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
-                  "completes; ONLY THEN read the output_file. Use for long host work like RDMA perftest over " +
-                  "SSH (start the server on host A in the background, then the client on host B). The command " +
-                  "is wrapped in `timeout` and capped (~3600s). Output needing structural (JSON) redaction " +
-                  "cannot run in background.",
+                  "with a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, " +
+                  "sleep, or read the output_file until the completion notification). EXCEPTION: when this is the " +
+                  "server/listener side of a paired test, do NOT wait — IMMEDIATELY run the client on the peer " +
+                  "host, then read the output_file when the test finishes (waiting for the server's completion " +
+                  "first deadlocks: it blocks until the client connects, then times out). Use for long-running " +
+                  "host commands over SSH. The command is wrapped in `timeout` and capped (~3600s). Output needing " +
+                  "structural (JSON) redaction cannot run in background.",
               })
             ),
           }

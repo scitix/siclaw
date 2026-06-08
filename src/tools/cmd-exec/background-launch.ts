@@ -43,11 +43,16 @@ export function backgroundLaunchedResult(
       task_id: jobId,
       output_file: outputFile,
       message:
-        `${runningWhere} END YOUR TURN NOW — do NOT read this file or call any other tool yet, and do NOT ` +
-        "wait/sleep. You will be notified automatically when it completes; read the output_file ONLY after " +
-        "that notification arrives. To stop it early, use job_stop. NOTE: task_id and output_file are internal " +
-        "handles for YOUR use only (job_stop / reading the file later) — do NOT show them to the user; just tell " +
-        "the user in plain language what is running and that you'll report back when it finishes.",
+        `${runningWhere} It runs detached and you are notified automatically when it COMPLETES. ` +
+        "Default: END YOUR TURN NOW — do NOT read this file, poll, sleep, or spawn a sub-agent to wait on it. " +
+        "EXCEPTION — paired/orchestrated tests: if this is ONE SIDE of a protocol that only makes progress once " +
+        "its counterpart runs (a server/listener blocking until its client connects; a packet capture needing " +
+        "traffic generated), do NOT wait for completion — immediately run the counterpart (e.g. the client on the peer " +
+        "node) and read this output_file once the test finishes. Waiting for such a server's completion FIRST " +
+        "deadlocks: it blocks until a client connects, then times out. " +
+        "Otherwise read the output_file ONLY after the completion notification. Stop it early with job_stop. " +
+        "NOTE: task_id and output_file are internal handles for YOUR use only — do NOT show them to the user; just " +
+        "tell the user in plain language what is running and that you'll report back when it finishes.",
     }, null, 2) }],
     details: { backgroundTaskId: jobId, outputFile },
   };

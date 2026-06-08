@@ -100,10 +100,12 @@ Examples:
 - node: "node-1", command: "nvidia-smi"
 - node: "node-1", command: "ibstat"
 - node: "node-1", command: "ib_write_bw --help"
-- RDMA perftest across two nodes (server on A in the background, then client on B):
-    1. node: "node-A", command: "ib_write_bw -d mlx5_1 -x 3 -D 20 -F", run_in_background: true   (server; returns immediately)
-    2. node: "node-B", command: "ib_write_bw -d mlx5_1 -x 3 -D 20 -F <node-A-ip>"               (client; blocks ~20s, prints the bandwidth table)
 - node: "node-1", command: "tcpdump -i eth0 -nn -c 50 port 53"   (bounded capture: 50 DNS packets)
+- node: "node-1", command: "tcpdump -i eth0 -nn", run_in_background: true   (open-ended capture; returns immediately — stop it later with job_stop, then read the output_file)
+- paired capture/traffic — start the capture in the background, then IMMEDIATELY generate the traffic it should observe (do NOT wait for the capture first: it blocks until packets arrive, so waiting deadlocks):
+    1. node: "node-1", command: "tcpdump -i eth0 -nn -c 5 port 80", run_in_background: true   (capture; returns immediately — go straight to step 2, same turn)
+    2. node: "node-1", command: "curl -s http://10.0.0.1/healthz"                             (client; one request easily produces the few packets the capture is waiting for)
+    3. once the capture hits its packet count it exits and you're notified — then read its output_file.
 - node: "node-1", command: "dmesg --level=err"
 - node: "node-1", command: "sysctl net.ipv4.ip_forward"
 - node: "node-1", command: "cat /etc/os-release"
@@ -160,12 +162,13 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
               Type.Boolean({
                 description:
                   "Run the command on the node in the background instead of waiting. Returns immediately " +
-                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
-                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
-                  "completes; ONLY THEN read the output_file. Use for long node work like RDMA perftest " +
-                  "(start the server on node A in the background, then the client on node B). The command is " +
-                  "wrapped in `timeout` and capped at the debug-pod lifetime (~600s) — for longer runs lower " +
-                  "the perftest duration. Output needing structural (JSON) redaction cannot run in background.",
+                  "with a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, " +
+                  "sleep, or read the output_file until the completion notification). EXCEPTION: when this is the " +
+                  "server/listener side of a paired test, do NOT wait — IMMEDIATELY run the client on the peer " +
+                  "node, then read the output_file when the test finishes (waiting for the server's completion " +
+                  "first deadlocks: it blocks until the client connects, then times out). Use for long-running " +
+                  "node commands. The command is wrapped in `timeout` and capped at the debug-pod lifetime (~600s) — " +
+                  "for longer runs lower the command's own duration. Output needing structural (JSON) redaction cannot run in background.",
               })
             ),
           }
