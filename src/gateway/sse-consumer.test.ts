@@ -127,6 +127,176 @@ describe("consumeAgentSse — assistant message flow", () => {
     const result = await consumeAgentSse({ client: mkClient(events), sessionId: "s", userId: "u" });
     expect(result.resultText).toBe("partial");
   });
+
+  it("persists model-route switch notices and annotates fallback assistant rows", async () => {
+    const seen: any[] = [];
+    const events = [
+      {
+        type: "model_route_start",
+        strategy: "ordered_fallback",
+        candidateCount: 2,
+        primaryCandidateKey: "openai/gpt-4",
+        primaryProvider: "openai",
+        primaryModelId: "gpt-4",
+      },
+      {
+        type: "model_route_switch",
+        attempt: 1,
+        fromCandidateKey: "openai/gpt-4",
+        fromProvider: "openai",
+        fromModelId: "gpt-4",
+        toCandidateKey: "anthropic/claude",
+        toProvider: "anthropic",
+        toModelId: "claude",
+        failureKind: "rate_limit",
+        errorMessage: "429 too many requests",
+        cooldownUntil: 123456,
+      },
+      {
+        type: "model_route_success",
+        attempt: 2,
+        candidateKey: "anthropic/claude",
+        provider: "anthropic",
+        modelId: "claude",
+        isFallback: true,
+        primaryCandidateKey: "openai/gpt-4",
+      },
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } },
+    ];
+
+    await consumeAgentSse({
+      client: mkClient(events),
+      sessionId: "sid",
+      userId: "u",
+      persistMessages: true,
+      onEvent: (evt) => seen.push(evt),
+    });
+
+    const noticeRow = appendCalls.find((r) => r.metadata?.kind === "model_route_notice");
+    expect(noticeRow).toBeDefined();
+    expect(noticeRow.content).toContain("Switched to fallback model anthropic/claude");
+    expect(noticeRow.metadata).toMatchObject({
+      event_type: "model_route.switch",
+      from_provider: "openai",
+      to_provider: "anthropic",
+      failure_kind: "rate_limit",
+    });
+
+    const assistantRow = appendCalls.find((r) => r.role === "assistant" && r.content === "ok");
+    expect(assistantRow.metadata.model_route).toMatchObject({
+      provider: "anthropic",
+      model_id: "claude",
+      is_fallback: true,
+      switched_from_provider: "openai",
+      failure_kind: "rate_limit",
+    });
+    const liveEnd = seen.find((evt) => evt.type === "message_end");
+    expect(liveEnd.modelRoute).toMatchObject({ provider: "anthropic", is_fallback: true });
+  });
+
+  it("persists model-route recovery notices without marking primary replies as fallback", async () => {
+    const events = [
+      {
+        type: "model_route_start",
+        strategy: "ordered_fallback",
+        candidateCount: 2,
+        activeCandidateKey: "anthropic/claude",
+        primaryCandidateKey: "openai/gpt-4",
+        primaryProvider: "openai",
+        primaryModelId: "gpt-4",
+      },
+      {
+        type: "model_route_success",
+        attempt: 1,
+        candidateKey: "openai/gpt-4",
+        provider: "openai",
+        modelId: "gpt-4",
+        isFallback: false,
+        primaryCandidateKey: "openai/gpt-4",
+        recoveredFromCandidateKey: "anthropic/claude",
+        recoveredFromProvider: "anthropic",
+        recoveredFromModelId: "claude",
+      },
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "primary ok" } },
+      { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "primary ok" }] } },
+    ];
+
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+
+    const noticeRow = appendCalls.find((r) => r.metadata?.event_type === "model_route.recovered");
+    expect(noticeRow).toBeDefined();
+    expect(noticeRow.content).toContain("Recovered to primary model openai/gpt-4");
+
+    const assistantRow = appendCalls.find((r) => r.role === "assistant" && r.content === "primary ok");
+    expect(assistantRow.metadata.model_route).toMatchObject({
+      provider: "openai",
+      model_id: "gpt-4",
+      is_fallback: false,
+      recovered_from_provider: "anthropic",
+    });
+  });
+
+  it("annotates routed tool-only turns with model-route metadata", async () => {
+    const events = [
+      {
+        type: "model_route_start",
+        strategy: "ordered_fallback",
+        candidateCount: 2,
+        primaryCandidateKey: "openai/gpt-4",
+        primaryProvider: "openai",
+        primaryModelId: "gpt-4",
+      },
+      {
+        type: "model_route_switch",
+        attempt: 1,
+        fromCandidateKey: "openai/gpt-4",
+        fromProvider: "openai",
+        fromModelId: "gpt-4",
+        toCandidateKey: "anthropic/claude",
+        toProvider: "anthropic",
+        toModelId: "claude",
+        failureKind: "rate_limit",
+        errorMessage: "429 too many requests",
+        cooldownUntil: 123456,
+      },
+      {
+        type: "model_route_success",
+        attempt: 2,
+        candidateKey: "anthropic/claude",
+        provider: "anthropic",
+        modelId: "claude",
+        isFallback: true,
+        primaryCandidateKey: "openai/gpt-4",
+      },
+      { type: "tool_execution_start", toolName: "kubectl", args: { cmd: "get pods" } },
+      {
+        type: "tool_execution_end",
+        toolName: "kubectl",
+        result: { content: [{ type: "text", text: "pod-a Running" }] },
+      },
+    ];
+
+    await consumeAgentSse({ client: mkClient(events), sessionId: "sid", userId: "u", persistMessages: true });
+
+    const toolStartRow = appendCalls.find((r) => r.role === "tool" && r.toolName === "kubectl");
+    expect(toolStartRow.metadata.model_route).toMatchObject({
+      provider: "anthropic",
+      model_id: "claude",
+      is_fallback: true,
+      switched_from_provider: "openai",
+      failure_kind: "rate_limit",
+    });
+    expect(updateCalls[0].metadata.model_route).toMatchObject({
+      provider: "anthropic",
+      model_id: "claude",
+      is_fallback: true,
+      switched_from_provider: "openai",
+      failure_kind: "rate_limit",
+    });
+  });
 });
 
 // ── Tool calls ──────────────────────────────────────────

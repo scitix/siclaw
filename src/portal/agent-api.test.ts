@@ -173,6 +173,64 @@ describe("registerAgentRoutes", () => {
       expect(body.id).toBe("a-new");
     });
 
+    it("stores normalized model_routing policy on create", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[], []])
+        .mockResolvedValueOnce([[{ id: "a-new", name: "routed" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: {
+          name: "routed",
+          model_routing: {
+            enabled: true,
+            candidates: [
+              { provider: " openai ", modelId: " gpt-4 " },
+              { provider: "openai", modelId: "gpt-4" },
+              { provider: "anthropic", modelId: "claude", modelConfig: { apiKey: "do-not-store" } },
+            ],
+            fallbackOn: ["rate_limit", "bad"],
+            cooldownMsByKind: {
+              rate_limit: 60000,
+              quota: 3600000,
+              bad_kind: 1,
+              timeout: -1,
+            },
+          },
+        },
+      }));
+
+      expect(status).toBe(201);
+      const insertArgs = query.mock.calls[0][1];
+      expect(JSON.parse(insertArgs[6])).toEqual({
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "openai", modelId: "gpt-4" },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+        fallbackOn: ["rate_limit"],
+        cooldownMsByKind: {
+          billing: 3600000,
+          rate_limit: 60000,
+        },
+      });
+    });
+
+    it("rejects invalid model_routing policy on create", async () => {
+      const { status, body } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents",
+        method: "POST",
+        body: { name: "bad", model_routing: { enabled: true, candidates: [] } },
+      }));
+
+      expect(status).toBe(400);
+      expect(body.error).toContain("model_routing");
+      expect(query).not.toHaveBeenCalled();
+    });
+
     it("continues if builtin skill auto-bind fails", async () => {
       query
         .mockResolvedValueOnce([undefined, []])                   // insert agent
@@ -258,6 +316,33 @@ describe("registerAgentRoutes", () => {
       }));
 
       expect(connMap.notify).not.toHaveBeenCalled();
+    });
+
+    it("updates model_routing as a standalone field", async () => {
+      query
+        .mockResolvedValueOnce([undefined, []])
+        .mockResolvedValueOnce([[{ id: "a1" }], []]);
+
+      const { status } = await runRoute(router, fakeReq({
+        url: "/api/v1/agents/a1",
+        method: "PUT",
+        body: {
+          model_routing: {
+            enabled: true,
+            cooldownMsByKind: { rate_limit: 0 },
+            candidates: [{ provider: "openai", modelId: "gpt-4" }],
+          },
+        },
+      }));
+
+      expect(status).toBe(200);
+      expect(query.mock.calls[0][0]).toContain("model_routing = ?");
+      expect(JSON.parse(query.mock.calls[0][1][0])).toEqual({
+        enabled: true,
+        strategy: "ordered_fallback",
+        cooldownMsByKind: { rate_limit: 0 },
+        candidates: [{ provider: "openai", modelId: "gpt-4" }],
+      });
     });
   });
 

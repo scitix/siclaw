@@ -41,6 +41,8 @@ import type {
   CliSnapshotSkill,
 } from "./cli-snapshot-types.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
+import type { ModelRoutePolicy } from "../core/model-routing.js";
+import { resolveSnapshotModelRouting } from "./model-routing-config.js";
 
 export type {
   CliSnapshotKnowledgeRepo,
@@ -192,6 +194,7 @@ interface AgentRow {
   status: string;
   model_provider: string | null;
   model_id: string | null;
+  model_routing: unknown;
   system_prompt: string | null;
   icon: string | null;
   color: string | null;
@@ -215,6 +218,7 @@ export interface CliSnapshot {
     }>;
   }>;
   default: { provider: string; modelId: string } | null;
+  modelRouting?: ModelRoutePolicy;
   mcpServers: Record<string, unknown>;
   skills: CliSnapshotSkill[];
   /** Active versions of each knowledge repo, gzip'd-tar + base64. */
@@ -260,7 +264,7 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
     // the request is scoped, so the TUI can render its picker without a
     // second round-trip.
     const [allAgents] = await db.query<AgentRow[]>(
-      "SELECT id, name, description, status, model_provider, model_id, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
+      "SELECT id, name, description, status, model_provider, model_id, model_routing, system_prompt, icon, color FROM agents WHERE status = 'active' ORDER BY name",
     );
 
     // Resolve the scoping agent (if any). Return 404 early so the client
@@ -507,6 +511,14 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
       defaultOut = { provider: activeAgent.model_provider, modelId: activeAgent.model_id };
     }
 
+    const modelRoutingOut = activeAgent && activeAgent.model_provider && activeAgent.model_id
+      ? resolveSnapshotModelRouting(
+          activeAgent.model_routing,
+          { provider: activeAgent.model_provider, modelId: activeAgent.model_id },
+          providersOut,
+        )
+      : undefined;
+
     const availableAgentsOut: CliSnapshotAgentMeta[] = allAgents.map((a) => ({
       name: a.name,
       description: a.description,
@@ -523,12 +535,14 @@ export function registerCliSnapshotRoute(router: RestRouter, cliSnapshotSecret: 
           systemPrompt: activeAgent.system_prompt,
           modelProvider: activeAgent.model_provider,
           modelId: activeAgent.model_id,
+          ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),
         }
       : null;
 
     const snapshot: CliSnapshot = {
       providers: providersOut,
       default: defaultOut,
+      ...(modelRoutingOut ? { modelRouting: modelRoutingOut } : {}),
       mcpServers: mcpServersOut,
       skills: skillsOut,
       knowledge: knowledgeOut,

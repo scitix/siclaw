@@ -36,6 +36,7 @@ export function serializeMessagesToMarkdown(messages: PilotMessage[]): string {
   for (const m of messages) {
     if (m.hidden) continue
     if (m.metadata?.kind === "delegation_status_notice") continue
+    if (m.metadata?.kind === "model_route_notice") continue
     const ts = m.timestamp ? ` · ${m.timestamp}` : ""
     if (m.role === "user") {
       blocks.push(`**You**${ts}\n\n${(m.content ?? "").trim()}`)
@@ -62,6 +63,7 @@ export function serializeMessagesToText(messages: PilotMessage[]): string {
   for (const m of messages) {
     if (m.hidden) continue
     if (m.metadata?.kind === "delegation_status_notice") continue
+    if (m.metadata?.kind === "model_route_notice") continue
     if (m.role === "user") {
       lines.push(`You:\n${stripImageData((m.content ?? "").trim())}`)
     } else if (m.role === "assistant") {

@@ -113,6 +113,7 @@
     "smoke:delegate-async": "node scripts/smoke/real-delegate-async.mjs",
     "smoke:delegate-ui": "node scripts/smoke/real-delegate-ui.mjs",
     "smoke:delegate-batch-ui": "node scripts/smoke/real-delegate-batch-ui.mjs",
+    "smoke:agentbox-routing": "node scripts/smoke/agentbox-model-routing.mjs",
     "docker:build:runtime": "docker build -f Dockerfile.runtime -t siclaw/siclaw-runtime:latest .",
     "docker:build:portal": "docker build -f Dockerfile.portal -t siclaw/siclaw-portal:latest .",
     "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw/siclaw-agentbox:latest .",

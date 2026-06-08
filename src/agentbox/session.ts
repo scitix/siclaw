@@ -54,6 +54,15 @@ import type {
 } from "../shared/delegation-persistence.js";
 import { isTaskEvent, buildTaskEventChatMessage, type TaskEvent } from "../shared/task-events.js";
 import { getOrCreateLedger, deleteLedger, type LedgerTask } from "../core/task-ledger.js";
+import {
+  createModelRouteState,
+  normalizeModelRouteState,
+  runPromptWithModelRouting,
+  shouldUseModelRouteRunner,
+  type ModelRouteEvent,
+  type ModelRoutePolicy,
+  type ModelRouteState,
+} from "../core/model-routing.js";
 import type { GatewayClient } from "./gateway-client.js";
 // topic-consolidator import removed — consolidation disabled
 
@@ -117,6 +126,12 @@ export interface ManagedSession {
   _releaseTimer: ReturnType<typeof setTimeout> | null;
   /** Background work currently owned by this parent session (e.g. detached sub-agent jobs). */
   _backgroundWorkCount: number;
+  /** Per-session model routing state, persisted as a sidecar under the session directory. */
+  modelRouteState: ModelRouteState;
+  /** Last normalized model routing policy supplied by Runtime/Portal for this session. */
+  modelRoutePolicy?: ModelRoutePolicy;
+  /** When true, brain events are emitted by the route runner after attempt filtering. */
+  _routeBrainEventsThroughExtra: boolean;
   /**
    * Extra event subscribers — tools (via sessionEventEmitter in ToolRefs) can
    * push custom events here, and the SSE handler forwards them to clients.
@@ -654,17 +669,69 @@ export class AgentBoxSessionManager {
         // acknowledgement and is dropped (no bubble); see the finally block.
         const turnMessages: any[] = [];
         let turnHadTool = false;
-        const brainUnsub = managed.brain.subscribe((event: any) => {
+        const routePolicy = managed.modelRoutePolicy;
+        const routeEnabled = shouldUseModelRouteRunner(routePolicy, managed.modelRouteState);
+        let latestModelRouteSwitch: Extract<ModelRouteEvent, { type: "model_route_switch" }> | null = null;
+        let currentModelRouteMetadata: Record<string, unknown> | null = null;
+        const handleRouteEvent = (event: ModelRouteEvent): void => {
+          if (!managed._promptDone) managed._eventBuffer.push({ ...event, sessionId: sid });
+          if (event.type === "model_route_switch") {
+            latestModelRouteSwitch = event;
+            return;
+          }
+          if (event.type !== "model_route_success") return;
+
+          const metadata: Record<string, unknown> = {
+            candidate_key: event.candidateKey,
+            provider: event.provider,
+            model_id: event.modelId,
+            is_fallback: event.isFallback,
+            primary_candidate_key: event.primaryCandidateKey,
+            attempt: event.attempt,
+          };
+          if (latestModelRouteSwitch && latestModelRouteSwitch.toCandidateKey === event.candidateKey) {
+            metadata.switched_from_candidate_key = latestModelRouteSwitch.fromCandidateKey;
+            metadata.switched_from_provider = latestModelRouteSwitch.fromProvider;
+            metadata.switched_from_model_id = latestModelRouteSwitch.fromModelId;
+            metadata.failure_kind = latestModelRouteSwitch.failureKind;
+            metadata.error_message = latestModelRouteSwitch.errorMessage;
+            metadata.cooldown_until = latestModelRouteSwitch.cooldownUntil;
+          }
+          if (event.recoveredFromCandidateKey) {
+            metadata.recovered_from_candidate_key = event.recoveredFromCandidateKey;
+            metadata.recovered_from_provider = event.recoveredFromProvider;
+            metadata.recovered_from_model_id = event.recoveredFromModelId;
+          }
+          currentModelRouteMetadata = event.isFallback || event.recoveredFromCandidateKey ? metadata : null;
+        };
+        const handleBrainEvent = (event: any): void => {
           if (!managed._promptDone) managed._eventBuffer.push(event);
           if (event?.type === "tool_execution_start") turnHadTool = true;
           if (event?.type === "message_end" && event.message) {
             if (event.message.role === "toolResult") turnHadTool = true;
             turnMessages.push(event.message);
           }
+        };
+        const brainUnsub = managed.brain.subscribe((event: any) => {
+          if (!routeEnabled) handleBrainEvent(event);
         });
         managed._bufferUnsub = () => brainUnsub();
         try {
-          await managed.brain.prompt(text);
+          if (routeEnabled) {
+            await runPromptWithModelRouting(
+              managed.brain,
+              text,
+              routePolicy,
+              managed.modelRouteState,
+              {
+                emitEvent: handleRouteEvent,
+                emitBrainEvent: handleBrainEvent,
+                onStateChange: () => this.persistModelRouteState(managed.id, managed.modelRouteState),
+              },
+            );
+          } else {
+            await managed.brain.prompt(text);
+          }
         } catch (err) {
           console.warn(`[agentbox-session] synthetic prompt failed for ${managed.id}:`, err);
         } finally {
@@ -693,7 +760,7 @@ export class AgentBoxSessionManager {
           // When kept, persist the whole turn then fire a refetch so the frontend shows it.
           if (canPersist && (turnHadTool || (allowTextOnlyPersist && turnHadText))) {
             void Promise.allSettled(
-              turnMessages.map((m) => this.persistSyntheticMessage(sid, m).catch(() => {})),
+              turnMessages.map((m) => this.persistSyntheticMessage(sid, m, currentModelRouteMetadata).catch(() => {})),
             ).then(() =>
               this.persistDelegationEvent({
                 type: "delegation.emit_chat_event",
@@ -757,7 +824,11 @@ export class AgentBoxSessionManager {
    * not attached to this turn. The leading <task_notification> user message is tagged
    * metadata.kind so the UI can fold it like other system notices.
    */
-  private async persistSyntheticMessage(sessionId: string, message: any): Promise<void> {
+  private async persistSyntheticMessage(
+    sessionId: string,
+    message: any,
+    modelRouteMetadata?: Record<string, unknown> | null,
+  ): Promise<void> {
     const role: "user" | "assistant" | "tool" =
       message.role === "toolResult" ? "tool" : message.role === "assistant" ? "assistant" : "user";
     const content = Array.isArray(message.content)
@@ -773,7 +844,11 @@ export class AgentBoxSessionManager {
       role,
       content,
       toolName: message.toolName ?? null,
-      metadata: isNotification ? { kind: "task_notification" } : null,
+      metadata: isNotification
+        ? { kind: "task_notification" }
+        : role === "assistant" && modelRouteMetadata
+          ? { model_route: modelRouteMetadata }
+          : null,
       // A COMPLETED tool row must persist a terminal outcome. Without this a successful tool call
       // in a synthetic (background-completion) turn was written with outcome=null, which the
       // frontend maps to "running" → a spinner that never resolves and a recovered-run poller stuck
@@ -823,6 +898,38 @@ export class AgentBoxSessionManager {
   // a PV-backed snapshot so the plan also survives a full pod/process restart.
   private ledgerFile(taskListId: string): string {
     return path.join(this.getSessionDir(taskListId), ".plan-ledger.json");
+  }
+
+  private modelRouteStateFile(sessionId: string): string {
+    return path.join(this.getSessionDir(sessionId), ".model-route-state.json");
+  }
+
+  private loadModelRouteState(sessionId: string): ModelRouteState {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.modelRouteStateFile(sessionId), "utf8"));
+      return normalizeModelRouteState(raw);
+    } catch {
+      return createModelRouteState();
+    }
+  }
+
+  /**
+   * Best-effort model-route state durability. The state is independent of
+   * pi-agent's append-only JSONL history: it controls which candidate Siclaw
+   * should try next after AgentBox release/rebuild, but it does not alter the
+   * conversation context.
+   */
+  persistModelRouteState(sessionId: string, state: ModelRouteState): void {
+    const file = this.modelRouteStateFile(sessionId);
+    const tmp = `${file}.${randomUUID()}.tmp`;
+    const payload = `${JSON.stringify(normalizeModelRouteState(state), null, 2)}\n`;
+    void fs.promises
+      .writeFile(tmp, payload, "utf8")
+      .then(() => fs.promises.rename(tmp, file))
+      .catch((err) => {
+        console.warn(`[agentbox-session] model-route state persist failed for ${sessionId}:`, err);
+        void fs.promises.unlink(tmp).catch(() => {});
+      });
   }
 
   /**
@@ -1230,6 +1337,7 @@ export class AgentBoxSessionManager {
 
     const sessionDir = this.getSessionDir(id);
     console.log(`[agentbox-session] Creating session: ${id} in ${sessionDir}`);
+    const modelRouteState = this.loadModelRouteState(id);
 
     if (isMemoryEnabled()) {
       const memoryDir = this.getMemoryDir();
@@ -1358,6 +1466,9 @@ export class AgentBoxSessionManager {
       _lastSavedMessageCount: 0,
       _releaseTimer: null,
       _backgroundWorkCount: 0,
+      modelRouteState,
+      modelRoutePolicy: undefined,
+      _routeBrainEventsThroughExtra: false,
       _promptInflight: null,
       _extraEventSubs: extraEventSubs,
       _extraEventBuffer: extraEventBuffer,

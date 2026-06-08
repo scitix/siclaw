@@ -25,6 +25,7 @@ import {
   type ErrorDetail,
 } from "../lib/error-envelope.js";
 import { defaultProviderModelCompat } from "../core/model-compat.js";
+import { resolveAgentModelRouting } from "./model-routing-config.js";
 
 interface ChatAttachment {
   kind?: string;
@@ -279,10 +280,10 @@ async function parseChatRequestBody(
 async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelBinding | null> {
   const db = getDb();
   const [agentRows] = await db.query(
-    "SELECT model_provider, model_id FROM agents WHERE id = ?",
+    "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
     [agentId],
   ) as any;
-  const agent = agentRows[0] as { model_provider?: string; model_id?: string } | undefined;
+  const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
   if (!agent?.model_provider || !agent?.model_id) return null;
 
   const [providerRows] = await db.query(
@@ -309,6 +310,11 @@ async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelB
     compat: defaultProviderModelCompat({ api: provider.api_type, baseUrl: provider.base_url }),
   }));
 
+  const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
+    provider: agent.model_provider,
+    modelId: agent.model_id,
+  });
+
   return {
     modelProvider: provider.name,
     modelId: agent.model_id,
@@ -320,6 +326,7 @@ async function resolveAgentModelBinding(agentId: string): Promise<ResolvedModelB
       authHeader: true,
       models,
     },
+    ...(modelRouting ? { modelRouting } : {}),
   };
 }
 
@@ -478,6 +485,7 @@ export function registerChatRoutes(
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
+      modelRouting: modelBinding.modelRouting,
       turnStartMs,
     });
 
@@ -720,6 +728,7 @@ export function registerChatRoutes(
       modelProvider: modelBinding.modelProvider,
       modelId: modelBinding.modelId,
       modelConfig: modelBinding.modelConfig,
+      modelRouting: modelBinding.modelRouting,
     });
 
     if (!result.ok && !resolved) {

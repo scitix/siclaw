@@ -11,6 +11,7 @@ import type {
   BrainModelInfo,
   BrainContextUsage,
   BrainSessionStats,
+  BrainProviderResponse,
 } from "../brain-session.js";
 
 export class PiAgentBrain implements BrainSession {
@@ -74,7 +75,7 @@ export class PiAgentBrain implements BrainSession {
       //
       // Skip retry when stopReason === "error": pi-agent-core has already
       // exhausted its transport-level retries by the time it surfaces a
-      // failed turn this way (auth/quota/network give-up). Re-prompting just
+      // failed turn this way (auth/billing/network give-up). Re-prompting just
       // hammers the same failure, while each retry emits agent_start /
       // agent_end pairs that flicker the frontend Thinking indicator on/off
       // even though stream_error has already shown the user the error bubble.
@@ -215,4 +216,94 @@ export class PiAgentBrain implements BrainSession {
   registerProvider(name: string, config: Record<string, unknown>): void {
     this.session.modelRegistry.registerProvider(name, config as any);
   }
+
+  captureProviderResponse(listener: (response: BrainProviderResponse) => void): () => void {
+    const agent = (this.session as unknown as { agent?: { onResponse?: unknown } }).agent;
+    if (!agent || typeof agent !== "object") return () => {};
+
+    const previous = typeof agent.onResponse === "function" ? agent.onResponse : undefined;
+    const wrapped = async (response: unknown, model: unknown) => {
+      try {
+        const status = isRecord(response) && typeof response.status === "number" ? response.status : undefined;
+        if (status !== undefined) {
+          listener({
+            status,
+            headers: normalizeHeaders(isRecord(response) ? response.headers : undefined),
+            provider: isRecord(model) && typeof model.provider === "string" ? model.provider : undefined,
+            modelId: isRecord(model) && typeof model.id === "string" ? model.id : undefined,
+          });
+        }
+      } catch {
+        // Best-effort telemetry; never let routing observation break provider streaming.
+      }
+      if (previous) {
+        return previous.call(agent, response, model);
+      }
+    };
+
+    agent.onResponse = wrapped;
+    return () => {
+      if (agent.onResponse === wrapped) agent.onResponse = previous;
+    };
+  }
+
+  createPromptCheckpoint(): unknown {
+    return this.session.sessionManager.getLeafId();
+  }
+
+  restorePromptCheckpoint(checkpoint: unknown): void {
+    const sessionManager = this.session.sessionManager;
+    if (typeof checkpoint === "string") {
+      if (!sessionManager.getEntry(checkpoint)) {
+        throw new Error(`Prompt checkpoint entry not found: ${checkpoint}`);
+      }
+      sessionManager.branch(checkpoint);
+    } else {
+      sessionManager.resetLeaf();
+    }
+    this.session.agent.state.messages = sessionManager.buildSessionContext().messages;
+  }
+}
+
+function normalizeHeaders(value: unknown): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const setHeader = (key: unknown, headerValue: unknown): void => {
+    if (typeof key !== "string" || key.trim() === "") return;
+    if (typeof headerValue === "string" || typeof headerValue === "number" || typeof headerValue === "boolean") {
+      headers[key.toLowerCase()] = String(headerValue);
+    }
+  };
+
+  if (!value) return headers;
+
+  const maybeForEach = (value as { forEach?: unknown }).forEach;
+  if (typeof maybeForEach === "function") {
+    maybeForEach.call(value, (headerValue: unknown, key: unknown) => setHeader(key, headerValue));
+    return headers;
+  }
+
+  const maybeEntries = (value as { entries?: unknown }).entries;
+  if (typeof maybeEntries === "function") {
+    for (const entry of maybeEntries.call(value) as Iterable<unknown>) {
+      if (Array.isArray(entry) && entry.length >= 2) setHeader(entry[0], entry[1]);
+    }
+    return headers;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (Array.isArray(entry) && entry.length >= 2) setHeader(entry[0], entry[1]);
+    }
+    return headers;
+  }
+
+  if (!isRecord(value)) return headers;
+  for (const [key, headerValue] of Object.entries(value)) {
+    setHeader(key, headerValue);
+  }
+  return headers;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -45,7 +45,15 @@ import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
 import { ErrorBubble } from "./ErrorBubble"
 import { stripAttachmentOcrEvidence } from "./user-message-text"
-import type { ChatAttachment, PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
+import type {
+  ChatAttachment,
+  PilotMessage,
+  ContextUsage,
+  ActionChip,
+  PrefixActionChip,
+  MessageTiming,
+  ModelRouteMetadata,
+} from "./types"
 
 // Wrap copy-ready message HTML in a minimal self-contained document for the
 // Markdown-export's companion .html file. Charts are inline PNG <img>, which
@@ -112,6 +120,56 @@ function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
   return (
     <span data-copy-ignore className="text-xs text-muted-foreground/70 tabular-nums select-text cursor-text">
       thinking {formatTimingMs(total)}
+    </span>
+  )
+}
+
+function stringMeta(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function numberMeta(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function modelRouteMetadata(message: PilotMessage): ModelRouteMetadata | null {
+  const route = message.metadata?.model_route
+  if (!route || typeof route !== "object" || Array.isArray(route)) return null
+  return route as ModelRouteMetadata
+}
+
+function routeModelLabel(provider?: string, modelId?: string): string {
+  return provider && modelId ? `${provider}/${modelId}` : provider || modelId || "unknown"
+}
+
+function formatCooldown(until: unknown): string | undefined {
+  const value = numberMeta(until)
+  if (value == null) return undefined
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function ModelRouteBadge({ route }: { route: ModelRouteMetadata | null }) {
+  if (!route?.is_fallback) return null
+  const fallbackModel = routeModelLabel(route.provider, route.model_id)
+  const fromModel = routeModelLabel(route.switched_from_provider, route.switched_from_model_id)
+  const reason = route.failure_kind ? `Reason: ${route.failure_kind}` : undefined
+  const cooldown = formatCooldown(route.cooldown_until)
+  const title = [
+    `Fallback model: ${fallbackModel}`,
+    route.switched_from_provider || route.switched_from_model_id ? `Previous attempt: ${fromModel}` : undefined,
+    reason,
+    cooldown ? `Primary cooldown until ${cooldown}` : undefined,
+  ].filter(Boolean).join("\n")
+  return (
+    <span
+      data-copy-ignore
+      title={title}
+      className="inline-flex max-w-[18rem] items-center gap-1 rounded-full border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium leading-none text-amber-700"
+    >
+      <ArrowRight className="h-3 w-3 shrink-0" />
+      <span className="truncate">fallback: {fallbackModel}</span>
     </span>
   )
 }
@@ -1379,6 +1437,10 @@ function MessageItem({
     return <DelegationStatusNotice content={message.content} />
   }
 
+  if (message.metadata?.kind === "model_route_notice") {
+    return <ModelRouteNotice message={message} />
+  }
+
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
@@ -1431,6 +1493,7 @@ function MessageItem({
     : suggestedChips
   const editableText = isUser ? getEditableUserText(message.content) : ""
   const canRenderEditor = !!onEditMessageChange && !!onCancelEditMessage && !!onSubmitEditMessage
+  const route = !isUser && !isTool ? modelRouteMetadata(message) : null
 
   return (
     <div className={cn("flex gap-4 group", isUser ? "flex-row-reverse" : "flex-row")}>
@@ -1446,10 +1509,11 @@ function MessageItem({
       </div>
 
       <div className={cn("flex flex-col min-w-0", isUser ? "items-end" : "items-start")}>
-        <div className="flex items-baseline gap-2 mb-1">
+        <div className="flex flex-wrap items-center gap-2 mb-1 min-w-0">
           <span className="text-sm font-semibold text-foreground">{isUser ? "You" : "Siclaw"}</span>
           <span className="text-xs text-muted-foreground/70">{message.timestamp}</span>
           {!isUser && <ModelTimeLabel timing={message.timing} />}
+          {!isUser && <ModelRouteBadge route={route} />}
           {message.isStreaming && !isUser && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/70" />}
         </div>
 
@@ -1552,6 +1616,39 @@ function DelegationStatusNotice({ content }: { content: string }) {
         <span className="font-medium">{headline}</span>
         {detail && <span className="text-blue-300/70">·</span>}
         {detail && <span className="truncate">{detail}</span>}
+      </div>
+    </div>
+  )
+}
+
+function ModelRouteNotice({ message }: { message: PilotMessage }) {
+  const metadata = message.metadata ?? {}
+  const eventType = stringMeta(metadata.event_type)
+  const from = routeModelLabel(stringMeta(metadata.from_provider), stringMeta(metadata.from_model_id))
+  const to = routeModelLabel(stringMeta(metadata.to_provider), stringMeta(metadata.to_model_id))
+  const failureKind = stringMeta(metadata.failure_kind)
+  const cooldown = formatCooldown(metadata.cooldown_until)
+  const isRecovery = eventType === "model_route.recovered"
+  const title = [
+    isRecovery ? `Recovered to ${to}` : `Switched from ${from} to ${to}`,
+    failureKind ? `Reason: ${failureKind}` : undefined,
+    stringMeta(metadata.error_message),
+    cooldown ? `Primary cooldown until ${cooldown}` : undefined,
+  ].filter(Boolean).join("\n")
+
+  return (
+    <div className="pl-12 min-w-0" data-copy-ignore>
+      <div
+        title={title}
+        className={cn(
+          "inline-flex max-w-3xl items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm shadow-black/10",
+          isRecovery
+            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700"
+            : "border-amber-500/30 bg-amber-500/10 text-amber-700",
+        )}
+      >
+        <ArrowRight className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium truncate">{message.content}</span>
       </div>
     </div>
   )

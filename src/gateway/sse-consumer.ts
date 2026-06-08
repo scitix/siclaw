@@ -138,6 +138,139 @@ function extractPersistableDetails(
   }
 }
 
+function routeString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function routeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function routeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function compactRouteError(value: unknown, redactionConfig: RedactionConfig): string | undefined {
+  const text = routeString(value);
+  if (!text) return undefined;
+  return redactText(text, redactionConfig).slice(0, 500);
+}
+
+function modelRouteSwitchMetadata(evt: SseEvent, redactionConfig: RedactionConfig): Record<string, unknown> | null {
+  const fromCandidateKey = routeString(evt.fromCandidateKey);
+  const toCandidateKey = routeString(evt.toCandidateKey);
+  const fromProvider = routeString(evt.fromProvider);
+  const fromModelId = routeString(evt.fromModelId);
+  const toProvider = routeString(evt.toProvider);
+  const toModelId = routeString(evt.toModelId);
+  if (!fromCandidateKey || !toCandidateKey || !fromProvider || !fromModelId || !toProvider || !toModelId) {
+    return null;
+  }
+  return {
+    kind: "model_route_notice",
+    event_type: "model_route.switch",
+    from_candidate_key: fromCandidateKey,
+    from_provider: fromProvider,
+    from_model_id: fromModelId,
+    to_candidate_key: toCandidateKey,
+    to_provider: toProvider,
+    to_model_id: toModelId,
+    failure_kind: routeString(evt.failureKind),
+    error_message: compactRouteError(evt.errorMessage, redactionConfig),
+    cooldown_until: routeNumber(evt.cooldownUntil),
+    attempt: routeNumber(evt.attempt),
+  };
+}
+
+function modelRouteSuccessMetadata(
+  evt: SseEvent,
+  latestSwitch: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  const candidateKey = routeString(evt.candidateKey);
+  const provider = routeString(evt.provider);
+  const modelId = routeString(evt.modelId);
+  const isFallback = routeBoolean(evt.isFallback);
+  const primaryCandidateKey = routeString(evt.primaryCandidateKey);
+  if (!candidateKey || !provider || !modelId || isFallback === undefined || !primaryCandidateKey) {
+    return null;
+  }
+
+  const metadata: Record<string, unknown> = {
+    candidate_key: candidateKey,
+    provider,
+    model_id: modelId,
+    is_fallback: isFallback,
+    primary_candidate_key: primaryCandidateKey,
+    attempt: routeNumber(evt.attempt),
+  };
+
+  if (latestSwitch && latestSwitch.to_candidate_key === candidateKey) {
+    metadata.switched_from_candidate_key = latestSwitch.from_candidate_key;
+    metadata.switched_from_provider = latestSwitch.from_provider;
+    metadata.switched_from_model_id = latestSwitch.from_model_id;
+    metadata.failure_kind = latestSwitch.failure_kind;
+    metadata.error_message = latestSwitch.error_message;
+    metadata.cooldown_until = latestSwitch.cooldown_until;
+  }
+
+  const recoveredFromCandidateKey = routeString(evt.recoveredFromCandidateKey);
+  if (recoveredFromCandidateKey) {
+    metadata.recovered_from_candidate_key = recoveredFromCandidateKey;
+    metadata.recovered_from_provider = routeString(evt.recoveredFromProvider);
+    metadata.recovered_from_model_id = routeString(evt.recoveredFromModelId);
+  }
+
+  return metadata;
+}
+
+function modelRouteRecoveryMetadata(evt: SseEvent): Record<string, unknown> | null {
+  const recoveredFromCandidateKey = routeString(evt.recoveredFromCandidateKey);
+  const recoveredFromProvider = routeString(evt.recoveredFromProvider);
+  const recoveredFromModelId = routeString(evt.recoveredFromModelId);
+  const toCandidateKey = routeString(evt.candidateKey);
+  const toProvider = routeString(evt.provider);
+  const toModelId = routeString(evt.modelId);
+  if (!recoveredFromCandidateKey || !recoveredFromProvider || !recoveredFromModelId || !toCandidateKey || !toProvider || !toModelId) {
+    return null;
+  }
+  return {
+    kind: "model_route_notice",
+    event_type: "model_route.recovered",
+    from_candidate_key: recoveredFromCandidateKey,
+    from_provider: recoveredFromProvider,
+    from_model_id: recoveredFromModelId,
+    to_candidate_key: toCandidateKey,
+    to_provider: toProvider,
+    to_model_id: toModelId,
+    attempt: routeNumber(evt.attempt),
+  };
+}
+
+function modelRouteNoticeContent(metadata: Record<string, unknown>): string {
+  const eventType = routeString(metadata.event_type);
+  const toProvider = routeString(metadata.to_provider) ?? "unknown";
+  const toModelId = routeString(metadata.to_model_id) ?? "unknown";
+  if (eventType === "model_route.recovered") {
+    return `Recovered to primary model ${toProvider}/${toModelId}.`;
+  }
+  const fromProvider = routeString(metadata.from_provider) ?? "unknown";
+  const fromModelId = routeString(metadata.from_model_id) ?? "unknown";
+  const failureKind = routeString(metadata.failure_kind);
+  const reason = failureKind ? ` (${failureKind})` : "";
+  return `Switched to fallback model ${toProvider}/${toModelId} after ${fromProvider}/${fromModelId} failed${reason}.`;
+}
+
+function attachModelRouteMetadata(
+  metadata: Record<string, unknown> | null,
+  modelRouteMetadata: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!modelRouteMetadata) return metadata;
+  return {
+    ...(metadata ?? {}),
+    model_route: modelRouteMetadata,
+  };
+}
+
 function pushPending<T>(map: Map<string, T[]>, key: string, value: T): void {
   const queue = map.get(key);
   if (queue) queue.push(value);
@@ -200,6 +333,8 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
   // make a naive UI sum double-count the same interval N times. Tracked
   // and only emitted once.
   let firstAssistantPersisted = false;
+  let latestModelRouteSwitch: Record<string, unknown> | null = null;
+  let currentModelRouteMetadata: Record<string, unknown> | null = null;
 
   for await (const event of client.streamEvents(sessionId)) {
     if (signal?.aborted) break;
@@ -220,8 +355,55 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
       console.log(`[sse-consumer] ${userId}: ${eventType}`, JSON.stringify(event).slice(0, 300));
     }
 
-    // ── DB persistence: tool_execution_end ──────────
     let dbMessageId: string | undefined;
+
+    // ── Model route audit + UI notices ──────────────
+    if (eventType === "model_route_start") {
+      latestModelRouteSwitch = null;
+      currentModelRouteMetadata = null;
+    }
+
+    if (eventType === "model_route_switch") {
+      const metadata = modelRouteSwitchMetadata(evt, redactionConfig);
+      if (metadata) {
+        latestModelRouteSwitch = metadata;
+        if (persist) {
+          dbMessageId = await appendMessage({
+            sessionId,
+            role: "assistant",
+            content: modelRouteNoticeContent(metadata),
+            metadata,
+          });
+          await incrementMessageCount(sessionId);
+        }
+      }
+    }
+
+    if (eventType === "model_route_success") {
+      const metadata = modelRouteSuccessMetadata(evt, latestModelRouteSwitch);
+      const isFallback = metadata?.is_fallback === true;
+      const recovered = typeof metadata?.recovered_from_candidate_key === "string";
+      currentModelRouteMetadata = metadata && (isFallback || recovered) ? metadata : null;
+      if (currentModelRouteMetadata) {
+        (evt as Record<string, unknown>).modelRoute = currentModelRouteMetadata;
+      }
+
+      const recoveryMetadata = modelRouteRecoveryMetadata(evt);
+      if (recoveryMetadata) {
+        latestModelRouteSwitch = null;
+        if (persist) {
+          dbMessageId = await appendMessage({
+            sessionId,
+            role: "assistant",
+            content: modelRouteNoticeContent(recoveryMetadata),
+            metadata: recoveryMetadata,
+          });
+          await incrementMessageCount(sessionId);
+        }
+      }
+    }
+
+    // ── DB persistence: tool_execution_end ──────────
     if (eventType === "tool_execution_end") {
       const toolResult = evt.result as {
         content?: Array<{ type: string; text?: string }>;
@@ -260,6 +442,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         preThinkingMs != null
           ? { ...(detailsMeta ?? {}), pre_thinking_ms: preThinkingMs }
           : detailsMeta;
+      const metadataWithRoute = attachModelRouteMetadata(metadata, currentModelRouteMetadata);
       const delegationId = typeof metadata?.delegation_id === "string" ? metadata.delegation_id : null;
 
       if (persist) {
@@ -270,7 +453,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           toolInput: toolInput ? redactText(toolInput, redactionConfig) : null,
           outcome,
           durationMs: durationMs ?? null,
-          metadata,
+          metadata: metadataWithRoute,
           delegationId,
         };
         if (existingMessageId) {
@@ -368,6 +551,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         if (preThinkingMs !== undefined) {
           startMetadata.pre_thinking_ms = preThinkingMs;
         }
+        const startMetadataWithRoute = attachModelRouteMetadata(startMetadata, currentModelRouteMetadata);
         dbMessageId = await appendMessage({
           sessionId,
           role: "tool",
@@ -376,7 +560,7 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
           toolInput: rawToolInput ? redactText(rawToolInput, redactionConfig) : null,
           outcome: null,
           durationMs: null,
-          metadata: startMetadata,
+          metadata: startMetadataWithRoute,
         });
         pushPending(pendingToolMessageIds, startToolName, dbMessageId);
         await incrementMessageCount(sessionId);
@@ -467,6 +651,9 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
         // Attach timing onto the live event so the SSE consumer (frontend)
         // can render badges immediately without waiting for DB reload.
         (evt as Record<string, unknown>).timing = timing;
+        if (currentModelRouteMetadata) {
+          (evt as Record<string, unknown>).modelRoute = currentModelRouteMetadata;
+        }
 
         // Persist assistant message (skip entirely if it's purely an empty-
         // response marker — keeps the trace free of pi-agent diagnostics)
@@ -477,7 +664,10 @@ export async function consumeAgentSse(opts: ConsumeAgentSseOptions): Promise<Sse
               sessionId,
               role: "assistant",
               content: redactText(cleaned, redactionConfig),
-              metadata: { timing },
+              metadata: {
+                timing,
+                ...(currentModelRouteMetadata ? { model_route: currentModelRouteMetadata } : {}),
+              },
             });
             await incrementMessageCount(sessionId);
             firstAssistantPersisted = true;

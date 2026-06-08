@@ -97,6 +97,7 @@ if (portalSnapshot) {
   setPortalSnapshot({
     providers: portalSnapshot.providers,
     default: portalSnapshot.default ?? undefined,
+    modelRouting: portalSnapshot.modelRouting,
     mcpServers: portalSnapshot.mcpServers,
   });
   // Materialize Portal skills into an ephemeral cache so pi-coding-agent's
