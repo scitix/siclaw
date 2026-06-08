@@ -275,26 +275,17 @@ export function PilotArea({
     setEditingDraft("")
   }, [sessionKey])
 
-  const lastSentRef = useRef<string | null>(null)
   const wrappedSendMessage = useCallback(
     (text: string, attachments?: ChatAttachment[]) => {
-      if (!isLoading) lastSentRef.current = text
       sendMessage(text, attachments)
     },
-    [sendMessage, isLoading],
+    [sendMessage],
   )
+  // Stop just stops: abort the running turn and leave the input alone. We intentionally do NOT
+  // restore the sent message back into the input box — the turn has usually already been
+  // partly processed (tools ran), so re-filling the input reads as the message "bouncing back".
   const wrappedAbort = useCallback(() => {
     abortResponse?.()
-    if (lastSentRef.current) {
-      // Strip the injected markers + fullPrompt so only what the user actually
-      // typed returns to the input. Same parsers used to render past user
-      // bubbles cleanly, so round-trip is consistent.
-      const { text: afterDp } = parseDeepInvestigation(lastSentRef.current)
-      const { text: userTyped } = parseActionChipMarker(afterDp)
-      setChipSeq((s) => s + 1)
-      setChipDraft(userTyped)
-      lastSentRef.current = null
-    }
   }, [abortResponse])
 
   const scrollToBottom = useCallback((smooth = true) => {
@@ -359,11 +350,6 @@ export function PilotArea({
     const text = editingDraft.trim()
     if (!text || isLoading) return
     wrappedSendMessage(text)
-    // wrappedSendMessage records lastSentRef so wrappedAbort can restore the
-    // draft if the user aborts a normal send. For edit-resends the message is
-    // already visible in the conversation, so we don't want abort to re-fill
-    // the input with it.
-    lastSentRef.current = null
     setEditingMessageId(null)
     setEditingDraft("")
   }, [editingDraft, isLoading, wrappedSendMessage])

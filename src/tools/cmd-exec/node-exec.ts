@@ -1,6 +1,4 @@
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
@@ -9,8 +7,7 @@ import { renderTextResult } from "../infra/tool-render.js";
 import { checkNodeReady } from "../infra/k8s-checks.js";
 import { loadConfig } from "../../core/config.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
-import { parseArgs, CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { extractCommands } from "../infra/command-validator.js";
+import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
 import {
@@ -21,6 +18,7 @@ import {
 } from "../infra/exec-utils.js";
 import { resolvePodNetnsViaKubectl, validateNetnsName } from "../infra/pod-netns-resolve.js";
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
+import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
@@ -260,53 +258,32 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         }
       }
       const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
-      const commands = extractCommands(params.command);
-      const needsShell = commands.length > 1;
-      const cmdArgs = parseArgs(params.command);
-
-      // Build nsenter command (use rewritten args for single-command case)
-      // When netns is specified, wrap with "ip netns exec <name>" to run
-      // in the pod's network namespace using host tools.
+      // Build the nsenter prefix for host-namespace execution. When netns is specified, wrap
+      // with "ip netns exec <name>" to run in the pod's network namespace using host tools.
+      // Both the foreground and background forms run the user command via `sh -c` so they can be
+      // wrapped in setsid + `timeout` (a killable, time-bounded session — see bg-session.ts).
       const netnsPrefix = netns ? `ip netns exec ${netns} ` : "";
       const NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"];
-      // tail = the part after `nsenter -- ` (the host-namespace command); reused for the
-      // foreground and (timeout-wrapped) background forms.
-      const tail: string[] =
-        needsShell || netnsPrefix
-          ? ["sh", "-c", netnsPrefix + params.command]
-          : [...cmdArgs];
-      const nsenterCmd: string[] = [...NSENTER, ...tail];
 
       // ── Background mode ──────────────────────────────────────────────
       // Ensure+pin the debug pod, then hand a detached `kubectl exec … -- nsenter …` to
-      // the runtime executor. The remote command runs in its OWN process group via
-      // `setsid` and records its PGID to a node-side file, so job_stop can promptly kill
-      // the whole group (kubectl exec does NOT propagate kill to a host-namespace
-      // process). `timeout <ttl>` is the backstop if the job is never stopped. The user
-      // command is interpolated single-quote-escaped into `sh -c` (kubectl exec does NOT
-      // forward local env), already whitelisted by preExecSecurity; see the launchScript below.
+      // the runtime executor. The remote command runs as its own session leader via `setsid`
+      // and records its session id to a node-side file, so job_stop can promptly reap the whole
+      // session (kubectl exec does NOT propagate kill to a host-namespace process). `timeout <ttl>`
+      // is the backstop if the job is never stopped. This uses the SAME killable-session helpers
+      // (bg-session.ts) as the foreground path so there is one reap mechanism per transport.
       if (backgroundEnabled && params.run_in_background === true) {
         if (pre.action && !pre.action.lineSafe) {
           return backgroundNotLineSafeError();
         }
         const cfg = loadConfig();
         const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
-        const userShell = netnsPrefix + params.command;
-        const safeJob = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_");
-        // Random suffix: two background jobs whose tool-call ids sanitize to the same
-        // string (cross-session reuse → same node, host PID ns), or a stale .pgid left by
-        // a crashed prior run, must NOT share this file — otherwise job_stop could read the
-        // wrong PGID and kill an unrelated process group.
-        const pgidFile = `/tmp/siclaw-bg-${safeJob}-${randomBytes(4).toString("hex")}.pgid`;
         // The user command is interpolated single-quote-escaped (NOT via env — kubectl exec
         // does not forward the local process env to the remote command). preExecSecurity
         // already whitelisted it; the '\'' escaping makes it injection-safe regardless.
-        const userShellEsc = userShell.replace(/'/g, "'\\''");
-        // `setsid -w` (wait): run the command as a NEW session/group leader (its PID == PGID,
-        // recorded to pgidFile) but KEEP the exec attached & streaming until it exits — plain
-        // setsid forks+detaches and returns immediately. `timeout <ttl>` is the leak backstop.
-        const launchScript = `echo $$ > ${pgidFile}; exec timeout ${ttl} sh -c '${userShellEsc}'`;
-        const bgNsenterCmd = [...NSENTER, "setsid", "-w", "sh", "-c", launchScript];
+        const userShellEsc = (netnsPrefix + params.command).replace(/'/g, "'\\''");
+        const pgidFile = backgroundPgidFile(toolCallId);
+        const bgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${ttl} sh -c '${userShellEsc}'`, pgidFile)];
         const spec = { userId: userId ?? "unknown", nodeName, command: bgNsenterCmd, image, clusterKey };
         let cachedPod;
         try {
@@ -328,24 +305,16 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
             details: { error: true, reason: "debug_pod_gone" },
           };
         }
-        // job_stop → kill the remote process GROUP (TERM, then KILL) by the recorded PGID.
-        // Poll briefly for the pgid file: job_stop can race the remote launch (the file is
-        // written by `echo $$` at the very start of launchScript), and reading an empty
-        // pgid would make the kill a silent no-op, leaking the host process until `timeout`.
-        const killScript = `pgid=""; for i in 1 2 3; do pgid=$(cat ${pgidFile} 2>/dev/null); [ -n "$pgid" ] && break; sleep 1; done; if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null; sleep 1; kill -KILL -"$pgid" 2>/dev/null; fi; rm -f ${pgidFile}`;
-        const onAbort = () => {
-          try {
-            const killer = spawn(
-              "kubectl",
-              [...env.kubeconfigArgs, "-n", cachedPod!.namespace, "exec", cachedPod!.podName, "--", ...NSENTER, "sh", "-c", killScript],
-              { env: env.childEnv as Record<string, string>, detached: true },
-            );
-            killer.on("error", () => {});
-            // Don't let the kill-exec linger forever.
-            setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, 15_000).unref();
-            killer.unref();
-          } catch { /* best-effort */ }
-        };
+        // job_stop → reap the remote session (pkill -s, catching timeout's own child group) over
+        // a FRESH kubectl exec; the kill script retries reading the .pgid to cover the launch race.
+        const onAbort = () => killRemoteSessionViaKubectl({
+          kubeconfigArgs: env.kubeconfigArgs,
+          childEnv: env.childEnv as Record<string, string>,
+          namespace: cachedPod!.namespace,
+          podName: cachedPod!.podName,
+          nsenterPrefix: NSENTER,
+          pgidFile,
+        });
         try {
           const { jobId, outputFile } = bg!.executor!({
             file: "kubectl",
@@ -369,11 +338,51 @@ To run in a POD's network namespace (host tools + the pod's network view — e.g
         }
       }
 
-      const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName, command: nsenterCmd, image, clusterKey },
-        env,
-        { timeoutMs: timeout, signal },
-      );
+      // ── Foreground mode ──────────────────────────────────────────────
+      // Run the host-namespace command as a killable session (setsid + recorded session id)
+      // wrapped in `timeout <cap>`, exactly like the background path. On abort the LOCAL kubectl
+      // is killed by runInDebugPod's signal, but that does NOT propagate to the host-namespace
+      // process — so we ALSO reap the remote process group over a FRESH kubectl exec. The remote
+      // `timeout` is the backstop if the reap is somehow missed (previously a foreground command
+      // had no remote bound and orphaned on the node past the local wait).
+      const cap = Math.min(params.timeout_seconds ?? 30, 120);
+      const fgUserShellEsc = (netnsPrefix + params.command).replace(/'/g, "'\\''");
+      const fgPgidFile = backgroundPgidFile(toolCallId);
+      const fgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${cap} sh -c '${fgUserShellEsc}'`, fgPgidFile)];
+      const fgSpec = { userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey };
+
+      // Ensure the (idempotent, cache-hit) pod up front, then PIN it for the duration of the exec.
+      // runInDebugPod only resets the idle timer AFTER a successful exec, so without a pin a long
+      // foreground command (cap up to 120s; idle timeout can be shorter) could be idle-evicted
+      // mid-exec — killing the command AND leaving the abort reap to target a deleted pod. The pin
+      // also guarantees fgPod stays the live pod the reap kubectl-execs into.
+      let fgPod;
+      try {
+        fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
+          details: { error: true, reason: "debug_pod_failed" },
+        };
+      }
+      const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort
+      const onAbort = () => killRemoteSessionViaKubectl({
+        kubeconfigArgs: env.kubeconfigArgs,
+        childEnv: env.childEnv as Record<string, string>,
+        namespace: fgPod!.namespace,
+        podName: fgPod!.podName,
+        nsenterPrefix: NSENTER,
+        pgidFile: fgPgidFile,
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      let execResult;
+      try {
+        execResult = await runInDebugPod(fgSpec, env, { timeoutMs: timeout, signal });
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        if (fgPinnedPodName) releaseDebugPod(fgSpec, fgPinnedPodName);
+      }
 
       if (signal?.aborted) {
         return {

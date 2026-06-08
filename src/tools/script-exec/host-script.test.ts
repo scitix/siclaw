@@ -109,8 +109,29 @@ describe("host_script — one-step pod netns", () => {
     expect((res.details as any).error).toBeFalsy();
     expect(resolvePodNetnsViaSsh).toHaveBeenCalledTimes(1);
     expect(vi.mocked(resolvePodNetnsViaSsh).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
+    // Foreground now runs as a killable, timeout-bounded setsid session; the netns'd interpreter
+    // command lives inside that wrapper (so the abort reap can kill the whole remote group).
     const remoteCmd = vi.mocked(sshExec).mock.calls[0][1] as string;
-    expect(remoteCmd.startsWith("ip netns exec cni-x ")).toBe(true);
+    expect(remoteCmd).toContain("setsid -w sh -c");
+    expect(remoteCmd).toContain("timeout ");
+    expect(remoteCmd).toContain("ip netns exec cni-x ");
     expect(remoteCmd).toContain("bash -s");
+  });
+
+  it("foreground: reaps the remote session on abort instead of returning ssh_exec_failed", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValue(okTarget as any);
+    vi.mocked(resolveScript).mockReturnValue({ interpreter: "bash", content: "echo hi", path: "/x", scope: "global" } as any);
+    // The real SSH path rejects with Error("Aborted") on abort; emulate that after the signal fires.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) { controller.abort(); throw new Error("Aborted"); }
+      return { stdout: "", stderr: "", exitCode: 0 } as any;
+    });
+    const res = await tool.execute("tc1", { host: "node-1", script: "x.sh" }, controller.signal, {} as any);
+    expect(res.content[0].text).toBe("Aborted.");
+    expect((res.details as any).reason).not.toBe("ssh_exec_failed");
+    // A SECOND sshExec carried the reap script over a fresh connection.
+    const kill = vi.mocked(sshExec).mock.calls.find((c) => String(c[1]).includes("pkill -TERM -s"));
+    expect(kill).toBeTruthy();
   });
 });

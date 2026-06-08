@@ -122,7 +122,7 @@ Examples:
       );
     },
     renderResult: renderTextResult,
-    async execute(toolCallId, rawParams) {
+    async execute(toolCallId, rawParams, signal) {
       const params = rawParams as PodExecParams;
 
       try {
@@ -224,10 +224,14 @@ Examples:
       }
 
       try {
+        // Thread the turn's AbortSignal so a Stop promptly kills the LOCAL kubectl. The in-pod
+        // process runs in the pod's own PID namespace and is bounded by the pod lifecycle (we do
+        // not setsid/timeout-wrap it here — minimal target images may lack sh/setsid/timeout), so
+        // unlike node_exec/host_exec there is no host-namespace orphan to reap over a new connection.
         const { stdout, stderr } = await execFileAsync(
           "kubectl",
           kubectlArgs,
-          { timeout, env: env.childEnv },
+          { timeout, env: env.childEnv, signal },
         );
 
         return {
@@ -235,6 +239,11 @@ Examples:
           details: { exitCode: 0 },
         };
       } catch (err: any) {
+        // User Stop → execFile rejects with an AbortError; surface a clean "Aborted." rather than
+        // a spurious command error like "[exit code: ABORT_ERR]" (mirrors node_exec/host_exec).
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
+        }
         const stdout = (err.stdout?.trim() ?? "") as string;
         const stderr = (err.stderr?.trim() ?? err.message) as string;
         const exitCode = err.code ?? "unknown";

@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../infra/script-resolver.js", () => ({ resolveScript: vi.fn() }));
 vi.mock("../infra/k8s-checks.js", () => ({ checkNodeReady: vi.fn() }));
-vi.mock("../infra/debug-pod.js", () => ({ runInDebugPod: vi.fn() }));
+vi.mock("../infra/debug-pod.js", () => ({
+  runInDebugPod: vi.fn(),
+  ensureDebugPodReady: vi.fn(async () => ({ podName: "node-debug-x", namespace: "siclaw-debug" })),
+  acquireDebugPod: vi.fn(() => "node-debug-x"),
+  releaseDebugPod: vi.fn(),
+}));
 vi.mock("../infra/kubeconfig-resolver.js", () => ({
   resolveRequiredKubeconfig: vi.fn(() => ({ path: "/tmp/kc" })),
   resolveDebugImage: vi.fn(() => "debug:latest"),

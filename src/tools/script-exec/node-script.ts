@@ -1,7 +1,5 @@
 import type { ToolEntry, BackgroundExecWiring } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
 import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { KubeconfigRef } from "../../core/types.js";
@@ -22,6 +20,7 @@ import {
 import { resolvePodNetnsViaKubectl, validateNetnsName } from "../infra/pod-netns-resolve.js";
 import { postExecSecurity } from "../infra/security-pipeline.js";
 import { runInDebugPod, ensureDebugPodReady, acquireDebugPod, releaseDebugPod } from "../infra/debug-pod.js";
+import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaKubectl } from "../infra/bg-session.js";
 import { resolveRequiredKubeconfig, resolveDebugImage } from "../infra/kubeconfig-resolver.js";
 import { ensureClusterForTool } from "../infra/ensure-kubeconfigs.js";
 
@@ -224,7 +223,6 @@ Examples:
         : baseCmd;
 
       const NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"];
-      const nsenterCmd = [...NSENTER, "sh", "-c", innerCmd];
 
       // ── Background mode ──────────────────────────────────────────────
       // Mirror node_exec's background path (ensure + pin a debug pod, record the remote PGID
@@ -234,10 +232,11 @@ Examples:
       if (backgroundEnabled && params.run_in_background === true) {
         const cfg = loadConfig();
         const ttl = Math.min(params.timeout_seconds ?? cfg.debugPodTTL, cfg.debugPodTTL);
-        const safeJob = toolCallId.replace(/[^A-Za-z0-9_-]/g, "_");
-        const pgidFile = `/tmp/siclaw-bg-${safeJob}-${randomBytes(4).toString("hex")}.pgid`;
-        const launchScript = `echo $$ > ${pgidFile}; exec timeout ${ttl} ${innerCmd}`;
-        const bgNsenterCmd = [...NSENTER, "setsid", "-w", "sh", "-c", launchScript];
+        // Killable setsid session + remote `timeout` backstop, reaped by SESSION id over a fresh
+        // kubectl exec on job_stop — the SAME helpers node_exec uses (one reap mechanism). The
+        // script body flows through stdin (`echo $$` consumes none).
+        const pgidFile = backgroundPgidFile(toolCallId);
+        const bgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${ttl} ${innerCmd}`, pgidFile)];
         const spec = { userId: userId ?? "unknown", nodeName, command: bgNsenterCmd, image, clusterKey };
         let cachedPod;
         try {
@@ -255,19 +254,14 @@ Examples:
             details: { error: true, reason: "debug_pod_gone" },
           };
         }
-        const killScript = `pgid=""; for i in 1 2 3; do pgid=$(cat ${pgidFile} 2>/dev/null); [ -n "$pgid" ] && break; sleep 1; done; if [ -n "$pgid" ]; then kill -TERM -"$pgid" 2>/dev/null; sleep 1; kill -KILL -"$pgid" 2>/dev/null; fi; rm -f ${pgidFile}`;
-        const onAbort = () => {
-          try {
-            const killer = spawn(
-              "kubectl",
-              [...env.kubeconfigArgs, "-n", cachedPod!.namespace, "exec", cachedPod!.podName, "--", ...NSENTER, "sh", "-c", killScript],
-              { env: env.childEnv as Record<string, string>, detached: true },
-            );
-            killer.on("error", () => {});
-            setTimeout(() => { try { killer.kill("SIGKILL"); } catch { /* gone */ } }, 15_000).unref();
-            killer.unref();
-          } catch { /* best-effort */ }
-        };
+        const onAbort = () => killRemoteSessionViaKubectl({
+          kubeconfigArgs: env.kubeconfigArgs,
+          childEnv: env.childEnv as Record<string, string>,
+          namespace: cachedPod!.namespace,
+          podName: cachedPod!.podName,
+          nsenterPrefix: NSENTER,
+          pgidFile,
+        });
         try {
           const { jobId, outputFile } = bg!.executor!({
             file: "kubectl",
@@ -291,11 +285,42 @@ Examples:
         }
       }
 
-      const execResult = await runInDebugPod(
-        { userId: userId ?? "unknown", nodeName, command: nsenterCmd, image, clusterKey, stdinData: resolved.content },
-        env,
-        { timeoutMs: timeout, signal },
-      );
+      // ── Foreground mode ──────────────────────────────────────────────
+      // Run the host-namespace script as a killable setsid session wrapped in `timeout <cap>` and
+      // PIN the debug pod for the duration, then reap the remote group over a fresh kubectl exec on
+      // abort — mirrors node_exec foreground (kubectl exec does not propagate kill to a
+      // host-namespace process). The script body still streams via stdin.
+      const cap = Math.round(timeout / 1000);
+      const fgPgidFile = backgroundPgidFile(toolCallId);
+      const fgNsenterCmd = [...NSENTER, "sh", "-c", wrapBackgroundSession(`timeout ${cap} ${innerCmd}`, fgPgidFile)];
+      const fgSpec = { userId: userId ?? "unknown", nodeName, command: fgNsenterCmd, image, clusterKey, stdinData: resolved.content };
+      let fgPod;
+      try {
+        fgPod = await ensureDebugPodReady(fgSpec, env, { signal });
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: true, message: `Debug pod failed to start: ${err?.message ?? String(err)}` }) }],
+          details: { error: true, reason: "debug_pod_failed" },
+        };
+      }
+      const fgPinnedPodName = acquireDebugPod(fgSpec); // null if the pod vanished; proceed best-effort
+      const onFgAbort = () => killRemoteSessionViaKubectl({
+        kubeconfigArgs: env.kubeconfigArgs,
+        childEnv: env.childEnv as Record<string, string>,
+        namespace: fgPod!.namespace,
+        podName: fgPod!.podName,
+        nsenterPrefix: NSENTER,
+        pgidFile: fgPgidFile,
+      });
+      signal?.addEventListener("abort", onFgAbort, { once: true });
+
+      let execResult;
+      try {
+        execResult = await runInDebugPod(fgSpec, env, { timeoutMs: timeout, signal });
+      } finally {
+        signal?.removeEventListener("abort", onFgAbort);
+        if (fgPinnedPodName) releaseDebugPod(fgSpec, fgPinnedPodName);
+      }
 
       if (signal?.aborted) {
         return {

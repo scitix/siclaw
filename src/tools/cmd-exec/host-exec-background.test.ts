@@ -84,9 +84,13 @@ describe("host_exec — one-step pod netns", () => {
     await tool.execute("c1", { host: "node-1", pod: "rdma-a", namespace: "rdma-test", command: "show_gids" }, undefined, {} as any);
     expect(resolvePodNetnsViaSsh).toHaveBeenCalledTimes(1);
     expect(vi.mocked(resolvePodNetnsViaSsh).mock.calls[0][0]).toMatchObject({ pod: "rdma-a", namespace: "rdma-test" });
-    // The actual remote command wraps the whole thing in `ip netns exec <netns> sh -c '<cmd>'`.
+    // Foreground now runs as a killable, timeout-bounded setsid session (so Stop can reap the
+    // remote process group), with the user command still inside `ip netns exec <netns> sh -c`.
     const fgCmd = vi.mocked(sshExec).mock.calls.find((c) => String(c[1]).includes("show_gids"))![1] as string;
-    expect(fgCmd).toBe("ip netns exec cni-x sh -c 'show_gids'");
+    expect(fgCmd).toContain("setsid -w sh -c");
+    expect(fgCmd).toContain("timeout 30 ");
+    expect(fgCmd).toContain(".pgid");
+    expect(fgCmd).toContain("ip netns exec cni-x sh -c '\\''show_gids'\\''");
   });
 
   it("background: the launched command runs under ip netns exec + timeout + setsid", async () => {

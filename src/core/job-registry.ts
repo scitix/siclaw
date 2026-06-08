@@ -53,6 +53,13 @@ export interface JobRecord {
    */
   notified: boolean;
   /**
+   * Set when the job was stopped by the USER's Stop button (not the model's job_stop tool, and
+   * not natural completion). The completion still folds the launching card to "stopped", but the
+   * parent is NOT woken with a synthetic turn — a user Stop is terminal; the model reacting to its
+   * own cancellation is exactly the "it won't stop" behavior the Stop button must avoid.
+   */
+  suppressNotifyTurn?: boolean;
+  /**
    * Kill hook. subagent → requestStop(); bash → process.kill(-pid, SIGKILL).
    * Undefined while the job is still starting up (no PID/controller yet).
    */
@@ -121,11 +128,13 @@ export class JobRegistry {
    * (agentbox + TUI) so the guard sequence and the stopped-status transition can't drift.
    * The message wording adapts to the job type ("sub-agent" vs "command").
    */
-  stopJob(jobId: string): JobStopResult {
+  stopJob(jobId: string, opts?: { suppressNotifyTurn?: boolean }): JobStopResult {
     const job = this.jobs.get(jobId);
     if (!job) return { stopped: false, message: `No background job "${jobId}".` };
     if (job.status !== "running") return { stopped: false, message: `Job "${jobId}" is not running (${job.status}).` };
     if (!job.abort) return { stopped: false, message: `Job "${jobId}" is starting up; try again shortly.` };
+    // Set BEFORE abort() so the (later, async) settle → notifyParent already sees the flag.
+    if (opts?.suppressNotifyTurn) job.suppressNotifyTurn = true;
     job.abort();
     this.setStatus(jobId, "stopped");
     return { stopped: true, message: `Stopping background ${job.type === "subagent" ? "sub-agent" : "command"} "${jobId}".` };

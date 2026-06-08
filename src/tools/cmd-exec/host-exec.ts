@@ -5,7 +5,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { renderTextResult } from "../infra/tool-render.js";
 import { CONTAINER_SENSITIVE_PATHS } from "../infra/command-sets.js";
-import { backgroundPgidFile, wrapBackgroundSession, backgroundSessionKillScript } from "../infra/bg-session.js";
+import { backgroundPgidFile, wrapBackgroundSession, killRemoteSessionViaSsh } from "../infra/bg-session.js";
 import { preExecSecurity, postExecSecurity } from "../infra/security-pipeline.js";
 import { BACKGROUND_BASH_ENABLED } from "../../core/subagent-registry.js";
 import { backgroundNotLineSafeError, backgroundLaunchedResult } from "./background-launch.js";
@@ -170,6 +170,10 @@ Examples (pass the id from host_list; names shown here for readability):
           details: { error: true, reason: "host_acquire_failed" },
         };
       }
+      // The model often passes an opaque host id; surface the resolved friendly name so the tool
+      // card can render `<name> $ <command>` like node_exec instead of a bare UUID. Persisted via
+      // the result details → tool row metadata (foreground details + background extraDetails).
+      const hostLabel = target.name || params.host;
 
       // One-step pod netns: resolve the pod's netns over SSH (crictl on this node; needs root),
       // then run the command inside it via `ip netns exec`. The prefix is tool-built — only the
@@ -208,10 +212,9 @@ Examples (pass the id from host_list; names shown here for readability):
         // remote tree incl. timeout's own process group. See bg-session.ts for the rationale.
         const pgidFile = backgroundPgidFile(toolCallId);
         const wrapped = wrapBackgroundSession(userCmd, pgidFile);
-        const killScript = backgroundSessionKillScript(pgidFile);
         // job_stop: kill the remote process group over a FRESH ssh connection (the streaming
         // channel is being torn down). Best-effort, time-boxed; the runner closes the channel after.
-        const onAbort = () => { void sshExec(target, killScript, { timeoutMs: 20_000 }).catch(() => {}); };
+        const onAbort = () => killRemoteSessionViaSsh({ target, pgidFile });
         try {
           const { jobId, outputFile } = bg!.executor!({
             // The job outlives this turn, so it is NOT tied to the turn's AbortSignal —
@@ -227,25 +230,46 @@ Examples (pass the id from host_list; names shown here for readability):
             jobType: "host",
             onAbort,
           });
-          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.");
+          return backgroundLaunchedResult(jobId, outputFile, "Running on the host in the background.", { host_label: hostLabel });
         } catch (err) {
           // Concurrency cap (or executor failure): fall through to a foreground run.
           console.warn(`[host-exec] background launch declined, running foreground:`, err);
         }
       }
 
-      const timeout = Math.min(params.timeout_seconds ?? 30, 120) * 1000;
+      // ── Foreground mode ──────────────────────────────────────────────
+      // Run as a killable session (setsid + recorded session id) wrapped in `timeout <cap>`, just
+      // like the background path. On abort the local ssh channel is torn down, but closing it does
+      // NOT reliably SIGHUP a non-PTY remote process — so we ALSO reap the remote process group
+      // over a FRESH ssh connection, and the remote `timeout` is the backstop. Previously a
+      // foreground command had no remote bound and could keep running on the host past the local wait.
+      // This requires `setsid` + `timeout` on the host — the SAME dependency the background path
+      // already takes for every host command (util-linux + coreutils, present on any normal SSH
+      // target incl. BusyBox); a host missing them errors visibly rather than orphaning silently.
+      const cap = Math.min(params.timeout_seconds ?? 30, 120);
+      const timeout = cap * 1000;
+      const fgPgidFile = backgroundPgidFile(toolCallId);
+      const fgWrapped = wrapBackgroundSession(`timeout ${cap} ${netnsExec}sh -c '${esc}'`, fgPgidFile);
+      const onAbort = () => killRemoteSessionViaSsh({ target, pgidFile: fgPgidFile });
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       let result;
       try {
-        const fgCmd = netnsExec ? `${netnsExec}sh -c '${esc}'` : params.command;
-        result = await sshExec(target, fgCmd, { timeoutMs: timeout, signal });
+        result = await sshExec(target, fgWrapped, { timeoutMs: timeout, signal });
       } catch (err) {
+        // The SSH path REJECTS with Error("Aborted") when the signal fires — surface a clean stop
+        // here (the post-try abort check below is unreachable on the reject path), not a spurious
+        // "ssh_exec_failed" connection error.
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],
           details: { error: true, reason: "ssh_exec_failed", host: params.host },
         };
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
       }
 
       if (signal?.aborted) {
@@ -273,6 +297,7 @@ Examples (pass the id from host_list; names shown here for readability):
         details: {
           exitCode: result.exitCode,
           host: params.host,
+          host_label: hostLabel,
           ...(isError && { error: true }),
           ...(result.signal ? { signal: result.signal } : {}),
         },
