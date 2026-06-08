@@ -257,6 +257,12 @@ Examples (pass the id from host_list; names shown here for readability):
       try {
         result = await sshExec(target, fgWrapped, { timeoutMs: timeout, signal });
       } catch (err) {
+        // The SSH path REJECTS with Error("Aborted") when the signal fires — surface a clean stop
+        // here (the post-try abort check below is unreachable on the reject path), not a spurious
+        // "ssh_exec_failed" connection error.
+        if (signal?.aborted) {
+          return { content: [{ type: "text", text: "Aborted." }], details: { error: true } };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${msg}\n\nSSH connection to "${params.host}" failed (a connection failure, not a command error). If "${params.host}" is a Kubernetes node, retry this command with node_exec (debug pod, no SSH).` }],

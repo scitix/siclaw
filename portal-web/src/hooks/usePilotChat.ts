@@ -1139,6 +1139,12 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                 ...(toolDetails ? { toolDetails, metadata: toolDetails } : {}),
                 ...(durationMs != null ? { timing: { ...(current.timing ?? {}), durationMs } } : {}),
                 ...(dbMessageId ? { id: dbMessageId } : {}),
+                // Recompute the header now that result metadata is in hand — e.g. host_exec/host_script
+                // resolve metadata.host_label here so the LIVE card flips from the raw host id to the
+                // friendly name without waiting for a refetch. No-op for tools that ignore metadata.
+                ...(current.toolName && current.toolArgs
+                  ? { toolInput: formatToolInput(current.toolName, current.toolArgs, (toolDetails ?? current.metadata) as Record<string, unknown> | undefined) }
+                  : {}),
               }
               return [
                 ...prev.slice(0, fallbackIndex),

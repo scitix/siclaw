@@ -100,6 +100,26 @@ describe("host_exec", () => {
     expect((result.details as any).error).toBe(true); // "Aborted."
   });
 
+  it("foreground: an SSH reject AFTER abort returns a clean 'Aborted.' (not ssh_exec_failed)", async () => {
+    const controller = new AbortController();
+    vi.mocked(acquireSshTarget).mockResolvedValueOnce({
+      host: "10.0.0.1", port: 22, username: "root",
+      auth: { type: "key", privateKeyPath: "/tmp/h1.key" },
+    });
+    // Real SSH path: rejects with Error("Aborted") once the signal fires (the reject path the
+    // earlier resolve-mock missed). The catch must recognize signal.aborted, not report a
+    // connection failure.
+    vi.mocked(sshExec).mockImplementation(async (_t: any, cmd: any) => {
+      if (typeof cmd === "string" && cmd.includes("setsid")) { controller.abort(); throw new Error("Aborted"); }
+      return { stdout: "", stderr: "", exitCode: 0 } as any;
+    });
+    const result = await tool.execute(
+      "tc2", { host: "h1", command: "ping -c 100 10.0.0.254" }, controller.signal, {} as any,
+    );
+    expect(result.content[0].text).toBe("Aborted.");
+    expect((result.details as any).reason).not.toBe("ssh_exec_failed");
+  });
+
   it("signal-killed with stdout is NOT treated as error (mirrors node_exec)", async () => {
     vi.mocked(acquireSshTarget).mockResolvedValueOnce({
       host: "10.0.0.1", port: 22, username: "root",
