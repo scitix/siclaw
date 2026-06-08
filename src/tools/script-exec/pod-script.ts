@@ -106,9 +106,11 @@ Examples:
               Type.Boolean({
                 description:
                   "Run the script in the pod in the background instead of waiting. Returns immediately with " +
-                  "a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read the file " +
-                  "or call any tool, and do NOT sleep/wait. You are notified automatically when it completes; " +
-                  "ONLY THEN read the output_file. The script is wrapped in `timeout` (requires coreutils/busybox " +
+                  "a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, sleep, or " +
+                  "read the output_file until the completion notification). EXCEPTION: when this is the server/listener " +
+                  "side of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then read the output_file when " +
+                  "the test finishes (waiting for the server's completion first deadlocks: it blocks until the client " +
+                  "connects, then times out). The script is wrapped in `timeout` (requires coreutils/busybox " +
                   "`timeout` in the pod). Use for long-running in-pod scripts (soak, load).",
               }),
             ),

@@ -115,9 +115,11 @@ Examples (pass the id from host_list; names shown here for readability):
               Type.Boolean({
                 description:
                   "Run the script on the host in the background instead of waiting. Returns immediately " +
-                  "with a task_id and output_file. IMPORTANT: after launching, END YOUR TURN — do NOT read " +
-                  "the file or call any tool, and do NOT sleep/wait. You are notified automatically when it " +
-                  "completes; ONLY THEN read the output_file. Use for long-running skill scripts over SSH " +
+                  "with a task_id and output_file. After launching, END YOUR TURN by default (do NOT poll, sleep, " +
+                  "or read the output_file until the completion notification). EXCEPTION: when this is the server/listener " +
+                  "side of a paired test, do NOT wait — IMMEDIATELY run the counterpart, then read the output_file when " +
+                  "the test finishes (waiting for the server's completion first deadlocks: it blocks until the client " +
+                  "connects, then times out). Use for long-running skill scripts over SSH " +
                   "(orchestration, soak, perftest). The script is wrapped in `timeout` and capped (~3600s).",
               }),
             ),
