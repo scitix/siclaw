@@ -136,9 +136,11 @@ function SessionSidebar({
 
 interface AgentChatProps {
   agentId: string
+  selectedSessionId?: string | null
+  onSessionChange?: (sessionId: string | null) => void
 }
 
-export function AgentChat({ agentId }: AgentChatProps) {
+export function AgentChat({ agentId, selectedSessionId, onSessionChange }: AgentChatProps) {
   const toast = useToast()
   const confirmDialog = useConfirm()
   const [showSessions, setShowSessions] = useState(false)
@@ -146,6 +148,8 @@ export function AgentChat({ agentId }: AgentChatProps) {
   const [sessions, setSessions] = useState<ChatSession[]>([])
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const activeSessionIdRef = useRef<string | null>(null)
+  const selectedSessionIdRef = useRef<string | null | undefined>(selectedSessionId)
 
   // Panel state
   const [skillPanelMsg, setSkillPanelMsg] = useState<PilotMessage | null>(null)
@@ -155,6 +159,20 @@ export function AgentChat({ agentId }: AgentChatProps) {
 
   // Auto-title: track whether we already titled this session
   const titledSessionRef = useRef<string | null>(null)
+
+  const selectSession = useCallback((sessionId: string | null) => {
+    activeSessionIdRef.current = sessionId
+    setActiveSessionId(sessionId)
+    onSessionChange?.(sessionId)
+  }, [onSessionChange])
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId
+  }, [activeSessionId])
+
+  useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId
+  }, [selectedSessionId])
 
   // Pilot-style chat hook
   const pilot = usePilotChat({ agentId, sessionId: activeSessionId })
@@ -186,12 +204,24 @@ export function AgentChat({ agentId }: AgentChatProps) {
       try {
         setLoading(true)
         const res = await api<{ data: ChatSession[] }>(`/siclaw/agents/${agentId}/chat/sessions`)
-        const items = Array.isArray(res.data) ? res.data : Array.isArray(res) ? (res as any) : []
+        const items: ChatSession[] = Array.isArray(res.data)
+          ? res.data
+          : Array.isArray(res)
+            ? (res as ChatSession[])
+            : []
         if (!cancelled) {
           setSessions(items)
-          if (items.length > 0 && !activeSessionId) {
-            setActiveSessionId(items[0].id)
-          }
+          const hasSession = (sessionId: string | null | undefined) => (
+            Boolean(sessionId) && items.some((item) => item.id === sessionId)
+          )
+          const requestedSessionId = selectedSessionIdRef.current
+          const currentSessionId = activeSessionIdRef.current
+          const nextSessionId = hasSession(requestedSessionId)
+            ? requestedSessionId!
+            : hasSession(currentSessionId)
+              ? currentSessionId!
+              : items[0]?.id || null
+          selectSession(nextSessionId)
         }
       } catch (err: any) {
         if (!cancelled) toast.error(err.message || "Failed to load sessions")
@@ -203,7 +233,34 @@ export function AgentChat({ agentId }: AgentChatProps) {
     return () => {
       cancelled = true
     }
-  }, [agentId]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [agentId, selectSession, toast])
+
+  useEffect(() => {
+    if (selectedSessionId === undefined) return
+
+    const hasSession = (sessionId: string | null | undefined) => (
+      Boolean(sessionId) && sessions.some((item) => item.id === sessionId)
+    )
+
+    if (selectedSessionId && hasSession(selectedSessionId)) {
+      if (activeSessionId !== selectedSessionId) {
+        selectSession(selectedSessionId)
+      }
+      return
+    }
+
+    if (selectedSessionId && sessions.length > 0) {
+      const fallbackSessionId = hasSession(activeSessionId)
+        ? activeSessionId
+        : sessions[0].id
+      selectSession(fallbackSessionId)
+      return
+    }
+
+    if (!selectedSessionId && sessions.length === 0 && activeSessionId) {
+      selectSession(null)
+    }
+  }, [activeSessionId, selectedSessionId, selectSession, sessions])
 
   // Auto-generate title from first user message (only if still default name)
   useEffect(() => {
@@ -238,11 +295,11 @@ export function AgentChat({ agentId }: AgentChatProps) {
     try {
       const session = await api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
       setSessions((prev) => [session, ...prev])
-      setActiveSessionId(session.id)
+      selectSession(session.id)
     } catch (err: any) {
       toast.error(err.message || "Failed to create session")
     }
-  }, [agentId, toast])
+  }, [agentId, selectSession, toast])
 
   const handleDeleteSession = useCallback(
     async (sid: string) => {
@@ -255,16 +312,17 @@ export function AgentChat({ agentId }: AgentChatProps) {
       if (!ok) return
       try {
         await api(`/siclaw/agents/${agentId}/chat/sessions/${sid}`, { method: "DELETE" })
-        setSessions((prev) => prev.filter((s) => s.id !== sid))
+        const nextSessions = sessions.filter((s) => s.id !== sid)
+        setSessions(nextSessions)
         if (activeSessionId === sid) {
-          setActiveSessionId(null)
+          selectSession(nextSessions[0]?.id || null)
         }
         toast.success("Session deleted")
       } catch (err: any) {
         toast.error(err.message || "Failed to delete session")
       }
     },
-    [agentId, activeSessionId, toast, confirmDialog],
+    [agentId, activeSessionId, confirmDialog, selectSession, sessions, toast],
   )
 
   // Wrap send to also handle first-message session creation
@@ -275,7 +333,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
         api<ChatSession>(`/siclaw/agents/${agentId}/chat/sessions`, { method: "POST" })
           .then((session) => {
             setSessions((prev) => [session, ...prev])
-            setActiveSessionId(session.id)
+            selectSession(session.id)
             // Short delay to let state propagate
             setTimeout(() => pilot.send(text, attachments), 50)
           })
@@ -286,7 +344,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
       }
       pilot.send(text, attachments)
     },
-    [activeSessionId, agentId, pilot, toast],
+    [activeSessionId, agentId, pilot, selectSession, toast],
   )
 
   if (loading) {
@@ -314,7 +372,7 @@ export function AgentChat({ agentId }: AgentChatProps) {
               sessions={sessions}
               activeSessionId={activeSessionId}
               agentId={agentId}
-              onSelect={(id) => { setActiveSessionId(id); setShowSessions(false) }}
+              onSelect={(id) => { selectSession(id); setShowSessions(false) }}
               onNew={() => { handleNewSession(); setShowSessions(false) }}
               onDelete={handleDeleteSession}
               onRenamed={(sid, title) => setSessions(prev => prev.map(s => s.id === sid ? { ...s, title } : s))}

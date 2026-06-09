@@ -5,6 +5,7 @@ import { api, clearToken } from "../api"
 import { NotificationBell } from "../components/NotificationBell"
 import { useTheme } from "../hooks/useTheme"
 import { Chat } from "./Chat"
+import { CHAT_SELECTION_CHANGE_EVENT, chatPathFromStoredSelection } from "../lib/chatSelection"
 
 const siclawItems = [
   { path: "/chat", label: "Chat", icon: MessageSquare },
@@ -40,6 +41,7 @@ export function Layout() {
     location.pathname.startsWith("/settings")
   )
   const [isAdmin, setIsAdmin] = useState(false)
+  const [chatPath, setChatPath] = useState(() => chatPathFromStoredSelection())
 
   useEffect(() => {
     api<{ role: string }>("/auth/me")
@@ -50,6 +52,17 @@ export function Layout() {
   useEffect(() => {
     try { localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0") } catch { /* ignore */ }
   }, [collapsed])
+
+  useEffect(() => {
+    const updateChatPath = () => setChatPath(chatPathFromStoredSelection())
+    updateChatPath()
+    window.addEventListener(CHAT_SELECTION_CHANGE_EVENT, updateChatPath)
+    window.addEventListener("storage", updateChatPath)
+    return () => {
+      window.removeEventListener(CHAT_SELECTION_CHANGE_EVENT, updateChatPath)
+      window.removeEventListener("storage", updateChatPath)
+    }
+  }, [location.pathname, location.search])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -117,7 +130,7 @@ export function Layout() {
           {siclawItems.map(({ path, label, icon: Icon }) => (
             <Link
               key={path}
-              to={path}
+              to={path === "/chat" ? chatPath : path}
               title={collapsed ? label : undefined}
               className={`${rowBase} ${rowLayout} ${isActive(path) ? rowActive : rowIdle}`}
             >

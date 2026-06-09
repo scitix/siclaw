@@ -5,6 +5,7 @@ import { api, clearAgentMemory } from "../api"
 import { useToast } from "../components/toast"
 import { Tooltip } from "../components/tooltip"
 import { useConfirm } from "../components/confirm-dialog"
+import { buildChatPath, chatSessionForAgent } from "../lib/chatSelection"
 
 interface Agent {
   id: string; name: string; description: string; status: string
@@ -81,6 +82,10 @@ export function Agents() {
     const m = p?.models?.find((mo) => mo.model_id === agent.model_id)
     return m?.name || agent.model_id
   }
+
+  const chatPathForAgent = (agentId: string) => (
+    buildChatPath({ agentId, sessionId: chatSessionForAgent(agentId) })
+  )
 
   if (loading) return <div className="flex items-center justify-center h-full"><Loader2 className="h-6 w-6 animate-spin text-muted-foreground" /></div>
 
@@ -163,7 +168,7 @@ export function Agents() {
         ) : (
           <div className="px-6 py-4 space-y-2">
             {agents.map((a) => (
-              <div key={a.id} className="flex items-center gap-4 p-4 rounded-lg border border-border/50 hover:bg-secondary/20 cursor-pointer transition-colors" onClick={() => navigate(`/chat?agent=${a.id}`)}>
+              <div key={a.id} className="flex items-center gap-4 p-4 rounded-lg border border-border/50 hover:bg-secondary/20 cursor-pointer transition-colors" onClick={() => navigate(chatPathForAgent(a.id))}>
                 {/* Icon */}
                 <div className="h-10 w-10 rounded-lg flex items-center justify-center shrink-0 bg-secondary text-muted-foreground">
                   <Bot className="h-5 w-5" />
@@ -205,7 +210,7 @@ export function Agents() {
 
                 {/* Actions */}
                 <div className="flex items-center gap-0.5 shrink-0">
-                  <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(`/chat?agent=${a.id}`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
+                  <Tooltip content="Chat"><button onClick={(e) => { e.stopPropagation(); navigate(chatPathForAgent(a.id)) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><MessageSquare className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Fork"><button onClick={(e) => { e.stopPropagation(); handleFork(a) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Copy className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Clear Memory"><button onClick={(e) => { e.stopPropagation(); handleClearMemory(a.id) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Eraser className="h-4 w-4" /></button></Tooltip>
                   <Tooltip content="Settings"><button onClick={(e) => { e.stopPropagation(); navigate(`/agents/${a.id}?tab=basic`) }} className="p-1.5 rounded-md hover:bg-secondary text-muted-foreground hover:text-foreground"><Settings className="h-4 w-4" /></button></Tooltip>

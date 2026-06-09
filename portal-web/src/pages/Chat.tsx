@@ -1,8 +1,14 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useSearchParams, useLocation } from "react-router-dom"
 import { Bot, Loader2, MessageSquare, PanelLeftClose, PanelLeftOpen } from "lucide-react"
 import { api } from "../api"
 import { AgentChat } from "../components/AgentChat"
+import {
+  chatSessionForAgent,
+  readChatSelection,
+  rememberChatAgent,
+  rememberChatSession,
+} from "../lib/chatSelection"
 
 const AGENT_SELECTOR_COLLAPSED_KEY = "siclaw.agentSelector.collapsed"
 const AGENT_SELECTOR_OVERLAY_WIDTH = 220
@@ -16,7 +22,15 @@ export function Chat() {
   const location = useLocation()
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(searchParams.get("agent") || "")
+  const [selectedAgentId, setSelectedAgentId] = useState<string>(() => {
+    const selection = readChatSelection()
+    return searchParams.get("agent") || selection.lastAgentId || ""
+  })
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(() => {
+    const selection = readChatSelection()
+    const initialAgentId = searchParams.get("agent") || selection.lastAgentId || ""
+    return searchParams.get("session") || chatSessionForAgent(initialAgentId, selection)
+  })
   const [agentPreview, setAgentPreview] = useState<{ agentId: string; left: number; top: number } | null>(null)
   const [agentSelectorCollapsed, setAgentSelectorCollapsed] = useState<boolean>(() => {
     try {
@@ -26,28 +40,75 @@ export function Chat() {
     }
   })
 
-  // Sync agent selection when the URL's ?agent= param changes (e.g. deep link
-  // navigation while the component is always mounted in Layout).
+  const updateChatSearchParams = useCallback(
+    (agentId: string, sessionId: string | null, replace = false) => {
+      const pathname = typeof window === "undefined" ? location.pathname : window.location.pathname
+      if (!pathname.startsWith("/chat")) return
+
+      const next = new URLSearchParams()
+      next.set("agent", agentId)
+      if (sessionId) next.set("session", sessionId)
+      setSearchParams(next, { replace })
+    },
+    [location.pathname, setSearchParams],
+  )
+
+  // Sync selection when URL params change while Chat is kept mounted by Layout.
   const agentFromUrl = searchParams.get("agent")
+  const sessionFromUrl = searchParams.get("session")
   useEffect(() => {
-    if (agentFromUrl && agentFromUrl !== selectedAgentId) {
-      setSelectedAgentId(agentFromUrl)
+    if (!location.pathname.startsWith("/chat") || !agentFromUrl) {
+      return
+    }
+
+    const restoredSessionId = sessionFromUrl || chatSessionForAgent(agentFromUrl)
+    setSelectedAgentId((current) => (current === agentFromUrl ? current : agentFromUrl))
+    setSelectedSessionId((current) => (current === restoredSessionId ? current : restoredSessionId))
+
+    if (sessionFromUrl) {
+      rememberChatSession(agentFromUrl, sessionFromUrl)
+    } else {
+      rememberChatAgent(agentFromUrl)
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [agentFromUrl])
+  }, [agentFromUrl, sessionFromUrl, location.pathname])
 
   useEffect(() => {
+    const initialAgentFromUrl = searchParams.get("agent")
+    const initialSessionFromUrl = searchParams.get("session")
+
     api<{ data: Agent[] }>("/agents")
       .then((r) => {
         const list = Array.isArray(r.data) ? r.data : []
         setAgents(list)
-        // Auto-select first agent if none specified
-        if (!selectedAgentId && list.length > 0) {
-          setSelectedAgentId(list[0].id)
+        if (list.length === 0) return
+
+        const selection = readChatSelection()
+        const candidateAgentId = [
+          initialAgentFromUrl,
+          selectedAgentId,
+          selection.lastAgentId,
+        ].find((agentId): agentId is string => (
+          Boolean(agentId) && list.some((agent) => agent.id === agentId)
+        ))
+
+        const nextAgentId = candidateAgentId || list[0].id
+        const nextSessionId = nextAgentId === initialAgentFromUrl && initialSessionFromUrl
+          ? initialSessionFromUrl
+          : chatSessionForAgent(nextAgentId, selection)
+
+        setSelectedAgentId(nextAgentId)
+        setSelectedSessionId(nextSessionId)
+        if (nextSessionId) {
+          rememberChatSession(nextAgentId, nextSessionId)
+        } else {
+          rememberChatAgent(nextAgentId)
         }
+        updateChatSearchParams(nextAgentId, nextSessionId, true)
       })
       .catch(() => setAgents([]))
       .finally(() => setLoading(false))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -91,12 +152,25 @@ export function Chat() {
   }
 
   const handleSelectAgent = (agentId: string) => {
+    const nextSessionId = chatSessionForAgent(agentId)
     setSelectedAgentId(agentId)
-    collapseAgentSelector()
-    if (location.pathname.startsWith("/chat")) {
-      setSearchParams({ agent: agentId })
+    setSelectedSessionId(nextSessionId)
+    if (nextSessionId) {
+      rememberChatSession(agentId, nextSessionId)
+    } else {
+      rememberChatAgent(agentId)
     }
+    collapseAgentSelector()
+    updateChatSearchParams(agentId, nextSessionId)
   }
+
+  const handleSessionChange = useCallback((sessionId: string | null) => {
+    if (!selectedAgentId) return
+
+    setSelectedSessionId(sessionId)
+    rememberChatSession(selectedAgentId, sessionId)
+    updateChatSearchParams(selectedAgentId, sessionId, true)
+  }, [selectedAgentId, updateChatSearchParams])
 
   const handleShowAgentPreview = (agentId: string, element: HTMLElement) => {
     if (!agentSelectorCollapsed) return
@@ -252,7 +326,12 @@ export function Chat() {
       {/* Chat area */}
       <div className="flex-1 min-w-0 overflow-hidden">
         {selectedAgentId ? (
-          <AgentChat key={selectedAgentId} agentId={selectedAgentId} />
+          <AgentChat
+            key={selectedAgentId}
+            agentId={selectedAgentId}
+            selectedSessionId={selectedSessionId}
+            onSessionChange={handleSessionChange}
+          />
         ) : (
           <div className="flex flex-col items-center justify-center h-full">
             <MessageSquare className="h-12 w-12 text-muted-foreground/30 mb-3" />
