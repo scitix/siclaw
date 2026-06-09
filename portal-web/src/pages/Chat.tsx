@@ -168,11 +168,7 @@ export function Chat() {
     if (!selectedAgentId) return
 
     setSelectedSessionId(sessionId)
-    if (sessionId) {
-      rememberChatSession(selectedAgentId, sessionId)
-    } else {
-      rememberChatSession(selectedAgentId, null)
-    }
+    rememberChatSession(selectedAgentId, sessionId)
     updateChatSearchParams(selectedAgentId, sessionId, true)
   }, [selectedAgentId, updateChatSearchParams])
 
