@@ -1,18 +1,14 @@
 /**
- * Pure state model for scroll-to-select message copying.
+ * Pure state model for message-range copying.
  *
- * Auto-select by visibility: in select mode, every message that is (or scrolls)
- * into the viewport is selected automatically — no clicking. Selection
- * accumulates as you scroll up or down, so you "paint" a range just by scrolling
- * through it (mouse wheel or scrollbar, either direction). Checkboxes still let
- * you fine-tune: un-checking a message records it in `excluded` so a later scroll
- * past it won't re-select it.
+ * Selection starts from one sticky "Select following" boundary, then checkboxes
+ * let the user fine-tune individual messages.
  */
 
 export interface SelectionState {
   /** Currently selected message ids. */
   selected: ReadonlySet<string>
-  /** Ids the user explicitly un-checked — never auto-re-selected on scroll. */
+  /** Ids the user explicitly removed from the current selected range. */
   excluded: ReadonlySet<string>
 }
 
@@ -22,26 +18,26 @@ export function isSelected(state: SelectionState, id: string): boolean {
   return state.selected.has(id)
 }
 
-/**
- * Auto-select every currently-visible id, skipping ones the user un-checked.
- * Returns the SAME state object when nothing changed, so React skips the
- * re-render — cheap to call on every scroll tick.
- */
-export function selectVisible(state: SelectionState, visibleIds: readonly string[]): SelectionState {
-  let added = false
-  const selected = new Set(state.selected)
-  for (const id of visibleIds) {
-    if (state.excluded.has(id) || selected.has(id)) continue
-    selected.add(id)
-    added = true
-  }
-  return added ? { selected, excluded: state.excluded } : state
+/** Select a contiguous loaded range from `startIndex` through the end. */
+export function selectFollowing(ids: readonly string[], startIndex: number): SelectionState {
+  const safeStart = Math.max(0, Math.min(startIndex, ids.length))
+  return { selected: new Set(ids.slice(safeStart)), excluded: new Set() }
 }
 
 /**
- * Toggle one message via its checkbox (or a click on the bubble). Un-checking
- * records the id in `excluded` so scrolling past it again won't re-select it;
- * re-checking clears that.
+ * Toggle the current boundary range: selecting a new boundary replaces the
+ * range, while clicking the same fully-selected range clears it.
+ */
+export function toggleFollowing(ids: readonly string[], startIndex: number, state: SelectionState): SelectionState {
+  const next = selectFollowing(ids, startIndex)
+  if (sameSelectedIds(next.selected, state.selected)) return EMPTY_SELECTION
+  return next
+}
+
+/**
+ * Toggle one message via its checkbox (or a click on the bubble). Exclusions are
+ * kept so the state still records which selected range items were manually
+ * removed.
  */
 export function toggleMessage(state: SelectionState, id: string): SelectionState {
   const selected = new Set(state.selected)
@@ -56,15 +52,18 @@ export function toggleMessage(state: SelectionState, id: string): SelectionState
   return { selected, excluded }
 }
 
-/** Select every message (toolbar "All"); clears any manual exclusions. */
-export function selectAll(ids: readonly string[]): SelectionState {
-  return { selected: new Set(ids), excluded: new Set() }
-}
-
 export function selectedIds(state: SelectionState): Set<string> {
   return new Set(state.selected)
 }
 
 export function selectedCount(state: SelectionState): number {
   return state.selected.size
+}
+
+function sameSelectedIds(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const id of a) {
+    if (!b.has(id)) return false
+  }
+  return true
 }
