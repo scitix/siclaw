@@ -31,7 +31,9 @@ import { buildTaskNotificationText, type TaskNotification } from "./task-notific
 import type {
   BackgroundExecExecutor,
   JobStopExecutor,
+  TaskOutputReader,
 } from "./tool-registry.js";
+import { cleanupTaskOutput } from "../tools/cmd-exec/disk-output.js";
 
 export class TuiBackgroundHost {
   private jobs = new JobRegistry();
@@ -58,6 +60,9 @@ export class TuiBackgroundHost {
           /* already gone */
         }
       }
+      // The session is ending — the model won't read these again, so reclaim the output
+      // files now (in TUI/local mode the process is long-lived and nothing else GCs them).
+      if (job.outputFile) void cleanupTaskOutput(job.jobId);
     }
   }
 
@@ -82,6 +87,10 @@ export class TuiBackgroundHost {
   createJobStopExecutor(): JobStopExecutor {
     // Shared stop logic lives on JobRegistry (same as the agentbox path).
     return async (jobId) => this.jobs.stopJob(jobId);
+  }
+
+  createTaskOutputReader(): TaskOutputReader {
+    return (jobId) => this.jobs.snapshot(jobId);
   }
 
   private notify(jobId: string, n: TaskNotification): void {

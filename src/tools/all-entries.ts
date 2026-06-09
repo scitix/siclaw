@@ -39,6 +39,7 @@ import {
 } from "./workflow/task-tools.js";
 import { registration as spawnSubagent } from "./workflow/spawn-subagent.js";
 import { registration as jobStop } from "./workflow/job-stop.js";
+import { registration as taskOutput } from "./workflow/task-output.js";
 
 export const allToolEntries: ToolEntry[] = [
   // ── cmd-exec ──
@@ -51,5 +52,5 @@ export const allToolEntries: ToolEntry[] = [
   // ── workflow ──
   saveFeedback, manageSchedule, taskReport, skillPreview,
   taskCreateRegistration, taskUpdateRegistration, taskListRegistration, taskGetRegistration,
-  spawnSubagent, jobStop,
+  spawnSubagent, jobStop, taskOutput,
 ];

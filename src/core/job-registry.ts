@@ -14,7 +14,7 @@
  * (replacing the old inline `subagentJobs` map); the TUI host owns its own.
  */
 
-import type { JobStopResult } from "./tool-registry.js";
+import type { JobStopResult, TaskOutputSnapshot } from "./tool-registry.js";
 
 export type JobType = "subagent" | "bash" | "node" | "pod" | "host" | "local";
 
@@ -109,6 +109,17 @@ export class JobRegistry {
   setAbort(jobId: string, abort: () => void): void {
     const job = this.jobs.get(jobId);
     if (job) job.abort = abort;
+  }
+
+  /**
+   * Project a job to the status shape the task_output tool consumes. One owner of the
+   * registry→snapshot mapping so the agentbox and TUI readers can't drift.
+   */
+  snapshot(jobId: string): TaskOutputSnapshot {
+    const job = this.jobs.get(jobId);
+    return job
+      ? { found: true, status: job.status, exitCode: job.exitCode, outputFile: job.outputFile }
+      : { found: false };
   }
 
   /** All jobs, optionally filtered to one parent session. */

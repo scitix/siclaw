@@ -221,6 +221,7 @@ const buildSiclawOpts = (sm: SessionManager) => ({
   // stay TUI-unavailable; that needs the agentbox child-session machinery.)
   backgroundExecExecutor: tuiBackgroundHost.createBackgroundExecExecutor(),
   jobStopExecutor: tuiBackgroundHost.createJobStopExecutor(),
+  taskOutputReader: tuiBackgroundHost.createTaskOutputReader(),
 });
 
 const { brain, session, services, extensionsResult, modelFallbackMessage, customTools, skillsDirs, memoryIndexer, mcpManager } =
