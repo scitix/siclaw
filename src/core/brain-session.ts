@@ -47,6 +47,14 @@ export interface BrainProviderResponse {
   headers: Record<string, string>;
 }
 
+export interface BrainContextPreflightResult {
+  ok: boolean;
+  compacted: boolean;
+  tokens?: number;
+  contextWindow?: number;
+  errorMessage?: string;
+}
+
 export interface BrainSession {
   readonly brainType: BrainType;
 
@@ -89,6 +97,13 @@ export interface BrainSession {
 
   /** Find a model by provider + id. Returns undefined if not found. */
   findModel(provider: string, modelId: string): BrainModelInfo | undefined;
+
+  /**
+   * Optional preflight before prompting on the current model. Implementations
+   * can compact when a fallback candidate has a smaller context window than the
+   * active session history.
+   */
+  ensureContextForModelPrompt?(model: BrainModelInfo, text: string): Promise<BrainContextPreflightResult>;
 
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;

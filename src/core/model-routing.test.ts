@@ -49,6 +49,7 @@ function makePolicy(): ModelRoutePolicy {
 type BrainOutcome =
   | "ok"
   | "rate_limit"
+  | "tool_then_rate_limit"
   | "model_not_found"
   | "context"
   | "empty"
@@ -102,6 +103,31 @@ function makeBrain(outcomes: BrainOutcome[]): BrainSession & {
         return;
       }
       if (outcome === "rate_limit") {
+        emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+      if (outcome === "tool_then_rate_limit") {
+        emitter.emit("event", {
+          type: "tool_execution_start",
+          toolCallId: "call_1",
+          toolName: "read",
+          args: { path: "README.md" },
+        });
+        emitter.emit("event", {
+          type: "tool_execution_end",
+          toolCallId: "call_1",
+          toolName: "read",
+          result: { content: [{ type: "text", text: "ok" }] },
+          isError: false,
+        });
         emitter.emit("event", {
           type: "message_end",
           message: {
@@ -169,6 +195,7 @@ function makeBrain(outcomes: BrainOutcome[]): BrainSession & {
       setModelCalls.push(model);
     }),
     findModel: vi.fn((provider: string, id: string) => MODELS.find((model) => model.provider === provider && model.id === id)),
+    ensureContextForModelPrompt: vi.fn(async () => ({ ok: true, compacted: false })),
     registerProvider: vi.fn(),
     captureProviderResponse: vi.fn((listener) => {
       providerResponseListener = listener;
@@ -356,6 +383,130 @@ describe("runPromptWithModelRouting", () => {
     expect(state.activeCandidateKey).toBe("anthropic/claude");
     expect(state.cooldowns["openai/gpt-4"]).toBe(11_000);
     expect(events.some((event) => event.type === "model_route_switch")).toBe(true);
+  });
+
+  it("does not replay a prompt on fallback after a tool has executed", async () => {
+    const brain = makeBrain(["tool_then_rate_limit", "ok"]);
+    const state = createModelRouteState();
+    const routeEvents: ModelRouteEvent[] = [];
+    const brainEvents: unknown[] = [];
+
+    const result = await runPromptWithModelRouting(brain, "inspect then fail", makePolicy(), state, {
+      emitEvent: (event) => routeEvents.push(event),
+      emitBrainEvent: (event) => brainEvents.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(result.finalFailureKind).toBe("rate_limit");
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+    expect(brain.promptModels).toEqual(["openai/gpt-4"]);
+    expect(result.attempted[0]).toMatchObject({
+      failureKind: "rate_limit",
+      fallbackBlockedReason: "tool_execution",
+    });
+    expect(state.cooldowns["openai/gpt-4"]).toBe(11_000);
+    expect(routeEvents.some((event) => event.type === "model_route_switch")).toBe(false);
+    expect(routeEvents.find((event) => event.type === "model_route_exhausted")).toMatchObject({
+      failureKind: "rate_limit",
+      fallbackBlockedReason: "tool_execution",
+    });
+    expect(brainEvents.some((event) => isEventType(event, "tool_execution_end"))).toBe(true);
+    expect(brainEvents.some((event) => isEventType(event, "message_end"))).toBe(true);
+  });
+
+  it("runs context preflight before prompting each candidate", async () => {
+    const brain = makeBrain(["ok"]);
+    const state = createModelRouteState();
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, {
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(brain.ensureContextForModelPrompt).toHaveBeenCalledWith(MODELS[0], "hello");
+    expect(brain.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not prompt a candidate when context preflight cannot fit its window", async () => {
+    const brain = makeBrain(["ok"]);
+    brain.ensureContextForModelPrompt = vi.fn(async () => ({
+      ok: false,
+      compacted: true,
+      tokens: 300_000,
+      contextWindow: 128_000,
+      errorMessage: "Context preflight failed after compaction",
+    }));
+    const state = createModelRouteState();
+    const events: ModelRouteEvent[] = [];
+    const policy: ModelRoutePolicy = {
+      ...makePolicy(),
+      candidates: [{ provider: "openai", modelId: "gpt-4" }],
+    };
+
+    const result = await runPromptWithModelRouting(brain, "huge history", policy, state, {
+      emitEvent: (event) => events.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.exhausted).toBe(true);
+    expect(result.finalFailureKind).toBe("context_overflow");
+    expect(brain.prompt).not.toHaveBeenCalled();
+    expect(result.attempted[0]).toMatchObject({
+      failureKind: "context_overflow",
+      failureSource: "setup",
+      errorMessage: "Context preflight failed after compaction",
+    });
+    expect(events.some((event) => event.type === "model_route_switch")).toBe(false);
+    expect(events.find((event) => event.type === "model_route_exhausted")).toMatchObject({
+      failureKind: "context_overflow",
+    });
+  });
+
+  it("skips a preflight-overflow candidate and tries the next route candidate", async () => {
+    const brain = makeBrain(["rate_limit", "ok"]);
+    brain.ensureContextForModelPrompt = vi.fn(async (model: BrainModelInfo) => {
+      if (model.provider === "anthropic") {
+        return {
+          ok: false,
+          compacted: true,
+          tokens: 300_000,
+          contextWindow: 128_000,
+          errorMessage: "Context preflight failed after compaction",
+        };
+      }
+      return { ok: true, compacted: false };
+    });
+    const state = createModelRouteState();
+    const events: ModelRouteEvent[] = [];
+
+    const result = await runPromptWithModelRouting(brain, "huge history", makePolicy(), state, {
+      emitEvent: (event) => events.push(event),
+      now: () => 10_000,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.attempted.map((attempt) => attempt.candidateKey)).toEqual([
+      "openai/gpt-4",
+      "anthropic/claude",
+      "deepseek/deepseek-chat",
+    ]);
+    expect(result.attempted[1]).toMatchObject({
+      failureKind: "context_overflow",
+      failureSource: "setup",
+    });
+    expect(brain.promptModels).toEqual(["openai/gpt-4", "deepseek/deepseek-chat"]);
+    expect(state.cooldowns["openai/gpt-4"]).toBe(11_000);
+    expect(state.cooldowns["anthropic/claude"]).toBeUndefined();
+    expect(events.filter((event) => event.type === "model_route_switch")).toHaveLength(2);
+    expect(events.find((event): event is ModelRouteEvent & { type: "model_route_success" } =>
+      event.type === "model_route_success",
+    )).toMatchObject({
+      candidateKey: "deepseek/deepseek-chat",
+      isFallback: true,
+    });
   });
 
   it("classifies routed attempts using captured provider response status", async () => {
@@ -867,3 +1018,7 @@ describe("runPromptWithModelRouting", () => {
     });
   });
 });
+
+function isEventType(event: unknown, type: string): boolean {
+  return typeof event === "object" && event !== null && (event as { type?: unknown }).type === type;
+}
