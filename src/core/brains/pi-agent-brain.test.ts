@@ -256,6 +256,65 @@ describe("PiAgentBrain", () => {
     expect(session.modelRegistry.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
   });
 
+  it("restores a checkpoint by branching the session leaf and rebuilding agent messages", () => {
+    const checkpointMessages = [
+      { role: "user", content: [{ type: "text", text: "diagnose" }] },
+    ];
+    const partialFailedAttempt = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call-1", name: "bash", input: { command: "kubectl get pods" } }],
+    };
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn((id: string) => (id === "leaf-before-attempt" ? { id } : undefined)),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: checkpointMessages })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [...checkpointMessages, partialFailedAttempt] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(brain.createPromptCheckpoint()).toBe("leaf-before-attempt");
+
+    brain.restorePromptCheckpoint("leaf-before-attempt");
+
+    expect(sessionManager.getEntry).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.branch).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.resetLeaf).not.toHaveBeenCalled();
+    expect(session.agent.state.messages).toBe(checkpointMessages);
+    expect(session.agent.state.messages).not.toContain(partialFailedAttempt);
+  });
+
+  it("refuses to restore a missing string checkpoint", () => {
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn(() => undefined),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: [] })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(() => brain.restorePromptCheckpoint("missing-leaf")).toThrow(
+      "Prompt checkpoint entry not found: missing-leaf",
+    );
+    expect(sessionManager.branch).not.toHaveBeenCalled();
+    expect(sessionManager.buildSessionContext).not.toHaveBeenCalled();
+  });
+
   it("captureProviderResponse wraps pi-agent onResponse and restores it", async () => {
     const previous = vi.fn(async () => "ok");
     const session = makeFakeSession({ agent: { onResponse: previous } });

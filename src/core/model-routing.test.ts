@@ -693,6 +693,63 @@ describe("runPromptWithModelRouting", () => {
     expect(messageEnds[0].message.stopReason).toBe("stop");
   });
 
+  it("does not carry partial tool-use context into the fallback attempt after checkpoint restore", async () => {
+    const brain = makeBrain([]);
+    const state = createModelRouteState();
+    const checkpointContext = [
+      { role: "user", content: [{ type: "text", text: "diagnose" }] },
+    ];
+    const partialToolUse = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call-1", name: "bash", input: { command: "kubectl get pods" } }],
+    };
+    let context: any[] = [...checkpointContext];
+    let attempt = 0;
+    let fallbackContextAtPrompt: any[] | undefined;
+    const order: string[] = [];
+    const originalSetModel = brain.setModel.bind(brain);
+
+    brain.createPromptCheckpoint = vi.fn(() => [...context]);
+    brain.restorePromptCheckpoint = vi.fn(async (checkpoint) => {
+      order.push("restore");
+      context = [...(checkpoint as any[])];
+    });
+    brain.setModel = vi.fn(async (model: BrainModelInfo) => {
+      order.push(`setModel:${model.provider}/${model.id}`);
+      await originalSetModel(model);
+    });
+    brain.prompt = vi.fn(async () => {
+      attempt++;
+      order.push(`prompt:${attempt}`);
+      if (attempt === 1) {
+        context.push(partialToolUse);
+        brain.emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [partialToolUse.content[0]],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+
+      fallbackContextAtPrompt = [...context];
+      brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const result = await runPromptWithModelRouting(brain, "hello", makePolicy(), state, { now: () => 10_000 });
+
+    expect(result.success).toBe(true);
+    expect(fallbackContextAtPrompt).toEqual(checkpointContext);
+    expect(fallbackContextAtPrompt).not.toContain(partialToolUse);
+    expect(order).toEqual(["prompt:1", "restore", "setModel:anthropic/claude", "prompt:2"]);
+  });
+
   it("does not fallback for context overflow because pi-agent owns compaction recovery", async () => {
     const brain = makeBrain(["context", "ok"]);
     const state = createModelRouteState();
