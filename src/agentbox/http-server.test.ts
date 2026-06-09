@@ -431,6 +431,63 @@ describe("http-server — model routing", () => {
     expect(sm.persistModelRouteState).toHaveBeenCalledWith("route-fallback", s.modelRouteState);
   });
 
+  it("does not fallback by replaying the prompt after a tool has executed", async () => {
+    const s = await sm.getOrCreate("route-tool-side-effect");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "tool_execution_start",
+        toolCallId: "call_1",
+        toolName: "read",
+        args: { path: "README.md" },
+      });
+      s.brain.emitter.emit("event", {
+        type: "tool_execution_end",
+        toolCallId: "call_1",
+        toolName: "read",
+        result: { content: [{ type: "text", text: "ok" }] },
+        isError: false,
+      });
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "429 rate limit exceeded",
+        },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "route me after tool",
+      sessionId: "route-tool-side-effect",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4"]);
+    expect(s.modelRouteState.activeCandidateKey).toBeUndefined();
+    expect(s.modelRouteState.cooldowns["openai/gpt-4"]).toBeGreaterThan(0);
+    expect(s.modelRouteState.attempts[0]).toMatchObject({
+      failureKind: "rate_limit",
+      fallbackBlockedReason: "tool_execution",
+    });
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
+    expect(s._extraEventBuffer.find((event) => event.type === "model_route_exhausted")).toMatchObject({
+      failureKind: "rate_limit",
+      fallbackBlockedReason: "tool_execution",
+    });
+    expect(s._extraEventBuffer.some((event) => event.type === "tool_execution_end")).toBe(true);
+    expect(s._extraEventBuffer.some((event) =>
+      event.type === "message_end" && (event.message as any)?.stopReason === "error",
+    )).toBe(true);
+    expect(sm.persistModelRouteState).toHaveBeenCalledWith("route-tool-side-effect", s.modelRouteState);
+  });
+
   it("does not fallback on context overflow", async () => {
     const s = await sm.getOrCreate("route-context");
     const seenModels: string[] = [];
