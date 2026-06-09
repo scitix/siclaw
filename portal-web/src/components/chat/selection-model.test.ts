@@ -2,52 +2,49 @@ import { describe, it, expect } from "vitest"
 import {
   EMPTY_SELECTION,
   isSelected,
-  selectVisible,
+  selectFollowing,
   toggleMessage,
-  selectAll,
+  toggleFollowing,
   selectedIds,
   selectedCount,
 } from "./selection-model"
 
 const ids = (s: Parameters<typeof selectedIds>[0]) => [...selectedIds(s)].sort()
 
-describe("selection-model (visibility accumulate)", () => {
+describe("selection-model (explicit following range)", () => {
   it("selects nothing by default", () => {
     expect(selectedCount(EMPTY_SELECTION)).toBe(0)
   })
 
-  it("auto-selects whatever is currently visible", () => {
-    const s = selectVisible(EMPTY_SELECTION, ["b", "c"])
+  it("selects all loaded messages from the chosen divider", () => {
+    const s = selectFollowing(["a", "b", "c", "d"], 2)
+    expect(ids(s)).toEqual(["c", "d"])
+  })
+
+  it("clamps out-of-range dividers", () => {
+    expect(ids(selectFollowing(["a", "b"], -1))).toEqual(["a", "b"])
+    expect(ids(selectFollowing(["a", "b"], 99))).toEqual([])
+  })
+
+  it("replacing the range clears previous manual exclusions", () => {
+    let s = selectFollowing(["a", "b", "c"], 0)
+    s = toggleMessage(s, "b")
+    expect(ids(s)).toEqual(["a", "c"])
+    s = selectFollowing(["a", "b", "c"], 1)
     expect(ids(s)).toEqual(["b", "c"])
   })
 
-  it("accumulates as new messages scroll into view (up or down)", () => {
-    let s = selectVisible(EMPTY_SELECTION, ["c", "d"]) // initial screenful
-    s = selectVisible(s, ["d", "e"]) // scroll down
-    s = selectVisible(s, ["a", "b"]) // scroll up past the start
-    expect(ids(s)).toEqual(["a", "b", "c", "d", "e"])
-  })
-
-  it("returns the same state object when nothing new becomes visible", () => {
-    const s = selectVisible(EMPTY_SELECTION, ["a", "b"])
-    expect(selectVisible(s, ["a", "b"])).toBe(s)
-  })
-
-  it("un-checking excludes a message and scrolling past it won't re-select it", () => {
-    let s = selectVisible(EMPTY_SELECTION, ["a", "b", "c"])
-    s = toggleMessage(s, "b") // user un-checks b
+  it("un-checking excludes a message from the current range", () => {
+    let s = selectFollowing(["a", "b", "c"], 0)
+    s = toggleMessage(s, "b")
     expect(ids(s)).toEqual(["a", "c"])
-    s = selectVisible(s, ["a", "b", "c"]) // scroll past b again
-    expect(ids(s)).toEqual(["a", "c"]) // stays excluded
   })
 
   it("re-checking clears the exclusion", () => {
-    let s = selectVisible(EMPTY_SELECTION, ["a"])
+    let s = selectFollowing(["a"], 0)
     s = toggleMessage(s, "a") // off
     expect(isSelected(s, "a")).toBe(false)
     s = toggleMessage(s, "a") // on again
-    expect(isSelected(s, "a")).toBe(true)
-    s = selectVisible(s, ["a"]) // and stays on while visible
     expect(isSelected(s, "a")).toBe(true)
   })
 
@@ -56,12 +53,16 @@ describe("selection-model (visibility accumulate)", () => {
     expect(ids(s)).toEqual(["z"])
   })
 
-  it("selectAll selects all and resets exclusions", () => {
-    let s = selectVisible(EMPTY_SELECTION, ["a"])
-    s = toggleMessage(s, "a") // exclude a
-    s = selectAll(["a", "b", "c"])
+  it("toggleFollowing clears when the same range is already selected", () => {
+    let s = toggleFollowing(["a", "b", "c"], 1, EMPTY_SELECTION)
+    expect(ids(s)).toEqual(["b", "c"])
+    s = toggleFollowing(["a", "b", "c"], 1, s)
+    expect(ids(s)).toEqual([])
+  })
+
+  it("toggleFollowing replaces a previous range", () => {
+    let s = toggleFollowing(["a", "b", "c"], 1, EMPTY_SELECTION)
+    s = toggleFollowing(["a", "b", "c"], 0, s)
     expect(ids(s)).toEqual(["a", "b", "c"])
-    // exclusion cleared: scrolling keeps everything
-    expect(selectVisible(s, ["a", "b", "c"])).toBe(s)
   })
 })

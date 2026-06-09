@@ -34,9 +34,8 @@ import { downloadBlob } from "./svg-export"
 import { serializeMessagesToText, serializeMessagesToMarkdown, stripVisualizationFences, stripImageData } from "./transcript"
 import {
   EMPTY_SELECTION,
-  selectVisible,
+  toggleFollowing,
   toggleMessage,
-  selectAll as selectAllMessages,
   selectedIds as computeSelectedIds,
   type SelectionState,
 } from "./selection-model"
@@ -351,6 +350,7 @@ export function PilotArea({
 }: PilotAreaProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const selectBoundaryRef = useRef<HTMLDivElement>(null)
   const prevMsgCountRef = useRef(0)
   const userScrolledAwayRef = useRef(false)
   const needsScrollOnLoadRef = useRef(false)
@@ -444,7 +444,7 @@ export function PilotArea({
     [messages],
   )
   const hasVisibleMessages = renderMessages.length > 0
-  // The exact list rendered as rows, in order. Scroll-selection indexes into
+  // The exact list rendered as rows, in order. Range selection indexes into
   // this same list, so a row's data-msg-idx always maps back to the right message.
   const selectableMessages = renderMessages
   const latestEditableUserMessageId = useMemo(() => {
@@ -475,10 +475,9 @@ export function PilotArea({
     setEditingDraft("")
   }, [editingDraft, isLoading, wrappedSendMessage])
 
-  // --- Scroll-to-select copy ---
-  // Click a message to anchor, scroll to paint a contiguous band over the
-  // messages you pass, fine-tune with checkboxes, then copy the lot (images and
-  // all). See selection-model.ts for the pure state rules.
+  // --- Range selection copy ---
+  // Click the sticky "Select following" boundary to select a loaded message range,
+  // fine-tune with checkboxes, then copy/download the lot (images and all).
   const [selectMode, setSelectMode] = useState(false)
   const [selection, setSelection] = useState<SelectionState>(EMPTY_SELECTION)
   const selectModeRef = useRef(false)
@@ -504,32 +503,24 @@ export function PilotArea({
     setSelection((s) => toggleMessage(s, id))
   }, [])
 
-  // Scroll-to-select via IntersectionObserver: while in select mode, every
-  // message row that enters the viewport is auto-checked (accumulating, either
-  // scroll direction). The observer fires only on actual visibility changes —
-  // no per-scroll-event layout scans of the whole list — and its initial
-  // callback covers whatever is already on screen when select mode turns on.
-  useEffect(() => {
-    if (!selectMode) return
+  const getBoundaryStartIndex = useCallback(() => {
     const container = scrollContainerRef.current
-    if (!container) return
-    const visible = new Set<string>()
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          const id = (entry.target as HTMLElement).getAttribute("data-msg-id")
-          if (!id) continue
-          if (entry.isIntersecting) visible.add(id)
-          else visible.delete(id)
-        }
-        setSelection((s) => selectVisible(s, [...visible]))
-      },
-      { root: container, threshold: 0 },
-    )
-    container.querySelectorAll<HTMLElement>("[data-msg-id]").forEach((row) => io.observe(row))
-    return () => io.disconnect()
-    // Re-observe when the rendered list changes so new rows are tracked too.
-  }, [selectMode, selectableMessages])
+    if (!container) return 0
+
+    const boundaryBottom = selectBoundaryRef.current?.getBoundingClientRect().bottom
+      ?? container.getBoundingClientRect().top
+    const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-msg-id]"))
+    const firstBelowBoundary = rows.find((row) => row.getBoundingClientRect().bottom > boundaryBottom + 4)
+    const id = firstBelowBoundary?.getAttribute("data-msg-id")
+    const index = id ? selectableMessages.findIndex((m) => m.id === id) : selectableMessages.length
+    return index >= 0 ? index : 0
+  }, [selectableMessages])
+
+  const handleToggleFollowingBoundary = useCallback(() => {
+    const startIndex = getBoundaryStartIndex()
+    const ids = selectableMessages.map((m) => m.id)
+    setSelection((s) => toggleFollowing(ids, startIndex, s))
+  }, [getBoundaryStartIndex, selectableMessages])
 
   const selectedIdSet = useMemo(() => computeSelectedIds(selection), [selection])
   const selectedCount = selectedIdSet.size
@@ -556,24 +547,29 @@ export function PilotArea({
     const selected = selectableMessages.filter((m) => selectedIdSet.has(m.id))
     const base = `siclaw-chat-${selected.length}-messages`
 
-    // 1) Markdown — content verbatim, charts kept as ```chart spec blocks
-    //    (compact chart data; the HTML carries the rendered colour image).
-    const md = serializeMessagesToMarkdown(selected)
-    downloadBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), `${base}.md`)
-
-    // 2) Self-contained HTML — buildCopyHtml rasterizes charts/Mermaid to <img>,
-    //    which browsers always render, so double-clicking the .html shows them.
+    // Prefer one file per click: HTML when the rendered selection contains
+    // visuals, Markdown for plain text/tool transcripts.
     const container = scrollContainerRef.current
     if (container) {
-      const rowById = new Map(
-        Array.from(container.querySelectorAll<HTMLElement>("[data-msg-id]")).map(
-          (r) => [r.getAttribute("data-msg-id"), r] as const,
-        ),
-      )
-      const els = selected.map((m) => rowById.get(m.id)).filter((r): r is HTMLElement => !!r)
-      const { html } = await buildCopyHtml(els)
-      downloadBlob(new Blob([wrapChatHtml(html)], { type: "text/html;charset=utf-8" }), `${base}.html`)
+      try {
+        const rowById = new Map(
+          Array.from(container.querySelectorAll<HTMLElement>("[data-msg-id]")).map(
+            (r) => [r.getAttribute("data-msg-id"), r] as const,
+          ),
+        )
+        const els = selected.map((m) => rowById.get(m.id)).filter((r): r is HTMLElement => !!r)
+        const { html, hasVisual } = await buildCopyHtml(els)
+        if (hasVisual) {
+          downloadBlob(new Blob([wrapChatHtml(html)], { type: "text/html;charset=utf-8" }), `${base}.html`)
+          return
+        }
+      } catch (err) {
+        console.warn("[download] rich HTML export failed, falling back to Markdown:", err)
+      }
     }
+
+    const md = serializeMessagesToMarkdown(selected)
+    downloadBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), `${base}.md`)
   }, [selectedIdSet, selectableMessages])
 
   // Auto-scroll logic
@@ -604,8 +600,7 @@ export function PilotArea({
     prevMsgCountRef.current = messages.length
   }, [messages, scrollToBottom])
 
-  // Detect user scrolling away (scroll-to-select is handled by the
-  // IntersectionObserver above, not here).
+  // Detect user scrolling away.
   const handleScroll = useCallback(() => {
     const container = scrollContainerRef.current
     if (!container) return
@@ -638,29 +633,14 @@ export function PilotArea({
       {selectMode && (
         <div className="absolute top-2 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full border border-border bg-card/95 px-3 py-1.5 shadow-md shadow-black/10 backdrop-blur">
           <span className="text-xs font-medium text-foreground whitespace-nowrap">
-            {selectedCount > 0 ? `${selectedCount} selected` : "Scroll to select on-screen messages"}
+            {selectedCount > 0 ? `${selectedCount} selected` : "Use top boundary"}
           </span>
           <div className="h-3.5 w-px bg-border" />
           <button
             type="button"
-            onClick={() => setSelection(selectAllMessages(selectableMessages.map((m) => m.id)))}
-            className="px-2 py-0.5 rounded-md border border-border bg-secondary/40 text-xs font-medium text-foreground hover:bg-secondary transition-colors"
-          >
-            All
-          </button>
-          <button
-            type="button"
-            onClick={() => setSelection(EMPTY_SELECTION)}
-            disabled={selectedCount === 0}
-            className="px-2 py-0.5 rounded-md border border-border bg-secondary/40 text-xs font-medium text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:hover:bg-secondary/40"
-          >
-            Clear
-          </button>
-          <button
-            type="button"
             onClick={downloadSelection}
             disabled={selectedCount === 0}
-            title="Download selected as Markdown + HTML"
+            title="Download selected (HTML for visuals, Markdown otherwise)"
             className="flex items-center rounded-md border border-border bg-secondary/40 p-1 text-foreground hover:bg-secondary transition-colors disabled:opacity-40 disabled:hover:bg-secondary/40"
           >
             <Download className="h-4 w-4" />
@@ -719,6 +699,27 @@ export function PilotArea({
                 </div>
               )}
 
+              {selectMode && selectableMessages.length > 0 && (
+                <div
+                  ref={selectBoundaryRef}
+                  data-copy-ignore
+                  className="pointer-events-none sticky top-14 z-20 ml-8 flex items-center gap-2 bg-card/90 py-2 pr-2 backdrop-blur"
+                >
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      handleToggleFollowingBoundary()
+                    }}
+                    className="pointer-events-auto shrink-0 rounded-full border border-border bg-card/95 px-2.5 py-0.5 text-[11px] font-medium text-muted-foreground shadow-sm transition-colors hover:bg-secondary hover:text-foreground"
+                    title="Toggle this boundary and following messages"
+                  >
+                    Select following
+                  </button>
+                  <div className="h-px flex-1 bg-border/70" />
+                </div>
+              )}
+
               {selectableMessages.map((msg) => {
                 const childSessionId = msg.metadata?.kind === "delegation_event"
                   ? (msg.metadata as Record<string, unknown>).child_session_id
@@ -726,80 +727,81 @@ export function PilotArea({
                 const subStatus = (msg.metadata as Record<string, unknown> | undefined)?.status
                 const selected = selectMode && selectedIdSet.has(msg.id)
                 return (
-                <div
-                  key={msg.id}
-                  data-msg-id={msg.id}
-                  data-msg-role={msg.role}
-                  onClick={selectMode ? () => handleToggleMessage(msg.id) : undefined}
-                  className={cn(
-                    "relative rounded-xl transition-colors",
-                    // No row-level highlight — the checkbox alone signals selection.
-                    selectMode && "cursor-pointer px-2 -mx-2 py-1 hover:bg-secondary/30",
-                  )}
-                >
-                  {selectMode && (
-                    <button
-                      type="button"
-                      data-copy-ignore
-                      title={selected ? "Deselect" : "Select"}
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleToggleMessage(msg.id)
-                      }}
-                      className="absolute left-1.5 top-1.5 z-10 text-muted-foreground hover:text-foreground transition-colors"
-                    >
-                      {selected ? (
-                        <span className="flex h-3.5 w-3.5 items-center justify-center rounded-[4px] bg-blue-500 text-white">
-                          <Check className="h-2.5 w-2.5" strokeWidth={3} />
-                        </span>
-                      ) : (
-                        <Square className="h-3.5 w-3.5" />
+                  <div key={msg.id}>
+                    <div
+                      data-msg-id={msg.id}
+                      data-msg-role={msg.role}
+                      onClick={selectMode ? () => handleToggleMessage(msg.id) : undefined}
+                      className={cn(
+                        "relative rounded-xl transition-colors",
+                        // No row-level highlight — the checkbox alone signals selection.
+                        selectMode && "cursor-pointer px-2 -mx-2 py-1 hover:bg-secondary/30",
                       )}
-                    </button>
-                  )}
-                  <div className={cn(selectMode && "pl-8 pointer-events-none select-none")}>
-                    <MessageItem
-                      message={msg}
-                      sendMessage={wrappedSendMessage}
-                      showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
-                      dpActive={dpActive}
-                      canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
-                      editingContent={editingMessageId === msg.id ? editingDraft : null}
-                      onStartEditMessage={startEditingMessage}
-                      onEditMessageChange={setEditingDraft}
-                      onCancelEditMessage={cancelEditingMessage}
-                      onSubmitEditMessage={submitEditedMessage}
-                      onChipClick={(chip, meta) => {
-                        if (meta.isDpCheckpoint) {
-                          const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
-                          if (prefixChip) {
-                            setActivePrefix(prefixChip)
-                            setChipDraft(null)
-                            return
-                          }
-                        }
-                        setChipSeq((s) => s + 1)
-                        setChipDraft(chip.insertText + " ")
-                      }}
-                      onOpenSkillPanel={onOpenSkillPanel}
-                      onOpenSchedulePanel={onOpenSchedulePanel}
-                      agentId={agentId}
-                    />
-                    {typeof childSessionId === "string" && onOpenSubagent && (
-                      <div className="pl-12 -mt-1 mb-2">
+                    >
+                      {selectMode && (
                         <button
                           type="button"
-                          onClick={() => onOpenSubagent(childSessionId as string, typeof subStatus === "string" ? subStatus : undefined, "Sub-agent")}
-                          className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+                          data-copy-ignore
+                          title={selected ? "Deselect" : "Select"}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleToggleMessage(msg.id)
+                          }}
+                          className="absolute left-1.5 top-1.5 z-10 text-muted-foreground hover:text-foreground transition-colors"
                         >
-                          View sub-agent transcript →
+                          {selected ? (
+                            <span className="flex h-3.5 w-3.5 items-center justify-center rounded-[4px] bg-blue-500 text-white">
+                              <Check className="h-2.5 w-2.5" strokeWidth={3} />
+                            </span>
+                          ) : (
+                            <Square className="h-3.5 w-3.5" />
+                          )}
                         </button>
+                      )}
+                      <div className={cn(selectMode && "pl-8 pointer-events-none select-none")}>
+                        <MessageItem
+                          message={msg}
+                          sendMessage={wrappedSendMessage}
+                          showSuggestedReplies={msg.id === lastAssistantMsgId && !isLoading}
+                          dpActive={dpActive}
+                          canEditMessage={msg.id === latestEditableUserMessageId && !isLoading}
+                          editingContent={editingMessageId === msg.id ? editingDraft : null}
+                          onStartEditMessage={startEditingMessage}
+                          onEditMessageChange={setEditingDraft}
+                          onCancelEditMessage={cancelEditingMessage}
+                          onSubmitEditMessage={submitEditedMessage}
+                          onChipClick={(chip, meta) => {
+                            if (meta.isDpCheckpoint) {
+                              const prefixChip = DP_CHECKPOINT_PREFIX_CHIPS[chip.insertText.toUpperCase()]
+                              if (prefixChip) {
+                                setActivePrefix(prefixChip)
+                                setChipDraft(null)
+                                return
+                              }
+                            }
+                            setChipSeq((s) => s + 1)
+                            setChipDraft(chip.insertText + " ")
+                          }}
+                          onOpenSkillPanel={onOpenSkillPanel}
+                          onOpenSchedulePanel={onOpenSchedulePanel}
+                          agentId={agentId}
+                        />
+                        {typeof childSessionId === "string" && onOpenSubagent && (
+                          <div className="pl-12 -mt-1 mb-2">
+                            <button
+                              type="button"
+                              onClick={() => onOpenSubagent(childSessionId as string, typeof subStatus === "string" ? subStatus : undefined, "Sub-agent")}
+                              className="text-[11px] text-blue-400 hover:text-blue-300 hover:underline underline-offset-2"
+                            >
+                              View sub-agent transcript →
+                            </button>
+                          </div>
+                        )}
                       </div>
-                    )}
+                    </div>
                   </div>
-                </div>
                 )
-                })}
+              })}
 
               {/* Dig deeper — shown when agent produced a conclusion and user may want
                   to trace the root cause upstream. Hidden while a prefix chip is active. */}
