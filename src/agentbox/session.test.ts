@@ -6,7 +6,7 @@ import path from "node:path";
 /**
  * Tests for AgentBoxSessionManager.
  *
- * The module imports from @mariozechner/pi-coding-agent (SessionManager) and
+ * The module imports from @earendil-works/pi-coding-agent (SessionManager) and
  * from the core agent-factory (createSiclawSession). Both are replaced with
  * lightweight fakes so the tests focus on the manager's own state machine:
  * getOrCreate caching, release/close lifecycle, scheduleRelease timer
@@ -15,7 +15,7 @@ import path from "node:path";
 
 // ── Fakes/mocks (hoisted) ─────────────────────────────────────────────
 
-vi.mock("@mariozechner/pi-coding-agent", () => {
+vi.mock("@earendil-works/pi-coding-agent", () => {
   const g = globalThis as any;
   g.__frameworkEntriesState = g.__frameworkEntriesState ?? { entries: [] };
   class FakeFrameworkSessionManager {
@@ -494,6 +494,71 @@ describe("AgentBoxSessionManager — list + get + activeCount", () => {
     expect(mgr.activeCount()).toBe(1);
     await mgr.close("a");
     expect(mgr.activeCount()).toBe(0);
+  });
+
+  it("persists and rehydrates model route state across release/rebuild", async () => {
+    const mgr = new AgentBoxSessionManager();
+    const session = await mgr.getOrCreate("route-state");
+    session.modelRouteState.activeCandidateKey = "anthropic/claude";
+    session.modelRouteState.activeCandidateSource = "auto";
+    session.modelRouteState.cooldowns["openai/gpt-4"] = 12345;
+    mgr.persistModelRouteState(session.id, session.modelRouteState);
+
+    const statePath = path.join(_cfgUserDataDir, "agent", "sessions", "route-state", ".model-route-state.json");
+    for (let i = 0; i < 20 && !fs.existsSync(statePath); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(fs.existsSync(statePath)).toBe(true);
+
+    await mgr.close("route-state");
+    const restored = await mgr.getOrCreate("route-state");
+
+    expect(restored.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(restored.modelRouteState.activeCandidateSource).toBe("auto");
+    expect(restored.modelRouteState.cooldowns["openai/gpt-4"]).toBe(12345);
+  });
+
+  it("rehydrates sanitized model route state after manager restart", async () => {
+    const sessionId = "route-state-restart";
+    const stateDir = path.join(_cfgUserDataDir, "agent", "sessions", sessionId);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, ".model-route-state.json"),
+      JSON.stringify({
+        activeCandidateKey: "anthropic/claude",
+        activeCandidateSource: "user",
+        cooldowns: {
+          "openai/gpt-4": 12345,
+          "deepseek/deepseek-chat": "not-a-number",
+        },
+        attempts: Array.from({ length: 25 }, (_, index) => ({
+          attempt: index + 1,
+          candidateKey: `provider/model-${index + 1}`,
+          provider: "provider",
+          modelId: `model-${index + 1}`,
+          startedAt: index + 1,
+          finishedAt: index + 2,
+          success: index === 24,
+        })),
+        lastSwitchReason: "rate_limit",
+        lastSuccessAt: 777,
+        lastFailureAt: "bad",
+      }),
+      "utf8",
+    );
+
+    const restartedMgr = new AgentBoxSessionManager();
+    const restored = await restartedMgr.getOrCreate(sessionId);
+
+    expect(restored.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(restored.modelRouteState.activeCandidateSource).toBe("user");
+    expect(restored.modelRouteState.cooldowns).toEqual({ "openai/gpt-4": 12345 });
+    expect(restored.modelRouteState.attempts).toHaveLength(20);
+    expect(restored.modelRouteState.attempts[0].attempt).toBe(6);
+    expect(restored.modelRouteState.attempts.at(-1)?.attempt).toBe(25);
+    expect(restored.modelRouteState.lastSwitchReason).toBe("rate_limit");
+    expect(restored.modelRouteState.lastSuccessAt).toBe(777);
+    expect(restored.modelRouteState.lastFailureAt).toBeUndefined();
   });
 });
 

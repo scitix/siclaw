@@ -23,7 +23,7 @@
  * terminal where losing a "your background job finished" notice is worse than minor context drift.
  */
 
-import type { AgentSession } from "@mariozechner/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { JobRegistry } from "./job-registry.js";
 import { spawnBackgroundBash } from "./background-bash-runner.js";
 import { getBackgroundBashConcurrency } from "./subagent-registry.js";

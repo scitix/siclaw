@@ -1,6 +1,6 @@
 import type { ToolEntry } from "../../core/tool-registry.js";
 import { Type } from "@sinclair/typebox";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { KubeconfigRef } from "../../core/types.js";
 import { loadConfig } from "../../core/config.js";
 import { GatewayClient } from "../../agentbox/gateway-client.js";

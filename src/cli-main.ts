@@ -6,7 +6,7 @@ import {
   runPrintMode,
   SessionManager,
   type CreateAgentSessionRuntimeFactory,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { createSiclawSession } from "./core/agent-factory.js";
 import { TuiBackgroundHost } from "./core/tui-background-host.js";
 import { isMemoryEnabled, loadConfig, getDefaultLlm, setPortalSnapshot, validateLlmConfig } from "./core/config.js";
@@ -97,6 +97,7 @@ if (portalSnapshot) {
   setPortalSnapshot({
     providers: portalSnapshot.providers,
     default: portalSnapshot.default ?? undefined,
+    modelRouting: portalSnapshot.modelRouting,
     mcpServers: portalSnapshot.mcpServers,
   });
   // Materialize Portal skills into an ephemeral cache so pi-coding-agent's

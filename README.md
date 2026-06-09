@@ -46,7 +46,7 @@ A hosted preview of the Portal UI — 4 specialist agents, recorded investigatio
 
 ## Prerequisites
 
-- **Node.js >= 22.12.0** — [Download](https://nodejs.org/)
+- **Node.js >= 22.19.0** — [Download](https://nodejs.org/)
 - **npm** — Comes with Node.js
 - **kubectl** — Optional, only needed if you want Siclaw to investigate Kubernetes clusters
 

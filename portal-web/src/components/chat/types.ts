@@ -29,6 +29,24 @@ export interface MessageTiming {
   turnTotalMs?: number
 }
 
+export interface ModelRouteMetadata {
+  candidate_key?: string
+  provider?: string
+  model_id?: string
+  is_fallback?: boolean
+  primary_candidate_key?: string
+  switched_from_candidate_key?: string
+  switched_from_provider?: string
+  switched_from_model_id?: string
+  recovered_from_candidate_key?: string
+  recovered_from_provider?: string
+  recovered_from_model_id?: string
+  failure_kind?: string
+  error_message?: string
+  cooldown_until?: number
+  attempt?: number
+}
+
 /** Wire-compatible with siclaw's ErrorDetail (src/lib/error-envelope.ts) and
  *  the management server's ErrorDetail. See docs/design/error-envelope.md. */
 export interface ErrorDetail {

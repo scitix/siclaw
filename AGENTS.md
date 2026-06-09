@@ -64,7 +64,7 @@ snapshot, K8s/Docker/Helm, or user-facing workflows.
 ## Stack And Local Conventions
 
 ```text
-Runtime: Node.js >= 22.12.0, ESM-only
+Runtime: Node.js >= 22.19.0, ESM-only
 Language: TypeScript 5.9 strict, .js imports
 Tests: vitest
 Frontend: React + Vite + Tailwind

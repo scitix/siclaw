@@ -36,6 +36,7 @@ const PORTAL_SCHEMA_SQLS: string[] = [
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     model_provider VARCHAR(100),
     model_id VARCHAR(255),
+    model_routing TEXT,
     system_prompt TEXT,
     is_production TINYINT(1) NOT NULL DEFAULT 1,
     icon VARCHAR(50),
@@ -497,6 +498,7 @@ export async function runPortalMigrations(): Promise<void> {
   // databases (e.g. idx_agent_task_runs_session on agent_task_runs.session_id,
   // which was added in a later migration than the CREATE TABLE).
   await safeAlterTable(db, "clusters", "debug_image", "VARCHAR(500) DEFAULT NULL");
+  await safeAlterTable(db, "agents", "model_routing", "TEXT DEFAULT NULL");
   await safeAlterTable(db, "agent_task_runs", "session_id", "CHAR(36) DEFAULT NULL");
   await safeAlterTable(db, "agent_tasks", "last_manual_run_at", "TIMESTAMP NULL DEFAULT NULL");
   await safeAlterTable(db, "skills", "is_builtin", "TINYINT(1) NOT NULL DEFAULT 0");

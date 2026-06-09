@@ -28,6 +28,7 @@ import type {
   CliSnapshotAgentMeta,
   CliSnapshotActiveAgent,
 } from "../portal/cli-snapshot-api.js";
+import type { ModelRoutePolicy } from "../core/model-routing.js";
 
 const CLI_SNAPSHOT_SECRET_HEADER = "X-Siclaw-Cli-Snapshot-Secret";
 
@@ -49,6 +50,7 @@ export interface PortalSnapshot {
     }>;
   }>;
   default: { provider: string; modelId: string } | null;
+  modelRouting?: ModelRoutePolicy;
   mcpServers: Record<string, unknown>;
   skills: CliSnapshotSkill[];
   knowledge: CliSnapshotKnowledgeRepo[];

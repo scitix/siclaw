@@ -9,7 +9,7 @@
  * loader mid-session. Multi-agent parallel use = multiple terminals.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { CliSnapshotAgentMeta, CliSnapshotActiveAgent } from "../../portal/cli-snapshot-types.js";
 
 export interface AgentExtensionDeps {

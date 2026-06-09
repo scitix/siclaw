@@ -12,8 +12,8 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { renderTextResult } from "../infra/tool-render.js";
 import type { ToolEntry, ToolRefs, SpawnSubagentResult } from "../../core/tool-registry.js";
 import { getSubagentType, listSubagentTypes, DEFAULT_SUBAGENT_TYPE, RUN_IN_BACKGROUND_ENABLED } from "../../core/subagent-registry.js";

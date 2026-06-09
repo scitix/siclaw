@@ -181,6 +181,46 @@ describe("chat-gateway routes", () => {
       }));
     });
 
+    it("forwards agent modelRouting to Runtime chat.send", async () => {
+      query
+        .mockResolvedValueOnce([[{
+          model_provider: "openai",
+          model_id: "gpt-4",
+          model_routing: JSON.stringify({
+            enabled: true,
+            candidates: [{ provider: "anthropic", modelId: "claude" }],
+          }),
+        }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []])
+        .mockResolvedValueOnce([[{ id: "p1", name: "openai", base_url: "u", api_key: "k", api_type: "openai" }], []])
+        .mockResolvedValueOnce([[{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }], []])
+        .mockResolvedValueOnce([[{ id: "p2", name: "anthropic", base_url: "a", api_key: "ak", api_type: "anthropic" }], []])
+        .mockResolvedValueOnce([[{ model_id: "claude", name: "Claude", reasoning: 1, context_window: 200000, max_tokens: 8192 }], []]);
+
+      const res = fakeRes();
+      const req = fakeReq({
+        url: "/api/v1/siclaw/agents/a1/chat/send",
+        method: "POST",
+        headers: { authorization: `Bearer ${USER_TOKEN}` },
+        body: { text: "hi", session_id: "s1" },
+      });
+
+      router.handle(req, res);
+
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+      await new Promise(r => setImmediate(r));
+
+      const command = (connMap.sendCommand as any).mock.calls[0][2];
+      expect(command.modelRouting.candidates).toEqual([
+        expect.objectContaining({ provider: "openai", modelId: "gpt-4" }),
+        expect.objectContaining({ provider: "anthropic", modelId: "claude" }),
+      ]);
+      expect(command.modelRouting.candidates[1].modelConfig.apiKey).toBe("ak");
+    });
+
     it("calls OCR backend for chat attachments and forwards extracted evidence", async () => {
       vi.stubEnv("SICLAW_OCR_BACKEND_URL", "http://siclaw-ocr-backend:8088/parse");
       const fetchMock = vi.fn().mockResolvedValue({

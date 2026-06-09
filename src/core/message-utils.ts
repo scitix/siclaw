@@ -5,7 +5,7 @@
  * (compaction, compaction-safeguard, session-tool-result-guard)
  * without coupling unrelated concerns.
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export type ToolCallLike = { id: string; name?: string };
 

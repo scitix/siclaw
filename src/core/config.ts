@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { normalizeModelRoutePolicy, type ModelRoutePolicy } from "./model-routing.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,6 +52,7 @@ export interface EmbeddingConfig {
 export interface SiclawConfig {
   providers: Record<string, ProviderConfig>;
   default?: { provider: string; modelId: string };
+  modelRouting?: ModelRoutePolicy;
   embedding?: EmbeddingConfig;
   paths: { userDataDir: string; skillsDir: string; credentialsDir: string; reposDir: string; docsDir: string; knowledgeDir: string };
   server: { port: number; gatewayUrl: string };
@@ -172,6 +174,7 @@ export function getConfigPath(): string {
 let snapshotOverride: {
   providers?: SiclawConfig["providers"];
   default?: SiclawConfig["default"];
+  modelRouting?: SiclawConfig["modelRouting"];
   mcpServers?: SiclawConfig["mcpServers"];
 } | null = null;
 
@@ -179,6 +182,7 @@ export function setPortalSnapshot(
   override: {
     providers?: SiclawConfig["providers"];
     default?: SiclawConfig["default"];
+    modelRouting?: SiclawConfig["modelRouting"];
     mcpServers?: SiclawConfig["mcpServers"];
   } | null,
 ): void {
@@ -210,10 +214,15 @@ export function loadConfig(): SiclawConfig {
     if (snapshotOverride.default) {
       cached.default = snapshotOverride.default;
     }
+    if (snapshotOverride.modelRouting) {
+      cached.modelRouting = snapshotOverride.modelRouting;
+    }
     if (snapshotOverride.mcpServers && Object.keys(snapshotOverride.mcpServers).length > 0) {
       cached.mcpServers = snapshotOverride.mcpServers;
     }
   }
+
+  cached.modelRouting = normalizeModelRoutePolicy(cached.modelRouting);
 
   // Environment variable overrides (deployment/infrastructure only — NOT LLM config)
   if (process.env.SICLAW_AGENTBOX_PORT) {

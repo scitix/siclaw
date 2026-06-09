@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback, useMemo, useLayoutEffect } from "react"
-import type { KeyboardEvent } from "react"
+import type { KeyboardEvent as ReactKeyboardEvent } from "react"
 import { formatToolInput } from "../../hooks/usePilotChat"
 import {
   Terminal,
@@ -24,6 +24,7 @@ import {
   Square,
   X,
   Download,
+  CircleAlert,
 } from "lucide-react"
 import { cn } from "./cn"
 import { Markdown } from "./Markdown"
@@ -45,7 +46,15 @@ import { SkillCard } from "./SkillCard"
 import { ScheduleCard } from "./ScheduleCard"
 import { ErrorBubble } from "./ErrorBubble"
 import { stripAttachmentOcrEvidence } from "./user-message-text"
-import type { ChatAttachment, PilotMessage, ContextUsage, ActionChip, PrefixActionChip, MessageTiming } from "./types"
+import type {
+  ChatAttachment,
+  PilotMessage,
+  ContextUsage,
+  ActionChip,
+  PrefixActionChip,
+  MessageTiming,
+  ModelRouteMetadata,
+} from "./types"
 
 // Wrap copy-ready message HTML in a minimal self-contained document for the
 // Markdown-export's companion .html file. Charts are inline PNG <img>, which
@@ -112,6 +121,109 @@ function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
   return (
     <span data-copy-ignore className="text-xs text-muted-foreground/70 tabular-nums select-text cursor-text">
       thinking {formatTimingMs(total)}
+    </span>
+  )
+}
+
+function stringMeta(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function numberMeta(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function modelRouteMetadata(message: PilotMessage): ModelRouteMetadata | null {
+  const route = message.metadata?.model_route
+  if (!route || typeof route !== "object" || Array.isArray(route)) return null
+  return route as ModelRouteMetadata
+}
+
+function isModelRouteNoticeMessage(message: PilotMessage): boolean {
+  return message.metadata?.kind === "model_route_notice"
+}
+
+function isVisibleChatMessage(message: PilotMessage): boolean {
+  return !message.hidden && !isModelRouteNoticeMessage(message)
+}
+
+function routeModelLabel(provider?: string, modelId?: string): string {
+  return provider && modelId ? `${provider}/${modelId}` : provider || modelId || "unknown"
+}
+
+function routeModelDisplayName(modelId?: string, provider?: string): string {
+  if (!modelId) return provider || "unknown"
+  const parts = modelId.split("/").filter(Boolean)
+  return parts[parts.length - 1] || modelId
+}
+
+function formatCooldown(until: unknown): string | undefined {
+  const value = numberMeta(until)
+  if (value == null) return undefined
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function ModelRouteIndicator({ route }: { route: ModelRouteMetadata | null }) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLSpanElement>(null)
+  const isFallback = Boolean(route?.is_fallback)
+
+  useEffect(() => {
+    if (!open || !isFallback) return
+    const closeOnOutside = (event: MouseEvent) => {
+      if (rootRef.current?.contains(event.target as Node)) return
+      setOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false)
+    }
+    document.addEventListener("mousedown", closeOnOutside)
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutside)
+      document.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [open, isFallback])
+
+  if (!route?.model_id && !route?.provider) return null
+
+  const displayName = routeModelDisplayName(route.model_id, route.provider)
+  const title = `Model: ${displayName}`
+
+  return (
+    <span
+      ref={rootRef}
+      data-copy-ignore
+      title={title}
+      className="relative inline-flex h-5 max-w-[12rem] items-center gap-1 rounded-md px-1 text-xs leading-none text-muted-foreground/70"
+    >
+      {isFallback && (
+        <button
+          type="button"
+          aria-label="Fallback model explanation"
+          aria-expanded={open}
+          title="Fallback model"
+          onClick={() => setOpen((value) => !value)}
+          className={cn(
+            "inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors",
+            "text-muted-foreground/55 hover:bg-secondary hover:text-muted-foreground",
+            open && "bg-secondary text-muted-foreground",
+          )}
+        >
+          <CircleAlert className="h-3 w-3" />
+        </button>
+      )}
+      <span className="truncate">{displayName}</span>
+      {open && isFallback && (
+        <span
+          role="status"
+          className="absolute left-0 top-full z-50 mt-1.5 w-64 rounded-md border border-border bg-card px-3 py-2 text-left text-[11px] leading-snug text-muted-foreground shadow-md shadow-black/10"
+        >
+          This reply used a fallback model after the primary model was unavailable.
+        </span>
+      )}
     </span>
   )
 }
@@ -296,7 +408,7 @@ export function PilotArea({
 
   // Find last assistant message id
   const lastAssistantMsgId = useMemo(() => {
-    const visible = messages.filter((m) => !m.hidden)
+    const visible = messages.filter(isVisibleChatMessage)
     for (let i = visible.length - 1; i >= 0; i--) {
       if (visible[i].role === "assistant") return visible[i].id
       if (visible[i].role === "user") return null
@@ -320,12 +432,21 @@ export function PilotArea({
     if (turnStart < 0) return false
     return messages
       .slice(turnStart + 1)
-      .some((m) => m.role === "assistant" && !m.isStreaming && (m.content?.trim().length ?? 0) > 0)
+      .some((m) =>
+        m.role === "assistant" &&
+        !m.isStreaming &&
+        !isModelRouteNoticeMessage(m) &&
+        (m.content?.trim().length ?? 0) > 0
+      )
   }, [messages, isLoading, dpActive])
-  const renderMessages = useMemo(() => withDelegationStatusNotices(messages), [messages])
+  const renderMessages = useMemo(
+    () => withDelegationStatusNotices(messages).filter(isVisibleChatMessage),
+    [messages],
+  )
+  const hasVisibleMessages = renderMessages.length > 0
   // The exact list rendered as rows, in order. Scroll-selection indexes into
   // this same list, so a row's data-msg-idx always maps back to the right message.
-  const selectableMessages = useMemo(() => renderMessages.filter((m) => !m.hidden), [renderMessages])
+  const selectableMessages = renderMessages
   const latestEditableUserMessageId = useMemo(() => {
     for (let i = renderMessages.length - 1; i >= 0; i--) {
       const message = renderMessages[i]
@@ -493,7 +614,7 @@ export function PilotArea({
     userScrolledAwayRef.current = distanceFromBottom > 300
   }, [])
 
-  const visibleForCopy = useMemo(() => messages.filter((m) => !m.hidden), [messages])
+  const visibleForCopy = useMemo(() => messages.filter(isVisibleChatMessage), [messages])
 
   return (
     <div className="flex-1 flex flex-col h-full bg-card relative">
@@ -570,7 +691,7 @@ export function PilotArea({
               <Loader2 className="w-8 h-8 animate-spin text-muted-foreground/50 mb-4" />
               <p className="text-sm">Loading messages...</p>
             </div>
-          ) : messages.length === 0 ? (
+          ) : !hasVisibleMessages ? (
             <div className="flex flex-col items-center justify-center py-20 text-muted-foreground/70">
               <MessageSquare className="w-12 h-12 text-gray-200 mb-4" />
               <p className="text-sm text-muted-foreground">Send a message to start the conversation</p>
@@ -712,7 +833,7 @@ export function PilotArea({
         onRemovePending={onRemovePending}
         dpActive={dpActive}
         onSetDpActive={onSetDpActive}
-        hasMessages={messages.length > 0}
+        hasMessages={hasVisibleMessages}
         draft={chipDraft}
         draftSeq={chipSeq}
         historyMessages={userMessageHistory}
@@ -1117,7 +1238,7 @@ function withDelegationStatusNotices(messages: PilotMessage[]): PilotMessage[] {
 
     const hasSyntheticReply = messages
       .slice(i + 1)
-      .some((candidate) => candidate.role === "assistant" && !candidate.hidden)
+      .some((candidate) => candidate.role === "assistant" && isVisibleChatMessage(candidate))
     if (hasSyntheticReply) continue
 
     next.push({
@@ -1379,6 +1500,10 @@ function MessageItem({
     return <DelegationStatusNotice content={message.content} />
   }
 
+  if (message.metadata?.kind === "model_route_notice") {
+    return <ModelRouteNotice message={message} />
+  }
+
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
@@ -1431,6 +1556,7 @@ function MessageItem({
     : suggestedChips
   const editableText = isUser ? getEditableUserText(message.content) : ""
   const canRenderEditor = !!onEditMessageChange && !!onCancelEditMessage && !!onSubmitEditMessage
+  const route = !isUser && !isTool ? modelRouteMetadata(message) : null
 
   return (
     <div className={cn("flex gap-4 group", isUser ? "flex-row-reverse" : "flex-row")}>
@@ -1446,9 +1572,10 @@ function MessageItem({
       </div>
 
       <div className={cn("flex flex-col min-w-0", isUser ? "items-end" : "items-start")}>
-        <div className="flex items-baseline gap-2 mb-1">
+        <div className="flex flex-wrap items-center gap-2 mb-1 min-w-0">
           <span className="text-sm font-semibold text-foreground">{isUser ? "You" : "Siclaw"}</span>
           <span className="text-xs text-muted-foreground/70">{message.timestamp}</span>
+          {!isUser && <ModelRouteIndicator route={route} />}
           {!isUser && <ModelTimeLabel timing={message.timing} />}
           {message.isStreaming && !isUser && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground/70" />}
         </div>
@@ -1552,6 +1679,39 @@ function DelegationStatusNotice({ content }: { content: string }) {
         <span className="font-medium">{headline}</span>
         {detail && <span className="text-blue-300/70">·</span>}
         {detail && <span className="truncate">{detail}</span>}
+      </div>
+    </div>
+  )
+}
+
+function ModelRouteNotice({ message }: { message: PilotMessage }) {
+  const metadata = message.metadata ?? {}
+  const eventType = stringMeta(metadata.event_type)
+  const from = routeModelLabel(stringMeta(metadata.from_provider), stringMeta(metadata.from_model_id))
+  const to = routeModelLabel(stringMeta(metadata.to_provider), stringMeta(metadata.to_model_id))
+  const failureKind = stringMeta(metadata.failure_kind)
+  const cooldown = formatCooldown(metadata.cooldown_until)
+  const isRecovery = eventType === "model_route.recovered"
+  const title = [
+    isRecovery ? `Recovered to ${to}` : `Switched from ${from} to ${to}`,
+    failureKind ? `Reason: ${failureKind}` : undefined,
+    stringMeta(metadata.error_message),
+    cooldown ? `Primary cooldown until ${cooldown}` : undefined,
+  ].filter(Boolean).join("\n")
+
+  return (
+    <div className="pl-12 min-w-0" data-copy-ignore>
+      <div
+        title={title}
+        className={cn(
+          "inline-flex max-w-3xl items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm shadow-black/10",
+          isRecovery
+            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700"
+            : "border-amber-500/30 bg-amber-500/10 text-amber-700",
+        )}
+      >
+        <ArrowRight className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium truncate">{message.content}</span>
       </div>
     </div>
   )
@@ -1680,7 +1840,7 @@ function EditableUserMessage({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Escape" && !isComposingRef.current && !event.nativeEvent.isComposing) {
       event.preventDefault()
       onCancel()

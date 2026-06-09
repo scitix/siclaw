@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import type { ExtensionAPI, ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 /** Shorthand for the UI subset of ExtensionCommandContext used by setup handlers. */
 type SetupCtx = Pick<ExtensionCommandContext, "ui" | "hasUI">;

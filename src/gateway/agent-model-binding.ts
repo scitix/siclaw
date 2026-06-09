@@ -6,6 +6,7 @@
  */
 
 import type { FrontendWsClient } from "./frontend-ws-client.js";
+import type { ModelRoutePolicy } from "../core/model-routing.js";
 
 export interface ResolvedModelBinding {
   modelProvider: string;
@@ -27,6 +28,7 @@ export interface ResolvedModelBinding {
       compat?: Record<string, unknown>;
     }>;
   };
+  modelRouting?: ModelRoutePolicy;
 }
 
 export async function resolveAgentModelBinding(

@@ -204,6 +204,89 @@ describe("notifyParent", () => {
     expect(btd).toHaveLength(1); // refetch trigger fired so the UI shows the report
   });
 
+  it("routes an idle synthetic turn through fallback using the session's last modelRouting policy", async () => {
+    const mgr = new AgentBoxSessionManager() as any;
+    const listeners = new Set<(event: any) => void>();
+    const emit = (event: any) => {
+      for (const listener of listeners) listener(event);
+    };
+    const models = [
+      { id: "gpt-4", provider: "openai", name: "GPT-4" },
+      { id: "claude", provider: "anthropic", name: "Claude" },
+    ];
+    let currentModel = models[0];
+    const seenModels: string[] = [];
+    const brain = {
+      followUp: vi.fn(async () => {}),
+      subscribe: vi.fn((fn: (e: any) => void) => {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      }),
+      prompt: vi.fn(async () => {
+        seenModels.push(`${currentModel.provider}/${currentModel.id}`);
+        if (currentModel.provider === "openai") {
+          emit({
+            type: "message_end",
+            message: {
+              role: "assistant",
+              content: [],
+              stopReason: "error",
+              errorMessage: "429 rate limit exceeded",
+            },
+          });
+          return;
+        }
+        emit({
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "fallback synthetic report" }],
+            stopReason: "stop",
+          },
+        });
+      }),
+      getModel: vi.fn(() => currentModel),
+      findModel: vi.fn((provider: string, id: string) =>
+        models.find((model) => model.provider === provider && model.id === id),
+      ),
+      setModel: vi.fn(async (model: typeof currentModel) => { currentModel = model; }),
+    };
+    const managed = fakeManaged("s1", brain as any, true);
+    managed.modelRouteState = { cooldowns: {}, attempts: [] };
+    managed.modelRoutePolicy = {
+      enabled: true,
+      strategy: "ordered_fallback",
+      cooldownMsByKind: { rate_limit: 1000 },
+      candidates: [
+        { provider: "openai", modelId: "gpt-4" },
+        { provider: "anthropic", modelId: "claude" },
+      ],
+    };
+    mgr.sessions.set("s1", managed);
+    mgr.persistModelRouteState = vi.fn();
+    mgr.jobs.register({ jobId: "sa1", type: "subagent", parentSessionId: "s1", description: "compute", status: "completed", startedAt: 0, notified: false });
+    const send = vi.fn(async () => ({ ok: true, id: "x" }));
+    mgr.gatewayClient = { sendDelegationPersistenceEvent: send };
+    mgr.agentId = "agent-1";
+
+    await mgr.notifyParent("s1", "sa1", { taskId: "sa1", status: "completed", summary: "result" });
+    await flushCoalesce();
+
+    expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(managed.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    const events = send.mock.calls.map((c) => c[0]);
+    const report = events
+      .filter((e: any) => e?.type === "delegation.append_message")
+      .find((e: any) => (e.message?.content || "").includes("fallback synthetic report"));
+    expect(report?.message?.metadata?.model_route).toMatchObject({
+      provider: "anthropic",
+      model_id: "claude",
+      is_fallback: true,
+      switched_from_provider: "openai",
+      failure_kind: "rate_limit",
+    });
+  });
+
   it("a text-only synthetic turn for a BASH job (output_file present) is still dropped (pure ack)", async () => {
     const mgr = new AgentBoxSessionManager() as any;
     let cb: ((e: any) => void) | undefined;
