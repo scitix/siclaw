@@ -114,6 +114,31 @@ describe("AgentBoxClient — prompt + session CRUD", () => {
     expect(req.headers["content-type"]).toBe("application/json");
   });
 
+  it("prompt() preserves optional modelRouting policy", async () => {
+    await client.prompt({
+      text: "hi",
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "openai", modelId: "gpt-4" },
+          { provider: "anthropic", modelId: "claude" },
+        ],
+      },
+    });
+
+    const req = srv.captures[srv.captures.length - 1];
+    expect(req.url).toBe("/api/prompt");
+    expect(JSON.parse(req.body).modelRouting).toEqual({
+      enabled: true,
+      strategy: "ordered_fallback",
+      candidates: [
+        { provider: "openai", modelId: "gpt-4" },
+        { provider: "anthropic", modelId: "claude" },
+      ],
+    });
+  });
+
   it("listSessions() returns the parsed sessions array", async () => {
     const r = await client.listSessions();
     expect(r.sessions).toHaveLength(1);

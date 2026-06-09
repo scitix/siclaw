@@ -11,8 +11,8 @@
  * - context: in-place context transforms (before context sent to LLM)
  */
 
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { guardLog } from "./guard-log.js";
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
 import { repairToolUsePairingGuard } from "./compaction.js";

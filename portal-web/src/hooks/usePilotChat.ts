@@ -13,6 +13,7 @@ import type {
   ContextUsage,
   ErrorDetail,
   ChatAttachment,
+  ModelRouteMetadata,
 } from "../components/chat/types"
 import { stripAttachmentOcrEvidence } from "../components/chat/user-message-text"
 import { findPendingSteerIndex, removePendingAt, extractUserMessageText, pendingSteerMatchText } from "./steer-pending"
@@ -237,6 +238,42 @@ function normalizeMetadata(value: unknown): Record<string, unknown> | undefined 
   if (typeof value === "string") return tryParseJson(value);
   if (typeof value === "object") return value as Record<string, unknown>;
   return undefined;
+}
+
+function routeString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined
+}
+
+function routeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function routeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined
+}
+
+function modelRouteFromEvent(evt: Record<string, unknown>): ModelRouteMetadata | null {
+  const embedded = normalizeMetadata(evt.modelRoute)
+  if (embedded) {
+    return embedded as ModelRouteMetadata
+  }
+
+  const candidateKey = routeString(evt.candidateKey)
+  const provider = routeString(evt.provider)
+  const modelId = routeString(evt.modelId)
+  const isFallback = routeBoolean(evt.isFallback)
+  if (!candidateKey || !provider || !modelId || isFallback === undefined) return null
+  return {
+    candidate_key: candidateKey,
+    provider,
+    model_id: modelId,
+    is_fallback: isFallback,
+    primary_candidate_key: routeString(evt.primaryCandidateKey),
+    recovered_from_candidate_key: routeString(evt.recoveredFromCandidateKey),
+    recovered_from_provider: routeString(evt.recoveredFromProvider),
+    recovered_from_model_id: routeString(evt.recoveredFromModelId),
+    attempt: routeNumber(evt.attempt),
+  }
 }
 
 export function parsePortalTimestamp(value: string): number {
@@ -626,6 +663,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
   // that gap could re-paint them "running" over the optimistic "aborted". Bounded (a few hundred ms)
   // so a stuck/failed abort can never freeze the message list.
   const abortGuardUntilRef = useRef(0)
+  const currentModelRouteRef = useRef<ModelRouteMetadata | null>(null)
   const activeSessionIdRef = useRef<string | undefined>(sessionId ?? undefined)
   const [isCompacting, setIsCompacting] = useState(false)
   const hasActiveAsyncDelegation = hasActiveAsyncDelegationSurface(messages)
@@ -666,6 +704,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
     }
     prevSessionIdRef.current = sessionId ?? undefined
     activeSessionIdRef.current = sessionId ?? undefined
+    currentModelRouteRef.current = null
 
     if (!sessionId) {
       setMessages([])
@@ -988,6 +1027,18 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
       }
 
       switch (eventType) {
+        case "model_route_start":
+          currentModelRouteRef.current = null
+          break
+
+        case "model_route_switch":
+          break
+
+        case "model_route_success": {
+          currentModelRouteRef.current = modelRouteFromEvent(evt)
+          break
+        }
+
         // --- Text streaming (simplified brain: agent_message is the portal gateway's text event) ---
         case "agent_message": {
           const text = evt.text as string | undefined
@@ -995,8 +1046,17 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
             setMessages((prev) => {
               const last = prev[prev.length - 1]
               if (last?.isStreaming && last.role === "assistant") {
-                return [...prev.slice(0, -1), { ...last, content: last.content + text }]
+                const route = currentModelRouteRef.current
+                return [
+                  ...prev.slice(0, -1),
+                  {
+                    ...last,
+                    content: last.content + text,
+                    ...(route ? { metadata: { ...(last.metadata ?? {}), model_route: route } } : {}),
+                  },
+                ]
               }
+              const route = currentModelRouteRef.current
               return [
                 ...prev,
                 {
@@ -1005,6 +1065,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                   content: text,
                   timestamp: timeNow(),
                   isStreaming: true,
+                  ...(route ? { metadata: { model_route: route } } : {}),
                 },
               ]
             })
@@ -1028,10 +1089,16 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                 const m = prev[i]
                 if (m.isStreaming && m.role === "assistant") {
                   const updated = [...prev]
-                  updated[i] = { ...m, content: m.content + ame.delta }
+                  const route = currentModelRouteRef.current
+                  updated[i] = {
+                    ...m,
+                    content: m.content + ame.delta,
+                    ...(route ? { metadata: { ...(m.metadata ?? {}), model_route: route } } : {}),
+                  }
                   return updated
                 }
               }
+              const route = currentModelRouteRef.current
               return [
                 ...prev,
                 {
@@ -1040,6 +1107,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
                   content: ame.delta!,
                   timestamp: timeNow(),
                   isStreaming: true,
+                  ...(route ? { metadata: { model_route: route } } : {}),
                 },
               ]
             })
@@ -1224,19 +1292,32 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           const evtTiming = evt.timing as
             | { ttft_ms?: number; thinking_ms?: number; output_ms?: number; turn_total_ms?: number }
             | undefined
-          if (endMsg?.role === "assistant" && evtTiming) {
+          const evtRoute = endMsg?.role === "assistant" ? (modelRouteFromEvent(evt) ?? currentModelRouteRef.current) : null
+          if (endMsg?.role === "assistant" && evtRoute) {
+            currentModelRouteRef.current = evtRoute
+          }
+          if (endMsg?.role === "assistant" && (evtTiming || evtRoute)) {
             setMessages((prev) => {
-              const idx = findLastMessageIndex(prev, (m) => m.role === "assistant")
+              const idx = findLastMessageIndex(prev, (m) =>
+                m.role === "assistant" &&
+                m.metadata?.kind !== "model_route_notice" &&
+                m.metadata?.kind !== "delegation_status_notice",
+              )
               if (idx < 0) return prev
               const current = prev[idx]
               const timing = {
                 ...(current.timing ?? {}),
-                ...(typeof evtTiming.ttft_ms === "number" ? { ttftMs: evtTiming.ttft_ms } : {}),
-                ...(typeof evtTiming.thinking_ms === "number" ? { thinkingMs: evtTiming.thinking_ms } : {}),
-                ...(typeof evtTiming.output_ms === "number" ? { outputMs: evtTiming.output_ms } : {}),
-                ...(typeof evtTiming.turn_total_ms === "number" ? { turnTotalMs: evtTiming.turn_total_ms } : {}),
+                ...(typeof evtTiming?.ttft_ms === "number" ? { ttftMs: evtTiming.ttft_ms } : {}),
+                ...(typeof evtTiming?.thinking_ms === "number" ? { thinkingMs: evtTiming.thinking_ms } : {}),
+                ...(typeof evtTiming?.output_ms === "number" ? { outputMs: evtTiming.output_ms } : {}),
+                ...(typeof evtTiming?.turn_total_ms === "number" ? { turnTotalMs: evtTiming.turn_total_ms } : {}),
               }
-              return [...prev.slice(0, idx), { ...current, timing }, ...prev.slice(idx + 1)]
+              const next = {
+                ...current,
+                ...(Object.keys(timing).length > 0 ? { timing } : {}),
+                ...(evtRoute ? { metadata: { ...(current.metadata ?? {}), model_route: evtRoute } } : {}),
+              }
+              return [...prev.slice(0, idx), next, ...prev.slice(idx + 1)]
             })
           }
           if (endMsg?.role === "toolResult" && endMsg.details && Object.keys(endMsg.details).length > 0) {
@@ -1280,6 +1361,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         // --- Prompt done (agent prompt truly finished) ---
         case "prompt_done":
           setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+          currentModelRouteRef.current = null
           // During abort, don't unlock here — abort handler will do it after RPC completes
           if (!isAbortingRef.current) {
             setStreaming(false)
@@ -1300,6 +1382,7 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
         case "turn_complete":
         case "done": {
           setMessages((prev) => prev.map((m) => (m.isStreaming ? { ...m, isStreaming: false } : m)))
+          if (eventType === "done") currentModelRouteRef.current = null
           setStreaming(false)
           streamingRef.current = false
           recoveredStreamingRef.current = false

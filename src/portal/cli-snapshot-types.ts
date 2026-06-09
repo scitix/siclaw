@@ -7,6 +7,7 @@
  */
 
 import type { SkillPackageFile } from "../shared/skill-package.js";
+import type { ModelRoutePolicy } from "../core/model-routing.js";
 
 export interface CliSnapshotKnowledgeRepo {
   name: string;
@@ -67,6 +68,7 @@ export interface CliSnapshotActiveAgent {
   systemPrompt: string | null;
   modelProvider: string | null;
   modelId: string | null;
+  modelRouting?: ModelRoutePolicy;
 }
 
 export interface CliSnapshotSkill {

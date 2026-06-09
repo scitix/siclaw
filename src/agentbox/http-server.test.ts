@@ -14,6 +14,10 @@ import type https from "node:https";
 
 // ── Mocks (hoisted) ───────────────────────────────────────────────────
 
+const mockConfigState = vi.hoisted(() => ({
+  modelRouting: undefined as unknown,
+}));
+
 // Silence metrics auth side effects.
 vi.mock("../shared/metrics.js", () => ({
   checkMetricsAuth: () => true,
@@ -47,6 +51,7 @@ vi.mock("../core/config.js", () => ({
         models: [{ id: "gpt-4", name: "GPT-4", contextWindow: 128000, maxTokens: 4096, reasoning: false }],
       },
     },
+    modelRouting: mockConfigState.modelRouting,
   }),
   isMemoryEnabled: () => true,
 }));
@@ -83,6 +88,12 @@ async function startServer(server: http.Server | https.Server): Promise<number> 
 function makeFakeBrain() {
   const { EventEmitter } = require("node:events");
   const emitter = new EventEmitter();
+  const models = [
+    { id: "gpt-4", provider: "openai", name: "GPT-4", contextWindow: 128000, maxTokens: 4096, reasoning: false },
+    { id: "claude", provider: "anthropic", name: "Claude", contextWindow: 200000, maxTokens: 8192, reasoning: true },
+    { id: "deepseek-chat", provider: "deepseek", name: "DeepSeek", contextWindow: 64000, maxTokens: 4096, reasoning: false },
+  ];
+  let currentModel = models[0];
   return {
     emitter,
     subscribe: (cb: (e: any) => void) => {
@@ -94,13 +105,9 @@ function makeFakeBrain() {
     abort: vi.fn(async () => {}),
     steer: vi.fn(async () => {}),
     clearQueue: vi.fn(() => ({ steering: [], followUp: [] })),
-    getModel: vi.fn(() => ({ id: "gpt-4", provider: "openai", name: "GPT-4", contextWindow: 128000, maxTokens: 4096, reasoning: false })),
-    setModel: vi.fn(async () => {}),
-    findModel: vi.fn((provider: string, id: string) =>
-      provider === "openai" && id === "gpt-4"
-        ? { id: "gpt-4", provider: "openai", name: "GPT-4", contextWindow: 128000, maxTokens: 4096, reasoning: false }
-        : null,
-    ),
+    getModel: vi.fn(() => currentModel),
+    setModel: vi.fn(async (model: typeof currentModel) => { currentModel = model; }),
+    findModel: vi.fn((provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id)),
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, cost: 0.01 })),
     registerProvider: vi.fn(),
@@ -126,6 +133,12 @@ function makeFakeSession(id: string) {
     _lastSavedMessageCount: 0,
     _releaseTimer: null,
     _promptInflight: null,
+    _syntheticPromptQueue: null,
+    _backgroundWorkCount: 0,
+    modelRouteState: { cooldowns: {}, attempts: [] },
+    _routeBrainEventsThroughExtra: false,
+    _extraEventSubs: new Set<(e: Record<string, unknown>) => void>(),
+    _extraEventBuffer: [] as Record<string, unknown>[],
     kubeconfigRef: { credentialsDir: "", credentialBroker: undefined },
     dpStateRef: { active: false },
   };
@@ -157,6 +170,8 @@ function makeFakeSessionManager() {
     closeAll: async () => { sessions.clear(); },
     resetMemory: async () => {},
     scheduleRelease: (_id: string) => {},
+    setDelegationModel: vi.fn(),
+    persistModelRouteState: vi.fn(),
     getPersistedDpState: (_id: string): { active: boolean } | null => null,
     onSessionRelease: undefined as undefined | (() => void),
     credentialBroker: undefined,
@@ -176,6 +191,11 @@ async function getJson(port: number, path: string, method = "GET", body?: unknow
   return { status: resp.status, data };
 }
 
+async function flushAsync(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 let server: http.Server | https.Server;
@@ -184,6 +204,7 @@ let sm: ReturnType<typeof makeFakeSessionManager>;
 const origEnv = { SICLAW_GATEWAY_URL: process.env.SICLAW_GATEWAY_URL, SICLAW_CERT_PATH: process.env.SICLAW_CERT_PATH };
 
 beforeEach(async () => {
+  mockConfigState.modelRouting = undefined;
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -318,6 +339,402 @@ describe("http-server — model switching", () => {
     expect(r.status).toBe(200);
     expect(r.data.ok).toBe(true);
   });
+
+  it("PUT /api/sessions/:id/model marks a strict user model selection and clears route cooldowns", async () => {
+    const s = await sm.getOrCreate("m5");
+    s.modelRouteState.activeCandidateKey = "anthropic/claude";
+    s.modelRouteState.activeCandidateSource = "auto";
+    s.modelRouteState.cooldowns["openai/gpt-4"] = Date.now() + 60_000;
+
+    const r = await getJson(port, "/api/sessions/m5/model", "PUT", { provider: "deepseek", modelId: "deepseek-chat" });
+
+    expect(r.status).toBe(200);
+    expect(s.modelRouteState.activeCandidateKey).toBe("deepseek/deepseek-chat");
+    expect(s.modelRouteState.activeCandidateSource).toBe("user");
+    expect(s.modelRouteState.cooldowns).toEqual({});
+    expect(s.modelRouteState.lastSwitchReason).toBe("user_selection");
+    expect(sm.persistModelRouteState).toHaveBeenCalledWith("m5", s.modelRouteState);
+  });
+});
+
+describe("http-server — model routing", () => {
+  const routePolicy = {
+    enabled: true,
+    strategy: "ordered_fallback" as const,
+    cooldownMsByKind: {
+      billing: 1000,
+      rate_limit: 1000,
+      timeout: 1000,
+      server_error: 1000,
+      model_not_found: 1000,
+      network: 1000,
+      empty_response: 1000,
+    },
+    candidates: [
+      { provider: "openai", modelId: "gpt-4" },
+      { provider: "anthropic", modelId: "claude" },
+      { provider: "deepseek", modelId: "deepseek-chat" },
+    ],
+  };
+  const compactAgentPolicy = {
+    enabled: true,
+    strategy: "ordered_fallback" as const,
+    candidates: [
+      { provider: "openai", modelId: "gpt-4" },
+      { provider: "anthropic", modelId: "claude" },
+    ],
+  };
+
+  it("falls back to the next candidate on a fallbackable model error", async () => {
+    const s = await sm.getOrCreate("route-fallback");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      if (model.provider === "openai") {
+        s.brain.emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "route me",
+      sessionId: "route-fallback",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(s.modelRouteState.cooldowns["openai/gpt-4"]).toBeGreaterThan(0);
+    expect(s._eventBuffer).toEqual([]);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+    expect(s._extraEventBuffer.some((event) =>
+      event.type === "message_end" && (event.message as any)?.stopReason === "error",
+    )).toBe(false);
+    expect(s._extraEventBuffer.some((event) =>
+      event.type === "message_end" && (event.message as any)?.content?.[0]?.text === "ok",
+    )).toBe(true);
+    expect(sm.persistModelRouteState).toHaveBeenCalledWith("route-fallback", s.modelRouteState);
+  });
+
+  it("does not fallback on context overflow", async () => {
+    const s = await sm.getOrCreate("route-context");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "context_length_exceeded: too many tokens",
+        },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "too much history",
+      sessionId: "route-context",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4"]);
+    expect(s.modelRouteState.activeCandidateKey).toBeUndefined();
+    expect(s._eventBuffer).toEqual([]);
+    expect(s._extraEventBuffer.some((event) =>
+      event.type === "message_end" && (event.message as any)?.stopReason === "error",
+    )).toBe(true);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_exhausted")).toBe(true);
+  });
+
+  it("does not fallback on auth errors by default", async () => {
+    const s = await sm.getOrCreate("route-auth");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [],
+          stopReason: "error",
+          errorMessage: "401 invalid api key",
+        },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "bad credentials",
+      sessionId: "route-auth",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4"]);
+    expect(s.modelRouteState.activeCandidateKey).toBeUndefined();
+    expect(s.modelRouteState.cooldowns).toEqual({});
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(false);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_exhausted")).toBe(true);
+  });
+
+  it("uses the persisted fallback candidate while the primary is cooling", async () => {
+    const s = await sm.getOrCreate("route-cooldown");
+    s.modelRouteState.activeCandidateKey = "anthropic/claude";
+    s.modelRouteState.cooldowns["openai/gpt-4"] = Date.now() + 60_000;
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "stay on fallback",
+      sessionId: "route-cooldown",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["anthropic/claude"]);
+    expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+  });
+
+  it("does not engage automatic fallback while a manual user model selection is active", async () => {
+    const s = await sm.getOrCreate("route-user-strict");
+    await getJson(port, "/api/sessions/route-user-strict/model", "PUT", { provider: "anthropic", modelId: "claude" });
+
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "respect manual model",
+      sessionId: "route-user-strict",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["anthropic/claude"]);
+    expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(s.modelRouteState.activeCandidateSource).toBe("user");
+    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
+  });
+
+  it("clears manual strict selection when the next prompt explicitly targets a different primary model", async () => {
+    const s = await sm.getOrCreate("route-user-overridden");
+    await getJson(port, "/api/sessions/route-user-overridden/model", "PUT", { provider: "anthropic", modelId: "claude" });
+
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      if (model.provider === "openai") {
+        s.brain.emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "explicit configured primary",
+      sessionId: "route-user-overridden",
+      modelProvider: "openai",
+      modelId: "gpt-4",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(s.modelRouteState.activeCandidateSource).toBe("auto");
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+  });
+
+  it("uses modelRouting from loaded settings when request omits policy", async () => {
+    mockConfigState.modelRouting = routePolicy;
+    const s = await sm.getOrCreate("route-config-default");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      if (model.provider === "openai") {
+        s.brain.emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "route by config",
+      sessionId: "route-config-default",
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+  });
+
+  it("applies unified defaults to compact agent modelRouting from settings", async () => {
+    mockConfigState.modelRouting = compactAgentPolicy;
+    const s = await sm.getOrCreate("route-compact-agent-policy");
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      if (model.provider === "openai") {
+        s.brain.emitter.emit("event", {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [],
+            stopReason: "error",
+            errorMessage: "429 rate limit exceeded",
+          },
+        });
+        return;
+      }
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const beforePrompt = Date.now();
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "route by compact config",
+      sessionId: "route-compact-agent-policy",
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4", "anthropic/claude"]);
+    expect(s.modelRouteState.activeCandidateKey).toBe("anthropic/claude");
+    expect(s.modelRouteState.cooldowns["openai/gpt-4"]).toBeGreaterThanOrEqual(beforePrompt + 60 * 1000);
+    expect(s._extraEventBuffer.some((event) => event.type === "model_route_switch")).toBe(true);
+  });
+
+  it("streams live (skips the buffered routing runner) when only one candidate is configured", async () => {
+    const s = await sm.getOrCreate("route-single");
+    const singleCandidatePolicy = {
+      enabled: true,
+      strategy: "ordered_fallback" as const,
+      candidates: [{ provider: "openai", modelId: "gpt-4" }],
+    };
+    const seenModels: string[] = [];
+    s.brain.prompt.mockImplementation(async () => {
+      const model = s.brain.getModel();
+      seenModels.push(`${model.provider}/${model.id}`);
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "single candidate",
+      sessionId: "route-single",
+      modelRouting: singleCandidatePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    expect(seenModels).toEqual(["openai/gpt-4"]);
+    // A lone candidate has nothing to fall back to, so the runner must not
+    // engage: no model_route_* telemetry, no state persistence, and brain
+    // events flow through the live buffer (not the routing extra bus) so
+    // streaming is preserved.
+    expect(s._extraEventBuffer.some((event) => String(event.type).startsWith("model_route"))).toBe(false);
+    expect(sm.persistModelRouteState).not.toHaveBeenCalled();
+    expect(s._routeBrainEventsThroughExtra).toBe(false);
+    expect(s._eventBuffer.some((event: any) => event.type === "message_end")).toBe(true);
+  });
+
+  it("enriches agent_end with token stats on the routed (buffered) flush path", async () => {
+    const s = await sm.getOrCreate("route-enrich");
+    s.brain.prompt.mockImplementation(async () => {
+      s.brain.emitter.emit("event", {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" },
+      });
+      s.brain.emitter.emit("event", { type: "agent_end" });
+    });
+
+    const r = await getJson(port, "/api/prompt", "POST", {
+      text: "route enrich",
+      sessionId: "route-enrich",
+      modelRouting: routePolicy,
+    });
+    await flushAsync();
+
+    expect(r.status).toBe(200);
+    // The buffered flush path bypasses the live SSE subscription, so the
+    // enrichment must be re-applied there — otherwise routed sessions emit a
+    // bare agent_end with no token/cost badge.
+    const agentEnd = s._extraEventBuffer.find((event) => event.type === "agent_end");
+    expect(agentEnd).toBeDefined();
+    expect((agentEnd as any).contextUsage).toMatchObject({
+      tokens: 10,
+      inputTokens: 1,
+      outputTokens: 2,
+      cost: 0.01,
+    });
+  });
 });
 
 describe("http-server — steer / abort / clear-queue", () => {
@@ -389,8 +806,8 @@ describe("http-server — steer / abort / clear-queue", () => {
     const fail = await getJson(port, "/api/prompt", "POST", {
       text: "second",
       sessionId: "stuck",
-      modelProvider: "openai",
-      modelId: "gpt-4",
+      modelProvider: "anthropic",
+      modelId: "claude",
     });
     expect(fail.status).toBe(500);
     expect(s._promptDone).toBe(true);

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react"
-import { Loader2, Save, Trash2 } from "lucide-react"
+import { ArrowDown, ArrowUp, Loader2, Plus, Save, Trash2 } from "lucide-react"
 import { api } from "../api"
 import { useToast } from "./toast"
 import { AgentTasks } from "./AgentTasks"
@@ -9,6 +9,7 @@ interface Agent {
   id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; system_prompt: string
   is_production: boolean; icon: string; color: string; created_at: string
+  model_routing?: unknown
 }
 
 interface AgentResources {
@@ -24,6 +25,17 @@ interface AvailableCluster { id: string; name: string; api_server: string; is_pr
 interface AvailableHost { id: string; name: string; ip: string; is_production: boolean }
 interface ModelEntry { id: string; model_id: string; name: string }
 interface Provider { id: string; name: string; models?: ModelEntry[] }
+interface ModelRouteCandidateForm { provider: string; modelId: string }
+interface ModelRoutePolicy {
+  enabled?: boolean
+  strategy?: string
+  candidates?: Array<{ provider?: unknown; modelId?: unknown; model_id?: unknown }>
+  fallbackOn?: unknown
+  noFallbackOn?: unknown
+  cooldownMsByKind?: unknown
+}
+
+const ROUTE_COOLDOWN_LABEL = "by condition"
 
 const TABS = [
   { key: "basic", label: "Basic" },
@@ -38,6 +50,99 @@ const TABS = [
 ] as const
 
 type TabKey = (typeof TABS)[number]["key"]
+
+function parseModelRouting(raw: unknown): ModelRoutePolicy | null {
+  if (!raw) return null
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === "object" ? parsed as ModelRoutePolicy : null
+    } catch {
+      return null
+    }
+  }
+  return typeof raw === "object" ? raw as ModelRoutePolicy : null
+}
+
+function candidateKey(candidate: ModelRouteCandidateForm) {
+  return `${encodeURIComponent(candidate.provider)}/${encodeURIComponent(candidate.modelId)}`
+}
+
+function normalizeRouteCandidates(policy: ModelRoutePolicy | null, primaryProvider: string, primaryModelId: string): ModelRouteCandidateForm[] {
+  const seen = new Set<string>()
+  const candidates: ModelRouteCandidateForm[] = []
+  const primaryKey = candidateKey({ provider: primaryProvider.trim(), modelId: primaryModelId.trim() })
+
+  for (const rawCandidate of policy?.candidates || []) {
+    const provider = typeof rawCandidate.provider === "string" ? rawCandidate.provider.trim() : ""
+    const rawModelId = rawCandidate.modelId ?? rawCandidate.model_id
+    const modelId = typeof rawModelId === "string" ? rawModelId.trim() : ""
+    if (!provider || !modelId) continue
+
+    const key = candidateKey({ provider, modelId })
+    if (key === primaryKey || seen.has(key)) continue
+    seen.add(key)
+    candidates.push({ provider, modelId })
+  }
+
+  return candidates
+}
+
+function validStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const normalized = value.filter((item): item is string => typeof item === "string" && item.length > 0)
+  return normalized.length > 0 ? normalized : undefined
+}
+
+function validCooldownMsByKind(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const entries = Object.entries(value)
+    .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1]) && entry[1] >= 0)
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined
+}
+
+function buildModelRoutingPayload(fallbackCandidates: ModelRouteCandidateForm[], primaryProvider: string, primaryModelId: string, existingPolicy: ModelRoutePolicy | null): ModelRoutePolicy | null {
+  const seen = new Set<string>()
+  const primaryKey = candidateKey({ provider: primaryProvider.trim(), modelId: primaryModelId.trim() })
+  const candidates: ModelRouteCandidateForm[] = []
+
+  for (const candidate of fallbackCandidates) {
+    const normalized = { provider: candidate.provider.trim(), modelId: candidate.modelId.trim() }
+    const key = candidateKey(normalized)
+    if (!normalized.provider || !normalized.modelId || key === primaryKey || seen.has(key)) continue
+    seen.add(key)
+    candidates.push(normalized)
+  }
+
+  if (candidates.length === 0) return null
+  const fallbackOn = validStringArray(existingPolicy?.fallbackOn)
+  const noFallbackOn = validStringArray(existingPolicy?.noFallbackOn)
+  const cooldownMsByKind = validCooldownMsByKind(existingPolicy?.cooldownMsByKind)
+  return {
+    enabled: true,
+    strategy: "ordered_fallback",
+    candidates,
+    ...(fallbackOn ? { fallbackOn } : {}),
+    ...(noFallbackOn ? { noFallbackOn } : {}),
+    ...(cooldownMsByKind ? { cooldownMsByKind } : {}),
+  }
+}
+
+function firstAvailableFallbackCandidate(providers: Provider[], primaryProvider: string, primaryModelId: string, fallbackCandidates: ModelRouteCandidateForm[]): ModelRouteCandidateForm {
+  const used = new Set([
+    candidateKey({ provider: primaryProvider, modelId: primaryModelId }),
+    ...fallbackCandidates.map(candidateKey),
+  ])
+
+  for (const provider of providers) {
+    for (const model of provider.models || []) {
+      const candidate = { provider: provider.name, modelId: model.model_id }
+      if (!used.has(candidateKey(candidate))) return candidate
+    }
+  }
+
+  return { provider: "", modelId: "" }
+}
 
 interface AgentSettingsProps {
   agent: Agent
@@ -54,6 +159,8 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   const [description, setDescription] = useState(agent.description || "")
   const [modelProvider, setModelProvider] = useState(agent.model_provider || "")
   const [modelId, setModelId] = useState(agent.model_id || "")
+  const [routingEnabled, setRoutingEnabled] = useState(false)
+  const [fallbackCandidates, setFallbackCandidates] = useState<ModelRouteCandidateForm[]>([])
   const [systemPrompt, setSystemPrompt] = useState(agent.system_prompt || "")
   const [isProduction, setIsProduction] = useState(agent.is_production)
 
@@ -82,6 +189,9 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
   useEffect(() => {
     setName(agent.name); setDescription(agent.description || "")
     setModelProvider(agent.model_provider || ""); setModelId(agent.model_id || "")
+    const modelRouting = parseModelRouting(agent.model_routing)
+    setRoutingEnabled(modelRouting?.enabled === true)
+    setFallbackCandidates(normalizeRouteCandidates(modelRouting, agent.model_provider || "", agent.model_id || ""))
     setSystemPrompt(agent.system_prompt || ""); setIsProduction(agent.is_production)
   }, [agent])
 
@@ -121,11 +231,24 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
 
   const handleSave = async () => {
     if (!name.trim()) return
+    let modelRouting: ModelRoutePolicy | null = null
+    if (routingEnabled) {
+      if (!modelProvider.trim() || !modelId.trim()) {
+        toast.error("Select a primary model before enabling fallback")
+        return
+      }
+      modelRouting = buildModelRoutingPayload(fallbackCandidates, modelProvider, modelId, parseModelRouting(agent.model_routing))
+      if (!modelRouting) {
+        toast.error("Add at least one fallback model")
+        return
+      }
+    }
+
     setSaving(true)
     try {
       const updated = await api<Agent>(`/agents/${agent.id}`, {
         method: "PUT",
-        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), system_prompt: systemPrompt.trim(), is_production: isProduction },
+        body: { name: name.trim(), description: description.trim(), model_provider: modelProvider.trim(), model_id: modelId.trim(), model_routing: routingEnabled ? modelRouting : null, system_prompt: systemPrompt.trim(), is_production: isProduction },
       })
       await api(`/agents/${agent.id}/resources`, {
         method: "PUT",
@@ -176,7 +299,7 @@ export function AgentSettings({ agent, onUpdate, initialTab }: AgentSettingsProp
       {/* Tab content */}
       <div className="flex-1 overflow-auto">
         {activeTab === "basic" && <BasicTab name={name} setName={setName} description={description} setDescription={setDescription} systemPrompt={systemPrompt} setSystemPrompt={setSystemPrompt} isProduction={isProduction} setIsProduction={setIsProduction} />}
-        {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} />}
+        {activeTab === "model" && <ModelTab providers={providers} modelProvider={modelProvider} setModelProvider={setModelProvider} modelId={modelId} setModelId={setModelId} availableModels={availableModels} routingEnabled={routingEnabled} setRoutingEnabled={setRoutingEnabled} fallbackCandidates={fallbackCandidates} setFallbackCandidates={setFallbackCandidates} />}
         {activeTab === "skills" && <SkillsTab allSkills={allSkills} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} skillLabelFilter={skillLabelFilter} setSkillLabelFilter={setSkillLabelFilter} isProduction={isProduction} loading={loadingSkills || loadingResources} />}
         {activeTab === "mcp" && <McpTab allMcpServers={allMcpServers} selectedMcpIds={selectedMcpIds} setSelectedMcpIds={setSelectedMcpIds} loading={loadingMcp || loadingResources} />}
         {activeTab === "knowledge" && <KnowledgeTab allRepos={allKnowledgeRepos} selectedIds={selectedKnowledgeRepoIds} setSelectedIds={setSelectedKnowledgeRepoIds} loading={loadingKnowledge || loadingResources} />}
@@ -234,10 +357,38 @@ function BasicTab({ name, setName, description, setDescription, systemPrompt, se
   )
 }
 
-function ModelTab({ providers, modelProvider, setModelProvider, modelId, setModelId, availableModels }: {
+function ModelTab({ providers, modelProvider, setModelProvider, modelId, setModelId, availableModels, routingEnabled, setRoutingEnabled, fallbackCandidates, setFallbackCandidates }: {
   providers: Provider[]; modelProvider: string; setModelProvider: (v: string) => void
   modelId: string; setModelId: (v: string) => void; availableModels: ModelEntry[]
+  routingEnabled: boolean; setRoutingEnabled: (v: boolean) => void
+  fallbackCandidates: ModelRouteCandidateForm[]; setFallbackCandidates: (v: ModelRouteCandidateForm[]) => void
 }) {
+  const modelsForProvider = (providerName: string) => providers.find(p => p.name === providerName)?.models || []
+  const addFallbackCandidate = () => {
+    setFallbackCandidates([...fallbackCandidates, firstAvailableFallbackCandidate(providers, modelProvider, modelId, fallbackCandidates)])
+  }
+  const updateFallbackCandidate = (index: number, candidate: ModelRouteCandidateForm) => {
+    setFallbackCandidates(fallbackCandidates.map((item, itemIndex) => itemIndex === index ? candidate : item))
+  }
+  const moveFallbackCandidate = (index: number, direction: -1 | 1) => {
+    const nextIndex = index + direction
+    if (nextIndex < 0 || nextIndex >= fallbackCandidates.length) return
+    const next = [...fallbackCandidates]
+    const [candidate] = next.splice(index, 1)
+    next.splice(nextIndex, 0, candidate)
+    setFallbackCandidates(next)
+  }
+  const removeFallbackCandidate = (index: number) => {
+    setFallbackCandidates(fallbackCandidates.filter((_, itemIndex) => itemIndex !== index))
+  }
+  const toggleRouting = () => {
+    const nextEnabled = !routingEnabled
+    setRoutingEnabled(nextEnabled)
+    if (nextEnabled && fallbackCandidates.length === 0) {
+      setFallbackCandidates([firstAvailableFallbackCandidate(providers, modelProvider, modelId, fallbackCandidates)])
+    }
+  }
+
   return (
     <div className="px-6 py-6 space-y-5 max-w-2xl">
       <div className="grid grid-cols-2 gap-3">
@@ -255,6 +406,85 @@ function ModelTab({ providers, modelProvider, setModelProvider, modelId, setMode
             {availableModels.map(m => <option key={m.id} value={m.model_id}>{m.name || m.model_id}</option>)}
           </select>
         </div>
+      </div>
+      <div className="border-t border-border pt-5 space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h4 className="text-[12px] font-medium text-muted-foreground">Fallback Routing</h4>
+            <p className="text-[11px] text-muted-foreground/70">Conditions: default · Cooldown: {ROUTE_COOLDOWN_LABEL}</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={routingEnabled}
+            onClick={toggleRouting}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${routingEnabled ? "bg-primary" : "bg-muted-foreground/30"}`}
+          >
+            <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${routingEnabled ? "translate-x-6" : "translate-x-1"}`} />
+          </button>
+        </div>
+        {routingEnabled && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="text-[12px] text-muted-foreground">Fallback order</label>
+              <button
+                type="button"
+                onClick={addFallbackCandidate}
+                title="Add fallback model"
+                className="h-7 w-7 inline-flex items-center justify-center rounded-md border border-border text-muted-foreground hover:text-foreground"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            <div className="space-y-1.5">
+              {fallbackCandidates.map((candidate, index) => {
+                const candidateModels = modelsForProvider(candidate.provider)
+                return (
+                  <div key={`${index}-${candidate.provider}-${candidate.modelId}`} className="grid grid-cols-[28px_minmax(0,1fr)_minmax(0,1fr)_112px] gap-2 items-center">
+                    <span className="h-8 w-7 inline-flex items-center justify-center rounded-md bg-secondary/60 text-[11px] text-muted-foreground">
+                      {index + 1}
+                    </span>
+                    <select
+                      value={candidate.provider}
+                      onChange={e => {
+                        const provider = e.target.value
+                        const modelId = modelsForProvider(provider)[0]?.model_id || ""
+                        updateFallbackCandidate(index, { provider, modelId })
+                      }}
+                      className="w-full h-8 px-2 text-[12px] rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">Provider</option>
+                      {providers.map(p => <option key={p.id} value={p.name}>{p.name}</option>)}
+                    </select>
+                    <select
+                      value={candidate.modelId}
+                      onChange={e => updateFallbackCandidate(index, { ...candidate, modelId: e.target.value })}
+                      disabled={!candidate.provider}
+                      className="w-full h-8 px-2 text-[12px] rounded-md border border-border bg-background disabled:opacity-50 focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">Model</option>
+                      {candidateModels.map(m => <option key={m.id} value={m.model_id}>{m.name || m.model_id}</option>)}
+                    </select>
+                    <div className="flex items-center justify-end gap-1">
+                      <button type="button" onClick={() => moveFallbackCandidate(index, -1)} disabled={index === 0} title="Move up" className="h-8 w-8 inline-flex items-center justify-center rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-40">
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </button>
+                      <button type="button" onClick={() => moveFallbackCandidate(index, 1)} disabled={index === fallbackCandidates.length - 1} title="Move down" className="h-8 w-8 inline-flex items-center justify-center rounded-md border border-border text-muted-foreground hover:text-foreground disabled:opacity-40">
+                        <ArrowDown className="h-3.5 w-3.5" />
+                      </button>
+                      <button type="button" onClick={() => removeFallbackCandidate(index)} title="Remove" className="h-8 w-8 inline-flex items-center justify-center rounded-md border border-border text-muted-foreground hover:text-red-400">
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+            {fallbackCandidates.length === 0 && (
+              <p className="text-[11px] text-muted-foreground/70">No fallback models selected.</p>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

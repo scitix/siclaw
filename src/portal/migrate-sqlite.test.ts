@@ -171,6 +171,13 @@ describe("runPortalMigrations on SQLite :memory:", () => {
     expect(cols).toContain("updated_at");
   });
 
+  it("agents.model_routing column exists after migration", async () => {
+    await runPortalMigrations();
+    const db = getDb();
+    const [rows] = await db.query<Array<{ name: string }>>("PRAGMA table_info(agents)");
+    expect(rows.map((r) => r.name)).toContain("model_routing");
+  });
+
   it("skills and skill_versions files columns exist after migration", async () => {
     await runPortalMigrations();
     const db = getDb();

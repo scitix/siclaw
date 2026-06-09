@@ -8,7 +8,7 @@
  * Ported from OpenClaw's src/agents/tool-call-id.ts.
  */
 import { createHash } from "node:crypto";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { extractToolCallsFromAssistant, extractToolResultId } from "./message-utils.js";
 
 export type ToolCallIdMode = "strict" | "strict9";

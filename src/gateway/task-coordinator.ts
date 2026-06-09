@@ -282,6 +282,7 @@ export class TaskCoordinator {
         modelProvider: binding.modelProvider,
         modelId: binding.modelId,
         modelConfig: binding.modelConfig,
+        modelRouting: binding.modelRouting,
       };
       await client.prompt(promptOpts);
 

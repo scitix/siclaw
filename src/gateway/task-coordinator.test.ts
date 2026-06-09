@@ -325,6 +325,39 @@ describe("TaskCoordinator execution", () => {
     expect(received.resultText).toBe("done");
   });
 
+  it("passes modelRouting from resolved binding to AgentBox prompt", async () => {
+    const { coord, frontend } = makeCoord();
+    bindingResponder.result = {
+      modelProvider: "p", modelId: "m",
+      modelConfig: { name: "n", baseUrl: "u", apiKey: "k", api: "x", authHeader: false, models: [] },
+      modelRouting: {
+        enabled: true,
+        strategy: "ordered_fallback",
+        candidates: [
+          { provider: "p", modelId: "m" },
+          { provider: "fallback", modelId: "m2" },
+        ],
+      },
+    };
+    sseResponder.result = { resultText: "done", taskReportText: "", errorMessage: "", eventCount: 1, durationMs: 5 };
+    frontend.responses.set("task.fireNow", {
+      outcome: "ok",
+      task: {
+        id: "t1", agent_id: "a", name: "Route Task", description: null,
+        schedule: "*/5 * * * *", prompt: "p", status: "active",
+        created_by: "u1", last_run_at: null, last_result: null, last_manual_run_at: null,
+      },
+    });
+    frontend.responses.set("task.runStart", { ok: true });
+    frontend.responses.set("task.runFinalize", { ok: true });
+    frontend.responses.set("task.updateMeta", { ok: true });
+
+    await coord.fireNow("t1");
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(lastFakeClient?.promptCalls[0].modelRouting).toEqual(bindingResponder.result.modelRouting);
+  });
+
   it("propagates SSE-layer errorMessage as failure", async () => {
     const { coord, frontend } = makeCoord();
     bindingResponder.result = {

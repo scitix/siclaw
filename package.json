@@ -36,17 +36,20 @@
     "agent"
   ],
   "engines": {
-    "node": ">=22.12.0"
+    "node": ">=22.19.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
     "@clack/prompts": "^1.1.0",
+    "@earendil-works/pi-agent-core": "^0.78.1",
+    "@earendil-works/pi-coding-agent": "0.78.1",
+    "@earendil-works/pi-tui": "^0.78.1",
     "@kubernetes/client-node": "^1.4.0",
-    "@mariozechner/pi-coding-agent": "^0.73.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "@sinclair/typebox": "^0.34.0",
     "adm-zip": "^0.5.17",
     "diff": "^8.0.3",
+    "glob": "^13.0.6",
     "js-yaml": "^4.1.1",
     "jsonwebtoken": "^9.0.3",
     "markdown-it": "^14.1.0",
@@ -110,6 +113,7 @@
     "smoke:delegate-async": "node scripts/smoke/real-delegate-async.mjs",
     "smoke:delegate-ui": "node scripts/smoke/real-delegate-ui.mjs",
     "smoke:delegate-batch-ui": "node scripts/smoke/real-delegate-batch-ui.mjs",
+    "smoke:agentbox-routing": "node scripts/smoke/agentbox-model-routing.mjs",
     "docker:build:runtime": "docker build -f Dockerfile.runtime -t siclaw/siclaw-runtime:latest .",
     "docker:build:portal": "docker build -f Dockerfile.portal -t siclaw/siclaw-portal:latest .",
     "docker:build:agentbox": "docker build -f Dockerfile.agentbox -t siclaw/siclaw-agentbox:latest .",

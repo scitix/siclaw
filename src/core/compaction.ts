@@ -4,9 +4,9 @@
  * Ported from OpenClaw's src/agents/compaction.ts — wraps pi-coding-agent SDK
  * functions with security filtering and multi-stage summarization.
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { estimateTokens, generateSummary } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { estimateTokens, generateSummary } from "@earendil-works/pi-coding-agent";
 import { extractToolCallsFromAssistant, extractToolResultId, type ToolCallLike } from "./message-utils.js";
 export { extractToolCallsFromAssistant, extractToolResultId, type ToolCallLike };
 

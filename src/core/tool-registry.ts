@@ -7,7 +7,7 @@
  * in one pass: mode filter → available check → instantiate → allowedTools filter.
  */
 
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type {
   SessionMode, KubeconfigRef, MemoryRef, DpStateRef,
 } from "./types.js";

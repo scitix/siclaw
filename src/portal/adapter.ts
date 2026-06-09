@@ -19,6 +19,7 @@ import { defaultProviderModelCompat } from "../core/model-compat.js";
 import { normalizeChatSessionPreview, normalizeChatSessionTitle } from "./chat-session-fields.js";
 import { safeParseSkillFiles } from "../shared/skill-package.js";
 import { walkJumpChainRows, chainHopFromRow } from "./host-api.js";
+import { resolveAgentModelRouting } from "./model-routing-config.js";
 
 function requireInternalAuth(req: http.IncomingMessage, internalSecret: string): boolean {
   const token = req.headers["x-auth-token"] as string | undefined;
@@ -528,7 +529,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
 
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
 
@@ -537,7 +538,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       return;
     }
 
-    const agent = agentRows[0] as { model_provider: string; model_id: string };
+    const agent = agentRows[0] as { model_provider: string; model_id: string; model_routing?: unknown };
 
     const [providerRows] = await db.query(
       "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
@@ -556,6 +557,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       [p.id],
     ) as any;
 
+    const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
+      provider: agent.model_provider,
+      modelId: agent.model_id,
+    });
     sendJson(res, 200, {
       providers: {
         [p.name]: {
@@ -573,6 +578,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
         },
       },
       default: { provider: agent.model_provider, modelId: agent.model_id },
+      ...(modelRouting ? { modelRouting } : {}),
     });
   });
 
@@ -1125,10 +1131,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
     }
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string } | undefined;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       sendJson(res, 200, { binding: null });
       return;
@@ -1156,6 +1162,10 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
       maxTokens: m.max_tokens,
       compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
     }));
+    const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
+      provider: agent.model_provider,
+      modelId: agent.model_id,
+    });
     sendJson(res, 200, {
       binding: {
         modelProvider: p.name,
@@ -1168,6 +1178,7 @@ export function registerAdapterRoutes(router: RestRouter, internalSecret: string
           authHeader: true,
           models,
         },
+        ...(modelRouting ? { modelRouting } : {}),
       },
     });
   });
@@ -1541,13 +1552,13 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
   handlers.set("config.getSettings", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
     if (agentRows.length === 0 || !agentRows[0].model_provider) {
       return { providers: {} };
     }
-    const agent = agentRows[0] as { model_provider: string; model_id: string };
+    const agent = agentRows[0] as { model_provider: string; model_id: string; model_routing?: unknown };
     const [providerRows] = await db.query(
       "SELECT id, name, base_url, api_key, api_type FROM model_providers WHERE name = ? LIMIT 1",
       [agent.model_provider],
@@ -1561,6 +1572,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
        FROM model_entries WHERE provider_id = ? ORDER BY sort_order, created_at`,
       [p.id],
     ) as any;
+    const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
+      provider: agent.model_provider,
+      modelId: agent.model_id,
+    });
     return {
       providers: {
         [p.name]: {
@@ -1578,16 +1593,17 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
         },
       },
       default: { provider: agent.model_provider, modelId: agent.model_id },
+      ...(modelRouting ? { modelRouting } : {}),
     };
   });
 
   handlers.set("config.getModelBinding", async (params) => {
     const db = getDb();
     const [agentRows] = await db.query(
-      "SELECT model_provider, model_id FROM agents WHERE id = ?",
+      "SELECT model_provider, model_id, model_routing FROM agents WHERE id = ?",
       [params.agentId],
     ) as any;
-    const agent = agentRows[0] as { model_provider?: string; model_id?: string } | undefined;
+    const agent = agentRows[0] as { model_provider?: string; model_id?: string; model_routing?: unknown } | undefined;
     if (!agent?.model_provider || !agent?.model_id) {
       return { binding: null };
     }
@@ -1613,6 +1629,10 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
       maxTokens: m.max_tokens,
       compat: defaultProviderModelCompat({ api: p.api_type, baseUrl: p.base_url }),
     }));
+    const modelRouting = await resolveAgentModelRouting(agent.model_routing, {
+      provider: agent.model_provider,
+      modelId: agent.model_id,
+    });
     return {
       binding: {
         modelProvider: p.name,
@@ -1625,6 +1645,7 @@ export function buildAdapterRpcHandlers(): Map<string, (params: any, agentId: st
           authHeader: true,
           models,
         },
+        ...(modelRouting ? { modelRouting } : {}),
       },
     };
   });

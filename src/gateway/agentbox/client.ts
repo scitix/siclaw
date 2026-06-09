@@ -7,6 +7,7 @@
 
 import https from "node:https";
 import { GATEWAY_SYNC_DESCRIPTORS, type GatewaySyncType } from "../../shared/gateway-sync.js";
+import type { ModelRoutePolicy } from "../../core/model-routing.js";
 
 export interface AgentBoxTlsOptions {
   cert: string;
@@ -47,6 +48,8 @@ export interface PromptOptions {
       compat?: Record<string, unknown>;
     }>;
   };
+  /** Optional ordered model fallback policy. Omitted means legacy single-model behavior. */
+  modelRouting?: ModelRoutePolicy;
 }
 
 export interface PromptResponse {

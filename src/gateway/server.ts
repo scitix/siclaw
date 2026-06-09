@@ -161,6 +161,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
     sessionRegistry.remember(sessionId, userId, agentId);
 
     const modelConfig = params.modelConfig as PromptOptions["modelConfig"];
+    const modelRouting = params.modelRouting as PromptOptions["modelRouting"];
     const promptOpts: PromptOptions = {
       sessionId,
       text,
@@ -170,6 +171,7 @@ export async function startRuntime(opts: StartRuntimeOptions): Promise<RuntimeSe
       systemPromptTemplate: params.systemPrompt as string | undefined,
       mode: params.mode as string | undefined,
       modelConfig,
+      modelRouting,
     };
 
     // Async-ack protocol: return { ok, sessionId } within milliseconds; do

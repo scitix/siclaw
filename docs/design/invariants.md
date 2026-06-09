@@ -382,7 +382,7 @@ Module system:  ESM only — no CommonJS, no require()
 Import syntax:  Always use .js extensions: import { X } from "./x.js"
 Strict mode:    TypeScript strict: true
 Exports:        Named exports preferred; no default exports in barrel files
-Node version:   ≥22.12.0 (required for ESM stability + node:sqlite)
+Node version:   ≥22.19.0 (required for ESM stability + node:sqlite)
 Test runner:    vitest
 ```
 

@@ -9,7 +9,7 @@
 #   ssh (future host_exec) — will be setgid hostcred group, reads SSH credentials via group permission
 
 # ── Build stage ──────────────────────────────────────────────────
-FROM node:22-slim AS builder
+FROM node:22.19-slim AS builder
 
 WORKDIR /app
 
@@ -38,7 +38,7 @@ COPY src/portal/cli-snapshot-types.ts ./src/portal/
 RUN npx tsc -p tsconfig.agentbox.json
 
 # ── Production stage ─────────────────────────────────────────────
-FROM node:22-slim
+FROM node:22.19-slim
 
 # System deps + kubectl in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \

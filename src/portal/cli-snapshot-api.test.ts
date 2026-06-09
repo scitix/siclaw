@@ -498,6 +498,46 @@ describe("GET /api/v1/cli-snapshot", () => {
     expect(body.credentials.clusters.map((c: any) => c.name)).toEqual(["bound-cluster"]);
   });
 
+  it("includes active agent modelRouting in scoped snapshots", async () => {
+    const db = getDb();
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-openai", "default", "openai", "https://api.openai.com", "sk-openai", "openai", 0],
+    );
+    await db.query(
+      "INSERT INTO model_providers (id, org_id, name, base_url, api_key, api_type, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ["p-anthropic", "default", "anthropic", "https://api.anthropic.com", "sk-anthropic", "anthropic", 1],
+    );
+    await db.query(
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["m-openai", "p-openai", "gpt-4o", "GPT-4o", 0, 128000, 4096, 1, 0],
+    );
+    await db.query(
+      "INSERT INTO model_entries (id, provider_id, model_id, name, reasoning, context_window, max_tokens, is_default, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["m-anthropic", "p-anthropic", "claude", "Claude", 1, 200000, 8192, 0, 0],
+    );
+    await db.query(
+      "INSERT INTO agents (id, name, status, model_provider, model_id, model_routing, is_production, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      ["ag-route", "route-agent", "active", "openai", "gpt-4o", JSON.stringify({
+        enabled: true,
+        candidates: [{ provider: "anthropic", modelId: "claude" }],
+      }), 1, "u"],
+    );
+
+    const { status, body } = await runRoute(
+      router,
+      fakeReq({ url: "/api/v1/cli-snapshot?agent=route-agent", headers: authedHeaders() }),
+    );
+
+    expect(status).toBe(200);
+    expect(body.modelRouting.candidates).toEqual([
+      expect.objectContaining({ provider: "openai", modelId: "gpt-4o" }),
+      expect.objectContaining({ provider: "anthropic", modelId: "claude" }),
+    ]);
+    expect(body.modelRouting.candidates[1].modelConfig.apiKey).toBe("sk-anthropic");
+    expect(body.activeAgent.modelRouting.candidates[0].provider).toBe("openai");
+  });
+
   it("suppresses builtin skills that have an overlay", async () => {
     const db = getDb();
     const base = "---\nname: shared-name\n---\nbase";

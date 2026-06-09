@@ -21,6 +21,16 @@ import { HttpTransport } from "./credential-transport.js";
 import { getSyncHandler, createClusterHandler, createHostHandler } from "./sync-handlers.js";
 import { GATEWAY_SYNC_DESCRIPTORS, type AgentBoxSyncHandler, type GatewaySyncType } from "../shared/gateway-sync.js";
 import { detectLanguage } from "../shared/detect-language.js";
+import {
+  clearModelRouteUserSelectionIfDifferent,
+  markModelRouteUserSelection,
+  normalizeModelRoutePolicy,
+  runPromptWithModelRouting,
+  shouldUseModelRouteRunner,
+  type ModelRouteEvent,
+  type ModelRoutePolicy,
+} from "../core/model-routing.js";
+import type { BrainSession } from "../core/brain-session.js";
 
 type RequestHandler = (
   req: http.IncomingMessage,
@@ -33,6 +43,46 @@ interface Route {
   pattern: RegExp;
   paramNames: string[];
   handler: RequestHandler;
+}
+
+interface PromptRequestBody {
+  sessionId?: string;
+  text?: string;
+  mode?: SessionMode;
+  modelProvider?: string;
+  modelId?: string;
+  systemPromptTemplate?: string;
+  modelConfig?: Record<string, unknown>;
+  modelRouting?: ModelRoutePolicy;
+}
+
+/**
+ * Enrich an `agent_end` event with per-turn context/token usage so the
+ * frontend can render token + cost badges. Shared by the live SSE path and the
+ * model-routing flush path — when routing buffers brain events and replays
+ * them after a winning attempt, the live path is bypassed, so without this the
+ * routed session would emit a bare `agent_end` and lose its token stats.
+ * Non-`agent_end` events (and the case where the brain exposes no usage yet)
+ * pass through untouched.
+ */
+function enrichAgentEndEvent(brain: BrainSession, event: any): any {
+  if (event?.type !== "agent_end") return event;
+  const usage = brain.getContextUsage?.();
+  const stats = brain.getSessionStats?.();
+  if (!usage && !stats) return event;
+  return {
+    ...event,
+    contextUsage: {
+      tokens: usage?.tokens ?? 0,
+      contextWindow: usage?.contextWindow ?? 0,
+      percent: usage?.percent ?? 0,
+      inputTokens: stats?.tokens?.input ?? 0,
+      outputTokens: stats?.tokens?.output ?? 0,
+      cacheReadTokens: stats?.tokens?.cacheRead ?? 0,
+      cacheWriteTokens: stats?.tokens?.cacheWrite ?? 0,
+      cost: stats?.cost ?? 0,
+    },
+  };
 }
 
 /**
@@ -287,7 +337,7 @@ export function createHttpServer(
    * The message is sent to the Agent, and responses are returned via SSE stream.
    */
   addRoute("POST", "/api/prompt", async (req, res) => {
-    const body = (await parseJsonBody(req)) as { sessionId?: string; text?: string; mode?: SessionMode; modelProvider?: string; modelId?: string; systemPromptTemplate?: string; modelConfig?: Record<string, unknown> };
+    const body = (await parseJsonBody(req)) as PromptRequestBody;
 
     if (!body.text) {
       sendJson(res, 400, { error: "Missing 'text' field" });
@@ -308,10 +358,32 @@ export function createHttpServer(
       return;
     }
 
+    const configuredModelRouting = normalizeModelRoutePolicy(
+      body.modelRouting !== undefined ? body.modelRouting : loadConfig().modelRouting,
+    );
+    if (body.modelProvider && body.modelId) {
+      const clearedUserSelection = clearModelRouteUserSelectionIfDifferent(managed.modelRouteState, {
+        provider: body.modelProvider,
+        modelId: body.modelId,
+      });
+      if (clearedUserSelection) {
+        sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
+      }
+    }
+    // Only engage the buffered routing runner when a real fallback target
+    // exists (≥2 distinct candidates). With a single candidate there is nothing
+    // to fall back to, so buffering every brain event until the attempt
+    // completes would kill live streaming for zero resilience gain — run the
+    // prompt live instead. (Upstream always co-sends modelProvider/modelId with
+    // modelRouting, and candidates[0] is that same primary, so the model-setup
+    // block below still pins the right model on the live path.)
+    managed.modelRoutePolicy = configuredModelRouting;
+    const routeEnabled = shouldUseModelRouteRunner(configuredModelRouting, managed.modelRouteState);
     // Mark the session busy before model setup so a refresh, second tab, or
     // fast double-submit cannot start a second prompt on the same brain.
     managed._promptDone = false;
     managed._aborted = false;
+    managed._routeBrainEventsThroughExtra = routeEnabled;
     // Acquire the brain.prompt mutex synchronously before any await so the
     // synth notify path (which polls _promptDone via waitForParentIdle)
     // cannot race in and call brain.prompt() concurrently — see jacoblee
@@ -325,7 +397,7 @@ export function createHttpServer(
     }
     // Subscribe to buffer events so SSE can replay them even if it connects late
     const brainUnsub = managed.brain.subscribe((event) => {
-      if (!managed._promptDone) {
+      if (!managed._promptDone && !managed._routeBrainEventsThroughExtra) {
         managed._eventBuffer.push(event);
       }
     });
@@ -343,6 +415,7 @@ export function createHttpServer(
     const releasePromptLockOnSetupFailure = (err: unknown): void => {
       console.error(`[agentbox-http] Prompt setup failed for session ${managed.id}:`, err);
       managed._promptDone = true;
+      managed._routeBrainEventsThroughExtra = false;
       if (managed._bufferUnsub) {
         managed._bufferUnsub();
         managed._bufferUnsub = null;
@@ -453,6 +526,7 @@ export function createHttpServer(
 
     const actuallyFinish = () => {
       managed._promptDone = true;
+      managed._routeBrainEventsThroughExtra = false;
 
       // Emit prompt metrics via diagnostic event bus
       const currStats = managed.brain.getSessionStats();
@@ -512,7 +586,44 @@ export function createHttpServer(
       }
       actuallyFinish();
     };
-    managed.brain.prompt(promptText).then(() => {
+
+    const emitSessionExtraEvent = (event: unknown): void => {
+      const payload: Record<string, unknown> =
+        event && typeof event === "object" && !Array.isArray(event)
+          ? event as Record<string, unknown>
+          : { type: "model_route_event", value: event };
+      if (managed._extraEventSubs.size === 0) {
+        managed._extraEventBuffer.push(payload);
+        return;
+      }
+      for (const sub of managed._extraEventSubs) {
+        try { sub(payload); } catch { /* best-effort SSE bridge */ }
+      }
+    };
+
+    const emitRouteEvent = (event: ModelRouteEvent): void => {
+      emitSessionExtraEvent({ ...event, sessionId: managed.id });
+    };
+
+    const promptPromise = routeEnabled
+      ? runPromptWithModelRouting(
+          managed.brain,
+          promptText,
+          configuredModelRouting,
+          managed.modelRouteState,
+          {
+            emitEvent: emitRouteEvent,
+            // Routing buffers brain events and replays them here after the
+            // winning attempt, bypassing the live SSE subscription that would
+            // otherwise enrich agent_end — re-apply the same enrichment so
+            // routed sessions still get token/cost stats.
+            emitBrainEvent: (event) => emitSessionExtraEvent(enrichAgentEndEvent(managed.brain, event)),
+            onStateChange: () => sessionManager.persistModelRouteState(managed.id, managed.modelRouteState),
+          },
+        )
+      : managed.brain.prompt(promptText);
+
+    promptPromise.then(() => {
       console.log(`[agentbox-http] Prompt completed for session ${managed.id}`);
       promptOutcome = "completed";
       onPromptFinish();
@@ -607,28 +718,9 @@ export function createHttpServer(
 
     // Subscribe to Agent events (live, after buffer replay)
     const unsubscribe = managed.brain.subscribe((event: any) => {
+      if (managed._routeBrainEventsThroughExtra) return;
       // Enrich agent_end with context usage so frontend can display token stats
-      if (event?.type === "agent_end") {
-        const usage = managed.brain.getContextUsage?.();
-        const stats = managed.brain.getSessionStats?.();
-        if (usage || stats) {
-          writeEvent({
-            ...event,
-            contextUsage: {
-              tokens: usage?.tokens ?? 0,
-              contextWindow: usage?.contextWindow ?? 0,
-              percent: usage?.percent ?? 0,
-              inputTokens: stats?.tokens?.input ?? 0,
-              outputTokens: stats?.tokens?.output ?? 0,
-              cacheReadTokens: stats?.tokens?.cacheRead ?? 0,
-              cacheWriteTokens: stats?.tokens?.cacheWrite ?? 0,
-              cost: stats?.cost ?? 0,
-            },
-          });
-          return;
-        }
-      }
-      writeEvent(event);
+      writeEvent(enrichAgentEndEvent(managed.brain, event));
     });
 
     // Heartbeat: send SSE comment every 30s to keep connection alive
@@ -944,6 +1036,8 @@ export function createHttpServer(
 
     console.log(`[agentbox-http] Switching model for session ${sessionId}: ${model.provider}/${model.id}`);
     await managed.brain.setModel(model);
+    markModelRouteUserSelection(managed.modelRouteState, { provider: model.provider, modelId: model.id });
+    sessionManager.persistModelRouteState(managed.id, managed.modelRouteState);
     sendJson(res, 200, { ok: true, model });
   });
 

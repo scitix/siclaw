@@ -140,6 +140,38 @@ describe("config.getSettings", () => {
     });
   });
 
+  it("returns agent modelRouting in settings with hydrated provider configs", async () => {
+    mockQuery(
+      [{
+        model_provider: "openai",
+        model_id: "gpt-4",
+        model_routing: JSON.stringify({
+          enabled: true,
+          candidates: [{ provider: "anthropic", modelId: "claude" }],
+          cooldownMsByKind: { rate_limit: 1234, quota: 60000 },
+        }),
+      }],
+      [{ id: "p-openai", name: "openai", base_url: "https://api.openai.com", api_key: "sk-openai", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
+      [{ id: "p-openai", name: "openai", base_url: "https://api.openai.com", api_key: "sk-openai", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 0, context_window: 128000, max_tokens: 4096 }],
+      [{ id: "p-anthropic", name: "anthropic", base_url: "https://api.anthropic.com", api_key: "sk-anthropic", api_type: "anthropic" }],
+      [{ model_id: "claude", name: "Claude", reasoning: 1, context_window: 200000, max_tokens: 8192 }],
+    );
+
+    const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
+    expect(result.modelRouting).toMatchObject({
+      enabled: true,
+      strategy: "ordered_fallback",
+      cooldownMsByKind: { rate_limit: 1234, billing: 60000 },
+      candidates: [
+        { provider: "openai", modelId: "gpt-4" },
+        { provider: "anthropic", modelId: "claude" },
+      ],
+    });
+    expect(result.modelRouting.candidates[1].modelConfig.apiKey).toBe("sk-anthropic");
+  });
+
   it("returns empty providers when agent has no model_provider", async () => {
     mockQuery([{ model_provider: null, model_id: null }]);
     const result = await getHandler("config.getSettings")({ agentId: "a1" }, "a1");
@@ -205,6 +237,33 @@ describe("config.getModelBinding", () => {
       supportsUsageInStreaming: true,
       maxTokensField: "max_tokens",
     });
+  });
+
+  it("returns hydrated modelRouting in model binding", async () => {
+    mockQuery(
+      [{
+        model_provider: "openai",
+        model_id: "gpt-4",
+        model_routing: JSON.stringify({
+          enabled: true,
+          candidates: [
+            { provider: "openai", modelId: "gpt-4" },
+            { provider: "anthropic", modelId: "claude" },
+          ],
+        }),
+      }],
+      [{ id: "p-openai", name: "openai", base_url: "https://api.openai.com", api_key: "sk-openai", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 1, context_window: 128000, max_tokens: 4096 }],
+      [{ id: "p-openai", name: "openai", base_url: "https://api.openai.com", api_key: "sk-openai", api_type: "openai" }],
+      [{ model_id: "gpt-4", name: "GPT-4", reasoning: 1, context_window: 128000, max_tokens: 4096 }],
+      [{ id: "p-anthropic", name: "anthropic", base_url: "https://api.anthropic.com", api_key: "sk-anthropic", api_type: "anthropic" }],
+      [{ model_id: "claude", name: "Claude", reasoning: 0, context_window: 200000, max_tokens: 8192 }],
+    );
+
+    const result = await getHandler("config.getModelBinding")({ agentId: "a1" }, "a1");
+    expect(result.binding.modelRouting.candidates).toHaveLength(2);
+    expect(result.binding.modelRouting.candidates[0]).toMatchObject({ provider: "openai", modelId: "gpt-4" });
+    expect(result.binding.modelRouting.candidates[1].modelConfig.name).toBe("anthropic");
   });
 
   it("returns null binding when agent has no model_provider", async () => {

@@ -9,6 +9,7 @@ interface Agent {
   id: string; name: string; description: string; status: string
   model_provider: string; model_id: string; is_production: boolean
   system_prompt: string; icon: string; color: string; created_at: string
+  model_routing?: unknown
 }
 
 const statusColors: Record<string, string> = {

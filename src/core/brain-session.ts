@@ -40,6 +40,13 @@ export interface BrainSessionStats {
   cost: number;
 }
 
+export interface BrainProviderResponse {
+  provider?: string;
+  modelId?: string;
+  status: number;
+  headers: Record<string, string>;
+}
+
 export interface BrainSession {
   readonly brainType: BrainType;
 
@@ -85,4 +92,20 @@ export interface BrainSession {
 
   /** Register a provider dynamically (from gateway DB config). */
   registerProvider?(name: string, config: Record<string, unknown>): void;
+
+  /**
+   * Optional provider-response tap. pi-agent exposes HTTP status/headers through
+   * its onResponse hook; model routing uses this as a best-effort signal and
+   * still falls back to final assistant errorMessage classification when absent.
+   */
+  captureProviderResponse?(listener: (response: BrainProviderResponse) => void): () => void;
+
+  /**
+   * Optional append-only conversation checkpoint used by model routing.
+   * Implementations that support branching can restore this before replaying
+   * the same user prompt on a fallback model, so failed attempts do not become
+   * part of the active LLM context.
+   */
+  createPromptCheckpoint?(): unknown;
+  restorePromptCheckpoint?(checkpoint: unknown): Promise<void> | void;
 }

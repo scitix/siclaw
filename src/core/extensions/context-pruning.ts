@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /** Rough character-to-token ratio for estimating context usage */
 const CHARS_PER_TOKEN = 4;

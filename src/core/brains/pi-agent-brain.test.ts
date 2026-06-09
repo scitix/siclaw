@@ -19,6 +19,7 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 100, percent: 10 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 }, cost: 0.001 })),
     model: { id: "m", name: "M", provider: "p", contextWindow: 100, maxTokens: 10, reasoning: false },
+    agent: { onResponse: vi.fn(async () => {}) },
     modelRegistry: {
       find: vi.fn((provider: string, id: string) => ({
         id, name: id, provider, contextWindow: 1000, maxTokens: 100, reasoning: false,
@@ -83,7 +84,7 @@ describe("PiAgentBrain", () => {
   });
 
   it("prompt skips retry when stopReason is error", async () => {
-    // Model errors (auth/quota/network give-up after pi-agent-core's
+    // Model errors (auth/billing/network give-up after pi-agent-core's
     // transport retries) reach the brain as stopReason="error" with empty
     // content. The empty-response retry must NOT engage — re-prompting just
     // hammers the same permanent failure and flickers the frontend Thinking
@@ -253,5 +254,109 @@ describe("PiAgentBrain", () => {
     const brain = new PiAgentBrain(session);
     brain.registerProvider!("name", { baseUrl: "u", models: [] });
     expect(session.modelRegistry.registerProvider).toHaveBeenCalledWith("name", { baseUrl: "u", models: [] });
+  });
+
+  it("restores a checkpoint by branching the session leaf and rebuilding agent messages", () => {
+    const checkpointMessages = [
+      { role: "user", content: [{ type: "text", text: "diagnose" }] },
+    ];
+    const partialFailedAttempt = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "call-1", name: "bash", input: { command: "kubectl get pods" } }],
+    };
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn((id: string) => (id === "leaf-before-attempt" ? { id } : undefined)),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: checkpointMessages })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [...checkpointMessages, partialFailedAttempt] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(brain.createPromptCheckpoint()).toBe("leaf-before-attempt");
+
+    brain.restorePromptCheckpoint("leaf-before-attempt");
+
+    expect(sessionManager.getEntry).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.branch).toHaveBeenCalledWith("leaf-before-attempt");
+    expect(sessionManager.resetLeaf).not.toHaveBeenCalled();
+    expect(session.agent.state.messages).toBe(checkpointMessages);
+    expect(session.agent.state.messages).not.toContain(partialFailedAttempt);
+  });
+
+  it("refuses to restore a missing string checkpoint", () => {
+    const sessionManager = {
+      getLeafId: vi.fn(() => "leaf-before-attempt"),
+      getEntry: vi.fn(() => undefined),
+      branch: vi.fn(),
+      resetLeaf: vi.fn(),
+      buildSessionContext: vi.fn(() => ({ messages: [] })),
+    };
+    const session = makeFakeSession({
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [] },
+      },
+      sessionManager,
+    });
+    const brain = new PiAgentBrain(session);
+
+    expect(() => brain.restorePromptCheckpoint("missing-leaf")).toThrow(
+      "Prompt checkpoint entry not found: missing-leaf",
+    );
+    expect(sessionManager.branch).not.toHaveBeenCalled();
+    expect(sessionManager.buildSessionContext).not.toHaveBeenCalled();
+  });
+
+  it("captureProviderResponse wraps pi-agent onResponse and restores it", async () => {
+    const previous = vi.fn(async () => "ok");
+    const session = makeFakeSession({ agent: { onResponse: previous } });
+    const brain = new PiAgentBrain(session);
+    const seen: any[] = [];
+
+    const unsubscribe = brain.captureProviderResponse((response) => seen.push(response));
+    const result = await session.agent.onResponse(
+      { status: 429, headers: { "Retry-After": "5", "x-ratelimit-reset": "10" } },
+      { provider: "openai", id: "gpt-4" },
+    );
+
+    expect(result).toBe("ok");
+    expect(previous).toHaveBeenCalled();
+    expect(seen).toEqual([{
+      status: 429,
+      headers: { "retry-after": "5", "x-ratelimit-reset": "10" },
+      provider: "openai",
+      modelId: "gpt-4",
+    }]);
+
+    unsubscribe();
+    expect(session.agent.onResponse).toBe(previous);
+  });
+
+  it("captureProviderResponse normalizes Web Headers objects", async () => {
+    const previous = vi.fn(async () => undefined);
+    const session = makeFakeSession({ agent: { onResponse: previous } });
+    const brain = new PiAgentBrain(session);
+    const seen: any[] = [];
+
+    brain.captureProviderResponse((response) => seen.push(response));
+    await session.agent.onResponse(
+      { status: 503, headers: new Headers([["Retry-After", "7"], ["X-RateLimit-Reset-Tokens", "9s"]]) },
+      { provider: "anthropic", id: "claude" },
+    );
+
+    expect(seen).toEqual([{
+      status: 503,
+      headers: { "retry-after": "7", "x-ratelimit-reset-tokens": "9s" },
+      provider: "anthropic",
+      modelId: "claude",
+    }]);
   });
 });

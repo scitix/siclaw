@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 // Mock the LLM summarization function before importing the code under test.
 // This lets us exercise summarizeWithFallback / summarizeInStages without a real API.
-vi.mock("@mariozechner/pi-coding-agent", async (orig) => {
-  const original = await orig<typeof import("@mariozechner/pi-coding-agent")>();
+vi.mock("@earendil-works/pi-coding-agent", async (orig) => {
+  const original = await orig<typeof import("@earendil-works/pi-coding-agent")>();
   return {
     ...original,
     generateSummary: vi.fn(async (messages: AgentMessage[]) => {
@@ -14,7 +14,7 @@ vi.mock("@mariozechner/pi-coding-agent", async (orig) => {
   };
 });
 
-import * as piAgent from "@mariozechner/pi-coding-agent";
+import * as piAgent from "@earendil-works/pi-coding-agent";
 import {
   repairToolUsePairingGuard,
   summarizeWithFallback,

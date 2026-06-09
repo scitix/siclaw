@@ -17,6 +17,7 @@ import {
 } from "../gateway/rest-router.js";
 import { requireAdmin } from "./auth.js";
 import type { RuntimeConnectionMap } from "./runtime-connection.js";
+import { encodeModelRoutingForDb } from "./model-routing-config.js";
 
 export function registerAgentRoutes(
   router: RestRouter,
@@ -49,7 +50,7 @@ export function registerAgentRoutes(
     const total: number = Number(countRows[0].total);
 
     const listParams = [...params, pageSize, offset];
-    const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id,
+    const listSql = `SELECT a.id, a.name, a.description, a.status, a.model_provider, a.model_id, a.model_routing,
         a.is_production, a.icon, a.color, a.created_by, a.created_at, a.updated_at,
         (SELECT COUNT(*) FROM agent_skills ask WHERE ask.agent_id = a.id) AS skills_count,
         (SELECT COUNT(*) FROM agent_mcp_servers ams WHERE ams.agent_id = a.id) AS mcp_count,
@@ -77,10 +78,17 @@ export function registerAgentRoutes(
 
     const id = crypto.randomUUID();
     const db = getDb();
+    let modelRouting: string | null | undefined;
+    try {
+      modelRouting = encodeModelRoutingForDb(body.model_routing);
+    } catch (err) {
+      sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      return;
+    }
 
     await db.query(
-      `INSERT INTO agents (id, name, description, status, model_provider, model_id, system_prompt, is_production, icon, color, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         body.name,
@@ -88,6 +96,7 @@ export function registerAgentRoutes(
         body.status ?? "active",
         body.model_provider ?? null,
         body.model_id ?? null,
+        modelRouting ?? null,
         body.system_prompt ?? null,
         body.is_production ?? 1,
         body.icon ?? null,
@@ -153,6 +162,18 @@ export function registerAgentRoutes(
       if (field in body) {
         setClauses.push(`${field} = ?`);
         values.push(body[field]);
+      }
+    }
+    if ("model_routing" in body) {
+      try {
+        const modelRouting = encodeModelRoutingForDb(body.model_routing);
+        if (modelRouting !== undefined) {
+          setClauses.push("model_routing = ?");
+          values.push(modelRouting);
+        }
+      } catch (err) {
+        sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+        return;
       }
     }
 
@@ -370,8 +391,8 @@ export function registerAgentRoutes(
       await conn.beginTransaction();
 
       await conn.query(
-        `INSERT INTO agents (id, name, description, status, model_provider, model_id, system_prompt, is_production, icon, color, created_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO agents (id, name, description, status, model_provider, model_id, model_routing, system_prompt, is_production, icon, color, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newId,
           newName,
@@ -379,6 +400,7 @@ export function registerAgentRoutes(
           source.status,
           source.model_provider,
           source.model_id,
+          source.model_routing,
           source.system_prompt,
           source.is_production,
           source.icon,

@@ -9,8 +9,8 @@
  * Ported from OpenClaw's session-tool-result-guard.ts (simplified —
  * no plugin hooks, no transcript events).
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { SessionManager } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { extractToolCallsFromAssistant, extractToolResultId } from "./message-utils.js";
 import { sanitizeToolCallInputs } from "./tool-call-repair.js";
 import type { PersistGuard } from "./guard-pipeline.js";

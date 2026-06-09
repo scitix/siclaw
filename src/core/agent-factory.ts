@@ -23,7 +23,7 @@ import {
   type LoadExtensionsResult,
   type ToolDefinition,
   type ExtensionAPI,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { globSync } from "glob";
 import { createMemoryIndexer, type MemoryIndexer, type MemoryIndexerOpts } from "../memory/index.js";
 import { ToolRegistry, type AgentMode } from "./tool-registry.js";
