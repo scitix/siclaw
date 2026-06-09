@@ -19,7 +19,11 @@ function makeFakeSession(overrides: Partial<Record<string, any>> = {}) {
     getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 100, percent: 10 })),
     getSessionStats: vi.fn(() => ({ tokens: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 }, cost: 0.001 })),
     model: { id: "m", name: "M", provider: "p", contextWindow: 100, maxTokens: 10, reasoning: false },
-    agent: { onResponse: vi.fn(async () => {}) },
+    agent: { onResponse: vi.fn(async () => {}), state: { messages: [] } },
+    compact: vi.fn(async () => ({ summary: "ok", firstKeptEntryId: "entry-1", tokensBefore: 100 })),
+    settingsManager: {
+      getCompactionSettings: vi.fn(() => ({ enabled: true, reserveTokens: 16, keepRecentTokens: 20 })),
+    },
     modelRegistry: {
       find: vi.fn((provider: string, id: string) => ({
         id, name: id, provider, contextWindow: 1000, maxTokens: 100, reasoning: false,
@@ -198,6 +202,88 @@ describe("PiAgentBrain", () => {
     const session = makeFakeSession({ getContextUsage: () => ({ tokens: 50, contextWindow: 100 }) });
     const brain = new PiAgentBrain(session);
     expect(brain.getContextUsage()).toEqual({ tokens: 50, contextWindow: 100, percent: 0 });
+  });
+
+  it("context preflight skips compaction when the target model window fits", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 10, contextWindow: 1000, percent: 1 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "short prompt",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: false });
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight does not compact when fallback target has a larger window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 1_000_000, contextWindow: 1_000_000, percent: 100 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "bigger", name: "Bigger", provider: "p", contextWindow: 1_250_000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: false });
+    expect(session.compact).not.toHaveBeenCalled();
+  });
+
+  it("context preflight compacts before prompting on a smaller target window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn()
+        .mockReturnValueOnce({ tokens: 990, contextWindow: 1000, percent: 99 })
+        .mockReturnValueOnce({ tokens: 100, contextWindow: 1000, percent: 10 }),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result).toMatchObject({ ok: true, compacted: true });
+    expect(session.compact).toHaveBeenCalledWith(expect.stringContaining("moonshot/kimi"));
+  });
+
+  it("context preflight fails closed when compaction cannot fit the target window", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => ({ tokens: 990, contextWindow: 1000, percent: 99 })),
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "kimi", name: "Kimi", provider: "moonshot", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(true);
+    expect(result.errorMessage).toContain("still exceeds");
+  });
+
+  it("context preflight uses message estimation when provider usage is unavailable", async () => {
+    const session = makeFakeSession({
+      getContextUsage: vi.fn(() => undefined),
+      agent: {
+        onResponse: vi.fn(async () => {}),
+        state: { messages: [{ role: "user", content: [{ type: "text", text: "x".repeat(4000) }] }] },
+      },
+    });
+    const brain = new PiAgentBrain(session);
+
+    const result = await brain.ensureContextForModelPrompt(
+      { id: "tiny", name: "Tiny", provider: "p", contextWindow: 1000, maxTokens: 100, reasoning: false },
+      "continue",
+    );
+
+    expect(result.compacted).toBe(true);
+    expect(session.compact).toHaveBeenCalled();
   });
 
   it("getSessionStats returns token + cost values", () => {

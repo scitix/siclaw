@@ -18,6 +18,7 @@ export type ModelRouteFailureKind =
   | "unknown";
 
 export type ModelRouteCooldownMsByKind = Partial<Record<ModelRouteFailureKind, number>>;
+export type ModelRouteFallbackBlockedReason = "tool_execution";
 
 export interface ModelRouteCandidate {
   provider: string;
@@ -45,6 +46,7 @@ export interface ModelRouteAttempt {
   success?: boolean;
   failureKind?: ModelRouteFailureKind;
   failureSource?: "prompt_error" | "message_end" | "setup";
+  fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
   errorMessage?: string;
 }
 
@@ -76,6 +78,7 @@ export type ModelRouteEvent =
       modelId: string;
       status: "started" | "failed";
       failureKind?: ModelRouteFailureKind;
+      fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
       errorMessage?: string;
     }
   | {
@@ -108,6 +111,7 @@ export type ModelRouteEvent =
       attempt: number;
       candidateKey?: string;
       failureKind?: ModelRouteFailureKind;
+      fallbackBlockedReason?: ModelRouteFallbackBlockedReason;
       errorMessage?: string;
     };
 
@@ -159,6 +163,7 @@ interface AttemptResult {
   failure: AttemptFailure | null;
   checkpoint: unknown;
   events: unknown[];
+  hadToolExecution: boolean;
 }
 
 const ATTEMPT_HISTORY_LIMIT = 20;
@@ -450,6 +455,13 @@ export function shouldFallbackForKind(kind: ModelRouteFailureKind, policy: Model
   return DEFAULT_FALLBACK_ON.has(kind);
 }
 
+function shouldTryNextCandidateForFailure(failure: AttemptFailure, policy: ModelRoutePolicy): boolean {
+  if (failure.kind === "context_overflow" && failure.source === "setup") {
+    return !normalizeFailureKindSet(policy.noFallbackOn).has("context_overflow");
+  }
+  return shouldFallbackForKind(failure.kind, policy);
+}
+
 export async function runPromptWithModelRouting(
   brain: BrainSession,
   text: string,
@@ -547,6 +559,7 @@ export async function runPromptWithModelRouting(
     attempt.failureKind = failure.kind;
     attempt.failureSource = failure.source;
     attempt.errorMessage = failure.message;
+    if (attemptResult.hadToolExecution) attempt.fallbackBlockedReason = "tool_execution";
     state.lastFailureAt = attempt.finishedAt;
     recordAttempt(state, attempt);
 
@@ -558,11 +571,17 @@ export async function runPromptWithModelRouting(
       modelId: candidate.modelId,
       status: "failed",
       failureKind: failure.kind,
+      fallbackBlockedReason: attempt.fallbackBlockedReason,
       errorMessage: failure.message,
     });
 
     const nextCandidate = ordered[i + 1];
-    if (!nextCandidate || !shouldFallbackForKind(failure.kind, policy)) {
+    if (attempt.fallbackBlockedReason && nextCandidate) {
+      const cooldownUntil = cooldownUntilForFailure(failure, policy, now());
+      if (cooldownUntil) state.cooldowns[key] = cooldownUntil;
+      else delete state.cooldowns[key];
+    }
+    if (!nextCandidate || attempt.fallbackBlockedReason || !shouldTryNextCandidateForFailure(failure, policy)) {
       flushBrainEvents(attemptResult.events, emitBrainEvent);
       state.lastSwitchReason = failure.kind;
       options.onStateChange?.(state);
@@ -571,6 +590,7 @@ export async function runPromptWithModelRouting(
         attempt: attempt.attempt,
         candidateKey: key,
         failureKind: failure.kind,
+        fallbackBlockedReason: attempt.fallbackBlockedReason,
         errorMessage: failure.message,
       });
 
@@ -643,16 +663,18 @@ async function runAttempt(
     if (response.modelId && response.modelId !== candidate.modelId) return;
     lastProviderResponse = response;
   });
+  let model: BrainModelInfo | undefined;
   try {
     if (candidate.modelConfig && brain.registerProvider) {
       brain.registerProvider(candidate.provider, candidate.modelConfig);
     }
-    const model = brain.findModel(candidate.provider, candidate.modelId);
+    model = brain.findModel(candidate.provider, candidate.modelId);
     if (!model) {
       unsubscribeProviderResponse?.();
       return {
         checkpoint,
         events: [],
+        hadToolExecution: false,
         failure: {
           kind: "model_not_found",
           source: "setup",
@@ -670,6 +692,7 @@ async function runAttempt(
     return {
       checkpoint,
       events: [],
+      hadToolExecution: false,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -688,8 +711,10 @@ async function runAttempt(
 
   let lastAssistantMessage: AssistantMessageLike | null = null;
   const events: unknown[] = [];
+  let hadToolExecution = false;
   const unsubscribe = brain.subscribe((event: unknown) => {
     events.push(event);
+    if (isToolExecutionEvent(event)) hadToolExecution = true;
     if (!isRecord(event) || event.type !== "message_end") return;
     const message = event.message;
     if (isRecord(message) && message.role === "assistant") {
@@ -698,12 +723,29 @@ async function runAttempt(
   });
 
   try {
+    const preflight = model
+      ? await brain.ensureContextForModelPrompt?.(model, text)
+      : undefined;
+    if (preflight && !preflight.ok) {
+      return {
+        checkpoint,
+        events,
+        hadToolExecution,
+        failure: {
+          kind: "context_overflow",
+          source: "setup",
+          message: preflight.errorMessage ?? `Context preflight failed for ${candidate.provider}/${candidate.modelId}`,
+          providerResponse: lastProviderResponse,
+        },
+      };
+    }
     await brain.prompt(text);
   } catch (err) {
     const message = errorMessage(err);
     return {
       checkpoint,
       events,
+      hadToolExecution,
       failure: {
         kind: classifyModelRouteFailure({
           errorMessage: message,
@@ -726,6 +768,7 @@ async function runAttempt(
   return {
     checkpoint,
     events,
+    hadToolExecution,
     failure: failureFromAssistantMessage(lastAssistantMessage, candidate, lastProviderResponse),
   };
 }
@@ -736,6 +779,13 @@ async function restorePromptCheckpoint(brain: BrainSession, checkpoint: unknown)
 
 function flushBrainEvents(events: unknown[], emitBrainEvent: (event: unknown) => void): void {
   for (const event of events) emitBrainEvent(event);
+}
+
+function isToolExecutionEvent(event: unknown): boolean {
+  if (!isRecord(event)) return false;
+  if (event.type === "tool_execution_start" || event.type === "tool_execution_end") return true;
+  if (event.type !== "message_end" || !isRecord(event.message)) return false;
+  return event.message.role === "toolResult";
 }
 
 function failureFromAssistantMessage(

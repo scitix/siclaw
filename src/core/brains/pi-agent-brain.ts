@@ -12,7 +12,9 @@ import type {
   BrainContextUsage,
   BrainSessionStats,
   BrainProviderResponse,
+  BrainContextPreflightResult,
 } from "../brain-session.js";
+import { estimateMessagesTokens } from "../compaction.js";
 
 export class PiAgentBrain implements BrainSession {
   readonly brainType = "pi-agent" as const;
@@ -28,6 +30,7 @@ export class PiAgentBrain implements BrainSession {
 
   private static readonly MAX_EMPTY_RETRIES = 2;
   private static readonly RETRY_DELAY_MS = 2000;
+  private static readonly PROMPT_PREFLIGHT_SAFETY_TOKENS = 2048;
 
   private emit(event: any): void {
     for (const listener of this.extraListeners) {
@@ -217,6 +220,69 @@ export class PiAgentBrain implements BrainSession {
     this.session.modelRegistry.registerProvider(name, config as any);
   }
 
+  async ensureContextForModelPrompt(
+    model: BrainModelInfo,
+    text: string,
+  ): Promise<BrainContextPreflightResult> {
+    const settings = this.session.settingsManager.getCompactionSettings();
+    const contextWindow = Math.max(0, Math.floor(model.contextWindow || 0));
+    const reserveTokens = Math.max(0, Math.floor(settings.reserveTokens || 0));
+    const promptTokens = estimatePromptTokens(text) + Math.min(
+      PiAgentBrain.PROMPT_PREFLIGHT_SAFETY_TOKENS,
+      Math.max(0, Math.floor(contextWindow * 0.02)),
+    );
+    const budget = contextWindow - reserveTokens;
+    if (contextWindow <= 0 || budget <= 0) {
+      return {
+        ok: false,
+        compacted: false,
+        contextWindow,
+        errorMessage: `Context preflight failed: invalid context window for ${model.provider}/${model.id}`,
+      };
+    }
+
+    const beforeTokens = estimateCurrentContextTokens(this.session) + promptTokens;
+    if (beforeTokens <= budget) {
+      return { ok: true, compacted: false, tokens: beforeTokens, contextWindow };
+    }
+    if (!settings.enabled) {
+      return {
+        ok: false,
+        compacted: false,
+        tokens: beforeTokens,
+        contextWindow,
+        errorMessage: `Context preflight failed: estimated ${beforeTokens} tokens exceeds ${model.provider}/${model.id} window ${contextWindow} and compaction is disabled.`,
+      };
+    }
+
+    try {
+      await this.session.compact(
+        `Prepare this session to continue on ${model.provider}/${model.id} with a ${contextWindow} token context window. Preserve the user's latest request, current task state, decisions, constraints, tool findings, and exact identifiers needed to continue.`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        compacted: false,
+        tokens: beforeTokens,
+        contextWindow,
+        errorMessage: `Context preflight compaction failed before using ${model.provider}/${model.id}: ${message}`,
+      };
+    }
+
+    const afterTokens = estimateCurrentContextTokens(this.session) + promptTokens;
+    if (afterTokens > budget) {
+      return {
+        ok: false,
+        compacted: true,
+        tokens: afterTokens,
+        contextWindow,
+        errorMessage: `Context preflight failed after compaction: estimated ${afterTokens} tokens still exceeds ${model.provider}/${model.id} budget ${budget}.`,
+      };
+    }
+    return { ok: true, compacted: true, tokens: afterTokens, contextWindow };
+  }
+
   captureProviderResponse(listener: (response: BrainProviderResponse) => void): () => void {
     const agent = (this.session as unknown as { agent?: { onResponse?: unknown } }).agent;
     if (!agent || typeof agent !== "object") return () => {};
@@ -263,6 +329,25 @@ export class PiAgentBrain implements BrainSession {
     }
     this.session.agent.state.messages = sessionManager.buildSessionContext().messages;
   }
+}
+
+function estimatePromptTokens(text: string): number {
+  return estimateMessagesTokens([
+    {
+      role: "user",
+      content: [{ type: "text", text }],
+      timestamp: Date.now(),
+    } as any,
+  ]);
+}
+
+function estimateCurrentContextTokens(session: AgentSession): number {
+  const usage = session.getContextUsage();
+  if (usage && typeof usage.tokens === "number" && Number.isFinite(usage.tokens)) {
+    return Math.max(0, Math.ceil(usage.tokens));
+  }
+  const messages = Array.isArray(session.agent.state.messages) ? session.agent.state.messages : [];
+  return estimateMessagesTokens(messages as any[]);
 }
 
 function normalizeHeaders(value: unknown): Record<string, string> {
