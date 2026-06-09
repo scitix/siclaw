@@ -10,7 +10,11 @@ describe("backgroundLaunchedResult message", () => {
   it("keeps the default: end the turn, don't poll/sleep/spawn-a-waiter", () => {
     const m = msg();
     expect(m).toMatch(/END YOUR TURN/);
-    expect(m).toMatch(/do NOT read this file, poll, sleep, or spawn a sub-agent/i);
+    expect(m).toMatch(/do NOT read anything, poll, sleep, or spawn a sub-agent/i);
+  });
+
+  it("directs the model to task_output(task_id) rather than reading the raw output_file", () => {
+    expect(msg()).toMatch(/task_output\(task_id\)/);
   });
 
   it("carries the paired server/client EXCEPTION (so a perftest server isn't waited on → no deadlock)", () => {

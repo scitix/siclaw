@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { reloadConfig } from "./config.js";
 import { JobRegistry } from "./job-registry.js";
 import { spawnBackgroundBash } from "./background-bash-runner.js";
-import { DiskTaskOutput, getTaskOutputDir, getTaskOutputPath, SanitizingLineBuffer } from "../tools/cmd-exec/disk-output.js";
+import { DiskTaskOutput, getTaskOutputDir, getTaskOutputPath, SanitizingLineBuffer, sweepStaleTaskOutputs } from "../tools/cmd-exec/disk-output.js";
 import type { BackgroundExecRequest } from "./tool-registry.js";
 import type { OutputAction } from "../tools/infra/output-sanitizer.js";
 
@@ -103,6 +103,25 @@ describe("spawnBackgroundBash", () => {
     // close handler must NOT overwrite "stopped" with "killed" — same terminal state as a
     // stopped sub-agent, so the notification the model sees is consistent across paths.
     expect(await done).toBe("stopped");
+  });
+
+  it("releases the live-writer guard when setup throws before settle is wired (no liveTaskOutputs leak)", async () => {
+    const jobs = new JobRegistry();
+    const jobId = `jthrow-${Math.random().toString(36).slice(2)}`;
+    // A non-line-safe action makes the SanitizingLineBuffer ctor throw inside spawnBackgroundBash,
+    // before settle() (the only caller of disk.markFinal()) is wired.
+    const nonLineSafe: OutputAction = { type: "sanitize", sanitize: (s) => s, lineSafe: false };
+    expect(() => spawnBackgroundBash(req({ jobId, action: nonLineSafe }), jobs, () => {})).toThrow();
+    // Let the eager-create settle, then prove the basename is NOT protected: a file at that path
+    // with an old mtime must be swept. If markFinal hadn't run in the catch, the guard would leak
+    // and the file would survive forever.
+    await new Promise((r) => setTimeout(r, 20));
+    const p = getTaskOutputPath(jobId);
+    fs.writeFileSync(p, "leftover");
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(p, old, old);
+    await sweepStaleTaskOutputs(30 * 60 * 1000);
+    expect(fs.existsSync(p)).toBe(false);
   });
 });
 

@@ -20,7 +20,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { type FileHandle, mkdir, open, stat, unlink } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readdir, stat, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import { loadConfig } from "../../core/config.js";
 import {
@@ -62,11 +62,37 @@ export function getTaskOutputPath(jobId: string): string {
 }
 
 /**
+ * Open a task-output file for appending. Centralizes the security-relevant flags
+ * (O_NOFOLLOW anti-symlink, O_APPEND, O_CREAT — never O_TRUNC) so the writer (drain) and
+ * the eager create path can't drift. Caller owns close().
+ */
+function openAppendHandle(filePath: string): Promise<FileHandle> {
+  return open(
+    filePath,
+    process.platform === "win32"
+      ? "a"
+      : fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | O_NOFOLLOW,
+  );
+}
+
+/**
+ * Basenames of output files that currently have a LIVE writer (a DiskTaskOutput constructed
+ * but not yet markFinal()'d). Process-wide on purpose: the opportunistic stale-output sweep
+ * scans the SHARED task dir but is triggered by a single session's JobRegistry, so a
+ * registry-local protect set can't see another session/agent's running jobs (local mode runs
+ * one manager+registry per agent in one process). A silent long-running job has an old mtime
+ * yet must never be swept — its writer would reopen an empty file on the next chunk and lose
+ * output. Tracking liveness here, independent of any registry, closes that cross-registry gap.
+ */
+const liveTaskOutputs = new Set<string>();
+
+/**
  * Async disk writer for one job's output. Flat-array write queue + single drain loop:
  * each chunk is released as soon as its write completes (no retained .then() closures).
  */
 export class DiskTaskOutput {
   #path: string;
+  #base: string;
   #fileHandle: FileHandle | null = null;
   #queue: string[] = [];
   #bytesWritten = 0;
@@ -76,6 +102,35 @@ export class DiskTaskOutput {
 
   constructor(jobId: string) {
     this.#path = getTaskOutputPath(jobId);
+    this.#base = path.basename(this.#path);
+    liveTaskOutputs.add(this.#base); // protected from the stale-output sweep until markFinal()
+  }
+
+  /**
+   * Mark this writer permanently done (call once the job settles). Drops it from the
+   * live-writer protection set so the stale-output GC may reclaim its file once it ages
+   * past the cutoff. Idempotent; the file itself is left in place for the read window.
+   */
+  markFinal(): void {
+    liveTaskOutputs.delete(this.#base);
+  }
+
+  /**
+   * Eagerly create the (empty) output file at job launch. Without this the file is created
+   * only on the first non-empty append(), so a background job that has not produced output
+   * yet (e.g. an `ib_write_bw` server blocked waiting for a client) has NO file, and reading
+   * the `output_file` handed back at launch returns ENOENT — read as "task failed/missing"
+   * rather than "running, no output yet". Idempotent (O_APPEND|O_CREAT, never truncates);
+   * best-effort (the first append() would create it anyway).
+   */
+  async ensureCreated(): Promise<void> {
+    try {
+      await mkdir(getTaskOutputDir(), { recursive: true });
+      const fh = await openAppendHandle(this.#path);
+      await fh.close();
+    } catch {
+      /* best-effort — drain's open() will create it on the first chunk */
+    }
   }
 
   append(content: string): void {
@@ -106,12 +161,7 @@ export class DiskTaskOutput {
       try {
         if (!this.#fileHandle) {
           await mkdir(getTaskOutputDir(), { recursive: true });
-          this.#fileHandle = await open(
-            this.#path,
-            process.platform === "win32"
-              ? "a"
-              : fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | O_NOFOLLOW,
-          );
+          this.#fileHandle = await openAppendHandle(this.#path);
         }
         while (this.#queue.length > 0) {
           const queue = this.#queue.splice(0, this.#queue.length);
@@ -167,6 +217,105 @@ export async function cleanupTaskOutput(jobId: string): Promise<void> {
   } catch {
     /* ENOENT or already gone */
   }
+}
+
+/** Max bytes read back for a tail request / a whole-file request — bounds memory well below
+ * the 5GB disk cap so a huge output can never OOM (or exceed V8's max string) on the read. */
+const READ_TAIL_BYTE_CAP = 2 * 1024 * 1024; // 2MB
+const READ_FULL_BYTE_CAP = 8 * 1024 * 1024; // 8MB
+
+/**
+ * Read a job's output file, tolerant of "not created yet" (returns empty + exists:false
+ * rather than throwing ENOENT). Content is already sanitized on the write side. Reads only
+ * the LAST `cap` bytes (never the whole multi-GB file), so a large output can't OOM; when
+ * `tailLines` > 0 only the last N lines are returned. `bytes` is the full file size;
+ * `truncated` is set when the byte cap and/or the line tail dropped content.
+ */
+export async function readTaskOutput(
+  jobId: string,
+  tailLines?: number,
+): Promise<{ output: string; bytes: number; truncated: boolean; exists: boolean }> {
+  let fh: FileHandle;
+  try {
+    // Read with O_NOFOLLOW (symmetric with the append side) so a symlink planted at the
+    // output path can't redirect the read off-target. Plain "r" on win32 (no O_NOFOLLOW).
+    fh = await open(
+      getTaskOutputPath(jobId),
+      process.platform === "win32" ? "r" : fsConstants.O_RDONLY | O_NOFOLLOW,
+    );
+  } catch {
+    return { output: "", bytes: 0, truncated: false, exists: false }; // not created yet / cleaned
+  }
+  try {
+    const size = (await fh.stat()).size;
+    const wantTail = tailLines != null && tailLines > 0;
+    const cap = wantTail ? READ_TAIL_BYTE_CAP : READ_FULL_BYTE_CAP;
+    const readLen = Math.min(size, cap);
+    const buf = Buffer.alloc(readLen);
+    if (readLen > 0) await fh.read(buf, 0, readLen, size - readLen);
+    let content = buf.toString("utf8");
+    let truncated = size > readLen;
+    // We read from an arbitrary byte offset — drop the (possibly partial / split-multibyte)
+    // first line so we never surface a corrupted leading fragment. But if the whole window
+    // has NO newline (a pathological newline-less blob, e.g. a base64 stream), keep the raw
+    // bytes rather than collapse to "" — better a blob clipped at the front than empty output.
+    if (truncated) {
+      const nl = content.indexOf("\n");
+      if (nl >= 0) content = content.slice(nl + 1);
+    }
+    if (!wantTail) return { output: content, bytes: size, truncated, exists: true };
+    const lines = content.split("\n");
+    // Output ends in "\n" → split yields a trailing "" — drop it so a tail of N returns N real lines.
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    if (lines.length > tailLines) {
+      return { output: lines.slice(-tailLines).join("\n"), bytes: size, truncated: true, exists: true };
+    }
+    return { output: lines.join("\n"), bytes: size, truncated, exists: true };
+  } finally {
+    await fh.close();
+  }
+}
+
+/** Default age past which a finished job's output file is swept (24h). */
+const STALE_TASK_OUTPUT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Best-effort GC of stale task-output files. The app otherwise never deletes them, so in a
+ * long-lived process (local / TUI mode) they accumulate forever. Called opportunistically at
+ * each background launch — no scheduler needed, runtime-agnostic — and deletes `*.output`
+ * files whose mtime is older than `maxAgeMs` (well past any read window). A K8s agentbox pod
+ * is ephemeral and reclaims them on teardown anyway; this covers local/TUI and crash leftovers.
+ *
+ * Files with a live writer are ALWAYS skipped (via the process-wide liveTaskOutputs set), so a
+ * silent long-running job — even one owned by another session/agent sharing this dir — is never
+ * swept. `protect` is an optional extra set of basenames for explicit callers/tests.
+ */
+export async function sweepStaleTaskOutputs(
+  maxAgeMs = STALE_TASK_OUTPUT_MS,
+  protect?: Set<string>,
+): Promise<void> {
+  const dir = getTaskOutputDir();
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return; // dir not created yet — nothing to sweep
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  await Promise.all(
+    entries.map(async (name) => {
+      if (!name.endsWith(".output")) return;
+      // Never delete a still-running job's file: it may be silent (old mtime) yet alive — its
+      // writer would otherwise reopen an empty file on the next chunk and lose prior output.
+      if (liveTaskOutputs.has(name) || protect?.has(name)) return;
+      const full = path.join(dir, name);
+      try {
+        if ((await stat(full)).mtimeMs < cutoff) await unlink(full);
+      } catch {
+        /* raced with another sweep / already gone */
+      }
+    }),
+  );
 }
 
 /**
