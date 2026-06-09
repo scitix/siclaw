@@ -267,6 +267,27 @@ Allowed subcommands: `topo`, `nvlink`
 
 ---
 
+### Node Health-Check Agent
+
+| Command | Validator | Restrictions |
+|---------|-----------|-------------|
+| `sichek` | declarative `allowedSubcommands` | Only the GPU/IB/GPFS/transceiver/LLDP check subcommands; everything else (incl. `daemon`/`config`/`exporter`) rejected |
+
+`sichek` runs hardware/software health checks and prints results. Its internal tool calls
+run inside the `sichek` process (they do not re-enter `validateCommand()`). Only the specific
+read-only check subcommands needed are allowed; every other subcommand — including the
+state-changing `daemon` (systemd unit / Node annotations / config overwrite), `config`
+(`config sync` writes files), and `exporter` (long-running server) — is absent from the
+allow-list and therefore auto-rejected.
+
+#### sichek — allowed subcommands (position 0)
+
+```
+gpu (g)  infiniband (i)  gpfs (f)  transceiver (tr)  lldp (l)
+```
+
+---
+
 ### Hardware Info
 
 | Command | Validator | Restrictions |

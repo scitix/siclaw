@@ -1180,6 +1180,20 @@ export const COMMANDS: Record<string, CommandDef> = {
   // toggle DCGM watches. "config"/"policy"/"set"/"profile"/"group"/"diag" are not allowed.
   dcgmi:        { category: "gpu", validate: validateDcgmi },
 
+  // ── node health-check agent (read-only diagnostics) ──
+  // sichek runs hardware/software health checks as a child process and prints results.
+  // Only the specific read-only check subcommands we need are allowed (full name + alias);
+  // every other subcommand — including the state-changing daemon/config/exporter — is NOT
+  // listed → auto-rejected. sichek's own internal tool calls run inside its process and
+  // never re-enter validateCommand().
+  sichek: { category: "diagnostic", allowedSubcommands: { position: 0, allowed: [
+    "gpu", "g",            // Nvidia GPU
+    "infiniband", "i",     // InfiniBand
+    "gpfs", "f",           // GPFS
+    "transceiver", "tr",   // optical modules
+    "lldp", "l",           // LLDP neighbors
+  ] } },
+
   // ── hardware info ──
   lspci:     { category: "hardware" },
   lsusb:     { category: "hardware" },

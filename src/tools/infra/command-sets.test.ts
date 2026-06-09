@@ -50,6 +50,8 @@ describe("COMMANDS registry", () => {
     "mst", "mlxlink", "perfquery", "ibqueryerrors", "saquery", "ibping",
     "dcgmi", "smartctl", "nvme", "sensors", "getconf",
     "pidstat", "pstree", "numastat", "ipcs", "nstat", "tree", "hexdump", "od", "tac", "nl",
+    // node health-check agent
+    "sichek",
   ];
   for (const cmd of newCommands) {
     it(`contains "${cmd}"`, () => {
@@ -1586,5 +1588,31 @@ describe("read-only enforcement for added diagnostic commands", () => {
     expect(validateCommandRestrictions("resolvectl flush-caches")).not.toBeNull();
     expect(validateCommandRestrictions("resolvectl dns eth0 1.1.1.1")).not.toBeNull();
     expect(validateCommandRestrictions("resolvectl revert eth0")).not.toBeNull();
+  });
+
+  // sichek node health-check agent — only the gpu/infiniband/gpfs/transceiver/lldp checks
+  it("allows the specific sichek check subcommands (full names + aliases)", () => {
+    expect(validateCommandRestrictions("sichek gpu")).toBeNull();
+    expect(validateCommandRestrictions("sichek g -v")).toBeNull();
+    expect(validateCommandRestrictions("sichek infiniband")).toBeNull();
+    expect(validateCommandRestrictions("sichek i")).toBeNull();
+    expect(validateCommandRestrictions("sichek gpfs")).toBeNull();
+    expect(validateCommandRestrictions("sichek f")).toBeNull();
+    expect(validateCommandRestrictions("sichek transceiver")).toBeNull();
+    expect(validateCommandRestrictions("sichek tr")).toBeNull();
+    expect(validateCommandRestrictions("sichek lldp")).toBeNull();
+    expect(validateCommandRestrictions("sichek l")).toBeNull();
+    // flag values (e.g. -v) must not be mistaken for the subcommand
+    expect(validateCommandRestrictions("sichek gpu -v")).toBeNull();
+  });
+  it("rejects sichek subcommands outside the allow-list", () => {
+    // other read checks not requested
+    expect(validateCommandRestrictions("sichek all")).not.toBeNull();
+    expect(validateCommandRestrictions("sichek cpu")).not.toBeNull();
+    expect(validateCommandRestrictions("sichek nccltest")).not.toBeNull();
+    // state-changing subcommands
+    expect(validateCommandRestrictions("sichek daemon start")).not.toBeNull();
+    expect(validateCommandRestrictions("sichek config sync")).not.toBeNull();
+    expect(validateCommandRestrictions("sichek exporter")).not.toBeNull();
   });
 });
