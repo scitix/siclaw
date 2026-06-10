@@ -177,11 +177,12 @@ export class K8sSpawner implements BoxSpawner {
     }
 
     // Forward agentbox-relevant runtime knobs into the agentbox pod. The agentbox
-    // runs in its own pod and does NOT inherit the runtime process env, yet this
-    // flag is read inside the agentbox (sub-agent fan-out limiter, design §3).
+    // runs in its own pod and does NOT inherit the runtime process env, yet these
+    // flags are read inside the agentbox (sub-agent fan-out limiter, design §3;
+    // session checkpointing, 2026-06-10-session-checkpoint-db.md §5).
     // Curated allowlist only — never forward arbitrary env. Set the value on the
     // runtime deployment to control every agentbox it spawns.
-    const AGENTBOX_FORWARDED_ENV = ["SICLAW_SUBAGENT_CONCURRENCY"];
+    const AGENTBOX_FORWARDED_ENV = ["SICLAW_SUBAGENT_CONCURRENCY", "SICLAW_SESSION_CHECKPOINT_ENABLED"];
     for (const name of AGENTBOX_FORWARDED_ENV) {
       const value = process.env[name];
       if (value !== undefined && value !== "") {

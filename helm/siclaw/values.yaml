@@ -161,6 +161,13 @@ agentbox:
     # Leaving this empty while enabled keeps the PVC in Pending state.
     storageClassName: ""
     size: "10Gi"
+  # DB-backed session checkpoints — the PVC-free successor to `persistence`
+  # (docs/design/2026-06-10-session-checkpoint-db.md). Session dirs are
+  # uploaded through the Gateway on release/preStop and restored after pod
+  # restarts. Safe to run alongside persistence during migration (double-
+  # write); once verified, disable persistence and drop the PVC.
+  sessionCheckpoint:
+    enabled: false
 
 # -- Metrics & Observability
 metrics:

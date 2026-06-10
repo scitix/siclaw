@@ -64,6 +64,13 @@ spec:
             - name: SICLAW_PERSISTENCE_CLAIM_NAME
               value: {{ include "siclaw.dataPvcName" . | quote }}
             {{- end }}
+            {{- if .Values.agentbox.sessionCheckpoint.enabled }}
+            # Forwarded by the runtime spawner into each AgentBox pod: session
+            # dirs are checkpointed to the DB via the Gateway on release/preStop
+            # and hydrated after pod restarts (replaces the shared RWX PVC).
+            - name: SICLAW_SESSION_CHECKPOINT_ENABLED
+              value: "true"
+            {{- end }}
             {{- if .Values.agentbox.debugImage }}
             - name: SICLAW_DEBUG_IMAGE
               value: {{ .Values.agentbox.debugImage | quote }}
