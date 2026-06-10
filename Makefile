@@ -23,6 +23,7 @@ TAG       ?= $(if $(GIT_TAG),$(GIT_TAG),$(VERSION)-$(GIT_COMMIT)$(GIT_DIRTY))
 RUNTIME_IMAGE  = $(REGISTRY)/siclaw-runtime:$(TAG)
 AGENTBOX_IMAGE = $(REGISTRY)/siclaw-agentbox:$(TAG)
 PORTAL_IMAGE   = $(REGISTRY)/siclaw-portal:$(TAG)
+OCR_IMAGE      = $(REGISTRY)/siclaw-ocr:$(TAG)
 
 # ── OCI labels injected into every image ──
 DOCKER_LABELS = \
@@ -71,7 +72,7 @@ build-portal-web: ## Compile Portal frontend (Vite)
 # ==================== Docker ====================
 ##@ Docker
 
-docker: docker-runtime docker-agentbox docker-portal ## Build all Docker images
+docker: docker-runtime docker-agentbox docker-portal docker-ocr ## Build all Docker images
 
 docker-runtime: ## Build runtime image
 	docker build -f Dockerfile.runtime $(DOCKER_LABELS) -t $(RUNTIME_IMAGE) .
@@ -82,7 +83,10 @@ docker-agentbox: ## Build agentbox image
 docker-portal: ## Build portal image
 	docker build -f Dockerfile.portal $(DOCKER_LABELS) -t $(PORTAL_IMAGE) .
 
-push: push-runtime push-agentbox push-portal ## Push all images to registry
+docker-ocr: ## Build OCR backend image
+	docker build -f Dockerfile.ocr $(DOCKER_LABELS) -t $(OCR_IMAGE) .
+
+push: push-runtime push-agentbox push-portal push-ocr ## Push all images to registry
 
 push-runtime: ## Push runtime image
 	docker push $(RUNTIME_IMAGE)
@@ -92,6 +96,9 @@ push-agentbox: ## Push agentbox image
 
 push-portal: ## Push portal image
 	docker push $(PORTAL_IMAGE)
+
+push-ocr: ## Push OCR backend image
+	docker push $(OCR_IMAGE)
 
 # ==================== Test ====================
 ##@ Test
@@ -116,6 +123,7 @@ info: ## Print build variables
 	@echo "RUNTIME:     $(RUNTIME_IMAGE)"
 	@echo "AGENTBOX:    $(AGENTBOX_IMAGE)"
 	@echo "PORTAL:      $(PORTAL_IMAGE)"
+	@echo "OCR:         $(OCR_IMAGE)"
 
 logs: ## View recent logs (all components)
 	@echo "=== Runtime ===" && \
