@@ -83,4 +83,55 @@ describe("cluster_list tool — lazy fill", () => {
     const parsed = JSON.parse((result.content[0] as any).text);
     expect(parsed.error).toContain("Credential broker not initialized");
   });
+
+  it("filters by name substring (case-insensitive)", async () => {
+    transport.clusters = [
+      { name: "changliu-prod", is_production: true },
+      { name: "changliu-dev", is_production: false },
+      { name: "other-cluster", is_production: true },
+    ];
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", { name: "ChangLiu" });
+    const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
+    expect(parsed.clusters.map((c: any) => c.name).sort()).toEqual(["changliu-dev", "changliu-prod"]);
+  });
+
+  it("hints to drop the filter when a name search matches nothing", async () => {
+    transport.clusters = [
+      { name: "prod-a", is_production: true },
+      { name: "prod-b", is_production: true },
+    ];
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", { name: "nope" });
+    const text = (result.content[0] as any).text;
+    const parsed = JSON.parse(text.split("\n\n")[0]);
+    expect(parsed.clusters).toHaveLength(0);
+    expect(text).toContain('No clusters match "nope"');
+    expect(text).toContain("2"); // mentions the bound-cluster count
+  });
+
+  it("still reports unbound when the agent has zero clusters (not a search miss)", async () => {
+    transport.clusters = [];
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", { name: "anything" });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain("No clusters are bound");
+  });
+
+  it("passes structured meta through, flattened to key→value", async () => {
+    transport.clusters = [
+      { name: "c1", is_production: true, meta: [
+        { key: "rdma_type", display_name: "RDMA Type", value: "SR-IOV" },
+        { key: "scheduler", value: "volcano" },
+      ] },
+      { name: "c2", is_production: false }, // no meta
+    ];
+    const tool = createClusterListTool(ref);
+    const result = await tool.execute("id", {});
+    const parsed = JSON.parse((result.content[0] as any).text.split("\n\n")[0]);
+    const c1 = parsed.clusters.find((c: any) => c.name === "c1");
+    const c2 = parsed.clusters.find((c: any) => c.name === "c2");
+    expect(c1.meta).toEqual({ rdma_type: "SR-IOV", scheduler: "volcano" });
+    expect(c2).not.toHaveProperty("meta");
+  });
 });
