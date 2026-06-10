@@ -1035,7 +1035,12 @@ export function usePilotChat({ agentId, sessionId }: UsePilotChatOptions): UsePi
           break
 
         case "model_route_success": {
-          currentModelRouteRef.current = modelRouteFromEvent(evt)
+          // Match the gateway's persistence predicate (sse-consumer): route
+          // metadata is kept only for fallback/recovery replies. Tagging every
+          // routed reply live would make the model label vanish on reload.
+          const route = modelRouteFromEvent(evt)
+          currentModelRouteRef.current =
+            route && (route.is_fallback || route.recovered_from_candidate_key) ? route : null
           break
         }
 

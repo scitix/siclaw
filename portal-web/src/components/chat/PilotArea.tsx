@@ -124,14 +124,6 @@ function ModelTimeLabel({ timing }: { timing: MessageTiming | undefined }) {
   )
 }
 
-function stringMeta(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined
-}
-
-function numberMeta(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined
-}
-
 function modelRouteMetadata(message: PilotMessage): ModelRouteMetadata | null {
   const route = message.metadata?.model_route
   if (!route || typeof route !== "object" || Array.isArray(route)) return null
@@ -146,22 +138,10 @@ function isVisibleChatMessage(message: PilotMessage): boolean {
   return !message.hidden && !isModelRouteNoticeMessage(message)
 }
 
-function routeModelLabel(provider?: string, modelId?: string): string {
-  return provider && modelId ? `${provider}/${modelId}` : provider || modelId || "unknown"
-}
-
 function routeModelDisplayName(modelId?: string, provider?: string): string {
   if (!modelId) return provider || "unknown"
   const parts = modelId.split("/").filter(Boolean)
   return parts[parts.length - 1] || modelId
-}
-
-function formatCooldown(until: unknown): string | undefined {
-  const value = numberMeta(until)
-  if (value == null) return undefined
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return undefined
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
 }
 
 function ModelRouteIndicator({ route }: { route: ModelRouteMetadata | null }) {
@@ -1502,10 +1482,6 @@ function MessageItem({
     return <DelegationStatusNotice content={message.content} />
   }
 
-  if (message.metadata?.kind === "model_route_notice") {
-    return <ModelRouteNotice message={message} />
-  }
-
   if (isTool) {
     if (message.toolName === "delegate_to_agents") {
       return <AgentWorkBatchCard message={message} />
@@ -1681,39 +1657,6 @@ function DelegationStatusNotice({ content }: { content: string }) {
         <span className="font-medium">{headline}</span>
         {detail && <span className="text-blue-300/70">·</span>}
         {detail && <span className="truncate">{detail}</span>}
-      </div>
-    </div>
-  )
-}
-
-function ModelRouteNotice({ message }: { message: PilotMessage }) {
-  const metadata = message.metadata ?? {}
-  const eventType = stringMeta(metadata.event_type)
-  const from = routeModelLabel(stringMeta(metadata.from_provider), stringMeta(metadata.from_model_id))
-  const to = routeModelLabel(stringMeta(metadata.to_provider), stringMeta(metadata.to_model_id))
-  const failureKind = stringMeta(metadata.failure_kind)
-  const cooldown = formatCooldown(metadata.cooldown_until)
-  const isRecovery = eventType === "model_route.recovered"
-  const title = [
-    isRecovery ? `Recovered to ${to}` : `Switched from ${from} to ${to}`,
-    failureKind ? `Reason: ${failureKind}` : undefined,
-    stringMeta(metadata.error_message),
-    cooldown ? `Primary cooldown until ${cooldown}` : undefined,
-  ].filter(Boolean).join("\n")
-
-  return (
-    <div className="pl-12 min-w-0" data-copy-ignore>
-      <div
-        title={title}
-        className={cn(
-          "inline-flex max-w-3xl items-center gap-2 rounded-full border px-3 py-1.5 text-xs shadow-sm shadow-black/10",
-          isRecovery
-            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700"
-            : "border-amber-500/30 bg-amber-500/10 text-amber-700",
-        )}
-      >
-        <ArrowRight className="h-3.5 w-3.5 shrink-0" />
-        <span className="font-medium truncate">{message.content}</span>
       </div>
     </div>
   )
